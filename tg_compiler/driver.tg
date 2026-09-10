@@ -43,9 +43,11 @@ use tg_compiler::types::{type_check, type_check_strict, type_check_typed, type_e
 use tg_compiler::resolver::{resolve_names}
 use tg_compiler::access_check::{access_check}
 use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_context_new, AnalyzedProgram}
-use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo, verify_mir, check_effect_class_annotations_mir}
+use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, pretty_print_mir, instrument_for_pgo, verify_mir, check_effect_class_annotations_mir, check_purity_annotations_mir, check_budget_annotations_mir}
 use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target}
-use tg_compiler::lir::{lir_compile_object, lir_compile_executable, lir_target_desc}
+use tg_compiler::lir::{
+  lir_compile_object_cov, lir_compile_executable_cov, lir_target_desc
+}
 use tg_compiler::backend_thumb::{thumb_compile_object, thumb_compile_executable}
 use tg_compiler::backend_rv::{rv_compile_object, rv_compile_executable}
 use tg_compiler::backend_x86_64::{x86_64_compile_object, x86_64_compile_executable}
@@ -90,8 +92,13 @@ use tg_compiler::compiler_core::{
   emitter_new, emitter_new_json, DiagnosticEmitter, driver_lower_to_mir, analyze_program,
   Diagnostic, DiagLevel, json_escape, parse_source_program, join_diagnostics,
   emit_diagnostic, type_errors_to_diags, merge_imported_deps,
-  CodegenRoute, parse_codegen_route
+  CodegenRoute, parse_codegen_route, resolve_coverage_out
 }
+# (third-audit item 34 — the runtime producer): the coverage emission plan
+# the LIR route consumes (coverage_graph.tg section 2b). The driver builds
+# it from the finalized MIR when --coverage is on and hands it to the
+# plan-aware LIR entries.
+use tg_compiler::coverage_graph::{coverage_emission_plan_of_functions, coverage_emission_plan_disabled}
 # The §30 semantic snapshot route (audit §30; default-off): the driver
 # house of the env-gated artifact gates (with the LIR gates) — the
 # snapshot builder is full-library-only and the compiler kernel stays
@@ -106,9 +113,19 @@ use tg_compiler::semantic_snapshot::{
   semantic_snapshot_of_final_state, semantic_snapshot_finalize, semantic_snapshot_serialize,
   SnapshotError
 }
+# The persistent declaration-lineage store (third-audit item 11): the
+# snapshot route's SIBLING artifact (<snapshot>.lineages) — loaded at build
+# start (empty when absent), threaded through the builder's def walk and
+# saved after a successful build so repeated route/server runs accumulate
+# lineage history.
+use tg_compiler::stable_ids::{
+  DeclLineageStore, stable_lineage_store_new, stable_lineage_store_load, stable_lineage_store_save
+}
 use tg_compiler::semantic_model::{semantic_digest_zero, semantic_digest_render}
 use tg_compiler::semantic_index::{build_semantic_index}
-use tg_compiler::semantic_server::{compiler_session_from_finalized, session_serve_loop}
+use tg_compiler::semantic_server::{
+  compiler_session_from_finalized, snapshot_session_from_text, session_serve_loop
+}
 # The §37 verification evidence (proof_patch.tg — audit item 20): the
 # snapshot route assembles ONE VerifiedCompilationEvidence per successful
 # compile (the stage flags the route's own pipeline established — see
@@ -186,6 +203,57 @@ def parse_codegen_flag(arg: String) -> Result[CodegenRoute, String]
     return Result::Err("Malformed --codegen flag: " + arg + " (expected --codegen=direct or --codegen=lir)")
   end
   parse_codegen_route(parts[1].clone())
+end
+
+# The --coverage route gate (third-audit item 34): the counter emission
+# and the exit-time dump exist on the aarch64 host LIR route only. The
+# direct emitter and the wasm backend have no counter emission, and the
+# desc'd thumb/riscv/x86_64 LIR backends reject the flag inside
+# compile_lir_route; this predicate is the driver-level fail-closed gate
+# for every route that would otherwise silently ignore the flag.
+def coverage_route_supported(opts: CompilerOptions) -> Bool
+  if opts.codegen != CodegenRoute::Lir then
+    return false
+  end
+  if is_wasm_target(opts) then
+    return false
+  end
+  true
+end
+
+def coverage_route_message() -> String
+  "--coverage is implemented on the aarch64 host LIR route only: pass --codegen=lir with no cross --target to instrument a host build (the direct emitter and the desc'd/wasm backends have no counter emission); --coverage-out=<path> selects the dump path (default /tmp/tg.cov.trace, \"-\" = stdout)"
+end
+
+# The --coverage-out=<path> value extraction (the --pgo-gen idiom): the
+# flag requires the '=' form; an empty path fails closed. The routine
+# records the path only — the caller sets coverage = true.
+def parse_coverage_out_flag(arg: String) -> Result[String, String]
+  if !arg.starts_with("--coverage-out=") then
+    return Result::Err("Missing value for --coverage-out (expected --coverage-out=<path>, \"-\" for stdout)")
+  end
+  let path = arg.slice(15, arg.len())
+  if path.len() == 0 then
+    return Result::Err("Missing value for --coverage-out (expected --coverage-out=<path>, \"-\" for stdout)")
+  end
+  Result::Ok(path)
+end
+
+# The raw-argv coverage probe for the direct-only subcommands (tg test /
+# tg run / project builds): their parse paths can fall back to default
+# options before the parsed coverage surface is visible (e.g. the
+# "No input files" project-discovery path), so the flag is detected on
+# RAW argv. True when --coverage or --coverage-out=... appears.
+def coverage_flag_in_args(argv: Vec[String]) -> Bool
+  var i = 0
+  while i < argv.len() do
+    let a = argv[i].clone()
+    if a == "--coverage" || a.starts_with("--coverage-out=") then
+      return true
+    end
+    i = i + 1
+  end
+  false
 end
 
 # The deprecated-alias fallback (audit item 31): TANGERINE_LIR=1 is the
@@ -305,6 +373,18 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
       end
       opts.codegen = route
       codegen_explicit = true
+    elsif arg == "--coverage" then
+      # (third-audit item 34) coverage instrumentation: the LIR route
+      # emits counters + the runtime dump; the route gate runs after the
+      # deprecated TANGERINE_LIR alias is applied, at the compile entry.
+      opts.coverage = true
+    elsif arg.starts_with("--coverage-out=") then
+      let cov_path = match parse_coverage_out_flag(arg.clone())
+      when Result::Ok(p) then p
+      when Result::Err(e) then return Result::Err(e)
+      end
+      opts.coverage = true
+      opts.coverage_out = Option::Some(cov_path)
     elsif arg == "--panic-strategy" then
       # STATE A (abort-only): panic=abort is the ONLY stable panic
       # strategy. The unwind/catch machinery is experimental and carries
@@ -469,6 +549,17 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
       end
       opts.codegen = route
       codegen_explicit = true
+    elsif arg == "--coverage" then
+      # (third-audit item 34) the same coverage option surface as
+      # parse_args (the route gate runs at the compile entry).
+      opts.coverage = true
+    elsif arg.starts_with("--coverage-out=") then
+      let cov_path2 = match parse_coverage_out_flag(arg.clone())
+      when Result::Ok(p) then p
+      when Result::Err(e) then return Result::Err(e)
+      end
+      opts.coverage = true
+      opts.coverage_out = Option::Some(cov_path2)
     elsif arg == "--no-std" then
       # The no_std flag: accepted here (the compile route reads it from the
       # raw argv — CompilerOptions carries no dedicated field). A no_std
@@ -524,6 +615,10 @@ def print_help() -> Unit
   println("  bench     Run benchmarks")
   println("  repl      Interactive REPL")
   println("  lsp       Start language server (alias: ln)")
+  println("  server    Serve the semantic session protocol on stdin/stdout")
+  println("            (compiles <file>; --snapshot=<path> writes the artifact,")
+  println("             --store=<path> sets the lineage store;")
+  println("             --snapshot-only --snapshot=<path> loads an offline artifact)")
   println("  init      Create new project")
   println("  dep       Dependency management (add/remove/list/update/tree)")
   println("  install   Install a package globally")
@@ -556,6 +651,9 @@ def print_help() -> Unit
   println("  --codegen=direct|lir  Codegen route (default direct; lir is the standalone")
   println("                     LIR pipeline — experimental, host aarch64 + the desc'd")
   println("                     embedded triples only; TANGERINE_LIR is a deprecated alias)")
+  println("  --coverage           Emit block/edge counters (aarch64 LIR route) and dump the")
+  println("                     tg.cov.trace.v1 trace at exit; requires --codegen=lir")
+  println("  --coverage-out=PATH  Coverage dump path (default /tmp/tg.cov.trace; \"-\" = stdout)")
   println("  --panic-strategy <S>  abort (the ONLY stable strategy; unwind is rejected —")
   println("                     the unwind/catch machinery is experimental and never selectable)")
   println("  --pgo-gen[=PATH]     Instrument binary for profile generation")
@@ -596,6 +694,7 @@ enum Subcommand
   Agent        # tg agent  run agentic workflows
   Bindgen      # tg bindgen  generate FFI bindings
   Abi          # tg abi  ABI tools (test, dump)
+  Server       # tg server  serve the semantic session on stdin/stdout
   Compile      # tg <files>  raw compile (default, no subcommand)
 end
 
@@ -691,6 +790,8 @@ def driver_main() -> Int
     cmd_bindgen(startup_subcommand_argv())
   elsif first == "abi" then
     cmd_abi(startup_subcommand_argv())
+  elsif first == "server" then
+    cmd_server(startup_subcommand_argv())
   elsif first == "compile" then
     cmd_compile(startup_subcommand_argv())
   else
@@ -754,6 +855,8 @@ def detect_subcommand(argv: Vec[String]) -> SubcommandDispatch
     Subcommand::Bindgen
   elsif first == "abi" then
     Subcommand::Abi
+  elsif first == "server" then
+    Subcommand::Server
   elsif first == "compile" then
     Subcommand::Compile
   else
@@ -801,6 +904,14 @@ def cmd_build(argv: Vec[String]) -> Int
   # Try loading project from Tangerine.toml first
   match load_project(".") 
   when Result::Ok(project) then
+    # (third-audit item 34) the project build route ignores the codegen
+    # option (build_project compiles through the direct emitter), so
+    # --coverage fails closed on the RAW argv — the parse path may fall
+    # back to project sources before the parsed coverage surface exists.
+    if coverage_flag_in_args(argv) then
+      eprintln("--coverage is not supported by project builds: the project route compiles through the direct emitter — compile a file with `tg compile --codegen=lir --coverage <file>` to produce the tg.cov.trace.v1 trace")
+      return 1
+    end
     # Merge CLI options with project config
     let opts = match parse_args(argv)
     when Result::Ok(o) then o
@@ -862,6 +973,14 @@ end
 # 
 
 def cmd_run(argv: Vec[String]) -> Int
+  # (third-audit item 34) `tg run` compiles through the direct emitter on
+  # every path (project fallback included); coverage needs the LIR
+  # producer — fail closed on the RAW argv so the fallback cannot
+  # silently ignore the flag.
+  if coverage_flag_in_args(argv) then
+    eprintln("--coverage is not supported by `tg run`: the run route compiles through the direct emitter (no counter emission) — use `tg compile --codegen=lir --coverage <file>` and run the produced binary")
+    return 1
+  end
   # Compile to a temp executable, then run it
   let opts = match parse_args(argv)
   when Result::Ok(o) then o
@@ -924,6 +1043,16 @@ end
 # 
 
 def cmd_test(argv: Vec[String]) -> Int
+  # (third-audit item 34) `tg test` compiles each suite through the
+  # DIRECT emitter (compile_and_run_tests -> compile_file), which has no
+  # counter emission — fail closed on the RAW argv before discovery so
+  # the "no files" project path cannot silently ignore --coverage. The
+  # LIR producer is the ordinary compile route:
+  #   tg compile --codegen=lir --coverage prog.tg && ./prog <test key>
+  if coverage_flag_in_args(argv) then
+    eprintln("--coverage is not supported by `tg test`: the test route compiles through the direct emitter (no counter emission) — compile the program with `tg compile --codegen=lir --coverage <file>` and run the produced binary to write the tg.cov.trace.v1 trace")
+    return 1
+  end
   # Discover test sources: from project or CLI args. Explicitly named FILES
   # are verified strictly; project discovery and directory scans select only
   # RECOGNIZED test sources (the files carrying the @test test-attribute
@@ -2247,6 +2376,30 @@ def compile_to_wasm_route(opts: CompilerOptions, files: Vec[String], output_path
       end
       return Result::Err(join_diagnostics(&mir_effect_diags))
     end
+    # (third-audit item 25 — the purity theorem): verify the `pure`
+    # declarations on the same lowered program, persist the statuses on
+    # MirProgram.purity and reject a non-ProvenPure `pure` function
+    # (E0234 — Unknown fails closed).
+    let mir_purity_errs = check_purity_annotations_mir(&mut mir, env)
+    if !mir_purity_errs.is_empty() then
+      let mir_purity_diags = type_errors_to_diags(&mir_purity_errs)
+      for d in mir_purity_diags do
+        emit_diagnostic(&mut emitter, d)
+      end
+      return Result::Err(join_diagnostics(&mir_purity_diags))
+    end
+    # (third-audit item 45 — the complete @budget system): the declared
+    # budgets are checked against the MIR derivations on the same lowered
+    # program (E0235 on a static guarantee whose derived bound exceeds its
+    # declared limit).
+    let mir_budget_errs = check_budget_annotations_mir(&mir, env)
+    if !mir_budget_errs.is_empty() then
+      let mir_budget_diags = type_errors_to_diags(&mir_budget_errs)
+      for d in mir_budget_diags do
+        emit_diagnostic(&mut emitter, d)
+      end
+      return Result::Err(join_diagnostics(&mir_budget_diags))
+    end
     var mono_cache = mono_cache_new(&ast, &typed.resolutions)
     match monomorphize_program(&mut mir, &mut mono_cache)
     when Result::Ok(_) then ()
@@ -3095,6 +3248,11 @@ end
 # section (the audit §16 NVIC handler slice — see backend_thumb.tg's
 # interrupt-ABI section).
 def compile_lir_route_thumb(mir: MirProgram, opts: CompilerOptions, out_path: String, tdesc: TargetDesc) -> Result[Unit, String]
+  # (third-audit item 34) coverage is an aarch64-host-route feature; the
+  # cortex-m backend has no counter emission — fail closed, never ignore.
+  if opts.coverage then
+    return Result::Err(coverage_route_message())
+  end
   # The gate consults the route's CANONICAL ARMv7-M description — the
   # single source of target data (the same fail-closed shape check the
   # aarch64 arm runs against lir_target_desc).
@@ -3139,6 +3297,10 @@ end
 # the desc of the --target triple (audit item 39 — target_desc_of_triple)
 # or of the legacy env alias; its pointer width is the xlen.
 def compile_lir_route_rv(mir: MirProgram, opts: CompilerOptions, out_path: String, tdesc: TargetDesc) -> Result[Unit, String]
+  # (third-audit item 34) no counter emission on the riscv backend.
+  if opts.coverage then
+    return Result::Err(coverage_route_message())
+  end
   let xlen = tdesc.pointer_width
   if xlen != 4 && xlen != 8 then
     return Result::Err("internal error: the riscv LIR route must compile for xlen 4 or 8 bytes (the `" + tdesc.name + "` description says " + xlen.to_string() + ")")
@@ -3190,6 +3352,10 @@ end
 # TANGERINE_LIR_TARGET=x86_64 or --target x86_64-*. The default host
 # route is unchanged.
 def compile_lir_route_x86(mir: MirProgram, opts: CompilerOptions, out_path: String, tdesc: TargetDesc) -> Result[Unit, String]
+  # (third-audit item 34) no counter emission on the x86_64 backend.
+  if opts.coverage then
+    return Result::Err(coverage_route_message())
+  end
   if tdesc.pointer_width != 8 || tdesc.stack_alignment != 16 || tdesc.arch != Arch::X86_64 then
     return Result::Err("internal error: the x86_64 LIR route was given the `" + tdesc.name + "` description (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the item-30 route compiles for the 8-byte-pointer, 16-aligned x86_64 System V description (the --target triple or the legacy alias must select an x86_64 desc)")
   end
@@ -3270,6 +3436,26 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
   if !mir_effect_errs.is_empty() then
     let mir_effect_diags = type_errors_to_diags(&mir_effect_errs)
     return Result::Err(join_diagnostics(&mir_effect_diags))
+  end
+  # (third-audit item 25 — the purity theorem): verify the `pure`
+  # declarations on the same lowered program, persist the statuses on
+  # MirProgram.purity (the optimizer/equivalence/snapshot table) and
+  # reject a non-ProvenPure `pure` function (E0234 — Unknown fails
+  # closed).
+  let mir_purity_errs = check_purity_annotations_mir(&mut mir, env)
+  if !mir_purity_errs.is_empty() then
+    let mir_purity_diags = type_errors_to_diags(&mir_purity_errs)
+    return Result::Err(join_diagnostics(&mir_purity_diags))
+  end
+  # (third-audit item 45 — the complete @budget system): the declared
+  # budgets are checked against the MIR derivations on the same lowered
+  # program (E0235 on a static-proof/static-bound guarantee whose derived
+  # bound exceeds its declared limit; the runtime-measured counters keep
+  # their generated frame checks).
+  let mir_budget_errs = check_budget_annotations_mir(&mir, env)
+  if !mir_budget_errs.is_empty() then
+    let mir_budget_diags = type_errors_to_diags(&mir_budget_errs)
+    return Result::Err(join_diagnostics(&mir_budget_diags))
   end
   var mono_cache = mono_cache_new(&ast, &typed.resolutions)
   match monomorphize_program(&mut mir, &mut mono_cache)
@@ -3375,9 +3561,19 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
     return Result::Err("the LIR host route does not support --target overrides (" + tt + "); use --codegen=direct for the direct emitter")
   when Option::None then ()
   end
+  # (third-audit item 34) the coverage emission plan: built from the
+  # FINALIZED MIR (program order, one counter table per non-extern
+  # function, global bases) and handed to the plan-aware LIR entries; a
+  # compile without --coverage uses the disabled plan and emits the
+  # byte-identical pre-coverage object.
+  let cov_plan = if opts.coverage then
+    coverage_emission_plan_of_functions(mir.functions.clone(), resolve_coverage_out(opts.clone()))
+  else
+    coverage_emission_plan_disabled()
+  end
   match opts.emit
   when EmitMode::Object then
-    let bytes = match lir_compile_object(mir, target.clone())
+    let bytes = match lir_compile_object_cov(mir, target.clone(), cov_plan.clone())
     when Result::Err(e) then return Result::Err(e)
     when Result::Ok(b) then b
     end
@@ -3387,7 +3583,7 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
     end
     Result::Ok(())
   when EmitMode::Executable then
-    lir_compile_executable(mir, target.clone(), out_path)
+    lir_compile_executable_cov(mir, target.clone(), out_path, cov_plan.clone())
   when _ then
     Result::Err("the LIR host route supports --emit=obj and --emit=exe only (use --codegen=direct for other emit modes)")
   end
@@ -3410,6 +3606,21 @@ end
 # surface hashes ride the header and whose revision is the
 # content-addressed digest of its own canonical text.
 #
+# THIRD-AUDIT ITEM 11 (the persistent declaration lineage): the route also
+# owns the store's SIBLING artifact, "<path>.lineages" (the canonical
+# "pkg|module|kind|name|lineage" text of stable_lineage_store_save). At
+# build start the file is loaded when present (stable_lineage_store_load)
+# and a fresh empty store is used otherwise; the store is threaded through
+# the snapshot builder's def walk (stable_decl_stamp — an existing name
+# keeps its number; stable_decl_stamp_renamed — a unique same-kind/
+# same-signature disappeared entry transfers its number) and written back
+# after a successful build. Repeated route (and TANGERINE_SERVER) runs thus
+# accumulate lineage history keyed by the snapshot path. FIDELITY
+# BOUNDARY (documented in stable_ids.tg): the store text carries no
+# signature digests, so a LOADED store's entries are re-signed by the next
+# build's walk — a rename is rebindable once the pre-rename entry has been
+# re-signed in-process; the numbers themselves always survive.
+#
 # AUDIT ITEM 21 (the server carrying finalized state): this route is the
 # successful final compiler boundary. When TANGERINE_SERVER=1 is set
 # alongside TANGERINE_SNAPSHOT, the route additionally constructs the §39
@@ -3418,6 +3629,13 @@ end
 # (compiler_session_from_finalized, semantic_server.tg) — and serves the
 # §39 request protocol from stdin to stdout until EOF (session_serve_loop;
 # the snapshot file is written first, exactly as without the server var).
+# THIRD-AUDIT ITEM 22 (the normal command entry): `tg server <file>`
+# reaches the SAME boundary through the normal CLI — the shared
+# compile_snapshot_serve_route below — with --snapshot / --store options;
+# its --snapshot-only form is the OFFLINE-ARTIFACT path (read + parse the
+# stored artifact, serve snapshot_only_session; see serve_snapshot_artifact).
+# TANGERINE_SERVER stays the documented alias route. See the `tg server`
+# section below.
 # AUDIT ITEM 20 (the verification-evidence capture): the boundary also
 # assembles ONE VerifiedCompilationEvidence of the compile (every stage
 # flag set where this route's pipeline ran the stage — the §11
@@ -3465,9 +3683,255 @@ def semantic_server_requested() -> Bool
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# THE `tg server` COMMAND (third-audit item 22) — the NORMAL CLI entry
+# ———————————————————————————————————————————————————————————————
+# The semantic serve loop is reachable from the compiler's normal command
+# surface, not only through the TANGERINE_SNAPSHOT + TANGERINE_SERVER env
+# route:
+#
+#   tg server [OPTIONS] <file>          (pipeline form — compiles <file>)
+#   tg server --snapshot-only --snapshot=<path>
+#                                       (offline-artifact form — loads and
+#                                        serves the serialized artifact; no
+#                                        input file, no compile)
+#
+#     --snapshot=<path>  pipeline form: write the finalized §30
+#                        SemanticSnapshot artifact to <path> before serving
+#                        (the same artifact the env route writes).
+#                        Offline form: LOAD that artifact — the file is
+#                        read, parsed by semantic_snapshot_parse (the exact
+#                        inverse of the serializer) and served through
+#                        snapshot_only_session.
+#     --store=<path>     the persistent declaration-lineage store path
+#                        (default: "<snapshot>.lineages" when --snapshot is
+#                        given; no store is persisted otherwise; ignored by
+#                        the offline form, which compiles nothing)
+#     --snapshot-only    serve the OFFLINE-ARTIFACT session form from
+#                        --snapshot=<path>: no pipeline state, no input
+#                        file; the §38 snapshot + index ops answer from the
+#                        artifact tables (missing --snapshot fails closed)
+#     --offline          alias of --snapshot-only
+#     -q, --quiet        suppress the post-loop status lines
+#
+# The pipeline form COMPILES <file> through the same snapshot pipeline the
+# env route runs (the shared compile_snapshot_serve_route below), constructs
+# the CompilerSession at the successful final boundary and serves the
+# existing length-prefixed request/response protocol on stdin/stdout
+# (semantic_server.session_serve_loop — the same framing + handle entry
+# the env route uses). Errors fail closed: a bad option, a read/parse
+# failure of the offline artifact or a compile failure prints the reason to
+# stderr and exits 1 before any frame is written; the serve loop itself
+# terminates fail-closed on a framing / parse violation (see
+# semantic_server.tg).
+#
+# SNAPSHOT-ARTIFACT LOADING: semantic_snapshot_parse (semantic_snapshot.tg)
+# is the exact inverse of the serializer, so a serialized artifact is a
+# first-class server boot image: `tg server --snapshot-only
+# --snapshot=<path>` reads the file, parses every row family, rebuilds the
+# def key texts of digest-only rows from the symbol/type tables and serves
+# the snapshot + index ops from the record (snapshot_session_from_text —
+# semantic_server.tg). The offline session never pretends to hold pipeline
+# state: its target / final_env / final_typed / final_mir slots stay None,
+# so the §33 MIR-slice ops answer their documented "unavailable" rows.
+#
+# ENV ALIAS (documented): TANGERINE_SNAPSHOT=<path> TANGERINE_SERVER=1
+# remains the scripted alias route — it writes the artifact and serves the
+# pipeline-boundary session exactly as before. `tg server` is the normal
+# command entry; both share compile_snapshot_serve_route.
+
+pub struct SemanticServerCommand
+  input_file: String = ""
+  snapshot_path: String = ""
+  store_path: String = ""
+  offline_session: Bool = false
+  quiet: Bool = false
+end
+
+pub def print_server_usage() -> Unit
+  println("Usage: tg server [OPTIONS] <file>")
+  println("       tg server --snapshot-only --snapshot=<path>")
+  println("")
+  println("Serves the semantic session request/response protocol on stdin/stdout.")
+  println("")
+  println("Options:")
+  println("  --snapshot=<path>   Write the finalized semantic snapshot artifact")
+  println("                      (pipeline form); with --snapshot-only: load and")
+  println("                      serve that artifact offline")
+  println("  --store=<path>      Persistent declaration-lineage store path")
+  println("                      (default: <snapshot>.lineages; pipeline form only)")
+  println("  --snapshot-only     Serve an offline artifact (requires --snapshot=<path>;")
+  println("                      no input file and no compile)")
+  println("  --offline           Alias of --snapshot-only")
+  println("  -q, --quiet         Suppress the post-loop status lines")
+  println("  -h, --help          Show this help")
+end
+
+# Parse the `server` sub-argv ([program, args...] — the startup_subcommand_
+# argv shape). Strict and fail-closed: unknown options, a missing option
+# value, an empty path value, zero or more than one input file (pipeline
+# form) and a missing --snapshot (offline form) all answer Result::Err;
+# "help" is the sentinel the caller turns into usage + exit 0.
+pub def parse_server_args(argv: Vec[String]) -> Result[SemanticServerCommand, String]
+  var command = SemanticServerCommand {}
+  var i = 1
+  while i < argv.len() do
+    let arg = argv[i].clone()
+    if arg == "-h" || arg == "--help" then
+      return Result::Err("help")
+    elsif arg == "--snapshot" then
+      i = i + 1
+      if i >= argv.len() then
+        return Result::Err("Missing argument for --snapshot (expected a snapshot artifact path)")
+      end
+      command.snapshot_path = argv[i].clone()
+      if command.snapshot_path.len() == 0 then
+        return Result::Err("--snapshot requires a non-empty path")
+      end
+    elsif arg.starts_with("--snapshot=") then
+      command.snapshot_path = arg.slice(11, arg.len())
+      if command.snapshot_path.len() == 0 then
+        return Result::Err("--snapshot requires a non-empty path")
+      end
+    elsif arg == "--store" then
+      i = i + 1
+      if i >= argv.len() then
+        return Result::Err("Missing argument for --store (expected a lineage store path)")
+      end
+      command.store_path = argv[i].clone()
+      if command.store_path.len() == 0 then
+        return Result::Err("--store requires a non-empty path")
+      end
+    elsif arg.starts_with("--store=") then
+      command.store_path = arg.slice(8, arg.len())
+      if command.store_path.len() == 0 then
+        return Result::Err("--store requires a non-empty path")
+      end
+    elsif arg == "--snapshot-only" || arg == "--offline" then
+      command.offline_session = true
+    elsif arg == "-q" || arg == "--quiet" then
+      command.quiet = true
+    elsif arg.starts_with("-") then
+      return Result::Err("Unknown option for `tg server`: " + arg)
+    else
+      if command.input_file.len() > 0 then
+        return Result::Err("`tg server` accepts exactly one input file (got '" +
+          command.input_file.clone() + "' and '" + arg.clone() + "')")
+      end
+      command.input_file = arg.clone()
+    end
+    i = i + 1
+  end
+  if command.offline_session then
+    if command.snapshot_path.len() == 0 then
+      return Result::Err("`tg server --snapshot-only` requires --snapshot=<path> (the artifact to load)")
+    end
+  elsif command.input_file.len() == 0 then
+    return Result::Err("`tg server` requires one input file (see `tg server --help`)")
+  end
+  Result::Ok(command)
+end
+
+# The OFFLINE-ARTIFACT serve entry (`tg server --snapshot-only
+# --snapshot=<path>`): read the artifact, parse it through the ONE
+# deserializer, build the snapshot-only session and serve the §39 protocol
+# until EOF. Read and parse failures fail closed before any frame is
+# written; the parse reason carries the parser's line/row/field context
+# verbatim.
+def serve_snapshot_artifact(path: String, quiet: Bool) -> Result[Unit, String]
+  let text = match read_file(path.clone())
+  when Result::Ok(t) then t
+  when Result::Err(e) then return Result::Err("failed to read semantic snapshot '" + path.clone() + "': " + e)
+  end
+  let session = match snapshot_session_from_text(text)
+  when Result::Err(e) then return Result::Err("failed to parse semantic snapshot '" + path.clone() + "': " + e)
+  when Result::Ok(s) then s
+  end
+  let served = session_serve_loop(&session)
+  if !quiet then
+    println("Semantic server: served " + served.to_string() + " request(s) (offline artifact '" + path.clone() + "')")
+  end
+  Result::Ok(())
+end
+
+# The normal command entry: parse, then either serve the offline artifact
+# (--snapshot-only) or compile through the shared snapshot pipeline and
+# serve. Exit 0 on a clean serve (including EOF), 1 on a usage, read/parse
+# or compile error (no frame is written before the loop starts).
+pub def cmd_server(argv: Vec[String]) -> Int
+  let command = match parse_server_args(argv)
+  when Result::Ok(c) then c
+  when Result::Err(e) then
+    if e == "help" then
+      print_server_usage()
+      return 0
+    end
+    eprintln(e)
+    print_server_usage()
+    return 1
+  end
+  if command.offline_session then
+    match serve_snapshot_artifact(command.snapshot_path.clone(), command.quiet)
+    when Result::Ok(_) then
+      return 0
+    when Result::Err(e) then
+      eprintln(e)
+      return 1
+    end
+  end
+  var opts = default_options()
+  opts.quiet = command.quiet
+  var files: Vec[String] = Vec::new()
+  files.push(command.input_file.clone())
+  let snapshot_path = if command.snapshot_path.len() > 0 then
+    Option::Some(command.snapshot_path.clone())
+  else
+    Option::None
+  end
+  let store_path = if command.store_path.len() > 0 then
+    Option::Some(command.store_path.clone())
+  else
+    Option::None
+  end
+  match compile_snapshot_serve_route(
+    &opts, files, snapshot_path, store_path, true)
+  when Result::Ok(_) then 0
+  when Result::Err(e) then
+    eprintln(e)
+    1
+  end
+end
+
+# The env route's entry (unchanged behavior): exactly one input file, the
+# artifact path from TANGERINE_SNAPSHOT, the serve loop when
+# TANGERINE_SERVER=1 requested it.
 def compile_snapshot_route(opts: CompilerOptions, files: Vec[String], snapshot_path: String) -> Result[Unit, String]
   if files.len() != 1 then
     return Result::Err("TANGERINE_SNAPSHOT requires exactly one input file (unset it for a normal compile)")
+  end
+  compile_snapshot_serve_route(
+    &opts, files, Option::Some(snapshot_path), Option::None,
+    semantic_server_requested())
+end
+
+# The SHARED snapshot pipeline of the env route and `tg server`'s pipeline
+# form (third-audit item 22): compiles exactly one file to the finalized §30
+# snapshot, writes the artifact when a path was given (and the lineage store
+# when resolved), then serves the §39 protocol when requested via
+# compiler_session_from_finalized over the pipeline's real finalized values.
+# The offline-artifact form (--snapshot-only) never reaches here: the CLI
+# loads and serves the artifact directly (serve_snapshot_artifact above).
+# Behavior for the env route is identical to the former
+# compile_snapshot_route body.
+def compile_snapshot_serve_route(
+  opts: CompilerOptions,
+  files: Vec[String],
+  snapshot_path: Option[String],
+  store_path: Option[String],
+  serve: Bool
+) -> Result[Unit, String]
+  if files.len() != 1 then
+    return Result::Err("the semantic route requires exactly one input file")
   end
   let file = files[0].clone()
   let source = match read_file(file.clone())
@@ -3512,6 +3976,26 @@ def compile_snapshot_route(opts: CompilerOptions, files: Vec[String], snapshot_p
     let mir_effect_diags = type_errors_to_diags(&mir_effect_errs)
     return Result::Err(join_diagnostics(&mir_effect_diags))
   end
+  # (third-audit item 25 — the purity theorem): verify the `pure`
+  # declarations on the same lowered program, persist the statuses on
+  # MirProgram.purity (the optimizer/equivalence/snapshot table) and
+  # reject a non-ProvenPure `pure` function (E0234 — Unknown fails
+  # closed).
+  let mir_purity_errs = check_purity_annotations_mir(&mut mir, env)
+  if !mir_purity_errs.is_empty() then
+    let mir_purity_diags = type_errors_to_diags(&mir_purity_errs)
+    return Result::Err(join_diagnostics(&mir_purity_diags))
+  end
+  # (third-audit item 45 — the complete @budget system): the declared
+  # budgets are checked against the MIR derivations on the same lowered
+  # program (E0235 on a static-proof/static-bound guarantee whose derived
+  # bound exceeds its declared limit; the runtime-measured counters keep
+  # their generated frame checks).
+  let mir_budget_errs = check_budget_annotations_mir(&mir, env)
+  if !mir_budget_errs.is_empty() then
+    let mir_budget_diags = type_errors_to_diags(&mir_budget_errs)
+    return Result::Err(join_diagnostics(&mir_budget_diags))
+  end
   var mono_cache = mono_cache_new(&ast, &typed.resolutions)
   match monomorphize_program(&mut mir, &mut mono_cache)
   when Result::Ok(_) then ()
@@ -3531,79 +4015,125 @@ def compile_snapshot_route(opts: CompilerOptions, files: Vec[String], snapshot_p
   when _ then
     return Result::Err("the TANGERINE_SNAPSHOT route has no TargetDesc for this host (aarch64/x86-64 only) — unset TANGERINE_SNAPSHOT to use the direct emitter")
   end
+  # The persistent declaration-lineage store (third-audit item 11): the
+  # SIBLING artifact of the snapshot file. Loaded when present so repeated
+  # runs of this route (the TANGERINE_SERVER route and `tg server`
+  # included) accumulate lineage history; a fresh empty store otherwise
+  # (first sight bootstraps structurally). One store is threaded through
+  # the whole build. Path resolution (third-audit item 22): an explicit
+  # --store path wins, then the sibling "<snapshot>.lineages" convention
+  # when an artifact path was given; otherwise no store is persisted.
+  var lineage_path = "".to_string()
+  match store_path
+  when Option::Some(p) then
+    lineage_path = p.clone()
+  when Option::None then
+    match snapshot_path.clone()
+    when Option::Some(p) then
+      lineage_path = p.clone() + ".lineages"
+    when Option::None then ()
+    end
+  end
+  end
+  var lineage_store = stable_lineage_store_new()
+  if lineage_path.len() > 0 then
+    lineage_store = match read_file(lineage_path.clone())
+    when Result::Ok(text) then stable_lineage_store_load(text)
+    when Result::Err(_) then stable_lineage_store_new()
+    end
+  end
   var snapshot = match semantic_snapshot_of_final_state(
-    &env, &typed.typed, &mir, &target_desc, VERSION, semantic_digest_zero())
+    &env, &typed.typed, &mir, &target_desc, VERSION, semantic_digest_zero(), &mut lineage_store)
   when Result::Err(e) then
     return Result::Err("semantic snapshot build failed: " + snapshot_error_text(e))
   when Result::Ok(s) then s
   end
   semantic_snapshot_finalize(&mut snapshot)
   let snapshot_text = semantic_snapshot_serialize(&mut snapshot)
-  match write_file_bytes(snapshot_path.clone(), &snapshot_text.bytes())
-  when Result::Ok(_) then
-    if !opts.quiet then
-      println("Semantic snapshot: " + snapshot_path)
-    end
-    # THE SUCCESSFUL FINAL COMPILER BOUNDARY (audit item 21): after the
-    # final verify_mir (above), the snapshot of the finalized state is
-    # written — and when TANGERINE_SERVER=1 requests it, the §39
-    # CompilerSession is constructed HERE from the pipeline's real
-    # finalized values (env = the analyzer's TypeEnv, typed.typed = the
-    # typed program it returned, mir = the monomorphized + optimized +
-    # post-opt-verified MirProgram, target_desc = the route's canonical
-    # host descriptor, snapshot = the finalized §30 artifact, revision =
-    # its content-addressed digest) and the §39 request protocol is
-    # served from stdin to stdout until EOF.
-    #
-    # THE EVIDENCE CAPTURE (audit item 20 — the item-20 leftover): the
-    # route also assembles ONE VerifiedCompilationEvidence of the compile
-    # and rides it on the session's evidence slot (compiler_session_from_
-    # finalized — see semantic_server.tg). Every stage flag is set ONLY
-    # where THIS route's pipeline actually ran the stage to success:
-    # parse_ok = the parse above; resolution_ok / type_ok / access_ok /
-    # resource_ok = analyze_program's canonical semantic pass (resolution
-    # + type checking + the access/ownership and resource convention
-    # checks all succeeded inside analyze_parsed); mir_verify_ok = the
-    # pre-mono verify_mir over the lowered program; effect_verify_ok = the
-    # §11 effect-class annotation check added above (the stage the route
-    # previously could not truthfully claim); post_opt_mir_verify_ok = the
-    # final post-opt verify_mir. mono_verify_ok stays false with this doc
-    # note: the route runs monomorphization but NO post-mono verifier
-    # checkpoint (its sibling routes run none either — the pre-mono and
-    # post-opt verifications bound the mono transform; compiler_core's
-    # compile flows run the unconditional post-mono checkpoint, so only
-    # their evidence may claim the flag). abi_verify_ok stays false with
-    # this doc note: NO ABI-verify stage exists anywhere yet — the flag is
-    # reserved for the future pub/extern ABI surface check.
-    # Unset TANGERINE_SERVER and the route behaves exactly as before (the
-    # file write above is the whole effect); the construction/serve block
-    # never runs and no pipeline value is consumed by it.
-    if semantic_server_requested() then
-      let index = build_semantic_index(&snapshot)
-      let route_evidence = verified_compilation_evidence(
-        semantic_digest_render(&snapshot.revision),
-        true,   # parse_ok — parse_source_program succeeded
-        true,   # resolution_ok — analyze_parsed's resolution succeeded
-        true,   # type_ok — type_check_typed succeeded
-        true,   # access_ok — access_check succeeded
-        true,   # resource_ok — resource_check succeeded
-        true,   # mir_verify_ok — the pre-mono verify over the lowered program
-        false,  # mono_verify_ok — no post-mono verifier checkpoint on this route
-        true,   # post_opt_mir_verify_ok — the final post-opt verify
-        true,   # effect_verify_ok — the §11 annotation check above
-        false)  # abi_verify_ok — no ABI-verify stage exists yet
-      let session = compiler_session_from_finalized(
-        snapshot.revision, &target_desc, &env, &typed.typed, &mir, &snapshot, &index,
-        Option::Some(route_evidence))
-      let served = session_serve_loop(&session)
+  let have_snapshot_path = snapshot_path.is_some()
+  match snapshot_path
+  when Option::Some(path) then
+    match write_file_bytes(path.clone(), &snapshot_text.bytes())
+    when Result::Ok(_) then
       if !opts.quiet then
-        println("Semantic server: served " + served.to_string() + " request(s)")
+        println("Semantic snapshot: " + path.clone())
       end
+    when Result::Err(e) then
+      return Result::Err("failed to write semantic snapshot '" + path + "': " + e.message())
     end
-    Result::Ok(())
-  when Result::Err(e) then
-    Result::Err("failed to write semantic snapshot '" + snapshot_path + "': " + e.message())
+  when Option::None then ()
   end
+  # Persist the MUTATED store beside the artifact (the sibling
+  # "<snapshot>.lineages" convention) or at the explicit --store path: the
+  # next run's walk reuses these numbers and rebinds renames among the
+  # entries it re-signs. Skipped when no store path was resolved.
+  if lineage_path.len() > 0 then
+    match write_file_bytes(lineage_path.clone(), &stable_lineage_store_save(lineage_store).bytes())
+    when Result::Ok(_) then
+      if !opts.quiet && have_snapshot_path then
+        println("Semantic lineages: " + lineage_path.clone())
+      end
+    when Result::Err(e) then
+      return Result::Err("failed to write semantic lineage store '" + lineage_path.clone() + "': " + e.message())
+    end
+  end
+  # THE SUCCESSFUL FINAL COMPILER BOUNDARY (audit item 21): after the final
+  # verify_mir (above), the snapshot of the finalized state is written — and
+  # when serve was requested (TANGERINE_SERVER=1 on the env route, or the
+  # `tg server` pipeline form), the §39 CompilerSession is constructed HERE
+  # from the pipeline's real finalized values (env = the analyzer's TypeEnv,
+  # typed.typed = the typed program it returned, mir = the monomorphized +
+  # optimized + post-opt-verified MirProgram, target_desc = the route's
+  # canonical host descriptor, snapshot = the finalized §30 artifact,
+  # revision = its content-addressed digest) and the §39 request protocol is
+  # served from stdin to stdout until EOF. The offline-artifact form
+  # (`tg server --snapshot-only --snapshot=<path>`) never reaches this
+  # boundary: it parses the stored artifact and serves snapshot_only_session
+  # (serve_snapshot_artifact above) with no pipeline slots filled.
+  #
+  # THE EVIDENCE CAPTURE (audit item 20 — the item-20 leftover): the route
+  # also assembles ONE VerifiedCompilationEvidence of the compile and rides
+  # it on the session's evidence slot (compiler_session_from_finalized —
+  # see semantic_server.tg). Every stage flag is set ONLY where THIS
+  # route's pipeline actually ran the stage to success: parse_ok = the
+  # parse above; resolution_ok / type_ok / access_ok / resource_ok =
+  # analyze_program's canonical semantic pass (resolution + type checking +
+  # the access/ownership and resource convention checks all succeeded
+  # inside analyze_parsed); mir_verify_ok = the pre-mono verify_mir over
+  # the lowered program; effect_verify_ok = the §11 effect-class annotation
+  # check added above (the stage the route previously could not truthfully
+  # claim); post_opt_mir_verify_ok = the final post-opt verify_mir.
+  # mono_verify_ok stays false with this doc note: the route runs
+  # monomorphization but NO post-mono verifier checkpoint (its sibling
+  # routes run none either — the pre-mono and post-opt verifications bound
+  # the mono transform; compiler_core's compile flows run the unconditional
+  # post-mono checkpoint, so only their evidence may claim the flag).
+  # abi_verify_ok stays false with this doc note: NO ABI-verify stage
+  # exists anywhere yet — the flag is reserved for the future pub/extern
+  # ABI surface check.
+  if serve then
+    let index = build_semantic_index(&snapshot)
+    let route_evidence = verified_compilation_evidence(
+      semantic_digest_render(&snapshot.revision),
+      true,   # parse_ok — parse_source_program succeeded
+      true,   # resolution_ok — analyze_parsed's resolution succeeded
+      true,   # type_ok — type_check_typed succeeded
+      true,   # access_ok — access_check succeeded
+      true,   # resource_ok — resource_check succeeded
+      true,   # mir_verify_ok — the pre-mono verify over the lowered program
+      false,  # mono_verify_ok — no post-mono verifier checkpoint on this route
+      true,   # post_opt_mir_verify_ok — the final post-opt verify
+      true,   # effect_verify_ok — the §11 annotation check above
+      false)  # abi_verify_ok — no ABI-verify stage exists yet
+    let session = compiler_session_from_finalized(
+      snapshot.revision, &target_desc, &env, &typed.typed, &mir, &snapshot, &index,
+      Option::Some(route_evidence))
+    let served = session_serve_loop(&session)
+    if !opts.quiet then
+      println("Semantic server: served " + served.to_string() + " request(s)")
+    end
+  end
+  Result::Ok(())
 end
 
 def host_arch_name(arch: Arch) -> String
@@ -3648,6 +4178,16 @@ def cmd_compile(argv: Vec[String]) -> Int
     for rej in cap_rejections do
       eprintln(rej)
     end
+    return 1
+  end
+
+  # (third-audit item 34) THE COVERAGE ROUTE GATE: coverage counters are
+  # emitted by the aarch64 host LIR route only. Every other selection
+  # (direct, wasm, embedded --target) fails closed here — the flag is
+  # never silently ignored. The desc'd LIR arms re-check inside
+  # compile_lir_route for the embedded route that reaches them.
+  if opts.coverage && !coverage_route_supported(opts.clone()) then
+    eprintln(coverage_route_message())
     return 1
   end
 
@@ -3861,6 +4401,18 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
       end
       opts.codegen = route
       codegen_explicit = true
+    elsif arg == "--coverage" then
+      # (third-audit item 34) the raw compile mode's coverage surface.
+      opts.coverage = true
+    elsif arg.starts_with("--coverage-out=") then
+      let cov_path3 = match parse_coverage_out_flag(arg.clone())
+      when Result::Ok(p) then p
+      when Result::Err(e) then
+        println(e)
+        return 1
+      end
+      opts.coverage = true
+      opts.coverage_out = Option::Some(cov_path3)
     elsif arg == "--no-std" then
       # Accepted in raw compile mode too (see cmd_compile's no_std route).
       ()
@@ -3907,6 +4459,14 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
     for rej in cap_rejections_raw do
       eprintln(rej)
     end
+    return 1
+  end
+
+  # (third-audit item 34) the raw-mode COVERAGE ROUTE GATE — the same
+  # fail-closed policy as cmd_compile: no silent ignore on the direct,
+  # wasm or desc'd backends.
+  if opts.coverage && !coverage_route_supported(opts.clone()) then
+    eprintln(coverage_route_message())
     return 1
   end
 
@@ -5416,7 +5976,9 @@ def agent_check(argv: Vec[String]) -> Int
     when ItemKind::ItemFunction(f) then
       for contract in f.contracts do
         contract_count = contract_count + 1
-        # Verify contract is well-formed (condition references in-scope names)
+        # Report the contract clause. The authoritative check is the
+        # MirContractCheck that lower_contract emits (runtime trap in
+        # codegen); this subcommand only summarizes what is declared.
         let cond_note = match contract.message
         when Option::Some(m) then m.clone()
         when Option::None then "(no message)"
@@ -5427,14 +5989,13 @@ def agent_check(argv: Vec[String]) -> Int
     end
   end
 
-  # THE REAL SEMANTIC VERIFICATION (the reviewer's false-success fix):
-  # the agentic subsystem's contract checker ACTUALLY runs —
-  # analyze_agentic_features checks every contract for unsatisfiability
-  # (the trivially-false probe), every required capability for
-  # availability, and every declared effect for existence — and the
-  # violations ARE counted and reported (the old stub counted 0 forever
-  # and returned success on every input). A violation fails the
-  # invocation.
+  # ADVISORY static analysis (NOT contract verification — there is exactly
+  # ONE contract authority: mir.tg lower_contract -> MirContractCheck,
+  # enforced at runtime by codegen). analyze_agentic_features reports
+  # definitely-unsatisfiable clauses via the trivially-false probe, plus
+  # unavailable required capabilities and unknown declared effects. The
+  # violations ARE counted and reported (the old stub counted 0 forever);
+  # a violation fails this advisory invocation.
   var ctx = agentic_context_new()
   let violations = analyze_agentic_features(&mut ctx, ast)
   for v in violations do

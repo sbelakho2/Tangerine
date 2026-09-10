@@ -150,6 +150,9 @@ use tg_compiler::lir::{
   LirBitMoveOp, LirAggCallArg,
   lower_mir_fn_to_lir_prog_x86, lir_peephole, lir_alloc_registers_mode,
   lir_validate_callees, lir_first_alloc_vreg, lir_check_extern_enum_calls,
+  lir_enum_abi_version, lir_enum_abi_version_word, lir_enum_abi_note_label,
+  lir_check_enum_abi_program, lir_check_fn_enum_abi_export,
+  lir_fn_export_binding,
   lir_is_fixed_fp_id, lir_fixed_fp_base, lir_fp_width_of,
   lir_alloc_fp_width_of, lir_seg_at, lir_reload_at, lir_block_label,
   lir_slot_offset, lir_simd_lane_of_vector_lane, lir_vector_lane_name,
@@ -1304,14 +1307,18 @@ end
 
 # Register a machine function symbol at the current buffer position.
 # Stage 1 emits every body into one .text (@cold is not specialized —
-# the hint is documented as ignored in the module header).
-def x86_emit_fn_symbol(inout xe: X86Emit, name: String) -> Unit
+# the hint is documented as ignored in the module header). `binding` is
+# the ABI-stability boundary's answer (third-audit item 42 boundary rule
+# (c)): lir_fn_export_binding makes a payloaded-enum function LOCAL —
+# internal to the object, never a public ABI export — while every
+# non-crossing function stays Global exactly as before.
+def x86_emit_fn_symbol(inout xe: X86Emit, name: String, binding: SymBinding) -> Unit
   xe.syms.push(AsmSymbol {
     name: name,
     section: Section::Text,
     offset: buf_pos(&xe.buf),
     size: 0,
-    binding: SymBinding::Global,
+    binding: binding,
     kind: SymKind::Func
   })
 end
@@ -3868,7 +3875,9 @@ def x86_emit_fn(inout xe: X86Emit, lir_fn: LirFunction, alloc: LirAlloc, externs
   if frame_total > 2147483647 then
     return Result::Err("x86_64: function " + lir_fn.name + " needs a " + frame_total.to_string() + "-byte frame — larger than the signed 32-bit sub rsp immediate (fail-closed)")
   end
-  x86_emit_fn_symbol(xe, lir_fn.name.clone())
+  # The ABI-stability boundary (third-audit item 42 boundary rule (c)) —
+  # the x86 writer's side of the rule.
+  x86_emit_fn_symbol(xe, lir_fn.name.clone(), lir_fn_export_binding(lir_fn))
   def_label(&mut xe.buf, lir_fn.name.clone())
   x86_emit_prologue(xe, frame_total, saved, lir_fn, alloc)
   var pos = 0
@@ -4119,6 +4128,35 @@ def x86_emit_program_statics(inout xe: X86Emit, program: MirProgram) -> Result[U
     xe.bss_size = xe.bss_size + 1
   end
   Result::Ok(())
+end
+
+# THE OBJECT-METADATA ENUM-ABI NOTE, x86_64 ELF WRITER (third-audit
+# item 42 boundary rule (d)): this writer's section set is fixed
+# (.text/.rela.text/.data/.bss/.symtab/.strtab — no .rodata), so the
+# version rides .data: a GLOBAL data symbol `tg.abi.enumver` whose target
+# is the NUL-terminated version word ("inline-image-v1"). A consumer
+# reads the bytes at the symbol and parses them with
+# lir_enum_abi_version_of_word (failing closed on an unknown word via
+# lir_check_enum_abi_word). Appended after every static has its offset,
+# so the static layout is unchanged; emitted only when a function
+# carries the payloaded-enum marker.
+def x86_emit_enum_abi_note(inout xe: X86Emit) -> Unit
+  let word = lir_enum_abi_version_word(lir_enum_abi_version())
+  let note_off = xe.data.len()
+  var i = 0
+  while i < word.len() do
+    xe.data.push(word.char_at(i) as u8)
+    i = i + 1
+  end
+  xe.data.push(0)
+  xe.syms.push(AsmSymbol {
+    name: lir_enum_abi_note_label(),
+    section: Section::Data,
+    offset: note_off,
+    size: word.len(),
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
 end
 
 # The (name, offset, size, section-kind) DATA symbols in program order;
@@ -4512,6 +4550,11 @@ def x86_64_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u
     type_defs.insert(program.types[tdi].id.id, program.types[tdi].clone())
     tdi = tdi + 1
   end
+  # The program-wide enum ABI version (third-audit item 42 — the aarch64
+  # route's rule, shared): one version per program; every function marker
+  # must match it, and `uses_enum_abi` decides the object-metadata note.
+  let program_enum_abi = lir_enum_abi_version()
+  var uses_enum_abi = false
   fi = 0
   while fi < program.functions.len() do
     let f = program.functions[fi]
@@ -4538,6 +4581,19 @@ def x86_64_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(lf) then lf
       end
+      # The enum-ABI uniformity + required-export gates (third-audit
+      # item 42 — the aarch64 route's checks, shared).
+      match lir_check_enum_abi_program(lir_fn, program_enum_abi)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      match lir_check_fn_enum_abi_export(lir_fn)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      if lir_fn.enum_abi_crossing then
+        uses_enum_abi = true
+      end
       match lir_validate_callees(lir_fn, defined, externs)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
@@ -4562,6 +4618,13 @@ def x86_64_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u
       end
     end
     fi = fi + 1
+  end
+  # The object-metadata enum-ABI note (third-audit item 42 boundary rule
+  # (d)): emitted exactly when a function carries the payloaded-enum
+  # marker; the .data bytes land after every static, so the static
+  # layout is unchanged.
+  if uses_enum_abi then
+    x86_emit_enum_abi_note(xe)
   end
   match x86_resolve_patches(xe)
   when Result::Err(e) then return Result::Err(e)

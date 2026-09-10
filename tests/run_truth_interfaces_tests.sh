@@ -7,10 +7,12 @@
 #       the explicit "debug info is not supported" error — the inert
 #       debug_info option is gone (no compile path emits debug info, so
 #       the flag is never silently accepted).
-#   (2) `tg agent check` is the REAL semantic verification: a file with
-#       an unsatisfiable contract (pre false) is REPORTED — the
-#       violation is counted and the invocation fails — and a clean file
-#       passes with zero violations (the never-incremented
+#   (2) `tg agent check` is an ADVISORY static check (NOT contract
+#       verification — the ONE contract authority is the MirContractCheck
+#       that mir.tg lower_contract emits and codegen enforces): a file
+#       with a definitely-unsatisfiable contract (pre false) is REPORTED —
+#       the violation is counted and the invocation fails — and a clean
+#       file passes with zero violations (the never-incremented
 #       violation_count stub is gone).
 #   (3) std::gpu_vulkan's device properties are the UNSUPPORTED contract
 #       (P1.11): the enumeration returns the Unsupported error and never
@@ -76,10 +78,10 @@ check "tg run -g is REJECTED (nonzero)" 1 $?
 check "tg check -g is REJECTED (nonzero)" 1 $?
 
 echo ""
-echo "--- (2) tg agent check: the real semantic verification ---"
+echo "--- (2) tg agent check: the advisory unsatisfiable-contract lint ---"
 
 # The UNSATISFIABLE contract: `pre false` is trivially false — the
-# checker's contract machinery must report it as a violation.
+# advisory trivially-false probe must report it as a violation.
 cat > "$TMP/bad_contract.tg" <<'EOF'
 def divide(a: Int, b: Int) -> Int
   pre false

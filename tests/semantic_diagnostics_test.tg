@@ -1,0 +1,204 @@
+# tests/semantic_diagnostics_test.tg — third-audit items 23/24 end-to-end
+# lanes: the stable diagnostic identity + retained store, the typed
+# ExplainNode derivation trees, and the diagnostic.* operation round trip.
+#
+# The module lanes live in the compiler modules themselves:
+#   semantic_diagnostics_lane_check — StableDiagnosticId derivation
+#     (owner/cause/code/obligation + digest words), collision ordinals,
+#     store idempotency, store_get/store_all/store_match, the ExplainNode
+#     render byte-identity + typed find, and the diagnostic.get record
+#     round trip over the hand-built store (D1-D6 rows).
+#   explain_lane_check — the ExplainNode builders' render byte-identity
+#     for an existing capability.explain case and the typed tree's find
+#     (E1/E2 rows).
+# This suite drives those lanes and adds the operation round trips:
+# diagnostic.get over a HAND-BUILT DiagnosticStore, the session-retained
+# store round trip, and the operation registry's resolution (the new
+# names resolve, an unknown one does not).
+#
+# Run with the repo root as the working directory:
+#   tg test tests/semantic_diagnostics_test.tg
+
+use std::core::{Option, Unit}
+use std::collections::{Vec}
+use std::test::*
+
+use tg_compiler::ids::{StableDigest}
+use tg_compiler::token::{Span}
+use tg_compiler::parser::{Diagnostic, DiagLevel, DiagnosticSemanticData, OwnershipDiagnosticData}
+use tg_compiler::semantic_model::{SemanticSnapshot, StableTargetId}
+use tg_compiler::semantic_server::{
+  SEMANTIC_PROTOCOL_VERSION, SemanticRequest,
+  new_compiler_session, session_handle_request, session_diagnostics_add,
+  session_diagnostics_len, server_op_known, server_operation_resolve
+}
+use tg_compiler::semantic_diagnostics::{
+  semantic_diagnostics_lane_check, new_diagnostic_store, diagnostic_store_add,
+  stable_diagnostic_id_text
+}
+use tg_compiler::semantic_query::{explain_lane_check, diagnostic_get}
+
+def diag_test_target() -> StableTargetId
+  StableTargetId {
+    triple: "test-none".to_string(),
+    arch: "test".to_string(),
+    cpu: "test".to_string(),
+    pointer_width: 64,
+    endian: "little".to_string(),
+    abi: "sysv".to_string(),
+    float_abi: "hard".to_string(),
+    isa_features: Vec::new(),
+    native_atomic_widths: Vec::new()
+  }
+end
+
+def diag_test_snapshot() -> SemanticSnapshot
+  SemanticSnapshot {
+    revision: StableDigest { hi: 0, lo: 0 },
+    compiler_version: "test".to_string(),
+    target: diag_test_target(),
+    public_api_hash: StableDigest { hi: 0, lo: 0 },
+    abi_hash: StableDigest { hi: 0, lo: 0 },
+    unsafe_hash: StableDigest { hi: 0, lo: 0 }
+  }
+end
+
+def diag_test_diagnostic() -> Diagnostic
+  Diagnostic {
+    level: DiagLevel::Error,
+    message: "use of moved value `r`".to_string(),
+    span: Option::Some(Span { file: "roundtrip.tg", start: 7, end_pos: 8 }),
+    notes: Vec::new(),
+    suggestions: Vec::new(),
+    code: Option::Some("E0201".to_string()),
+    primary_symbol: Option::Some("m::f#fn()->unit".to_string()),
+    semantic_site: Option::Some("ownership analysis".to_string()),
+    semantic_data: Option::Some(DiagnosticSemanticData::Ownership(OwnershipDiagnosticData {
+      place: "r".to_string(),
+      state_before: "consumed".to_string(),
+      operation: "use".to_string(),
+      consume_site: "roundtrip.tg:5".to_string(),
+      use_site: "roundtrip.tg:7".to_string(),
+      type_id: "R".to_string()
+    }))
+  }
+end
+
+def diag_test_request(request_id: Int, operation: String, payload: String) -> SemanticRequest
+  SemanticRequest {
+    protocol_version: SEMANTIC_PROTOCOL_VERSION,
+    request_id: request_id,
+    operation: operation,
+    payload: payload
+  }
+end
+
+@test
+def test_semantic_diagnostics_lane() -> Unit
+  let rows = semantic_diagnostics_lane_check()
+  assert(rows.len() == 0, "semantic diagnostics lane mismatches: " + rows.join("; "))
+end
+
+@test
+def test_explain_node_lane() -> Unit
+  let rows = explain_lane_check()
+  assert(rows.len() == 0, "explain lane mismatches: " + rows.join("; "))
+end
+
+@test
+def test_diagnostic_get_hand_built_store() -> Unit
+  var store = new_diagnostic_store()
+  let diag = diag_test_diagnostic()
+  let id = diagnostic_store_add(&mut store, diag.clone())
+  let id_text = stable_diagnostic_id_text(id.clone())
+
+  # ———— diagnostic.get: the record round trip over the hand-built store ————
+  let res = diagnostic_get(store.clone(), id_text.clone())
+  assert(res.kind == "diagnostic.get", "diagnostic.get kind: " + res.kind.clone())
+  var saw_id = false
+  var saw_message = false
+  var saw_related = false
+  for k in res.keys do
+    if k == "id:" + id_text.clone() then saw_id = true end
+    if k == "message:use of moved value `r`" then saw_message = true end
+    if k == "related:place:r" then saw_related = true end
+  end
+  assert(saw_id, "diagnostic.get must carry the stable id row")
+  assert(saw_message, "diagnostic.get must carry the record message row")
+  assert(saw_related, "diagnostic.get must carry the typed payload row")
+
+  # An absent id answers the typed unavailable kind — never a fabricated row.
+  let missing = diagnostic_get(store.clone(), "no-such-id".to_string())
+  assert(missing.kind == "diagnostic.get_unavailable", "absent id kind: " + missing.kind.clone())
+  assert(missing.keys.len() == 0, "absent id must answer no rows")
+end
+
+@test
+def test_diagnostic_get_round_trip_via_session() -> Unit
+  var session = new_compiler_session(diag_test_snapshot())
+  let diag = diag_test_diagnostic()
+  let id = session_diagnostics_add(&mut session, diag.clone())
+  let id_text = stable_diagnostic_id_text(id.clone())
+  assert(session_diagnostics_len(&session) == 1,
+    "the session store must hold the added diagnostic")
+
+  # ———— diagnostic.get: the record round trip ————
+  let resp = session_handle_request(&session,
+    diag_test_request(1, "diagnostic.get".to_string(), id_text.clone()))
+  assert(resp.ok, "diagnostic.get must answer ok")
+  assert(resp.kind == "diagnostic.get", "diagnostic.get kind: " + resp.kind.clone())
+  var saw_id = false
+  var saw_message = false
+  var saw_related = false
+  for k in resp.keys do
+    if k == "id:" + id_text.clone() then saw_id = true end
+    if k == "message:use of moved value `r`" then saw_message = true end
+    if k == "related:state_before:consumed" then saw_related = true end
+  end
+  assert(saw_id, "diagnostic.get must carry the stable id row")
+  assert(saw_message, "diagnostic.get must carry the record message row")
+  assert(saw_related, "diagnostic.get must carry the typed payload row")
+
+  # ———— diagnostic.explain: the store-form derivation ————
+  let resp_explain = session_handle_request(&session,
+    diag_test_request(2, "diagnostic.explain".to_string(), id_text.clone()))
+  assert(resp_explain.kind == "diagnostic.explain", "diagnostic.explain kind: " + resp_explain.kind.clone())
+  assert(resp_explain.keys.len() > 0 && resp_explain.keys[0] == id_text,
+    "diagnostic.explain must root the store record at the stable id")
+
+  # ———— diagnostic.repair_context: the typed fact rows ————
+  let resp_ctx = session_handle_request(&session,
+    diag_test_request(3, "diagnostic.repair_context".to_string(), id_text.clone()))
+  assert(resp_ctx.kind == "diagnostic.repair_context", "repair_context kind: " + resp_ctx.kind.clone())
+  var saw_fact = false
+  for k in resp_ctx.keys do
+    if k == "fact:place:r" then saw_fact = true end
+  end
+  assert(saw_fact, "diagnostic.repair_context must carry the typed place fact")
+
+  # ———— idempotent re-add: same semantic tuple + same content ————
+  let id2 = session_diagnostics_add(&mut session, diag.clone())
+  assert(stable_diagnostic_id_text(id2.clone()) == id_text,
+    "re-adding the same diagnostic must return the same stable id")
+  assert(session_diagnostics_len(&session) == 1,
+    "re-adding the same diagnostic must not append a duplicate record")
+end
+
+@test
+def test_operation_registry() -> Unit
+  assert(server_op_known("diagnostic.get"), "diagnostic.get must be registered")
+  assert(server_op_known("replay.minimal_causal_slice"), "replay ops must be registered")
+  assert(server_op_known("build.plan"), "build.plan must be registered")
+  assert(!server_op_known("no.such.op"), "an unknown op must not be registered")
+  match server_operation_resolve("diagnostic.get".to_string())
+  when Option::Some(op) then
+    assert(op.handler_kind == "diagnostic", "diagnostic.get family: " + op.handler_kind.clone())
+  when Option::None then
+    assert(false, "diagnostic.get must resolve")
+  end
+  # An unregistered op answers kind "unknown" exactly like §38's query().
+  var session = new_compiler_session(diag_test_snapshot())
+  let resp = session_handle_request(&session,
+    diag_test_request(9, "no.such.op".to_string(), "".to_string()))
+  assert(resp.kind == "unknown", "an unregistered op must answer kind unknown")
+end

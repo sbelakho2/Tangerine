@@ -1,0 +1,348 @@
+# ———————————————————————————————————————————————————————————————
+# tests/semantic_pgo_perf_test.tg — third-audit items 39 (the
+# stable-keyed semantic PGO profile) and 40 (perf fact provenance +
+# semantic operation classification) behavior lanes.
+#
+# Item 39: the PGO rows are keyed by the stable semantic identities
+# (StableCallableInstanceId for "fn" hotness, StableMirBlockId for "blk"
+# counts, StableMirEdgeId for "edge" probabilities, StableCallId for
+# "call" frequencies, StableAllocationSiteId for "alloc" frequencies).
+# This file drives:
+#   test_pgo_profile_stable_roundtrip — build a v2 profile, serialize
+#     (deterministic (kind, key) ordering: reversed insertion gives the
+#     identical text), parse it back, look every domain up through
+#     pgo_function_hotness / pgo_block_count / pgo_edge_probability /
+#     pgo_call_frequency / pgo_allocation_frequency, round-trip the file
+#     API (save_pgo_profile / load_pgo_profile / read_pgo_profile) and
+#     check the stable-id parsers; a malformed row fails closed.
+#   test_pgo_legacy_format_conversion — a legacy v1 tab-separated file
+#     is detected and converted (the emission name IS the instance key;
+#     the dense block ordinal is carried in the canonical block key; NO
+#     fn hotness row is synthesized).
+# Item 40: test_perf_fact_provenance_labels pins the per-metric labels
+# (StaticExact for the exact walks, StaticUpperBound for the
+# conservative heap/escape walks, StaticEstimate for the derived
+# instruction estimate) and the ABSENT RetainRelease row;
+# test_perf_clone_and_retain_release_classification pins the semantic
+# operation classification: an IntrinsicId::Clone call (stamped or
+# router-classified) counts as a clone, while a callee merely named
+# "release" is never a retain/release count (no Arc/Rc operation id
+# exists in the MIR vocabulary).
+#
+# Run with the repo root as the working directory:
+#   tg test tests/semantic_pgo_perf_test.tg
+
+use std::core::{Option, Result}
+use std::collections::Vec
+use std::fs::{remove_file}
+use std::test::assert
+
+use tg_compiler::mir::{
+  PgoRow, PgoProfile, pgo_profile_to_text, pgo_profile_from_text,
+  load_pgo_profile, read_pgo_profile, save_pgo_profile,
+  pgo_function_hotness, pgo_block_count, pgo_edge_probability,
+  pgo_call_frequency, pgo_allocation_frequency,
+  MirProgram, MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId,
+  MirStatement, MirStatementKind, MirRvalue, MirRvalueKind, MirBinOp,
+  MirOperand, MirOperandKind, MirConstant, MirConstantKind, MirTerminator,
+  MirTerminatorKind, place_local, operand_copy, operand_constant
+}
+use tg_compiler::perf_report::{
+  PerfField, PerfFactSource, PerfFact, perf_report_of_mir_function,
+  perf_facts_of_mir_function
+}
+use tg_compiler::stable_ids::{
+  stable_mir_block_key, stable_mir_edge_key, stable_call_key,
+  stable_allocation_stmt_key, stable_allocation_term_key,
+  stable_mir_block_of_key, stable_mir_edge_of_key, stable_call_of_key,
+  stable_allocation_site_of_key
+}
+use tg_compiler::types::Type
+use tg_compiler::token::span_dummy
+use tg_compiler::ids::IntrinsicId
+
+# Whether a labeled fact row for `field` exists at all.
+def perf_fact_row_present(facts: Vec[PerfFact], field: PerfField) -> Bool
+  for fact in facts do
+    if fact.field == field then
+      return true
+    end
+  end
+  false
+end
+
+# Whether a labeled fact row for `field` carries provenance `source`.
+def perf_fact_source_is(facts: Vec[PerfFact], field: PerfField, source: PerfFactSource) -> Bool
+  for fact in facts do
+    if fact.field == field && fact.source == source then
+      return true
+    end
+  end
+  false
+end
+
+# ———————————————————————————————————————————————————————————————
+# Item 39 — the stable-keyed PGO profile
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_pgo_profile_stable_roundtrip() -> Unit
+  let fn_key = "pkg::m::1::fn$Int_str"
+  let blk_key = stable_mir_block_key(&fn_key, 3)
+  let edge_key = stable_mir_edge_key(&fn_key, 3, 7)
+  let call_key = stable_call_key(&fn_key, 3)
+  let alloc_key = stable_allocation_stmt_key(&fn_key, 3, 1)
+  let alloc_term_key = stable_allocation_term_key(&fn_key, 4)
+
+  # The stable-id parsers round-trip the canonical key builders.
+  assert(stable_mir_block_of_key(&blk_key).is_some(), "block key parses: " + blk_key)
+  assert(stable_mir_edge_of_key(&edge_key).is_some(), "edge key parses: " + edge_key)
+  assert(stable_call_of_key(&call_key).is_some(), "call key parses: " + call_key)
+  assert(stable_allocation_site_of_key(&alloc_key).is_some(), "alloc stmt key parses: " + alloc_key)
+  assert(stable_allocation_site_of_key(&alloc_term_key).is_some(), "alloc term key parses: " + alloc_term_key)
+  assert(stable_mir_edge_of_key(&blk_key).is_none(), "a block key is not an edge key")
+  assert(stable_call_of_key(&blk_key).is_none(), "a block key is not a call key")
+
+  var rows: Vec[PgoRow] = Vec::new()
+  rows.push(PgoRow { kind: "fn".to_string(), key: fn_key.clone(), value: 4200 })
+  rows.push(PgoRow { kind: "blk".to_string(), key: blk_key.clone(), value: 4200 })
+  rows.push(PgoRow { kind: "edge".to_string(), key: edge_key.clone(), value: 750 })
+  rows.push(PgoRow { kind: "call".to_string(), key: call_key.clone(), value: 42 })
+  rows.push(PgoRow { kind: "alloc".to_string(), key: alloc_key.clone(), value: 7 })
+  rows.push(PgoRow { kind: "alloc".to_string(), key: alloc_term_key.clone(), value: 9 })
+  let profile = PgoProfile { rows: rows }
+  let text = pgo_profile_to_text(&profile)
+  assert(text.starts_with("# Tangerine PGO profile v2"), "the canonical header is the v2 marker")
+  assert(text.contains("fn|" + fn_key.clone() + "|calls|4200"), "the fn row renders canonically, got:\n" + text)
+  assert(text.contains("edge|" + edge_key.clone() + "|prob|750"), "the edge row renders canonically")
+
+  # Deterministic ordering: reversed insertion serializes identically.
+  var reversed: Vec[PgoRow] = Vec::new()
+  reversed.push(PgoRow { kind: "alloc".to_string(), key: alloc_term_key.clone(), value: 9 })
+  reversed.push(PgoRow { kind: "alloc".to_string(), key: alloc_key.clone(), value: 7 })
+  reversed.push(PgoRow { kind: "call".to_string(), key: call_key.clone(), value: 42 })
+  reversed.push(PgoRow { kind: "edge".to_string(), key: edge_key.clone(), value: 750 })
+  reversed.push(PgoRow { kind: "blk".to_string(), key: blk_key.clone(), value: 4200 })
+  reversed.push(PgoRow { kind: "fn".to_string(), key: fn_key.clone(), value: 4200 })
+  let reversed_profile = PgoProfile { rows: reversed }
+  let reversed_text = pgo_profile_to_text(&reversed_profile)
+  assert(reversed_text == text, "equal row SETS must serialize byte-identically (deterministic (kind, key) order)")
+
+  match pgo_profile_from_text(&text)
+  when Result::Ok(parsed) then
+    assert(!parsed.converted_legacy, "a v2 file is not a legacy conversion")
+    assert(parsed.rows.len() == 6, "all six rows survive the round-trip, got " + parsed.rows.len().to_string())
+    assert(pgo_function_hotness(&parsed, &fn_key).unwrap_or(0) == 4200, "fn hotness lookup")
+    assert(pgo_block_count(&parsed, &blk_key).unwrap_or(0) == 4200, "block count lookup")
+    assert(pgo_edge_probability(&parsed, &edge_key).unwrap_or(0) == 750, "edge probability lookup")
+    assert(pgo_call_frequency(&parsed, &call_key).unwrap_or(0) == 42, "call frequency lookup")
+    assert(pgo_allocation_frequency(&parsed, &alloc_key).unwrap_or(0) == 7, "allocation (stmt) frequency lookup")
+    assert(pgo_allocation_frequency(&parsed, &alloc_term_key).unwrap_or(0) == 9, "allocation (term) frequency lookup")
+    assert(pgo_block_count(&parsed, &stable_mir_block_key(&fn_key, 99)).is_none(), "an absent row is None")
+  when Result::Err(e) then
+    assert(false, "the v2 profile must parse back: " + e)
+  end
+
+  # A malformed row FAILS CLOSED (never silently dropped).
+  match pgo_profile_from_text("bogus|row\n")
+  when Result::Ok(_) then
+    assert(false, "a malformed PGO row must fail closed")
+  when Result::Err(_) then ()
+  end
+  # A malformed metric fails closed too.
+  match pgo_profile_from_text("fn|" + fn_key.clone() + "|calls|12x\n")
+  when Result::Ok(_) then
+    assert(false, "a malformed PGO value must fail closed")
+  when Result::Err(_) then ()
+  end
+
+  # The file save/load API round-trips the same canonical content.
+  let path = "/tmp/tg_pgo_stable_test.dat"
+  save_pgo_profile(path.to_string(), profile.clone())
+  match load_pgo_profile(path.to_string())
+  when Option::Some(loaded) then
+    assert(pgo_function_hotness(&loaded, &fn_key).unwrap_or(0) == 4200, "load_pgo_profile hotness lookup")
+    assert(pgo_block_count(&loaded, &blk_key).unwrap_or(0) == 4200, "load_pgo_profile block lookup")
+  when Option::None then
+    assert(false, "the save/load PGO file round-trip must succeed")
+  end
+  match read_pgo_profile(path.to_string())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    assert(false, "read_pgo_profile must surface the saved profile: " + e)
+  end
+  match remove_file(path.to_string())
+  when Result::Ok(_) then ()
+  when Result::Err(_) then ()
+  end
+end
+
+@test
+def test_pgo_legacy_format_conversion() -> Unit
+  let legacy = "# Tangerine PGO profile data\n# func_name\tblock_id\tcount\nmyfn\t3\t11\nmyfn\t4\t0\n"
+  match pgo_profile_from_text(&legacy)
+  when Result::Ok(conv) then
+    assert(conv.converted_legacy, "the legacy v1 marker is recorded")
+    assert(conv.rows.len() == 2, "both legacy rows convert, got " + conv.rows.len().to_string())
+    assert(pgo_block_count(&conv, &stable_mir_block_key("myfn", 3)).unwrap_or(999) == 11, "the legacy count keys by the canonical block key")
+    assert(pgo_block_count(&conv, &stable_mir_block_key("myfn", 4)).unwrap_or(999) == 0, "a recorded zero converts too")
+    assert(!pgo_function_hotness(&conv, "myfn").is_some(), "NO fn hotness row is synthesized from a v1 file")
+    # The converted profile re-serializes in the canonical v2 format.
+    let text = pgo_profile_to_text(&conv)
+    assert(text.contains("blk|myfn#B3|exec|11"), "the converted row renders as a v2 blk row")
+  when Result::Err(e) then
+    assert(false, "the legacy v1 profile must convert: " + e)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Item 40 — the perf fact provenance labels and the semantic operation
+# classification
+# ———————————————————————————————————————————————————————————————
+
+# A one-block function whose single statement is
+# `_1 = _0 + 1` (one MirCopy operand, one constant operand, one branch
+# — the MirReturn terminator — and the instruction-count estimate).
+def perf_test_simple_function(name: String) -> MirFunction
+  let param0 = MirLocal { id: MirLocalId { id: 0 }, name: "_0", ty: Type::Int, is_mut: false, span: span_dummy() }
+  let one = operand_constant(MirConstant {
+    kind: MirConstantKind::MirInt(1),
+    ty: Type::Int,
+    instance: Option::None
+  })
+  let assign = MirStatement {
+    kind: MirStatementKind::MirAssign(
+      place_local(MirLocalId { id: 1 }),
+      MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Add, operand_copy(place_local(MirLocalId { id: 0 })), one) }
+    ),
+    span: span_dummy()
+  }
+  let block0 = MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: Vec::from([assign]),
+    terminator: MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+  }
+  MirFunction {
+    name: name,
+    params: Vec::from([param0]),
+    ret_type: Type::Unit,
+    locals: Vec::new(),
+    blocks: Vec::from([block0]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+# A two-block function whose terminator is a call to `callee_name` with
+# the optional stamped intrinsic payload.
+def perf_test_call_function(name: String, callee_name: String, intrinsic: Option[IntrinsicId]) -> MirFunction
+  let callee = MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem(callee_name),
+      ty: Type::Unit,
+      instance: Option::None
+    })
+  }
+  let call = MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: place_local(MirLocalId { id: 1 }),
+      func: callee,
+      args: Vec::new(),
+      success: MirBlockId { id: 1 },
+      unwind: Option::None,
+      intrinsic: intrinsic
+    },
+    span: span_dummy()
+  }
+  let block0 = MirBlock { id: MirBlockId { id: 0 }, statements: Vec::new(), terminator: call }
+  let block1 = MirBlock {
+    id: MirBlockId { id: 1 },
+    statements: Vec::new(),
+    terminator: MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+  }
+  MirFunction {
+    name: name,
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: Vec::new(),
+    blocks: Vec::from([block0, block1]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def perf_test_program(f: MirFunction) -> MirProgram
+  MirProgram { functions: Vec::from([f]), statics: Vec::new(), types: Vec::new() }
+end
+
+@test
+def test_perf_fact_provenance_labels() -> Unit
+  let f = perf_test_simple_function("m::provenance_probe".to_string())
+  let program = perf_test_program(f.clone())
+
+  # StaticExact: the exact walks.
+  assert(perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::BranchCount, PerfFactSource::StaticExact), "branch_count is an exact static walk")
+  assert(perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::Copies, PerfFactSource::StaticExact), "copies is an exact static walk")
+  assert(perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::ArenaAllocations, PerfFactSource::StaticExact), "the typed arena-capability walk is exact")
+  assert(perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::Clones, PerfFactSource::StaticExact), "the Clone semantic-operation walk is exact")
+  assert(perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::BoundsChecks, PerfFactSource::StaticExact), "the surviving bounds-check walk is exact")
+
+  # StaticUpperBound: the conservative walks.
+  assert(perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::HeapAllocations, PerfFactSource::StaticUpperBound), "heap allocations is a fail-closed upper bound")
+  assert(perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::Escapes, PerfFactSource::StaticUpperBound), "escapes is the documented conservative approximation")
+
+  # StaticEstimate: the derived instruction estimate.
+  assert(perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::EstInstructionCount, PerfFactSource::StaticEstimate), "the instruction count is a derived estimate")
+
+  # ProfileMeasured is never produced by the static views.
+  assert(!perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::BranchCount, PerfFactSource::ProfileMeasured), "no ProfileMeasured row is produced here")
+
+  # NO RetainRelease row: no Arc/Rc semantic operation exists in the MIR.
+  assert(!perf_fact_row_present(perf_facts_of_mir_function(&program, &f), PerfField::RetainRelease), "no RetainRelease row without an Arc/Rc operation id")
+end
+
+@test
+def test_perf_clone_and_retain_release_classification() -> Unit
+  # A bodyless callee named "clone" routes through the semantic
+  # intrinsic-name router to IntrinsicId::Clone.
+  let clone_fn = perf_test_call_function("m::clone_probe".to_string(), "clone".to_string(), Option::None)
+  let clone_program = perf_test_program(clone_fn.clone())
+  let clone_report = perf_report_of_mir_function(&clone_program, &clone_fn)
+  assert(clone_report.clones == 1, "a router-classified clone call counts as the Clone operation, got " + clone_report.clones.to_string())
+  assert(clone_report.retain_release == 0, "a clone is never a retain/release count")
+
+  # The stamped intrinsic path: any callee name with the stamped
+  # IntrinsicId::Clone counts.
+  let stamped_fn = perf_test_call_function("m::stamped_clone_probe".to_string(), "some_callee".to_string(), Option::Some(IntrinsicId::Clone))
+  let stamped_program = perf_test_program(stamped_fn.clone())
+  let stamped_report = perf_report_of_mir_function(&stamped_program, &stamped_fn)
+  assert(stamped_report.clones == 1, "a STAMPED IntrinsicId::Clone call counts, got " + stamped_report.clones.to_string())
+
+  # A callee named "release" is NOT a retain/release operation: no Arc/Rc
+  # operation id exists in the MIR vocabulary, so nothing is counted and
+  # no RetainRelease row is emitted.
+  let release_fn = perf_test_call_function("m::release_probe".to_string(), "release".to_string(), Option::None)
+  let release_program = perf_test_program(release_fn.clone())
+  let release_report = perf_report_of_mir_function(&release_program, &release_fn)
+  assert(release_report.retain_release == 0, "the old callee-name heuristic is gone — no retain/release count")
+  assert(release_report.clones == 0, "a callee merely named release is not the Clone operation")
+  assert(!perf_fact_row_present(perf_facts_of_mir_function(&release_program, &release_fn), PerfField::RetainRelease), "no RetainRelease row is emitted")
+
+  # A callee whose name merely CONTAINS "clone" is never counted (the
+  # name-substring heuristic is removed; only the semantic router /
+  # stamped operation classifies).
+  let not_clone_fn = perf_test_call_function("m::not_clone_probe".to_string(), "declone_helpers".to_string(), Option::None)
+  let not_clone_program = perf_test_program(not_clone_fn.clone())
+  let not_clone_report = perf_report_of_mir_function(&not_clone_program, &not_clone_fn)
+  assert(not_clone_report.clones == 0, "a name containing clone is not the Clone operation")
+end

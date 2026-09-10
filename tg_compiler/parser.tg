@@ -8,12 +8,12 @@
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec}
-use tg_compiler::token::{Span, Token, TokenKind, span_new, span_merge, span_dummy, is_expr_start, is_stmt_start, is_item_start, is_doc_comment, parsed_int_to_host}
+use tg_compiler::token::{Span, Token, TokenKind, span_new, span_merge, span_dummy, is_expr_start, is_stmt_start, is_item_start, is_doc_comment, parsed_int_to_host, parsed_int_fits_host, parsed_int_decimal}
 use tg_compiler::lexer::LexResult
 use tg_compiler::ids::{is_intrinsic_extern_name}
 use tg_compiler::ast::{
   Program, Item, ItemKind, Visibility, Attribute,
-  FunctionDecl, GenericParam, GenericParamKind, Param, AccessConvention, NominalKind, FnBody, FunctionSig,
+  FunctionDecl, GenericParam, GenericParamKind, ConstRange, Param, AccessConvention, NominalKind, FnBody, FunctionSig,
   StructDecl, FieldDecl, EnumDecl, VariantDecl, LayoutAttrs, layout_attrs_plain,
   TraitDecl, TraitMethod, AssocType, ImplDecl, WherePredicate, AssocTypeImpl,
   ModuleDecl, UseDecl, AstPath, TypeAliasDecl, ConstDecl, StaticDecl,
@@ -126,6 +126,15 @@ struct Diagnostic
   # only the presentation spine stays legal and the §34 row texts remain
   # populated for the human-readable consumers.
   semantic_data: Option[DiagnosticSemanticData] = Option::None
+  # (third-audit item 23) id: the STABLE DIAGNOSTIC ID render the
+  # persistent DiagnosticStore assigned this diagnostic (the canonical
+  # text of semantic_diagnostics.tg's StableDiagnosticId — the record
+  # itself lives in that higher layer, so this leaf module carries only
+  # the text). Defaulted: Option::None until a store stamps it (the
+  # diagnostic_store_add_stamping convenience sets it); a diagnostic that
+  # never entered a store keeps None, and no existing construction site or
+  # message text changes.
+  id: Option[String] = Option::None
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1814,6 +1823,38 @@ def const_generic_param_type_ok(ty: TypeExpr) -> Bool
   end
 end
 
+# (§20 const generics, slice 4): parse ONE bound of a const generic
+# parameter's declared range (`in <lo>..=<hi>`). A bound is a signed
+# integer literal; a bound that does not fit the host Int is the same
+# fail-closed diagnostic as the const-argument literal gate (never a
+# wrapped value). On a malformed bound the diagnostic is reported and
+# Option::None is returned (the caller keeps the declaration valid with no
+# range).
+def parse_const_range_bound(inout p: TgcParser) -> Option[Int]
+  var negative = false
+  if at(p, TokenKind::Minus) then
+    advance(p)
+    negative = true
+  end
+  match peek(p)
+  when TokenKind::IntLit(n) then
+    let bound_span = peek_span(p)
+    if !parsed_int_fits_host(n) then
+      diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "const generic parameter range bound is out of range (must fit the host Int)", bound_span)
+      return Option::Some(0)
+    end
+    advance(p)
+    if negative then
+      Option::Some(0 - parsed_int_to_host(n))
+    else
+      Option::Some(parsed_int_to_host(n))
+    end
+  when _ then
+    diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "expected an integer literal as a const generic parameter range bound (`in <lo>..=<hi>`, bounds may be negative)", peek_span(p))
+    Option::None
+  end
+end
+
 def parse_single_generic_param(inout p: TgcParser) -> Option[GenericParam]
   # (§20 const generics, slice 1): `const NAME: SCALAR_TYPE` — a compile-time
   # VALUE (const) generic parameter. The declared type is restricted to the
@@ -1834,11 +1875,42 @@ def parse_single_generic_param(inout p: TgcParser) -> Option[GenericParam]
           if !const_generic_param_type_ok(ty) then
             diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "const generic parameter `" + name + "` must declare a scalar integer type (UInt, Int, USize, u8..u64, i8..i64)", ty.span)
           end
+          # (§20 slice 4): the optional declared RANGE — `in <lo>..=<hi>`
+          # after the declared type. Both bounds are inclusive and may be
+          # negative; the lower bound must not exceed the upper bound. A
+          # declaration with no `in` clause keeps const_range = None (every
+          # pre-slice-4 const parameter).
+          var const_range: Option[ConstRange] = Option::None
+          if at(p, TokenKind::In) then
+            let range_start = peek_span(p)
+            advance(p)
+            match parse_const_range_bound(p)
+            when Option::Some(lo) then
+              if at(p, TokenKind::DotDotEq) then
+                advance(p)
+                match parse_const_range_bound(p)
+                when Option::Some(hi) then
+                  if lo > hi then
+                    diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "const generic parameter `" + name + "` has an empty declared range: the lower bound " + lo.to_string() + " exceeds the upper bound " + hi.to_string(), span_merge(range_start, peek_span(p)))
+                  else
+                    const_range = Option::Some(ConstRange { lo: lo, hi: hi, span: span_merge(range_start, peek_span(p)) })
+                  end
+                when Option::None then ()
+                end
+              elsif at(p, TokenKind::DotDot) then
+                diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "const generic parameter range bounds are inclusive: write `in " + lo.to_string() + "..=<hi>`", peek_span(p))
+              else
+                diag_error(&mut p.diag, ErrorCode::E100UnexpectedToken, "expected `..=` between the const generic parameter range bounds (`in <lo>..=<hi>`)", peek_span(p))
+              end
+            when Option::None then ()
+            end
+          end
           return Option::Some(GenericParam {
             name: name,
             kind: GenericParamKind::ConstParam(ty),
             bounds: Vec::new(),
             default: Option::None,
+            const_range: const_range,
             span: span_merge(start, peek_span(p))
           })
         when Option::None then return Option::None
@@ -2993,22 +3065,49 @@ def parse_effect_op_param(inout p: TgcParser) -> Option[EffectOpParamSig]
   end
 end
 
+# One @budget annotation (third-audit item 45 — the complete resource
+# vocabulary). TWO equivalent spellings are accepted:
+#   @budget <metric>: "<bound>", <metric> = <bound>, ...   (the bare form)
+#   @budget(<metric> = <bound>, <metric>: <bound>, ...)    (the parenthesized
+#                                                           attribute-argument
+#                                                           form)
+# The separator may be ':'; '='; '<'; or '<='; the bound is a string
+# literal OR a bare integer literal (converted to its canonical decimal
+# text, so `stack_bytes = 256` and `stack_bytes: "256"` are the same
+# constraint). The metric identifiers themselves are validated by the
+# typed budget vocabulary (types.tg's budget_metric_resource): the
+# recognized set is heap_allocations / heap_bytes / stack_bytes /
+# code_size_bytes / time_us / instructions (plus their aliases) — any
+# other identifier parses and rides the typed record as runtime-measured.
 def parse_budget_annotation(inout p: TgcParser, start: Span) -> Option[BudgetAnnotation]
   mut constraints = Vec::new()
+  let parenthesized = at(p, TokenKind::LParen)
+  if parenthesized then advance(p) end
   
   while true do
+    if parenthesized && at(p, TokenKind::RParen) then break end
     let cstart = peek_span(p)
     match expect_ident(p)
     when Option::Some(metric) then
-      # Accept: or < or <= as separator
+      # Accept: or = or < or <= as separator
       if at(p, TokenKind::Colon) then advance(p)
+      elsif at(p, TokenKind::Eq) then advance(p)
       elsif at(p, TokenKind::LtEq) then advance(p)
       elsif at(p, TokenKind::Lt) then advance(p)
       end
       
+      var bound_opt: Option[String] = Option::None
       match peek(p)
       when TokenKind::StringLit(bound) then
         advance(p)
+        bound_opt = Option::Some(bound)
+      when TokenKind::IntLit(n) then
+        advance(p)
+        bound_opt = Option::Some(parsed_int_decimal(n))
+      when _ then ()
+      end
+      match bound_opt
+      when Option::Some(bound) then
         constraints.push(BudgetConstraint {
           metric: metric,
           bound: bound,
@@ -3016,14 +3115,18 @@ def parse_budget_annotation(inout p: TgcParser, start: Span) -> Option[BudgetAnn
         })
         if at(p, TokenKind::Comma) then
           advance(p)
+        elsif parenthesized && at(p, TokenKind::RParen) then
+          break
         else
           break
         end
-      when _ then break
+      when Option::None then break
       end
     when Option::None then break
     end
   end
+  
+  if parenthesized && at(p, TokenKind::RParen) then advance(p) end
   
   Option::Some(BudgetAnnotation {
     constraints: constraints,

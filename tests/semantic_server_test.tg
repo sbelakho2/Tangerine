@@ -1,0 +1,269 @@
+# tests/semantic_server_test.tg — third-audit item 22 lanes: the TYPED
+# WIRE RESPONSE records + the one-renderer/one-parser seam, and the
+# normal `tg server` command arg parse.
+#
+# Module lanes live in semantic_server.tg:
+#   semantic_wire_lane_check — every record family built with adversarial
+#     values (embedded ':', empty strings, empty lists, zero/nonzero
+#     Ints), rendered, parsed back, re-rendered and compared; plus the
+#     strict-parse rejections (missing mandatory scalar, unknown kind,
+#     non-numeric Int).
+# This suite drives that lane, the CallersResponse wire round trip, the
+# in-process dispatch attachment (session_handle_request builds the typed
+# record and renders it into the response keys), and the driver's server
+# subcommand parser (accept/reject forms).
+#
+# Run with the repo root as the working directory:
+#   tg test tests/semantic_server_test.tg
+
+use std::core::{Option, Result, Unit}
+use std::collections::{Vec}
+use std::test::*
+
+use tg_compiler::ids::{StableDigest}
+use tg_compiler::semantic_model::{SemanticSnapshot, StableTargetId}
+use tg_compiler::semantic_server::{
+  SEMANTIC_PROTOCOL_VERSION, SemanticRequest, CallersResponse, SemanticWirePayload,
+  semantic_wire_payload_render, semantic_wire_payload_parse,
+  semantic_wire_lane_check, new_compiler_session, session_handle_request,
+  semantic_response_frame, semantic_response_parse
+}
+use tg_compiler::driver::{parse_server_args}
+
+def server_test_target() -> StableTargetId
+  StableTargetId {
+    triple: "test-none".to_string(),
+    arch: "test".to_string(),
+    cpu: "test".to_string(),
+    pointer_width: 64,
+    endian: "little".to_string(),
+    abi: "sysv".to_string(),
+    float_abi: "hard".to_string(),
+    isa_features: Vec::new(),
+    native_atomic_widths: Vec::new()
+  }
+end
+
+def server_test_snapshot() -> SemanticSnapshot
+  SemanticSnapshot {
+    revision: StableDigest { hi: 0, lo: 0 },
+    compiler_version: "test".to_string(),
+    target: server_test_target(),
+    public_api_hash: StableDigest { hi: 0, lo: 0 },
+    abi_hash: StableDigest { hi: 0, lo: 0 },
+    unsafe_hash: StableDigest { hi: 0, lo: 0 }
+  }
+end
+
+def server_test_request(request_id: Int, operation: String, payload: String) -> SemanticRequest
+  SemanticRequest {
+    protocol_version: SEMANTIC_PROTOCOL_VERSION,
+    request_id: request_id,
+    operation: operation,
+    payload: payload
+  }
+end
+
+@test
+def test_semantic_wire_lane() -> Unit
+  let bad = semantic_wire_lane_check()
+  assert(bad.len() == 0, "semantic wire lane mismatches: " + bad.join("; "))
+end
+
+@test
+def test_callers_response_wire_round_trip() -> Unit
+  let record = CallersResponse {
+    target: "m::f#fn()->unit".to_string(),
+    callers: Vec::from([
+      "m::g#fn()->unit".to_string(),
+      "m::h#fn(x:i64)->i64".to_string()
+    ])
+  }
+  let rows = semantic_wire_payload_render(SemanticWirePayload::Callers(record.clone()))
+  assert(rows.len() == 3, "callers render must be target + 2 caller rows")
+  assert(rows[0] == "target:m::f#fn()->unit", "callers target row: " + rows[0].clone())
+  assert(rows[1] == "caller:m::g#fn()->unit", "callers caller row: " + rows[1].clone())
+  match semantic_wire_payload_parse("callers".to_string(), rows.clone())
+  when Option::None then
+    assert(false, "callers wire parse must succeed")
+  when Option::Some(parsed) then
+    match parsed
+    when SemanticWirePayload::Callers(back) then
+      assert(back.target == record.target, "callers target must round-trip")
+      assert(back.callers.len() == record.callers.len(), "callers row count must round-trip")
+      assert(back.callers[0] == record.callers[0], "caller 0 must round-trip")
+      assert(back.callers[1] == record.callers[1], "caller 1 must round-trip")
+    when _ then
+      assert(false, "callers parse must yield the Callers family")
+    end
+  end
+end
+
+@test
+def test_dispatch_builds_typed_wire_record() -> Unit
+  let session = new_compiler_session(server_test_snapshot())
+  let resp = session_handle_request(&session,
+    server_test_request(1, "callers".to_string(), "m::f#fn()->unit".to_string()))
+  assert(resp.ok, "callers must answer ok")
+  assert(resp.kind == "callers", "callers kind: " + resp.kind.clone())
+  # The rendered record IS the wire keys (the target row + zero callers on
+  # an empty index) — never a second wire field.
+  assert(resp.keys.len() == 1, "an empty caller list renders the target row only")
+  assert(resp.keys[0] == "target:m::f#fn()->unit", "typed target row: " + resp.keys[0].clone())
+  # The client-side parse inverse decodes the same typed record.
+  match semantic_wire_payload_parse(resp.kind.clone(), resp.keys.clone())
+  when Option::Some(SemanticWirePayload::Callers(back)) then
+    assert(back.target == "m::f#fn()->unit", "wire decode target")
+    assert(back.callers.len() == 0, "wire decode caller list")
+  when _ then
+    assert(false, "the callers wire rows must decode to the Callers family")
+  end
+  # The in-process dispatch slot carries the same typed record.
+  match resp.wire_payload.clone()
+  when Option::Some(SemanticWirePayload::Callers(record)) then
+    assert(record.target == "m::f#fn()->unit", "typed target must be the request arg")
+    assert(record.callers.len() == 0, "the empty index must answer no caller rows")
+  when _ then
+    assert(false, "the callers answer must carry the typed Callers family")
+  end
+end
+
+@test
+def test_wire_frame_ignores_typed_slot() -> Unit
+  let session = new_compiler_session(server_test_snapshot())
+  let resp = session_handle_request(&session,
+    server_test_request(2, "callers".to_string(), "m::f#fn()->unit".to_string()))
+  match semantic_response_parse(semantic_response_frame(resp.clone()))
+  when Option::Some(back) then
+    assert(back.ok, "the frame must carry ok")
+    assert(back.kind == resp.kind, "the frame must carry the kind")
+    assert(back.keys.len() == resp.keys.len(), "the frame must carry the rendered rows")
+    assert(back.keys[0] == resp.keys[0], "the frame keys must be the record render")
+    # The framing is unchanged: the typed slot never rides the wire.
+    match back.wire_payload
+    when Option::None then ()
+    when Option::Some(_) then assert(false, "the wire frame must never carry the typed slot")
+    end
+  when Option::None then
+    assert(false, "the response frame must parse")
+  end
+end
+
+@test
+def test_server_arg_parse_accept_forms() -> Unit
+  match parse_server_args(Vec::from(["tg".to_string(), "in.tg".to_string()]))
+  when Result::Ok(cfg) then
+    assert(cfg.input_file == "in.tg", "input file")
+    assert(cfg.snapshot_path == "", "no snapshot by default")
+    assert(cfg.store_path == "", "no store by default")
+    assert(!cfg.offline_session, "pipeline session by default")
+    assert(!cfg.quiet, "not quiet by default")
+  when Result::Err(e) then assert(false, "plain form must parse: " + e)
+  end
+
+  match parse_server_args(Vec::from([
+      "tg".to_string(),
+      "--snapshot=out.snap".to_string(),
+      "--store=st.lineages".to_string(),
+      "in.tg".to_string()
+    ]))
+  when Result::Ok(cfg) then
+    assert(cfg.input_file == "in.tg", "input file (equals form)")
+    assert(cfg.snapshot_path == "out.snap", "snapshot path")
+    assert(cfg.store_path == "st.lineages", "store path")
+  when Result::Err(e) then assert(false, "equals form must parse: " + e)
+  end
+
+  match parse_server_args(Vec::from([
+      "tg".to_string(),
+      "--snapshot".to_string(),
+      "out.snap".to_string(),
+      "--store".to_string(),
+      "st.lineages".to_string(),
+      "--snapshot-only".to_string(),
+      "--quiet".to_string(),
+      "in.tg".to_string()
+    ]))
+  when Result::Ok(cfg) then
+    assert(cfg.snapshot_path == "out.snap", "snapshot path (space form)")
+    assert(cfg.store_path == "st.lineages", "store path (space form)")
+    assert(cfg.offline_session, "snapshot-only must select the offline form")
+    assert(cfg.quiet, "quiet must be recognized")
+  when Result::Err(e) then assert(false, "space form must parse: " + e)
+  end
+end
+
+# The offline-artifact form: --snapshot-only takes no input file (the
+# artifact is the model) and requires --snapshot=<path> (the file to load).
+@test
+def test_server_arg_parse_offline_artifact_form() -> Unit
+  match parse_server_args(Vec::from([
+      "tg".to_string(),
+      "--snapshot-only".to_string(),
+      "--snapshot=art.snap".to_string()
+    ]))
+  when Result::Ok(cfg) then
+    assert(cfg.offline_session, "snapshot-only must select the offline form")
+    assert(cfg.snapshot_path == "art.snap", "offline artifact path: " + cfg.snapshot_path.clone())
+    assert(cfg.input_file == "", "the offline form needs no input file")
+  when Result::Err(e) then assert(false, "offline artifact form must parse: " + e)
+  end
+
+  # The alias and the space form.
+  match parse_server_args(Vec::from([
+      "tg".to_string(),
+      "--offline".to_string(),
+      "--snapshot".to_string(),
+      "art.snap".to_string()
+    ]))
+  when Result::Ok(cfg2) then
+    assert(cfg2.offline_session, "--offline must select the offline form")
+    assert(cfg2.snapshot_path == "art.snap", "offline artifact path (space form): " + cfg2.snapshot_path.clone())
+  when Result::Err(e) then assert(false, "--offline space form must parse: " + e)
+  end
+
+  # Offline without an artifact path is a usage error.
+  match parse_server_args(Vec::from(["tg".to_string(), "--snapshot-only".to_string()]))
+  when Result::Ok(_) then assert(false, "--snapshot-only without --snapshot must be rejected")
+  when Result::Err(e) then
+    assert(e.contains("--snapshot-only"), "offline-requirement error must name the flag: " + e)
+  end
+end
+
+@test
+def test_server_arg_parse_reject_forms() -> Unit
+  # No input file.
+  match parse_server_args(Vec::from(["tg".to_string()]))
+  when Result::Ok(_) then assert(false, "missing input must be rejected")
+  when Result::Err(_) then ()
+  end
+  # Two input files.
+  match parse_server_args(Vec::from(["tg".to_string(), "a.tg".to_string(), "b.tg".to_string()]))
+  when Result::Ok(_) then assert(false, "two inputs must be rejected")
+  when Result::Err(_) then ()
+  end
+  # Unknown option.
+  match parse_server_args(Vec::from(["tg".to_string(), "--bogus".to_string(), "a.tg".to_string()]))
+  when Result::Ok(_) then assert(false, "unknown option must be rejected")
+  when Result::Err(_) then ()
+  end
+  # Missing value for --snapshot.
+  match parse_server_args(Vec::from([
+      "tg".to_string(), "a.tg".to_string(), "--snapshot".to_string()
+    ]))
+  when Result::Ok(_) then assert(false, "missing --snapshot value must be rejected")
+  when Result::Err(_) then ()
+  end
+  # Empty --snapshot=.
+  match parse_server_args(Vec::from([
+      "tg".to_string(), "--snapshot=".to_string(), "a.tg".to_string()
+    ]))
+  when Result::Ok(_) then assert(false, "empty --snapshot path must be rejected")
+  when Result::Err(_) then ()
+  end
+  # Help sentinel.
+  match parse_server_args(Vec::from(["tg".to_string(), "--help".to_string()]))
+  when Result::Ok(_) then assert(false, "--help must answer the help sentinel")
+  when Result::Err(e) then assert(e == "help", "help sentinel: " + e)
+  end
+end

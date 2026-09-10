@@ -244,6 +244,10 @@ pub struct WasmCompiler
   data_offset: UInt
   ## global index of __stack_pointer
   stack_ptr_global: UInt
+  ## (third-audit item 45) the FUNCTION INDEX of the WASI clock_time_get
+  ## import (set by add_wasi_imports; 0 when the target adds no WASI
+  ## imports — the time budget's call site only runs on Wasm32Wasi).
+  wasi_clock_index: UInt
   ## the START section's function index (Option::None = no start section)
   start_fn: Option[UInt]
 end
@@ -267,6 +271,7 @@ impl WasmCompiler
       string_pool: Map::new(),
       data_offset: 0,
       stack_ptr_global: 0,
+      wasi_clock_index: 0,
       start_fn: Option::None,
     }
   end
@@ -489,6 +494,12 @@ impl WasmCompiler
         name: name.to_string(),
         desc: ImportDesc::Func(type_idx),
       })
+      ## (third-audit item 45) Record the clock import's function index
+      ## (imports precede defined functions in the wasm function index
+      ## space) so the time budget's stamp/elapsed arms can call it.
+      if name == "clock_time_get" then
+        self.wasi_clock_index = self.func_index
+      end
       self.func_index = self.func_index + 1
     end
   end
@@ -562,6 +573,20 @@ impl WasmCompiler
     let target_local = func.locals.len() + func.params.len()
     locals.push((1, WasmValType::I32))
 
+    ## (third-audit item 45) The per-invocation BUDGET counters: one extra
+    ## i32 wasm local per counter resource (allocation / instructions) and
+    ## one i64 local for the time entry stamp. Every wasm local is
+    ## per-invocation by construction and defaults to zero, so no
+    ## prologue zeroing exists (and none is needed); _wasm_budget_locals
+    ## derives the SAME index assignment the emission arms read. The
+    ## locals are declared only for the resources the function's MIR
+    ## actually carries, so a function with no budget statements keeps its
+    ## local set unchanged.
+    let budget_locals = _wasm_budget_locals(func)
+    if budget_locals.alloc >= 0 then locals.push((1, WasmValType::I32)) end
+    if budget_locals.instr >= 0 then locals.push((1, WasmValType::I32)) end
+    if budget_locals.time >= 0 then locals.push((1, WasmValType::I64)) end
+
     ## Set initial target to entry block
     emit_i32_const(&mut code, func.entry_block.id as i32)
     code.push(0x21)  ## local.set
@@ -625,12 +650,58 @@ impl WasmCompiler
     Ok(FunctionBody { locals: locals, code: code })
   end
 
+  # (third-audit item 45) The time budget's clock read: call the WASI
+  # clock_time_get import (CLOCK_MONOTONIC = 1, precision 1ns) writing
+  # the WASI u64 nanosecond timestamp to a scratch slot at
+  # [__stack_pointer - 16) and leave it on the stack as the i64 value.
+  # Only the red zone below the stack pointer is touched (wasm has no
+  # interrupts), so the stack pointer itself is unchanged.
+  def emit_clock_now(self, inout code: Array[u8]) -> Unit
+    emit_i32_const(code, 1)  ## clock id = CLOCK_MONOTONIC
+    emit_i64_const(code, 1000)  ## precision = 1ns
+    code.push(0x23)  ## global.get __stack_pointer
+    _encode_leb128_u32(code, self.stack_ptr_global)
+    emit_i32_const(code, 16)
+    code.push(0x6B)  ## i32.sub (the scratch timestamp address)
+    code.push(0x10)  ## call clock_time_get(clock_id, precision, ts_ptr)
+    _encode_leb128_u32(code, self.wasi_clock_index)
+    code.push(0x1A)  ## drop (the errno result)
+    code.push(0x23)  ## global.get __stack_pointer
+    _encode_leb128_u32(code, self.stack_ptr_global)
+    emit_i32_const(code, 16)
+    code.push(0x6B)  ## i32.sub
+    code.push(0x29)  ## i64.load (the WASI timestamp, ns)
+    code.push(0x03)  ## align=8
+    _encode_leb128_u32(code, 0)  ## offset=0
+  end
+
   # THE STATEMENT TABLE: every MirStatementKind is enumerated here —
   # SUPPORTED arms emit the REAL machine semantics, UNSUPPORTED arms fail
   # the compilation with the stable "unsupported MIR statement <name> for
   # the wasm target" diagnostic. There is NO fallthrough and no silent
   # no-op for an unhandled statement.
   def emit_statement(self, inout code: Array[u8], stmt: MirStatement, func: MirFunction) -> Result[Unit, WasmCompileError]
+    ## (third-audit item 45) The @budget INSTRUCTIONS metric's
+    ## per-statement counter: every emitted MIR statement in a function
+    ## whose MIR carries the instructions budget increments its wasm-local
+    ## counter once (the MirBudgetConsume check statements are excluded so
+    ## a limit equal to the exact statement count cannot spuriously trap).
+    ## Every wasm local is per-invocation and zero-initialized, so this
+    ## counter IS the budget frame slot on this target.
+    let budget_locals_pre = _wasm_budget_locals(func)
+    var instr_count_stmt = true
+    match stmt.kind
+    when MirStatementKind::MirBudgetConsume(_, _) then instr_count_stmt = false
+    when _ then ()
+    end
+    if instr_count_stmt && budget_locals_pre.instr >= 0 then
+      code.push(0x20)  ## local.get
+      _encode_leb128_u32(code, budget_locals_pre.instr as UInt)
+      emit_i32_const(code, 1)
+      code.push(0x6A)  ## i32.add
+      code.push(0x21)  ## local.set
+      _encode_leb128_u32(code, budget_locals_pre.instr as UInt)
+    end
     match stmt.kind
     when MirStatementKind::MirAssign(place, rvalue) then
       if place.projections.is_empty() then
@@ -682,18 +753,112 @@ impl WasmCompiler
       code.push(0x40)  ## void
       code.push(0x00)  ## unreachable
       code.push(0x0B)  ## end if
-    when MirStatementKind::MirBudgetConsume(_, _) then
-      ## UNSUPPORTED — the wasm backend has no budget frame-slot
-      ## machinery (the native backend's per-frame counters); the emission
-      ## FAILS the compilation with the stable diagnostic.
-      return Result::Err(WasmCompileError::UnsupportedMir(
-        "unsupported MIR statement MirBudgetConsume for the wasm target"))
-    when MirStatementKind::MirEffectRecord(_, _) then
-      ## UNSUPPORTED — the wasm backend has no __tg_effect_record import
-      ## (the native runtime's effect log); fail the compilation, never a
-      ## silent no-op.
-      return Result::Err(WasmCompileError::UnsupportedMir(
-        "unsupported MIR statement MirEffectRecord for the wasm target"))
+    when MirStatementKind::MirBudgetConsume(resource, amount) then
+      ## SUPPORTED (third-audit item 45) — the REAL budget enforcement,
+      ## the wasm mirror of the native per-frame counters. The counters
+      ## are the per-invocation wasm locals _wasm_budget_locals derives
+      ## (every wasm local is per-invocation and zero-initialized, so no
+      ## prologue zeroing exists):
+      ##   alloc         — increment + compare against the declared limit;
+      ##                   `unreachable` when exceeded (after an intrinsic
+      ##                   allocation, exactly the native arm).
+      ##   instructions  — compare the per-statement counter (incremented
+      ##                   at the top of emit_statement) against the
+      ##                   declared limit at every return.
+      ##   time          — read the WASI monotonic clock and compare the
+      ##                   elapsed span against the declared limit; a
+      ##                   target with no clock import FAILS CLOSED with
+      ##                   the stable diagnostic (never a silent pass).
+      let budget_locals = _wasm_budget_locals(func)
+      if resource == "alloc" then
+        if budget_locals.alloc < 0 then
+          ## A consume with no reserved counter is a lowering defect —
+          ## fail closed with the trap, never a [0] access.
+          code.push(0x00)  ## unreachable
+        else
+          code.push(0x20)  ## local.get counter
+          _encode_leb128_u32(code, budget_locals.alloc as UInt)
+          emit_i32_const(code, 1)
+          code.push(0x6A)  ## i32.add
+          code.push(0x22)  ## local.tee counter
+          _encode_leb128_u32(code, budget_locals.alloc as UInt)
+          emit_i32_const(code, amount as i32)
+          code.push(0x4A)  ## i32.gt_s
+          code.push(0x04)  ## if
+          code.push(0x40)  ## void
+          code.push(0x00)  ## unreachable (budget exhausted)
+          code.push(0x0B)  ## end if
+        end
+      elsif resource == "instructions" then
+        if budget_locals.instr < 0 then
+          code.push(0x00)  ## unreachable
+        else
+          code.push(0x20)  ## local.get counter
+          _encode_leb128_u32(code, budget_locals.instr as UInt)
+          emit_i32_const(code, amount as i32)
+          code.push(0x4A)  ## i32.gt_s
+          code.push(0x04)  ## if
+          code.push(0x40)  ## void
+          code.push(0x00)  ## unreachable (budget exhausted)
+          code.push(0x0B)  ## end if
+        end
+      elsif resource == "time" then
+        match self.config.target
+        when WasmTarget::Wasm32Wasi then
+          if budget_locals.time < 0 then
+            ## The entry stamp never ran (a malformed lowering): a zero
+            ## stamp would make the elapsed span enormous — trap closed.
+            code.push(0x00)  ## unreachable
+          else
+            self.emit_clock_now(code)
+            code.push(0x20)  ## local.get entry stamp
+            _encode_leb128_u32(code, budget_locals.time as UInt)
+            code.push(0x7D)  ## i64.sub (elapsed = now - stamp)
+            emit_i64_const(code, amount)
+            code.push(0x55)  ## i64.gt_s
+            code.push(0x04)  ## if
+            code.push(0x40)  ## void
+            code.push(0x00)  ## unreachable (budget exhausted)
+            code.push(0x0B)  ## end if
+          end
+        when _ then
+          return Result::Err(WasmCompileError::UnsupportedMir(
+            "unsupported MIR statement MirBudgetConsume(time) for the wasm target: no clock import exists on a non-WASI target"))
+        end
+      else
+        ## An unknown resource the lowering never constructs: fail closed,
+        ## never a silent no-op.
+        return Result::Err(WasmCompileError::UnsupportedMir(
+          "unsupported MIR statement MirBudgetConsume for the wasm target"))
+      end
+    when MirStatementKind::MirEffectRecord(name, _) then
+      if name == "__tg_budget_time_start" then
+        ## SUPPORTED for the time budget's entry marker — stamp the
+        ## per-invocation time local with the WASI monotonic clock (the
+        ## exit MirBudgetConsume(time, _) reads it back). Only a
+        ## clock-bearing target can stamp; every other target fails
+        ## closed.
+        match self.config.target
+        when WasmTarget::Wasm32Wasi then
+          let budget_locals_time = _wasm_budget_locals(func)
+          if budget_locals_time.time < 0 then
+            code.push(0x00)  ## unreachable
+          else
+            self.emit_clock_now(code)
+            code.push(0x21)  ## local.set stamp
+            _encode_leb128_u32(code, budget_locals_time.time as UInt)
+          end
+        when _ then
+          return Result::Err(WasmCompileError::UnsupportedMir(
+            "unsupported MIR statement MirEffectRecord for the wasm target: the __tg_budget_time_start stamp needs a clock import (WASI)"))
+        end
+      else
+        ## UNSUPPORTED — the wasm backend has no __tg_effect_record
+        ## import (the native runtime's effect log); fail the compilation,
+        ## never a silent no-op.
+        return Result::Err(WasmCompileError::UnsupportedMir(
+          "unsupported MIR statement MirEffectRecord for the wasm target"))
+      end
     when MirStatementKind::MirEffectPerform(_, _, _, _, _) then
       ## UNSUPPORTED — the wasm backend has no __tg_effect_perform import
       ## (the native runtime's handler-stack dispatch); fail the
@@ -1410,6 +1575,75 @@ def map_primitive_to_wasm(ty: Type) -> Option[WasmValType]
   when Type::I128 | Type::U128 then Option::None
   when _ then Option::None
   end  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# (third-audit item 45) The wasm budget frame slots
+# ———————————————————————————————————————————————————————————————
+# The wasm mirror of the native FrameInfo budget offsets. There is no
+# explicit frame pointer: every wasm function's locals ARE its frame (one
+# fresh, zero-initialized set per invocation), so a budget counter is an
+# extra local appended after the MIR locals, the ABI params and the
+# dispatch target local. The index assignment below is the SINGLE
+# authority compile_body declares against and emit_statement /
+# emit_clock_now read:
+#   alloc  i32 — the allocation counter (incremented + checked at each
+#                MirBudgetConsume("alloc", _))
+#   instr  i32 — the executed-statement counter (incremented once per
+#                emitted statement, checked at each return)
+#   time   i64 — the entry monotonic-clock stamp (written by the
+#                __tg_budget_time_start marker, read by the elapsed check)
+# -1 means "the function's MIR carries no statement for this resource".
+struct WasmBudgetLocals
+  alloc: Int = -1
+  instr: Int = -1
+  time: Int = -1
+end
+
+# Which budget resources a function's MIR carries (the wasm mirror of
+# codegen.tg's func_budget_slot_usage / func_budget_needs_instructions).
+def _wasm_budget_usage(func: MirFunction) -> (Bool, Bool, Bool)
+  var needs_alloc = false
+  var needs_instr = false
+  var needs_time = false
+  for block in func.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirBudgetConsume(resource, _) then
+        if resource == "alloc" then needs_alloc = true
+        elsif resource == "instructions" then needs_instr = true
+        elsif resource == "time" then needs_time = true
+        end
+      when MirStatementKind::MirEffectRecord(name, _) then
+        if name == "__tg_budget_time_start" then needs_time = true end
+      when _ then ()
+      end
+    end
+  end
+  (needs_alloc, needs_instr, needs_time)
+end
+
+# The wasm local indices of a function's budget counters (see
+# WasmBudgetLocals): the counters start after the MIR locals
+# (func.locals.len() declared entries), the ABI params and the dispatch
+# target local — the SAME base compile_body declares from.
+def _wasm_budget_locals(func: MirFunction) -> WasmBudgetLocals
+  let (needs_alloc, needs_instr, needs_time) = _wasm_budget_usage(func)
+  var out = WasmBudgetLocals {}
+  var next = func.locals.len() + func.params.len() + 1
+  if needs_alloc then
+    out.alloc = next
+    next = next + 1
+  end
+  if needs_instr then
+    out.instr = next
+    next = next + 1
+  end
+  if needs_time then
+    out.time = next
+    next = next + 1
+  end
+  out
 end
 
 ## Determine the WASM value type an operand will produce on the stack.
@@ -2173,7 +2407,13 @@ end ## module tg_compiler::wasm_target
 #   MirConstantKind: MirUnit/MirBool/MirInt/MirFloat/MirChar/MirString/MirZeroSized
 #                    SUPPORTED; MirFnItem/MirStaticRef/MirStaticAddr UNSUPPORTED
 #   MirStatementKind: MirAssign/MirStorageLive/MirStorageDead/MirNop/MirContractCheck
-#                    SUPPORTED; MirBudgetConsume/MirEffectRecord/MirEffectPerform/
+#                    SUPPORTED; MirBudgetConsume SUPPORTED (third-audit item 45 — the
+#                    per-invocation wasm-local budget counters: alloc/instructions
+#                    increment + limit check + unreachable trap; time is the WASI
+#                    clock_time_get stamp/elapsed check, UNSUPPORTED on a target with
+#                    no clock import); MirEffectRecord SUPPORTED for the
+#                    __tg_budget_time_start marker (the clock stamp) and the stable
+#                    UnsupportedMir diagnostic for every other record; MirEffectPerform/
 #                    MirEffectFrameEnter/MirEffectFrameExit UNSUPPORTED
 #
 # Run with: tg test tg_compiler/wasm_target.tg
@@ -2298,6 +2538,18 @@ def _wasm_test_compile_error(program: MirProgram) -> String
   when Result::Ok(_) then
     panic("wasm conformance: expected the compile to FAIL with the Unsupported diagnostic, but it succeeded")
   when Result::Err(e) then e.to_string()
+  end
+end
+
+# Compile for the WASI target (the time budget's clock import lives there)
+# and return the first body's instruction bytes.
+def _wasm_test_compile_wasi(program: MirProgram) -> Vec[u8]
+  let mut cfg = tg_compiler::wasm_target::WasmCompileConfig::default()
+  cfg.target = tg_compiler::wasm_target::WasmTarget::Wasm32Wasi
+  match tg_compiler::wasm_target::WasmCompiler::new(cfg).compile(&program)
+  when Result::Ok(bytes) then _wasm_test_body_bytes(bytes)
+  when Result::Err(e) then
+    panic("wasm conformance: unexpected wasi compile failure: " + e.to_string())
   end
 end
 
@@ -2699,15 +2951,70 @@ def test_wasm_statements_supported() -> Unit
 end
 
 @test
+def test_wasm_budget_frame_slots() -> Unit
+  ## (third-audit item 45) The wasm budget frame-slot mechanism: one
+  ## per-invocation wasm-local counter per resource, incremented and
+  ## checked with the real opcodes; the alloc/instructions counters live
+  ## in locals after the MIR locals and the dispatch target (here: MIR
+  ## local 0 + target local 1 -> the first budget local is index 2).
+  var alloc_locals = Vec::new()
+  alloc_locals.push(_wasm_test_local(0, "_0", Type::Unit))
+  var alloc_stmts = Vec::new()
+  alloc_stmts.push(MirStatement { kind: MirStatementKind::MirBudgetConsume("alloc".to_string(), 3), span: span_dummy() })
+  let alloc_body = _wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_stmt_program("f_budget_alloc_frame", Type::Unit, alloc_locals, alloc_stmts)))
+  wasm_test_check(_wasm_test_contains(alloc_body, vec![0x20, 0x02, 0x41, 0x01, 0x6A]),
+    "the allocation consume increments the wasm budget local (local.get 2 / i32.const 1 / i32.add)")
+  wasm_test_check(_wasm_test_contains(alloc_body, vec![0x22, 0x02, 0x41, 0x03, 0x4A, 0x04, 0x40, 0x00]),
+    "the allocation consume checks the counter against the limit and traps (local.tee / i32.gt_s / if / unreachable)")
+
+  ## The INSTRUCTIONS budget: the same per-invocation local, checked at
+  ## the consume (the per-statement increments at the top of
+  ## emit_statement exclude the consume itself).
+  var instr_locals = Vec::new()
+  instr_locals.push(_wasm_test_local(0, "_0", Type::Unit))
+  var instr_stmts = Vec::new()
+  instr_stmts.push(MirStatement { kind: MirStatementKind::MirBudgetConsume("instructions".to_string(), 5), span: span_dummy() })
+  let instr_body = _wasm_test_body_bytes(_wasm_test_compile(
+    _wasm_test_stmt_program("f_budget_instr_frame", Type::Unit, instr_locals, instr_stmts)))
+  wasm_test_check(_wasm_test_contains(instr_body, vec![0x20, 0x02, 0x41, 0x05, 0x4A, 0x04, 0x40, 0x00]),
+    "the instructions consume compares the counter with the limit and traps")
+
+  ## The TIME budget on the WASI target: the __tg_budget_time_start marker
+  ## stamps the i64 local (index 2) via the clock_time_get import (import
+  ## index 3 — the imports precede the defined functions), the exit
+  ## consume reads it again and compares the elapsed span.
+  var time_locals = Vec::new()
+  time_locals.push(_wasm_test_local(0, "_0", Type::Unit))
+  var time_stmts = Vec::new()
+  time_stmts.push(MirStatement {
+    kind: MirStatementKind::MirEffectRecord("__tg_budget_time_start".to_string(), operand_copy_local(MirLocalId { id: 0 })),
+    span: span_dummy()
+  })
+  time_stmts.push(MirStatement { kind: MirStatementKind::MirBudgetConsume("time".to_string(), 10000), span: span_dummy() })
+  let time_body = _wasm_test_compile_wasi(_wasm_test_stmt_program("f_budget_time_frame", Type::Unit, time_locals, time_stmts))
+  wasm_test_check(_wasm_test_contains(time_body, vec![0x10, 0x03]),
+    "the time stamp/check calls the WASI clock_time_get import (call 3)")
+  wasm_test_check(_wasm_test_contains(time_body, vec![0x21, 0x02]),
+    "the time stamp writes the per-invocation i64 budget local (local.set 2)")
+  wasm_test_check(_wasm_test_contains(time_body, vec![0x7D, 0x55, 0x04, 0x40, 0x00]),
+    "the time exit check computes the elapsed span and traps when it exceeds the limit (i64.sub / i64.gt_s / if / unreachable)")
+end
+
+@test
 def test_wasm_statements_unsupported_diagnostics() -> Unit
   var base_locals = Vec::new()
   base_locals.push(_wasm_test_local(0, "_0", Type::Unit))
   var base_stmts = Vec::new()
 
+  ## A TIME budget on a target with no clock import fails closed with the
+  ## stable diagnostic (the alloc/instructions budgets are SUPPORTED —
+  ## see test_wasm_budget_frame_slots).
   base_stmts = Vec::new()
-  base_stmts.push(MirStatement { kind: MirStatementKind::MirBudgetConsume("alloc".to_string(), 10), span: span_dummy() })
-  wasm_test_check(_wasm_test_compile_error(_wasm_test_stmt_program("f_budget", Type::Unit, base_locals.clone(), base_stmts)) ==
-    "unsupported MIR statement MirBudgetConsume for the wasm target", "MirBudgetConsume fails with the stable diagnostic")
+  base_stmts.push(MirStatement { kind: MirStatementKind::MirBudgetConsume("time".to_string(), 10), span: span_dummy() })
+  wasm_test_check(_wasm_test_compile_error(_wasm_test_stmt_program("f_budget_time_neg", Type::Unit, base_locals.clone(), base_stmts)) ==
+    "unsupported MIR statement MirBudgetConsume(time) for the wasm target: no clock import exists on a non-WASI target",
+    "a time budget on a non-WASI target fails with the stable diagnostic")
 
   base_stmts = Vec::new()
   base_stmts.push(MirStatement { kind: MirStatementKind::MirEffectRecord("evt".to_string(), operand_copy_local(MirLocalId { id: 0 })), span: span_dummy() })

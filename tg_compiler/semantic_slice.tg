@@ -95,12 +95,16 @@
 #
 # THE TYPED ENTRY (audit item 22): mir_slice(Option[MirProgram],
 # MirSliceRequest) routes ONE kind onto those engines (Failure onto the
-# node-anchored slice_failure machinery above) plus the two module-local
-# walks: ControlDependence (a bounded CFG-predecessor walk adding the
-# conditional terminators that decide the anchor block's reachability —
-# the CFG-only slice; the conditions' def chains stay the dataflow kinds'
-# business) and Ownership (the nodes whose operand/place keys touch the
-# anchor's local/place family — conservative). Request anchors are the §33
+# node-anchored slice_failure machinery above) plus the module-local
+# walks: ControlDependence (the TRANSITIVE closure of the standard
+# Ferrante/Ottenstein/Warren control-dependence graph over the anchor
+# block — the CFG-only slice; the conditions' def chains stay the
+# dataflow kinds' business) and Ownership (the nodes whose operand/place
+# keys touch the anchor's local/place family — conservative). Third-audit
+# item 20/22 adds the MIR GRAPH REASONING kinds at the bottom of this
+# module — Dominators / PostDominators / Loops / ReachingDefs / Path —
+# keyed by the item-16 role-derived stable statement ids and the §1
+# StableMirBlockId.stable_key texts. Request anchors are the §33
 # node key texts "<fn emission name>#B<block id>#S<stmt index>" / "#T",
 # the §27 local key texts (declared name or the "l<id>" locator), the §7
 # place key texts (root + projections over the MIR type table) or the
@@ -122,8 +126,11 @@
 # ENTRY block's head records the "param:<index>:<name>" anchor; any other
 # never-defined wanted local drops silently; a walk exhausting its budget
 # stops adding (the deterministic FIFO-worklist prefix). Control
-# dependence is NOT modeled (the failure trace is the only control-flow
-# term); Goto/Abort/Unreachable carry no operands and are never reads.
+# dependence is not modeled by the FOUR BASE SLICES below (the failure
+# trace is the only control-flow term there); the typed entry's
+# ControlDependence kind models it properly (the item-20/22 CDG closure in
+# the MIR GRAPH REASONING section). Goto/Abort/Unreachable carry no
+# operands and are never reads.
 #
 # DETERMINISM: bounded worklists process FIFO; every result Vec sorts
 # (statements, span keys and externals textually) before leaving the
@@ -132,12 +139,18 @@
 
 use std::collections::{Vec, Map, Set}
 
-use tg_compiler::ids::{StableDigest, InstanceId, stable_digest_of}
-use tg_compiler::token::{Span}
+use tg_compiler::ids::{
+  StableDigest, InstanceId, MirLocalId, MirBlockId, CallableId, DefId, ModuleId,
+  stable_digest_of
+}
+use tg_compiler::token::{Span, span_dummy}
 use tg_compiler::parser::{Diagnostic}
 use tg_compiler::stable_ids::{
-  SnapshotMirLocator, StableSemanticNodeId, stable_mir_node_key_text,
-  stable_semantic_node_id_of, snapshot_mir_locator_of_key
+  SnapshotMirLocator, StableSemanticNodeId, StableMirBlockId, StableMirStatementId,
+  stable_mir_node_key_text, stable_semantic_node_id_of, snapshot_mir_locator_of_key,
+  stable_mir_block_of_key, stable_mir_role_drop, stable_mir_role_bounds_check,
+  stable_mir_role_contract_check, stable_mir_statement_id_of_role,
+  stable_mir_statement_role_key_text
 }
 use tg_compiler::types::{
   AccessEffect, EffectClass, EffectSummary, Type,
@@ -145,10 +158,12 @@ use tg_compiler::types::{
 }
 use tg_compiler::semantic_model::{semantic_json_escape}
 use tg_compiler::mir::{
-  MirProgram, MirFunction, MirStatement, MirStatementKind, MirRvalueKind, MirBinOp,
-  MirUnOp, CastKind, MirOperand, MirOperandKind, MirConstantKind, MirTerminator,
+  MirProgram, MirFunction, MirStatement, MirStatementKind, MirRvalue, MirRvalueKind, MirBinOp,
+  MirUnOp, CastKind, MirOperand, MirOperandKind, MirConstant, MirConstantKind, MirTerminator,
   MirTerminatorKind, MirTypeDefKind, AggregateKind, MirCallArg, MirCallValue, Place,
-  Projection, AssertMessage, MirContractKind, MirEffectState,
+  Projection, AssertMessage, MirContract, MirContractKind, MirEffectState,
+  MirBlock, MirLocal, SwitchTarget, place_local, operand_copy, operand_constant,
+  compute_dominators, mir_idom_dominates, terminator_successor_ids,
   mir_effect_scan_function, mir_effect_classify_call,
   mir_effect_classify_deinit, mir_effect_place_type,
   mir_effect_operand_is_string, mir_effect_type_is_string_like
@@ -1455,11 +1470,17 @@ end
 #
 #   BackwardDataflow   → slice_value-style backward def chains.
 #   ForwardDataflow    → slice_statement-style forward use chains.
-#   ControlDependence  → the bounded CFG-predecessor walk below.
+#   ControlDependence  → the standard CDG closure of the anchor block.
 #   Ownership          → the place-family walk below.
 #   Effects            → slice_effect's §11 classifier row of the fn.
 #   Failure            → the node-anchored slice_failure machinery.
 #   ReturnValue        → the backward slice of the "_ret" local 0.
+#   Dominators         → mir_dominators (entry-anchored "block|idom" rows).
+#   PostDominators     → mir_postdominators (reverse CFG, virtual exit).
+#   Loops              → mir_loops (the natural-loop forest rows).
+#   ReachingDefs       → mir_reaching_defs (node anchor; per-operand rows).
+#   Path               → mir_paths (drop/effect site anchor; the dataflow
+#                        path with the item-16 stable statement texts).
 #
 # REQUEST ANCHOR GRAMMAR (per kind):
 #   node anchors    — the §33 statement/terminator key texts
@@ -1486,23 +1507,32 @@ end
 #                     "no_alloc" / "no_block" / "no_io" and the message
 #                     words "allocation" / "blocking" / "I/O" (Effects).
 #   ReturnValue     — the anchor text is ignored (pass "").
+#   Dominators / PostDominators / Loops — the anchor text is ignored (the
+#                     rows cover the whole function).
+#   ReachingDefs    — the node-key anchor of the USE statement/terminator.
+#   Path            — the node-key anchor of a MirDeinit terminator (drop)
+#                     or a §11 effect site (call/deinit/perform/record).
 #
 # ERROR MAPPING: Option::None → MirProgramUnavailable; a function_key
 # naming no emission name → FunctionNotFound; an anchor that is not a key
 # of its kind or whose key does not resolve (a missing block/statement, an
-# unresolvable local/place root, an unknown class word) → AnchorNotFound.
+# unresolvable local/place root, an unknown class word, a non-site Path
+# anchor) → AnchorNotFound.
 # MirSliceError::UnsupportedKind is the RESERVED variant of the typed
 # surface: every kind routes today, so the error never leaves the module
 # (documented).
 #
 # The MirSlice payload carries the sorted statement key texts + sorted
 # external anchors; span_keys never cross this boundary (spans are
-# presentation-only per the module doc). Empty Ok slices are documented
-# per kind: a node-anchored BackwardDataflow whose node reads nothing, a
-# ForwardDataflow node whose defs nothing reads, an Effects request whose
-# function has no DIRECT class row (a class reaching it only through
-# in-program callees lives in the callee rows), a value with no use sites
-# (slice_value's rule) and the CFG walks with nothing to report.
+# presentation-only per the module doc). The MIR-graph kinds answer their
+# canonical ROW grammar in statements: "block|idom" (Dominators /
+# PostDominators, an empty right side = the virtual exit), "header|parent|
+# blocks" (Loops) and "local|def1,def2" (ReachingDefs). Empty Ok slices are
+# documented per kind: a node-anchored BackwardDataflow whose node reads
+# nothing, a ForwardDataflow node whose defs nothing reads, an Effects
+# request whose function has no DIRECT class row (a class reaching it only
+# through in-program callees lives in the callee rows), a value with no use
+# sites (slice_value's rule) and the CFG walks with nothing to report.
 
 enum MirSliceKind
   BackwardDataflow
@@ -1512,6 +1542,15 @@ enum MirSliceKind
   Effects
   Failure
   ReturnValue
+  # (third-audit item 20/22) the MIR-graph reasoning kinds — dependence
+  # outputs keyed by the item-16 role-derived stable statement ids and the
+  # §1 StableMirBlockId.stable_key texts (the MIR GRAPH REASONING section
+  # at the bottom of this module).
+  Dominators
+  PostDominators
+  Loops
+  ReachingDefs
+  Path
 end
 
 # ONE typed slice request. Anchor texts follow the per-kind grammar above.
@@ -1931,82 +1970,62 @@ def slice_ownership_walk(mir: MirProgram, ctx: SliceFnCtx, root: Int, tail: Stri
 end
 
 # ———————————————————————————————————————————————————————————————
-# The ControlDependence walk — conditional terminators deciding the anchor
-# block's reachability
+# The ControlDependence walk — the STANDARD CDG closure of the anchor block
 # ———————————————————————————————————————————————————————————————
-# A bounded FIFO walk over the module's predecessor map (slice_fn_find
-# builds it from the terminator targets; abort/unreachable/self edges are
-# not modeled — documented above): every predecessor chain of the anchor
-# block is visited once (deduped, capped at slice_max_items() popped
-# blocks), and the CONDITIONAL terminators along the way — the branch
-# sites that decide whether control reaches the anchor — are the slice's
-# statements. Conditional = a switch/assert (the assert's condition
-# decides target vs. abort) or a call/deinit WITH an unwind edge (the
-# success-vs-unwind split); goto/return/abort/unreachable and
-# unwind-free calls decide nothing in the modeled CFG. Pure CFG slice: the
-# conditions' own def chains stay the dataflow kinds' business
-# (documented); no external anchors.
-
-# Whether a terminator is a conditional decision site (see the walk doc).
-def slice_term_is_conditional(term: MirTerminator) -> Bool
-  match term.kind
-  when MirTerminatorKind::MirGoto(_) then false
-  when MirTerminatorKind::MirReturn then false
-  when MirTerminatorKind::MirUnreachable then false
-  when MirTerminatorKind::MirSwitchInt { op: _, targets: _, default_target: _ } then true
-  when MirTerminatorKind::MirCall { dest: _, func: _, args: _, success: _, unwind, intrinsic: _ } then
-    match unwind
-    when Option::Some(_) then true
-    when Option::None then false
-    end
-  when MirTerminatorKind::MirAssert { cond: _, expected: _, msg: _, target: _, unwind: _ } then true
-  when MirTerminatorKind::MirAbort then false
-  when MirTerminatorKind::MirDeinit { place: _, deinit_fn: _, target: _, unwind } then
-    match unwind
-    when Option::Some(_) then true
-    when Option::None then false
-    end
-  end
-end
+# The Ferrante/Ottenstein/Warren definition (the CDG builder lives in the
+# MIR GRAPH REASONING section at the bottom; the walk here consumes it):
+# a block Y is control dependent on a block X when X's terminator branches
+# and some successor S of X does NOT postdominate X, with Y on the
+# postdominator path from S up to (excluding) ipdom(X). The branch sites
+# that decide whether control reaches the ANCHOR are therefore the CDG
+# controllers of the anchor and, transitively, THEIR controllers — the
+# closure this walk collects (one FIFO worklist, deduped, capped at
+# slice_max_items() popped blocks). The anchor's own terminator is not
+# included; each reached controller's TERMINATOR is (with its presentation
+# span). Pure CFG slice: the conditions' own def chains stay the dataflow
+# kinds' business (documented); no external anchors.
 
 def slice_control_dependence_walk(ctx: SliceFnCtx, v: Int) -> SliceResult
   var included: Map[String, String] = Map::new()
+  let cdg = slice_graph_cdg(ctx.clone())
   var seen: Set[Int] = Set::new()
   var work: Vec[Int] = Vec::new()
   var items = 0
-  # the seed: the anchor block's own predecessors.
-  var pred_rows: Vec[Int] = Vec::new()
-  match ctx.preds.get(v)
-  when Option::Some(rows) then pred_rows = rows.clone()
-  when Option::None then ()
-  end
-  for p in pred_rows do
-    if !seen.contains(&p) then
-      seen.insert(p)
-      work.push(p)
-    end
-  end
+  seen.insert(v)
+  work.push(v)
   while work.len() > 0 && items < slice_max_items() do
     items = items + 1
     let b = work[0]
     work.remove(0)
-    let term = ctx.f.blocks[b].terminator
-    if slice_term_is_conditional(&term) then
+    # the anchor's own terminator is included only when the anchor is one
+    # of its own controllers (a loop header — its branch decides the next
+    # iteration); every other reached controller's terminator is included.
+    var include_node = b != v
+    if b == v then
+      match cdg.get(v)
+      when Option::Some(rows) then
+        if rows.contains(&v) then
+          include_node = true
+        end
+      when Option::None then ()
+      end
+    end
+    if include_node then
       let node_key = slice_term_key(&ctx.name, ctx.f.blocks[b].id.id)
       if !included.contains_key(&node_key) then
-        let nspan = slice_span_copy(term.span)
+        let nspan = slice_span_copy(ctx.f.blocks[b].terminator.span)
         included.insert(node_key, slice_span_key(&node_key, nspan))
       end
     end
-    var b_preds: Vec[Int] = Vec::new()
-    match ctx.preds.get(b)
-    when Option::Some(rows2) then b_preds = rows2.clone()
+    var controllers: Vec[Int] = Vec::new()
+    match cdg.get(b)
+    when Option::Some(rows) then controllers = rows.clone()
     when Option::None then ()
     end
-    for q in b_preds do
-      if !seen.contains(&q) then
-        seen.insert(q)
-        work.push(q)
+    for c in controllers do
+      if !seen.contains(&c) then
+        seen.insert(c)
+        work.push(c)
       end
     end
   end
@@ -2298,6 +2317,81 @@ def slice_mir_return(mir: MirProgram, fn_key: String) -> Result[MirSlice, MirSli
   end
 end
 
+# Dominators: the whole-function "block|idom" row set (mir_dominator_rows;
+# the anchor text is ignored). Rows are the §1 StableMirBlockId.stable_key
+# texts — never the dense §33 node locators.
+def slice_mir_graph_dominators(mir: MirProgram, fn_key: String) -> Result[MirSlice, MirSliceError]
+  match mir_dominator_rows(mir, fn_key.clone())
+  when Option::Some(rows) then
+    Result::Ok(MirSlice {
+      function_key: fn_key,
+      statements: rows,
+      externals: Vec::new(),
+      kind: MirSliceKind::Dominators
+    })
+  when Option::None then
+    Result::Err(MirSliceError::FunctionNotFound)
+  end
+end
+
+# PostDominators: the reverse-CFG/virtual-exit row set (an empty right side
+# marks the virtual exit — see mir_postdominators).
+def slice_mir_graph_postdominators(mir: MirProgram, fn_key: String) -> Result[MirSlice, MirSliceError]
+  match mir_postdominator_rows(mir, fn_key.clone())
+  when Option::Some(rows) then
+    Result::Ok(MirSlice {
+      function_key: fn_key,
+      statements: rows,
+      externals: Vec::new(),
+      kind: MirSliceKind::PostDominators
+    })
+  when Option::None then
+    Result::Err(MirSliceError::FunctionNotFound)
+  end
+end
+
+# Loops: the natural-loop forest rows "header|parent|block,block,...".
+def slice_mir_graph_loops(mir: MirProgram, fn_key: String) -> Result[MirSlice, MirSliceError]
+  match mir_loop_rows(mir, fn_key.clone())
+  when Option::Some(rows) then
+    Result::Ok(MirSlice {
+      function_key: fn_key,
+      statements: rows,
+      externals: Vec::new(),
+      kind: MirSliceKind::Loops
+    })
+  when Option::None then
+    Result::Err(MirSliceError::FunctionNotFound)
+  end
+end
+
+# ReachingDefs: a node anchor — "local|def1,def2" rows for the use node's
+# read operands (see mir_reaching_defs).
+def slice_mir_graph_reaching(mir: MirProgram, fn_key: String, anchor: String) -> Result[MirSlice, MirSliceError]
+  let present = mir_function_present(mir.clone(), fn_key.clone())
+  match mir_reaching_def_rows(mir.clone(), fn_key.clone(), anchor)
+  when Option::Some(rows) then
+    Result::Ok(MirSlice {
+      function_key: fn_key,
+      statements: rows,
+      externals: Vec::new(),
+      kind: MirSliceKind::ReachingDefs
+    })
+  when Option::None then
+    if present then
+      Result::Err(MirSliceError::AnchorNotFound)
+    else
+      Result::Err(MirSliceError::FunctionNotFound)
+    end
+  end
+end
+
+# Path: a drop/effect site anchor — mir_paths' typed slice (the stable
+# statement id texts of the contributing path).
+def slice_mir_graph_path(mir: MirProgram, fn_key: String, anchor: String) -> Result[MirSlice, MirSliceError]
+  mir_paths(mir, fn_key, anchor)
+end
+
 # The ONE typed slicing entry — routes the request per kind onto the
 # engines above; see the section doc for the anchor grammar and the error
 # mapping.
@@ -2314,21 +2408,39 @@ pub def mir_slice(program: Option[MirProgram], request: MirSliceRequest) -> Resu
     when MirSliceKind::Effects then slice_mir_effects(mir, request.function_key.clone(), request.anchor.clone())
     when MirSliceKind::Failure then slice_mir_failure(mir, request.function_key.clone(), request.anchor.clone())
     when MirSliceKind::ReturnValue then slice_mir_return(mir, request.function_key.clone())
+    when MirSliceKind::Dominators then slice_mir_graph_dominators(mir, request.function_key.clone())
+    when MirSliceKind::PostDominators then slice_mir_graph_postdominators(mir, request.function_key.clone())
+    when MirSliceKind::Loops then slice_mir_graph_loops(mir, request.function_key.clone())
+    when MirSliceKind::ReachingDefs then slice_mir_graph_reaching(mir, request.function_key.clone(), request.anchor.clone())
+    when MirSliceKind::Path then slice_mir_graph_path(mir, request.function_key.clone(), request.anchor.clone())
     end
   end
 end
 
 # ———————————————————————————————————————————————————————————————
-# STABLE SEMANTIC NODE IDENTITY (audit item 47) — the content-derived
+# STABLE SEMANTIC NODE IDENTITY (audit items 47 + 16) — the ROLE-derived
 # derivation over the statements BEHIND the §33 locators
 # ———————————————————————————————————————————————————————————————
 # The record vocabulary (SnapshotMirLocator / StableSemanticNodeId, the
-# length-prefixed content-key grammar stable_mir_node_key_text and the
-# piece constructor stable_semantic_node_id_of) lives in stable_ids.tg
-# section 8. THIS section renders MIR nodes into the content pieces — the
-# only place a node's identity can be derived, because the canonical text
-# needs the MIR shapes (operation kind word, destination, operands in
-# render order) and the FUNCTION context the locators alone cannot carry.
+# length-prefixed role-key grammar stable_mir_node_key_text and the piece
+# constructor stable_semantic_node_id_of) lives in stable_ids.tg section 8.
+# THIS section renders MIR nodes into the identity pieces — the only place
+# a node's identity can be derived, because the canonical text needs the
+# MIR shapes (operation kind word, destination, operands in render order)
+# and the FUNCTION context the locators alone cannot carry.
+#
+# IDENTITY SCHEME (third-audit item 16, replacing the predecessor chain):
+# a node's identity is (function, hir_node_seq where available else
+# operation + role_seq, lowering_role). MirProgram carries no HIR node
+# origin today, so every derivation below takes the fallback path: the
+# node's stable ROLE (the operation word for source statements, a
+# stable_mir_role_* string for the compiler-generated families) plus
+# role_seq = the ordinal of this node among the function's SAME-role nodes
+# in block order, with the operation/destination/operand pieces as
+# collision cargo. Inserting a node of a DIFFERENT role shifts no
+# role_seq, so a simple unrelated insertion no longer re-keys the suffix;
+# inserting the same role before a node shifts only the later same-role
+# nodes (the audit's acceptance).
 #
 # RENDER VOCABULARY (deterministic, ASCII; every entry is opaque to the
 # length-prefixed grammar, so the delimiters below are readability only):
@@ -2339,6 +2451,14 @@ end
 #                      "effect-frame-exit"; terminator nodes: "goto" /
 #                      "return" / "unreachable" / "switch" / "call" /
 #                      "assert" / "abort" / "deinit".
+#   roles            — the operation word for source statements, except the
+#                      generated families the stable_mir_role_* builders
+#                      name: a contract check carries
+#                      "contract-check:<kind>:<message render>", a
+#                      bounds-check assert carries
+#                      "bounds-check:<index>:<container>", a deinit
+#                      carries "drop:<place key render>". Lowering roles
+#                      are "stmt" and "term".
 #   destination      — the CANONICAL PLACE KEY TEXT of the node's write
 #                      (slice_render_place's §7 grammar over the MIR type
 #                      table: local name / "l<id>" root + projection
@@ -2361,11 +2481,6 @@ end
 #                      "constparam:<numeric>"), aggregate kinds, phi
 #                      sources ("src:b<block>@<local key>"), contract
 #                      pieces, budget/effect-frame payloads.
-#   predecessor      — the canonical content-key TEXT of the previous
-#                      node in the block, or the block entry marker (the
-#                      §33 block key text "<fn key>#B<block id>") for the
-#                      block's first node (see stable_ids.tg section 8 for
-#                      the chaining semantics).
 #
 # DENSE COMPONENTS by documented policy (stable_ids.tg section 8): the
 # "l<id>" ordinals of unnamed locals, MirBlockId.id targets, the type
@@ -2727,72 +2842,152 @@ def slice_term_node_pieces(mir: MirProgram, f: MirFunction, term: MirTerminator)
   end
 end
 
-# The block entry marker of a node chain: the §33 block key text of the
-# node's own block (the predecessor context of the block's first node).
-def slice_node_block_marker(ctx: SliceFnCtx, v: Int) -> String
-  ctx.name.clone() + "#B" + ctx.f.blocks[v].id.id.to_string()
+# The stable ROLE of one statement node (third-audit item 16): the
+# operation word for the source-shaped kinds; the stable_mir_role_* string
+# for the compiler-generated contract-check family (the MIR carries the
+# contract kind + message, the §31 contract row key is not reachable from
+# a MirProgram alone).
+def slice_stmt_node_role(mir: MirProgram, f: MirFunction, st: MirStatement) -> String
+  match st.kind
+  when MirStatementKind::MirContractCheck(contract, _) then
+    stable_mir_role_contract_check(slice_contract_node_id_text(&contract))
+  when MirStatementKind::MirAssign(_, _) then "assign"
+  when MirStatementKind::MirStorageLive(_) then "storage-live"
+  when MirStatementKind::MirStorageDead(_) then "storage-dead"
+  when MirStatementKind::MirNop then "nop"
+  when MirStatementKind::MirBudgetConsume(_, _) then "budget-consume"
+  when MirStatementKind::MirEffectRecord(_, _) then "effect-record"
+  when MirStatementKind::MirEffectPerform(_, _, _, _, _) then "effect-perform"
+  when MirStatementKind::MirEffectFrameEnter(_, _, _, _, _) then "effect-frame-enter"
+  when MirStatementKind::MirEffectFrameExit then "effect-frame-exit"
+  end
+end
+
+# The canonical contract ID render of a MirContract (the MIR-local cargo
+# of the contract-check role; the §31 row key needs the typed program).
+def slice_contract_node_id_text(contract: MirContract) -> String
+  let msg = contract.message.clone()
+  let kw = match contract.kind
+    when MirContractKind::Pre then "pre"
+    when MirContractKind::Post then "post"
+    when MirContractKind::Invariant then "invariant"
+  end
+  kw + ":" + msg
+end
+
+# The stable ROLE of one terminator node: the operation word except the
+# generated families — a bounds-check assert carries
+# "bounds-check:<index>:<container>" and a deinit carries "drop:<place>".
+def slice_term_node_role(mir: MirProgram, f: MirFunction, term: MirTerminator) -> String
+  match term.kind
+  when MirTerminatorKind::MirGoto(_) then "goto"
+  when MirTerminatorKind::MirReturn then "return"
+  when MirTerminatorKind::MirUnreachable then "unreachable"
+  when MirTerminatorKind::MirSwitchInt { op: _, targets: _, default_target: _ } then "switch"
+  when MirTerminatorKind::MirCall { dest: _, func: _, args: _, success: _, unwind: _, intrinsic: _ } then "call"
+  when MirTerminatorKind::MirAssert { cond: _, expected: _, msg, target: _, unwind: _ } then
+    match msg
+    when AssertMessage::BoundsCheck(index_op, len_op) then
+      stable_mir_role_bounds_check(
+        slice_node_operand_text(&mir, &f, index_op),
+        slice_node_operand_text(&mir, &f, len_op)
+      )
+    when _ then "assert"
+    end
+  when MirTerminatorKind::MirAbort then "abort"
+  when MirTerminatorKind::MirDeinit { place, deinit_fn: _, target: _, unwind: _ } then
+    stable_mir_role_drop(slice_render_place(&mir, &f, &place))
+  end
+end
+
+# The ROLE ORDINAL of the target node: the count of same-role nodes before
+# it in the function's block order. The walk is the section's documented
+# derivation cost (the same shape as the old predecessor-chain walk), and
+# it is what makes a DIFFERENT-role insertion leave every existing
+# role_seq untouched.
+def slice_node_role_seq(mir: MirProgram, f: MirFunction, target_block: Int, target_node: Int, target_role: String, target_lowering_role: String) -> Int
+  var seq = 0
+  var b = 0
+  while b < f.blocks.len() do
+    var s = 0
+    while s < f.blocks[b].statements.len() do
+      if b == target_block && s == target_node && target_lowering_role == "stmt" then
+        return seq
+      end
+      let st = f.blocks[b].statements[s]
+      if target_lowering_role == "stmt" && slice_stmt_node_role(&mir, &f, st) == target_role then
+        seq = seq + 1
+      end
+      s = s + 1
+    end
+    if b == target_block && target_node == f.blocks[b].statements.len() && target_lowering_role == "term" then
+      return seq
+    end
+    let term = f.blocks[b].terminator
+    if target_lowering_role == "term" && slice_term_node_role(&mir, &f, &term) == target_role then
+      seq = seq + 1
+    end
+    b = b + 1
+  end
+  seq
 end
 
 # Derive the StableSemanticNodeId of the node at (block Vec index v, node
 # index p — p == the block's statement count = the terminator). The
-# predecessor chain is walked from the block head: each node's content key
-# is built over its own pieces plus the PREVIOUS node's content key text
-# (the block marker for the first), then the requested node's record is
-# built over its pieces and the chain tail. Option::None only when p is
-# out of the node range.
+# identity is the item-16 role scheme: (function, role, role_seq,
+# lowering_role) with the operation/destination/operand pieces as
+# collision cargo (MirProgram carries no HIR node origin today, so the
+# HIR-anchor path is unused here). Option::None only when p is out of the
+# node range.
 def slice_node_derive(mir: MirProgram, ctx: SliceFnCtx, v: Int, p: Int) -> Option[StableSemanticNodeId]
   let block_len = ctx.f.blocks[v].statements.len()
   if p < 0 || p > block_len then
     return Option::None
   end
-  var prev = slice_node_block_marker(&ctx, v)
-  var j = 0
-  while j < p do
-    let st = ctx.f.blocks[v].statements[j]
-    let pieces = slice_stmt_node_pieces(&mir, &ctx.f, st)
-    let key = stable_mir_node_key_text(
+  if p == block_len then
+    let term = ctx.f.blocks[v].terminator
+    let pieces = slice_term_node_pieces(&mir, &ctx.f, &term)
+    let role = slice_term_node_role(&mir, &ctx.f, &term)
+    let seq = slice_node_role_seq(&mir, &ctx.f, v, p, role.clone(), "term".to_string())
+    Option::Some(stable_semantic_node_id_of(
       ctx.name.clone(),
       pieces.0,
       pieces.1,
       pieces.2,
-      prev.clone()
-    )
-    prev = key
-    j = j + 1
-  end
-  if p == block_len then
-    let term_pieces = slice_term_node_pieces(&mir, &ctx.f, &ctx.f.blocks[v].terminator)
-    Option::Some(stable_semantic_node_id_of(
-      ctx.name.clone(),
-      term_pieces.0,
-      term_pieces.1,
-      term_pieces.2,
-      prev
+      role,
+      "term".to_string(),
+      -1,
+      seq
     ))
   else
+    let st = ctx.f.blocks[v].statements[p]
+    let pieces = slice_stmt_node_pieces(&mir, &ctx.f, st)
     let st2 = ctx.f.blocks[v].statements[p]
-    let st_pieces = slice_stmt_node_pieces(&mir, &ctx.f, st2)
+    let role = slice_stmt_node_role(&mir, &ctx.f, st2)
+    let seq = slice_node_role_seq(&mir, &ctx.f, v, p, role.clone(), "stmt".to_string())
     Option::Some(stable_semantic_node_id_of(
       ctx.name.clone(),
-      st_pieces.0,
-      st_pieces.1,
-      st_pieces.2,
-      prev
+      pieces.0,
+      pieces.1,
+      pieces.2,
+      role,
+      "stmt".to_string(),
+      -1,
+      seq
     ))
   end
 end
 
-# The audit-item-47 derivation: the revision-stable semantic node identity
-# of the node BEHIND a dense §33 locator (SnapshotMirLocator — parseable
-# from the "#B"/"#S"/"#T" key texts through snapshot_mir_locator_of_key).
-# Option::None when the locator names no function of the program, no block
-# of that function, or no node of that block (the locator's own
-# function_key is authoritative — mirror of the slice engines' prefix
-# rule). Derivation semantics (the content key and the
-# predecessor-context chain) are documented in the section doc and at
-# stable_ids.tg section 8: an insertion before statement k re-keys exactly
-# the chain from k onward — the tail-only acceptance — never the entire
-# identity domain.
+# The audit-item-47/16 derivation: the revision-stable semantic node
+# identity of the node BEHIND a dense §33 locator (SnapshotMirLocator —
+# parseable from the "#B"/"#S"/"#T" key texts through
+# snapshot_mir_locator_of_key). Option::None when the locator names no
+# function of the program, no block of that function, or no node of that
+# block (the locator's own function_key is authoritative — mirror of the
+# slice engines' prefix rule). Derivation semantics (the role scheme and
+# the role ordinal) are documented in the section doc and at stable_ids.tg
+# section 8: inserting a DIFFERENT-role statement no longer re-keys the
+# suffix; only same-role insertions shift the later same-role ordinals.
 pub def stable_node_id_of(mir: MirProgram, locator: SnapshotMirLocator) -> Option[StableSemanticNodeId]
   match slice_fn_find(mir, locator.function_key.clone())
   when Option::None then
@@ -2862,7 +3057,10 @@ pub def stable_node_ids_of_slice(
                     nid.operation.clone(),
                     nid.dest_key.clone(),
                     nid.operands.clone(),
-                    nid.predecessor_context.clone()
+                    nid.role.clone(),
+                    nid.lowering_role.clone(),
+                    nid.hir_node_seq,
+                    nid.role_seq
                   )
                   if !by_key.contains_key(&canon) then
                     by_key.insert(canon, nid)
@@ -2890,4 +3088,1534 @@ pub def stable_node_ids_of_slice(
       out
     end
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# MIR GRAPH REASONING (third-audit item 20/22) — dominators,
+# postdominators, the loop forest, control dependence, reaching
+# definitions and the drop/effect paths
+# ———————————————————————————————————————————————————————————————
+# The dependence layer over the VERIFIED MirProgram: the CFG reasoning the
+# audit's item 20/22 asks for, keyed by the NEW stable ids of the identity
+# work (item 16/47):
+#
+#   BLOCKS      — the §1 StableMirBlockId.stable_key text
+#                 "<fn emission key>#B<block id>" (slice_graph_block_key;
+#                 the SAME text snapshot_mir_locator_text prefixes).
+#   STATEMENTS  — the role-derived StableMirStatementId of the node (the
+#                 canonical role-key text stable_mir_statement_role_key_text
+#                 over the role + role_seq the item-16 derivation computes —
+#                 the digest preimage of stable_mir_statement_id_of_role),
+#                 NEVER the dense "#S<ordinal>" locator. Only the compact
+#                 MirSlice-machinery rows (def chains, span keys) stay in the
+#                 §33 locator domain; the graph outputs below translate to
+#                 the stable statement ids at the boundary.
+#
+# THE ALGORITHMS (all over the function's terminator edges; determinism
+# comes from block/edge order plus the final textual sorts):
+#
+#   MIR_DOMINATORS — the existing optimizer machinery: mir.tg's
+#     compute_dominators (Cooper/Harvey/Kennedy over the entry's RPO,
+#     self edges included) reused verbatim; idom[entry] = entry; blocks
+#     unreachable from the entry carry no row (no dominator-tree position).
+#   MIR_POSTDOMINATORS — the reverse CFG with a VIRTUAL EXIT (-1): the
+#     structural exits are the return/abort/unreachable terminators; blocks
+#     that cannot reach an exit have no postdominator position. The
+#     postdominator sets are the standard downward fixpoint
+#     postdom[b] = {b} ∪ ∩ postdom[succ(b)] (exits start {exit, -1}); the
+#     immediate postdominator is the strict postdominator postdominated by
+#     every other strict postdominator (the closest one); -1 = the virtual
+#     exit. Bounded by 2*|blocks|+8 rounds (a conservative cap — documented).
+#   MIR_LOOPS — natural loops over the RAW back edges: an edge tail -> header
+#     with header dominating tail (mir_idom_dominates over the forward idom,
+#     the mir.tg helper verbatim). The body is the header plus the reverse
+#     flood from the tail over the raw predecessor map (nodes reaching the
+#     tail without passing through the header). Back edges sharing a header
+#     merge into ONE natural loop (per-header forest — documented). The
+#     parent is the innermost other loop header strictly dominating this
+#     header (max dominator depth); top-level loops carry "".
+#   MIR_CONTROL_DEPENDENCE — the STANDARD Ferrante/Ottenstein/Warren graph:
+#     for every terminator X and successor S with S NOT postdominating X,
+#     every block on the postdominator path from S up to (excluding)
+#     ipdom(X) is control dependent on X. Rows are (dependent block,
+#     controller block) — the controller's TERMINATOR is the branch site.
+#     The anchored MirSliceKind::ControlDependence walk consumes the CDG's
+#     transitive closure (the old bounded predecessor approximation is
+#     gone).
+#   MIR_REACHING_DEFS — the MAY (union over all paths) reaching-definition
+#     answers for a USE node's read operands, mirroring the lir.tg
+#     def-before-use model over MIR statements: IN[b] = ∪ OUT[pred];
+#     OUT applies the block's writes in order — a BARE dest write KILLS the
+#     local's earlier defs, a PROJECTED (partial) dest write ACCUMULATES
+#     (the module's def-use model: a partial def does not end the chain).
+#     A use resolves the nearest bare def BELOW it in-block (plus the
+#     partial defs between it and the use); with no in-block bare def the
+#     block's IN carries the predecessor defs. Parameters/never-defined
+#     locals answer the row with an empty def list. The worklist is bounded
+#     by slice_max_items() (documented).
+#   MIR_DROP_PATHS / MIR_EFFECT_PATHS — the PATH slice of a site node: the
+#     site + its block's statement prefix (the local path) + the anchored
+#     backward def chains of the values the site reads (the contributing
+#     dataflow path — the SliceBack machinery reused). A DROP site is a
+#     MirDeinit terminator; an EFFECT site is a §11-classified call/deinit
+#     terminator, a MirEffectPerform / MirEffectRecord statement or the
+#     string-concat Add assignment (slice_effect's direct-site vocabulary).
+#     The control predication of a path stays the ControlDependence kind's
+#     business (documented separation); statements are emitted as the
+#     item-16 stable statement id texts.
+#
+# ROW GRAMMAR (the query layer's keys; every row is one sorted text):
+#   dominators/postdominators  "<block key>|<idom/ipdom block key>"
+#                              ("" right side = the virtual exit)
+#   loops                      "<header key>|<parent header key>|<block key>,..."
+#   control dependence         "<dependent block key>|<controller block key>"
+#   reaching defs              "<operand local key>|<def id>,<def id>,..."
+#   paths                      the stable statement id texts in statements
+#
+# BOUNDS: every walk uses the module's deterministic budgets (slice_max_items
+# work items, 4096-hop dominance walks). The row sets are sorted before
+# leaving the module. RESIDUAL (documented): the reaching-def fixpoint rides
+# the module's ctx.preds/ctx.succs maps, which drop SELF edges — a def later
+# in a block reaching a use earlier in the SAME block through a self-loop
+# edge is not propagated by the fixpoint (the in-block scan still resolves
+# every lexically-earlier def); the loop forest itself uses the RAW edge maps
+# (self edges included), so single-block self-loops ARE natural loops there.
+
+# ———— Shared graph atoms ————
+
+# The §1 StableMirBlockId.stable_key text "<fn key>#B<block id>".
+def slice_graph_block_key(name: String, block_id: Int) -> String
+  name + "#B" + block_id.to_string()
+end
+
+# One node slot inside the reaching-def dataflow ("<block vec idx>@<node
+# idx>"; the node index equals the block's statement count at the
+# terminator).
+def slice_graph_slot_text(v: Int, p: Int) -> String
+  v.to_string() + "@" + p.to_string()
+end
+
+def slice_graph_slot_parts(slot: String) -> (Int, Int)
+  var at = -1
+  var i = 0
+  while i < slot.len() do
+    if slot.slice(i, i + 1) == "@" then
+      at = i
+      break
+    end
+    i = i + 1
+  end
+  if at < 0 then
+    return (-1, -1)
+  end
+  let left = slot.slice(0, at)
+  let right = slot.slice(at + 1, slot.len())
+  var v = -1
+  var p = -1
+  if slice_is_digits(&left) then v = slice_text_to_int(&left) end
+  if slice_is_digits(&right) then p = slice_text_to_int(&right) end
+  (v, p)
+end
+
+# The revision-stable StableMirStatementId text of the node at (block Vec
+# index v, node index p — p == the block's statement count = the
+# terminator): the canonical role-key text over the item-16 role scheme
+# (role + role_seq; MirProgram carries no HIR origin today).
+def slice_graph_node_stmt_text(mir: MirProgram, ctx: SliceFnCtx, v: Int, p: Int) -> String
+  match slice_node_derive(&mir, &ctx, v, p)
+  when Option::Some(nid) then
+    let sid = stable_mir_statement_id_of_role(ctx.name.clone(), nid.role.clone(), nid.role_seq)
+    stable_mir_statement_role_key_text(sid.function.instance_key.clone(), sid.role.clone(), sid.role_seq, sid.hir_node_seq)
+  when Option::None then ""
+  end
+end
+
+# The StableMirBlockId record of one block of a function (the §1 stable
+# block identity; Option::None for an absent function/block key).
+pub def mir_block_stable_id(function_key: String, block_id: Int) -> Option[StableMirBlockId]
+  stable_mir_block_of_key(slice_graph_block_key(&function_key, block_id))
+end
+
+# The revision-stable StableMirStatementId record of the node BEHIND a §33
+# node-key locator (the item-16 role scheme over the derivation in this
+# module; Option::None for a function/block/node the locator cannot
+# resolve).
+pub def mir_node_statement_id(mir: MirProgram, function_key: String, node_key: String) -> Option[StableMirStatementId]
+  match slice_fn_find(mir, function_key.clone())
+  when Option::None then Option::None
+  when Option::Some(ctx) then
+    match slice_node_anchor_at(&ctx, &node_key)
+    when Option::None then Option::None
+    when Option::Some(parts) then
+      match slice_node_derive(&mir, &ctx, parts.0, parts.1)
+      when Option::Some(nid) then
+        Option::Some(stable_mir_statement_id_of_role(ctx.name.clone(), nid.role.clone(), nid.role_seq))
+      when Option::None then Option::None
+      end
+    end
+  end
+end
+
+# The RAW CFG of a function ctx: successor/predecessor maps over block Vec
+# indices, from terminator_successor_ids (mir.tg — the optimizer's own edge
+# vocabulary). SELF EDGES ARE KEPT (a self-loop is a natural-loop back edge)
+# and duplicate targets deduped per block in target order.
+struct SliceRawCfg
+  succs: Map[Int, Vec[Int]]
+  preds: Map[Int, Vec[Int]]
+end
+
+def slice_graph_raw_cfg(ctx: SliceFnCtx) -> SliceRawCfg
+  var succs: Map[Int, Vec[Int]] = Map::new()
+  var preds: Map[Int, Vec[Int]] = Map::new()
+  var bi = 0
+  while bi < ctx.f.blocks.len() do
+    succs.insert(bi, Vec::new())
+    preds.insert(bi, Vec::new())
+    bi = bi + 1
+  end
+  bi = 0
+  while bi < ctx.f.blocks.len() do
+    let targets = terminator_successor_ids(&ctx.f.blocks[bi].terminator)
+    var rows: Vec[Int] = Vec::new()
+    for id in targets do
+      let v = slice_block_vec_index(&ctx, id)
+      if v >= 0 && !rows.contains(&v) then
+        rows.push(v)
+      end
+    end
+    succs.insert(bi, rows.clone())
+    for v2 in rows do
+      var prows: Vec[Int] = Vec::new()
+      match preds.get(v2)
+      when Option::Some(existing) then prows = existing.clone()
+      when Option::None then ()
+      end
+      if !prows.contains(&bi) then
+        prows.push(bi)
+      end
+      preds.insert(v2, prows)
+    end
+    bi = bi + 1
+  end
+  SliceRawCfg { succs: succs, preds: preds }
+end
+
+# ———— Dominators ————
+
+# The forward idom map (block id -> idom block id) through mir.tg's
+# compute_dominators — the existing optimizer machinery reused verbatim.
+# Only blocks reachable from the entry carry an idom.
+def slice_graph_fwd_idom(ctx: SliceFnCtx) -> Map[Int, Int]
+  let dom = compute_dominators(ctx.f.clone())
+  dom.idom
+end
+
+# The dominator-tree depth of one block (hops to the entry/root).
+def slice_graph_dom_depth(idom: Map[Int, Int], v: Int) -> Int
+  var depth = 0
+  var cur = v
+  var hops = 0
+  while hops < 4096 do
+    match idom.get(cur)
+    when Option::Some(d) then
+      if d == cur then
+        return depth
+      end
+      cur = d
+      depth = depth + 1
+    when Option::None then
+      return depth
+    end
+    hops = hops + 1
+  end
+  depth
+end
+
+# The whole-function immediate-dominator rows as (block key, idom key)
+# pairs; idom[entry] = entry; unreachable blocks are omitted (no row).
+pub def mir_dominators(mir: MirProgram, function_key: String) -> Vec[(String, String)]
+  match slice_fn_find(mir, function_key.clone())
+  when Option::None then Vec::new()
+  when Option::Some(ctx) then
+    let idom = slice_graph_fwd_idom(ctx.clone())
+    var rows: Vec[(String, String)] = Vec::new()
+    var bi = 0
+    while bi < ctx.f.blocks.len() do
+      match idom.get(ctx.f.blocks[bi].id.id)
+      when Option::Some(d) then
+        rows.push((
+          slice_graph_block_key(&ctx.name, ctx.f.blocks[bi].id.id),
+          slice_graph_block_key(&ctx.name, d)
+        ))
+      when Option::None then ()
+      end
+      bi = bi + 1
+    end
+    rows.sort_by(|a, b| if a.0 != b.0 then a.0 < b.0 else a.1 < b.1 end)
+    rows
+  end
+end
+
+# ———— Postdominators (reverse CFG + virtual exit) ————
+
+# The structural EXIT blocks: the terminators that end the flow (return /
+# abort / unreachable). Verified MIR has no dangling edges, so the exit set
+# is exactly these terminators.
+def slice_graph_exit_blocks(ctx: SliceFnCtx) -> Vec[Int]
+  var out: Vec[Int] = Vec::new()
+  var bi = 0
+  while bi < ctx.f.blocks.len() do
+    var is_exit = false
+    match ctx.f.blocks[bi].terminator.kind
+    when MirTerminatorKind::MirReturn then is_exit = true
+    when MirTerminatorKind::MirAbort then is_exit = true
+    when MirTerminatorKind::MirUnreachable then is_exit = true
+    when _ then ()
+    end
+    if is_exit then
+      out.push(bi)
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+# The blocks that can reach an exit (the postdominator domain): reverse BFS
+# from the exits over the raw predecessor map. A non-terminating region has
+# no postdominator position (documented).
+def slice_graph_can_reach_exit(raw_preds: Map[Int, Vec[Int]], exits: Vec[Int]) -> Set[Int]
+  var seen: Set[Int] = Set::new()
+  var work: Vec[Int] = Vec::new()
+  for e in exits do
+    if !seen.contains(&e) then
+      seen.insert(e)
+      work.push(e)
+    end
+  end
+  while work.len() > 0 do
+    let b = work[0]
+    work.remove(0)
+    var rows: Vec[Int] = Vec::new()
+    match raw_preds.get(b)
+    when Option::Some(p) then rows = p.clone()
+    when Option::None then ()
+    end
+    for p2 in rows do
+      if !seen.contains(&p2) then
+        seen.insert(p2)
+        work.push(p2)
+      end
+    end
+  end
+  seen
+end
+
+def slice_graph_set_text(s: Set[Int]) -> String
+  var xs: Vec[Int] = Vec::new()
+  for x in s do
+    xs.push(x)
+  end
+  xs.sort_by(|a, b| a < b)
+  var parts: Vec[String] = Vec::new()
+  for x2 in xs do
+    parts.push(x2.to_string())
+  end
+  parts.join(",")
+end
+
+def slice_graph_set_intersect(a: Set[Int], b: Set[Int]) -> Set[Int]
+  var out: Set[Int] = Set::new()
+  for x in a do
+    if b.contains(&x) then
+      out.insert(x)
+    end
+  end
+  out
+end
+
+# The postdominator map (block Vec index -> immediate postdominator; -1 =
+# the VIRTUAL EXIT) over the standard set fixpoint. Only blocks that can
+# reach an exit are positioned. See the section doc for the algorithm and
+# the round cap.
+def slice_graph_ipdom(ctx: SliceFnCtx) -> Map[Int, Int]
+  let raw = slice_graph_raw_cfg(ctx.clone())
+  let exits = slice_graph_exit_blocks(ctx.clone())
+  let domain = slice_graph_can_reach_exit(raw.preds.clone(), exits.clone())
+  var universe: Set[Int] = Set::new()
+  universe.insert(-1)
+  for b0 in domain do
+    universe.insert(b0)
+  end
+  var post: Map[Int, Set[Int]] = Map::new()
+  var block_list: Vec[Int] = Vec::new()
+  var bi = 0
+  while bi < ctx.f.blocks.len() do
+    if domain.contains(&bi) then
+      block_list.push(bi)
+      var is_exit = false
+      for e in exits do
+        if e == bi then
+          is_exit = true
+        end
+      end
+      if is_exit then
+        var s: Set[Int] = Set::new()
+        s.insert(bi)
+        s.insert(-1)
+        post.insert(bi, s)
+      else
+        post.insert(bi, universe.clone())
+      end
+    end
+    bi = bi + 1
+  end
+  var changed = true
+  var rounds = 0
+  let round_cap = block_list.len() * 2 + 8
+  while changed && rounds < round_cap do
+    changed = false
+    rounds = rounds + 1
+    var li = 0
+    while li < block_list.len() do
+      let b = block_list[li]
+      var is_exit = false
+      for e2 in exits do
+        if e2 == b then
+          is_exit = true
+        end
+      end
+      if !is_exit then
+        var rows: Vec[Int] = Vec::new()
+        match raw.succs.get(b)
+        when Option::Some(s2) then rows = s2.clone()
+        when Option::None then ()
+        end
+        var inter: Set[Int] = Set::new()
+        var first = true
+        for s3 in rows do
+          if domain.contains(&s3) then
+            match post.get(s3)
+            when Option::Some(ps) then
+              if first then
+                inter = ps.clone()
+                first = false
+              else
+                inter = slice_graph_set_intersect(inter, ps.clone())
+              end
+            when Option::None then ()
+            end
+          end
+        end
+        var new_set: Set[Int] = inter.clone()
+        new_set.insert(b)
+        var old_text = ""
+        match post.get(b)
+        when Option::Some(old) then old_text = slice_graph_set_text(old.clone())
+        when Option::None then ()
+        end
+        if slice_graph_set_text(new_set.clone()) != old_text then
+          post.insert(b, new_set)
+          changed = true
+        end
+      end
+      li = li + 1
+    end
+  end
+  # the virtual root's postdominator set (the ipdom selection compares
+  # against it, so the root is the furthest strict postdominator).
+  var virt: Set[Int] = Set::new()
+  virt.insert(-1)
+  post.insert(-1, virt)
+  # the immediate postdominator: the strict postdominator x that every
+  # OTHER strict postdominator y postdominates (y ∈ postdom[x]).
+  var ipdom: Map[Int, Int] = Map::new()
+  for b2 in block_list do
+    match post.get(b2)
+    when Option::Some(s4) then
+      var strict: Vec[Int] = Vec::new()
+      for x in s4 do
+        if x != b2 then
+          strict.push(x)
+        end
+      end
+      var best = -2
+      for cand in strict do
+        var cand_set: Set[Int] = Set::new()
+        match post.get(cand)
+        when Option::Some(sc) then cand_set = sc.clone()
+        when Option::None then ()
+        end
+        var ok = true
+        for y in strict do
+          if y != cand then
+            if !cand_set.contains(&y) then
+              ok = false
+            end
+          end
+        end
+        if ok then
+          best = cand
+        end
+      end
+      if best != -2 then
+        ipdom.insert(b2, best)
+      end
+    when Option::None then ()
+    end
+  end
+  ipdom
+end
+
+# The whole-function immediate-postdominator rows as (block key, ipdom key)
+# pairs; an empty right side marks the virtual exit (ipdom == -1). Blocks
+# that cannot reach an exit are omitted.
+pub def mir_postdominators(mir: MirProgram, function_key: String) -> Vec[(String, String)]
+  match slice_fn_find(mir, function_key.clone())
+  when Option::None then Vec::new()
+  when Option::Some(ctx) then
+    let ipdom = slice_graph_ipdom(ctx.clone())
+    var rows: Vec[(String, String)] = Vec::new()
+    var bi = 0
+    while bi < ctx.f.blocks.len() do
+      match ipdom.get(bi)
+      when Option::Some(d) then
+        var ip_key = ""
+        if d >= 0 then
+          ip_key = slice_graph_block_key(&ctx.name, ctx.f.blocks[d].id.id)
+        end
+        rows.push((slice_graph_block_key(&ctx.name, ctx.f.blocks[bi].id.id), ip_key))
+      when Option::None then ()
+      end
+      bi = bi + 1
+    end
+    rows.sort_by(|a, b| if a.0 != b.0 then a.0 < b.0 else a.1 < b.1 end)
+    rows
+  end
+end
+
+# ———— The natural-loop forest ————
+
+# ONE natural loop of the forest: the header, its body blocks (header
+# included) and the enclosing loop header ("" = top level). The keys are
+# StableMirBlockId.stable_key texts; block_keys is sorted.
+struct MirLoopInfo
+  header_key: String
+  block_keys: Vec[String] = Vec::new()
+  parent_header_key: String = ""
+end
+
+# The natural-loop forest: back edges (tail -> header with header dominating
+# tail) merged by header; the parent is the innermost other loop header
+# strictly dominating this header. See the section doc.
+pub def mir_loops(mir: MirProgram, function_key: String) -> Vec[MirLoopInfo]
+  match slice_fn_find(mir, function_key.clone())
+  when Option::None then Vec::new()
+  when Option::Some(ctx) then
+    let idom = slice_graph_fwd_idom(ctx.clone())
+    let raw = slice_graph_raw_cfg(ctx.clone())
+    var bodies: Map[Int, Set[Int]] = Map::new()
+    var bi = 0
+    while bi < ctx.f.blocks.len() do
+      var rows: Vec[Int] = Vec::new()
+      match raw.succs.get(bi)
+      when Option::Some(s) then rows = s.clone()
+      when Option::None then ()
+      end
+      for h in rows do
+        # the forward idom map is keyed by MirBlockId.id (compute_dominators'
+        # domain); raw.succs is keyed by block Vec index — translate.
+        let h_id = ctx.f.blocks[h].id.id
+        let bi_id = ctx.f.blocks[bi].id.id
+        if idom.contains_key(&h_id) && idom.contains_key(&bi_id) && mir_idom_dominates(&idom, h_id, bi_id) then
+          # back edge bi -> h (h dominates bi): the natural loop of h.
+          var body: Set[Int] = Set::new()
+          body.insert(h)
+          var work: Vec[Int] = Vec::new()
+          work.push(bi)
+          while work.len() > 0 do
+            let n = work[0]
+            work.remove(0)
+            if !body.contains(&n) then
+              body.insert(n)
+              var prows: Vec[Int] = Vec::new()
+              match raw.preds.get(n)
+              when Option::Some(p) then prows = p.clone()
+              when Option::None then ()
+              end
+              for p2 in prows do
+                if !body.contains(&p2) then
+                  work.push(p2)
+                end
+              end
+            end
+          end
+          # merge the back edges sharing a header (one natural loop per header).
+          var merged: Set[Int] = Set::new()
+          match bodies.get(h)
+          when Option::Some(existing) then merged = existing.clone()
+          when Option::None then ()
+          end
+          for b in body do
+            merged.insert(b)
+          end
+          bodies.insert(h, merged)
+        end
+      end
+      bi = bi + 1
+    end
+    var headers: Vec[Int] = Vec::new()
+    var entries: Vec[(Int, Set[Int])] = bodies.entries()
+    for e in entries do
+      headers.push(e.0)
+    end
+    headers.sort_by(|a, b| a < b)
+    var out: Vec[MirLoopInfo] = Vec::new()
+    var hi = 0
+    while hi < headers.len() do
+      let h = headers[hi]
+      var parent = -1
+      var parent_depth = 0
+      var hj = 0
+      while hj < headers.len() do
+        let h2 = headers[hj]
+        let h2_id = ctx.f.blocks[h2].id.id
+        let h_id = ctx.f.blocks[h].id.id
+        if h2 != h && mir_idom_dominates(&idom, h2_id, h_id) then
+          let depth = slice_graph_dom_depth(&idom, h2_id)
+          if parent < 0 || depth > parent_depth then
+            parent = h2
+            parent_depth = depth
+          end
+        end
+        hj = hj + 1
+      end
+      var parent_key = ""
+      if parent >= 0 then
+        parent_key = slice_graph_block_key(&ctx.name, ctx.f.blocks[parent].id.id)
+      end
+      var block_keys: Vec[String] = Vec::new()
+      match bodies.get(h)
+      when Option::Some(set) then
+        for b2 in set do
+          block_keys.push(slice_graph_block_key(&ctx.name, ctx.f.blocks[b2].id.id))
+        end
+      when Option::None then ()
+      end
+      block_keys.sort_by(|a, b| a < b)
+      out.push(MirLoopInfo {
+        header_key: slice_graph_block_key(&ctx.name, ctx.f.blocks[h].id.id),
+        block_keys: block_keys,
+        parent_header_key: parent_key
+      })
+      hi = hi + 1
+    end
+    out.sort_by(|a, b| a.header_key < b.header_key)
+    out
+  end
+end
+
+# ———— Control dependence ————
+
+# The control-dependence graph: dependent block Vec index -> controlling
+# block Vec indices (the standard Ferrante/Ottenstein/Warren construction;
+# see the section doc). The controller's TERMINATOR is the branch site.
+def slice_graph_cdg(ctx: SliceFnCtx) -> Map[Int, Vec[Int]]
+  var out: Map[Int, Vec[Int]] = Map::new()
+  let ipdom = slice_graph_ipdom(ctx.clone())
+  let raw = slice_graph_raw_cfg(ctx.clone())
+  var bi = 0
+  while bi < ctx.f.blocks.len() do
+    if ipdom.contains_key(&bi) then
+      var subrows: Vec[Int] = Vec::new()
+      match raw.succs.get(bi)
+      when Option::Some(s) then subrows = s.clone()
+      when Option::None then ()
+      end
+      for s2 in subrows do
+        if ipdom.contains_key(&s2) && !mir_idom_dominates(&ipdom, s2, bi) then
+          var stop = -1
+          match ipdom.get(bi)
+          when Option::Some(d) then stop = d
+          when Option::None then ()
+          end
+          var runner = s2
+          var guard = 0
+          while runner != stop && runner >= 0 && guard < 4096 do
+            guard = guard + 1
+            var existing: Vec[Int] = Vec::new()
+            match out.get(runner)
+            when Option::Some(e) then existing = e.clone()
+            when Option::None then ()
+            end
+            if !existing.contains(&bi) then
+              existing.push(bi)
+              out.insert(runner, existing)
+            end
+            match ipdom.get(runner)
+            when Option::Some(nxt) then runner = nxt
+            when Option::None then runner = -1
+            end
+          end
+        end
+      end
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+# The whole-function control-dependence rows: (dependent block key,
+# controller block key) pairs — the controller's terminator is the deciding
+# branch site.
+pub def mir_control_dependence(mir: MirProgram, function_key: String) -> Vec[(String, String)]
+  match slice_fn_find(mir, function_key.clone())
+  when Option::None then Vec::new()
+  when Option::Some(ctx) then
+    let cdg = slice_graph_cdg(ctx.clone())
+    var rows: Vec[(String, String)] = Vec::new()
+    var entries: Vec[(Int, Vec[Int])] = cdg.entries()
+    for e in entries do
+      for c in e.1 do
+        rows.push((
+          slice_graph_block_key(&ctx.name, ctx.f.blocks[e.0].id.id),
+          slice_graph_block_key(&ctx.name, ctx.f.blocks[c].id.id)
+        ))
+      end
+    end
+    rows.sort_by(|a, b| if a.0 != b.0 then a.0 < b.0 else a.1 < b.1 end)
+    rows
+  end
+end
+
+# ———— Reaching definitions (may / union over all paths) ————
+
+def slice_reach_state_text(state: Map[Int, Set[String]]) -> String
+  var rows: Vec[String] = Vec::new()
+  var entries: Vec[(Int, Set[String])] = state.entries()
+  for e in entries do
+    var defs: Vec[String] = Vec::new()
+    for d in e.1 do
+      defs.push(d.clone())
+    end
+    defs.sort_by(|a, b| a < b)
+    rows.push(e.0.to_string() + ">" + defs.join(","))
+  end
+  rows.sort_by(|a, b| a < b)
+  rows.join(";")
+end
+
+# The OUT state of one block given its IN: deep-copy the IN and apply the
+# block's writes in order — a bare dest write replaces the local's def set
+# (KILL), a projected (partial) dest write accumulates (no kill).
+def slice_reach_block_out(ctx: SliceFnCtx, b: Int, in_state: Map[Int, Set[String]]) -> Map[Int, Set[String]]
+  var out: Map[Int, Set[String]] = Map::new()
+  var entries: Vec[(Int, Set[String])] = in_state.entries()
+  for e in entries do
+    out.insert(e.0, e.1.clone())
+  end
+  let block_len = ctx.f.blocks[b].statements.len()
+  var si = 0
+  while si < block_len do
+    let st = ctx.f.blocks[b].statements[si]
+    let defs = slice_stmt_defs(st)
+    if defs.0 >= 0 then
+      var set: Set[String] = Set::new()
+      set.insert(slice_graph_slot_text(b, si))
+      out.insert(defs.0, set)
+    end
+    if defs.1 >= 0 then
+      var set2: Set[String] = Set::new()
+      match out.get(defs.1)
+      when Option::Some(existing) then set2 = existing.clone()
+      when Option::None then ()
+      end
+      set2.insert(slice_graph_slot_text(b, si))
+      out.insert(defs.1, set2)
+    end
+    si = si + 1
+  end
+  let term = ctx.f.blocks[b].terminator
+  let tdefs = slice_term_defs(&term)
+  if tdefs.0 >= 0 then
+    var tset: Set[String] = Set::new()
+    tset.insert(slice_graph_slot_text(b, block_len))
+    out.insert(tdefs.0, tset)
+  end
+  if tdefs.1 >= 0 then
+    var tset2: Set[String] = Set::new()
+    match out.get(tdefs.1)
+    when Option::Some(existing2) then tset2 = existing2.clone()
+    when Option::None then ()
+    end
+    tset2.insert(slice_graph_slot_text(b, block_len))
+    out.insert(tdefs.1, tset2)
+  end
+  out
+end
+
+# The per-block IN/OUT facts of the may-reach fixpoint: FIFO worklist over
+# the block Vec order, a changed block requeues its successors (bounded by
+# slice_max_items() — documented).
+struct SliceReachFacts
+  in_map: Map[Int, Map[Int, Set[String]]]
+  out_map: Map[Int, Map[Int, Set[String]]]
+end
+
+def slice_reach_in_out(ctx: SliceFnCtx) -> SliceReachFacts
+  var in_map: Map[Int, Map[Int, Set[String]]] = Map::new()
+  var out_map: Map[Int, Map[Int, Set[String]]] = Map::new()
+  var queue: Vec[Int] = Vec::new()
+  var queued: Set[Int] = Set::new()
+  var bi = 0
+  while bi < ctx.f.blocks.len() do
+    in_map.insert(bi, Map::new())
+    out_map.insert(bi, Map::new())
+    queue.push(bi)
+    queued.insert(bi)
+    bi = bi + 1
+  end
+  var items = 0
+  while queue.len() > 0 && items < slice_max_items() do
+    items = items + 1
+    let b = queue[0]
+    queue.remove(0)
+    queued.remove(&b)
+    var new_in: Map[Int, Set[String]] = Map::new()
+    var pred_rows: Vec[Int] = Vec::new()
+    match ctx.preds.get(b)
+    when Option::Some(rows) then pred_rows = rows.clone()
+    when Option::None then ()
+    end
+    for p in pred_rows do
+      var pout: Map[Int, Set[String]] = Map::new()
+      match out_map.get(p)
+      when Option::Some(o) then pout = o.clone()
+      when Option::None then ()
+      end
+      var entries: Vec[(Int, Set[String])] = pout.entries()
+      for e in entries do
+        var acc: Set[String] = Set::new()
+        match new_in.get(e.0)
+        when Option::Some(a) then acc = a.clone()
+        when Option::None then ()
+        end
+        for d in e.1 do
+          acc.insert(d.clone())
+        end
+        new_in.insert(e.0, acc)
+      end
+    end
+    var old_text = ""
+    match in_map.get(b)
+    when Option::Some(old) then old_text = slice_reach_state_text(old.clone())
+    when Option::None then ()
+    end
+    let new_text = slice_reach_state_text(new_in.clone())
+    if new_text != old_text then
+      in_map.insert(b, new_in.clone())
+      let new_out = slice_reach_block_out(ctx.clone(), b, new_in)
+      out_map.insert(b, new_out)
+      var succ_rows: Vec[Int] = Vec::new()
+      match ctx.succs.get(b)
+      when Option::Some(s) then succ_rows = s.clone()
+      when Option::None then ()
+      end
+      for s2 in succ_rows do
+        if !queued.contains(&s2) then
+          queued.insert(s2)
+          queue.push(s2)
+        end
+      end
+    end
+  end
+  SliceReachFacts { in_map: in_map, out_map: out_map }
+end
+
+# The reaching definitions of a USE node's read operands: for every
+# distinct read local, the in-block defs from the nearest bare def up to
+# the use (partial defs included) or, when no bare def is below the use,
+# the block's IN set — answered as (operand local key, sorted stable def
+# ids). An unknown function or anchor yields the empty vector (the query
+# layer's mir_reaching_def_rows distinguishes the two against the
+# function table).
+pub def mir_reaching_defs(mir: MirProgram, function_key: String, stmt_key: String) -> Vec[(String, Vec[String])]
+  match slice_fn_find(mir, function_key.clone())
+  when Option::None then Vec::new()
+  when Option::Some(ctx) then
+    match slice_node_anchor_at(&ctx, &stmt_key)
+    when Option::None then Vec::new()
+    when Option::Some(parts) then
+      let v = parts.0
+      let p = parts.1
+      let block_len = ctx.f.blocks[v].statements.len()
+      var reads: Vec[Int] = Vec::new()
+      if p >= block_len then
+        reads = slice_term_reads(&ctx.f.blocks[v].terminator)
+      else
+        reads = slice_stmt_reads(ctx.f.blocks[v].statements[p])
+      end
+      var locals: Vec[Int] = Vec::new()
+      for r in reads do
+        if !locals.contains(&r) then
+          locals.push(r)
+        end
+      end
+      let facts = slice_reach_in_out(ctx.clone())
+      var rows: Vec[(String, Vec[String])] = Vec::new()
+      var li = 0
+      while li < locals.len() do
+        let l = locals[li]
+        var slots: Vec[String] = Vec::new()
+        var found_bare = false
+        var si = p - 1
+        if si > block_len - 1 then
+          si = block_len - 1
+        end
+        while si >= 0 && !found_bare do
+          let st = ctx.f.blocks[v].statements[si]
+          let defs = slice_stmt_defs(st)
+          if defs.0 == l then
+            slots.push(slice_graph_slot_text(v, si))
+            found_bare = true
+          elsif defs.1 == l then
+            slots.push(slice_graph_slot_text(v, si))
+          end
+          si = si - 1
+        end
+        if !found_bare then
+          match facts.in_map.get(v)
+          when Option::Some(vin) then
+            match vin.get(l)
+            when Option::Some(s) then
+              for d in s do
+                if !slots.contains(&d) then
+                  slots.push(d.clone())
+                end
+              end
+            when Option::None then ()
+            end
+          when Option::None then ()
+          end
+        end
+        var def_keys: Vec[String] = Vec::new()
+        for slot in slots do
+          let slot_parts = slice_graph_slot_parts(slot)
+          if slot_parts.0 >= 0 && slot_parts.1 >= 0 then
+            let key = slice_graph_node_stmt_text(&mir, &ctx, slot_parts.0, slot_parts.1)
+            if key.len() > 0 && !def_keys.contains(&key) then
+              def_keys.push(key)
+            end
+          end
+        end
+        def_keys.sort_by(|a, b| a < b)
+        rows.push((slice_local_canonical_text(&ctx.f, l), def_keys))
+        li = li + 1
+      end
+      rows.sort_by(|a, b| if a.0 != b.0 then a.0 < b.0 else a.1.join(",") < b.1.join(",") end)
+      rows
+    end
+  end
+end
+
+# ———— Drop / effect paths ————
+
+# A DROP site: the node is the block's terminator (p == the statement
+# count) and the terminator is a MirDeinit.
+def slice_path_site_is_drop(ctx: SliceFnCtx, v: Int, p: Int) -> Bool
+  let block_len = ctx.f.blocks[v].statements.len()
+  if p != block_len then
+    return false
+  end
+  match ctx.f.blocks[v].terminator.kind
+  when MirTerminatorKind::MirDeinit { place: _, deinit_fn: _, target: _, unwind: _ } then true
+  when _ then false
+  end
+end
+
+# An EFFECT site: a §11-classified call/deinit terminator, a
+# MirEffectPerform / MirEffectRecord statement or the string-concat
+# MirBinOp::Add assignment (slice_effect's direct-site vocabulary).
+def slice_path_site_is_effect(mir: MirProgram, ctx: SliceFnCtx, v: Int, p: Int) -> Bool
+  let block_len = ctx.f.blocks[v].statements.len()
+  if p >= block_len then
+    let term = ctx.f.blocks[v].terminator
+    let type_index = slice_type_index(&mir)
+    let fn_index = slice_fn_index(&mir)
+    let ev = slice_term_effect_evidence(&mir, &ctx.f, &term, &type_index, &fn_index)
+    for e in ev do
+      if e.len() > 0 then
+        return true
+      end
+    end
+    return false
+  end
+  let st = ctx.f.blocks[v].statements[p]
+  let ev2 = slice_stmt_effect_evidence(&ctx.f, st)
+  for e2 in ev2 do
+    if e2.len() > 0 then
+      return true
+    end
+  end
+  false
+end
+
+# The path slice of a site node: the site + its block's statement prefix
+# (the local path) + the anchored backward def chains of the values the
+# site reads (the contributing dataflow path). Statements are emitted as
+# the item-16 stable statement id texts; the SliceBack externals ride
+# along (sorted).
+def slice_path_mir(mir: MirProgram, ctx: SliceFnCtx, v: Int, p: Int) -> MirSlice
+  var back = SliceBack { ctx: ctx.clone(), work: Vec::new(), seen: Set::new(), included: Map::new(), external: Set::new(), items: 0 }
+  let block_len = ctx.f.blocks[v].statements.len()
+  var reads: Vec[Int] = Vec::new()
+  var span = Span { file: "", start: 0, end_pos: 0 }
+  if p >= block_len then
+    let term = ctx.f.blocks[v].terminator
+    reads = slice_term_reads(&term)
+    span = slice_span_copy(term.span)
+  else
+    let st = ctx.f.blocks[v].statements[p]
+    reads = slice_stmt_reads(st)
+    span = slice_span_copy(st.span)
+  end
+  slice_back_include(&mut back, v, p, span)
+  var ti = 0
+  while ti < p && ti < block_len do
+    let st2 = ctx.f.blocks[v].statements[ti]
+    let tspan = slice_span_copy(st2.span)
+    slice_back_include(&mut back, v, ti, tspan)
+    ti = ti + 1
+  end
+  for r in reads do
+    slice_backward_at(&mut back, v, p, r)
+  end
+  let res = slice_result_build(&back.ctx, &back.included, &back.external)
+  var stable: Vec[String] = Vec::new()
+  for row in res.statements do
+    match snapshot_mir_locator_of_key(row.clone())
+    when Option::Some(loc) then
+      let rv = slice_block_vec_index(&ctx, loc.block_ordinal)
+      if rv >= 0 then
+        let rlen = ctx.f.blocks[rv].statements.len()
+        var rp = -1
+        if loc.stmt_ordinal < 0 then
+          rp = rlen
+        elsif loc.stmt_ordinal < rlen then
+          rp = loc.stmt_ordinal
+        end
+        if rp >= 0 then
+          let key = slice_graph_node_stmt_text(&mir, &ctx, rv, rp)
+          if key.len() > 0 && !stable.contains(&key) then
+            stable.push(key)
+          end
+        end
+      end
+    when Option::None then ()
+    end
+  end
+  stable.sort_by(|a, b| a < b)
+  MirSlice {
+    function_key: ctx.name.clone(),
+    statements: stable,
+    externals: res.external.clone(),
+    kind: MirSliceKind::Path
+  }
+end
+
+# The typed DROP-path slice of a MirDeinit site (AnchorNotFound when the
+# node is not a deinit).
+pub def mir_drop_paths(mir: MirProgram, function_key: String, site_key: String) -> Result[MirSlice, MirSliceError]
+  match slice_fn_find(mir.clone(), function_key.clone())
+  when Option::None then Result::Err(MirSliceError::FunctionNotFound)
+  when Option::Some(ctx) then
+    match slice_node_anchor_at(&ctx, &site_key)
+    when Option::None then Result::Err(MirSliceError::AnchorNotFound)
+    when Option::Some(parts) then
+      if slice_path_site_is_drop(ctx.clone(), parts.0, parts.1) then
+        Result::Ok(slice_path_mir(mir, ctx, parts.0, parts.1))
+      else
+        Result::Err(MirSliceError::AnchorNotFound)
+      end
+    end
+  end
+end
+
+# The typed EFFECT-path slice of a §11 effect site (AnchorNotFound when the
+# node is not an effect site).
+pub def mir_effect_paths(mir: MirProgram, function_key: String, site_key: String) -> Result[MirSlice, MirSliceError]
+  match slice_fn_find(mir.clone(), function_key.clone())
+  when Option::None then Result::Err(MirSliceError::FunctionNotFound)
+  when Option::Some(ctx) then
+    match slice_node_anchor_at(&ctx, &site_key)
+    when Option::None then Result::Err(MirSliceError::AnchorNotFound)
+    when Option::Some(parts) then
+      if slice_path_site_is_effect(mir.clone(), ctx.clone(), parts.0, parts.1) then
+        Result::Ok(slice_path_mir(mir, ctx, parts.0, parts.1))
+      else
+        Result::Err(MirSliceError::AnchorNotFound)
+      end
+    end
+  end
+end
+
+# The typed Path kind dispatcher: a MirDeinit terminator is a DROP path; any
+# §11 effect site is an EFFECT path; anything else is AnchorNotFound.
+pub def mir_paths(mir: MirProgram, function_key: String, anchor: String) -> Result[MirSlice, MirSliceError]
+  match slice_fn_find(mir.clone(), function_key.clone())
+  when Option::None then Result::Err(MirSliceError::FunctionNotFound)
+  when Option::Some(ctx) then
+    match slice_node_anchor_at(&ctx, &anchor)
+    when Option::None then Result::Err(MirSliceError::AnchorNotFound)
+    when Option::Some(parts) then
+      let is_drop = slice_path_site_is_drop(ctx.clone(), parts.0, parts.1)
+      var is_effect = false
+      if !is_drop then
+        is_effect = slice_path_site_is_effect(mir.clone(), ctx.clone(), parts.0, parts.1)
+      end
+      if is_drop || is_effect then
+        Result::Ok(slice_path_mir(mir, ctx, parts.0, parts.1))
+      else
+        Result::Err(MirSliceError::AnchorNotFound)
+      end
+    end
+  end
+end
+
+# ———— The query-layer row builders ————
+
+pub def mir_function_present(mir: MirProgram, function_key: String) -> Bool
+  match slice_fn_find(mir, function_key)
+  when Option::Some(_) then true
+  when Option::None then false
+  end
+end
+
+pub def mir_dominator_rows(mir: MirProgram, function_key: String) -> Option[Vec[String]]
+  if !mir_function_present(mir.clone(), function_key.clone()) then
+    return Option::None
+  end
+  let rows = mir_dominators(mir, function_key)
+  var out: Vec[String] = Vec::new()
+  for r in rows do
+    out.push(r.0.clone() + "|" + r.1.clone())
+  end
+  Option::Some(out)
+end
+
+pub def mir_postdominator_rows(mir: MirProgram, function_key: String) -> Option[Vec[String]]
+  if !mir_function_present(mir.clone(), function_key.clone()) then
+    return Option::None
+  end
+  let rows = mir_postdominators(mir, function_key)
+  var out: Vec[String] = Vec::new()
+  for r in rows do
+    out.push(r.0.clone() + "|" + r.1.clone())
+  end
+  Option::Some(out)
+end
+
+pub def mir_loop_rows(mir: MirProgram, function_key: String) -> Option[Vec[String]]
+  if !mir_function_present(mir.clone(), function_key.clone()) then
+    return Option::None
+  end
+  let loops = mir_loops(mir, function_key)
+  var out: Vec[String] = Vec::new()
+  for l in loops do
+    out.push(l.header_key.clone() + "|" + l.parent_header_key.clone() + "|" + l.block_keys.join(","))
+  end
+  Option::Some(out)
+end
+
+pub def mir_control_dependence_rows(mir: MirProgram, function_key: String) -> Option[Vec[String]]
+  if !mir_function_present(mir.clone(), function_key.clone()) then
+    return Option::None
+  end
+  let rows = mir_control_dependence(mir, function_key)
+  var out: Vec[String] = Vec::new()
+  for r in rows do
+    out.push(r.0.clone() + "|" + r.1.clone())
+  end
+  Option::Some(out)
+end
+
+pub def mir_reaching_def_rows(mir: MirProgram, function_key: String, stmt_key: String) -> Option[Vec[String]]
+  match slice_fn_find(mir.clone(), function_key.clone())
+  when Option::None then Option::None
+  when Option::Some(ctx) then
+    match slice_node_anchor_at(&ctx, &stmt_key)
+    when Option::None then Option::None
+    when Option::Some(_) then
+      let rows = mir_reaching_defs(mir, function_key, stmt_key)
+      var out: Vec[String] = Vec::new()
+      for r in rows do
+        out.push(r.0.clone() + "|" + r.1.join(","))
+      end
+      Option::Some(out)
+    end
+  end
+end
+
+pub def mir_path_slice(mir: MirProgram, function_key: String, anchor: String) -> Option[MirSlice]
+  match mir_paths(mir, function_key, anchor)
+  when Result::Ok(slice) then Option::Some(slice)
+  when Result::Err(_) then Option::None
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The mir.graph lane check (the sibling lane-def pattern): hand-built
+# MirPrograms asserting the graph algorithms' structural answers
+# (verifier_projection_tests.tg's construction style). Empty = the lane
+# verifies.
+# ———————————————————————————————————————————————————————————————
+
+def mir_lane_switch_operand() -> MirOperand
+  operand_constant(MirConstant { kind: MirConstantKind::MirInt(0), ty: Type::Int, instance: Option::None })
+end
+
+def mir_lane_instance() -> InstanceId
+  InstanceId {
+    def: CallableId { def: DefId { module: ModuleId { id: 0 }, index: 0 } },
+    substs: Vec::new()
+  }
+end
+
+def mir_lane_assign(dest_local: Int, rvalue: MirRvalue) -> MirStatement
+  MirStatement {
+    kind: MirStatementKind::MirAssign(place_local(MirLocalId { id: dest_local }), rvalue),
+    span: span_dummy()
+  }
+end
+
+def mir_lane_copy_rvalue(src_local: Int) -> MirRvalue
+  MirRvalue {
+    kind: MirRvalueKind::MirMove(operand_copy(place_local(MirLocalId { id: src_local }))),
+    span: span_dummy()
+  }
+end
+
+def mir_lane_add_rvalue(l: Int, r: Int) -> MirRvalue
+  MirRvalue {
+    kind: MirRvalueKind::MirBinOp(MirBinOp::Add, operand_copy(place_local(MirLocalId { id: l })), operand_copy(place_local(MirLocalId { id: r }))),
+    span: span_dummy()
+  }
+end
+
+def mir_lane_goto(id: Int) -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirGoto(MirBlockId { id: id }), span: span_dummy() }
+end
+
+def mir_lane_return() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def mir_lane_switch(if_true: Int, if_false: Int) -> MirTerminator
+  MirTerminator {
+    kind: MirTerminatorKind::MirSwitchInt {
+      op: mir_lane_switch_operand(),
+      targets: Vec::from([SwitchTarget { value: 1, target: MirBlockId { id: if_true } }]),
+      default_target: MirBlockId { id: if_false }
+    },
+    span: span_dummy()
+  }
+end
+
+def mir_lane_deinit(place_local_id: Int, target: Int) -> MirTerminator
+  MirTerminator {
+    kind: MirTerminatorKind::MirDeinit {
+      place: place_local(MirLocalId { id: place_local_id }),
+      deinit_fn: mir_lane_instance(),
+      target: MirBlockId { id: target },
+      unwind: Option::None
+    },
+    span: span_dummy()
+  }
+end
+
+def mir_lane_block(id: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: id }, statements: stmts, terminator: term }
+end
+
+def mir_lane_local(id: Int, name: String, ty: Type) -> MirLocal
+  MirLocal { id: MirLocalId { id: id }, name: name, ty: ty, is_mut: false, span: span_dummy() }
+end
+
+def mir_lane_fn(name: String, locals: Vec[MirLocal], blocks: Vec[MirBlock]) -> MirFunction
+  MirFunction {
+    name: name,
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "",
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def mir_lane_program(f: MirFunction) -> MirProgram
+  MirProgram { functions: Vec::from([f]), statics: Vec::new(), types: Vec::new() }
+end
+
+# The diamond: 0 branches to 1/2, both join at 3.
+def mir_lane_diamond() -> MirProgram
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(mir_lane_block(0, Vec::new(), mir_lane_switch(1, 2)))
+  blocks.push(mir_lane_block(1, Vec::new(), mir_lane_goto(3)))
+  blocks.push(mir_lane_block(2, Vec::new(), mir_lane_goto(3)))
+  blocks.push(mir_lane_block(3, Vec::new(), mir_lane_return()))
+  mir_lane_program(mir_lane_fn("lane_diamond".to_string(), Vec::new(), blocks))
+end
+
+# The loop: 1 is the header (2 its body), 3 the exit.
+def mir_lane_loop() -> MirProgram
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(mir_lane_block(0, Vec::new(), mir_lane_goto(1)))
+  blocks.push(mir_lane_block(1, Vec::new(), mir_lane_switch(2, 3)))
+  blocks.push(mir_lane_block(2, Vec::new(), mir_lane_goto(1)))
+  blocks.push(mir_lane_block(3, Vec::new(), mir_lane_return()))
+  mir_lane_program(mir_lane_fn("lane_loop".to_string(), Vec::new(), blocks))
+end
+
+# The nested loops: outer header 1 (body 2,3,4), inner header 3 (body 4).
+def mir_lane_nested() -> MirProgram
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(mir_lane_block(0, Vec::new(), mir_lane_goto(1)))
+  blocks.push(mir_lane_block(1, Vec::new(), mir_lane_switch(2, 5)))
+  blocks.push(mir_lane_block(2, Vec::new(), mir_lane_goto(3)))
+  blocks.push(mir_lane_block(3, Vec::new(), mir_lane_switch(4, 1)))
+  blocks.push(mir_lane_block(4, Vec::new(), mir_lane_goto(3)))
+  blocks.push(mir_lane_block(5, Vec::new(), mir_lane_return()))
+  mir_lane_program(mir_lane_fn("lane_nested".to_string(), Vec::new(), blocks))
+end
+
+# The straight-line reaching-def fixture: b = a; c = b + b; b = c; a = b.
+def mir_lane_reach() -> MirProgram
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(mir_lane_local(0, "_ret".to_string(), Type::Unit))
+  locals.push(mir_lane_local(1, "a".to_string(), Type::Int))
+  locals.push(mir_lane_local(2, "b".to_string(), Type::Int))
+  locals.push(mir_lane_local(3, "c".to_string(), Type::Int))
+  var stmts: Vec[MirStatement] = Vec::new()
+  stmts.push(mir_lane_assign(2, mir_lane_copy_rvalue(1)))
+  stmts.push(mir_lane_assign(3, mir_lane_add_rvalue(2, 2)))
+  stmts.push(mir_lane_assign(2, mir_lane_copy_rvalue(3)))
+  stmts.push(mir_lane_assign(1, mir_lane_copy_rvalue(2)))
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(mir_lane_block(0, stmts, mir_lane_return()))
+  mir_lane_program(mir_lane_fn("lane_reach".to_string(), locals, blocks))
+end
+
+# The cross-block reaching-def fixture: block0 defines b, block1 uses it.
+def mir_lane_reach_cross() -> MirProgram
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(mir_lane_local(0, "_ret".to_string(), Type::Unit))
+  locals.push(mir_lane_local(1, "a".to_string(), Type::Int))
+  locals.push(mir_lane_local(2, "b".to_string(), Type::Int))
+  locals.push(mir_lane_local(3, "c".to_string(), Type::Int))
+  var b0: Vec[MirStatement] = Vec::new()
+  b0.push(mir_lane_assign(2, mir_lane_copy_rvalue(1)))
+  var b1: Vec[MirStatement] = Vec::new()
+  b1.push(mir_lane_assign(3, mir_lane_add_rvalue(2, 2)))
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(mir_lane_block(0, b0, mir_lane_goto(1)))
+  blocks.push(mir_lane_block(1, b1, mir_lane_return()))
+  mir_lane_program(mir_lane_fn("lane_reach_cross".to_string(), locals, blocks))
+end
+
+# The drop fixture: block0 defines b, block1 deinits it, block2 returns.
+def mir_lane_drop() -> MirProgram
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(mir_lane_local(0, "_ret".to_string(), Type::Unit))
+  locals.push(mir_lane_local(1, "a".to_string(), Type::Int))
+  locals.push(mir_lane_local(2, "b".to_string(), Type::Int))
+  var b0: Vec[MirStatement] = Vec::new()
+  b0.push(mir_lane_assign(2, mir_lane_copy_rvalue(1)))
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(mir_lane_block(0, b0, mir_lane_goto(1)))
+  blocks.push(mir_lane_block(1, Vec::new(), mir_lane_deinit(2, 2)))
+  blocks.push(mir_lane_block(2, Vec::new(), mir_lane_return()))
+  mir_lane_program(mir_lane_fn("lane_drop".to_string(), locals, blocks))
+end
+
+def mir_lane_bkey(name: String, id: Int) -> String
+  slice_graph_block_key(&name, id)
+end
+
+def mir_graph_lane_same(a: Vec[String], b: Vec[String]) -> Bool
+  if a.len() != b.len() then
+    return false
+  end
+  var i = 0
+  while i < a.len() do
+    if a[i] != b[i] then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+def mir_graph_lane_contains(rows: Vec[String], key: String) -> Bool
+  for r in rows do
+    if r == key then
+      return true
+    end
+  end
+  false
+end
+
+def mir_graph_lane_row(inout out: Vec[String], name: String, got: Vec[String], expected: Vec[String]) -> Unit
+  if !mir_graph_lane_same(got, expected) then
+    out.push(name + ": expected [" + expected.join(",") + "], got [" + got.join(",") + "]")
+  end
+  ()
+end
+
+# Run the lane rows. Returns every mismatch row (empty = the lane verifies).
+pub def mir_graph_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  # —— the diamond: dominance, postdominance, no loops, branch control
+  # dependence ——
+  let diamond = mir_lane_diamond()
+  let dname = "lane_diamond".to_string()
+  var d_dom: Vec[String] = Vec::from([
+    mir_lane_bkey(&dname, 0) + "|" + mir_lane_bkey(&dname, 0),
+    mir_lane_bkey(&dname, 1) + "|" + mir_lane_bkey(&dname, 0),
+    mir_lane_bkey(&dname, 2) + "|" + mir_lane_bkey(&dname, 0),
+    mir_lane_bkey(&dname, 3) + "|" + mir_lane_bkey(&dname, 0)
+  ])
+  d_dom.sort_by(|a, b| a < b)
+  mir_graph_lane_row(&mut out, "dom.diamond", mir_dominator_rows(diamond.clone(), dname.clone()).unwrap_or(Vec::new()), d_dom)
+  var d_post: Vec[String] = Vec::from([
+    mir_lane_bkey(&dname, 0) + "|" + mir_lane_bkey(&dname, 3),
+    mir_lane_bkey(&dname, 1) + "|" + mir_lane_bkey(&dname, 3),
+    mir_lane_bkey(&dname, 2) + "|" + mir_lane_bkey(&dname, 3),
+    mir_lane_bkey(&dname, 3) + "|"
+  ])
+  d_post.sort_by(|a, b| a < b)
+  mir_graph_lane_row(&mut out, "post.diamond", mir_postdominator_rows(diamond.clone(), dname.clone()).unwrap_or(Vec::new()), d_post)
+  mir_graph_lane_row(&mut out, "loops.diamond", mir_loop_rows(diamond.clone(), dname.clone()).unwrap_or(Vec::new()), Vec::new())
+  var d_cd: Vec[String] = Vec::from([
+    mir_lane_bkey(&dname, 1) + "|" + mir_lane_bkey(&dname, 0),
+    mir_lane_bkey(&dname, 2) + "|" + mir_lane_bkey(&dname, 0)
+  ])
+  d_cd.sort_by(|a, b| a < b)
+  mir_graph_lane_row(&mut out, "cd.diamond", mir_control_dependence_rows(diamond.clone(), dname.clone()).unwrap_or(Vec::new()), d_cd)
+
+  # —— the loop: one natural loop, header self-control, header/exit ipdom ——
+  let loop_fn = mir_lane_loop()
+  let lname = "lane_loop".to_string()
+  var l_dom: Vec[String] = Vec::from([
+    mir_lane_bkey(&lname, 0) + "|" + mir_lane_bkey(&lname, 0),
+    mir_lane_bkey(&lname, 1) + "|" + mir_lane_bkey(&lname, 0),
+    mir_lane_bkey(&lname, 2) + "|" + mir_lane_bkey(&lname, 1),
+    mir_lane_bkey(&lname, 3) + "|" + mir_lane_bkey(&lname, 1)
+  ])
+  l_dom.sort_by(|a, b| a < b)
+  mir_graph_lane_row(&mut out, "dom.loop", mir_dominator_rows(loop_fn.clone(), lname.clone()).unwrap_or(Vec::new()), l_dom)
+  var l_post: Vec[String] = Vec::from([
+    mir_lane_bkey(&lname, 0) + "|" + mir_lane_bkey(&lname, 1),
+    mir_lane_bkey(&lname, 1) + "|" + mir_lane_bkey(&lname, 3),
+    mir_lane_bkey(&lname, 2) + "|" + mir_lane_bkey(&lname, 1),
+    mir_lane_bkey(&lname, 3) + "|"
+  ])
+  l_post.sort_by(|a, b| a < b)
+  mir_graph_lane_row(&mut out, "post.loop", mir_postdominator_rows(loop_fn.clone(), lname.clone()).unwrap_or(Vec::new()), l_post)
+  var l_loops: Vec[String] = Vec::from([
+    mir_lane_bkey(&lname, 1) + "||" + mir_lane_bkey(&lname, 1) + "," + mir_lane_bkey(&lname, 2)
+  ])
+  mir_graph_lane_row(&mut out, "loops.loop", mir_loop_rows(loop_fn.clone(), lname.clone()).unwrap_or(Vec::new()), l_loops)
+  var l_cd: Vec[String] = Vec::from([
+    mir_lane_bkey(&lname, 1) + "|" + mir_lane_bkey(&lname, 1),
+    mir_lane_bkey(&lname, 2) + "|" + mir_lane_bkey(&lname, 1)
+  ])
+  l_cd.sort_by(|a, b| a < b)
+  mir_graph_lane_row(&mut out, "cd.loop", mir_control_dependence_rows(loop_fn.clone(), lname.clone()).unwrap_or(Vec::new()), l_cd)
+
+  # —— the nested loops: the forest parent — the inner header's parent is
+  # the outer header ——
+  let nested = mir_lane_nested()
+  let nname = "lane_nested".to_string()
+  var n_dom: Vec[String] = Vec::from([
+    mir_lane_bkey(&nname, 0) + "|" + mir_lane_bkey(&nname, 0),
+    mir_lane_bkey(&nname, 1) + "|" + mir_lane_bkey(&nname, 0),
+    mir_lane_bkey(&nname, 2) + "|" + mir_lane_bkey(&nname, 1),
+    mir_lane_bkey(&nname, 3) + "|" + mir_lane_bkey(&nname, 2),
+    mir_lane_bkey(&nname, 4) + "|" + mir_lane_bkey(&nname, 3),
+    mir_lane_bkey(&nname, 5) + "|" + mir_lane_bkey(&nname, 1)
+  ])
+  n_dom.sort_by(|a, b| a < b)
+  mir_graph_lane_row(&mut out, "dom.nested", mir_dominator_rows(nested.clone(), nname.clone()).unwrap_or(Vec::new()), n_dom)
+  var n_post: Vec[String] = Vec::from([
+    mir_lane_bkey(&nname, 0) + "|" + mir_lane_bkey(&nname, 1),
+    mir_lane_bkey(&nname, 1) + "|" + mir_lane_bkey(&nname, 5),
+    mir_lane_bkey(&nname, 2) + "|" + mir_lane_bkey(&nname, 3),
+    mir_lane_bkey(&nname, 3) + "|" + mir_lane_bkey(&nname, 1),
+    mir_lane_bkey(&nname, 4) + "|" + mir_lane_bkey(&nname, 3),
+    mir_lane_bkey(&nname, 5) + "|"
+  ])
+  n_post.sort_by(|a, b| a < b)
+  mir_graph_lane_row(&mut out, "post.nested", mir_postdominator_rows(nested.clone(), nname.clone()).unwrap_or(Vec::new()), n_post)
+  var n_loops: Vec[String] = Vec::from([
+    mir_lane_bkey(&nname, 1) + "||" + mir_lane_bkey(&nname, 1) + "," + mir_lane_bkey(&nname, 2) + "," + mir_lane_bkey(&nname, 3) + "," + mir_lane_bkey(&nname, 4),
+    mir_lane_bkey(&nname, 3) + "|" + mir_lane_bkey(&nname, 1) + "|" + mir_lane_bkey(&nname, 3) + "," + mir_lane_bkey(&nname, 4)
+  ])
+  n_loops.sort_by(|a, b| a < b)
+  mir_graph_lane_row(&mut out, "loops.nested", mir_loop_rows(nested.clone(), nname.clone()).unwrap_or(Vec::new()), n_loops)
+
+  # —— the reaching defs: the kill (nearest bare def) and the cross-block
+  # predecessor def ——
+  let reach = mir_lane_reach()
+  let rname = "lane_reach".to_string()
+  match slice_fn_find(reach.clone(), rname.clone())
+  when Option::Some(rctx) then
+    let kill_key = slice_graph_node_stmt_text(&reach, &rctx, 0, 2)
+    let kill_use = slice_stmt_key(&rname, 0, 3)
+    mir_graph_lane_row(&mut out, "reach.kill", mir_reaching_def_rows(reach.clone(), rname.clone(), kill_use).unwrap_or(Vec::new()), Vec::from(["b|" + kill_key]))
+    let first_key = slice_graph_node_stmt_text(&reach, &rctx, 0, 0)
+    let first_use = slice_stmt_key(&rname, 0, 1)
+    mir_graph_lane_row(&mut out, "reach.first", mir_reaching_def_rows(reach.clone(), rname.clone(), first_use).unwrap_or(Vec::new()), Vec::from(["b|" + first_key]))
+  when Option::None then
+    out.push("reach: fixture function not found")
+  end
+  let cross = mir_lane_reach_cross()
+  let cname = "lane_reach_cross".to_string()
+  match slice_fn_find(cross.clone(), cname.clone())
+  when Option::Some(cctx) then
+    let cross_key = slice_graph_node_stmt_text(&cross, &cctx, 0, 0)
+    let cross_use = slice_stmt_key(&cname, 1, 0)
+    mir_graph_lane_row(&mut out, "reach.cross", mir_reaching_def_rows(cross.clone(), cname.clone(), cross_use).unwrap_or(Vec::new()), Vec::from(["b|" + cross_key]))
+  when Option::None then
+    out.push("reach.cross: fixture function not found")
+  end
+
+  # —— the drop path: the site + its destroyed place's def chain ——
+  let drop_fn = mir_lane_drop()
+  let dname2 = "lane_drop".to_string()
+  let drop_site = slice_term_key(&dname2, 1)
+  match slice_fn_find(drop_fn.clone(), dname2.clone())
+  when Option::Some(dctx) then
+    let site_key = slice_graph_node_stmt_text(&drop_fn, &dctx, 1, 0)
+    let def_key = slice_graph_node_stmt_text(&drop_fn, &dctx, 0, 0)
+    match mir_path_slice(drop_fn.clone(), dname2.clone(), drop_site)
+    when Option::Some(slice) then
+      if !mir_graph_lane_contains(&slice.statements, &site_key) then
+        out.push("path.drop: missing site " + site_key.clone())
+      end
+      if !mir_graph_lane_contains(&slice.statements, &def_key) then
+        out.push("path.drop: missing def " + def_key.clone())
+      end
+    when Option::None then
+      out.push("path.drop: expected a resolved path slice, got none")
+    end
+  when Option::None then
+    out.push("path.drop: fixture function not found")
+  end
+  out
 end

@@ -1,0 +1,1050 @@
+# Tangerine Compiler — Semantic Diagnostics (third-audit items 23 + 24)
+# Self-hosting compiler written in Tangerine
+#
+# The PERSISTENT diagnostic layer over the ONE shared Diagnostic record
+# (parser.tg): the STABLE diagnostic identity, the append-only store that
+# survives a session revision, and the TYPED ExplainNode derivation trees
+# the explain / repair-context consumers walk instead of re-parsing prose.
+#
+# WHY THIS MODULE IS A LEAF: it imports parser.tg (the Diagnostic record
+# and the typed semantic payloads) and stable_ids.tg (the stable digest)
+# only. parser.tg therefore cannot carry a typed StableDiagnosticId field
+# (that would close an import cycle); Diagnostic.id is the canonical id
+# TEXT render this module stamps (diagnostic_store_add_stamping) and the
+# round-trip handle diagnostic.get consumes.
+#
+# STABLE DIAGNOSTIC ID (audit item 23). A diagnostic's identity is the
+# semantic tuple (owner, cause, code, obligation):
+#   - owner      — the diagnostic's primary_symbol when it records one,
+#                  else "" (the typed payloads carry no symbol field; the
+#                  primary symbol is the source-level anchor).
+#   - cause      — the typed payload's site/place/node field:
+#                  TypeMismatchData.site, OwnershipDiagnosticData.place,
+#                  EffectViolationData.path[0] (the claimed subject node);
+#                  else the dense span locator "<file>:<start>"; else the
+#                  word "diagnostic". TraitFailureData carries no
+#                  site/place/node — its obligation is the tuple's own
+#                  obligation component and its cause falls to the span.
+#   - code       — the ErrorCode render ("E0201", ...; "" when none).
+#   - obligation — the typed TraitFailureData obligation render ("" for
+#                  every other payload and a payload-less diagnostic).
+# Semantically identical repeats (same tuple, different content — e.g. the
+# same rejection at two loop sites) are distinguished by the store-side
+# collision_ordinal: a per-tuple counter that starts at 0 and increments
+# once per stored occurrence. Re-adding the SAME content under the same
+# tuple is IDEMPOTENT (the existing id is returned, the counter does not
+# move), so re-running a pipeline over an unchanged compile never forks
+# identities. digest_hi/digest_lo are the 128-bit stable digest of the
+# canonical length-prefixed id text (owner, cause, code, obligation,
+# ordinal); Eq/Hash compare the digest words only, like the stable_ids
+# section-3/6 records.
+#
+# DIAGNOSTIC RECORD / STORE (audit item 23). DiagnosticRecord is the
+# PERSISTENT store form: id, message, span locator, the typed payload's
+# class word (semantic_kind) and the typed payload's RENDERED rows
+# (related). The RICH typed payload stays on the live Diagnostic
+# (parser.tg's semantic_data) — the record is the serializable projection,
+# and diagnostic.get returns it as canonical rows. DiagnosticStore is
+# append-only: by_id in insertion order + the collision counters map;
+# store_all re-renders the id-ordered view.
+#
+# EXPLAIN NODE (audit item 24 / item 52's typed follow-up). ExplainNode is
+# the typed derivation tree:
+#   kind     — the machine class word of the node ("ownership-rejection",
+#              "type-mismatch", "bound-failure-chain", "reason", ...) —
+#              the discriminator explain_node_find matches on.
+#   subject  — the node's ONE rendered line text (sans indentation). An
+#              empty subject (with empty fact/relation) makes the node a
+#              pure CONTAINER: it renders no line but keeps its children.
+#   relation — optional relation word; the reserved word "verbatim" marks
+#              a reason row that carries its OWN embedded indentation and
+#              is rendered WITHOUT the renderer's indent (the §34
+#              constraint-chain rows — the byte-identity rule below).
+#   fact     — optional reason text (used when subject is empty).
+#   children — ordered child nodes.
+# explain_node_render is the ONE renderer: line 0 = the root, two spaces
+# per depth, verbatim rows emitted unchanged. It reproduces the §52
+# explain_*_tree renders BYTE-IDENTICALLY (the effect evidence path is a
+# NESTED chain: path[0] under "evidence path", path[i] under path[i-1],
+# exactly the old 3 + i indent), so existing consumers hold.
+# explain_node_find / explain_node_find_all are the machine lookups
+# (pre-order, first match / all matches).
+#
+# DIAGNOSTIC EXPLAIN TREE. diagnostic_explain_node ports the §52
+# semantic_query.tg per-diagnostic renderer onto ExplainNode: root = the
+# primary symbol / semantic site / "diagnostic", children = the typed
+# DiagnosticSemanticData leaves and the non-empty §34 *_trace row families
+# (verbatim reason leaves). diagnostic_record_explain_node /
+# diagnostic_record_repair_context render the STORE form (never message
+# prose — the message travels through diagnostic.get's record rows, not
+# the derivation tree).
+
+use std::core::{Option, Result}
+use std::collections::{Vec, Map}
+use tg_compiler::token::{Span}
+use tg_compiler::parser::{
+  Diagnostic, DiagnosticSemanticData, DiagLevel, OwnershipDiagnosticData
+}
+use tg_compiler::stable_ids::{stable_key_digest}
+
+# ———————————————————————————————————————————————————————————————
+# StableDiagnosticId — the revision-stable diagnostic identity
+# ———————————————————————————————————————————————————————————————
+
+pub struct StableDiagnosticId
+  owner: String
+  cause: String
+  code: String
+  obligation: String
+  collision_ordinal: Int = 0
+  digest_hi: UInt = 0
+  digest_lo: UInt = 0
+end
+
+# The dense span locator of a diagnostic ("<file>:<start>"; "" when the
+# diagnostic carries no span) — the same "<file>:<start>" vocabulary the
+# typed payloads record in their site fields.
+def diagnostic_span_locator(d: Diagnostic) -> String
+  match d.span
+  when Option::Some(sp) then sp.file.clone() + ":" + sp.start.to_string()
+  when Option::None then "".to_string()
+  end
+end
+
+# The owner anchor: the primary symbol when recorded, else "".
+pub def stable_diagnostic_owner(d: Diagnostic) -> String
+  match d.primary_symbol
+  when Option::Some(p) then p.clone()
+  when Option::None then "".to_string()
+  end
+end
+
+# The cause locator: the typed payload's site/place/node field, else the
+# span locator, else the word "diagnostic".
+pub def stable_diagnostic_cause(d: Diagnostic) -> String
+  let fallback = stable_diagnostic_cause_fallback(&d)
+  match d.semantic_data
+  when Option::Some(sd) then
+    match sd
+    when DiagnosticSemanticData::Ownership(od) then
+      if od.place.len() > 0 then od.place.clone() else fallback.clone() end
+    when DiagnosticSemanticData::TypeMismatch(tm) then
+      if tm.site.len() > 0 then tm.site.clone() else fallback.clone() end
+    when DiagnosticSemanticData::TraitFailure(_) then
+      fallback.clone()
+    when DiagnosticSemanticData::EffectViolation(ev) then
+      if ev.path.len() > 0 then ev.path[0].clone() else fallback.clone() end
+    end
+  when Option::None then
+    fallback.clone()
+  end
+end
+
+def stable_diagnostic_cause_fallback(d: Diagnostic) -> String
+  let span_text = diagnostic_span_locator(d)
+  if span_text.len() > 0 then span_text else "diagnostic".to_string() end
+end
+
+# The code component: the ErrorCode render ("" when none).
+pub def stable_diagnostic_code(d: Diagnostic) -> String
+  match d.code
+  when Option::Some(c) then c.clone()
+  when Option::None then "".to_string()
+  end
+end
+
+# The obligation component: the typed TraitFailureData obligation render
+# ("" for every other payload class and a payload-less diagnostic).
+pub def stable_diagnostic_obligation(d: Diagnostic) -> String
+  var ob = "".to_string()
+  match d.semantic_data
+  when Option::Some(sd) then
+    match sd
+    when DiagnosticSemanticData::TraitFailure(tf) then ob = tf.obligation.clone()
+    when _ then ()
+    end
+  when Option::None then ()
+  end
+  ob
+end
+
+# The length-prefixed identity segment ("<len>:<text>") — the injectivity
+# convention of the composite identity texts (a helper mirror of
+# stable_ids.tg's module-private stable_identity_lenpref, so this module
+# stays a leaf).
+def diagnostic_lenpref(piece: String) -> String
+  piece.len().to_string() + ":" + piece
+end
+
+# The semantic tuple key (owner, cause, code, obligation) — the store's
+# counter key and the repeated-cause equivalence.
+pub def stable_diagnostic_tuple_key(
+  owner: String, cause: String, code: String, obligation: String
+) -> String
+  diagnostic_lenpref(&owner) + diagnostic_lenpref(&cause) +
+    diagnostic_lenpref(&code) + diagnostic_lenpref(&obligation)
+end
+
+# The canonical identity preimage: the semantic tuple PLUS the collision
+# ordinal (the ordinal is identity, not cargo — it distinguishes repeated
+# identical causes).
+def stable_diagnostic_id_canonical_text(
+  owner: String, cause: String, code: String, obligation: String, collision_ordinal: Int
+) -> String
+  stable_diagnostic_tuple_key(owner, cause, code, obligation) +
+    diagnostic_lenpref(&collision_ordinal.to_string())
+end
+
+# The typed id constructor: the 128-bit digest of the canonical preimage.
+pub def stable_diagnostic_id_of(
+  owner: String,
+  cause: String,
+  code: String,
+  obligation: String,
+  collision_ordinal: Int
+) -> StableDiagnosticId
+  let text = stable_diagnostic_id_canonical_text(
+    owner.clone(), cause.clone(), code.clone(), obligation.clone(), collision_ordinal)
+  let digest = stable_key_digest(&text)
+  StableDiagnosticId {
+    owner: owner,
+    cause: cause,
+    code: code,
+    obligation: obligation,
+    collision_ordinal: collision_ordinal,
+    digest_hi: digest.hi,
+    digest_lo: digest.lo
+  }
+end
+
+# The canonical id RENDER (diagnostics cargo / Diagnostic.id / the
+# diagnostic.get key): owner, code, cause, the length-prefixed obligation
+# and the ordinal. This is NOT the digest preimage — the digest words are
+# the identity; this text is the wire / round-trip handle.
+pub def stable_diagnostic_id_text(id: StableDiagnosticId) -> String
+  id.owner.clone() + "|diagnostic|" + id.code.clone() + "|" + id.cause.clone() +
+    "|" + diagnostic_lenpref(&id.obligation) + "|#" + id.collision_ordinal.to_string()
+end
+
+# ———— Eq/Hash (the digest-words fold; the pieces are collision cargo) ————
+
+impl Eq for StableDiagnosticId
+  def eq(self: Self, other: Self) -> Bool
+    self.digest_hi == other.digest_hi && self.digest_lo == other.digest_lo
+  end
+end
+
+impl Hash for StableDiagnosticId
+  def hash(self: Self) -> Int
+    var h = 0
+    h = ((h as UInt) * 31 + self.digest_hi) as Int
+    h = ((h as UInt) * 31 + self.digest_lo) as Int
+    h
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# DiagnosticRecord — the persistent store form
+# ———————————————————————————————————————————————————————————————
+# id / message / span / semantic_kind are the scalar spine; related
+# carries the TYPED payload's canonical rendered rows (the repair context
+# the store form can reconstruct without the live Diagnostic):
+#   ownership       place:<p> state_before:<s> operation:<o>
+#                   consumed_at:<site> rejected_at:<site> type:<t>
+#   type_mismatch   expected:<e> actual:<a> site:<locator>
+#   trait_failure   obligation:<ob> rejected_candidate:<render>...
+#   effect_violation effect:<ann> evidence:<i>:<fn>...
+# Rows are emitted in the payload's field order; the message NEVER enters
+# the derivation rows (it is the presentation spine and travels through
+# diagnostic.get's record rows).
+
+pub struct DiagnosticRecord
+  id: StableDiagnosticId
+  message: String
+  span: String
+  semantic_kind: String
+  related: Vec[String] = Vec::new()
+end
+
+pub def diagnostic_semantic_data_kind(d: Diagnostic) -> String
+  match d.semantic_data
+  when Option::Some(sd) then
+    match sd
+    when DiagnosticSemanticData::Ownership(_) then "ownership"
+    when DiagnosticSemanticData::TypeMismatch(_) then "type_mismatch"
+    when DiagnosticSemanticData::TraitFailure(_) then "trait_failure"
+    when DiagnosticSemanticData::EffectViolation(_) then "effect_violation"
+    end
+  when Option::None then "none"
+  end
+end
+
+pub def diagnostic_semantic_data_rows(d: Diagnostic) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  match d.semantic_data
+  when Option::Some(sd) then
+    match sd
+    when DiagnosticSemanticData::Ownership(od) then
+      if od.place.len() > 0 then rows.push("place:" + od.place.clone()) end
+      if od.state_before.len() > 0 then rows.push("state_before:" + od.state_before.clone()) end
+      if od.operation.len() > 0 then rows.push("operation:" + od.operation.clone()) end
+      if od.consume_site.len() > 0 then rows.push("consumed_at:" + od.consume_site.clone()) end
+      if od.use_site.len() > 0 then rows.push("rejected_at:" + od.use_site.clone()) end
+      if od.type_id.len() > 0 then rows.push("type:" + od.type_id.clone()) end
+    when DiagnosticSemanticData::TypeMismatch(tm) then
+      if tm.expected.len() > 0 then rows.push("expected:" + tm.expected.clone()) end
+      if tm.actual.len() > 0 then rows.push("actual:" + tm.actual.clone()) end
+      if tm.site.len() > 0 then rows.push("site:" + tm.site.clone()) end
+    when DiagnosticSemanticData::TraitFailure(tf) then
+      if tf.obligation.len() > 0 then rows.push("obligation:" + tf.obligation.clone()) end
+      for rc in tf.rejected_candidates do
+        rows.push("rejected_candidate:" + rc.clone())
+      end
+    when DiagnosticSemanticData::EffectViolation(ev) then
+      if ev.effect.len() > 0 then rows.push("effect:" + ev.effect.clone()) end
+      var pi = 0
+      for p in ev.path do
+        rows.push("evidence:" + pi.to_string() + ":" + p.clone())
+        pi = pi + 1
+      end
+    end
+  when Option::None then ()
+  end
+  rows
+end
+
+def diagnostic_content_key_of_parts(
+  message: String, span: String, kind: String, rows: Vec[String]
+) -> String
+  var text = diagnostic_lenpref(&message) + diagnostic_lenpref(&span) + diagnostic_lenpref(&kind)
+  for r in rows do
+    text = text + diagnostic_lenpref(&r)
+  end
+  text
+end
+
+# The content key of a LIVE diagnostic (message, span, class, typed rows)
+# — the idempotency comparison of diagnostic_store_add.
+pub def diagnostic_content_key(d: Diagnostic) -> String
+  diagnostic_content_key_of_parts(
+    d.message.clone(),
+    diagnostic_span_locator(&d),
+    diagnostic_semantic_data_kind(&d),
+    diagnostic_semantic_data_rows(&d))
+end
+
+pub def diagnostic_record_content_key(r: DiagnosticRecord) -> String
+  diagnostic_content_key_of_parts(
+    r.message.clone(), r.span.clone(), r.semantic_kind.clone(), r.related.clone())
+end
+
+# The persistent projection of a live diagnostic under an assigned id.
+pub def diagnostic_record_of(d: Diagnostic, id: StableDiagnosticId) -> DiagnosticRecord
+  DiagnosticRecord {
+    id: id,
+    message: d.message.clone(),
+    span: diagnostic_span_locator(&d),
+    semantic_kind: diagnostic_semantic_data_kind(&d),
+    related: diagnostic_semantic_data_rows(&d)
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# DiagnosticStore — the retained, append-only store
+# ———————————————————————————————————————————————————————————————
+
+pub struct DiagnosticStore
+  by_id: Vec[DiagnosticRecord] = Vec::new()
+  counters: Map[String, Int] = Map::new()
+end
+
+pub def new_diagnostic_store() -> DiagnosticStore
+  DiagnosticStore { by_id: Vec::new(), counters: Map::new() }
+end
+
+def diagnostic_record_tuple_matches(
+  r: DiagnosticRecord, owner: String, cause: String, code: String, obligation: String
+) -> Bool
+  r.id.owner == owner && r.id.cause == cause &&
+    r.id.code == code && r.id.obligation == obligation
+end
+
+# Add ONE diagnostic: returns the existing id when the SAME content under
+# the same semantic tuple is already stored (idempotent); otherwise
+# assigns the tuple's next collision ordinal and appends the record. The
+# counter is keyed by the semantic tuple text, so genuinely repeated
+# identical causes (same tuple, different content/site) get increasing
+# ordinals while a re-run of an unchanged compile returns the same ids.
+pub def diagnostic_store_add(inout store: DiagnosticStore, diagnostic: Diagnostic) -> StableDiagnosticId
+  let owner = stable_diagnostic_owner(&diagnostic)
+  let cause = stable_diagnostic_cause(&diagnostic)
+  let code = stable_diagnostic_code(&diagnostic)
+  let obligation = stable_diagnostic_obligation(&diagnostic)
+  let tuple_key = stable_diagnostic_tuple_key(
+    owner.clone(), cause.clone(), code.clone(), obligation.clone())
+  let content = diagnostic_content_key(&diagnostic)
+  var i = 0
+  while i < store.by_id.len() do
+    let r = store.by_id[i].clone()
+    if diagnostic_record_tuple_matches(
+        &r, owner.clone(), cause.clone(), code.clone(), obligation.clone()) &&
+       diagnostic_record_content_key(&r) == content then
+      return r.id.clone()
+    end
+    i = i + 1
+  end
+  let ordinal = store.counters.get(tuple_key.clone()).unwrap_or(0)
+  store.counters.insert(tuple_key.clone(), ordinal + 1)
+  let id = stable_diagnostic_id_of(owner, cause, code, obligation, ordinal)
+  store.by_id.push(diagnostic_record_of(&diagnostic, id.clone()))
+  id
+end
+
+pub def diagnostic_store_add_all(
+  inout store: DiagnosticStore, diagnostics: Vec[Diagnostic]
+) -> Vec[StableDiagnosticId]
+  var out: Vec[StableDiagnosticId] = Vec::new()
+  for d in diagnostics do
+    out.push(diagnostic_store_add(store, d.clone()))
+  end
+  out
+end
+
+# Store a diagnostic and STAMP its Diagnostic.id field with the canonical
+# id render — the round-trip handle diagnostic.get consumes.
+pub def diagnostic_store_add_stamping(
+  inout store: DiagnosticStore, inout diagnostic: Diagnostic
+) -> StableDiagnosticId
+  let id = diagnostic_store_add(store, diagnostic.clone())
+  diagnostic.id = Option::Some(stable_diagnostic_id_text(id.clone()))
+  id
+end
+
+pub def store_len(store: DiagnosticStore) -> Int
+  store.by_id.len()
+end
+
+def store_record_lt(a: DiagnosticRecord, b: DiagnosticRecord) -> Bool
+  stable_diagnostic_id_text(a.id.clone()) < stable_diagnostic_id_text(b.id.clone())
+end
+
+# The id-ordered store view (a fresh vector; insertion order never changes).
+pub def store_all(store: DiagnosticStore) -> Vec[DiagnosticRecord]
+  var out: Vec[DiagnosticRecord] = Vec::new()
+  for r in store.by_id do
+    out.push(r.clone())
+  end
+  out.sort_by(|a, b| store_record_lt(a, b))
+  out
+end
+
+pub def store_get(store: DiagnosticStore, id_text: String) -> Option[DiagnosticRecord]
+  for r in store.by_id do
+    if stable_diagnostic_id_text(r.id.clone()) == id_text then
+      return Option::Some(r.clone())
+    end
+  end
+  Option::None
+end
+
+pub def store_get_by_id(store: DiagnosticStore, id: StableDiagnosticId) -> Option[DiagnosticRecord]
+  for r in store.by_id do
+    if r.id.digest_hi == id.digest_hi && r.id.digest_lo == id.digest_lo then
+      return Option::Some(r.clone())
+    end
+  end
+  Option::None
+end
+
+# The diagnostic-op selector: a plain integer arg selects by the
+# id-ordered store_all index; any other text is an exact id render.
+pub def store_match(store: DiagnosticStore, arg: String) -> Option[DiagnosticRecord]
+  match arg.parse_int()
+  when Result::Ok(idx) then
+    let all = store_all(store.clone())
+    if idx >= 0 && idx < all.len() then
+      return Option::Some(all[idx].clone())
+    end
+  when Result::Err(_) then ()
+  end
+  store_get(store, arg)
+end
+
+# The diagnostic.get rows: the id first, then the record spine and every
+# typed related row (sorted after the id/span/class prefix, so the answer
+# is deterministic whatever the append order was).
+pub def diagnostic_record_get_rows(record: DiagnosticRecord) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("id:" + stable_diagnostic_id_text(record.id.clone()))
+  rows.push("message:" + record.message.clone())
+  rows.push("span:" + record.span.clone())
+  rows.push("semantic_kind:" + record.semantic_kind.clone())
+  for r in record.related do
+    rows.push("related:" + r.clone())
+  end
+  rows
+end
+
+# The repair context of the STORE form: the id + the typed class + every
+# typed fact row. Never message prose, never a fabricated candidate.
+pub def diagnostic_record_repair_context(record: DiagnosticRecord) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("id:" + stable_diagnostic_id_text(record.id.clone()))
+  rows.push("context:" + record.semantic_kind.clone())
+  for r in record.related do
+    rows.push("fact:" + r.clone())
+  end
+  rows
+end
+
+# ———————————————————————————————————————————————————————————————
+# ExplainNode — the typed derivation tree
+# ———————————————————————————————————————————————————————————————
+
+pub struct ExplainNode
+  kind: String
+  subject: String
+  relation: String
+  fact: String
+  children: Vec[ExplainNode] = Vec::new()
+end
+
+pub def explain_node(kind: String, subject: String, relation: String, fact: String) -> ExplainNode
+  ExplainNode {
+    kind: kind,
+    subject: subject,
+    relation: relation,
+    fact: fact,
+    children: Vec::new()
+  }
+end
+
+# A one-line node: subject = the exact line text (sans indentation).
+pub def explain_text_node(kind: String, text: String) -> ExplainNode
+  explain_node(kind, text, "".to_string(), "".to_string())
+end
+
+# A reason row rendered VERBATIM (no renderer indentation — the row
+# carries its own; the §34 constraint chains).
+pub def explain_verbatim_node(kind: String, row: String) -> ExplainNode
+  explain_node(kind, row, "verbatim".to_string(), "".to_string())
+end
+
+# A pure container: no line of its own, children only.
+pub def explain_container_node(kind: String, children: Vec[ExplainNode]) -> ExplainNode
+  ExplainNode {
+    kind: kind,
+    subject: "".to_string(),
+    relation: "".to_string(),
+    fact: "".to_string(),
+    children: children
+  }
+end
+
+pub def explain_node_with_children(
+  kind: String, subject: String, relation: String, fact: String, children: Vec[ExplainNode]
+) -> ExplainNode
+  ExplainNode {
+    kind: kind,
+    subject: subject,
+    relation: relation,
+    fact: fact,
+    children: children
+  }
+end
+
+pub def explain_node_child(node: ExplainNode, child: ExplainNode) -> ExplainNode
+  var children = node.children.clone()
+  children.push(child)
+  ExplainNode {
+    kind: node.kind.clone(),
+    subject: node.subject.clone(),
+    relation: node.relation.clone(),
+    fact: node.fact.clone(),
+    children: children
+  }
+end
+
+pub def explain_node_add_child(inout node: ExplainNode, child: ExplainNode) -> Unit
+  node.children.push(child)
+  ()
+end
+
+def explain_node_indent(depth: Int) -> String
+  var s = ""
+  var i = 0
+  while i < depth do
+    s = s + "  "
+    i = i + 1
+  end
+  s
+end
+
+def explain_node_line(node: ExplainNode) -> String
+  if node.subject.len() > 0 then
+    node.subject.clone()
+  elsif node.fact.len() > 0 then
+    node.fact.clone()
+  elsif node.relation.len() > 0 && node.relation != "verbatim" then
+    node.kind.clone() + " " + node.relation.clone()
+  else
+    "".to_string()
+  end
+end
+
+def explain_node_render_into(node: ExplainNode, depth: Int, inout out: Vec[String]) -> Unit
+  let text = explain_node_line(&node)
+  if node.relation == "verbatim" then
+    if text.len() > 0 then
+      out.push(text)
+    end
+  else
+    if text.len() > 0 then
+      out.push(explain_node_indent(depth) + text)
+    end
+  end
+  for c in node.children do
+    explain_node_render_into(c.clone(), depth + 1, &mut out)
+  end
+  ()
+end
+
+# The ONE renderer: indented lines in display order (line 0 = the root,
+# two spaces per depth); "verbatim" rows are emitted unchanged. The
+# output is byte-identical to the §52 string trees.
+pub def explain_node_render(node: ExplainNode) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  explain_node_render_into(node, 0, &mut out)
+  out
+end
+
+# The first node of the kind in pre-order (Option::None when absent).
+pub def explain_node_find(node: ExplainNode, kind: String) -> Option[ExplainNode]
+  if node.kind == kind then
+    return Option::Some(node.clone())
+  end
+  for c in node.children do
+    match explain_node_find(c.clone(), kind.clone())
+    when Option::Some(found) then return Option::Some(found)
+    when Option::None then ()
+    end
+  end
+  Option::None
+end
+
+def explain_node_find_all_into(node: ExplainNode, kind: String, inout out: Vec[ExplainNode]) -> Unit
+  if node.kind == kind then
+    out.push(node.clone())
+  end
+  for c in node.children do
+    explain_node_find_all_into(c.clone(), kind.clone(), &mut out)
+  end
+  ()
+end
+
+# Every node of the kind, pre-order.
+pub def explain_node_find_all(node: ExplainNode, kind: String) -> Vec[ExplainNode]
+  var out: Vec[ExplainNode] = Vec::new()
+  explain_node_find_all_into(node, kind, &mut out)
+  out
+end
+
+pub def explain_verbatim_row_nodes(kind: String, rows: Vec[String]) -> Vec[ExplainNode]
+  var out: Vec[ExplainNode] = Vec::new()
+  for r in rows do
+    out.push(explain_verbatim_node(kind.clone(), r.clone()))
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# The per-Diagnostic typed derivation tree
+# ———————————————————————————————————————————————————————————————
+
+# The effect evidence path as a NESTED chain: path[0] is the chain root
+# and every later hop is its child, so the render indents each hop one
+# level deeper (the old renderer's 3 + i depths). Callers guard
+# path.len() > 1.
+def effect_evidence_chain_node(path: Vec[String]) -> ExplainNode
+  var i = path.len() - 1
+  var chain = explain_text_node("effect-evidence".to_string(), path[i].clone())
+  while i > 0 do
+    i = i - 1
+    chain = explain_node_child(
+      explain_text_node("effect-evidence".to_string(), path[i].clone()), chain)
+  end
+  chain
+end
+
+# The typed payload of the diagnostic as ONE class node (children = the
+# record's real fields, at depth 2 under the class node's depth 1). The
+# rendered lines are EXACTLY the §52 explain_diagnostic typed leaves.
+def diagnostic_typed_leaf_nodes(sd: DiagnosticSemanticData) -> Vec[ExplainNode]
+  var out: Vec[ExplainNode] = Vec::new()
+  match sd
+  when DiagnosticSemanticData::Ownership(od) then
+    var node = explain_text_node("ownership-rejection".to_string(), "ownership rejection".to_string())
+    node = explain_node_child(node, explain_text_node("ownership-place".to_string(), "place " + od.place.clone()))
+    node = explain_node_child(node, explain_text_node("ownership-state-before".to_string(), "state before " + od.state_before.clone()))
+    node = explain_node_child(node, explain_text_node("ownership-operation".to_string(), "operation " + od.operation.clone()))
+    if od.consume_site.len() > 0 then
+      node = explain_node_child(node, explain_text_node("ownership-consume-site".to_string(), "consumed at " + od.consume_site.clone()))
+    end
+    if od.use_site.len() > 0 then
+      node = explain_node_child(node, explain_text_node("ownership-use-site".to_string(), "rejected at " + od.use_site.clone()))
+    end
+    if od.type_id.len() > 0 then
+      node = explain_node_child(node, explain_text_node("ownership-type".to_string(), "type " + od.type_id.clone()))
+    end
+    out.push(node)
+  when DiagnosticSemanticData::TypeMismatch(tm) then
+    var node = explain_text_node("type-mismatch".to_string(), "type mismatch".to_string())
+    if tm.expected.len() > 0 then
+      node = explain_node_child(node, explain_text_node("type-expected".to_string(), "expected " + tm.expected.clone()))
+    end
+    if tm.actual.len() > 0 then
+      node = explain_node_child(node, explain_text_node("type-actual".to_string(), "actual " + tm.actual.clone()))
+    end
+    if tm.site.len() > 0 then
+      node = explain_node_child(node, explain_text_node("type-site".to_string(), "site " + tm.site.clone()))
+    end
+    out.push(node)
+  when DiagnosticSemanticData::TraitFailure(tf) then
+    var node = explain_text_node("trait-failure".to_string(), "trait failure".to_string())
+    if tf.obligation.len() > 0 then
+      node = explain_node_child(node, explain_text_node("trait-obligation".to_string(), "obligation " + tf.obligation.clone()))
+    end
+    if tf.rejected_candidates.len() > 0 then
+      var rej = explain_text_node("trait-rejected-candidates".to_string(), "rejected candidates".to_string())
+      for rc in tf.rejected_candidates do
+        rej = explain_node_child(rej, explain_text_node("trait-rejected-candidate".to_string(), rc.clone()))
+      end
+      node = explain_node_child(node, rej)
+    end
+    out.push(node)
+  when DiagnosticSemanticData::EffectViolation(ev) then
+    var node = explain_text_node("effect-violation".to_string(), "effect violation".to_string())
+    node = explain_node_child(node, explain_text_node("effect-claim".to_string(), "claim " + ev.effect.clone()))
+    if ev.path.len() > 1 then
+      node = explain_node_child(node,
+        explain_node_child(explain_text_node("effect-evidence-path".to_string(), "evidence path".to_string()),
+          effect_evidence_chain_node(ev.path.clone())))
+    else
+      node = explain_node_child(node, explain_text_node("effect-no-evidence".to_string(), "no evidence leaf reachable".to_string()))
+    end
+    out.push(node)
+  end
+  out
+end
+
+# The non-empty §34 *_trace row families as label nodes with VERBATIM
+# reason children, in the canonical family order (capability, ownership,
+# effect, constraint, trait).
+def diagnostic_trace_family_nodes(d: Diagnostic) -> Vec[ExplainNode]
+  var out: Vec[ExplainNode] = Vec::new()
+  if d.capability_trace.len() > 0 then
+    out.push(explain_node_with_children("trace-capability".to_string(), "capability trace rows".to_string(),
+      "".to_string(), "".to_string(),
+      explain_verbatim_row_nodes("reason".to_string(), d.capability_trace.clone())))
+  end
+  if d.ownership_trace.len() > 0 then
+    out.push(explain_node_with_children("trace-ownership".to_string(), "ownership trace rows".to_string(),
+      "".to_string(), "".to_string(),
+      explain_verbatim_row_nodes("reason".to_string(), d.ownership_trace.clone())))
+  end
+  if d.effect_trace.len() > 0 then
+    out.push(explain_node_with_children("trace-effect".to_string(), "effect trace rows".to_string(),
+      "".to_string(), "".to_string(),
+      explain_verbatim_row_nodes("reason".to_string(), d.effect_trace.clone())))
+  end
+  if d.constraint_trace.len() > 0 then
+    out.push(explain_node_with_children("trace-constraint".to_string(), "constraint trace rows".to_string(),
+      "".to_string(), "".to_string(),
+      explain_verbatim_row_nodes("reason".to_string(), d.constraint_trace.clone())))
+  end
+  if d.trait_trace.len() > 0 then
+    out.push(explain_node_with_children("trace-trait".to_string(), "trait trace rows".to_string(),
+      "".to_string(), "".to_string(),
+      explain_verbatim_row_nodes("reason".to_string(), d.trait_trace.clone())))
+  end
+  out
+end
+
+# The typed derivation tree of ONE Diagnostic. Root = the primary_symbol
+# display render, else the semantic_site, else "diagnostic". Children =
+# the typed payload's class node first (when present), then the §34 trace
+# families; a data-less diagnostic with an expected/actual pair answers
+# the mismatch node, and a wholly data-less diagnostic the honest "no
+# structured semantic data" leaf. Byte-identical to the §52
+# explain_diagnostic render.
+pub def diagnostic_explain_node(d: Diagnostic) -> ExplainNode
+  var root_text = "diagnostic".to_string()
+  match d.primary_symbol
+  when Option::Some(p) then root_text = p.clone()
+  when Option::None then
+    match d.semantic_site
+    when Option::Some(s) then root_text = s.clone()
+    when Option::None then ()
+    end
+  end
+  var root = explain_text_node("diagnostic.explain".to_string(), root_text)
+  var any = false
+  var structured = false
+  match d.semantic_data
+  when Option::Some(sd) then
+    for child in diagnostic_typed_leaf_nodes(sd) do
+      root = explain_node_child(root, child)
+      any = true
+    end
+    structured = true
+  when Option::None then ()
+  end
+  for child in diagnostic_trace_family_nodes(&d) do
+    root = explain_node_child(root, child)
+    any = true
+  end
+  if !structured then
+    match d.expected_type
+    when Option::Some(exp) then
+      match d.actual_type
+      when Option::Some(act) then
+        var mismatch = explain_text_node("type-mismatch".to_string(), "type mismatch".to_string())
+        mismatch = explain_node_child(mismatch, explain_text_node("type-expected".to_string(), "expected " + exp.clone()))
+        mismatch = explain_node_child(mismatch, explain_text_node("type-actual".to_string(), "actual " + act.clone()))
+        root = explain_node_child(root, mismatch)
+        any = true
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+    if !any then
+      root = explain_node_child(root, explain_text_node("diagnostic-empty".to_string(), "no structured semantic data".to_string()))
+    end
+  end
+  root
+end
+
+# ———————————————————————————————————————————————————————————————
+# The STORE-form derivation nodes (never message prose)
+# ———————————————————————————————————————————————————————————————
+
+pub def diagnostic_record_explain_node(record: DiagnosticRecord) -> ExplainNode
+  var root = explain_text_node("diagnostic.record".to_string(), stable_diagnostic_id_text(record.id.clone()))
+  root = explain_node_child(root, explain_text_node("record-span".to_string(), "span " + record.span.clone()))
+  root = explain_node_child(root,
+    explain_text_node("record-semantic-kind".to_string(), "semantic_kind " + record.semantic_kind.clone()))
+  for r in record.related do
+    root = explain_node_child(root, explain_text_node("record-related".to_string(), r.clone()))
+  end
+  root
+end
+
+# ———————————————————————————————————————————————————————————————
+# The module lane (third-audit items 23/24 executable rows)
+# ———————————————————————————————————————————————————————————————
+# D1 id derivation + collision ordinals; D2 store add idempotency and
+# ordinal assignment; D3 store get / all / match; D4 ExplainNode render
+# byte-identity + typed find; D5 verbatim trace rows; D6 the
+# diagnostic.get record round trip (hand-built store). Empty result = the
+# lane verifies.
+
+def diag_lane_bool(inout out: Vec[String], name: String, ok: Bool) -> Unit
+  if !ok then
+    out.push(name + ": expected true")
+  end
+  ()
+end
+
+def diag_lane_int(inout out: Vec[String], name: String, got: Int, expected: Int) -> Unit
+  if got != expected then
+    out.push(name + ": expected " + expected.to_string() + ", got " + got.to_string())
+  end
+  ()
+end
+
+def diag_lane_text(inout out: Vec[String], name: String, got: String, expected: String) -> Unit
+  if got != expected then
+    out.push(name + ": expected '" + expected + "', got '" + got + "'")
+  end
+  ()
+end
+
+def diag_lane_rows(inout out: Vec[String], name: String, got: Vec[String], expected: Vec[String]) -> Unit
+  if got.len() != expected.len() then
+    out.push(name + ": expected " + expected.len().to_string() + " rows, got " + got.len().to_string())
+    return ()
+  end
+  var i = 0
+  while i < got.len() do
+    if got[i] != expected[i] then
+      out.push(name + "[" + i.to_string() + "]: expected '" + expected[i].clone() + "', got '" + got[i].clone() + "'")
+    end
+    i = i + 1
+  end
+  ()
+end
+
+def diag_lane_span(start: Int) -> Span
+  Span { file: "lane.tg", start: start, end_pos: start + 1 }
+end
+
+def diag_lane_ownership(message: String, start: Int) -> Diagnostic
+  Diagnostic {
+    level: DiagLevel::Error,
+    message: message,
+    span: Option::Some(diag_lane_span(start)),
+    notes: Vec::new(),
+    suggestions: Vec::new(),
+    code: Option::Some("E0201".to_string()),
+    primary_symbol: Option::Some("m::f#fn()->unit".to_string()),
+    semantic_site: Option::Some("ownership analysis".to_string()),
+    semantic_data: Option::Some(DiagnosticSemanticData::Ownership(OwnershipDiagnosticData {
+      place: "r".to_string(),
+      state_before: "consumed".to_string(),
+      operation: "use".to_string(),
+      consume_site: "lane.tg:5".to_string(),
+      use_site: "lane.tg:" + start.to_string(),
+      type_id: "R".to_string()
+    }))
+  }
+end
+
+pub def semantic_diagnostics_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # ———— D1: derivation + ordinals ————
+  let d1 = diag_lane_ownership("use of moved value `r`".to_string(), 10)
+  let d2 = diag_lane_ownership("use of moved value `r` (second site)".to_string(), 20)
+  diag_lane_text(&mut out, "d1-owner", stable_diagnostic_owner(&d1), "m::f#fn()->unit")
+  diag_lane_text(&mut out, "d1-cause-place", stable_diagnostic_cause(&d1), "r")
+  diag_lane_text(&mut out, "d1-code", stable_diagnostic_code(&d1), "E0201")
+  diag_lane_text(&mut out, "d1-obligation-none", stable_diagnostic_obligation(&d1), "")
+  let id1 = stable_diagnostic_id_of("m::f#fn()->unit".to_string(), "r".to_string(), "E0201".to_string(), "".to_string(), 0)
+  let id1_again = stable_diagnostic_id_of("m::f#fn()->unit".to_string(), "r".to_string(), "E0201".to_string(), "".to_string(), 0)
+  diag_lane_text(&mut out, "d1-id-deterministic",
+    stable_diagnostic_id_text(id1.clone()), stable_diagnostic_id_text(id1_again.clone()))
+  diag_lane_bool(&mut out, "d1-digest-words-agree",
+    id1.digest_hi == id1_again.digest_hi && id1.digest_lo == id1_again.digest_lo)
+  diag_lane_bool(&mut out, "d1-tuple-key-equal",
+    stable_diagnostic_tuple_key("m::f#fn()->unit".to_string(), "r".to_string(), "E0201".to_string(), "".to_string()) ==
+      stable_diagnostic_tuple_key("m::f#fn()->unit".to_string(), "r".to_string(), "E0201".to_string(), "".to_string()))
+  diag_lane_bool(&mut out, "d1-ordinal-distinguishes",
+    stable_diagnostic_id_text(id1.clone()) !=
+      stable_diagnostic_id_text(stable_diagnostic_id_of("m::f#fn()->unit".to_string(), "r".to_string(), "E0201".to_string(), "".to_string(), 1)))
+
+  # ———— D2: store idempotency + collision ordinals ————
+  var store = new_diagnostic_store()
+  let s1 = diagnostic_store_add(&mut store, d1.clone())
+  let s1_again = diagnostic_store_add(&mut store, d1.clone())
+  diag_lane_text(&mut out, "d2-idempotent-id",
+    stable_diagnostic_id_text(s1.clone()), stable_diagnostic_id_text(s1_again.clone()))
+  diag_lane_int(&mut out, "d2-idempotent-len", store_len(store.clone()), 1)
+  let s2 = diagnostic_store_add(&mut store, d2.clone())
+  diag_lane_int(&mut out, "d2-repeated-ordinal", s2.collision_ordinal, 1)
+  diag_lane_int(&mut out, "d2-store-len", store_len(store.clone()), 2)
+  let s1_after = diagnostic_store_add(&mut store, d1.clone())
+  diag_lane_text(&mut out, "d2-idempotent-after-repeat",
+    stable_diagnostic_id_text(s1.clone()), stable_diagnostic_id_text(s1_after.clone()))
+  diag_lane_int(&mut out, "d2-idempotent-after-len", store_len(store.clone()), 2)
+
+  # ———— D3: store get / all / match ————
+  match store_get(store.clone(), stable_diagnostic_id_text(s1.clone()))
+  when Option::Some(rec) then
+    diag_lane_text(&mut out, "d3-get-message", rec.message.clone(), d1.message.clone())
+    diag_lane_text(&mut out, "d3-get-span", rec.span.clone(), "lane.tg:10")
+    diag_lane_text(&mut out, "d3-get-kind", rec.semantic_kind.clone(), "ownership")
+    diag_lane_int(&mut out, "d3-get-related", rec.related.len(), 6)
+    diag_lane_text(&mut out, "d3-get-related-place", rec.related[0].clone(), "place:r")
+  when Option::None then
+    out.push("d3-get: expected Some, got None")
+  end
+  let all = store_all(store.clone())
+  diag_lane_int(&mut out, "d3-all-len", all.len(), 2)
+  if all.len() == 2 then
+    diag_lane_bool(&mut out, "d3-all-ordered",
+      stable_diagnostic_id_text(all[0].id.clone()) < stable_diagnostic_id_text(all[1].id.clone()))
+  end
+  match store_get_by_id(store.clone(), s2.clone())
+  when Option::Some(rec2) then
+    diag_lane_int(&mut out, "d3-get-by-id-ordinal", rec2.id.collision_ordinal, 1)
+  when Option::None then
+    out.push("d3-get-by-id: expected Some, got None")
+  end
+  match store_match(store.clone(), "0".to_string())
+  when Option::Some(_) then ()
+  when Option::None then out.push("d3-match-index: expected Some, got None")
+  end
+  match store_get(store.clone(), "no-such-id".to_string())
+  when Option::Some(_) then out.push("d3-get-absent: expected None, got Some")
+  when Option::None then ()
+  end
+
+  # ———— D4: ExplainNode render byte-identity + typed find ————
+  let tree = diagnostic_explain_node(&d1)
+  diag_lane_rows(&mut out, "d4-render-identity", explain_node_render(tree.clone()),
+    Vec::from([
+      "m::f#fn()->unit".to_string(),
+      "  ownership rejection".to_string(),
+      "    place r".to_string(),
+      "    state before consumed".to_string(),
+      "    operation use".to_string(),
+      "    consumed at lane.tg:5".to_string(),
+      "    rejected at lane.tg:10".to_string(),
+      "    type R".to_string()
+    ]))
+  match explain_node_find(tree.clone(), "ownership-rejection".to_string())
+  when Option::Some(node) then
+    diag_lane_text(&mut out, "d4-find-subject", node.subject.clone(), "ownership rejection")
+  when Option::None then
+    out.push("d4-find: expected Some, got None")
+  end
+  match explain_node_find(tree.clone(), "not-a-kind".to_string())
+  when Option::Some(_) then out.push("d4-find-absent: expected None, got Some")
+  when Option::None then ()
+  end
+  diag_lane_int(&mut out, "d4-find-all-place",
+    explain_node_find_all(tree.clone(), "ownership-place".to_string()).len(), 1)
+  diag_lane_int(&mut out, "d4-find-all-reason",
+    explain_node_find_all(tree.clone(), "reason".to_string()).len(), 0)
+
+  # ———— D5: verbatim trace rows (embedded indentation preserved) ————
+  var d_traced = diag_lane_ownership("use of moved value `r`".to_string(), 10)
+  d_traced.ownership_trace = Vec::from([
+    "`r`: live -> consumed at lane.tg:5".to_string(),
+    "  consumed by `consume(r)` at lane.tg:6".to_string()
+  ])
+  let traced = diagnostic_explain_node(&d_traced)
+  diag_lane_rows(&mut out, "d5-verbatim-render", explain_node_render(traced.clone()),
+    Vec::from([
+      "m::f#fn()->unit".to_string(),
+      "  ownership rejection".to_string(),
+      "    place r".to_string(),
+      "    state before consumed".to_string(),
+      "    operation use".to_string(),
+      "    consumed at lane.tg:5".to_string(),
+      "    rejected at lane.tg:10".to_string(),
+      "    type R".to_string(),
+      "  ownership trace rows".to_string(),
+      "`r`: live -> consumed at lane.tg:5".to_string(),
+      "  consumed by `consume(r)` at lane.tg:6".to_string()
+    ]))
+  diag_lane_int(&mut out, "d5-find-all-reason",
+    explain_node_find_all(traced.clone(), "reason".to_string()).len(), 2)
+
+  # ———— D6: the diagnostic.get record round trip (hand-built store) ————
+  match store_get(store.clone(), stable_diagnostic_id_text(s1.clone()))
+  when Option::Some(record) then
+    let rows = diagnostic_record_get_rows(record.clone())
+    diag_lane_int(&mut out, "d6-get-rows-len", rows.len(), 10)
+    diag_lane_text(&mut out, "d6-get-row-id", rows[0].clone(),
+      "id:" + stable_diagnostic_id_text(s1.clone()))
+    diag_lane_text(&mut out, "d6-get-row-message", rows[1].clone(),
+      "message:" + d1.message.clone())
+    diag_lane_text(&mut out, "d6-get-row-kind", rows[3].clone(), "semantic_kind:ownership")
+    diag_lane_text(&mut out, "d6-get-row-related", rows[4].clone(), "related:place:r")
+  when Option::None then
+    out.push("d6-get: expected Some, got None")
+  end
+
+  out
+end

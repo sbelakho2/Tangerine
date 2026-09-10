@@ -30,7 +30,7 @@ use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, StructDecl, EnumDecl, TraitDecl, ImplDecl,
   UseDecl, AstPath, ExternItem, NominalKind, AccessConvention,
   Attribute,
-  TypeExpr, TypeExprKind, Param, GenericParam, GenericParamKind,
+  TypeExpr, TypeExprKind, Param, GenericParam, GenericParamKind, ConstRange,
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind,
   BudgetAnnotation, BudgetConstraint, LayoutAttrs, layout_attrs_plain,
   expr_is_place_like
@@ -487,6 +487,18 @@ struct FnSignature
   declared_effects: Vec[EffectId] = Vec::new()
   declared_budget: Option[TypedBudget] = Option::None
   effect_annotations: Vec[EffectAnnotation] = Vec::new()
+  # (third-audit item 25 — the purity theorem): TRUE when the declaration
+  # was spelled `pure` (the function modifier the parser records on
+  # FunctionDecl.is_pure; it is NOT an @attribute — a `pure` declaration
+  # has no attribute form). The field is the typed annotation path the
+  # MIR carries: lower_function stamps it onto the lowered
+  # MirFunction.is_pure, and the MIR-side pass
+  # (mir.tg check_purity_annotations_mir) PROVES the rule against the
+  # transitive effect summaries + the store/call classification — a
+  # `pure` function that is not ProvenPure is a compiler error (E0234).
+  # Default false keeps every FnSignature literal site that predates the
+  # modifier unchanged.
+  is_pure: Bool = false
 end
 
 # The TYPED budget record of a function/method declaration — the
@@ -866,25 +878,65 @@ end
 # Budget ENFORCEMENT domain (the typed budget records' consumer side)
 # ———————————————————————————————————————————————————————————————
 # The parser declares ARBITRARY metric identifiers (`@budget <metric>:
-# "<bound>"` — see parse_budget_annotation); the std/budget.tg surface
-# enumerates time / memory / iterations / calls / allocations / custom.
-# The RUNTIME ENFORCEMENT covers two metrics, keyed by the canonical
-# resource:
-#   alloc | allocation | allocations  -> "alloc"  (the COUNT-based metric:
-#                                     each intrinsic allocation in the
-#                                     annotated function consumes one unit;
-#                                     the counter is compared against the
-#                                     declared limit at every consume)
-#   time                            -> "time"   (the ELAPSED-based metric:
-#                                     the entry stamp + the exit check
-#                                     against the declared limit)
-# Every other metric (memory, iterations, calls, custom names) parses and
-# rides the typed record but emits NO checks — reported as unenforced.
+# "<bound>"` or the parenthesized `@budget(<metric> = <bound>, ...)` form
+# — see parse_budget_annotation). The RECOGNIZED vocabulary (third-audit
+# item 45 — the complete @budget system) is:
+#
+#   heap_allocations | alloc | allocation | allocations | heap_allocs
+#       -> "alloc". The COUNT-based allocation metric: each classified
+#       intrinsic/string-concat allocation in the annotated function's
+#       transitive execution consumes one unit of THIS invocation's
+#       frame-slot counter; the runtime traps when a path exceeds the
+#       declared limit. Classified static-proof ONLY for limit 0 with the
+#       MIR-proven transitive no-allocation effect summary; otherwise
+#       runtime-measured (the counter decides — never a static site
+#       rejection: a 2-site if with one allocation per path is legal).
+#   heap_bytes | heap_size | heap
+#       -> "heap_bytes". The heap byte bound from the static
+#       allocation-site analysis (site count × BUDGET_ALLOC_SITE_BYTES,
+#       the documented conservative per-site cap; the MIR carries no
+#       allocation byte payload). Classification static-bound; static-
+#       proof for the zero case (limit 0, no sites, no-allocation proof).
+#   stack_bytes | stack_size | stack
+#       -> "stack_bytes". The function's stack frame size: the LIR
+#       frame_bytes is EXACT (static-proof) when the LIR route supplies
+#       it; the MIR-derived bound is static-bound. The generated native
+#       frame never exceeds the derivation (the pass fails the annotation
+#       when the derived bound exceeds the declared limit).
+#   code_size_bytes | code_size | code_bytes
+#       -> "code_size". The emitted code size: an emitter's exact word
+#       count classifies static-proof; the MIR instruction-count estimate
+#       (4 bytes per estimated instruction) classifies static-bound.
+#   time | time_us | time_ms | time_ns
+#       -> "time". The wall-clock bound: the runtime frame stamps the
+#       entry monotonic clock and every MirReturn exit check compares the
+#       elapsed clock against the declared limit. Classification
+#       runtime-measured. A `time_us` bound's bare number is MICROSECONDS
+#       (scaled to nanoseconds); an explicit unit suffix always wins
+#       ("10ms" is 10 milliseconds under every spelling).
+#   instructions | instruction_count | instrs
+#       -> "instructions". The executed-MIR-statement count: the static
+#       derivation (2 × statements + 3 × terminators) classifies
+#       static-bound; the per-invocation frame-slot counter (incremented
+#       per emitted statement, checked at every return) makes it
+#       runtime-measured when no derivation exists.
+#
+# Every OTHER metric (cpu, memory, iterations, calls, custom names)
+# parses, rides the typed record and is reported runtime-measured (fail
+# closed); the MIR pass never claims a static guarantee it cannot derive.
 def budget_metric_resource(metric: String) -> String
-  if metric == "alloc" || metric == "allocation" || metric == "allocations" then
+  if metric == "alloc" || metric == "allocation" || metric == "allocations" || metric == "heap_allocations" || metric == "heap_allocation" || metric == "heap_allocs" || metric == "allocs" then
     "alloc"
-  elsif metric == "time" then
+  elsif metric == "heap_bytes" || metric == "heap_size" || metric == "heap" then
+    "heap_bytes"
+  elsif metric == "stack_bytes" || metric == "stack_size" || metric == "stack" then
+    "stack_bytes"
+  elsif metric == "code_size_bytes" || metric == "code_size" || metric == "code_bytes" then
+    "code_size"
+  elsif metric == "time" || metric == "time_us" || metric == "time_ms" || metric == "time_ns" then
     "time"
+  elsif metric == "instructions" || metric == "instruction_count" || metric == "instrs" then
+    "instructions"
   else
     metric
   end
@@ -892,7 +944,7 @@ end
 
 def budget_metric_enforced(metric: String) -> Bool
   let res = budget_metric_resource(metric)
-  res == "alloc" || res == "time"
+  res == "alloc" || res == "heap_bytes" || res == "stack_bytes" || res == "code_size" || res == "time" || res == "instructions"
 end
 
 # The leading integer of a budget bound ("8" -> 8, "100ms" -> 100, "5ms"
@@ -923,19 +975,407 @@ def budget_time_limit_ns(bound: String) -> Int
   end
 end
 
+# The time limit of ONE constraint in nanoseconds, metric-aware: a
+# `time_us` bound's bare number is MICROSECONDS (third-audit item 45);
+# an explicit unit suffix always wins (delegates to
+# budget_time_limit_ns); every other spelling keeps the canonical rule.
+def budget_time_limit_ns_of(metric: String, bound: String) -> Int
+  if metric == "time_us" then
+    if bound.contains("ms") || bound.contains("us") || bound.contains("s") then
+      budget_time_limit_ns(bound)
+    else
+      budget_bound_value(bound) * 1000
+    end
+  else
+    budget_time_limit_ns(bound)
+  end
+end
+
 # The declared limit of a typed budget record for an enforced resource key
 # (the first matching constraint wins; the time metric scales its bound to
-# nanoseconds, the allocation metric counts raw units).
+# nanoseconds — metric-aware for the time_us spelling — and every other
+# resource counts raw units).
 def typed_budget_limit(tb: TypedBudget, resource: String) -> Int
   for c in tb.constraints do
     if budget_metric_resource(&c.metric) == resource then
       if resource == "time" then
-        return budget_time_limit_ns(&c.limit)
+        return budget_time_limit_ns_of(&c.metric.clone(), &c.limit)
       end
       return budget_bound_value(&c.limit)
     end
   end
   0
+end
+
+# ———————————————————————————————————————————————————————————————
+# (third-audit item 45) Budget GUARANTEES — the classification vocabulary
+# ———————————————————————————————————————————————————————————————
+# ONE classified guarantee of a @budget constraint: the canonical resource
+# key, the declared limit (raw units per typed_budget_limit) and the
+# classification word. The three words are CLOSED:
+#   "static-proof"      the derivation is exact — the compiler PROVES the
+#                       guarantee holds for every execution
+#   "static-bound"      the derivation is a documented conservative bound
+#                       (may over-count, never under-count)
+#   "runtime-measured"  no static derivation; the generated frame counter /
+#                       clock decides at run time (exceed -> trap)
+pub struct BudgetGuarantee
+  resource: String
+  limit: Int
+  classification: String
+end
+
+# The documented per-allocation-site byte bound of the static
+# allocation-site analysis: every allocating site the MIR can see (its
+# own or a reachable callee's) is charged this conservative cap, so a
+# function's heap_bytes bound is (site count × the cap). The MIR carries
+# no allocation byte payload — this is the documented conservative site
+# cost, never an invented exact size.
+pub const BUDGET_ALLOC_SITE_BYTES: Int = 4096
+
+# The DERIVATION CONTEXT of one @budget-annotated function: what the MIR
+# (and, when the LIR route supplies it, the LIR allocation) statically
+# says about each resource. The MIR pass (check_budget_annotations_mir)
+# fills it; a lane row can build it directly — the classification and
+# violation rules are pure functions of this record.
+pub struct BudgetDerivations
+  # The transitive no-allocation proof: the function's reachable effect
+  # summary carries NO Alloc class (the §11 MIR scan).
+  alloc_proven_none: Bool = false
+  # The allocating-site count over the transitive call graph.
+  alloc_sites: Int = 0
+  # The static heap-byte bound: alloc_sites × BUDGET_ALLOC_SITE_BYTES
+  # (0 when alloc_proven_none holds).
+  heap_bound_bytes: Int = 0
+  # The stack bound: the LIR frame_bytes when supplied (stack_exact), else
+  # the MIR-derived bound (see mir_budget_stack_bound_mir).
+  stack_bound_bytes: Int = 0
+  stack_exact: Bool = false
+  # The emitted code size: an emitter's exact word bytes when supplied
+  # (code_exact), else the MIR estimate × 4.
+  code_size_bytes: Int = 0
+  code_exact: Bool = false
+  # The MIR instruction-count estimate (2 × statements + 3 × terminators).
+  instruction_bound: Int = 0
+  # The static time bound in nanoseconds (0 = no static derivation — the
+  # runtime clock decides).
+  time_bound_ns: Int = 0
+end
+
+# The classification WORDS (the closed vocabulary).
+pub def budget_classification_static_proof() -> String
+  "static-proof"
+end
+
+pub def budget_classification_static_bound() -> String
+  "static-bound"
+end
+
+pub def budget_classification_runtime_measured() -> String
+  "runtime-measured"
+end
+
+# Whether a word is one of the three classification words.
+pub def budget_classification_valid(word: String) -> Bool
+  word == "static-proof" || word == "static-bound" || word == "runtime-measured"
+end
+
+# The classification rule (third-audit item 45) of a resource, by its
+# canonical key — the STRONGEST classification the resource's derivation
+# admits:
+#   heap_allocations -> "static-proof"      (limit 0 with the proven
+#                                            no-alloc summary; the
+#                                            derivation-aware builder
+#                                            downgrades every other case
+#                                            to runtime-measured)
+#   heap_bytes       -> "static-bound"      ("static-proof" for 0 with no
+#                                            allocation sites)
+#   stack_bytes      -> "static-proof"      (the LIR frame_bytes is exact;
+#                                            "static-bound" for the
+#                                            MIR-only derivation)
+#   code_size_bytes  -> "static-bound"      ("static-proof" with an
+#                                            emitter's exact word count)
+#   instructions     -> "static-bound"      ("runtime-measured" when no
+#                                            derivation exists)
+#   time_us / time   -> "runtime-measured"  (the frame clock decides)
+#   an unknown word  -> "runtime-measured"  (fail closed)
+pub def budget_classification_of(resource: String) -> String
+  let res = budget_metric_resource(resource)
+  if res == "alloc" then
+    "static-proof"
+  elsif res == "heap_bytes" then
+    "static-bound"
+  elsif res == "stack_bytes" then
+    "static-proof"
+  elsif res == "code_size" then
+    "static-bound"
+  elsif res == "instructions" then
+    "static-bound"
+  elsif res == "time" then
+    "runtime-measured"
+  else
+    "runtime-measured"
+  end
+end
+
+# The DERIVED value of a resource under a context (the static bound / the
+# measured count the diagnostic reports): the allocation-site count, the
+# heap/stack/code byte bound, the instruction estimate or the nanosecond
+# time bound; 0 for an underivable resource.
+pub def budget_derived_value_of(resource: String, d: BudgetDerivations) -> Int
+  let res = budget_metric_resource(resource)
+  if res == "alloc" then
+    d.alloc_sites
+  elsif res == "heap_bytes" then
+    d.heap_bound_bytes
+  elsif res == "stack_bytes" then
+    d.stack_bound_bytes
+  elsif res == "code_size" then
+    d.code_size_bytes
+  elsif res == "instructions" then
+    d.instruction_bound
+  elsif res == "time" then
+    d.time_bound_ns
+  else
+    0
+  end
+end
+
+# The derivation-aware classification of one resource + limit under a
+# context. The rule mirrors budget_classification_of but applies the
+# precondition each static classification demands:
+#   alloc        static-proof ONLY when limit == 0 and the no-alloc
+#                summary proves and no sites exist; else runtime-measured
+#   heap_bytes   static-proof for the zero case above; else static-bound
+#   stack_bytes  static-proof with the LIR frame_bytes; else static-bound
+#   code_size    static-proof with an exact emitted word count; else
+#                static-bound
+#   instructions static-bound when the estimate exists; else
+#                runtime-measured
+#   time         static-bound when a static derivation exists; else
+#                runtime-measured
+pub def budget_guarantee_classification(metric: String, limit: Int, d: BudgetDerivations) -> String
+  let res = budget_metric_resource(metric)
+  if res == "alloc" then
+    if limit == 0 && d.alloc_proven_none && d.alloc_sites == 0 then
+      "static-proof"
+    else
+      "runtime-measured"
+    end
+  elsif res == "heap_bytes" then
+    if limit == 0 && d.alloc_proven_none && d.alloc_sites == 0 then
+      "static-proof"
+    else
+      "static-bound"
+    end
+  elsif res == "stack_bytes" then
+    if d.stack_exact then "static-proof" else "static-bound" end
+  elsif res == "code_size" then
+    if d.code_exact then "static-proof" else "static-bound" end
+  elsif res == "instructions" then
+    if d.instruction_bound > 0 then "static-bound" else "runtime-measured" end
+  elsif res == "time" then
+    if d.time_bound_ns > 0 then "static-bound" else "runtime-measured" end
+  else
+    "runtime-measured"
+  end
+end
+
+# The classified guarantee of ONE @budget constraint.
+pub def budget_guarantee_of(metric: String, limit: Int, d: BudgetDerivations) -> BudgetGuarantee
+  BudgetGuarantee {
+    resource: budget_metric_resource(&metric.clone()),
+    limit: limit,
+    classification: budget_guarantee_classification(&metric.clone(), limit, &d)
+  }
+end
+
+# The classified guarantee list of one typed budget record under a
+# derivation context, in declaration order (ONE BudgetGuarantee per
+# constraint).
+pub def budget_guarantees_of(tb: TypedBudget, d: BudgetDerivations) -> Vec[BudgetGuarantee]
+  var out = Vec::new()
+  for c in tb.constraints do
+    var limit = budget_bound_value(&c.limit)
+    if budget_metric_resource(&c.metric) == "time" then
+      limit = budget_time_limit_ns_of(&c.metric.clone(), &c.limit)
+    end
+    out.push(budget_guarantee_of(c.metric.clone(), limit, &d))
+  end
+  out
+end
+
+# The classification + derived-value text of one resource under a context
+# (the diagnostics' suffix and the lane rows' evidence):
+# "static-bound bound 4096", "static-proof value 0" or
+# "runtime-measured (the generated frame decides)".
+pub def budget_derivation_text(resource: String, d: BudgetDerivations) -> String
+  let res = budget_metric_resource(resource)
+  let cls = budget_guarantee_classification(&res.clone(), 0, &d)
+  let value = budget_derived_value_of(&res, &d)
+  if cls == "static-proof" then
+    "static-proof value " + value.to_string()
+  elsif cls == "static-bound" then
+    "static-bound bound " + value.to_string()
+  else
+    "runtime-measured (the generated frame decides)"
+  end
+end
+
+# The static violation rows of one typed budget under a derivation: a
+# static-proof/static-bound guarantee whose derived value EXCEEDS the
+# declared limit yields ONE row naming the resource, the classification
+# and the derived (bound/measured) value; a runtime-measured guarantee
+# never yields a static row (the generated frame decides at run time).
+# Empty = every static guarantee holds.
+pub def budget_violation_rows(tb: TypedBudget, d: BudgetDerivations) -> Vec[String]
+  var out = Vec::new()
+  for c in tb.constraints do
+    var limit = budget_bound_value(&c.limit)
+    if budget_metric_resource(&c.metric) == "time" then
+      limit = budget_time_limit_ns_of(&c.metric.clone(), &c.limit)
+    end
+    let g = budget_guarantee_of(c.metric.clone(), limit, &d)
+    if g.classification == "static-proof" || g.classification == "static-bound" then
+      let derived = budget_derived_value_of(&g.resource, &d)
+      if derived > g.limit then
+        out.push("budget:" + g.resource.clone() + " " + g.classification.clone() + " bound " + derived.to_string() + " exceeds limit " + g.limit.to_string())
+      end
+    end
+  end
+  out
+end
+
+# The self-checking LANE rows of the third-audit item-45 classification
+# vocabulary (the sibling style of budget_lane_check in change_budget.tg):
+# the rows build BudgetDerivations fixtures directly and assert the
+# classification words, the derived values and the violation rows. The
+# returned list names every mismatch (empty = the lane verifies).
+pub def budget_guarantee_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # T1: the vocabulary canonicalizes every documented spelling.
+  budget_lane_expect_word(&mut out, "T1-heap-allocations-alias", budget_metric_resource("heap_allocations"), "alloc")
+  budget_lane_expect_word(&mut out, "T1-heap-bytes-alias", budget_metric_resource("heap_bytes"), "heap_bytes")
+  budget_lane_expect_word(&mut out, "T1-stack-bytes-alias", budget_metric_resource("stack_bytes"), "stack_bytes")
+  budget_lane_expect_word(&mut out, "T1-code-size-alias", budget_metric_resource("code_size_bytes"), "code_size")
+  budget_lane_expect_word(&mut out, "T1-time-us-alias", budget_metric_resource("time_us"), "time")
+  budget_lane_expect_word(&mut out, "T1-instructions", budget_metric_resource("instructions"), "instructions")
+  budget_lane_expect_word(&mut out, "T1-unknown-passthrough", budget_metric_resource("cpu"), "cpu")
+
+  # T2: the strongest classification per resource.
+  budget_lane_expect_word(&mut out, "T2-heap-allocations-static-proof", budget_classification_of("heap_allocations"), "static-proof")
+  budget_lane_expect_word(&mut out, "T2-heap-bytes-static-bound", budget_classification_of("heap_bytes"), "static-bound")
+  budget_lane_expect_word(&mut out, "T2-stack-bytes-static-proof", budget_classification_of("stack_bytes"), "static-proof")
+  budget_lane_expect_word(&mut out, "T2-code-size-static-bound", budget_classification_of("code_size_bytes"), "static-bound")
+  budget_lane_expect_word(&mut out, "T2-instructions-static-bound", budget_classification_of("instructions"), "static-bound")
+  budget_lane_expect_word(&mut out, "T2-time-us-runtime-measured", budget_classification_of("time_us"), "runtime-measured")
+  budget_lane_expect_word(&mut out, "T2-unknown-runtime-measured", budget_classification_of("cpu"), "runtime-measured")
+  budget_lane_expect_bool(&mut out, "T2-classification-words-valid", budget_classification_valid("static-proof") && budget_classification_valid("static-bound") && budget_classification_valid("runtime-measured") && !budget_classification_valid("maybe"))
+
+  # T3: heap_allocations = 0 with the proven no-alloc summary is
+  # static-proof with derived 0; any site downgrades to runtime-measured.
+  let d_proven = BudgetDerivations { alloc_proven_none: true, alloc_sites: 0, heap_bound_bytes: 0 }
+  let g_alloc = budget_guarantee_of("heap_allocations".to_string(), 0, &d_proven)
+  budget_lane_expect_word(&mut out, "T3-alloc-zero-proven-static-proof", g_alloc.classification, "static-proof")
+  budget_lane_expect_int(&mut out, "T3-alloc-zero-derived-zero", budget_derived_value_of("alloc", &d_proven), 0)
+  let d_sites = BudgetDerivations { alloc_proven_none: false, alloc_sites: 1, heap_bound_bytes: 4096 }
+  let g_alloc2 = budget_guarantee_of("heap_allocations".to_string(), 0, &d_sites)
+  budget_lane_expect_word(&mut out, "T3-alloc-zero-with-site-runtime", g_alloc2.classification, "runtime-measured")
+
+  # T4: heap_bytes is static-bound outside the zero proof (derived =
+  # sites × BUDGET_ALLOC_SITE_BYTES) and static-proof for the zero case.
+  let g_heap0 = budget_guarantee_of("heap_bytes".to_string(), 0, &d_proven)
+  budget_lane_expect_word(&mut out, "T4-heap-bytes-zero-proven-static-proof", g_heap0.classification, "static-proof")
+  let g_heap = budget_guarantee_of("heap_bytes".to_string(), 4096, &d_sites)
+  budget_lane_expect_word(&mut out, "T4-heap-bytes-one-site-static-bound", g_heap.classification, "static-bound")
+  budget_lane_expect_int(&mut out, "T4-heap-bytes-derived", budget_derived_value_of("heap_bytes", &d_sites), 4096)
+  let tb_heap_over = budget_lane_tb("heap_bytes", "1")
+  let tb_heap_ok = budget_lane_tb("heap_bytes", "4096")
+  budget_lane_expect_bool(&mut out, "T4-heap-bytes-over-limit-row", budget_violation_rows(&tb_heap_over, &d_sites).len() == 1)
+  budget_lane_expect_bool(&mut out, "T4-heap-bytes-within-limit-row", budget_violation_rows(&tb_heap_ok, &d_sites).len() == 0)
+
+  # T5: stack_bytes is static-proof with the exact LIR frame_bytes and
+  # static-bound with the MIR-only derivation; an over-limit bound fails
+  # with the derived value.
+  let d_lir = BudgetDerivations { stack_bound_bytes: 256, stack_exact: true }
+  let g_stack_lir = budget_guarantee_of("stack_bytes".to_string(), 256, &d_lir)
+  budget_lane_expect_word(&mut out, "T5-stack-lir-static-proof", g_stack_lir.classification, "static-proof")
+  let d_mir = BudgetDerivations { stack_bound_bytes: 512, stack_exact: false }
+  let g_stack_mir = budget_guarantee_of("stack_bytes".to_string(), 1024, &d_mir)
+  budget_lane_expect_word(&mut out, "T5-stack-mir-static-bound", g_stack_mir.classification, "static-bound")
+  let tb_stack_over = budget_lane_tb("stack_bytes", "256")
+  let tb_stack_ok = budget_lane_tb("stack_bytes", "512")
+  budget_lane_expect_bool(&mut out, "T5-stack-over-limit-row", budget_violation_rows(&tb_stack_over, &d_mir).len() == 1)
+  budget_lane_expect_bool(&mut out, "T5-stack-within-limit-ok", budget_violation_rows(&tb_stack_ok, &d_mir).len() == 0)
+
+  # T6: code_size_bytes is static-bound from the estimate; an exact
+  # emitted word count upgrades it to static-proof.
+  let d_code = BudgetDerivations { code_size_bytes: 512, code_exact: false }
+  let g_code = budget_guarantee_of("code_size_bytes".to_string(), 1024, &d_code)
+  budget_lane_expect_word(&mut out, "T6-code-estimate-static-bound", g_code.classification, "static-bound")
+  let d_code_exact = BudgetDerivations { code_size_bytes: 512, code_exact: true }
+  let g_code_exact = budget_guarantee_of("code_size_bytes".to_string(), 1024, &d_code_exact)
+  budget_lane_expect_word(&mut out, "T6-code-exact-static-proof", g_code_exact.classification, "static-proof")
+  let tb_code_over = budget_lane_tb("code_size_bytes", "256")
+  budget_lane_expect_bool(&mut out, "T6-code-over-limit-row", budget_violation_rows(&tb_code_over, &d_code).len() == 1)
+
+  # T7: instructions is static-bound with the derivation and
+  # runtime-measured without one; time_us is runtime-measured either way
+  # (no static clock derivation exists).
+  let d_instr = BudgetDerivations { instruction_bound: 64 }
+  let g_instr = budget_guarantee_of("instructions".to_string(), 128, &d_instr)
+  budget_lane_expect_word(&mut out, "T7-instructions-static-bound", g_instr.classification, "static-bound")
+  let d_instr_no = BudgetDerivations { instruction_bound: 0 }
+  let g_instr_no = budget_guarantee_of("instructions".to_string(), 128, &d_instr_no)
+  budget_lane_expect_word(&mut out, "T7-instructions-no-derivation-runtime", g_instr_no.classification, "runtime-measured")
+  let tb_instr_over = budget_lane_tb("instructions", "32")
+  budget_lane_expect_bool(&mut out, "T7-instructions-over-limit-row", budget_violation_rows(&tb_instr_over, &d_instr).len() == 1)
+  let g_time = budget_guarantee_of("time_us".to_string(), 10000, &d_instr)
+  budget_lane_expect_word(&mut out, "T7-time-us-runtime-measured", g_time.classification, "runtime-measured")
+  let tb_time_tiny = budget_lane_tb("time_us", "1")
+  budget_lane_expect_bool(&mut out, "T7-time-never-static-row", budget_violation_rows(&tb_time_tiny, &d_instr).len() == 0)
+
+  # T8: the time_us bare bound is microseconds (→ ns), an explicit unit
+  # suffix wins, and the derivation text renders the classification.
+  budget_lane_expect_int(&mut out, "T8-time-us-scaling", budget_time_limit_ns_of("time_us", "10"), 10000)
+  budget_lane_expect_int(&mut out, "T8-time-us-suffix-wins", budget_time_limit_ns_of("time_us", "10ms"), 10000000)
+  budget_lane_expect_word(&mut out, "T8-derivation-text-bound", budget_derivation_text("stack_bytes", &d_mir), "static-bound bound 512")
+  budget_lane_expect_word(&mut out, "T8-derivation-text-runtime", budget_derivation_text("time", &d_mir), "runtime-measured (the generated frame decides)")
+
+  out
+end
+
+# One lane assertion over a String word (a mismatch row names the row, the
+# wanted and the got words).
+def budget_lane_expect_word(inout out: Vec[String], name: String, got: String, want: String) -> Unit
+  if got != want then
+    out.push(name + ": expected `" + want.clone() + "`, got `" + got.clone() + "`")
+  end
+  ()
+end
+
+# One lane assertion over an Int value.
+def budget_lane_expect_int(inout out: Vec[String], name: String, got: Int, want: Int) -> Unit
+  if got != want then
+    out.push(name + ": expected " + want.to_string() + ", got " + got.to_string())
+  end
+  ()
+end
+
+# One lane assertion over a Bool value.
+def budget_lane_expect_bool(inout out: Vec[String], name: String, got: Bool, want: Bool) -> Unit
+  if got != want then
+    out.push(name + ": expected " + want.to_string() + ", got " + got.to_string())
+  end
+  ()
+end
+
+# One single-constraint TypedBudget fixture for the lane rows.
+def budget_lane_tb(metric: String, bound: String) -> TypedBudget
+  var cons = Vec::new()
+  cons.push(TypedBudgetConstraint { metric: metric, limit: bound })
+  TypedBudget { constraints: cons }
 end
 
 # Whether an intrinsic-classified call ALLOCATES heap storage (the
@@ -2232,6 +2672,26 @@ struct TypeEnv
   # constant out of the declared scalar range are diagnostics) and by the
   # call-site const-parameter inference guards.
   const_param_decl_types: Map[Int, Type] = Map::new()
+
+  # (§20 const generics, slice 4 — declared RANGE constraints): numeric
+  # GenericParamId -> the DECLARED inclusive range of a const generic
+  # parameter (`const SCALE: Int in 0..=18`; the ConstRange payload carries
+  # the declaration-site span). Recorded by bind_generic_params alongside
+  # const_param_decl_types, so the recorded id vector of any declaration
+  # (TypeDef.generic_params, the fn/impl signature walks) can be
+  # range-checked positionally at every instantiation point:
+  #   - the explicit-argument site (validate_generic_instantiation_args,
+  #     reached by resolve_type_expr — forming `Decimal64[19]` is the
+  #     diagnostic, not a later method call);
+  #   - the inference-bound const-argument path (the call-site const
+  #     presolve and the solved-substitution records —
+  #     validate_const_arg_value / validate_const_arg_ranges);
+  #   - the SUBSTITUTION boundary, where a symbolic const-expression folds
+  #     to its value (`Decimal128[SCALE + 19]` under SCALE := 0) — the
+  #     concrete-type walk validate_type_const_args.
+  # An id absent here has no declared range (every pre-slice-4 parameter
+  # and every impl-derived parameter that does not restate the range).
+  const_param_ranges: Map[Int, ConstRange] = Map::new()
 
   # (§20 const generics, slice 3): expr node id -> the numeric
   # GenericParamId of an IN-SCOPE const generic parameter read as a
@@ -6348,6 +6808,14 @@ def bind_generic_params(inout env: TypeEnv, generic_params: Vec[GenericParam], p
     when GenericParamKind::ConstParam(ty_expr) then
       bind_var(env, gp.name.clone(), Type::ConstParam(param_ids[i].clone()))
       env.const_param_decl_types.insert(generic_param_id_numeric(&param_ids[i]), resolve_type_expr(env, &ty_expr))
+      # (§20 slice 4): record the declared RANGE of this const parameter
+      # (`const SCALE: Int in 0..=18`); a parameter without an `in` clause
+      # (every pre-slice-4 declaration) records nothing.
+      match gp.const_range
+      when Option::Some(range) then
+        env.const_param_ranges.insert(generic_param_id_numeric(&param_ids[i]), range)
+      when Option::None then ()
+      end
     when GenericParamKind::TypeParam then
       bind_var(env, gp.name.clone(), Type::Param(param_ids[i].clone()))
     end
@@ -8006,6 +8474,20 @@ end
 #           unrecognized class (only no_alloc / no_block / no_io are
 #           supported) or names none at all (fail closed at the claim
 #           extraction)
+# (third-audit item 25 — the `pure` modifier theorem; emitted by mir.tg
+# check_purity_annotations_mir, NEXT free code after E0233):
+#   E0234 — A `pure` declaration is not ProvenPure: the transitive
+#           purity analysis (the §11 summaries + the MIR store/call
+#           classification + the in-program call graph fixed point)
+#           found a definite impurity (allocation / I-O / blocking /
+#           sleeping / spawn / mmap-or-arena capability / pointer or
+#           static store on some reachable path) or could not prove
+#           purity (a bodyless/extern callee, an indirect call, an
+#           algebraic-effects perform, a destruction outside this
+#           compilation). Unknown FAILS CLOSED — an unprovable
+#           annotation is an error, never a silently trusted one. The
+#           evidence path (the caller -> callee chain into the offending
+#           site) rides effect_trace.
 
 # ———————————————————————————————————————————————————————————————
 # Type Checking
@@ -9098,6 +9580,19 @@ end
 # — an operation whose allocation/blocking/IO behavior cannot be
 # bounded is conservatively capable of everything, so "@no_alloc
 # calling an unknown function MUST FAIL").
+#
+# (third-audit item 25) The `pure` MODIFIER is adjacent but distinct: it
+# is not an @attribute and has no claim record here — the parser records
+# FunctionDecl.is_pure, the typed signature carries it (FnSignature.is_pure
+# below), and lower_function stamps it onto MirFunction.is_pure. Its rule
+# is enforced by mir.tg's check_purity_annotations_mir (the purity theorem:
+# a transitive EffectSummary with no allocated/io/block/sleep/spawn bits,
+# no capabilities, no non-local pointer/static stores, no
+# bodyless/indirect calls, and every in-program callee ProvenPure; the
+# panic-class decision — panic is permitted, documented in that pass). The
+# status vocabulary PurityStatus { ProvenPure | Impure(evidence) |
+# Unknown(evidence) } and the E0234 fail-closed diagnostic live in mir.tg;
+# only ProvenPure earns the optimizer/equivalence privileges.
 #
 # Enforcement (annotation = proven-or-error):
 #   - @no_alloc forbids Alloc; @no_block forbids Block; @no_io forbids
@@ -10461,7 +10956,7 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
       env.fn_class_claims.insert(decl_key.clone(), effect_claims.clone())
     end
   end
-  env.typed_fn_signatures.insert(owner_key, FnSignature { params: fn_param_types, ret_type: ret_type.clone(), declared_effects: declared_effects, declared_budget: declared_budget, effect_annotations: effect_annotations })
+  env.typed_fn_signatures.insert(owner_key, FnSignature { params: fn_param_types, ret_type: ret_type.clone(), declared_effects: declared_effects, declared_budget: declared_budget, effect_annotations: effect_annotations, is_pure: f.is_pure })
   
  # every `return expr` in the body unifies immediately with the
   # declared return type (unconditional — not dependent on the last
@@ -11087,7 +11582,7 @@ def check_impl(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String]) -> Uni
     env.fn_declared_effect_names.insert(m_decl_key.clone(), m.name.clone())
     env.fn_declared_effect_spans.insert(m_decl_key.clone(), m.span)
     env.fn_effect_modules.insert(m_decl_key.clone(), env.current_module_path.clone())
-    impl_sig_records.push(FnSignature { params: param_types.clone(), ret_type: ret_type.clone(), declared_effects: m_declared_effects, declared_budget: typed_budget_of(&m.budget_val) })
+    impl_sig_records.push(FnSignature { params: param_types.clone(), ret_type: ret_type.clone(), declared_effects: m_declared_effects, declared_budget: typed_budget_of(&m.budget_val), is_pure: m.is_pure })
 
     # Collect method-level generic parameter ids for later substitution
  # (the ids in declaration order — the param-name table holds
@@ -18046,6 +18541,27 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
           rwi = rwi + 1
         end
         inst_ret = subst_type_const_map(&inst_ret, &const_binds)
+        # (§20 const generics, slice 4): EVERY inferred const argument is
+        # range-validated at the CALL site — a value the presolve bound
+        # from an argument type, or that a symbolic expression folded to,
+        # outside its parameter's declared range is the diagnostic here,
+        # exactly like the explicit-argument site. The rewritten signature
+        # is then walked for folded Adt slots (`Decimal128[SCALE + 19]`
+        # becomes Decimal128[19]); residual symbolic forms stay deferred.
+        var cbv = 0
+        while cbv < bind_entries.len() do
+          match bind_entries[cbv].1
+          when Type::Const(cbn) then validate_const_arg_value(env, bind_entries[cbv].0, cbn, expr.span)
+          when _ then ()
+          end
+          cbv = cbv + 1
+        end
+        var cwi = 0
+        while cwi < inst_params.len() do
+          validate_type_const_args(env, inst_params[cwi].ty, expr.span)
+          cwi = cwi + 1
+        end
+        validate_type_const_args(env, inst_ret, expr.span)
       end
       # Enforce exact arity for non-variadic callables: every declared
       # parameter must have a supplied argument and every argument must
@@ -19391,6 +19907,17 @@ def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, 
           when Option::Some(owner_tid) then
             var owner_ty: Option[Type] = Option::None
             if owner_args_resolved.len() > 0 then
+              # (§20 const generics, slice 4): the path owner's explicit
+              # type arguments form the concrete owner Adt directly (this
+              # construction bypasses resolve_type_expr's Named arm), so
+              # the instantiation-site argument validation runs HERE too —
+              # `Decimal64[19]::m(...)` is the diagnostic at the path, not
+              # a later method-call surprise.
+              match get_type_by_id(env, &owner_tid)
+              when Option::Some(owner_td) then
+                validate_generic_instantiation_args(env, &owner_td.generic_params, &owner_args_resolved, expr.span)
+              when Option::None then ()
+              end
               owner_ty = Option::Some(Type::Adt(owner_tid, owner_args_resolved.clone()))
             end
             match env.method_lookup.get(owner_tid.id)
@@ -19535,10 +20062,21 @@ def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, 
                             sp_svi = sp_svi + 1
                           end
                           if sp_all_solved then
+                            # (§20 const generics, slice 4): positional range
+                            # check of the solved associated-call substitution.
+                            validate_const_arg_ranges(env, sp_names.clone(), sp_solved.clone(), expr.span)
                             env.typed_call_instances.insert(expr.node_id, sp_solved)
                           elsif sp_names.len() > 0 then
                             env.pending_call_instances.insert(expr.node_id, (sp_names.clone(), sp_vars, expr.span))
                           end
+                          # (§20 slice 4): the instantiated signature's
+                          # folded Adt const slots.
+                          var swi = 0
+                          while swi < sp_inst_params.len() do
+                            validate_type_const_args(env, sp_inst_params[swi].ty, expr.span)
+                            swi = swi + 1
+                          end
+                          validate_type_const_args(env, sp_inst_ret, expr.span)
                           static_ret = Option::Some(resolve_type_var(env, sp_inst_ret))
                       end
                       end
@@ -19873,10 +20411,21 @@ def instantiate_param_for_type_method(
     svi = svi + 1
   end
   if all_solved then
+    # (§20 const generics, slice 4): the solved substitution's positional
+    # range check (a concrete const argument outside its parameter's
+    # declared range is the diagnostic at the call site).
+    validate_const_arg_ranges(env, all_names.clone(), solved_args.clone(), span)
     env.typed_call_instances.insert(call_node_id, solved_args)
   elsif all_names.len() > 0 then
     env.pending_call_instances.insert(call_node_id, (all_names.clone(), all_vars, span))
   end
+  # (§20 slice 4): the substituted signature's folded Adt const slots.
+  var wpi = 0
+  while wpi < inst_params.len() do
+    validate_type_const_args(env, inst_params[wpi].ty, span)
+    wpi = wpi + 1
+  end
+  validate_type_const_args(env, inst_ret, span)
   Option::Some(resolve_type_var(env, inst_ret))
 end
 
@@ -20025,10 +20574,21 @@ def instantiate_param_bound_method(
     svi = svi + 1
   end
   if all_solved then
+    # (§20 const generics, slice 4): the solved substitution's positional
+    # range check (a concrete const argument outside its parameter's
+    # declared range is the diagnostic at the call site).
+    validate_const_arg_ranges(env, all_names.clone(), solved_args.clone(), span)
     env.typed_call_instances.insert(call_node_id, solved_args)
   elsif all_names.len() > 0 then
     env.pending_call_instances.insert(call_node_id, (all_names.clone(), all_vars, span))
   end
+  # (§20 slice 4): the substituted signature's folded Adt const slots.
+  var wpi = 0
+  while wpi < inst_params.len() do
+    validate_type_const_args(env, inst_params[wpi].ty, span)
+    wpi = wpi + 1
+  end
+  validate_type_const_args(env, inst_ret, span)
   Option::Some(resolve_type_var(env, inst_ret))
 end
 
@@ -20534,10 +21094,43 @@ def instantiate_method_type(inout env: TypeEnv, imp: ImplInfo, m: MethodInfo, re
       rvi = rvi + 1
     end
     if all_solved then
-      env.typed_call_instances.insert(call_node_id, solved_args)
+      # (§20 const generics, slice 4): the solved substitution's positional
+      # range check (explicit method const arguments and values the
+      # receiver/head unification fixed).
+      validate_const_arg_ranges(env, all_names.clone(), solved_args.clone(), span)
+      env.typed_call_instances.insert(call_node_id, solved_args.clone())
+      # (§20 slice 4): the SOLVED bind map folds every const-parameter leaf
+      # this call fixed — the implicit method-level form (`other:
+      # Decimal128[S2]` binding S2 through the argument unification) leaves
+      # the return's ConstSym tree symbolic at the substitution ABOVE, so
+      # the folded view is validated here: the value the leaf folds to
+      # must lie inside the Adt parameter's declared range exactly like an
+      # explicit argument.
+      var cbinds: Map[Int, Type] = Map::new()
+      var cbi = 0
+      while cbi < all_names.len() && cbi < solved_args.len() do
+        cbinds.insert(generic_param_id_numeric(&all_names[cbi]), solved_args[cbi].clone())
+        cbi = cbi + 1
+      end
+      var fpi = 0
+      while fpi < inst_params.len() do
+        let fpt = inst_params[fpi]
+        validate_type_const_args(env, subst_type_const_map(&fpt.ty, &cbinds), span)
+        fpi = fpi + 1
+      end
+      validate_type_const_args(env, subst_type_const_map(&inst_ret, &cbinds), span)
     elsif all_names.len() > 0 then
       env.pending_call_instances.insert(call_node_id, (all_names.clone(), all_vars, span))
     end
+    # (§20 slice 4): the substituted signature's folded Adt const slots
+    # (this is the boundary where `Decimal64[SCALE + T]` under concrete
+    # impl/method arguments folds to its value before unification).
+    var wmi = 0
+    while wmi < inst_params.len() do
+      validate_type_const_args(env, inst_params[wmi].ty, span)
+      wmi = wmi + 1
+    end
+    validate_type_const_args(env, inst_ret, span)
     resolve_type_var(env, inst_ret)
   else
     # The impl head does not unify with this receiver instantiation (e.g. a
@@ -22058,6 +22651,136 @@ def const_value_fits_declared_type(v: Int, decl_ty: Type) -> Bool
   signed_decimal_cmp(vs, lo) >= 0 && signed_decimal_cmp(vs, hi) <= 0
 end
 
+# (§20 const generics, slice 4): the declared-RANGE half of the const-argument
+# validation — a concrete value outside its const parameter's declared range
+# (`const SCALE: Int in 0..=18`) is the ONE stable range diagnostic, naming
+# the parameter, its declared bounds and the offending value. A parameter
+# with no recorded range (every pre-slice-4 parameter) never reports here;
+# the declared-TYPE bounds stay with const_value_fits_declared_type.
+def validate_const_value_range(inout env: TypeEnv, gpid_num: Int, v: Int, span: Span) -> Unit
+  match env.const_param_ranges.get(gpid_num)
+  when Option::Some(r) then
+    if v < r.lo || v > r.hi then
+      let pname = match env.generic_param_table.names.get(gpid_num)
+      when Option::Some(n) then n.clone()
+      when Option::None then "<param#" + gpid_num.to_string() + ">"
+      end
+      type_add_error(env, "const generic argument " + v.to_string() + " is out of range for const parameter `" + pname + "`: the declared range is " + r.lo.to_string() + "..=" + r.hi.to_string(), span)
+    end
+  when Option::None then ()
+  end
+end
+
+# (§20 const generics, slice 4): the declared-TYPE + declared-RANGE
+# validation of a concrete const argument bound by INFERENCE or by a
+# symbolic FOLD (the explicit-argument site keeps its own wording through
+# validate_generic_instantiation_args; this entry point is the
+# inference-bound twin — declared type first, then the declared range, so a
+# value outside the scalar type's domain keeps the historical diagnostic).
+def validate_const_arg_value(inout env: TypeEnv, gpid_num: Int, v: Int, span: Span) -> Unit
+  var declared_ok = true
+  match env.const_param_decl_types.get(gpid_num)
+  when Option::Some(decl_ty) then
+    if !const_value_fits_declared_type(v, decl_ty) then
+      declared_ok = false
+      let pname = match env.generic_param_table.names.get(gpid_num)
+      when Option::Some(n) then n.clone()
+      when Option::None then "<param#" + gpid_num.to_string() + ">"
+      end
+      type_add_error(env, "const generic argument " + v.to_string() + " is out of range for const parameter `" + pname + "` of type `" + integer_type_name(decl_ty) + "`", span)
+    end
+  when Option::None then ()
+  end
+  if declared_ok then
+    validate_const_value_range(env, gpid_num, v, span)
+  end
+end
+
+# (§20 const generics, slice 4): positional range validation of a SOLVED
+# generic substitution — the (parameter id, solved argument) vectors
+# recorded at call sites (plain calls, method/associated calls and the
+# pending re-resolution). A concrete Type::Const outside its parameter's
+# declared range is a diagnostic at the instantiation site; symbolic
+# arguments (ConstParam/ConstSym — an enclosing declaration's parameters)
+# stay deferred (their own instantiation validates them), and non-const
+# arguments are ignored. Only call it with a FULLY solved vector — the
+# entries pair positionally with `names`.
+def validate_const_arg_ranges(inout env: TypeEnv, names: Vec[GenericParamId], args: Vec[Type], span: Span) -> Unit
+  var i = 0
+  while i < names.len() && i < args.len() do
+    match args[i]
+    when Type::Const(v) then validate_const_arg_value(env, generic_param_id_numeric(&names[i]), v, span)
+    when _ then ()
+    end
+    i = i + 1
+  end
+end
+
+# (§20 const generics, slice 4): the concrete-type walk at a SUBSTITUTION
+# boundary — every Adt node's positional const arguments are validated
+# against the DECLARED RANGE of the Adt definition's own parameters. This
+# is what catches a symbolic const-EXPRESSION argument that FOLDS out of
+# range during substitution (`Decimal128[SCALE + 19]` under SCALE := 0
+# folds to Decimal128[19]; the fold itself happens inside the pure
+# subst_type_args / subst_type_const_map / mono substitute_type visitors,
+# which cannot report — every checker-side substitution site runs this walk
+# over its instantiated signature instead, and monomorphization only ever
+# sees instances this checker validated). Symbolic arguments
+# (ConstParam/ConstSym) and inference variables pass through — residual
+# symbolic forms are already rejected by the post-instantiation scans
+# (fail-closed), and an unresolved inference variable has no concrete value
+# to range-check yet.
+def validate_type_const_args(inout env: TypeEnv, ty: Type, span: Span) -> Unit
+  match ty
+  when Type::Adt(tid, args) then
+    match get_type_by_id(env, &tid)
+    when Option::Some(td) then
+      var i = 0
+      while i < td.generic_params.len() && i < args.len() do
+        match args[i]
+        when Type::Const(v) then validate_const_value_range(env, generic_param_id_numeric(&td.generic_params[i]), v, span)
+        when _ then ()
+        end
+        i = i + 1
+      end
+    when Option::None then ()
+    end
+    var j = 0
+    while j < args.len() do
+      validate_type_const_args(env, args[j], span)
+      j = j + 1
+    end
+  when Type::Tuple(elems) then
+    var ti = 0
+    while ti < elems.len() do
+      validate_type_const_args(env, elems[ti], span)
+      ti = ti + 1
+    end
+  when Type::FnPtr(params, ret, _) then
+    var fpi = 0
+    while fpi < params.len() do
+      validate_type_const_args(env, params[fpi].ty, span)
+      fpi = fpi + 1
+    end
+    validate_type_const_args(env, ret, span)
+  when Type::Closure(_, params, ret, captures, _) then
+    var cpi = 0
+    while cpi < params.len() do
+      validate_type_const_args(env, params[cpi].ty, span)
+      cpi = cpi + 1
+    end
+    validate_type_const_args(env, ret, span)
+    validate_type_const_args(env, captures, span)
+  when Type::FixedArray(elem, _) then validate_type_const_args(env, elem, span)
+  when Type::FixedArraySym(elem, _) then validate_type_const_args(env, elem, span)
+  when Type::RefInternal(inner, _) then validate_type_const_args(env, inner, span)
+  when Type::Ptr(inner) then validate_type_const_args(env, inner, span)
+  when Type::PtrMut(inner) then validate_type_const_args(env, inner, span)
+  when Type::Effect(_, inner) then validate_type_const_args(env, inner, span)
+  when _ then ()
+  end
+end
+
 # (§20 const generics, slice 2): argument-kind/range validation at a generic
 # INSTANTIATION SITE — each resolved source argument is checked against its
 # parameter's DECLARED kind, classified through env.const_param_decl_types
@@ -22093,6 +22816,13 @@ def validate_generic_instantiation_args(inout env: TypeEnv, decl_params: Vec[Gen
         if !const_value_fits_declared_type(v, decl_ty) then
           let pname = generic_param_name_of(&env.generic_param_table, &gpid)
           type_add_error(env, "const generic argument " + v.to_string() + " is out of range for const parameter `" + pname + "` of type `" + integer_type_name(decl_ty) + "`", span)
+        else
+          # (§20 slice 4): a value inside the declared scalar type's domain
+          # must ALSO lie inside the parameter's declared range, when one is
+          # declared (`const SCALE: Int in 0..=18`). The two checks are
+          # disjoint by construction: the declared-type error keeps its
+          # historical wording, the range error names the declared bounds.
+          validate_const_value_range(env, generic_param_id_numeric(&gpid), v, span)
         end
       when Type::ConstParam(_) then ()
       when Type::ConstSym(_) then
@@ -22918,7 +23648,7 @@ def resolve_pending_int_literals(inout env: TypeEnv) -> Unit
     for p in sig.params do
       new_params.push(ParamType { ty: default_int_literal_type(env, &p.ty), convention: p.convention })
     end
-    new_sigs.insert(key, FnSignature { params: new_params, ret_type: default_int_literal_type(env, &sig.ret_type), declared_effects: sig.declared_effects.clone(), declared_budget: sig.declared_budget.clone(), effect_annotations: sig.effect_annotations.clone(), variadic: sig.variadic })
+    new_sigs.insert(key, FnSignature { params: new_params, ret_type: default_int_literal_type(env, &sig.ret_type), declared_effects: sig.declared_effects.clone(), declared_budget: sig.declared_budget.clone(), effect_annotations: sig.effect_annotations.clone(), variadic: sig.variadic, is_pure: sig.is_pure })
   end
   env.typed_fn_signatures = new_sigs
   var new_statics = Map::new()
@@ -23666,6 +24396,10 @@ def resolve_pending_call_instances(inout env: TypeEnv) -> Unit
       end
     end
     if all_solved then
+      # (§20 const generics, slice 4): the re-resolved substitution's
+      # positional range check — a parked constant the caller's context
+      # solved out of range fails here, at the same call site.
+      validate_const_arg_ranges(env, rec_names.clone(), solved_args.clone(), rec_span)
       env.typed_call_instances.insert(node_id, solved_args)
     else
       # Genuinely unconstrained: no context (arguments, annotation, dest)
@@ -23973,7 +24707,7 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
     for sp in sig_rec.params do
       chased_params.push(ParamType { ty: resolve_type_var(env, sp.ty), convention: sp.convention })
     end
-    typed_fn_sigs.insert(sig_key, FnSignature { params: chased_params, ret_type: resolve_type_var(env, sig_rec.ret_type), declared_effects: sig_rec.declared_effects.clone(), declared_budget: sig_rec.declared_budget.clone(), effect_annotations: sig_rec.effect_annotations.clone(), variadic: sig_rec.variadic })
+    typed_fn_sigs.insert(sig_key, FnSignature { params: chased_params, ret_type: resolve_type_var(env, sig_rec.ret_type), declared_effects: sig_rec.declared_effects.clone(), declared_budget: sig_rec.declared_budget.clone(), effect_annotations: sig_rec.effect_annotations.clone(), variadic: sig_rec.variadic, is_pure: sig_rec.is_pure })
   end
   var typed_static_tys = Map::new()
   for (st_key, st_ty) in env.typed_static_types do

@@ -62,6 +62,17 @@ SUITES=(
   "tests/platform/platform_surface_smoke_test.tg"
   "tests/mir_int_arith_semantics_test.tg"
   "tests/diag_derivation_test.tg"
+  # third-audit items 23/24: the stable diagnostic id + retained store,
+  # the typed ExplainNode trees and the diagnostic.* session round trip.
+  "tests/semantic_diagnostics_test.tg"
+  # third-audit item 22: the typed wire response records (the one-renderer/
+  # one-parser round trips + the dispatch attachment) and the normal
+  # `tg server` subcommand arg parse.
+  "tests/semantic_server_test.tg"
+  # offline snapshot path: the semantic_snapshot_parse exact-inverse lane
+  # (byte-identity over a hand-built full snapshot), the malformed-row
+  # fail-closed probes and the loaded-artifact session query.
+  "tests/semantic_snapshot_parse_test.tg"
   # audit item 49: the structured generic-instance keys (InstanceKey /
   # MonoCache.instances re-key + the documented const-fold model).
   "tests/mono_instance_key_test.tg"
@@ -76,6 +87,20 @@ SUITES=(
   # audit items 28 + 29: the ABI call-plan rows (classify_call_plan over
   # aarch64/x86-64/cortex-m/riscv64, internal + ExternC flavors).
   "tests/abi/abi_call_plan_rows_test.tg"
+  # third-audit item 34: the §40 coverage ingest lane (tg.cov.v1 ids, the
+  # tg.cov.trace.v1 ingest, the point indexes, uncovered_paths and the
+  # test.affected / coverage.affected ops).
+  "tests/coverage_graph_test.tg"
+  # third-audit item 34 (runtime producer): the coverage emission plan
+  # (counter table attach + global bases) and the dump-writer renderer
+  # over a synthetic counter array — the contract the LIR-route runtime
+  # blob is built from.
+  "tests/coverage_emission_test.tg"
+  # third-audit item 45: the @budget guarantee vocabulary + classification
+  # lane (the BudgetGuarantee / BudgetDerivations records, the
+  # budget_classification_of rule, the derivation-aware static
+  # classification and the violation-row derivation).
+  "tests/budget_guarantees_test.tg"
 )
 
 FAILED=0

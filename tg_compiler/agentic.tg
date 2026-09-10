@@ -2,368 +2,56 @@
 # Self-hosting compiler written in Tangerine
 #
 # This module provides runtime and compile-time support for:
-# - Design-by-Contract (pre/post conditions, invariants)
+# - Design-by-Contract advisory tooling (the ONE contract authority is the
+#   canonical MIR ContractCheck path; see contract_evaluation_authority)
 # - Capability-based security
 # - Effect tracking
 # - Budget/resource management
 # - Rationale documentation
 # - Semantic differencing
 
-use std::core::{Option, Result, panic}
+use std::core::{Option, Result}
 use std::collections::{Vec, Map, Set}
-use tg_compiler::token::{Span, parsed_int_to_host}
+use std::time::perf_counter_ms
+use tg_compiler::token::Span
 use tg_compiler::ast::{
-  Program, Item, ItemKind, FunctionDecl, Contract, ContractClause,
-  CapabilityDecl, EffectDecl, BudgetAnnotation,
-  AstContractKind, Expr, ExprKind, BinOp, UnOp, AccessConvention
+  Program, Item, ItemKind,
+  AstContractKind, Expr, ExprKind, UnOp, AccessConvention
 }
 
 # ———————————————————————————————————————————————————————————————
-# Contract System
+# Contract Evaluation Authority
 # ———————————————————————————————————————————————————————————————
-
-struct ContractChecker
-  enabled: Bool
-  mode: AgAgContractMode
-  violations: Vec[ContractViolation]
+# There is exactly ONE contract authority: the canonical MIR contract
+# machinery. AST contract clauses are lowered by mir.tg `lower_contract`
+# into `MirStatementKind::MirContractCheck`, and codegen.tg emits the
+# runtime trap on a false computed condition (unconditional in every mode
+# — see docs/current/language.md). This module deliberately carries NO
+# AST-level contract evaluator: the removed pseudo-evaluator
+# (check_preconditions / check_postconditions / check_invariants plus the
+# evaluate_condition mini-interpreter) defaulted unsupported expressions
+# to true and hardcoded method predicates, so a boolean verdict from it
+# was never verification. Callers must compile the condition and observe
+# the emitted ContractCheck; the def below reports that requirement as a
+# typed error (never Ok(true) for an unevaluated condition).
+def contract_evaluation_authority() -> Result[Unit, String]
+  Result::Err(
+    "contract evaluation belongs to emitted ContractCheck MIR " +
+    "(mir.tg lower_contract -> MirStatementKind::MirContractCheck; " +
+    "codegen.tg emits the runtime trap). No AST-level evaluator exists."
+  )
 end
 
-enum AgAgContractMode
-  AgRuntime    # Check at runtime, abort on failure
-  AgAssertMode # Debug-only assertions
-  AgVerify     # Static verification (where possible)
-  AgDisabled   # No checking
-end
-
-struct ContractViolation
-  kind: AgContractKind
-  message: String
-  location: Span
-  context: Vec[String]
-end
-
-enum AgContractKind
-  AgPrecondition
-  AgPostcondition
-  AgInvariant
-  AgAssert
-end
-
-def contract_checker_new() -> ContractChecker
-  ContractChecker {
-    enabled: true,
-    mode: AgAgContractMode::AgRuntime,
-    violations: Vec::new()
-  }
-end
-
-def check_preconditions(inout checker: ContractChecker, f: FunctionDecl, args: Vec[ContractValue]) -> Bool
-  if !checker.enabled then
-    return true
-  end
-  
-  for contract in f.contracts do
-    match contract.kind
-    when AstContractKind::AstPre then
-      if !evaluate_condition(&contract.expr, args) then
-        checker.violations.push(ContractViolation {
-          kind: AgContractKind::AgPrecondition,
-          message: contract.message.unwrap_or("precondition failed"),
-          location: contract.span,
-          context: Vec::new()
-        })
-        return false
-      end
-    when _ then ()
-    end
-  end
-  
-  true
-end
-
-def check_postconditions(inout checker: ContractChecker, f: FunctionDecl, result: ContractValue, old_state: State) -> Bool
-  if !checker.enabled then
-    return true
-  end
-  
-  for contract in f.contracts do
-    match contract.kind
-    when AstContractKind::AstPost then
-      if !evaluate_post_condition(&contract.expr, result, old_state) then
-        checker.violations.push(ContractViolation {
-          kind: AgContractKind::AgPostcondition,
-          message: contract.message.unwrap_or("postcondition failed"),
-          location: contract.span,
-          context: Vec::new()
-        })
-        return false
-      end
-    when _ then ()
-    end
-  end
-  
-  true
-end
-
-def check_invariants(inout checker: ContractChecker, struct_name: String, fields: Map[String, ContractValue], call_span: Span) -> Bool
-  # Check all registered invariants for the given struct type.
-  # Invariants are expressions that must hold after every mutation.
-  # Returns true if all invariants pass, false if any fail.
-  
-  if !checker.enabled then
-    return true
-  end
-  
-  match checker.mode
-  when AgAgContractMode::AgDisabled then return true
-  when _ then ()
-  end
-  
-  # Check that all fields have valid (non-zero) values for basic invariants
-  # More sophisticated checking would evaluate registered invariant expressions
-  mut all_passed = true
-  
-  for field_name in fields.keys() do
-    match fields.get(&field_name)
-    when Option::Some(field_val) then
-      # Basic non-null invariant: named fields should have data != -1 (sentinel)
-      if value_to_int(&field_val) == -1 then
-        checker.violations.push(ContractViolation {
-          kind: AgContractKind::AgInvariant,
-          message: "Invariant violation: field '" + field_name.clone() + "' in struct '" + struct_name + "' has invalid sentinel value",
-          location: call_span,
-          context: Vec::new()
-        })
-        all_passed = false
-      end
-    when Option::None then ()
-    end
-  end
-  
-  all_passed
-end
-
-# Placeholder types
+# Payload value of agentic bookkeeping records (performed-effect argument
+# lists). This is a VALUE CARRIER only — it is not a contract-evaluation
+# type; contract verdicts come exclusively from the emitted ContractCheck
+# path above.
 enum ContractValue
   Int(Int)
   Bool(Bool)
   Float(Float)
   Named(String, ContractValue)
   Unit
-end
-
-struct State
-  values: Map[String, ContractValue]
-end
-
-## Capture the pre-invocation state from function parameters.
-## This creates a State snapshot that can be used with old(expr) in postconditions.
-def capture_pre_state(f: FunctionDecl, args: Vec[ContractValue]) -> State
-  mut values = Map::new()
-  var i = 0
-  for param in f.params do
-    if i < args.len() then
-      values.insert(param.name.clone(), args[i].clone())
-    end
-    i = i + 1
-  end
-  State { values: values }
-end
-
-def evaluate_condition(cond: Expr, args: Vec[ContractValue]) -> Bool
-  # Evaluate a contract condition expression against concrete argument values.
-  # This implements a mini-interpreter for the expression subset used in contracts.
-  match cond.kind
-  when ExprKind::ExprBoolLit(b) then b
-  when ExprKind::ExprIntLit(n) then parsed_int_to_host(&n) != 0
-  when ExprKind::ExprIdent(name) then
-    # Look up the name in the args list (positional lookup)
-    # Convention: args are positionally indexed by parameter order
-    # A non-zero value is truthy
-    true  # Identifiers in isolation are truthy (bound variable exists)
-  when ExprKind::ExprBinaryOp(op, left, right) then
-    # For comparison operators, evaluate numeric values
-    match op
-    when BinOp::Gt then
-      evaluate_numeric(&left, args) > evaluate_numeric(&right, args)
-    when BinOp::Lt then
-      evaluate_numeric(&left, args) < evaluate_numeric(&right, args)
-    when BinOp::Ge then
-      evaluate_numeric(&left, args) >= evaluate_numeric(&right, args)
-    when BinOp::Le then
-      evaluate_numeric(&left, args) <= evaluate_numeric(&right, args)
-    when BinOp::Eq then
-      evaluate_numeric(&left, args) == evaluate_numeric(&right, args)
-    when BinOp::Ne then
-      evaluate_numeric(&left, args) != evaluate_numeric(&right, args)
-    when BinOp::And then
-      evaluate_condition(&left, args) && evaluate_condition(&right, args)
-    when BinOp::Or then
-      evaluate_condition(&left, args) || evaluate_condition(&right, args)
-    when BinOp::Add then
-      evaluate_numeric(&left, args) + evaluate_numeric(&right, args) != 0
-    when BinOp::Sub then
-      evaluate_numeric(&left, args) - evaluate_numeric(&right, args) != 0
-    when _ then
-      evaluate_condition(&left, args) && evaluate_condition(&right, args)
-    end
-  when ExprKind::ExprUnaryOp(op, inner) then
-    match op
-    when UnOp::Not then !evaluate_condition(&inner, args)
-    when UnOp::Neg then evaluate_numeric(&inner, args) != 0
-    when _ then evaluate_condition(&inner, args)
-    end
-  when ExprKind::ExprMethodCall(recv, method, _, method_args) then
-    # Common contract patterns: x.is_some(), x.len() > 0, x.contains(y)
-    match method.as_str()
-    when "is_some" then true   # Evaluate recv for Option-ness
-    when "is_none" then false
-    when "is_empty" then false
-    when "is_ok" then true
-    when "is_err" then false
-    when _ then evaluate_condition(&recv, args)
-    end
-  when ExprKind::ExprFieldAccess(recv, field) then
-    # Field access in conditions — evaluate the receiver
-    evaluate_condition(&recv, args)
-  when _ then
-    # For complex expressions we can't evaluate statically, default to true
-    # (the runtime contract check will handle the actual verification)
-    true
-  end
-end
-
-# Evaluate an expression to a numeric (Int) value for contract comparisons
-def evaluate_numeric(expr: Expr, args: Vec[ContractValue]) -> Int
-  match expr.kind
-  when ExprKind::ExprIntLit(n) then parsed_int_to_host(&n)
-  when ExprKind::ExprBoolLit(b) then if b then 1 else 0 end
-  when ExprKind::ExprIdent(name) then
-    # Positional lookup: find value in args by scanning param names
-    # For now, extract Int value if it's a ContractValue::Int
-    match find_value_by_name(args, &name)
-    when Option::Some(v) then value_to_int(&v)
-    when Option::None then 0
-    end
-  when ExprKind::ExprBinaryOp(op, left, right) then
-    let lhs = evaluate_numeric(&left, args)
-    let rhs = evaluate_numeric(&right, args)
-    match op
-    when BinOp::Add then lhs + rhs
-    when BinOp::Sub then lhs - rhs
-    when BinOp::Mul then lhs * rhs
-    when BinOp::Div then
-      if rhs == 0 then 0
-      else lhs / rhs
-      end
-    when BinOp::Mod then
-      if rhs == 0 then 0
-      else lhs % rhs
-      end
-    when _ then 0
-    end
-  when ExprKind::ExprUnaryOp(op, inner) then
-    match op
-    when UnOp::Neg then 0 - evaluate_numeric(&inner, args)
-    when _ then evaluate_numeric(&inner, args)
-    end
-  when ExprKind::ExprMethodCall(recv, method, _, method_args) then
-    match method.as_str()
-    when "len" then
-      # Return collection length — at compile time this would be statically known
-      # For runtime evaluation the actual call is dispatched
-      0
-    when "count" then 0
-    when "abs" then
-      let v = evaluate_numeric(&recv, args)
-      if v < 0 then 0 - v else v end
-    when _ then 0
-    end
-  when _ then 0
-  end  end  end
-end
-
-def find_value_by_name(args: Vec[ContractValue], name: String) -> Option[ContractValue]
-  for arg in args do
-    match arg
-    when ContractValue::Named(n, v) then
-      if n == *name then return Option::Some(v.clone()) end
-    when _ then ()
-    end
-  end
-  Option::None
-end
-
-def value_to_int(v: ContractValue) -> Int
-  match v
-  when ContractValue::Int(n) then *n
-  when ContractValue::Bool(b) then if *b then 1 else 0 end
-  when ContractValue::Float(f) then *f as Int
-  when _ then 0
-  end  end
-end
-
-def evaluate_post_condition(cond: Expr, result: ContractValue, old: State) -> Bool
-  # Evaluate a postcondition expression with access to:
-  #   - `result`: the return value of the function
-  #   - `old`: captured pre-invocation state (for old(x) expressions)
-  #
-  # Postcondition expressions can reference:
-  #   - `result` keyword (bound to the return value)
-  #   - `old(expr)` function (evaluates expr in pre-state)
-  #   - Normal identifiers (current state)
-  match cond.kind
-  when ExprKind::ExprBoolLit(b) then b
-  when ExprKind::ExprIdent(name) then
-    if name == "result" then
-      value_to_int(result) != 0
-    else
-      # Look up in current state
-      match old.values.get(name)
-      when Option::Some(v) then value_to_int(v) != 0
-      when Option::None then true
-      end
-    end
-  when ExprKind::ExprBinaryOp(op, left, right) then
-    let lhs_args = Vec::new()
-    let lhs = evaluate_condition(&left, &lhs_args)
-    let rhs = evaluate_condition(&right, &lhs_args)
-    match op
-    when BinOp::Eq then lhs == rhs
-    when BinOp::Ne then lhs != rhs
-    when BinOp::And then lhs && rhs
-    when BinOp::Or then lhs || rhs
-    when _ then true
-    end
-  when ExprKind::ExprUnaryOp(op, inner) then
-    match op
-    when UnOp::Not then
-      let empty_args = Vec::new()
-      !evaluate_condition(&inner, &empty_args)
-    when _ then true
-    end
-  when ExprKind::ExprCall(callee, call_args) then
-    # Handle old(expr) — evaluate the inner expression against pre-state
-    match callee.kind
-    when ExprKind::ExprIdent(fn_name) then
-      if fn_name == "old" && call_args.len() > 0 then
-        # Evaluate the first argument against old state
-        let inner = call_args[0]
-        match inner.kind
-        when ExprKind::ExprIdent(var_name) then
-          match old.values.get(var_name)
-          when Option::Some(v) then value_to_int(v) != 0
-          when Option::None then true
-          end
-        when _ then true
-        end
-      else
-        true
-      end
-    when _ then true
-    end
-  when _ then true
-  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -752,7 +440,14 @@ def consume_budget(inout ctx: BudgetContext, resource: String, amount: Int, span
     # Check rate limit
     match budget_entry.rate_limit
     when Option::Some(rl) then
-      # Would check actual time
+      # Real monotonic-time window: the decision uses the actual clock
+      # (perf_counter_ms), never an approximated time; the counter resets
+      # once the 1s window elapses.
+      let window_now_ms = perf_counter_ms()
+      if window_now_ms - rl.window_start >= 1000 then
+        rl.window_start = window_now_ms
+        rl.current_count = 0
+      end
       if rl.current_count >= rl.max_per_second then
         ctx.violations.push(BudgetViolation {
           resource: resource,
@@ -782,8 +477,17 @@ def consume_budget(inout ctx: BudgetContext, resource: String, amount: Int, span
     budget_entry.used = budget_entry.used + amount
     true
   when Option::None then
-    # Unknown resource, allow by default
-    true
+    # Fail closed: an unregistered resource has no verified limit, so the
+    # consume is DENIED and reported (never a silent allow). Register the
+    # resource via set_budget to make it consumable.
+    ctx.violations.push(BudgetViolation {
+      resource: resource,
+      limit: 0,
+      attempted: amount,
+      location: span,
+      message: "Unknown budget resource: " + resource
+    })
+    false
   end
 end
 
@@ -1160,9 +864,13 @@ def type_expr_to_string(ty: TypeExpr) -> String
 end
 
 def items_equal(a: Item, b: Item) -> Bool
-  # Deep structural comparison of two AST Items.
-  # Two items are equal if they have the same kind and equivalent content.
-  
+  # ADVISORY equality heuristic for semantic differencing — deliberately
+  # approximate, NOT verification. Same kind + name, then: parameter names
+  # and the rendered signature for functions; field/variant/generic counts
+  # for structs/enums; kind + name for the remaining item kinds. A `true`
+  # means "this differencing heuristic detected no change", never "the
+  # items are proven equivalent".
+
   # First check: same item kind discriminant
   let a_kind = match a.kind
   when ItemKind::ItemFunction(_) then 0
@@ -1276,191 +984,10 @@ def format_diff(diff: SemanticDiff) -> String
 end
 
 # ———————————————————————————————————————————————————————————————
-# Test Generation
-# ———————————————————————————————————————————————————————————————
-
-struct TestGenerator
-  functions: Vec[FunctionDecl]
-  generated_tests: Vec[GeneratedTest]
-end
-
-struct GeneratedTest
-  name: String
-  function: String
-  inputs: Vec[ContractValue]
-  expected: Option[ContractValue]
-  kind: TestKind
-end
-
-enum TestKind
-  UnitTest
-  PropertyTest
-  ContractTest
-  FuzzTest
-end
-
-def test_generator_new() -> TestGenerator
-  TestGenerator {
-    functions: Vec::new(),
-    generated_tests: Vec::new()
-  }
-end
-
-def generate_contract_tests(inout gen: TestGenerator, f: FunctionDecl) -> Unit
-  # Generate tests from preconditions (boundary cases)
-  for contract in f.contracts do
-    match contract.kind
-    when AstContractKind::AstPre then
-      # Generate positive test (valid input)
-      gen.generated_tests.push(GeneratedTest {
-        name: f.name + "_pre_valid",
-        function: f.name,
-        inputs: Vec::new(),  # Would generate valid inputs
-        expected: Option::None,
-        kind: TestKind::ContractTest
-      })
-      
-      # Generate negative test (invalid input)
-      gen.generated_tests.push(GeneratedTest {
-        name: f.name + "_pre_invalid",
-        function: f.name,
-        inputs: Vec::new(),  # Would generate invalid inputs
-        expected: Option::None,
-        kind: TestKind::ContractTest
-      })
-    when _ then ()
-    end
-  end
-end
-
-def generate_property_tests(inout gen: TestGenerator, f: FunctionDecl) -> Unit
-  # Generate property-based tests from postconditions
-  for contract in f.contracts do
-    match contract.kind
-    when AstContractKind::AstPost then
-      gen.generated_tests.push(GeneratedTest {
-        name: f.name + "_property",
-        function: f.name,
-        inputs: Vec::new(),
-        expected: Option::None,
-        kind: TestKind::PropertyTest
-      })
-    when _ then ()
-    end
-  end
-end
-
-def output_tests(gen: TestGenerator) -> String
-  mut parts: Vec[String] = Vec::new()
-  parts.push("# Generated Tests\n\n")
-  parts.push("use std::test::{test, assert, assert_eq}\n\n")
-  
-  for t in gen.generated_tests do
-    parts.push("#[test]\n")
-    parts.push("def " + t.name + "() -> Unit\n")
-    parts.push("  # Test for " + t.function + "\n")
-    
-    # Generate meaningful test body based on test kind
-    match t.kind
-    when TestKind::UnitTest then
-      # Call the function with generated inputs and check result
-      parts.push("  let result = " + t.function + "(")
-      mut first = true
-      for input in t.inputs do
-        if !first then parts.push(", ") end
-        parts.push(input.to_string())
-        first = false
-      end
-      parts.push(")\n")
-      match t.expected
-      when Option::Some(exp) then
-        parts.push("  assert_eq(result, " + exp + ")\n")
-      when Option::None then
-        # At minimum verify it doesn't panic
-        parts.push("  # Verify function completes without panic\n")
-        parts.push("  assert(true)\n")
-      end
-      
-    when TestKind::ContractTest then
-      # Test that contracts hold for valid inputs, or fail for invalid inputs
-      if t.name.ends_with("_pre_valid") then
-        # Valid inputs: function should succeed
-        parts.push("  # Precondition should hold for valid inputs\n")
-        parts.push("  let result = " + t.function + "(")
-        mut first = true
-        for input in t.inputs do
-          if !first then parts.push(", ") end
-          parts.push(input.to_string())
-          first = false
-        end
-        parts.push(")\n")
-        parts.push("  # Function completed — precondition passed\n")
-        parts.push("  assert(true)\n")
-      else
-        # Invalid inputs: function should fail/panic
-        parts.push("  # Precondition violation test\n")
-        parts.push("  mut caught_error = false\n")
-        parts.push("  # In a real test, we'd catch the contract violation:\n")
-        parts.push("  # assert_panics { " + t.function + "(")
-        mut first = true
-        for input in t.inputs do
-          if !first then parts.push(", ") end
-          parts.push(input.to_string())
-          first = false
-        end
-        parts.push(") }\n")
-        parts.push("  caught_error = true\n")
-        parts.push("  assert(caught_error)\n")
-      end
-      
-    when TestKind::PropertyTest then
-      # Property-based test: generate random inputs and check postcondition holds
-      parts.push("  # Property: postcondition must hold for all inputs\n")
-      parts.push("  mut iterations = 0\n")
-      parts.push("  while iterations < 100 do\n")
-      parts.push("    # Generate random inputs in range\n")
-      parts.push("    let result = " + t.function + "(")
-      mut first = true
-      for input in t.inputs do
-        if !first then parts.push(", ") end
-        parts.push(input.to_string())
-        first = false
-      end
-      parts.push(")\n")
-      parts.push("    # Postcondition is checked by built-in contract evaluation\n")
-      parts.push("    iterations = iterations + 1\n")
-      parts.push("  end\n")
-      parts.push("  assert(iterations == 100)\n")
-      
-    when TestKind::FuzzTest then
-      parts.push("  # Fuzz test: random inputs, verify no crashes\n")
-      parts.push("  mut iterations = 0\n")
-      parts.push("  while iterations < 1000 do\n")
-      parts.push("    let _result = " + t.function + "(")
-      mut first = true
-      for input in t.inputs do
-        if !first then parts.push(", ") end
-        parts.push(input.to_string())
-        first = false
-      end
-      parts.push(")\n")
-      parts.push("    iterations = iterations + 1\n")
-      parts.push("  end\n")
-      parts.push("  assert(iterations == 1000)\n")
-    end
-    
-    parts.push("end\n\n")
-  end
-  
-  parts.join("")
-end
-
-# ———————————————————————————————————————————————————————————————
 # Public API
 # ———————————————————————————————————————————————————————————————
 
 struct AgenticContext
-  contracts: ContractChecker
   capabilities: CapabilityContext
   effects: EffectContext
   budgets: BudgetContext
@@ -1469,7 +996,6 @@ end
 
 def agentic_context_new() -> AgenticContext
   AgenticContext {
-    contracts: contract_checker_new(),
     capabilities: cap_context_new(),
     effects: effect_context_new(),
     budgets: budget_context_new(),
@@ -1477,6 +1003,13 @@ def agentic_context_new() -> AgenticContext
   }
 end
 
+# ADVISORY static lint (deliberately incomplete, SOUND in the reporting
+# direction): true only for a syntactically `false` / `!true` expression;
+# every other expression yields false ("not trivially false"). It never
+# claims a contract HOLDS, so it is neither a verifier nor a second
+# contract authority — the canonical MIR ContractCheck (see
+# contract_evaluation_authority) is the ONE authority. Used by
+# analyze_agentic_features to flag definitely-unsatisfiable clauses.
 def contract_expr_trivially_false(expr: Expr) -> Bool
   match expr.kind
   when ExprKind::ExprBoolLit(b) then !b

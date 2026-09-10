@@ -35,10 +35,13 @@ use tg_compiler::layout_engine::{
   # plan's AbiReturn is deliberately NOT imported — codegen's own AbiReturn
   # (Direct/IndirectSret) is a different vocabulary; the plan's result class
   # is asked through abi_return_uses_sret).
-  classify_call_plan, AbiFlavor,
+  classify_call_plan, AbiFlavor, AbiValueClass,
   abi_return_uses_sret,
   enum_layout_for_type,
   EnumLayout, EnumValueRepresentation, EnumTagLayout, EnumNiche,
+  NicheKind, NicheSpec,
+  enum_layout_niche_payloadless_index, enum_layout_niche_payload_index,
+  enum_niche_payload_type, niche_of_type,
   variant_discriminant,
   substitute_in_concrete_adt,
   layout_error_to_string
@@ -170,13 +173,20 @@ struct FrameInfo
   #     it with __tg_clock_ns at function entry and the exit
   #     MirBudgetConsume("time", _) reads it back — nesting works because
   #     the inner invocation's frame is separate.
-  # Both offsets are reserved FIRST in allocate_locals (spill_off starts
+  #   * budget_instr_offset — (third-audit item 45) the INSTRUCTIONS
+  #     metric's executed-statement counter ([FP + offset]); the prologue
+  #     zeroes it at entry and codegen_statement increments it once per
+  #     emitted statement (budget-consume checks excluded), and the exit
+  #     MirBudgetConsume("instructions", _) traps when it exceeds the
+  #     declared limit.
+  # These offsets are reserved FIRST in allocate_locals (spill_off starts
   # at -8), so they sit at the top of the spill area, never collide with
   # other spills (those continue below) or the callee-saved saves (the
   # bottom of the frame), and stay within the a64 LDUR/STUR -256..255
   # range for every function.
   budget_alloc_offset: i32 = 0
   budget_time_offset: i32 = 0
+  budget_instr_offset: i32 = 0
   # The per-invocation EFFECT-HANDLER frame slots (FP-relative offsets;
   # empty = the function installs no handler frames). EVERY
   # MirEffectFrameEnter in the function gets its OWN 48-byte slot (the
@@ -879,7 +889,10 @@ end
 # the MirBudgetConsume("time", _) exit checks). The scan is the slot-
 # reservation authority: a function that carries no such statement never
 # reserves frame space, and a function that does always finds its slots
-# reserved when the codegen arms address them.
+# reserved when the codegen arms address them. The INSTRUCTIONS metric's
+# slot is a SEPARATE scan (func_budget_needs_instructions) so the
+# established (needs_alloc, needs_time) tuple's call sites stay
+# unchanged.
 def func_budget_slot_usage(func: MirFunction) -> (Bool, Bool)
   var needs_alloc = false
   var needs_time = false
@@ -897,6 +910,25 @@ def func_budget_slot_usage(func: MirFunction) -> (Bool, Bool)
     end
   end
   (needs_alloc, needs_time)
+end
+
+# (third-audit item 45) Whether the function's MIR carries the
+# INSTRUCTIONS metric's exit check (MirBudgetConsume("instructions", _)) —
+# the budget-instr frame slot is reserved exactly when it does. The
+# per-statement counter increments in codegen_statement and the slot is
+# zeroed by the prologue.
+def func_budget_needs_instructions(func: MirFunction) -> Bool
+  var needs_instr = false
+  for block in func.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirBudgetConsume(resource, _) then
+        if resource == "instructions" then needs_instr = true end
+      when _ then ()
+      end
+    end
+  end
+  needs_instr
 end
 
 # Whether a function installs effect-handler frames: any
@@ -934,12 +966,13 @@ def allocate_locals(func: MirFunction, arch: Arch, inout engine: LayoutEngine) -
   var address_taken_locals: Set[Int] = Set::new()
 
   # The per-invocation budget slots: reserved FIRST (before the sret slot
-  # and every spill), so their FP offsets are fixed at -8/-16 and every
-  # MirBudgetConsume / __tg_budget_time_start arm in the function's body
-  # addresses them through fctx.frame. A function that carries no budget
-  # statements never reserves (its frame stays unchanged).
+  # and every spill), so their FP offsets are fixed at -8/-16/-24 and
+  # every MirBudgetConsume / __tg_budget_time_start arm in the function's
+  # body addresses them through fctx.frame. A function that carries no
+  # budget statements never reserves (its frame stays unchanged).
   var budget_alloc_offset: i32 = 0
   var budget_time_offset: i32 = 0
+  var budget_instr_offset: i32 = 0
   let (fn_needs_alloc, fn_needs_time) = func_budget_slot_usage(func)
   if fn_needs_alloc then
     spill_off = spill_off - 8
@@ -948,6 +981,11 @@ def allocate_locals(func: MirFunction, arch: Arch, inout engine: LayoutEngine) -
   if fn_needs_time then
     spill_off = spill_off - 8
     budget_time_offset = spill_off
+  end
+  # (third-audit item 45) The INSTRUCTIONS metric's counter slot.
+  if func_budget_needs_instructions(func) then
+    spill_off = spill_off - 8
+    budget_instr_offset = spill_off
   end
   # The effect-handler frame slots: reserved with the budget slots — one
   # 48-byte slot per MirEffectFrameEnter occurrence, placed BELOW the
@@ -1126,6 +1164,7 @@ def allocate_locals(func: MirFunction, arch: Arch, inout engine: LayoutEngine) -
     sret_offset: sret_offset,
     budget_alloc_offset: budget_alloc_offset,
     budget_time_offset: budget_time_offset,
+    budget_instr_offset: budget_instr_offset,
     effect_frame_offsets: effect_frame_offsets
   }
 
@@ -4832,9 +4871,66 @@ def enum_layout_strict(inout ctx: CodegenCtx, ty: Type) -> EnumLayout
 end
 
 # The payload base offset of a registered enum's image, from the EnumLayout
-# (the single authority — never a hardcoded 8).
+# (the single authority — never a hardcoded 8). A niched enum's payload is
+# the value itself: its payload_offset is 0.
 def enum_payload_base(inout ctx: CodegenCtx, ty: Type) -> Int
   enum_layout_strict(ctx, ty).payload_offset
+end
+
+# The NICHED EnumLayout of a registered enum type (None for a non-enum and
+# for a tagged enum). The single query every codegen niche arm asks.
+def enum_layout_niched(inout ctx: CodegenCtx, ty: Type) -> Option[EnumLayout]
+  let stripped = strip_ref_like_type(ty)
+  match enum_layout_for_type(&mut ctx.layout_engine, &stripped)
+  when Option::Some(el) then
+    match el.niche.clone()
+    when Option::Some(_) then Option::Some(el)
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+# True when the registered enum type's EnumLayout is the NICHED form.
+def enum_layout_is_niched(inout ctx: CodegenCtx, ty: Type) -> Bool
+  match enum_layout_niched(ctx, ty)
+  when Option::Some(_) then true
+  when Option::None then false
+  end
+end
+
+# The niche spec of a registered enum type (fail-closed when the type has
+# no niche — every caller guards with enum_layout_is_niched first).
+def enum_niche_spec_strict(inout ctx: CodegenCtx, ty: Type) -> NicheSpec
+  let el = enum_layout_strict(ctx, ty)
+  match el.niche
+  when Option::Some(spec) then spec
+  when Option::None then
+    panic("ICE: enum_niche_spec_strict: type " + mir_type_identity_key(ty) + " has no niche spec")
+  end
+end
+
+# The discriminant of a niched enum's PAYLOAD-LESS variant (the one encoded
+# by the niche) and of its PAYLOAD variant, from the EnumLayout's variant
+# table (declaration order, payload_size-keyed).
+def enum_niche_payloadless_discriminant(inout ctx: CodegenCtx, ty: Type) -> Int
+  let el = enum_layout_strict(ctx, ty)
+  let idx = enum_layout_niche_payloadless_index(el)
+  if idx >= 0 && idx < el.variant_layouts.len() then
+    el.variant_layouts[idx].discriminant
+  else
+    panic("ICE: enum_niche_payloadless_discriminant: niched enum " + mir_type_identity_key(ty) + " has no payload-less variant")
+  end
+end
+
+def enum_niche_payload_discriminant(inout ctx: CodegenCtx, ty: Type) -> Int
+  let el = enum_layout_strict(ctx, ty)
+  let idx = enum_layout_niche_payload_index(el)
+  if idx >= 0 && idx < el.variant_layouts.len() then
+    el.variant_layouts[idx].discriminant
+  else
+    panic("ICE: enum_niche_payload_discriminant: niched enum " + mir_type_identity_key(ty) + " has no payload variant")
+  end
 end
 
 # The discriminant of a variant by its registered NAME, from the layout
@@ -4871,6 +4967,9 @@ end
 # and the deref rule come from the EnumLayout — codegen never contains the
 # boundary policy. For InlineTagged-represented enums the register value
 # carries the tag word itself (tag_offset 0) — no normalization is needed.
+# For Niched-represented enums the value word IS the payload: the word
+# equal to the niche pattern normalizes to the payload-less variant's
+# discriminant, every other word to the payload variant's.
 def normalize_enum_value_to_tag(inout ctx: CodegenCtx, reg: PhysReg, enum_ty: Type) -> Unit
   let el = enum_layout_strict(ctx, enum_ty)
   match el.representation
@@ -4883,6 +4982,23 @@ def normalize_enum_value_to_tag(inout ctx: CodegenCtx, reg: PhysReg, enum_ty: Ty
     def_label(&mut ctx.text, lbl_deref)
     emit_load_mem(ctx, reg, reg, el.tag_layout.offset as i32)
     def_label(&mut ctx.text, lbl_done)
+  when EnumValueRepresentation::Niched then
+    # The niched value word IS the payload (or the niche). The
+    # discriminant is the payload variant's UNLESS the word equals the
+    # niche pattern, in which case it is the payload-less variant's.
+    let niche_spec = match el.niche
+    when Option::Some(spec) then spec
+    when Option::None then
+      panic("ICE: normalize_enum_value_to_tag: Niched representation without a niche spec for type " + mir_type_identity_key(enum_ty))
+    end
+    let niche_disc = enum_niche_payloadless_discriminant(ctx, enum_ty)
+    let payload_disc = enum_niche_payload_discriminant(ctx, enum_ty)
+    let lbl_niche_done = next_codegen_label(ctx, ".Lenum_niche_tag_done.")
+    emit_cmp_ri(ctx, reg, niche_spec.encoded_niche as i32)
+    emit_mov_ri(ctx, reg, payload_disc as i64)
+    emit_jcc(ctx, CondKind::Ne, lbl_niche_done.clone())
+    emit_mov_ri(ctx, reg, niche_disc as i64)
+    def_label(&mut ctx.text, lbl_niche_done)
   when EnumValueRepresentation::InlineTagged then
     # The value IS the tagged image: the tag word sits at the value base
     # (tag_layout.offset is 0) — the low bits of the register value already
@@ -5069,6 +5185,23 @@ def emit_enum_eq_helper_body(inout ctx: CodegenCtx, ty: Type) -> Unit
   emit_cmp_rr(ctx, dst, scratch)
   emit_jcc(ctx, CondKind::Ne, lbl_false.clone())
 
+  # NICHED enums: the tag compare above already proved both operands are
+  # the same variant. The payload-less tag means equal; the payload tag
+  # means the payload words compare directly (the word IS the payload —
+  # the niche gate admits only one-word scalar payloads).
+  let eq_el = enum_layout_strict(ctx, ty)
+  let eq_niche = eq_el.niche.clone()
+  match eq_niche
+  when Option::Some(_) then
+    let eq_niche_disc = enum_niche_payloadless_discriminant(ctx, ty)
+    emit_cmp_ri(ctx, dst, eq_niche_disc as i32)
+    emit_jcc(ctx, CondKind::Eq, lbl_true.clone())
+    emit_load_mem(ctx, dst, fp, saved_left_offset as i32)
+    emit_load_mem(ctx, scratch, fp, saved_right_offset as i32)
+    emit_cmp_rr(ctx, dst, scratch)
+    emit_jcc(ctx, CondKind::Eq, lbl_true.clone())
+    emit_jmp(ctx, lbl_false.clone())
+  when Option::None then
   var has_payload_variant = false
   let type_id = extract_named_type_id(ctx, ty)
   match lookup_type_def(ctx, type_id)
@@ -5146,7 +5279,8 @@ def emit_enum_eq_helper_body(inout ctx: CodegenCtx, ty: Type) -> Unit
     when Option::None then ()
     end
 
-  emit_jmp(ctx, lbl_true.clone())
+    emit_jmp(ctx, lbl_true.clone())
+  end
 
   def_label(&mut ctx.text, lbl_false)
   emit_zero_reg(ctx, dst)
@@ -5185,6 +5319,13 @@ def projection_is_field(proj: Projection) -> Bool
   when Projection::TupleIndex(_) then true
   when _ then false
   end  end
+end
+
+def projection_is_variant(proj: Projection) -> Bool
+  match proj
+  when Projection::Variant(_) then true
+  when _ then false
+  end
 end
 
 # Storage size of a scalar type in bytes (1/2/4/8), matching storage_width_of.
@@ -5319,6 +5460,11 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
   var current_ty = local_type(fctx, place.local.id)
   var downcast_variant: Option[VariantId] = Option::None
   var last_deref_unwrapped_ref = false
+  # The count of stack spills a NON-TERMINAL niched Variant downcast pushed
+  # (a niched payload is inline, so projecting further needs an address:
+  # the payload word is copied to the stack and projected through its
+  # address). Balanced pops at the end of the walk.
+  var niched_spills = 0
   # Label to skip remaining projections after a payload-less inline-tag
   # Variant downcast (TaggedPtr-represented enums: a raw discriminant below
   # the layout threshold has no heap-allocated payload, so there is no
@@ -5516,6 +5662,17 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
           emit_jmp(ctx, lbl_skip_remaining.clone())
         end
         def_label(&mut ctx.text, lbl_payload_done)
+      when EnumValueRepresentation::Niched then
+        # The value word IS the payload: a TERMINAL downcast is already the
+        # payload (nothing to dereference). A further projection needs the
+        # payload's ADDRESS, which an inline register-known value does not
+        # have: copy the word to a stack spill and project through that
+        # address (balanced pop after the walk).
+        if i < projs.len() - 1 then
+          emit_push(ctx, reg)
+          emit_mov_rr(ctx, reg, sp_reg(ctx.target.arch))
+          niched_spills = niched_spills + 1
+        end
       when EnumValueRepresentation::InlineTagged then
         # The value is the inline image: the payload sits at payload_offset
         # within the image — no threshold test.
@@ -5531,6 +5688,18 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
     i = i + 1
   end
   def_label(&mut ctx.text, lbl_skip_remaining)
+  # Unwind the niched spills (LIFO) after the walk. The spill target is a
+  # scratch register that can never be the result register (reg), so a
+  # popped value never clobbers the projected result.
+  var niched_spill_pop = 0
+  while niched_spill_pop < niched_spills do
+    if phys_reg_id(reg) != phys_reg_id(scratch) then
+      emit_pop(ctx, scratch)
+    else
+      emit_pop(ctx, scratch2_reg(ctx.target.arch))
+    end
+    niched_spill_pop = niched_spill_pop + 1
+  end
 end
 
 def load_constant(inout ctx: CodegenCtx, cst: MirConstant, dst: PhysReg) -> Unit
@@ -5606,13 +5775,37 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
       let base = scratch2_reg(ctx.target.arch)  # X14 — not X0
       emit_push(ctx, src)
 
+      # A NICHED enum root whose first projection is the Variant downcast:
+      # the payload is INLINE in the local's storage, so the base must be
+      # the local's ADDRESS (a register-homed local is spilled to the stack
+      # first and written back after the stores), never the loaded value.
+      # A ref-like root already carries the enum's address; a Stack/Spilled
+      # root is addressed directly.
+      let niched_root_ty = strip_ref_like_type(&place_ty)
+      let niched_root = projection_is_variant(&place.projections[0]) && enum_layout_is_niched(ctx, &niched_root_ty)
+      let niched_root_is_ref = is_ref_like_type(&place_ty)
+      var niched_root_writeback: Option[PhysReg] = Option::None
       match loc
       when VarLoc::Register(r) then
-        emit_mov_rr(ctx, base, r)
+        if niched_root && !niched_root_is_ref then
+          emit_push(ctx, r)
+          emit_mov_rr(ctx, base, sp_reg(ctx.target.arch))
+          niched_root_writeback = Option::Some(r)
+        else
+          emit_mov_rr(ctx, base, r)
+        end
       when VarLoc::Stack(offset) then
-        emit_load_mem(ctx, base, fp, offset)
+        if niched_root && !niched_root_is_ref then
+          emit_lea_fp(ctx, base, offset)
+        else
+          emit_load_mem(ctx, base, fp, offset)
+        end
       when VarLoc::Spilled(offset) then
-        emit_load_mem(ctx, base, fp, offset)
+        if niched_root && !niched_root_is_ref then
+          emit_lea_fp(ctx, base, offset)
+        else
+          emit_load_mem(ctx, base, fp, offset)
+        end
       end
 
       # Walk projections except last to compute base address
@@ -5620,6 +5813,13 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
       var downcast_variant: Option[VariantId] = Option::None
       var i = 0
       let n = place.projections.len()
+      # True once `base` is known to hold the STORAGE address of a niched
+      # enum (the payload is inline there). A value-load in between leaves
+      # the payload word with no recoverable address — fail closed.
+      var niched_store_addr_known = false
+      if niched_root then
+        niched_store_addr_known = true
+      end
       # Label to skip remaining projections after a payload-less inline-tag
       # Variant downcast (the EnumLayout's TaggedPtr encoding: a raw
       # discriminant below the threshold has no heap-allocated payload, so
@@ -5632,13 +5832,21 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
         when Projection::ProjDeref then ()
         when _ then
           if is_ref_like_type(&current_ty) then
-            emit_load_mem(ctx, base, base, 0)
+            let niched_pointee_ty = strip_ref_like_type(&current_ty)
+            if i == 0 && projection_is_variant(&proj) && enum_layout_is_niched(ctx, &niched_pointee_ty) then
+              # Keep the ref/pointer value: it IS the niched enum's
+              # storage address (the payload is inline).
+              ()
+            else
+              emit_load_mem(ctx, base, base, 0)
+            end
             current_ty = project_deref_type(ctx, &current_ty)
           end
         end
         match proj
         when Projection::ProjDeref then
           emit_load_mem(ctx, base, base, 0)
+          niched_store_addr_known = false
           current_ty = project_deref_type(ctx, &current_ty)
         when Projection::Field(fid) then
  # the offset comes from the layout engine, resolved through
@@ -5679,6 +5887,14 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
               emit_jmp(ctx, lbl_skip_store.clone())
             end
             def_label(&mut ctx.text, lbl_payload_done)
+          when EnumValueRepresentation::Niched then
+            # The payload is inline at offset 0: the root special-case
+            # above already made `base` the enum's (payload) address, and a
+            # nested niched enum's base is an address too. A downcast
+            # reached through a value load has no recoverable address.
+            if !niched_store_addr_known then
+              panic("ICE: store_place: a Variant projection on a niched enum was reached through a value load, so the inline payload has no recoverable address (niched payloads are non-owning scalars; address the enum through its owning place)")
+            end
           when EnumValueRepresentation::InlineTagged then
             # The value is the inline image: payload at payload_offset.
             emit_add_ri(ctx, base, sp_el.payload_offset as i32)
@@ -5697,6 +5913,7 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
           emit_scale_index(ctx, scratch, sidx_stride)
           emit_add_rrr(ctx, base, base, scratch)
           emit_load_mem(ctx, base, base, 0)
+          niched_store_addr_known = false
           current_ty = project_index_type(ctx, &current_ty)
         when Projection::ProjConstantIndex(ci) then
           if is_heap_collection_type(ctx, &current_ty) then
@@ -5706,6 +5923,7 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
         let cidx_stride = element_stride_bytes(ctx, &cidx_elem_ty)
         emit_add_ri(ctx, base, (ci * cidx_stride) as i32)
           emit_load_mem(ctx, base, base, 0)
+          niched_store_addr_known = false
           current_ty = project_index_type(ctx, &current_ty)
         when _ then ()
         end
@@ -5720,8 +5938,16 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
       when Projection::ProjDeref then ()
       when _ then
         if is_ref_like_type(&current_ty) then
-          emit_load_mem(ctx, base, base, 0)
-          current_ty = project_deref_type(ctx, &current_ty)
+          let niched_last_pointee_ty = strip_ref_like_type(&current_ty)
+          if projection_is_variant(&last) && enum_layout_is_niched(ctx, &niched_last_pointee_ty) then
+            # The ref/pointer value IS the niched enum's storage address
+            # (the payload is inline): keep it and let the Variant arm's
+            # store_off (0) land on the payload in place.
+            current_ty = project_deref_type(ctx, &current_ty)
+          else
+            emit_load_mem(ctx, base, base, 0)
+            current_ty = project_deref_type(ctx, &current_ty)
+          end
         end
       end
       match last
@@ -5768,13 +5994,24 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
         store_off = 0
       end
 
-      emit_pop(ctx, src)  # restore value
       # Store exactly the final projected value's storage width so a narrow
       # field/element is never overwritten by an 8-byte write. A
       # @packed-aggregate field at a MISALIGNED static offset (the
       # attributed layout's packed offsets) lowers through the byte-wise
       # UNALIGNED path — never a direct misaligned mov.
       let final_store_width = storage_width_of(ctx, &current_ty)
+      # A register-homed niched root's enum value was spilled UNDER the
+      # saved src (stack: [sp] = enum word, [sp+8] = src). Its register may
+      # have been clobbered by the address walk: reload the saved value
+      # from the stack instead of popping (the spill must survive until
+      # the writeback). Every other case keeps the original pop-before-
+      # store order.
+      match niched_root_writeback
+      when Option::Some(_) then
+        emit_load_mem(ctx, src, sp_reg(ctx.target.arch), 8)
+      when Option::None then
+        emit_pop(ctx, src)  # restore value
+      end
       if (store_off as Int) % mem_width_bytes(final_store_width) != 0 then
         emit_push(ctx, base)
         emit_add_ri(ctx, base, store_off)
@@ -5782,6 +6019,15 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
         emit_pop(ctx, scratch)
       else
         emit_store_mem_sized(ctx, base, store_off, src, final_store_width)
+      end
+      # Refresh the local's register from the (now store-updated) spill,
+      # then release the spill slot and the saved src.
+      match niched_root_writeback
+      when Option::Some(wr) then
+        emit_load_mem(ctx, wr, sp_reg(ctx.target.arch), 0)
+        emit_pop(ctx, scratch)
+        emit_pop(ctx, src)
+      when Option::None then ()
       end
     end
   when Option::None then
@@ -6696,6 +6942,10 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
     var current_ty = local_type(fctx, place.local.id)
     let n = place.projections.len()
     var downcast_variant: Option[VariantId] = Option::None
+    # True once `dst` is known to hold the STORAGE address of a niched
+    # enum (the payload is inline there). Only that state can form the
+    # niched payload address; a value-load in between fails closed.
+    var niched_addr_known = false
     var i = 0
     # Label to skip remaining projections after a payload-less inline-tag
     # Variant downcast (the EnumLayout's TaggedPtr encoding: a raw
@@ -6710,7 +6960,15 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
       when Projection::ProjDeref then ()
       when _ then
         if is_ref_like_type(&current_ty) then
-          emit_load_mem(ctx, dst, dst, 0)
+          let niched_addr_pointee_ty = strip_ref_like_type(&current_ty)
+          if i == 0 && projection_is_variant(&proj) && enum_layout_is_niched(ctx, &niched_addr_pointee_ty) then
+            # The ref/pointer value IS the niched enum's storage address
+            # (the payload is inline): keep it instead of loading the
+            # enum word, which would leave dst holding the payload VALUE.
+            ()
+          else
+            emit_load_mem(ctx, dst, dst, 0)
+          end
           current_ty = project_deref_type(ctx, &current_ty)
         end
       end
@@ -6719,6 +6977,7 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
         if !is_last then
           emit_load_mem(ctx, dst, dst, 0)
         end
+        niched_addr_known = false
         current_ty = project_deref_type(ctx, &current_ty)
       when Projection::Field(fid) then
  # the offset comes from the layout engine, resolved through
@@ -6768,6 +7027,7 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
             emit_load_mem(ctx, dst, dst, 0)
           end
         end
+        niched_addr_known = false
         current_ty = project_index_type(ctx, &current_ty)
       when Projection::ProjConstantIndex(ci) then
         let is_byte_indexed = is_string_like_type(ctx, &current_ty)
@@ -6794,6 +7054,7 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
             emit_load_mem(ctx, dst, dst, offset as i32)
           end
         end
+        niched_addr_known = false
         current_ty = project_index_type(ctx, &current_ty)
       when Projection::Variant(vid) then
         downcast_variant = Option::Some(vid)
@@ -6827,6 +7088,36 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
             emit_jmp(ctx, lbl_skip_addr.clone())
           end
           def_label(&mut ctx.text, lbl_payload_done)
+        when EnumValueRepresentation::Niched then
+          # The payload is INLINE at offset 0. At the ROOT downcast the
+          # projected base must become the enum local's ADDRESS (a
+          # Stack/Spilled root is addressed directly; a Register root is
+          # spilled; a ref/pointer root's value was KEPT by the preamble as
+          # the enum's storage address). A later downcast reached through a
+          # value load is unrecoverable — fail closed.
+          if i == 0 then
+            let niche_root_ty = local_type(fctx, place.local.id)
+            if !is_ref_like_type(&niche_root_ty) then
+              match fctx.var_locs.get(place.local.id)
+              when Option::Some(root_loc) then
+                match root_loc
+                when VarLoc::Stack(root_off) then
+                  emit_lea_fp(ctx, dst, root_off)
+                when VarLoc::Spilled(root_off) then
+                  emit_lea_fp(ctx, dst, root_off)
+                when VarLoc::Register(_) then
+                  let niche_spill_off = fctx.frame.spill_offset - 8
+                  fctx.frame.spill_offset = niche_spill_off
+                  emit_store_mem(ctx, fp, niche_spill_off, dst)
+                  emit_lea_fp(ctx, dst, niche_spill_off)
+                end
+              when Option::None then ()
+              end
+            end
+            niched_addr_known = true
+          elsif !niched_addr_known then
+            panic("ICE: emit_place_address: a Variant projection on a niched enum was reached through a value load, so the inline payload has no recoverable address (niched payloads are non-owning scalars; address the enum through its owning place)")
+          end
         when EnumValueRepresentation::InlineTagged then
           # The value is the inline image: payload at payload_offset.
           emit_add_ri(ctx, dst, pa_el.payload_offset as i32)
@@ -6967,6 +7258,51 @@ def emit_method_receiver(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place:
   emit_place_address(ctx, fctx, place, dst)
 end
 
+# The NICHED enum aggregate construction (Option[Ptr[T]]'s Some(p),
+# Result[small, zero-sized-error]'s Ok/Err, ...): the value word IS the
+# payload, or the niche pattern when the constructed variant is the
+# payload-less one. No heap image is built (the tagged path's
+# _tg_bump_alloc + {tag, payload} stores are skipped entirely). The
+# discriminant operand (operands[0], the lowering's MirInt tag constant)
+# selects the variant; the single payload field is operands[1].
+def codegen_aggregate_niched(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, operands: Vec[MirOperand], dst: PhysReg, el: EnumLayout) -> Unit
+  let niche_spec = match el.niche.clone()
+  when Option::Some(spec) then spec
+  when Option::None then panic("ICE: codegen_aggregate_niched requires a niched EnumLayout (missing niche spec)")
+  end
+  let niche_idx = enum_layout_niche_payloadless_index(el.clone())
+  let payload_idx = enum_layout_niche_payload_index(el.clone())
+  if niche_idx < 0 || payload_idx < 0 then
+    panic("ICE: codegen_aggregate_niched: a niched enum needs exactly one payload-less and one payload variant")
+  end
+  let niche_disc = el.variant_layouts[niche_idx].discriminant
+
+  var disc = -1
+  if operands.len() > 0 then
+    match operands[0].kind
+    when MirOperandKind::MirConstant(cst) then
+      match cst.kind
+      when MirConstantKind::MirInt(d) then disc = d
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+  if disc < 0 then
+    panic("ICE: codegen_aggregate_niched: enum construction without a constant discriminant operand")
+  end
+
+  if disc == niche_disc then
+    # The payload-less variant IS the niche value.
+    emit_mov_ri(ctx, dst, niche_spec.encoded_niche as i64)
+  elsif operands.len() > 1 then
+    # The payload variant's single payload field IS the value word.
+    load_operand_aggregate_item(ctx, fctx, &operands[1], dst)
+  else
+    panic("ICE: codegen_aggregate_niched: payload variant construction without a payload operand")
+  end
+end
+
 def codegen_aggregate(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, kind: AggregateKind, operands: Vec[MirOperand], dst: PhysReg, agg_ty: Type) -> Unit
   let fp = fp_reg(ctx.target.arch)
   let scratch = scratch2_reg(ctx.target.arch)
@@ -7073,6 +7409,21 @@ def codegen_aggregate(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, kind: Agg
     panic("internal error: struct-literal aggregate of type `" + type_name + "` has no concrete element layout to derive the map layout from")
   end
 
+  # A NICHED enum aggregate: the constructed VALUE is the payload word (or
+  # the niche) — no heap image, no bump allocation. This branch must run
+  # before the heap-image allocation below.
+  let niched_el = if type_id >= 0 && is_enum_type_id(ctx, type_id) then
+    enum_layout_niched(ctx, agg_ty)
+  else
+    Option::None
+  end
+  match niched_el
+  when Option::Some(el) then
+    codegen_aggregate_niched(ctx, fctx, operands, dst, el)
+    return
+  when Option::None then ()
+  end
+
   # Try to get field offsets from the type layout (CONCRETE-keyed)
   let has_layout = match ctx.type_field_offsets.get(ckey)
   when Option::Some(_) then true
@@ -7175,6 +7526,25 @@ end
 
 def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: MirBlock, stmt_idx: Int) -> Unit
   let stmt = block.statements[stmt_idx]
+  # (third-audit item 45) The @budget INSTRUCTIONS metric's per-statement
+  # counter: every MIR statement emitted in a function whose frame carries
+  # the instructions slot increments it once. The budget-consume CHECK
+  # statements themselves are excluded (their arm would otherwise add one
+  # unit per exit path and a limit equal to the exact statement count
+  # could spuriously trap); the MirReturn exit checks compare the counter
+  # against the declared limit and trap when it is exceeded.
+  var instr_count_stmt = true
+  match stmt.kind
+  when MirStatementKind::MirBudgetConsume(_, _) then instr_count_stmt = false
+  when _ then ()
+  end
+  if instr_count_stmt && fctx.frame.budget_instr_offset != 0 then
+    let fp_i = fp_reg(ctx.target.arch)
+    let scratch_i = scratch_reg(ctx.target.arch)
+    emit_load_mem(ctx, scratch_i, fp_i, fctx.frame.budget_instr_offset)
+    emit_add_ri(ctx, scratch_i, 1)
+    emit_store_mem(ctx, fp_i, fctx.frame.budget_instr_offset, scratch_i)
+  end
   let rr = ret_reg(ctx.target.arch)
   match stmt.kind
   when MirStatementKind::MirAssign(place, MirRvalue { kind: rvalue_kind }) then
@@ -7447,7 +7817,8 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
   when MirStatementKind::MirBudgetConsume(resource, amount) then
     # REAL budget enforcement: the budget state lives in THIS invocation's
     # STACK FRAME (the slots allocate_locals reserved — FrameInfo's
-    # budget_alloc_offset / budget_time_offset), never in global .data, so
+    # budget_alloc_offset / budget_time_offset / budget_instr_offset),
+    # never in global .data, so
     # two calls of the same budgeted function never share a counter, nested
     # and recursive budgeted calls each get their own frame slots, and
     # concurrent calls on per-thread stacks cannot race. The amount payload
@@ -7496,10 +7867,32 @@ def codegen_statement(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, block: Mi
         emit_trap(ctx)
         def_label(&mut ctx.text, ok_label)
       end
+    elsif resource == "instructions" then
+      # (third-audit item 45) The instructions metric's exit check: the
+      # per-statement counter (incremented by codegen_statement, zeroed by
+      # the prologue) is compared against the declared limit; trap when it
+      # exceeds the limit. The consume is emitted at every MirReturn.
+      if fctx.frame.budget_instr_offset == 0 then
+        # Fail-closed: a consume without a reserved slot is a lowering
+        # defect (the slot scan is the authority), never a silent
+        # [FP+0] read.
+        emit_trap(ctx)
+      else
+        emit_load_mem(ctx, scratch2, fp, fctx.frame.budget_instr_offset)
+        emit_mov_ri(ctx, rr, amount as i64)
+        emit_cmp_rr(ctx, scratch2, rr)
+        let ok_label = ".Lbudget_ok." + ctx.fn_counter.to_string()
+        ctx.fn_counter = ctx.fn_counter + 1
+        emit_jcc(ctx, CondKind::Le, ok_label.clone())
+        emit_trap(ctx)
+        def_label(&mut ctx.text, ok_label)
+      end
     else
-      # Any other resource the lowering never emits (the budget discipline
-      # only constructs "alloc"/"time" consumes — budget_metric_enforced)
-      # is a lowering defect: fail closed with a trap.
+      # Any other resource the lowering never emits (the lowering only
+      # constructs "alloc"/"time"/"instructions" consumes; the static-only
+      # resources — stack_bytes/heap_bytes/code_size — are checked by the
+      # E0235 pass and never reach codegen) is a lowering defect: fail
+      # closed with a trap.
       emit_trap(ctx)
     end
 
@@ -7870,7 +8263,7 @@ def classify_argument(inout ctx: CodegenCtx, ty: Type, index: Int) -> AbiArg
   # authority — classify_call_plan over the canonical target desc — not
   # from a local re-decision.  The plan's single-parameter answer is mapped
   # onto the direct emitter's slot vocabulary.  The direct route's
-  # uniform GP-slot model consumes a class "float" entry through its
+  # uniform GP-slot model consumes a ScalarFloat entry through its
   # general slot (the documented P1-13 divergence; the LIR route consumes
   # the same plan entry through the FP file).  The plan is built from the
   # SAME classify_value_category call this function used to make, so the
@@ -7882,19 +8275,29 @@ def classify_argument(inout ctx: CodegenCtx, ty: Type, index: Int) -> AbiArg
   when Result::Ok(p) then p
   end
   let ap = plan.args[0]
-  match ap.class_word
-  when "zero" then AbiArg::Scalar(index, 0)
-  when "int" then AbiArg::Scalar(index, ap.size)
-  # The direct route's uniform GP-slot model: a float value rides its
-  # general slot at the value's width (the plan still classifies it
-  # "float", so the class information is not lost — a future direct-route
+  # (third-audit item 41): an exhaustive typed match over the structured
+  # AbiValueClass — no class strings.  The mapping is byte-identical to
+  # the old literal match: the direct route's uniform GP-slot model maps
+  # float-class values through their general slot, and the reserved
+  # classes (PairFloat / MixedPair / EnumInline — no classifier path
+  # emits them) mirror the crossing their names promise.
+  match ap.value_class
+  when AbiValueClass::Zero then AbiArg::Scalar(index, 0)
+  when AbiValueClass::ScalarInt(_) then AbiArg::Scalar(index, ap.size)
+  # The direct route's uniform GP-slot model: a float-class value rides
+  # its general slot at the value's width (the plan keeps the class
+  # typed, so the information is not lost — a future direct-route
   # FP-file migration changes only this mapping line).
-  when "float" then AbiArg::Scalar(index, ap.size)
-  when "vector" then AbiArg::Vector(index, ap.size)
-  when "pair" then AbiArg::ScalarPair(index, index + 1)
-  when "memory" then AbiArg::ByAddress(index, ap.size)
-  when _ then
-    panic("ICE: ABI argument classification produced an unknown class word '" + ap.class_word + "' for type '" + mir_type_identity_key(ty) + "' at index " + index.to_string())
+  when AbiValueClass::ScalarFloat(_) then AbiArg::Scalar(index, ap.size)
+  # The canonical ONE-word registered enum (audit item 29): one scalar
+  # slot, exactly the word the old "int" class mapped.
+  when AbiValueClass::TaggedPtr(_) then AbiArg::Scalar(index, ap.size)
+  when AbiValueClass::Vector(_) then AbiArg::Vector(index, ap.size)
+  when AbiValueClass::PairInt(_, _) then AbiArg::ScalarPair(index, index + 1)
+  when AbiValueClass::PairFloat(_, _) then AbiArg::ScalarPair(index, index + 1)
+  when AbiValueClass::MixedPair(_, _) then AbiArg::ScalarPair(index, index + 1)
+  when AbiValueClass::ByAddress(_) then AbiArg::ByAddress(index, ap.size)
+  when AbiValueClass::EnumInline(_) then AbiArg::ByAddress(index, ap.size)
   end
 end
 
@@ -8024,6 +8427,9 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
   # here so the drain call sites can always set up the buffer.
   var drain_dest_off: i32 = 0
   var drain_dest_ok = false
+  # Where the drain helper writes its 16-byte runtime image (the local's
+  # home, or a 16-byte scratch for a one-word niched local).
+  var drain_image_off: i32 = 0
   if !sret_dest_ok then
     match fctx.var_locs.get(dest.local.id)
     when Option::Some(loc) then
@@ -8351,9 +8757,23 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
             end
             if sret_dest_ok then
               emit_lea_fp(ctx, drain_sret, sret_dest_off)
+              drain_image_off = sret_dest_off
               did_sret = true
             else if drain_dest_ok then
-              emit_lea_fp(ctx, drain_sret, drain_dest_off)
+              # A NICHED enum's local slot is ONE word, but the drain
+              # helpers ALWAYS write the 16-byte {disc @ 0, payload @ 8}
+              # runtime image: point x8 at a 16-byte scratch slot and let
+              # codegen_drain_result_materialize decode that image INTO the
+              # real local slot.
+              if enum_layout_is_niched(ctx, &dest_ty) then
+                let drain_tmp_off = fctx.frame.spill_offset - 16
+                fctx.frame.spill_offset = drain_tmp_off
+                emit_lea_fp(ctx, drain_sret, drain_tmp_off)
+                drain_image_off = drain_tmp_off
+              else
+                emit_lea_fp(ctx, drain_sret, drain_dest_off)
+                drain_image_off = drain_dest_off
+              end
               did_sret = true
             end
           end
@@ -8364,8 +8784,8 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
           # projections, the drop-glue plan walk — agrees with the category
           # model.
           if (iid == IntrinsicId::MapDrainOne || iid == IntrinsicId::SetDrainOne) && did_sret then
-            let drain_materialize_off = if sret_dest_ok then sret_dest_off else drain_dest_off end
-            codegen_drain_result_materialize(ctx, fctx, &dest_ty, drain_materialize_off)
+            let drain_dest_real = if sret_dest_ok then sret_dest_off else drain_dest_off end
+            codegen_drain_result_materialize(ctx, fctx, &dest_ty, drain_image_off, drain_dest_real)
           end
         when Option::None then
           if fallback_clone_intrinsic then
@@ -9638,6 +10058,16 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
       def_label(&mut ctx.text, ok_label)
       # scratch holds the heap pointer; the payload sits at payload_offset
       emit_load_mem(ctx, rr, scratch, uw_el.payload_offset as i32)
+    when EnumValueRepresentation::Niched then
+      # The value word IS the payload; the niche pattern is None/Err.
+      let uw_niche = enum_niche_spec_strict(ctx, &uw_ty)
+      emit_cmp_ri(ctx, scratch, uw_niche.encoded_niche as i32)
+      emit_jcc(ctx, CondKind::Eq, trap_label.clone())
+      emit_mov_rr(ctx, rr, scratch)
+      emit_jmp(ctx, ok_label.clone())
+      def_label(&mut ctx.text, trap_label)
+      emit_trap(ctx)
+      def_label(&mut ctx.text, ok_label)
     when EnumValueRepresentation::InlineTagged then
       panic("ICE: unwrap of an InlineTagged-represented enum is not supported by the register encoding (no registered enum uses InlineTagged today)")
     when EnumValueRepresentation::Opaque then
@@ -9673,6 +10103,20 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
       emit_load_mem(ctx, rr, scratch, uo_el.payload_offset as i32)
       emit_jmp(ctx, done_label.clone())
       # None case: return default (arg1)
+      def_label(&mut ctx.text, none_label)
+      match arg_reg(arch, 1)
+      when Option::Some(r) then emit_mov_rr(ctx, rr, r)
+      when Option::None then ()
+      end
+      def_label(&mut ctx.text, done_label)
+    when EnumValueRepresentation::Niched then
+      # The value word IS the payload; the niche pattern selects the
+      # default (None/Err).
+      let uo_niche = enum_niche_spec_strict(ctx, &uo_ty)
+      emit_cmp_ri(ctx, scratch, uo_niche.encoded_niche as i32)
+      emit_jcc(ctx, CondKind::Eq, none_label.clone())
+      emit_mov_rr(ctx, rr, scratch)
+      emit_jmp(ctx, done_label.clone())
       def_label(&mut ctx.text, none_label)
       match arg_reg(arch, 1)
       when Option::Some(r) then emit_mov_rr(ctx, rr, r)
@@ -11093,16 +11537,25 @@ def codegen_prologue(inout ctx: CodegenCtx, fctx: FnCodegenCtx) -> Unit
     end
   end
 
-  # The per-invocation ALLOCATION counter: zero the function's budget slot
-  # at entry, so every invocation of a budgeted function counts its own
-  # consumed units from zero (the counter never leaks across calls,
-  # nested/recursive invocations, or concurrent per-thread stacks). The
-  # TIME slot needs no prologue action — the __tg_budget_time_start
-  # MirEffectRecord (the entry block's first statement) stamps it.
+  # The per-invocation ALLOCATION and INSTRUCTIONS counters: zero the
+  # function's budget slots at entry, so every invocation of a budgeted
+  # function counts its own consumed units from zero (the counter never
+  # leaks across calls, nested/recursive invocations, or concurrent
+  # per-thread stacks). The TIME slot needs no prologue action — the
+  # __tg_budget_time_start MirEffectRecord (the entry block's first
+  # statement) stamps it.
   if fctx.frame.budget_alloc_offset != 0 then
     let zr = scratch_reg(arch)
     emit_zero_reg(ctx, zr)
     emit_store_mem(ctx, fp, fctx.frame.budget_alloc_offset, zr)
+  end
+  # (third-audit item 45) The instructions counter slot (zeroed exactly
+  # when the frame reserved it; the per-statement increments in
+  # codegen_statement and the exit checks read it).
+  if fctx.frame.budget_instr_offset != 0 then
+    let zr_i = scratch_reg(arch)
+    emit_zero_reg(ctx, zr_i)
+    emit_store_mem(ctx, fp, fctx.frame.budget_instr_offset, zr_i)
   end
 
   # Move register-assigned params from ABI regs to their assigned regs.
@@ -15286,6 +15739,19 @@ def codegen_option_payload_wrap(inout ctx: CodegenCtx, dest_ty: Type) -> Unit
     emit_load_mem_sized(ctx, rr, rr, 0, pw, pext)
   end
 
+  # A NICHED dest: the found value IS the payload word (no heap image is
+  # built) and the absent case IS the niche sentinel.
+  let opt_niche = opt_el.niche.clone()
+  match opt_niche
+  when Option::Some(niche_spec) then
+    emit_jmp(ctx, lbl_done.clone())
+    def_label(&mut ctx.text, lbl_none)
+    emit_mov_ri(ctx, rr, niche_spec.encoded_niche as i64)
+    def_label(&mut ctx.text, lbl_done)
+    return
+  when Option::None then ()
+  end
+
   match arch
   when Arch::AArch64 then
     # Allocate the Some image and fill { tag, payload }.
@@ -15603,7 +16069,7 @@ end
 # payload projections, unwrap, the drop-glue plan walk) agrees with the
 # category model. The image is the enum's full layout image (the runtime
 # wrote disc + key + value bytes; the remaining padding is never read).
-def codegen_drain_result_materialize(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest_ty: Type, dest_off: i32) -> Unit
+def codegen_drain_result_materialize(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest_ty: Type, src_off: i32, dest_off: i32) -> Unit
   let arch = ctx.target.arch
   let fp = fp_reg(arch)
   let rr = ret_reg(arch)
@@ -15611,10 +16077,36 @@ def codegen_drain_result_materialize(inout ctx: CodegenCtx, inout fctx: FnCodege
   let data = scratch2_reg(arch)
   let img_sz = layout_of_strict(&mut ctx.layout_engine, dest_ty).size
 
+  # A NICHED dest: the drain helpers still write the runtime image
+  # {disc @ +0, payload @ +8} at src_off (a value-category-independent
+  # runtime ABI), but a niched local holds ONE word — the payload, or the
+  # niche sentinel when the discriminant is the payload-less variant's.
+  # Decode instead of copying the (now payload-sized) image.
+  let drain_niche = enum_layout_niched(ctx, dest_ty)
+  match drain_niche
+  when Option::Some(_) then
+    let drain_niche_disc = enum_niche_payloadless_discriminant(ctx, dest_ty)
+    let drain_niche_spec = enum_niche_spec_strict(ctx, dest_ty)
+    let lbl_drain_niche = next_codegen_label(ctx, ".Ldrain_niche.")
+    let lbl_drain_niche_done = next_codegen_label(ctx, ".Ldrain_niche_done.")
+    emit_load_mem(ctx, data, fp, src_off)               # disc
+    emit_load_mem(ctx, src, fp, src_off + 8)            # payload word
+    emit_cmp_ri(ctx, data, drain_niche_disc as i32)
+    emit_jcc(ctx, CondKind::Eq, lbl_drain_niche.clone())
+    emit_store_mem(ctx, fp, dest_off, src)
+    emit_jmp(ctx, lbl_drain_niche_done.clone())
+    def_label(&mut ctx.text, lbl_drain_niche)
+    emit_mov_ri(ctx, data, drain_niche_spec.encoded_niche as i64)
+    emit_store_mem(ctx, fp, dest_off, data)
+    def_label(&mut ctx.text, lbl_drain_niche_done)
+    return
+  when Option::None then ()
+  end
+
   emit_mov_ri(ctx, rr, img_sz as i64)
   emit_call_label(ctx, "_tg_bump_alloc")
-  # rr = heap image base; copy img_sz bytes from [fp + dest_off] to [rr].
-  emit_lea_fp(ctx, src, dest_off)
+  # rr = heap image base; copy img_sz bytes from [fp + src_off] to [rr].
+  emit_lea_fp(ctx, src, src_off)
   var copied = 0
   while img_sz - copied >= 8 do
     emit_load_mem(ctx, data, src, copied as i32)
@@ -16313,8 +16805,9 @@ end
 # The budget counters NO LONGER live in .data — the global counter table
 # (the former __tg_budget_alloc / __tg_budget_time slots) was removed with
 # the semantics fix: the counters moved into the generated function's STACK
-# FRAME (FrameInfo.budget_alloc_offset / budget_time_offset — reserved by
-# allocate_locals and zeroed/stamped by the prologue and the
+# FRAME (FrameInfo.budget_alloc_offset / budget_time_offset /
+# budget_instr_offset — reserved by allocate_locals and zeroed/stamped by
+# the prologue, the per-statement increment and the
 # __tg_budget_time_start record arm). Global counters broke the budget
 # semantics three ways — two calls of the same budgeted function shared one
 # counter, nested budgeted calls overwrote the single global time stamp,
@@ -16542,8 +17035,8 @@ def generate_native(program: MirProgram, target: AsmTarget) -> Result[Vec[u8], S
   emit_allocator_runtime_data(&mut ctx)
   # No budget data symbols: the budget counters live in each budgeted
   # function's STACK FRAME (FrameInfo.budget_alloc_offset /
-  # budget_time_offset), not in .data — per-invocation, nesting-safe,
-  # race-free.
+  # budget_time_offset / budget_instr_offset), not in .data —
+  # per-invocation, nesting-safe, race-free.
 
   # Combine text symbols with data, rodata, and BSS symbols so the
   # linker can resolve all cross-section relocations.
@@ -16652,8 +17145,8 @@ def generate_executable(program: MirProgram, target: AsmTarget, output_path: Str
   emit_allocator_runtime_data(&mut ctx)
   # No budget data symbols: the budget counters live in each budgeted
   # function's STACK FRAME (FrameInfo.budget_alloc_offset /
-  # budget_time_offset), not in .data — per-invocation, nesting-safe,
-  # race-free.
+  # budget_time_offset / budget_instr_offset), not in .data —
+  # per-invocation, nesting-safe, race-free.
 
   # Combine symbols from all sections + convert labels to symbols for cross-section refs
   var all_symbols = ctx.text.symbols.clone()

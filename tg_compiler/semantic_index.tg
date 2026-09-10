@@ -5,8 +5,12 @@
 # queries become Map lookups over the model rows instead of per-query table
 # scans (the delta core's per-query scans — semantic_delta_of's affected
 # closure walks every call row per round — are the workloads this module
-# serves). The module reads ONLY snapshot rows (semantic_model.tg records,
-# never AST / typed / MIR state) and mirrors the semantic_model.tg /
+# serves). The SemanticIndex itself reads ONLY snapshot rows
+# (semantic_model.tg records, never AST / typed / source state); the ONE
+# program-fed surface is the separate, on-demand MirGraphIndex
+# (build_mir_graph_index over a verified MirProgram — third-audit item 20),
+# which reuses semantic_slice.tg's reaching-definition authority. The
+# module mirrors the semantic_model.tg /
 # semantic_snapshot.tg / semantic_delta.tg idioms.
 #
 # INDEX ANCHORS (what each index is built from — the model's row tables):
@@ -15,11 +19,19 @@
 #     pairs dedupe to one row). callees_of(key) = the direct callees of the
 #     key's function; callers_of(key) = the reverse edge (who calls it) —
 #     the O(1) replacement for the delta's scan-for-callers loop.
+#   symbols                   — from snapshot.symbols rows: EVERY declared
+#     symbol's typed identity -> its canonical key text (the dedicated
+#     symbol table; symbol_get probes it DIRECTLY — no union probe over
+#     the other maps, so a symbol with no other row still answers — and
+#     symbol_search scans its records). (third-audit item 23 residual.)
 #   types_of                  — from snapshot.types rows: a def that IS a
-#     nominal type declaration maps to its type row's kind word. The
-#     general symbol -> type-USE relation (which declared types a function
-#     body or signature touches) has NO snapshot rows — DOCUMENTED GAP (a
-#     follow-up rides a future symbol_type_use table, not this module).
+#     nominal type declaration maps to its type row's kind word.
+#   type_users                — from the snapshot's dependency graph
+#     TypeUseEdge rows (typed data — the builder emits them from typed
+#     signatures / field shapes, never a string scan; the type table's
+#     own signature/field uses ride those same edges): the USED type's
+#     typed identity -> the canonical user key texts. The accessor is
+#     index_type_users_of.
 #   effects_of                — from snapshot.effects rows (one row per
 #     def-keyed function; value = the §11 dirty-word + sorted capability-ids
 #     payload — the writer's canonical projection).
@@ -27,14 +39,16 @@
 #     "cap<id>|Requires|Provides" — the delta's per-function suffix text).
 #   contracts_of              — from snapshot.contracts rows (value rows
 #     "Pre|clause" / "Post|clause" / "Invariant|clause").
-#   fields_of / impls_of / properties_of / layout_of — per type KEY from
-#     the snapshot.types + snapshot.symbols rows:
-#       fields_of     — Struct rows: the field names of the type's
-#         canonical signature body (stable_id.key's "#struct{...}"
-#         component — the semantic_snapshot.tg writer's own render);
-#         Enum rows: the VARIANT names of "#enum{...}" (the model has no
-#         separate variants table); Trait rows: none. A signature absent
-#         or not matching the kind's prefix indexes nothing.
+#   fields_of / variants_of / impls_of / properties_of / layout_of — per
+#     type KEY from the snapshot.types + snapshot.symbols + snapshot's
+#     abi_surfaces rows:
+#       fields_of     — Struct rows: the field NAME list (the abi_surfaces
+#         type row's already-rendered typed layout field list UNIONed with
+#         the writer's canonical signature render — the typed list first,
+#         the parse only filling names the layout list omits). Enum rows:
+#         the VARIANT names (the same typed-first union).
+#       variants_of   — Enum rows: the variant names (Struct/Trait rows
+#         index none).
 #       impls_of      — the type's METHOD surface: DefKind::Method symbol
 #         rows whose key path is "<type-path>::method" — struct-declared
 #         and impl-block methods (inherent AND trait-impl) register through
@@ -46,22 +60,48 @@
 #       properties_of — Trait rows: the method names of "#trait{...}" (the
 #         resolver folds trait methods into the TraitSymbol, so the
 #         signature body is their only row-carried form).
-#       layout_of     — EMPTY (documented): layouts are layout_engine /
-#         layout_descriptor computations over the typed program; no
-#         snapshot row carries layout data (a follow-up must add a layout
-#         row family).
+#       layout_of     — the abi_surfaces TYPE row's layout render
+#         ("size=<n>;align=<n>;fields=<f1;f2,...>") — the size / alignment
+#         / field rows the layout engine computed at snapshot build
+#         (third-audit items 18/20). A type with no successful ABI surface
+#         row of kind "type" indexes nothing (never a fabricated layout).
+#   trait_impls / impl_methods — from the snapshot's dependency graph
+#     TraitImplEdge / TraitSelectionEdge rows: trait decl -> the sorted
+#     "self-type|impl-key" rows (index_impls_of_trait) and impl key ->
+#     the selected impl-method def keys (index_methods_of_impl). The
+#     typed replacement for any path-convention impl reconstruction.
+#   contract_refs — from ContractReferenceEdge rows: contract row id
+#     (StableContractId.stable_key) -> the clause's referenced def keys.
+#   effect_sites / capability_sites — from the effect/capability rows'
+#     span site fields: function key text -> the "file:start-end" site
+#     renders (no span -> no row; no site is invented).
+#   type_instances — from GenericInstantiationEdge rows: template def key
+#     -> the mono instance row keys ("instance::<emission>").
+#   The remaining dependency families (LayoutDependency / ConstEval /
+#     DerivedBody / AbiDependency) stay UNINDEXED here — their consumers
+#     ride semantic_delta.tg's affected closure over the same snapshot
+#     rows (documented; the maps above are the ones the query ops serve).
+#   MIR block adjacency / def-use — NOT stored on the snapshot index (no
+#     MirProgram rides a snapshot): build_mir_graph_index(program) ->
+#     MirGraphIndex carries block_preds / block_succs (the RAW CFG keyed
+#     by StableMirBlockId.stable_key texts) and def_use (the inverse of
+#     semantic_slice.tg's reaching definitions — the authority is reused,
+#     never re-derived); dominators / postdominators / loops are
+#     delegated to semantic_slice.tg's row builders (no caller pays for
+#     them until asked).
 #   tests_for_symbol / symbols_for_test — from snapshot.tests rows: the
 #     test -> exercised-function table, documented EMPTY today (the driver
 #     runner is discovery/execution, not a semantic relationship) — both
 #     maps build over whatever rows exist and stay empty until that
 #     machinery lands (DOCUMENTED GAP).
-#   MIR value uses / MIR stmt defs — NOT INDEXABLE from the snapshot: the
-#     model's MirSemanticSummary is COARSE (counts, reachability,
-#     fail-closed markers, the transitive §11 summary) with no per-
-#     statement or per-value rows. The index carries the full summary per
-#     def-keyed function (index_mir_summary_of) and DOCUMENTS the gap:
-#     fine-grained value->uses / stmt->defs indexes require per-statement
-#     snapshot rows (a snapshot-writer follow-up).
+#   MIR value uses / MIR stmt defs — not snapshot rows (the model's
+#     MirSemanticSummary is COARSE: counts, reachability, fail-closed
+#     markers, the transitive §11 summary — no per-statement rows). The
+#     index carries the full summary per def-keyed function
+#     (index_mir_summary_of) AND the on-demand MirGraphIndex
+#     (build_mir_graph_index over a MirProgram) serves the statement-level
+#     block adjacency + def-use answers; a snapshot-only session cannot
+#     answer them (documented fail-closed).
 #   ownership / coverage      — not §32 index families; they stay
 #     scan-based (the delta core's row-text projections serve them).
 #
@@ -77,8 +117,9 @@
 # typed core, and the *_of_decl overloads take the typed key directly.
 # Row values are the canonical row texts of the writer / delta vocabulary —
 # never spans, never digest words, never ephemeral ids. Member extraction
-# parses ONLY the type row's OWN stable key text (the writer's canonical
-# signature component), never source or typed state.
+# prefers the layout engine's already-rendered typed field lists (the
+# abi_surfaces type rows) and parses the writer's canonical signature
+# component only as the no-ABI-row fallback — never source or typed state.
 #
 # DETERMINISM: builds are order-insensitive (Map insertion); every accessor
 # returns its rows SORTED; index_snapshot_hash digests the index's
@@ -89,14 +130,33 @@
 
 use std::collections::{Vec, Map}
 
-use tg_compiler::ids::{StableDigest, DefKind, stable_digest_of}
+use tg_compiler::ids::{StableDigest, DefKind, MirBlockId, stable_digest_of, stable_def_id_digested}
 use tg_compiler::ast::{AstContractKind}
-use tg_compiler::types::{EffectSummary}
-use tg_compiler::stable_ids::{StableDeclId, stable_decl_of_key, stable_decl_collision_check, stable_key_name_part}
+use tg_compiler::token::{Span, span_dummy}
+use tg_compiler::types::{EffectSummary, Type, CapabilityId}
+use tg_compiler::mir::{
+  MirProgram, MirFunction, MirBlock, MirStatement, MirTerminator,
+  MirTerminatorKind, terminator_successor_ids
+}
+use tg_compiler::stable_ids::{
+  StableDeclId, stable_decl_of_key, stable_decl_collision_check,
+  stable_key_name_part, stable_decl_reference_text,
+  stable_mir_statement_role_key_text
+}
+# The §33 MIR-graph machinery (third-audit item 20): the on-demand
+# MirGraphIndex reuses the reaching-definition authority and delegates the
+# dominator / loop builders — this module never re-derives the dataflow.
+use tg_compiler::semantic_slice::{
+  mir_reaching_defs, mir_node_statement_id,
+  mir_dominator_rows, mir_postdominator_rows, mir_loop_rows
+}
 use tg_compiler::semantic_model::{
   SemanticSnapshot, SemanticType, SemanticTypeKind, CapabilityEdgeKind,
-  MirSemanticSummary, semantic_json_escape, semantic_summary_dirty_word,
-  semantic_contract_expr_text
+  MirSemanticSummary, AbiSurfaceRow, SemanticSymbol, StableTargetId,
+  EffectEdge, CapabilityEdge, SemanticDependencyGraph, TypeUseEdge,
+  TraitImplEdge, TraitSelectionEdge, GenericInstantiationEdge,
+  ContractReferenceEdge, semantic_json_escape, semantic_summary_dirty_word,
+  semantic_contract_expr_text, semantic_digest_zero
 }
 
 # ———————————————————————————————————————————————————————————————
@@ -114,9 +174,16 @@ struct SemanticIndex
   callers: Map[StableDeclId, Vec[String]] = Map::new()
   # caller decl -> callee stable key texts (the direct call graph).
   callees: Map[StableDeclId, Vec[String]] = Map::new()
+  # EVERY declared symbol's typed identity -> its canonical key text (the
+  # dedicated symbol table; symbol_get probes it directly — no union probe).
+  # The canonical key text IS the symbol row's identity render, so the
+  # symbol_search "keys + row text" scan checks both spellings of it.
+  symbols: Map[StableDeclId, String] = Map::new()
   # nominal type decl -> kind word ("Struct" | "Enum" | "Trait")
   # (types_of: defs that ARE type declarations).
   symbol_types: Map[StableDeclId, String] = Map::new()
+  # used type decl -> user key texts (the typed TypeUseEdge inverse).
+  type_users: Map[StableDeclId, Vec[String]] = Map::new()
   # function decl -> §11 effect payload ("dirty-word;cap-ids").
   effects: Map[StableDeclId, String] = Map::new()
   # function decl -> capability rows ("cap<id>|Requires|Provides").
@@ -125,13 +192,29 @@ struct SemanticIndex
   contracts: Map[StableDeclId, Vec[String]] = Map::new()
   # type decl -> member names (Struct fields / Enum variant names).
   type_fields: Map[StableDeclId, Vec[String]] = Map::new()
+  # enum type decl -> variant names (the dedicated variants table).
+  type_variants: Map[StableDeclId, Vec[String]] = Map::new()
   # type decl -> method stable keys registered under "<type>::name".
   type_impls: Map[StableDeclId, Vec[String]] = Map::new()
   # trait type decl -> trait method names (the trait's properties).
   type_properties: Map[StableDeclId, Vec[String]] = Map::new()
-  # type decl -> layout rows. EMPTY — no snapshot row carries layout
-  # data (documented gap; see the module doc).
-  type_layouts: Map[StableDeclId, Vec[String]] = Map::new()
+  # trait type decl -> typed impl rows "self-type|impl-key" (the
+  # TraitImplEdge inverse).
+  trait_impls: Map[StableDeclId, Vec[String]] = Map::new()
+  # impl key text -> the selected impl-method def keys (TraitSelectionEdge).
+  impl_methods: Map[String, Vec[String]] = Map::new()
+  # type decl -> the abi_surfaces TYPE row's layout render
+  # ("size=<n>;align=<n>;fields=<f1;f2,...>"; the layout engine computed it
+  # at snapshot build — never fabricated here).
+  type_layout_map: Map[StableDeclId, String] = Map::new()
+  # contract row id (StableContractId.stable_key) -> referenced def keys.
+  contract_refs: Map[String, Vec[String]] = Map::new()
+  # function key text -> effect site renders ("file:start-end").
+  effect_sites: Map[String, Vec[String]] = Map::new()
+  # function key text -> capability site renders ("file:start-end").
+  capability_sites: Map[String, Vec[String]] = Map::new()
+  # generic template def key -> mono instance row keys.
+  type_instances: Map[String, Vec[String]] = Map::new()
   # test function decl -> exercised-function stable keys.
   test_targets: Map[StableDeclId, Vec[String]] = Map::new()
   # symbol decl -> test-function stable keys (the reverse edge).
@@ -140,8 +223,10 @@ struct SemanticIndex
   mir_summaries: Map[StableDeclId, MirSemanticSummary] = Map::new()
   # def decl -> the FULL canonical key text of the def (the attached text:
   # collision-detection cargo, diagnostics surface and the digest/protocol
-  # render source; the typed identity is the key). Every map key above has
-  # an entry here (inserted at the same parse site).
+  # render source; the typed identity is the key). Every def-keyed map key
+  # above has an entry here (inserted at the same parse site); the
+  # String-keyed row maps (impl_methods / contract_refs / effect_sites /
+  # capability_sites / type_instances) already carry canonical texts.
   def_texts: Map[StableDeclId, String] = Map::new()
 end
 
@@ -382,11 +467,11 @@ def index_decl_note(inout defs: Map[StableDeclId, String], key_text: String) -> 
 end
 
 # The canonical key text recorded for a decl (the def_texts cargo); the
-# lineage text is the honest fallback (no recorded row text).
+# stable-reference text is the honest fallback (no recorded row text).
 pub def index_def_text_of(idx: SemanticIndex, key: StableDeclId) -> String
   match idx.def_texts.get(key.clone())
   when Option::Some(text) then text.clone()
-  when Option::None then key.lineage_key.clone()
+  when Option::None then stable_decl_reference_text(&key)
   end
 end
 
@@ -440,6 +525,227 @@ def index_single_rows_decl(m: Map[StableDeclId, String], key: StableDeclId) -> V
   out
 end
 
+# ———— Text-keyed row helpers (the MIR-block / dependency-key domain) ————
+
+# Append one row under a String key, deduped (insert when the key is new).
+def index_map_push_text(inout m: Map[String, Vec[String]], key: String, val: String) -> Unit
+  match m.get(key.clone())
+  when Option::Some(rows) then
+    var new_rows = rows.clone()
+    if !new_rows.contains(&val) then
+      new_rows.push(val)
+      m.insert(key, new_rows)
+    end
+  when Option::None then
+    m.insert(key, Vec::from([val]))
+  end
+  ()
+end
+
+# The sorted rows of a String-keyed row map ([] when the key is absent).
+def index_map_rows_text(m: Map[String, Vec[String]], key: String) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  match m.get(key.clone())
+  when Option::Some(rows) then
+    for r in rows do
+      out.push(r.clone())
+    end
+  when Option::None then ()
+  end
+  out.sort_by(|a, b| a < b)
+  out
+end
+
+# The rows of a String-keyed single-value map (0 or 1 rows).
+def index_single_rows_text(m: Map[String, String], key: String) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  match m.get(key.clone())
+  when Option::Some(v) then out.push(v.clone())
+  when Option::None then ()
+  end
+  out
+end
+
+# The deterministic site render of a provenance span ("file:start-end");
+# "" when the row carries no span (or a dummy one) — no site row is
+# invented for absent provenance.
+def index_site_text(sp: Option[Span]) -> String
+  match sp
+  when Option::Some(s) then
+    if s.start == 0 && s.end_pos == 0 && s.file.len() == 0 then
+      ""
+    else
+      s.file.clone() + ":" + s.start.to_string() + "-" + s.end_pos.to_string()
+    end
+  when Option::None then ""
+  end
+end
+
+# ———— ABI type-row renders (the typed membership / layout source) ————
+
+# The layout render of one abi_surfaces "type" row, read from its fields:
+# "size=<n>;align=<n>;fields=<f1;f2,...>" (the field texts keep the
+# writer's "name offset size" / "Variant#<i> offset size" / "tag offset
+# size" render).
+def index_abi_layout_text(r: AbiSurfaceRow) -> String
+  "size=" + r.size.to_string() + ";align=" + r.alignment.to_string() +
+    ";fields=" + r.fields.join(";")
+end
+
+# The member names of a type row's ALREADY-TYPED field list (the
+# AbiSurfaceRow.fields render): the leading token of each field text; for
+# an enum, the "Variant#<i>" qualifier is stripped and the "tag" layout
+# row is skipped. Never a signature/path-string parse — the list is the
+# layout engine's typed render. Deduped, first-seen order.
+def index_abi_member_names(fields: Vec[String], is_enum: Bool) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  var fi = 0
+  while fi < fields.len() do
+    let f = fields[fi]
+    var name = ""
+    var i = 0
+    while i < f.len() do
+      let ch = f.slice(i, i + 1)
+      if ch == " " then
+        break
+      end
+      name = name + ch
+      i = i + 1
+    end
+    var is_tag_row = is_enum && name == "tag"
+    var member = name.clone()
+    if is_enum then
+      let hash_i = index_char_index(&member, "#", 0)
+      if hash_i > 0 then
+        member = member.slice(0, hash_i)
+      end
+    end
+    if member.len() > 0 && !is_tag_row && !out.contains(&member) then
+      out.push(member)
+    end
+    fi = fi + 1
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# MirGraphIndex — the on-demand MIR graph index (third-audit item 20)
+# ———————————————————————————————————————————————————————————————
+# The snapshot index carries no MirProgram state, so the statement-level
+# MIR maps are built ON DEMAND from a verified MirProgram:
+#   block_preds / block_succs — the RAW CFG adjacency keyed by the §1
+#     StableMirBlockId.stable_key texts ("<fn key>#B<id>"; self edges
+#     kept, duplicate targets deduped, both maps seeded for every block).
+#   def_use — the reaching-definition INVERSE: a definition's stable
+#     statement-id text -> the stable statement-id texts of the use nodes
+#     the definition reaches. semantic_slice.tg's mir_reaching_defs is the
+#     authority (reused verbatim — the dataflow is never re-derived here);
+#     definition and use ids are the item-16 role-derived stable ids,
+#     never the dense §33 locators.
+# The builder invokes the reaching-def fixpoint once per node — intended
+# for the small verified modules / interactive queries the graph ops
+# serve. Dominators / postdominators / loops are NOT stored (no caller
+# pays for them until asked): the index_mir_* wrappers below DELEGATE to
+# semantic_slice.tg's row builders.
+struct MirGraphIndex
+  block_preds: Map[String, Vec[String]] = Map::new()
+  block_succs: Map[String, Vec[String]] = Map::new()
+  def_use: Map[String, Vec[String]] = Map::new()
+end
+
+# The §1 StableMirBlockId.stable_key text "<fn emission key>#B<block id>"
+# (the SAME grammar semantic_slice.tg's slice_graph_block_key renders).
+def index_mir_block_key(fn_name: String, block_id: Int) -> String
+  fn_name + "#B" + block_id.to_string()
+end
+
+# The §33 node-key locator text of one block node ("#S<idx>" / "#T").
+def index_mir_node_key(fn_name: String, block_id: Int, is_term: Bool, idx: Int) -> String
+  if is_term then
+    fn_name + "#B" + block_id.to_string() + "#T"
+  else
+    fn_name + "#B" + block_id.to_string() + "#S" + idx.to_string()
+  end
+end
+
+def index_mir_block_exists(f: MirFunction, block_id: Int) -> Bool
+  var found = false
+  var i = 0
+  while i < f.blocks.len() do
+    if f.blocks[i].id.id == block_id then
+      found = true
+    end
+    i = i + 1
+  end
+  found
+end
+
+# Invert one node's reaching-definition rows into def_use: every def that
+# reaches the node's reads gains the use node's stable statement-id text.
+def index_mir_def_use_note(
+  program: MirProgram,
+  fn_name: String,
+  node_key: String,
+  inout def_use: Map[String, Vec[String]]
+) -> Unit
+  let use_text = match mir_node_statement_id(program.clone(), fn_name.clone(), node_key.clone())
+    when Option::Some(sid) then
+      stable_mir_statement_role_key_text(sid.function.instance_key.clone(), sid.role.clone(), sid.role_seq, sid.hir_node_seq)
+    when Option::None then ""
+    end
+  if use_text.len() == 0 then
+    return ()
+  end
+  for row in mir_reaching_defs(program.clone(), fn_name.clone(), node_key.clone()) do
+    for def_key in row.1 do
+      index_map_push_text(&mut def_use, def_key.clone(), use_text.clone())
+    end
+  end
+  ()
+end
+
+pub def build_mir_graph_index(program: MirProgram) -> MirGraphIndex
+  var block_preds: Map[String, Vec[String]] = Map::new()
+  var block_succs: Map[String, Vec[String]] = Map::new()
+  var def_use: Map[String, Vec[String]] = Map::new()
+  for f in program.functions do
+    let fn_name = f.name.clone()
+    for b in f.blocks do
+      let bkey = index_mir_block_key(&fn_name, b.id.id)
+      block_preds.insert(bkey.clone(), Vec::new())
+      block_succs.insert(bkey, Vec::new())
+    end
+    for b2 in f.blocks do
+      let bkey2 = index_mir_block_key(&fn_name, b2.id.id)
+      var succ_rows: Vec[String] = Vec::new()
+      for target in terminator_successor_ids(&b2.terminator) do
+        if index_mir_block_exists(f.clone(), target) then
+          let tkey = index_mir_block_key(&fn_name, target)
+          if !succ_rows.contains(&tkey) then
+            succ_rows.push(tkey)
+          end
+        end
+      end
+      succ_rows.sort_by(|a, b| a < b)
+      block_succs.insert(bkey2.clone(), succ_rows.clone())
+      for sk in succ_rows do
+        index_map_push_text(&mut block_preds, sk.clone(), bkey2.clone())
+      end
+    end
+    for b3 in f.blocks do
+      var si = 0
+      while si < b3.statements.len() do
+        let node = index_mir_node_key(&fn_name, b3.id.id, false, si)
+        index_mir_def_use_note(program.clone(), fn_name.clone(), node, &mut def_use)
+        si = si + 1
+      end
+      let term_node = index_mir_node_key(&fn_name, b3.id.id, true, 0)
+      index_mir_def_use_note(program.clone(), fn_name.clone(), term_node, &mut def_use)
+    end
+  end
+  MirGraphIndex { block_preds: block_preds, block_succs: block_succs, def_use: def_use }
+end
+
 # ———————————————————————————————————————————————————————————————
 # The builder — one index per snapshot
 # ———————————————————————————————————————————————————————————————
@@ -447,18 +753,39 @@ end
 pub def build_semantic_index(snapshot: SemanticSnapshot) -> SemanticIndex
   var callers: Map[StableDeclId, Vec[String]] = Map::new()
   var callees: Map[StableDeclId, Vec[String]] = Map::new()
+  var symbols: Map[StableDeclId, String] = Map::new()
   var symbol_types: Map[StableDeclId, String] = Map::new()
+  var type_users: Map[StableDeclId, Vec[String]] = Map::new()
   var effects: Map[StableDeclId, String] = Map::new()
   var capabilities: Map[StableDeclId, Vec[String]] = Map::new()
   var contracts: Map[StableDeclId, Vec[String]] = Map::new()
   var type_fields: Map[StableDeclId, Vec[String]] = Map::new()
+  var type_variants: Map[StableDeclId, Vec[String]] = Map::new()
   var type_impls: Map[StableDeclId, Vec[String]] = Map::new()
   var type_properties: Map[StableDeclId, Vec[String]] = Map::new()
-  var type_layouts: Map[StableDeclId, Vec[String]] = Map::new()
+  var trait_impls: Map[StableDeclId, Vec[String]] = Map::new()
+  var impl_methods: Map[String, Vec[String]] = Map::new()
+  var type_layout_map: Map[StableDeclId, String] = Map::new()
+  var contract_refs: Map[String, Vec[String]] = Map::new()
+  var effect_sites: Map[String, Vec[String]] = Map::new()
+  var capability_sites: Map[String, Vec[String]] = Map::new()
+  var type_instances: Map[String, Vec[String]] = Map::new()
   var test_targets: Map[StableDeclId, Vec[String]] = Map::new()
   var test_symbols: Map[StableDeclId, Vec[String]] = Map::new()
   var mir_summaries: Map[StableDeclId, MirSemanticSummary] = Map::new()
   var def_texts: Map[StableDeclId, String] = Map::new()
+
+  # 0. The dedicated symbol table (third-audit item 23 residual): EVERY
+  #    snapshot.symbols row is recorded — the canonical key text under the
+  #    typed identity — so symbol_get answers a symbol with no other row
+  #    and symbol_search scans the declared-symbol universe (never a union
+  #    probe over the other maps).
+  for s in snapshot.symbols do
+    let sdecl = index_decl_note(&mut def_texts, s.stable_id.key.clone())
+    if !symbols.contains_key(&sdecl) then
+      symbols.insert(sdecl, s.stable_id.key.clone())
+    end
+  end
 
   # 1. The call graph — both edge directions from the call rows. Each
   #    endpoint key is parsed to its typed decl once, and both the map key
@@ -470,15 +797,25 @@ pub def build_semantic_index(snapshot: SemanticSnapshot) -> SemanticIndex
     index_map_push_decl(&mut callees, caller_decl, c.callee.key.clone())
   end
 
-  # 2. The per-function fact rows (effects / capabilities / contracts).
+  # 2. The per-function fact rows (effects / capabilities / contracts) plus
+  #    the span-borne SITE rows (effect_sites / capability_sites — no span
+  #    -> no row, never an invented site).
   for e in snapshot.effects do
     let fdecl = index_decl_note(&mut def_texts, e.function.key.clone())
     effects.insert(fdecl, index_effect_payload(&e.summary))
+    let esite = index_site_text(e.span.clone())
+    if esite.len() > 0 then
+      index_map_push_text(&mut effect_sites, e.function.key.clone(), esite)
+    end
   end
   for ce in snapshot.capabilities do
     let fdecl = index_decl_note(&mut def_texts, ce.function.key.clone())
     index_map_push_decl(&mut capabilities, fdecl,
       "cap" + ce.capability.id.to_string() + "|" + index_capability_dir_text(&ce.kind))
+    let csite = index_site_text(ce.span.clone())
+    if csite.len() > 0 then
+      index_map_push_text(&mut capability_sites, ce.function.key.clone(), csite)
+    end
   end
   for ct in snapshot.contracts do
     let fdecl = index_decl_note(&mut def_texts, ct.function.key.clone())
@@ -493,9 +830,10 @@ pub def build_semantic_index(snapshot: SemanticSnapshot) -> SemanticIndex
   end
 
   # 4. The type rows: the def identity (types_of), the member lists
-  #    (fields / variants -> type_fields, trait methods -> type_properties)
-  #    and the path -> typed-key table the impls derivation joins on.
-  #    type_layouts stays empty (documented gap).
+  #    (fields / variants -> type_fields / type_variants, trait methods ->
+  #    type_properties) and the path -> typed-key table the impls
+  #    derivation joins on. The abi_surfaces pass (step 9) OVERRIDES the
+  #    membership for rows with a layout-engine typed field list.
   var type_key_by_path: Map[String, StableDeclId] = Map::new()
   for t in snapshot.types do
     let tkey = t.stable_id.key.clone()
@@ -506,6 +844,9 @@ pub def build_semantic_index(snapshot: SemanticSnapshot) -> SemanticIndex
       match t.kind
       when SemanticTypeKind::Trait then
         type_properties.insert(tdecl.clone(), members)
+      when SemanticTypeKind::Enum then
+        type_fields.insert(tdecl.clone(), members.clone())
+        type_variants.insert(tdecl.clone(), members)
       when _ then
         type_fields.insert(tdecl.clone(), members)
       end
@@ -543,17 +884,103 @@ pub def build_semantic_index(snapshot: SemanticSnapshot) -> SemanticIndex
     index_map_push_decl(&mut test_symbols, target_decl, tr.test.key.clone())
   end
 
+  # 7. The typed dependency graph (third-audit item 18 rows): the type-USE
+  #    inverse (used type -> user key texts), the trait impl / selection
+  #    relations (trait -> "self-type|impl-key"; impl key -> selected
+  #    method def keys), the generic-instance inverse (template ->
+  #    "instance::<emission>" keys) and the contract reference rows. All
+  #    endpoints are TYPED edge fields — never a row-text scan.
+  for e in snapshot.dependencies.type_uses do
+    let used_decl = index_decl_note(&mut def_texts, e.used_type.clone())
+    index_decl_note(&mut def_texts, e.user.clone())
+    index_map_push_decl(&mut type_users, used_decl, e.user.clone())
+  end
+  for e in snapshot.dependencies.trait_impls do
+    let trait_decl = index_decl_note(&mut def_texts, e.trait_key.clone())
+    index_decl_note(&mut def_texts, e.self_type.clone())
+    index_map_push_decl(&mut trait_impls, trait_decl, e.self_type.clone() + "|" + e.impl_key.clone())
+  end
+  for e in snapshot.dependencies.trait_selections do
+    index_decl_note(&mut def_texts, e.function.clone())
+    index_decl_note(&mut def_texts, e.trait_key.clone())
+    index_map_push_text(&mut impl_methods, e.impl_key.clone(), e.function.clone())
+  end
+  for e in snapshot.dependencies.generic_instantiations do
+    index_decl_note(&mut def_texts, e.template.clone())
+    index_map_push_text(&mut type_instances, e.template.clone(), e.instance_key.clone())
+  end
+  for e in snapshot.dependencies.contract_references do
+    index_map_push_text(&mut contract_refs, e.contract_id.clone(), e.referenced_symbol.clone())
+  end
+
+  # 8. The coarse MIR summaries are step 3; the fine-grained MIR graphs are
+  #    NOT snapshot data — see build_mir_graph_index (on demand).
+
+  # 9. The persisted ABI surface rows (third-audit items 18/20): the TYPE
+  #    rows carry the layout-engine render (size / alignment / field rows)
+  #    and the already-typed field / variant lists. They populate
+  #    type_layout_map and UNION their typed membership into the
+  #    signature-parsed lists when present (a fallback parse may carry
+  #    names the layout field list omits — e.g. zero-payload enum
+  #    variants); a type with no successful ABI row keeps the fallback
+  #    (and no layout row — never a fabricated one).
+  for r in snapshot.abi_surfaces do
+    if r.kind == "type" then
+      let rdecl = index_decl_note(&mut def_texts, r.symbol_key.clone())
+      type_layout_map.insert(rdecl.clone(), index_abi_layout_text(&r))
+      let kind_word = match symbol_types.get(rdecl.clone())
+        when Option::Some(k) then k.clone()
+        when Option::None then ""
+        end
+      if kind_word == "Enum" then
+        let typed = index_abi_member_names(r.fields.clone(), true)
+        let existing = index_map_rows_decl(&type_fields, rdecl.clone())
+        var merged = typed.clone()
+        for m in existing do
+          if !merged.contains(&m) then
+            merged.push(m.clone())
+          end
+        end
+        if merged.len() > 0 then
+          type_variants.insert(rdecl.clone(), merged.clone())
+          type_fields.insert(rdecl.clone(), merged)
+        end
+      elsif kind_word == "Struct" then
+        let typed2 = index_abi_member_names(r.fields.clone(), false)
+        let existing2 = index_map_rows_decl(&type_fields, rdecl.clone())
+        var merged2 = typed2.clone()
+        for m2 in existing2 do
+          if !merged2.contains(&m2) then
+            merged2.push(m2.clone())
+          end
+        end
+        if merged2.len() > 0 then
+          type_fields.insert(rdecl.clone(), merged2)
+        end
+      end
+    end
+  end
+
   SemanticIndex {
     callers: callers,
     callees: callees,
+    symbols: symbols,
     symbol_types: symbol_types,
+    type_users: type_users,
     effects: effects,
     capabilities: capabilities,
     contracts: contracts,
     type_fields: type_fields,
+    type_variants: type_variants,
     type_impls: type_impls,
     type_properties: type_properties,
-    type_layouts: type_layouts,
+    trait_impls: trait_impls,
+    impl_methods: impl_methods,
+    type_layout_map: type_layout_map,
+    contract_refs: contract_refs,
+    effect_sites: effect_sites,
+    capability_sites: capability_sites,
+    type_instances: type_instances,
     test_targets: test_targets,
     test_symbols: test_symbols,
     mir_summaries: mir_summaries,
@@ -587,9 +1014,59 @@ pub def index_callees_of_decl(idx: SemanticIndex, key: StableDeclId) -> Vec[Stri
   index_map_rows_decl(&idx.callees, key.clone())
 end
 
+# The symbol table (third-audit item 23 residual): the canonical key text
+# recorded for a declared symbol; Option::None when the key's identity is
+# not in snapshot.symbols (the probe is DIRECT — a symbol with no other
+# index row still answers; a def that only appears in another row family
+# does not).
+pub def index_symbol_get(idx: SemanticIndex, key: String) -> Option[String]
+  index_symbol_get_decl(&idx, stable_decl_of_key(&key))
+end
+
+pub def index_symbol_get_decl(idx: SemanticIndex, key: StableDeclId) -> Option[String]
+  match idx.symbols.get(key.clone())
+  when Option::Some(row) then Option::Some(row.clone())
+  when Option::None then Option::None
+  end
+end
+
+# The sorted symbol records whose canonical key text OR recorded row text
+# contains the needle (substring, not prefix). The universe is the
+# declared-symbol table — never the union of the other maps (audit item 23
+# residual: symbol_search searches symbol records).
+pub def index_symbol_search(idx: SemanticIndex, needle: String) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  var entries: Vec[(StableDeclId, String)] = idx.symbols.entries()
+  for entry in entries do
+    let sdecl = entry.0.clone()
+    let row_text = match idx.symbols.get(sdecl.clone())
+      when Option::Some(r) then r.clone()
+      when Option::None then ""
+      end
+    let key_text = index_def_text_of(&idx, sdecl.clone())
+    if key_text.contains(needle.clone()) || row_text.contains(needle.clone()) then
+      if !out.contains(&key_text) then
+        out.push(key_text)
+      end
+    end
+  end
+  out.sort_by(|a, b| a < b)
+  out
+end
+
+# The user key texts of a USED type key (the TypeUseEdge inverse — typed
+# edge data, never a row-text scan).
+pub def index_type_users_of(idx: SemanticIndex, key: String) -> Vec[String]
+  index_map_rows_decl(&idx.type_users, stable_decl_of_key(&key))
+end
+
+pub def index_type_users_of_decl(idx: SemanticIndex, key: StableDeclId) -> Vec[String]
+  index_map_rows_decl(&idx.type_users, key.clone())
+end
+
 # The kind word of the nominal type a def key denotes ("Struct" | "Enum" |
-# "Trait"; [] for defs that are not type declarations — the symbol ->
-# type-USE edges are a documented gap, see the module doc).
+# "Trait"; [] for defs that are not type declarations — the type-USE
+# relation rides index_type_users_of).
 pub def index_types_of(idx: SemanticIndex, key: String) -> Vec[String]
   index_single_rows_decl(&idx.symbol_types, stable_decl_of_key(&key))
 end
@@ -628,13 +1105,37 @@ pub def index_contracts_of_decl(idx: SemanticIndex, key: StableDeclId) -> Vec[St
 end
 
 # The member names of a type key: Struct field names / Enum variant names
-# (trait rows index none — their methods ride index_properties_of).
+# (trait rows index none — their methods ride index_properties_of). The
+# typed-first source is the abi_surfaces type row's rendered field list,
+# unioned with the writer's signature render so names the layout list omits
+# (e.g. zero-payload enum variants) stay present (see the builder's step 9).
 pub def index_fields_of(idx: SemanticIndex, key: String) -> Vec[String]
   index_map_rows_decl(&idx.type_fields, stable_decl_of_key(&key))
 end
 
 pub def index_fields_of_decl(idx: SemanticIndex, key: StableDeclId) -> Vec[String]
   index_map_rows_decl(&idx.type_fields, key.clone())
+end
+
+# The typed membership accessor (third-audit item 5): the field names of a
+# Struct key / variant names of an Enum key — never a path-string parse
+# (the map is built over the typed ABI field list where one exists; the
+# dedicated enum view is index_variants_of).
+pub def index_fields_of_type(idx: SemanticIndex, key: String) -> Vec[String]
+  index_fields_of(&idx, key.clone())
+end
+
+pub def index_fields_of_type_decl(idx: SemanticIndex, key: StableDeclId) -> Vec[String]
+  index_fields_of_decl(&idx, key.clone())
+end
+
+# The variant names of an Enum key ([] for Struct/Trait keys).
+pub def index_variants_of(idx: SemanticIndex, key: String) -> Vec[String]
+  index_map_rows_decl(&idx.type_variants, stable_decl_of_key(&key))
+end
+
+pub def index_variants_of_decl(idx: SemanticIndex, key: StableDeclId) -> Vec[String]
+  index_map_rows_decl(&idx.type_variants, key.clone())
 end
 
 # The method stable keys of a type key (the type's impl/method surface,
@@ -656,14 +1157,63 @@ pub def index_properties_of_decl(idx: SemanticIndex, key: StableDeclId) -> Vec[S
   index_map_rows_decl(&idx.type_properties, key.clone())
 end
 
-# The layout rows of a type key — always [] until a layout row family
-# exists in the snapshot (documented gap).
+# The typed impl rows of a trait key ("self-type|impl-key"; index_impls_of
+# stays the IMPL'D type's method surface — this is the TraitImplEdge
+# inverse the trait.resolve op answers from).
+pub def index_impls_of_trait(idx: SemanticIndex, key: String) -> Vec[String]
+  index_map_rows_decl(&idx.trait_impls, stable_decl_of_key(&key))
+end
+
+pub def index_impls_of_trait_decl(idx: SemanticIndex, key: StableDeclId) -> Vec[String]
+  index_map_rows_decl(&idx.trait_impls, key.clone())
+end
+
+# The selected impl-method def keys of an impl key text (the
+# TraitSelectionEdge inverse).
+pub def index_methods_of_impl(idx: SemanticIndex, impl_key: String) -> Vec[String]
+  index_map_rows_text(&idx.impl_methods, impl_key.clone())
+end
+
+# The layout rows of a type key: 0-1 rows ("size=<n>;align=<n>;fields=...")
+# from the abi_surfaces TYPE row ([] when the type has no successful ABI
+# surface row — the honest unavailable, never a fabricated layout).
+pub def index_type_layout_of(idx: SemanticIndex, key: String) -> Vec[String]
+  index_single_rows_decl(&idx.type_layout_map, stable_decl_of_key(&key))
+end
+
+pub def index_type_layout_of_decl(idx: SemanticIndex, key: StableDeclId) -> Vec[String]
+  index_single_rows_decl(&idx.type_layout_map, key.clone())
+end
+
+# The pre-item-20 name (kept for the existing callers / lib export).
 pub def index_layout_of(idx: SemanticIndex, key: String) -> Vec[String]
-  index_map_rows_decl(&idx.type_layouts, stable_decl_of_key(&key))
+  index_type_layout_of(&idx, key.clone())
 end
 
 pub def index_layout_of_decl(idx: SemanticIndex, key: StableDeclId) -> Vec[String]
-  index_map_rows_decl(&idx.type_layouts, key.clone())
+  index_type_layout_of_decl(&idx, key.clone())
+end
+
+# The referenced def keys of one contract row id (ContractReferenceEdge
+# inverse; the id is the StableContractId.stable_key text).
+pub def index_contract_refs_of(idx: SemanticIndex, contract_id: String) -> Vec[String]
+  index_map_rows_text(&idx.contract_refs, contract_id.clone())
+end
+
+# The recorded effect / capability site renders of a function key
+# ("file:start-end"; [] when the rows carried no span).
+pub def index_effect_sites_of(idx: SemanticIndex, function_key: String) -> Vec[String]
+  index_map_rows_text(&idx.effect_sites, function_key.clone())
+end
+
+pub def index_capability_sites_of(idx: SemanticIndex, function_key: String) -> Vec[String]
+  index_map_rows_text(&idx.capability_sites, function_key.clone())
+end
+
+# The mono instance row keys of a generic template def key
+# (GenericInstantiationEdge inverse).
+pub def index_type_instances_of(idx: SemanticIndex, template_key: String) -> Vec[String]
+  index_map_rows_text(&idx.type_instances, template_key.clone())
 end
 
 # The exercised-function stable keys of a test-function key.
@@ -686,8 +1236,9 @@ end
 
 # The coarse MirSemanticSummary of a def-keyed function (block/statement/
 # local counts, reachability, the fail-closed markers and the transitive
-# §11 summary). Fine-grained MIR value->uses / stmt->defs indexes are a
-# documented gap — the model carries no per-statement rows.
+# §11 summary). The statement-level graphs ride the on-demand
+# MirGraphIndex below (build_mir_graph_index over a MirProgram) — a
+# snapshot-only index cannot answer them.
 pub def index_mir_summary_of(idx: SemanticIndex, key: String) -> Option[MirSemanticSummary]
   index_mir_summary_of_decl(&idx, stable_decl_of_key(&key))
 end
@@ -696,6 +1247,46 @@ pub def index_mir_summary_of_decl(idx: SemanticIndex, key: StableDeclId) -> Opti
   match idx.mir_summaries.get(key.clone())
   when Option::Some(m) then Option::Some(m.clone())
   when Option::None then Option::None
+  end
+end
+
+# ———— MirGraphIndex accessors (third-audit item 20) ————
+# The predecessor / successor block keys of one StableMirBlockId key.
+pub def index_block_preds_of(graph: MirGraphIndex, key: String) -> Vec[String]
+  index_map_rows_text(&graph.block_preds, key.clone())
+end
+
+pub def index_block_succs_of(graph: MirGraphIndex, key: String) -> Vec[String]
+  index_map_rows_text(&graph.block_succs, key.clone())
+end
+
+# The use-node stable statement-id texts a definition's stable statement-id
+# text reaches (the reaching-def inversion).
+pub def index_def_use_of(graph: MirGraphIndex, key: String) -> Vec[String]
+  index_map_rows_text(&graph.def_use, key.clone())
+end
+
+# The dominators / postdominators / loops are DELEGATED to
+# semantic_slice.tg's row builders (they are not stored on MirGraphIndex —
+# no caller pays until asked); [] when the function is unknown.
+pub def index_mir_dominators_of(program: MirProgram, function_key: String) -> Vec[String]
+  match mir_dominator_rows(program, function_key)
+  when Option::Some(rows) then rows
+  when Option::None then Vec::new()
+  end
+end
+
+pub def index_mir_postdominators_of(program: MirProgram, function_key: String) -> Vec[String]
+  match mir_postdominator_rows(program, function_key)
+  when Option::Some(rows) then rows
+  when Option::None then Vec::new()
+  end
+end
+
+pub def index_mir_loops_of(program: MirProgram, function_key: String) -> Vec[String]
+  match mir_loop_rows(program, function_key)
+  when Option::Some(rows) then rows
+  when Option::None then Vec::new()
   end
 end
 
@@ -753,20 +1344,45 @@ def index_collect_mir_lines(m: Map[StableDeclId, MirSemanticSummary], idx: Seman
   ()
 end
 
+# The String-keyed row maps (impl_methods / contract_refs / effect_sites /
+# capability_sites / type_instances): the key IS already the canonical
+# text — no def_texts render step.
+def index_collect_text_vec_lines(tag: String, m: Map[String, Vec[String]], inout lines: Vec[String]) -> Unit
+  var entries: Vec[(String, Vec[String])] = m.entries()
+  for entry in entries do
+    let key_text = entry.0.clone()
+    let rows = index_map_rows_text(&m, key_text.clone())
+    for row in rows do
+      lines.push("{\"s\":\"" + tag + "\",\"k\":\"" + semantic_json_escape(&key_text) + "\"," +
+        "\"v\":\"" + semantic_json_escape(&row) + "\"}")
+    end
+  end
+  ()
+end
+
 # The canonical sorted text form of an index.
 def semantic_index_digest_text(idx: SemanticIndex) -> String
   var lines: Vec[String] = Vec::new()
   lines.push("{\"s\":\"header\",\"format\":\"tg-semantic-index/v1\"}")
   index_collect_vec_lines("callers", &idx.callers, &idx, &mut lines)
   index_collect_vec_lines("callees", &idx.callees, &idx, &mut lines)
+  index_collect_single_lines("symbols", &idx.symbols, &idx, &mut lines)
   index_collect_single_lines("types", &idx.symbol_types, &idx, &mut lines)
+  index_collect_vec_lines("type_users", &idx.type_users, &idx, &mut lines)
   index_collect_single_lines("effects", &idx.effects, &idx, &mut lines)
   index_collect_vec_lines("capabilities", &idx.capabilities, &idx, &mut lines)
   index_collect_vec_lines("contracts", &idx.contracts, &idx, &mut lines)
   index_collect_vec_lines("fields", &idx.type_fields, &idx, &mut lines)
+  index_collect_vec_lines("variants", &idx.type_variants, &idx, &mut lines)
   index_collect_vec_lines("impls", &idx.type_impls, &idx, &mut lines)
   index_collect_vec_lines("properties", &idx.type_properties, &idx, &mut lines)
-  index_collect_vec_lines("layouts", &idx.type_layouts, &idx, &mut lines)
+  index_collect_vec_lines("trait_impls", &idx.trait_impls, &idx, &mut lines)
+  index_collect_text_vec_lines("impl_methods", &idx.impl_methods, &mut lines)
+  index_collect_single_lines("layouts", &idx.type_layout_map, &idx, &mut lines)
+  index_collect_text_vec_lines("contract_refs", &idx.contract_refs, &mut lines)
+  index_collect_text_vec_lines("effect_sites", &idx.effect_sites, &mut lines)
+  index_collect_text_vec_lines("capability_sites", &idx.capability_sites, &mut lines)
+  index_collect_text_vec_lines("type_instances", &idx.type_instances, &mut lines)
   index_collect_vec_lines("test_targets", &idx.test_targets, &idx, &mut lines)
   index_collect_vec_lines("test_symbols", &idx.test_symbols, &idx, &mut lines)
   index_collect_mir_lines(&idx.mir_summaries, &idx, &mut lines)
@@ -782,4 +1398,269 @@ end
 # snapshot tables -> equal index digests).
 pub def index_snapshot_hash(idx: SemanticIndex) -> StableDigest
   stable_digest_of(&semantic_index_digest_text(&idx))
+end
+
+# ———————————————————————————————————————————————————————————————
+# The item-20 index lane (third-audit item 20 executable rows)
+# ———————————————————————————————————————————————————————————————
+# Hand-built snapshot rows (a symbol with NO other row, a type-use edge,
+# an ABI type row, a trait impl/selection pair, a generic instance, a
+# contract reference and effect/capability site spans) drive every new
+# accessor; the on-demand MirGraphIndex over a two-block hand-built
+# MirProgram exercises the adjacency / delegated-dominator maps. Empty =
+# the lane verifies.
+
+def index_lane_rows_same(a: Vec[String], b: Vec[String]) -> Bool
+  if a.len() != b.len() then
+    return false
+  end
+  var i = 0
+  while i < a.len() do
+    if a[i] != b[i] then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+def index_lane_rows(inout out: Vec[String], name: String, got: Vec[String], expected: Vec[String]) -> Unit
+  if !index_lane_rows_same(got.clone(), expected.clone()) then
+    out.push(name + ": expected [" + expected.join(",") + "], got [" + got.join(",") + "]")
+  end
+  ()
+end
+
+def index_lane_target() -> StableTargetId
+  StableTargetId {
+    triple: "lane-none".to_string(),
+    arch: "lane".to_string(),
+    cpu: "lane".to_string(),
+    pointer_width: 64,
+    endian: "little".to_string(),
+    abi: "sysv".to_string(),
+    float_abi: "hard".to_string(),
+    isa_features: Vec::new(),
+    native_atomic_widths: Vec::new()
+  }
+end
+
+def index_lane_snapshot() -> SemanticSnapshot
+  var s = SemanticSnapshot {
+    revision: semantic_digest_zero(),
+    compiler_version: "index-lane".to_string(),
+    target: index_lane_target(),
+    public_api_hash: semantic_digest_zero(),
+    abi_hash: semantic_digest_zero(),
+    unsafe_hash: semantic_digest_zero()
+  }
+  s.symbols = Vec::from([
+    SemanticSymbol {
+      stable_id: stable_def_id_digested("m::lonely#fn()->unit".to_string(), "m::lonely".to_string()),
+      kind: DefKind::Function,
+      name: "lonely".to_string(),
+      module_path: "m".to_string(),
+      is_pub: false,
+      is_generic: false
+    },
+    SemanticSymbol {
+      stable_id: stable_def_id_digested("m::u#fn(m::T)->unit".to_string(), "m::u".to_string()),
+      kind: DefKind::Function,
+      name: "u".to_string(),
+      module_path: "m".to_string(),
+      is_pub: false,
+      is_generic: false
+    }
+  ])
+  s.types = Vec::from([
+    SemanticType {
+      stable_id: stable_def_id_digested("m::T#struct{a:Int}".to_string(), "m::T".to_string()),
+      kind: SemanticTypeKind::Struct,
+      name: "T".to_string(),
+      module_path: "m".to_string(),
+      generic_arity: 0,
+      is_pub: true
+    }
+  ])
+  s.abi_surfaces = Vec::from([
+    AbiSurfaceRow {
+      surface_id: "type:m::T#struct{a:Int}".to_string(),
+      symbol_key: "m::T#struct{a:Int}".to_string(),
+      kind: "type".to_string(),
+      size: 8,
+      alignment: 4,
+      fields: Vec::from(["a 0 4"])
+    }
+  ])
+  s.dependencies = SemanticDependencyGraph {
+    type_uses: Vec::from([
+      TypeUseEdge {
+        user: "m::u#fn(m::T)->unit".to_string(),
+        used_type: "m::T#struct{a:Int}".to_string()
+      }
+    ]),
+    trait_impls: Vec::from([
+      TraitImplEdge {
+        impl_key: "impl::m::S#struct{}|as|m::Tr#trait{m()}".to_string(),
+        trait_key: "m::Tr#trait{m()}".to_string(),
+        self_type: "m::S#struct{}".to_string()
+      }
+    ]),
+    trait_selections: Vec::from([
+      TraitSelectionEdge {
+        function: "m::S::m#fn()->unit".to_string(),
+        trait_key: "m::Tr#trait{m()}".to_string(),
+        impl_key: "impl::m::S#struct{}|as|m::Tr#trait{m()}".to_string()
+      }
+    ]),
+    generic_instantiations: Vec::from([
+      GenericInstantiationEdge {
+        instance_key: "instance::m::G$Int".to_string(),
+        template: "m::G#fn()->unit".to_string()
+      }
+    ]),
+    contract_references: Vec::from([
+      ContractReferenceEdge {
+        contract_id: "m::u#fn(m::T)->unit|Pre|gt(x,0)".to_string(),
+        referenced_symbol: "m::lonely#fn()->unit".to_string()
+      }
+    ])
+  }
+  s.effects = Vec::from([
+    EffectEdge {
+      function: stable_def_id_digested("m::u#fn(m::T)->unit".to_string(), "m::u".to_string()),
+      summary: EffectSummary { may_io: true },
+      span: Option::Some(Span { file: "lane.tg".to_string(), start: 3, end_pos: 9 })
+    }
+  ])
+  s.capabilities = Vec::from([
+    CapabilityEdge {
+      function: stable_def_id_digested("m::u#fn(m::T)->unit".to_string(), "m::u".to_string()),
+      capability: CapabilityId { id: 1 },
+      kind: CapabilityEdgeKind::Requires,
+      span: Option::Some(Span { file: "lane.tg".to_string(), start: 11, end_pos: 15 })
+    }
+  ])
+  s
+end
+
+def index_lane_return() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def index_lane_goto(id: Int) -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirGoto(MirBlockId { id: id }), span: span_dummy() }
+end
+
+def index_lane_block(id: Int, statements: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: id }, statements: statements, terminator: term }
+end
+
+def index_lane_function() -> MirFunction
+  MirFunction {
+    name: "lane::g".to_string(),
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: Vec::new(),
+    blocks: Vec::from([
+      index_lane_block(0, Vec::new(), index_lane_goto(1)),
+      index_lane_block(1, Vec::new(), index_lane_return())
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def index_lane_program() -> MirProgram
+  MirProgram { functions: Vec::from([index_lane_function()]), statics: Vec::new(), types: Vec::new() }
+end
+
+pub def semantic_index_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  let snapshot = index_lane_snapshot()
+  let idx = build_semantic_index(&snapshot)
+
+  # L1 — the dedicated symbol table: a symbol with NO other row answers.
+  let lonely = "m::lonely#fn()->unit".to_string()
+  match index_symbol_get(&idx, lonely.clone())
+  when Option::Some(row) then
+    index_lane_rows(&mut out, "l1-symbol-get", Vec::from([row]), Vec::from([lonely.clone()]))
+  when Option::None then
+    out.push("l1-symbol-get: expected Some, got None")
+  end
+  match index_symbol_get_decl(&idx, stable_decl_of_key(&lonely))
+  when Option::Some(_) then ()
+  when Option::None then out.push("l2-symbol-get-decl: expected Some, got None") end
+  index_lane_rows(&mut out, "l3-symbol-search",
+    index_symbol_search(&idx, "lonely".to_string()), Vec::from([lonely.clone()]))
+  index_lane_rows(&mut out, "l4-symbol-search-miss",
+    index_symbol_search(&idx, "no-such-symbol".to_string()), Vec::new())
+
+  # L2 — the type-use inverse.
+  index_lane_rows(&mut out, "l5-type-users",
+    index_type_users_of(&idx, "m::T#struct{a:Int}".to_string()),
+    Vec::from(["m::u#fn(m::T)->unit".to_string()]))
+
+  # L3 — the ABI type row drives layout + typed membership.
+  index_lane_rows(&mut out, "l6-type-layout",
+    index_type_layout_of(&idx, "m::T#struct{a:Int}".to_string()),
+    Vec::from(["size=8;align=4;fields=a 0 4".to_string()]))
+  index_lane_rows(&mut out, "l7-type-fields",
+    index_fields_of_type(&idx, "m::T#struct{a:Int}".to_string()),
+    Vec::from(["a".to_string()]))
+  index_lane_rows(&mut out, "l8-types-of",
+    index_types_of(&idx, "m::T#struct{a:Int}".to_string()),
+    Vec::from(["Struct".to_string()]))
+
+  # L4 — the typed impl relations.
+  let trait_key = "m::Tr#trait{m()}".to_string()
+  let impl_key = "impl::m::S#struct{}|as|m::Tr#trait{m()}".to_string()
+  index_lane_rows(&mut out, "l9-trait-impls",
+    index_impls_of_trait(&idx, trait_key.clone()),
+    Vec::from(["m::S#struct{}|" + impl_key.clone()]))
+  index_lane_rows(&mut out, "l10-impl-methods",
+    index_methods_of_impl(&idx, impl_key.clone()),
+    Vec::from(["m::S::m#fn()->unit".to_string()]))
+
+  # L5 — contract refs / sites / instances.
+  index_lane_rows(&mut out, "l11-contract-refs",
+    index_contract_refs_of(&idx, "m::u#fn(m::T)->unit|Pre|gt(x,0)".to_string()),
+    Vec::from([lonely.clone()]))
+  index_lane_rows(&mut out, "l12-effect-sites",
+    index_effect_sites_of(&idx, "m::u#fn(m::T)->unit".to_string()),
+    Vec::from(["lane.tg:3-9".to_string()]))
+  index_lane_rows(&mut out, "l13-capability-sites",
+    index_capability_sites_of(&idx, "m::u#fn(m::T)->unit".to_string()),
+    Vec::from(["lane.tg:11-15".to_string()]))
+  index_lane_rows(&mut out, "l14-type-instances",
+    index_type_instances_of(&idx, "m::G#fn()->unit".to_string()),
+    Vec::from(["instance::m::G$Int".to_string()]))
+
+  # L6 — the on-demand MIR graph index + the delegated builders.
+  let program = index_lane_program()
+  let graph = build_mir_graph_index(program.clone())
+  index_lane_rows(&mut out, "l15-block-succs",
+    index_block_succs_of(&graph, "lane::g#B0".to_string()),
+    Vec::from(["lane::g#B1".to_string()]))
+  index_lane_rows(&mut out, "l16-block-preds",
+    index_block_preds_of(&graph, "lane::g#B1".to_string()),
+    Vec::from(["lane::g#B0".to_string()]))
+  index_lane_rows(&mut out, "l17-block-preds-empty",
+    index_block_preds_of(&graph, "lane::g#B0".to_string()), Vec::new())
+  index_lane_rows(&mut out, "l18-def-use-empty",
+    index_def_use_of(&graph, "none".to_string()), Vec::new())
+  index_lane_rows(&mut out, "l19-dominators",
+    index_mir_dominators_of(program.clone(), "lane::g".to_string()),
+    Vec::from([
+      "lane::g#B0|lane::g#B0".to_string(),
+      "lane::g#B1|lane::g#B0".to_string()
+    ]))
+  index_lane_rows(&mut out, "l20-loops",
+    index_mir_loops_of(program, "lane::g".to_string()), Vec::new())
+  out
 end

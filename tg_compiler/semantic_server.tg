@@ -48,12 +48,33 @@
 #   Parsers are strict and fail closed (prefix/length disagreement,
 #   truncated field, non-numeric int field, trailing bytes inside a body
 #   or an over-limit length -> None). keys are sorted stable key texts;
-#   request_id always echoes. The TYPED SemanticResponsePayload (audit
+#   for the twelve typed record families (third-audit item 22, below) the
+#   keys are instead the record's canonical render (identity scalar rows
+#   first, then the canonical list rows — the family renderer's fixed
+#   order). request_id always echoes. The TYPED SemanticResponsePayload
+#   (audit
 #   item 23) NEVER rides the wire: it is the in-process typed answer of
 #   the internal API — the framing above is unchanged, and a parsed
 #   response carries payload = None (the payload is filled by the server
 #   and consumed by in-process callers; the *_to_debug_string helpers
 #   render it for logs).
+#
+# TYPED WIRE RESPONSES (third-audit item 22): the semantic content of a
+# response is a TYPED RECORD — CallersResponse / CalleesResponse /
+# SymbolsResponse / TypeResponse / EffectsResponse / OwnershipResponse /
+# ContractResponse / MirFunctionResponse / AbiResponse / DiagnosticResponse
+# / DeltaResponse / PlanResponse — wrapped by the SemanticWirePayload enum
+# (the records + enum below). The wire keeps the kind + keys shape: the
+# dispatch builds the record mechanically from the §38 QueryResults rows
+# (semantic_wire_payload_of_results) and serializes it through the family's
+# ONE canonical renderer (wire_render_* / semantic_wire_payload_render);
+# the response carries the record in-process in SemanticResponse.
+# wire_payload while the rendered rows ride the SAME kind + keys fields as
+# before (so the framing, the limits and the response parser are
+# untouched). The strict inverse (wire_parse_* /
+# semantic_wire_payload_parse) decodes a render back into the record for
+# the server's own tests and typed clients; the internal API is typed and
+# the rows are the record's canonical render — never free-form prose.
 #
 #   §39 FRAMING LIMITS (audit item 25) — the request/response parsers
 #   enforce the module constants below on EVERY frame, and every check
@@ -72,31 +93,34 @@
 #     MAX_FIELD_BYTES   1 MiB  each length-prefixed text field
 #     MAX_KEYS         65536   the response keys-count (0 <= count)
 #
-# SESSION OPS: the sixteen §38 session ops (callers/callees/types/effects/
-# capabilities/contracts/fields/impls/properties/mir_function/symbol_get/
-# symbol_search/contract_list/type_explain/ownership_explain/mir_slice)
-# route to the §38 accessors; the eight EXPLAIN ops of audit item 52
-# (type.explain/trait.resolve/ownership.explain/effect.explain/
-# capability.explain/layout.explain/optimization.explain/
-# diagnostic.explain) route to the §38 explain trees (kind + keys where
-# the keys carry the tree's render lines in DISPLAY ORDER — the documented
-# explain carrier); unknown names return kind "unknown" exactly like §38's
-# query(). The ONE documented deviation is the
-# mir_slice arm: it hands the accessor the session's final_mir so the op
-# answers the TYPED §33 slice (the offline session forms — no program —
-# keep the §38 "mir_slice_unavailable" answer); see the request-routing
-# section. "revision" is the ONE §39 service op (the
-# revision digest render — the client's freshness probe); a version mismatch
-# fails closed with an ok=false "protocol_error" response.
+# SESSION OPS: every served op is a row of the §39 operation registry
+# (server_operations — name + handler family). The registry is the
+# declared dispatch authority: session_query_results resolves the name
+# FIRST (an unregistered name answers kind "unknown" exactly like §38's
+# query()) and routes by the resolved handler_kind. The §38 facade
+# families (index / explain / type / ownership / contract / symbol /
+# snapshot / plan / diagnostic / replay) answer through semantic_query's
+# query() over the session's snapshot + index + retained diagnostic store
+# + evidence, so the §38 and §39 answers can never diverge. The residual
+# server-only families are "mir" (mir_slice and the mir.* graph ops hand
+# the accessors the session's final_mir so they answer the TYPED §33/§22
+# results; the offline session forms — no program — keep the
+# "<op>_unavailable" answer) and "service" ("revision", the ONE §39
+# service op: the revision digest render, the client's freshness probe).
+# A version mismatch fails closed with an ok=false "protocol_error"
+# response.
 #
-# EXPLAIN NOTES (audit item 52): a CompilerSession holds no Diagnostic
-# records, so the server's explain arms answer the snapshot/index rows of
-# the trees (the explain() API's Option::None diagnostics form) —
-# layout.explain and optimization.explain answer their honest "not
-# available from snapshot rows" leaf and diagnostic.explain answers the
-# honest no-diagnostic leaf; in-process callers holding the compile's
-# diagnostics use the typed semantic_query::explain API directly to attach
-# the diagnostic-derived branches (the §34 trace rows / typed
+# EXPLAIN / DIAGNOSTIC NOTES (audit items 52 + 23): the session RETAINS
+# its diagnostics in the persistent DiagnosticStore (populated at the
+# pipeline boundary from the compile's diagnostics and appendable via
+# session_diagnostics_add), so diagnostic.get / diagnostic.explain /
+# diagnostic.repair_context answer the store records; the remaining
+# explain arms answer the snapshot/index rows of their trees (the
+# explain() API's Option::None diagnostics form) — layout.explain and
+# optimization.explain answer their honest "not available from snapshot
+# rows" leaf. In-process callers holding the compile's diagnostics use
+# the typed semantic_query::explain API directly to attach the
+# diagnostic-derived branches (the §34 trace rows / typed
 # DiagnosticSemanticData).
 #
 # REVISION LIFE-CYCLE: a source revision reaches the session as a NEW
@@ -113,18 +137,22 @@ use tg_compiler::ids::{StableDigest}
 use tg_compiler::types::{TypeEnv, TypedProgram}
 use tg_compiler::mir::{MirProgram}
 use tg_compiler::target_desc::{TargetDesc}
+use tg_compiler::parser::{Diagnostic}
 use tg_compiler::semantic_model::{
   SemanticSnapshot, SemanticResponsePayload, semantic_digest_render, semantic_json_escape
 }
-use tg_compiler::semantic_snapshot::{semantic_snapshot_digest}
+use tg_compiler::semantic_snapshot::{semantic_snapshot_digest, semantic_snapshot_parse}
 use tg_compiler::semantic_delta::{SemanticDelta, semantic_delta_of, semantic_delta_empty}
 use tg_compiler::semantic_index::{SemanticIndex, build_semantic_index}
 use tg_compiler::semantic_query::{
-  QueryResults, SemanticQuerySession, new_semantic_query_session,
-  query_callers, query_callees, query_types, query_effects, query_capabilities,
-  query_contracts, query_fields, query_impls, query_properties,
-  query_symbol_get, query_symbol_search, contract_list, type_explain,
-  ownership_explain, mir_function, mir_slice, explain_results
+  QueryResults, SemanticQuerySession, new_semantic_query_session, query,
+  mir_slice, mir_graph_query
+}
+# (third-audit items 23/24) the persistent diagnostic store the session
+# retains + the stable diagnostic id the add surface returns.
+use tg_compiler::semantic_diagnostics::{
+  DiagnosticStore, StableDiagnosticId, new_diagnostic_store,
+  diagnostic_store_add, diagnostic_store_add_all
 }
 # The §37 verification evidence (proof_patch.tg — audit item 20): the
 # session's evidence slot carries the compilation's
@@ -177,6 +205,118 @@ struct CompilerSession
   final_typed: Option[TypedProgram] = Option::None
   final_mir: Option[MirProgram] = Option::None
   evidence: Option[VerifiedCompilationEvidence] = Option::None
+  # (third-audit items 23/24) the retained persistent diagnostic store:
+  # the session's diagnostics are projected into it (append-only, stable
+  # ids) and the diagnostic.get / diagnostic.explain /
+  # diagnostic.repair_context ops answer from it. The offline-artifact
+  # constructors start it EMPTY (the field default); the pipeline-boundary
+  # constructor populates it from the compile's diagnostics parameter and
+  # session_diagnostics_add appends later.
+  diagnostics_store: DiagnosticStore = new_diagnostic_store()
+end
+
+# ———————————————————————————————————————————————————————————————
+# The TYPED WIRE RESPONSE RECORDS (third-audit item 22)
+# ———————————————————————————————————————————————————————————————
+# The typed server-side API of every served answer family: the target /
+# caller / function / type / contract / diagnostic fields are STABLE ID
+# TEXTS (the wire renders stable ids — never a display name), and the rows
+# lists carry the canonical §31/§32 row texts. The canonical row render of
+# each record family is defined once in the typed-wire section below
+# (<tag>:<value> rows). SemanticWirePayload wraps the twelve records so
+# ONE value carries any typed answer through the response record.
+#
+# PROJECTION NOTES (documented boundaries): TypeResponse.size/alignment
+# stay 0 until a layout row family exists (the §32 type_layouts map is
+# documented EMPTY — no fabricated layout); DiagnosticResponse is the
+# typed projection of one retained store record (the id / code / message /
+# related rows — the store's span / semantic-class spine rows stay
+# reachable through diagnostic.explain); ContractResponse carries ONE
+# clause, so the multi-row contract ops keep their §38 rows (the dispatch
+# maps only the single-clause answer); the purity.get status + ordered
+# evidence sequence and the explain tree lines belong to no record family
+# and keep their §38 rows.
+
+pub struct CallersResponse
+  target: String
+  callers: Vec[String] = Vec::new()
+end
+
+pub struct CalleesResponse
+  function: String
+  callees: Vec[String] = Vec::new()
+end
+
+pub struct SymbolsResponse
+  query: String
+  symbols: Vec[String] = Vec::new()
+end
+
+pub struct TypeResponse
+  type_key: String
+  kind: String
+  size: Int
+  alignment: Int
+  fields: Vec[String] = Vec::new()
+end
+
+pub struct EffectsResponse
+  function: String
+  bits: Int
+  capabilities: Vec[String] = Vec::new()
+  purity: String
+end
+
+pub struct OwnershipResponse
+  function: String
+  rows: Vec[String] = Vec::new()
+end
+
+pub struct ContractResponse
+  contract_id: String
+  kind: String
+  fingerprint: String
+  message: String
+end
+
+pub struct MirFunctionResponse
+  function: String
+  summary: String
+end
+
+pub struct AbiResponse
+  surface_id: String
+  rows: Vec[String] = Vec::new()
+end
+
+pub struct DiagnosticResponse
+  diagnostic_id: String
+  code: String
+  message: String
+  related: Vec[String] = Vec::new()
+end
+
+pub struct DeltaResponse
+  rows: Vec[String] = Vec::new()
+end
+
+pub struct PlanResponse
+  rows: Vec[String] = Vec::new()
+end
+
+pub enum SemanticWirePayload
+  Callers(record: CallersResponse)
+  Callees(record: CalleesResponse)
+  Symbols(record: SymbolsResponse)
+  Type(record: TypeResponse)
+  Effects(record: EffectsResponse)
+  Ownership(record: OwnershipResponse)
+  Contract(record: ContractResponse)
+  MirFunction(record: MirFunctionResponse)
+  Abi(record: AbiResponse)
+  Diagnostic(record: DiagnosticResponse)
+  Delta(record: DeltaResponse)
+  Plan(record: PlanResponse)
 end
 
 # One request: operation is a session-op name; payload = the arg key text.
@@ -200,6 +340,13 @@ struct SemanticResponse
   kind: String
   keys: Vec[String] = Vec::new()
   payload: Option[SemanticResponsePayload] = Option::None
+  # (third-audit item 22) the typed wire record whose canonical render IS
+  # the keys field when the answer belongs to one of the twelve record
+  # families; Option::None for error responses, parsed responses (the
+  # frame never carries it — see the module doc) and the families with no
+  # record (unknown / *_unavailable / explain trees / revision). Never a
+  # second wire field: semantic_response_frame writes kind + keys only.
+  wire_payload: Option[SemanticWirePayload] = Option::None
   error: String = ""
 end
 
@@ -222,7 +369,8 @@ pub def new_compiler_session(snapshot: SemanticSnapshot) -> CompilerSession
   CompilerSession {
     revision: revision,
     snapshot: snapshot,
-    index: build_semantic_index(&snapshot)
+    index: build_semantic_index(&snapshot),
+    diagnostics_store: new_diagnostic_store()
   }
 end
 
@@ -237,6 +385,20 @@ end
 # for a server fed from snapshot FILES rather than from a live compile.
 pub def snapshot_only_session(snapshot: SemanticSnapshot) -> CompilerSession
   new_compiler_session(snapshot)
+end
+
+# The OFFLINE-ARTIFACT session from a serialized snapshot TEXT (the
+# deserializer lane): parse the artifact (semantic_snapshot_parse — the
+# exact inverse of the serializer) and wrap the record in the artifact
+# session form above. Result::Err carries the parser's fail-closed reason
+# verbatim (line number, row tag, field). This is the ONE entry the driver
+# (`tg server --snapshot-only --snapshot=<path>`) calls after reading the
+# file: no pipeline state is constructed or implied.
+pub def snapshot_session_from_text(text: String) -> Result[CompilerSession, String]
+  match semantic_snapshot_parse(text)
+  when Result::Err(e) then Result::Err(e)
+  when Result::Ok(snapshot) then Result::Ok(snapshot_only_session(&snapshot))
+  end
 end
 
 # The PIPELINE-BOUNDARY session constructor (audit item 21): the session
@@ -267,8 +429,11 @@ pub def compiler_session_from_finalized(
   mir_program: MirProgram,
   snapshot: SemanticSnapshot,
   index: SemanticIndex,
-  evidence: Option[VerifiedCompilationEvidence] = Option::None
+  evidence: Option[VerifiedCompilationEvidence] = Option::None,
+  diagnostics: Vec[Diagnostic] = Vec::new()
 ) -> CompilerSession
+  var store = new_diagnostic_store()
+  diagnostic_store_add_all(&mut store, diagnostics)
   CompilerSession {
     revision: revision,
     snapshot: snapshot,
@@ -277,13 +442,44 @@ pub def compiler_session_from_finalized(
     final_env: Option::Some(env),
     final_typed: Option::Some(typed),
     final_mir: Option::Some(mir_program),
-    evidence: evidence
+    evidence: evidence,
+    diagnostics_store: store
   }
 end
 
-# The §38 facade ON DEMAND — the same snapshot+index, never duplicated.
+# The §38 facade ON DEMAND — the same snapshot+index, never duplicated;
+# (third-audit items 23/24) the session's retained diagnostic store and
+# evidence ride the facade so the §38 query ops answer from the SAME
+# state the §39 dispatch serves.
 pub def session_query(session: CompilerSession) -> SemanticQuerySession
-  new_semantic_query_session(session.snapshot, session.index)
+  new_semantic_query_session(session.snapshot, session.index,
+    Option::Some(session.diagnostics_store.clone()), session.evidence.clone())
+end
+
+# (third-audit items 23/24) Append ONE diagnostic to the retained store —
+# the store-side add surface for callers that hold the session and a
+# diagnostic produced after the boundary (idempotent per content, stable
+# ids; see semantic_diagnostics.tg).
+pub def session_diagnostics_add(
+  inout session: CompilerSession, diagnostic: Diagnostic
+) -> StableDiagnosticId
+  var store = session.diagnostics_store.clone()
+  let id = diagnostic_store_add(&mut store, diagnostic)
+  session.diagnostics_store = store
+  id
+end
+
+pub def session_diagnostics_add_all(
+  inout session: CompilerSession, diagnostics: Vec[Diagnostic]
+) -> Vec[StableDiagnosticId]
+  var store = session.diagnostics_store.clone()
+  let ids = diagnostic_store_add_all(&mut store, diagnostics)
+  session.diagnostics_store = store
+  ids
+end
+
+pub def session_diagnostics_len(session: CompilerSession) -> Int
+  session.diagnostics_store.by_id.len()
 end
 
 # The §31 delta of two sessions — the INVALIDATION UNIT of a revision:
@@ -332,20 +528,29 @@ end
 # ———————————————————————————————————————————————————————————————
 # Request routing — the §38 session ops + the §39 service op
 # ———————————————————————————————————————————————————————————————
-# The op table mirrors §38's query() arm for arm (every arm delegates to a
-# §38 typed accessor); "revision" is the one §39 service op. The mir_slice
-# arm is the ONE arm that deviates from §38's session-scoped query() in a
-# documented way: this session carries the PIPELINE's finalized state, so
-# the arm hands semantic_query.mir_slice the session's final_mir
+# The op table is DECLARED by the §39 operation registry below; every
+# registered family delegates to a §38 typed accessor (or, for the mir
+# family, to the §33/§22 engines with the session's finalized program);
+# "revision" is the one §39 service op. The mir family is the ONE family
+# that deviates from §38's session-scoped query() in a documented way:
+# this session carries the PIPELINE's finalized state, so the
+# mir_slice arm hands semantic_query.mir_slice the session's final_mir
 # (compiler_session_from_finalized's verified MirProgram — Option::None
 # on the offline-artifact session forms, whose arm then answers
 # "mir_slice_unavailable" exactly like §38's query()); with a program
 # present the adapter routes the §33 typed engine and surfaces the typed
 # MirSlice answer (see semantic_query.tg's mir_slice doc for the request
-# grammar and the kind/payload mapping).
-# The EXPLAIN arms (audit item 52) route through session_explain_results —
-# the §38 explain adapter over a facade built on demand from the session's
-# snapshot + index (the arm-level cost of one explain query; documented).
+# grammar and the kind/payload mapping). The MIR GRAPH ops (third-audit
+# item 20/22: mir.dominators / mir.postdominators / mir.loops /
+# mir.control / mir.path / mir.reaching / mir.diff) route the same way:
+# semantic_query.mir_graph_query receives the session's final_mir and
+# answers "<op>" rows or, without a program (the offline-artifact session
+# forms), "<op>_unavailable" — documented in that module's mir_graph_query
+# slot.
+# The EXPLAIN arms (audit item 52) and the diagnostic.* ops route through
+# the §38 facade family: ONE facade built on demand from the session's
+# snapshot + index + retained store + evidence, then query() (the
+# arm-level cost of one explain query; documented).
 # The "revision" service answer (the digest render — the client's
 # freshness probe). No §23 payload family is enumerated for the service
 # op's digest row (semantic_model.tg's mapping table), so payload stays
@@ -356,66 +561,428 @@ def session_revision_results(session: CompilerSession) -> QueryResults
   QueryResults { kind: "revision", keys: keys }
 end
 
-# The explain-answer adapter of the §39 dispatch: ONE on-demand §38 facade
-# over the session's snapshot + index, then the §38 explain_results
-# routing (the §38 query() explain arms do the same over the session's
-# own facade). The session holds no diagnostics, so the trees answer the
-# snapshot/index rows only (module doc's explain notes).
-def session_explain_results(session: CompilerSession, operation: String, arg: String) -> QueryResults
-  let facade = new_semantic_query_session(session.snapshot, session.index)
-  explain_results(&facade, operation, arg)
+# ———————————————————————————————————————————————————————————————
+# The §39 operation registry (third-audit item 23)
+# ———————————————————————————————————————————————————————————————
+# ONE declared table of every op the service serves: name + the handler
+# family word (the routing class: index / mir / explain / snapshot /
+# diagnostic / type / ownership / contract / symbol / plan / replay /
+# service).
+# server_operations is the DECLARED AUTHORITY of the dispatch:
+# session_query_results resolves the name FIRST and answers kind
+# "unknown" for an unregistered name, then routes by the resolved
+# handler_kind. The new item-23 families (type / ownership / contract /
+# symbol / snapshot / plan / diagnostic / replay) route through the §38
+# facade — query() built on demand with the session's retained store +
+# evidence — so the §38 and §39 answers can never diverge; the residual
+# families keep their server-only route because they consume pipeline
+# state the facade does not carry: mir / mir.* (the session's final_mir)
+# and service (the revision digest render). The existing §38-owned
+# families (index / explain) already route through the same facade path
+# every new family uses, so this registry plus the single facade route is
+# the whole convergence step; a later pass only needs to fold the residual
+# mir/service handlers into ServerOperation rows with their own family
+# words, leaving this resolver and route unchanged.
+pub struct ServerOperation
+  name: String
+  handler_kind: String
+end
+
+def server_operation(name: String, handler_kind: String) -> ServerOperation
+  ServerOperation { name: name, handler_kind: handler_kind }
+end
+
+pub def server_operations() -> Vec[ServerOperation]
+  Vec::from([
+    server_operation("callers".to_string(), "index".to_string()),
+    server_operation("callees".to_string(), "index".to_string()),
+    server_operation("types".to_string(), "index".to_string()),
+    server_operation("effects".to_string(), "index".to_string()),
+    server_operation("capabilities".to_string(), "index".to_string()),
+    server_operation("purity.get".to_string(), "index".to_string()),
+    server_operation("contracts".to_string(), "index".to_string()),
+    server_operation("fields".to_string(), "index".to_string()),
+    server_operation("impls".to_string(), "index".to_string()),
+    server_operation("properties".to_string(), "index".to_string()),
+    server_operation("mir_function".to_string(), "index".to_string()),
+    server_operation("symbol_get".to_string(), "index".to_string()),
+    server_operation("symbol_search".to_string(), "index".to_string()),
+    server_operation("contract_list".to_string(), "index".to_string()),
+    server_operation("type_explain".to_string(), "index".to_string()),
+    server_operation("ownership_explain".to_string(), "index".to_string()),
+    server_operation("mir_slice".to_string(), "mir".to_string()),
+    server_operation("mir.dominators".to_string(), "mir".to_string()),
+    server_operation("mir.postdominators".to_string(), "mir".to_string()),
+    server_operation("mir.loops".to_string(), "mir".to_string()),
+    server_operation("mir.control".to_string(), "mir".to_string()),
+    server_operation("mir.path".to_string(), "mir".to_string()),
+    server_operation("mir.reaching".to_string(), "mir".to_string()),
+    server_operation("mir.diff".to_string(), "mir".to_string()),
+    server_operation("type.explain".to_string(), "explain".to_string()),
+    server_operation("trait.resolve".to_string(), "explain".to_string()),
+    server_operation("trait.explain".to_string(), "explain".to_string()),
+    server_operation("ownership.explain".to_string(), "explain".to_string()),
+    server_operation("effect.explain".to_string(), "explain".to_string()),
+    server_operation("capability.explain".to_string(), "explain".to_string()),
+    server_operation("layout.explain".to_string(), "explain".to_string()),
+    server_operation("optimization.explain".to_string(), "explain".to_string()),
+    server_operation("diagnostic.explain".to_string(), "explain".to_string()),
+    server_operation("type.get".to_string(), "type".to_string()),
+    server_operation("type.layout".to_string(), "type".to_string()),
+    server_operation("type.properties".to_string(), "type".to_string()),
+    server_operation("ownership.moves".to_string(), "ownership".to_string()),
+    server_operation("ownership.drop_plan".to_string(), "ownership".to_string()),
+    server_operation("contract.obligations".to_string(), "contract".to_string()),
+    server_operation("contract.verify".to_string(), "contract".to_string()),
+    server_operation("symbol.references".to_string(), "symbol".to_string()),
+    # (third-audit item 34) the §40 coverage ops — routed through the §38
+    # facade like the other index-family ops (test.affected /
+    # coverage.affected answer from the session snapshot's ingested
+    # coverage rows; "<op>_unavailable" without them).
+    server_operation("test.affected".to_string(), "index".to_string()),
+    server_operation("coverage.affected".to_string(), "index".to_string()),
+    server_operation("snapshot.get".to_string(), "snapshot".to_string()),
+    server_operation("snapshot.diff".to_string(), "snapshot".to_string()),
+    # (third-audit item 30) the source-edit application op: source-in /
+    # edited-source-out through the semantic edit engine (§38 edit.apply).
+    server_operation("edit.apply".to_string(), "edit".to_string()),
+    server_operation("build.plan".to_string(), "plan".to_string()),
+    server_operation("verify.plan".to_string(), "plan".to_string()),
+    server_operation("diagnostic.get".to_string(), "diagnostic".to_string()),
+    server_operation("diagnostic.repair_context".to_string(), "diagnostic".to_string()),
+    server_operation("replay.trace_rows".to_string(), "replay".to_string()),
+    server_operation("replay.digest".to_string(), "replay".to_string()),
+    server_operation("replay.writes_to".to_string(), "replay".to_string()),
+    server_operation("replay.value_at".to_string(), "replay".to_string()),
+    server_operation("replay.causal_predecessors".to_string(), "replay".to_string()),
+    server_operation("replay.first_divergence".to_string(), "replay".to_string()),
+    server_operation("replay.minimal_causal_slice".to_string(), "replay".to_string()),
+    server_operation("revision".to_string(), "service".to_string())
+  ])
+end
+
+pub def server_operation_resolve(name: String) -> Option[ServerOperation]
+  for op in server_operations() do
+    if op.name == name then
+      return Option::Some(op)
+    end
+  end
+  Option::None
+end
+
+pub def server_op_known(name: String) -> Bool
+  match server_operation_resolve(&name)
+  when Option::Some(_) then true
+  when Option::None then false
+  end
+end
+
+# The registry's general route: the §38 facade of the session (snapshot +
+# index + the retained diagnostic store + evidence) → query(). This is
+# the arm every non-residual registered family uses — the index/explain
+# families included, so diagnostic.explain answers the STORE-aware arm
+# and the §38 and §39 answers can never diverge.
+def session_facade_results(session: CompilerSession, operation: String, arg: String) -> QueryResults
+  let facade = session_query(&session)
+  query(&facade, operation, arg)
 end
 
 def session_query_results(session: CompilerSession, operation: String, arg: String) -> QueryResults
+  match server_operation_resolve(&operation)
+  when Option::None then QueryResults { kind: "unknown", keys: Vec::new() }
+  when Option::Some(op) then
+    # The resolved handler family word drives the route — the registry is
+    # the authority, not the name text.
+    match op.handler_kind
+    # ———— the residual server-only families ————
+    # These consume pipeline state the §38 facade does not carry (the
+    # session's final_mir / the service revision).
+    when "mir" then
+      if operation == "mir_slice" then
+        mir_slice(arg.clone(), &session.final_mir)
+      else
+        mir_graph_query(operation.clone(), arg.clone(), &session.final_mir)
+      end
+    when "service" then session_revision_results(&session)
+    # ———— every other registered family: the §38 facade ————
+    # index / explain / type / ownership / contract / symbol / snapshot /
+    # plan / diagnostic / replay all answer through query() over the
+    # session's retained store + evidence, so §38 and §39 can never
+    # diverge.
+    when _ then session_facade_results(&session, operation.clone(), arg.clone())
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The dispatch → typed wire record mapping (third-audit item 22)
+# ———————————————————————————————————————————————————————————————
+# The MECHANICAL wrapper over the §38 QueryResults rows: one branch per
+# served operation, building the family record from the answer's canonical
+# rows and the request arg (the identity field the rows do not repeat —
+# callers.target, effects.function, ...). Option::None for every op with
+# no record family and for the *_unavailable answers (an empty row set is
+# never a fabricated record). The response constructor then serializes
+# the record through its family's ONE renderer, so the wire rows ARE the
+# record's canonical render.
+
+def server_wire_first_row(rows: Vec[String]) -> String
+  if rows.len() == 0 then
+    return "".to_string()
+  end
+  rows[0].clone()
+end
+
+# The §32 effect row splitter mirror ("<dirty-word>;<cap-id>;..." — the
+# same grammar semantic_query.tg's query_effects consumes): bits = the
+# first segment parsed as an Int (0 on a non-numeric word), caps = the
+# non-empty segments after the first.
+def server_wire_effect_row_split(row: String) -> (Int, Vec[String])
+  var bits = 0
+  var caps: Vec[String] = Vec::new()
+  var segment = 0
+  var start = 0
+  var i = 0
+  while i <= row.len() do
+    let is_separator = if i == row.len() then true else row.slice(i, i + 1) == ";" end
+    if is_separator then
+      let text = row.slice(start, i)
+      if segment == 0 then
+        match text.parse_int()
+        when Result::Ok(n) then bits = n
+        when Result::Err(_) then bits = 0
+        end
+      elsif text.len() > 0 then
+        caps.push(text.clone())
+      end
+      segment = segment + 1
+      start = i + 1
+    end
+    i = i + 1
+  end
+  (bits, caps)
+end
+
+def server_wire_effect_parts(rows: Vec[String]) -> (Int, Vec[String])
+  if rows.len() == 0 then
+    return (0, Vec::new())
+  end
+  server_wire_effect_row_split(rows[0].clone())
+end
+
+# The code component of a stable diagnostic id render
+# ("owner|diagnostic|code|cause|...|#ordinal"): "" when the id text does
+# not carry one.
+def server_wire_diagnostic_code_of_id(id_text: String) -> String
+  let parts = id_text.split("|")
+  if parts.len() >= 3 then
+    parts[2].clone()
+  else
+    "".to_string()
+  end
+end
+
+# The single-clause §31 contract row ("<fn key>|<kind>|<canonical text>")
+# as the typed record; Option::None on a multi-row or non-canonical answer
+# (the record family is ONE clause — a row list keeps its §38 rows).
+def server_wire_contract_of_row(rows: Vec[String]) -> Option[ContractResponse]
+  if rows.len() != 1 then
+    return Option::None
+  end
+  let parts = rows[0].clone().split("|")
+  if parts.len() != 3 then
+    return Option::None
+  end
+  Option::Some(ContractResponse {
+    contract_id: parts[0].clone(),
+    kind: parts[1].clone(),
+    fingerprint: "".to_string(),
+    message: parts[2].clone()
+  })
+end
+
+# The typed-wire form of the single-clause contract helper (the enum wrap
+# the dispatch mapping returns).
+def server_wire_contract_payload(rows: Vec[String]) -> Option[SemanticWirePayload]
+  match server_wire_contract_of_row(rows)
+  when Option::Some(record) then Option::Some(SemanticWirePayload::Contract(record))
+  when Option::None then Option::None
+  end
+end
+
+pub def semantic_wire_payload_of_results(
+  operation: String, arg: String, results: QueryResults
+) -> Option[SemanticWirePayload]
+  let rows = results.keys.clone()
   match operation
-  when "callers" then query_callers(&session.index, arg.clone())
-  when "callees" then query_callees(&session.index, arg.clone())
-  when "types" then query_types(&session.index, arg.clone())
-  when "effects" then query_effects(&session.index, arg.clone())
-  when "capabilities" then query_capabilities(&session.index, arg.clone())
-  when "contracts" then query_contracts(&session.index, arg.clone())
-  when "fields" then query_fields(&session.index, arg.clone())
-  when "impls" then query_impls(&session.index, arg.clone())
-  when "properties" then query_properties(&session.index, arg.clone())
-  when "mir_function" then mir_function(&session.snapshot, arg.clone())
-  when "symbol_get" then query_symbol_get(&session.index, arg.clone())
-  when "symbol_search" then query_symbol_search(&session.index, arg.clone())
-  when "contract_list" then contract_list(&session.snapshot, arg.clone())
-  when "type_explain" then type_explain(&session.index, arg.clone())
-  when "ownership_explain" then ownership_explain(&session.snapshot, arg.clone())
-  when "mir_slice" then mir_slice(arg.clone(), &session.final_mir)
-  # (audit item 52) the explain arms — the tree answers over the session's
-  # snapshot + index rows (the keys carry the render lines; see the
-  # explain notes in the module doc).
-  when "type.explain" then session_explain_results(&session, "type.explain".to_string(), arg.clone())
-  when "trait.resolve" then session_explain_results(&session, "trait.resolve".to_string(), arg.clone())
-  when "ownership.explain" then session_explain_results(&session, "ownership.explain".to_string(), arg.clone())
-  when "effect.explain" then session_explain_results(&session, "effect.explain".to_string(), arg.clone())
-  when "capability.explain" then session_explain_results(&session, "capability.explain".to_string(), arg.clone())
-  when "layout.explain" then session_explain_results(&session, "layout.explain".to_string(), arg.clone())
-  when "optimization.explain" then session_explain_results(&session, "optimization.explain".to_string(), arg.clone())
-  when "diagnostic.explain" then session_explain_results(&session, "diagnostic.explain".to_string(), arg.clone())
-  when "revision" then session_revision_results(&session)
-  when _ then QueryResults { kind: "unknown", keys: Vec::new() }
+  when "callers" then
+    Option::Some(SemanticWirePayload::Callers(CallersResponse {
+      target: arg.clone(),
+      callers: rows.clone()
+    }))
+  when "callees" then
+    Option::Some(SemanticWirePayload::Callees(CalleesResponse {
+      function: arg.clone(),
+      callees: rows.clone()
+    }))
+  when "symbol_get" then
+    Option::Some(SemanticWirePayload::Symbols(SymbolsResponse {
+      query: arg.clone(),
+      symbols: rows.clone()
+    }))
+  when "symbol_search" then
+    Option::Some(SemanticWirePayload::Symbols(SymbolsResponse {
+      query: arg.clone(),
+      symbols: rows.clone()
+    }))
+  when "types" then
+    Option::Some(SemanticWirePayload::Type(TypeResponse {
+      type_key: arg.clone(),
+      kind: server_wire_first_row(rows.clone()),
+      size: 0,
+      alignment: 0,
+      fields: Vec::new()
+    }))
+  when "type.get" then
+    Option::Some(SemanticWirePayload::Type(TypeResponse {
+      type_key: arg.clone(),
+      kind: server_wire_first_row(rows.clone()),
+      size: 0,
+      alignment: 0,
+      fields: Vec::new()
+    }))
+  when "fields" then
+    Option::Some(SemanticWirePayload::Type(TypeResponse {
+      type_key: arg.clone(),
+      kind: "".to_string(),
+      size: 0,
+      alignment: 0,
+      fields: rows.clone()
+    }))
+  when "effects" then
+    let parts = server_wire_effect_parts(rows.clone())
+    Option::Some(SemanticWirePayload::Effects(EffectsResponse {
+      function: arg.clone(),
+      bits: parts.0,
+      capabilities: parts.1.clone(),
+      purity: "".to_string()
+    }))
+  when "capabilities" then
+    Option::Some(SemanticWirePayload::Effects(EffectsResponse {
+      function: arg.clone(),
+      bits: 0,
+      capabilities: rows.clone(),
+      purity: "".to_string()
+    }))
+  when "ownership_explain" then
+    Option::Some(SemanticWirePayload::Ownership(OwnershipResponse {
+      function: arg.clone(),
+      rows: rows.clone()
+    }))
+  when "ownership.moves" then
+    Option::Some(SemanticWirePayload::Ownership(OwnershipResponse {
+      function: arg.clone(),
+      rows: rows.clone()
+    }))
+  when "ownership.drop_plan" then
+    Option::Some(SemanticWirePayload::Ownership(OwnershipResponse {
+      function: arg.clone(),
+      rows: rows.clone()
+    }))
+  when "mir_function" then
+    Option::Some(SemanticWirePayload::MirFunction(MirFunctionResponse {
+      function: arg.clone(),
+      summary: server_wire_first_row(rows.clone())
+    }))
+  when "abi_inspect" then
+    Option::Some(SemanticWirePayload::Abi(AbiResponse {
+      surface_id: arg.clone(),
+      rows: rows.clone()
+    }))
+  when "contracts" then server_wire_contract_payload(rows.clone())
+  when "contract_list" then server_wire_contract_payload(rows.clone())
+  when "contract.obligations" then server_wire_contract_payload(rows.clone())
+  when "diagnostic.get" then
+    if results.kind != "diagnostic.get" then
+      Option::None
+    else
+      var diagnostic_id = ""
+      var message = ""
+      var related: Vec[String] = Vec::new()
+      for row in rows.clone() do
+        match server_wire_split_row(row.clone())
+        when Option::Some(parts) then
+          if parts.0 == "id" then
+            diagnostic_id = parts.1.clone()
+          elsif parts.0 == "message" then
+            message = parts.1.clone()
+          elsif parts.0 == "related" then
+            related.push(parts.1.clone())
+          end
+        when Option::None then ()
+        end
+      end
+      if diagnostic_id.len() == 0 then
+        Option::None
+      else
+        Option::Some(SemanticWirePayload::Diagnostic(DiagnosticResponse {
+          diagnostic_id: diagnostic_id.clone(),
+          code: server_wire_diagnostic_code_of_id(diagnostic_id.clone()),
+          message: message,
+          related: related
+        }))
+      end
+    end
+  when "snapshot.diff" then
+    if results.kind == "snapshot.diff" then
+      Option::Some(SemanticWirePayload::Delta(DeltaResponse { rows: rows.clone() }))
+    else
+      Option::None
+    end
+  when "semantic_diff" then
+    Option::Some(SemanticWirePayload::Delta(DeltaResponse { rows: rows.clone() }))
+  when "build.plan" then
+    if results.kind == "build.plan" then
+      Option::Some(SemanticWirePayload::Plan(PlanResponse { rows: rows.clone() }))
+    else
+      Option::None
+    end
+  when "verify.plan" then
+    if results.kind == "verify.plan" then
+      Option::Some(SemanticWirePayload::Plan(PlanResponse { rows: rows.clone() }))
+    else
+      Option::None
+    end
+  when _ then Option::None
   end
 end
 
 # Route one §38 result into the response: kind + keys ride the wire
 # protocol; the typed payload (audit item 23) rides the response record
 # (the in-process channel — the framing in semantic_response_frame never
-# serializes it; a parse always yields None there).
+# serializes it; a parse always yields None there). (Third-audit item 22)
+# the typed WIRE record is built mechanically from the §38 rows and its
+# canonical render becomes the keys field — the wire rows are the record's
+# canonical render, never a second field.
 def session_results_response(req: SemanticRequest, results: QueryResults) -> SemanticResponse
   let payload = match results.payload
   when Option::Some(p) then Option::Some(p.clone())
   when Option::None then Option::None
+  end
+  let wire_payload = semantic_wire_payload_of_results(
+    req.operation.clone(), req.payload.clone(), &results)
+  let keys = match wire_payload.clone()
+  when Option::Some(p) then semantic_wire_payload_render(p)
+  when Option::None then results.keys.clone()
   end
   SemanticResponse {
     protocol_version: SEMANTIC_PROTOCOL_VERSION,
     request_id: req.request_id,
     ok: true,
     kind: results.kind.clone(),
-    keys: results.keys.clone(),
-    payload: payload
+    keys: keys,
+    payload: payload,
+    wire_payload: wire_payload
   }
 end
 
@@ -676,6 +1243,801 @@ pub def semantic_response_parse(bytes: Vec[u8]) -> Option[SemanticResponse]
 end
 
 # ———————————————————————————————————————————————————————————————
+# The typed wire render/parse seam (third-audit item 22)
+# ———————————————————————————————————————————————————————————————
+# ONE canonical renderer per record family (wire_render_*) and its strict
+# inverse (wire_parse_*). Canonical grammar: every row is "<tag>:<value>",
+# the FIRST ':' separating tag from value (values keep later ':'); scalar
+# fields always render (an empty value renders "<tag>:"), list fields
+# render one row per element. Parsers fail closed (Option::None) on a
+# malformed row, an unknown tag, a non-numeric Int field or a missing
+# mandatory scalar. The family's rows ARE the record's wire form — the
+# dispatch serializes the typed record through semantic_wire_payload_render
+# into the response keys (see session_results_response above), and
+# semantic_wire_payload_parse decodes a render back into the typed record
+# (the server's own tests + typed clients).
+
+def server_wire_split_row(row: String) -> Option[(String, String)]
+  var at = -1
+  var i = 0
+  while i < row.len() do
+    if row.slice(i, i + 1) == ":" then
+      at = i
+      break
+    end
+    i = i + 1
+  end
+  if at < 0 then
+    return Option::None
+  end
+  Option::Some((row.slice(0, at), row.slice(at + 1, row.len())))
+end
+
+pub def wire_render_callers(record: CallersResponse) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("target:" + record.target.clone())
+  for c in record.callers do
+    rows.push("caller:" + c.clone())
+  end
+  rows
+end
+
+pub def wire_parse_callers(rows: Vec[String]) -> Option[CallersResponse]
+  var target = ""
+  var have_target = false
+  var callers: Vec[String] = Vec::new()
+  for row in rows do
+    match server_wire_split_row(row.clone())
+    when Option::None then return Option::None
+    when Option::Some(parts) then
+      if parts.0 == "target" then
+        target = parts.1.clone()
+        have_target = true
+      elsif parts.0 == "caller" then
+        callers.push(parts.1.clone())
+      else
+        return Option::None
+      end
+    end
+  end
+  if !have_target then
+    return Option::None
+  end
+  Option::Some(CallersResponse { target: target, callers: callers })
+end
+
+pub def wire_render_callees(record: CalleesResponse) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("function:" + record.function.clone())
+  for c in record.callees do
+    rows.push("callee:" + c.clone())
+  end
+  rows
+end
+
+pub def wire_parse_callees(rows: Vec[String]) -> Option[CalleesResponse]
+  var function = ""
+  var have_function = false
+  var callees: Vec[String] = Vec::new()
+  for row in rows do
+    match server_wire_split_row(row.clone())
+    when Option::None then return Option::None
+    when Option::Some(parts) then
+      if parts.0 == "function" then
+        function = parts.1.clone()
+        have_function = true
+      elsif parts.0 == "callee" then
+        callees.push(parts.1.clone())
+      else
+        return Option::None
+      end
+    end
+  end
+  if !have_function then
+    return Option::None
+  end
+  Option::Some(CalleesResponse { function: function, callees: callees })
+end
+
+pub def wire_render_symbols(record: SymbolsResponse) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("query:" + record.query.clone())
+  for s in record.symbols do
+    rows.push("symbol:" + s.clone())
+  end
+  rows
+end
+
+pub def wire_parse_symbols(rows: Vec[String]) -> Option[SymbolsResponse]
+  var query = ""
+  var have_query = false
+  var symbols: Vec[String] = Vec::new()
+  for row in rows do
+    match server_wire_split_row(row.clone())
+    when Option::None then return Option::None
+    when Option::Some(parts) then
+      if parts.0 == "query" then
+        query = parts.1.clone()
+        have_query = true
+      elsif parts.0 == "symbol" then
+        symbols.push(parts.1.clone())
+      else
+        return Option::None
+      end
+    end
+  end
+  if !have_query then
+    return Option::None
+  end
+  Option::Some(SymbolsResponse { query: query, symbols: symbols })
+end
+
+pub def wire_render_type(record: TypeResponse) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("type:" + record.type_key.clone())
+  rows.push("kind:" + record.kind.clone())
+  rows.push("size:" + record.size.to_string())
+  rows.push("alignment:" + record.alignment.to_string())
+  for f in record.fields do
+    rows.push("field:" + f.clone())
+  end
+  rows
+end
+
+pub def wire_parse_type(rows: Vec[String]) -> Option[TypeResponse]
+  var type_key = ""
+  var have_key = false
+  var kind = ""
+  var have_kind = false
+  var size = 0
+  var have_size = false
+  var alignment = 0
+  var have_alignment = false
+  var fields: Vec[String] = Vec::new()
+  for row in rows do
+    match server_wire_split_row(row.clone())
+    when Option::None then return Option::None
+    when Option::Some(parts) then
+      let tag = parts.0.clone()
+      if tag == "type" then
+        type_key = parts.1.clone()
+        have_key = true
+      elsif tag == "kind" then
+        kind = parts.1.clone()
+        have_kind = true
+      elsif tag == "size" then
+        match parts.1.parse_int()
+        when Result::Ok(n) then
+          size = n
+          have_size = true
+        when Result::Err(_) then return Option::None
+        end
+      elsif tag == "alignment" then
+        match parts.1.parse_int()
+        when Result::Ok(n) then
+          alignment = n
+          have_alignment = true
+        when Result::Err(_) then return Option::None
+        end
+      elsif tag == "field" then
+        fields.push(parts.1.clone())
+      else
+        return Option::None
+      end
+    end
+  end
+  if !have_key || !have_kind || !have_size || !have_alignment then
+    return Option::None
+  end
+  Option::Some(TypeResponse {
+    type_key: type_key,
+    kind: kind,
+    size: size,
+    alignment: alignment,
+    fields: fields
+  })
+end
+
+pub def wire_render_effects(record: EffectsResponse) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("function:" + record.function.clone())
+  rows.push("bits:" + record.bits.to_string())
+  rows.push("purity:" + record.purity.clone())
+  for c in record.capabilities do
+    rows.push("capability:" + c.clone())
+  end
+  rows
+end
+
+pub def wire_parse_effects(rows: Vec[String]) -> Option[EffectsResponse]
+  var function = ""
+  var have_function = false
+  var bits = 0
+  var have_bits = false
+  var purity = ""
+  var have_purity = false
+  var capabilities: Vec[String] = Vec::new()
+  for row in rows do
+    match server_wire_split_row(row.clone())
+    when Option::None then return Option::None
+    when Option::Some(parts) then
+      let tag = parts.0.clone()
+      if tag == "function" then
+        function = parts.1.clone()
+        have_function = true
+      elsif tag == "bits" then
+        match parts.1.parse_int()
+        when Result::Ok(n) then
+          bits = n
+          have_bits = true
+        when Result::Err(_) then return Option::None
+        end
+      elsif tag == "purity" then
+        purity = parts.1.clone()
+        have_purity = true
+      elsif tag == "capability" then
+        capabilities.push(parts.1.clone())
+      else
+        return Option::None
+      end
+    end
+  end
+  if !have_function || !have_bits || !have_purity then
+    return Option::None
+  end
+  Option::Some(EffectsResponse {
+    function: function,
+    bits: bits,
+    capabilities: capabilities,
+    purity: purity
+  })
+end
+
+pub def wire_render_ownership(record: OwnershipResponse) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("function:" + record.function.clone())
+  for r in record.rows do
+    rows.push("row:" + r.clone())
+  end
+  rows
+end
+
+pub def wire_parse_ownership(rows: Vec[String]) -> Option[OwnershipResponse]
+  var function = ""
+  var have_function = false
+  var out: Vec[String] = Vec::new()
+  for row in rows do
+    match server_wire_split_row(row.clone())
+    when Option::None then return Option::None
+    when Option::Some(parts) then
+      if parts.0 == "function" then
+        function = parts.1.clone()
+        have_function = true
+      elsif parts.0 == "row" then
+        out.push(parts.1.clone())
+      else
+        return Option::None
+      end
+    end
+  end
+  if !have_function then
+    return Option::None
+  end
+  Option::Some(OwnershipResponse { function: function, rows: out })
+end
+
+pub def wire_render_contract(record: ContractResponse) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("contract:" + record.contract_id.clone())
+  rows.push("kind:" + record.kind.clone())
+  rows.push("fingerprint:" + record.fingerprint.clone())
+  rows.push("message:" + record.message.clone())
+  rows
+end
+
+pub def wire_parse_contract(rows: Vec[String]) -> Option[ContractResponse]
+  var contract_id = ""
+  var have_contract = false
+  var kind = ""
+  var have_kind = false
+  var fingerprint = ""
+  var have_fingerprint = false
+  var message = ""
+  var have_message = false
+  for row in rows do
+    match server_wire_split_row(row.clone())
+    when Option::None then return Option::None
+    when Option::Some(parts) then
+      if parts.0 == "contract" then
+        contract_id = parts.1.clone()
+        have_contract = true
+      elsif parts.0 == "kind" then
+        kind = parts.1.clone()
+        have_kind = true
+      elsif parts.0 == "fingerprint" then
+        fingerprint = parts.1.clone()
+        have_fingerprint = true
+      elsif parts.0 == "message" then
+        message = parts.1.clone()
+        have_message = true
+      else
+        return Option::None
+      end
+    end
+  end
+  if !have_contract || !have_kind || !have_fingerprint || !have_message then
+    return Option::None
+  end
+  Option::Some(ContractResponse {
+    contract_id: contract_id,
+    kind: kind,
+    fingerprint: fingerprint,
+    message: message
+  })
+end
+
+pub def wire_render_mir_function(record: MirFunctionResponse) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("function:" + record.function.clone())
+  rows.push("summary:" + record.summary.clone())
+  rows
+end
+
+pub def wire_parse_mir_function(rows: Vec[String]) -> Option[MirFunctionResponse]
+  var function = ""
+  var have_function = false
+  var summary = ""
+  var have_summary = false
+  for row in rows do
+    match server_wire_split_row(row.clone())
+    when Option::None then return Option::None
+    when Option::Some(parts) then
+      if parts.0 == "function" then
+        function = parts.1.clone()
+        have_function = true
+      elsif parts.0 == "summary" then
+        summary = parts.1.clone()
+        have_summary = true
+      else
+        return Option::None
+      end
+    end
+  end
+  if !have_function || !have_summary then
+    return Option::None
+  end
+  Option::Some(MirFunctionResponse { function: function, summary: summary })
+end
+
+pub def wire_render_abi(record: AbiResponse) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("surface:" + record.surface_id.clone())
+  for r in record.rows do
+    rows.push("row:" + r.clone())
+  end
+  rows
+end
+
+pub def wire_parse_abi(rows: Vec[String]) -> Option[AbiResponse]
+  var surface_id = ""
+  var have_surface = false
+  var out: Vec[String] = Vec::new()
+  for row in rows do
+    match server_wire_split_row(row.clone())
+    when Option::None then return Option::None
+    when Option::Some(parts) then
+      if parts.0 == "surface" then
+        surface_id = parts.1.clone()
+        have_surface = true
+      elsif parts.0 == "row" then
+        out.push(parts.1.clone())
+      else
+        return Option::None
+      end
+    end
+  end
+  if !have_surface then
+    return Option::None
+  end
+  Option::Some(AbiResponse { surface_id: surface_id, rows: out })
+end
+
+pub def wire_render_diagnostic(record: DiagnosticResponse) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  rows.push("id:" + record.diagnostic_id.clone())
+  rows.push("code:" + record.code.clone())
+  rows.push("message:" + record.message.clone())
+  for r in record.related do
+    rows.push("related:" + r.clone())
+  end
+  rows
+end
+
+pub def wire_parse_diagnostic(rows: Vec[String]) -> Option[DiagnosticResponse]
+  var diagnostic_id = ""
+  var have_id = false
+  var code = ""
+  var have_code = false
+  var message = ""
+  var have_message = false
+  var related: Vec[String] = Vec::new()
+  for row in rows do
+    match server_wire_split_row(row.clone())
+    when Option::None then return Option::None
+    when Option::Some(parts) then
+      if parts.0 == "id" then
+        diagnostic_id = parts.1.clone()
+        have_id = true
+      elsif parts.0 == "code" then
+        code = parts.1.clone()
+        have_code = true
+      elsif parts.0 == "message" then
+        message = parts.1.clone()
+        have_message = true
+      elsif parts.0 == "related" then
+        related.push(parts.1.clone())
+      else
+        return Option::None
+      end
+    end
+  end
+  if !have_id || !have_code || !have_message then
+    return Option::None
+  end
+  Option::Some(DiagnosticResponse {
+    diagnostic_id: diagnostic_id,
+    code: code,
+    message: message,
+    related: related
+  })
+end
+
+def wire_parse_row_list(rows: Vec[String]) -> Option[Vec[String]]
+  var out: Vec[String] = Vec::new()
+  for row in rows do
+    match server_wire_split_row(row.clone())
+    when Option::None then return Option::None
+    when Option::Some(parts) then
+      if parts.0 == "row" then
+        out.push(parts.1.clone())
+      else
+        return Option::None
+      end
+    end
+  end
+  Option::Some(out)
+end
+
+pub def wire_render_delta(record: DeltaResponse) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  for r in record.rows do
+    rows.push("row:" + r.clone())
+  end
+  rows
+end
+
+pub def wire_parse_delta(rows: Vec[String]) -> Option[DeltaResponse]
+  match wire_parse_row_list(rows.clone())
+  when Option::Some(out) then Option::Some(DeltaResponse { rows: out })
+  when Option::None then Option::None
+  end
+end
+
+pub def wire_render_plan(record: PlanResponse) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  for r in record.rows do
+    rows.push("row:" + r.clone())
+  end
+  rows
+end
+
+pub def wire_parse_plan(rows: Vec[String]) -> Option[PlanResponse]
+  match wire_parse_row_list(rows.clone())
+  when Option::Some(out) then Option::Some(PlanResponse { rows: out })
+  when Option::None then Option::None
+  end
+end
+
+# The ONE render dispatcher: every family's canonical rows.
+pub def semantic_wire_payload_render(payload: SemanticWirePayload) -> Vec[String]
+  match payload
+  when SemanticWirePayload::Callers(record) then wire_render_callers(record)
+  when SemanticWirePayload::Callees(record) then wire_render_callees(record)
+  when SemanticWirePayload::Symbols(record) then wire_render_symbols(record)
+  when SemanticWirePayload::Type(record) then wire_render_type(record)
+  when SemanticWirePayload::Effects(record) then wire_render_effects(record)
+  when SemanticWirePayload::Ownership(record) then wire_render_ownership(record)
+  when SemanticWirePayload::Contract(record) then wire_render_contract(record)
+  when SemanticWirePayload::MirFunction(record) then wire_render_mir_function(record)
+  when SemanticWirePayload::Abi(record) then wire_render_abi(record)
+  when SemanticWirePayload::Diagnostic(record) then wire_render_diagnostic(record)
+  when SemanticWirePayload::Delta(record) then wire_render_delta(record)
+  when SemanticWirePayload::Plan(record) then wire_render_plan(record)
+  end
+end
+
+# The ONE parse dispatcher: the family's canonical kind (the documented
+# operation spellings included) -> the typed record; Option::None for an
+# unknown kind or a strict-parse failure.
+pub def semantic_wire_payload_parse(kind: String, rows: Vec[String]) -> Option[SemanticWirePayload]
+  match kind
+  when "callers" then
+    match wire_parse_callers(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Callers(record))
+    when Option::None then Option::None
+    end
+  when "callees" then
+    match wire_parse_callees(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Callees(record))
+    when Option::None then Option::None
+    end
+  when "symbols" then
+    match wire_parse_symbols(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Symbols(record))
+    when Option::None then Option::None
+    end
+  when "symbol_get" then
+    match wire_parse_symbols(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Symbols(record))
+    when Option::None then Option::None
+    end
+  when "symbol_search" then
+    match wire_parse_symbols(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Symbols(record))
+    when Option::None then Option::None
+    end
+  when "types" then
+    match wire_parse_type(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Type(record))
+    when Option::None then Option::None
+    end
+  when "type.get" then
+    match wire_parse_type(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Type(record))
+    when Option::None then Option::None
+    end
+  when "type.layout" then
+    match wire_parse_type(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Type(record))
+    when Option::None then Option::None
+    end
+  when "fields" then
+    match wire_parse_type(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Type(record))
+    when Option::None then Option::None
+    end
+  when "effects" then
+    match wire_parse_effects(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Effects(record))
+    when Option::None then Option::None
+    end
+  when "capabilities" then
+    match wire_parse_effects(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Effects(record))
+    when Option::None then Option::None
+    end
+  when "ownership" then
+    match wire_parse_ownership(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Ownership(record))
+    when Option::None then Option::None
+    end
+  when "ownership_explain" then
+    match wire_parse_ownership(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Ownership(record))
+    when Option::None then Option::None
+    end
+  when "ownership.moves" then
+    match wire_parse_ownership(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Ownership(record))
+    when Option::None then Option::None
+    end
+  when "ownership.drop_plan" then
+    match wire_parse_ownership(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Ownership(record))
+    when Option::None then Option::None
+    end
+  when "contracts" then
+    match wire_parse_contract(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Contract(record))
+    when Option::None then Option::None
+    end
+  when "contract_list" then
+    match wire_parse_contract(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Contract(record))
+    when Option::None then Option::None
+    end
+  when "contract.obligations" then
+    match wire_parse_contract(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Contract(record))
+    when Option::None then Option::None
+    end
+  when "mir_function" then
+    match wire_parse_mir_function(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::MirFunction(record))
+    when Option::None then Option::None
+    end
+  when "abi_inspect" then
+    match wire_parse_abi(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Abi(record))
+    when Option::None then Option::None
+    end
+  when "diagnostic.get" then
+    match wire_parse_diagnostic(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Diagnostic(record))
+    when Option::None then Option::None
+    end
+  when "semantic_diff" then
+    match wire_parse_delta(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Delta(record))
+    when Option::None then Option::None
+    end
+  when "snapshot.diff" then
+    match wire_parse_delta(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Delta(record))
+    when Option::None then Option::None
+    end
+  when "build.plan" then
+    match wire_parse_plan(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Plan(record))
+    when Option::None then Option::None
+    end
+  when "verify.plan" then
+    match wire_parse_plan(rows.clone())
+    when Option::Some(record) then Option::Some(SemanticWirePayload::Plan(record))
+    when Option::None then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The typed-wire lane (third-audit item 22 executable rows)
+# ———————————————————————————————————————————————————————————————
+# W1: build each record family with adversarial values (embedded ':',
+# empty strings, empty lists, negative/zero Ints), render, parse back,
+# re-render and compare byte-for-byte. W2: strict-parse rejections
+# (missing mandatory scalar, unknown kind, non-numeric Int). Empty result
+# = the lane verifies.
+
+def server_wire_lane_case(
+  label: String, kind: String, payload: SemanticWirePayload, inout bad: Vec[String]
+) -> Unit
+  let rows = semantic_wire_payload_render(payload.clone())
+  match semantic_wire_payload_parse(kind.clone(), rows.clone())
+  when Option::None then
+    bad.push(label + ": parse failed")
+    ()
+  when Option::Some(back) then
+    let rows2 = semantic_wire_payload_render(back)
+    if rows.len() != rows2.len() then
+      bad.push(label + ": re-render row count " + rows2.len().to_string() +
+        " != " + rows.len().to_string())
+    else
+      var i = 0
+      while i < rows.len() do
+        if rows[i] != rows2[i] then
+          bad.push(label + ": re-render row " + i.to_string() + " mismatch")
+        end
+        i = i + 1
+      end
+    end
+  end
+end
+
+pub def semantic_wire_lane_check() -> Vec[String]
+  var bad: Vec[String] = Vec::new()
+
+  server_wire_lane_case("callers".to_string(), "callers".to_string(),
+    SemanticWirePayload::Callers(CallersResponse {
+      target: "m::f#fn()->unit".to_string(),
+      callers: Vec::from([
+        "m::g#fn()->unit".to_string(),
+        "m::h#fn(x:weird:type)->unit".to_string()
+      ])
+    }), &mut bad)
+
+  server_wire_lane_case("callees".to_string(), "callees".to_string(),
+    SemanticWirePayload::Callees(CalleesResponse {
+      function: "a:b".to_string(),
+      callees: Vec::from(["".to_string(), "c1".to_string()])
+    }), &mut bad)
+
+  server_wire_lane_case("symbols".to_string(), "symbol_search".to_string(),
+    SemanticWirePayload::Symbols(SymbolsResponse {
+      query: "needle:x".to_string(),
+      symbols: Vec::new()
+    }), &mut bad)
+
+  server_wire_lane_case("type".to_string(), "type.get".to_string(),
+    SemanticWirePayload::Type(TypeResponse {
+      type_key: "T:x".to_string(),
+      kind: "Struct".to_string(),
+      size: 0,
+      alignment: 16,
+      fields: Vec::from(["f1".to_string(), "f:2".to_string()])
+    }), &mut bad)
+
+  server_wire_lane_case("effects".to_string(), "effects".to_string(),
+    SemanticWirePayload::Effects(EffectsResponse {
+      function: "m::f#fn()->unit".to_string(),
+      bits: 7,
+      capabilities: Vec::from(["cap.a".to_string(), "cap:b".to_string()]),
+      purity: "Impure".to_string()
+    }), &mut bad)
+
+  server_wire_lane_case("ownership".to_string(), "ownership.moves".to_string(),
+    SemanticWirePayload::Ownership(OwnershipResponse {
+      function: "m::f#fn()->unit".to_string(),
+      rows: Vec::from(["f|p|sink".to_string(), "f|q|let:x".to_string()])
+    }), &mut bad)
+
+  server_wire_lane_case("contract".to_string(), "contract.obligations".to_string(),
+    SemanticWirePayload::Contract(ContractResponse {
+      contract_id: "f|Pre|p(x)".to_string(),
+      kind: "Pre".to_string(),
+      fingerprint: "hi:lo".to_string(),
+      message: "m:1|2".to_string()
+    }), &mut bad)
+
+  server_wire_lane_case("mir_function".to_string(), "mir_function".to_string(),
+    SemanticWirePayload::MirFunction(MirFunctionResponse {
+      function: "m::f#fn()->unit".to_string(),
+      summary: "".to_string()
+    }), &mut bad)
+
+  server_wire_lane_case("abi".to_string(), "abi_inspect".to_string(),
+    SemanticWirePayload::Abi(AbiResponse {
+      surface_id: "abi:x".to_string(),
+      rows: Vec::new()
+    }), &mut bad)
+
+  server_wire_lane_case("diagnostic".to_string(), "diagnostic.get".to_string(),
+    SemanticWirePayload::Diagnostic(DiagnosticResponse {
+      diagnostic_id: "f|diagnostic|E0201|place|3:x|#0".to_string(),
+      code: "E0201".to_string(),
+      message: "use: moved".to_string(),
+      related: Vec::from([
+        "state_before:consumed".to_string(),
+        "operation:use".to_string()
+      ])
+    }), &mut bad)
+
+  server_wire_lane_case("delta".to_string(), "semantic_diff".to_string(),
+    SemanticWirePayload::Delta(DeltaResponse {
+      rows: Vec::from(["created:a:b".to_string(), "modified:c".to_string()])
+    }), &mut bad)
+
+  server_wire_lane_case("plan".to_string(), "build.plan".to_string(),
+    SemanticWirePayload::Plan(PlanResponse {
+      rows: Vec::new()
+    }), &mut bad)
+
+  # W2 — strict parse rejections.
+  match semantic_wire_payload_parse("callers".to_string(),
+      Vec::from(["caller:m::g#fn()->unit".to_string()]))
+  when Option::None then ()
+  when Option::Some(_) then bad.push("callers: missing target must fail closed".to_string())
+  end
+
+  match semantic_wire_payload_parse("no.such.kind".to_string(), Vec::new())
+  when Option::None then ()
+  when Option::Some(_) then bad.push("unknown kind must fail closed".to_string())
+  end
+
+  match semantic_wire_payload_parse("type.get".to_string(), Vec::from([
+      "type:x".to_string(),
+      "kind:S".to_string(),
+      "size:x".to_string(),
+      "alignment:8".to_string()
+    ]))
+  when Option::None then ()
+  when Option::Some(_) then bad.push("non-numeric size must fail closed".to_string())
+  end
+
+  bad
+end
+
+# ———————————————————————————————————————————————————————————————
 # Debug helpers — JSONL for logs ONLY (never parsed); the json_escape
 # shape rides semantic_model's semantic_json_escape.
 # ———————————————————————————————————————————————————————————————
@@ -740,6 +2102,15 @@ def payload_option_debug_text(payload: Option[SemanticResponsePayload]) -> Strin
   end
 end
 
+# The debug render of the typed wire payload: the family's canonical rows
+# as a JSON list (logs only — the wire is kind + keys, never this).
+def wire_payload_option_debug_text(payload: Option[SemanticWirePayload]) -> String
+  match payload
+  when Option::None then "null"
+  when Option::Some(p) then server_json_keys_text(semantic_wire_payload_render(p))
+  end
+end
+
 pub def request_to_debug_string(req: SemanticRequest) -> String
   "{\"request\":{\"protocol_version\":" + req.protocol_version.to_string() +
     ",\"request_id\":" + req.request_id.to_string() +
@@ -754,6 +2125,7 @@ pub def response_to_debug_string(resp: SemanticResponse) -> String
     ",\"kind\":\"" + semantic_json_escape(&resp.kind) +
     "\",\"keys\":" + server_json_keys_text(resp.keys.clone()) +
     ",\"payload\":" + payload_option_debug_text(&resp.payload) +
+    ",\"wire_payload\":" + wire_payload_option_debug_text(resp.wire_payload.clone()) +
     ",\"error\":\"" + semantic_json_escape(&resp.error) + "\"}}"
 end
 
@@ -770,8 +2142,8 @@ end
 # failure (semantic_request_parse -> None — the byte stream can no longer
 # be trusted) or an IO error on either side ends the loop; no partial
 # response is ever written. The loop is silent (no log lines on the
-# wire); the caller
-# (driver.tg's compile_snapshot_route under TANGERINE_SERVER=1) prints
+# wire); the caller (driver.tg's compile_snapshot_serve_route — the
+# TANGERINE_SERVER=1 env route and the normal `tg server` command) prints
 # its own status line AFTER the loop. The driver's LSP loop reads the
 # same stdin fd only in its own command route, never concurrently.
 pub def session_serve_loop(session: CompilerSession) -> Int

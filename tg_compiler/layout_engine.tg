@@ -102,6 +102,54 @@ enum LayoutCategory
 end
 
 # ———————————————————————————————————————————————————————————————
+# Niche analysis — THE unused-bit-pattern authority
+# ———————————————————————————————————————————————————————————————
+# A NICHE is a bit pattern of a payload type that NO valid value of the
+# type can occupy (the classic Rust niche optimization): the null pointer
+# for Ptr/PtrMut/RefInternal, the all-zero pattern for a NonZero-style
+# integer wrapper, and the 2 pattern of Bool (whose only valid patterns
+# are 0/1). A two-variant enum with exactly one payload-less variant and
+# exactly one single-word payload variant whose payload type has a niche
+# may encode the payload-less variant IN the payload's niche, dropping
+# the tag word entirely:
+#   enum_layout_for_type(...).niche          = Some(spec)
+#   representation                           = EnumValueRepresentation::Niched
+#   size                                     = the payload's storage size
+#   tag_layout                               = {offset 0, size 0}
+#   payload_offset                           = 0
+# The niched layout is the DIRECT PIPELINE'S internal value encoding: it
+# is NOT a canonical ABI crossing (classify_enum_crossing fails closed
+# for it — the canonical crossing stays the EnumLayout's TaggedPtr word).
+#
+# The analyzer is conservative: only WORD-SIZED payloads (payload size ==
+# target pointer size) are applied, because the frame/register model
+# stores every enum value in one word. A Bool payload (1 byte) would
+# make an enclosing aggregate store overflow the field; it therefore
+# reports BoolRange but is not applied today. Enum-typed payloads are NOT
+# given a second niche (Option[Option[Ptr]] would need a second niche),
+# so only scalars qualify.
+pub enum NicheKind
+  # No niche (a type whose bit patterns are all valid).
+  None
+  # The null pointer pattern (Ptr[T]/PtrMut[T]/RefInternal): 0 is invalid.
+  PointerNull
+  # A NonZero-style wrapper: the all-zero pattern is invalid.
+  NonZero
+  # Bool's unused second pattern: valid 0/1, the niche is 2.
+  BoolRange
+end
+
+pub struct NicheSpec
+  kind: NicheKind
+  # The niche's bit width (the pointer width for PointerNull, the integer
+  # field's width for NonZero, 1 for BoolRange).
+  bits: Int
+  # The exact value the payload-less variant writes into the payload slot
+  # (the invalid pattern): 0 for PointerNull/NonZero, 2 for BoolRange.
+  encoded_niche: Int
+end
+
+# ———————————————————————————————————————————————————————————————
 # Runtime Value Representation — THE DECISION TABLE
 # ———————————————————————————————————————————————————————————————
 # ONE place states how every fundamental type's runtime value is stored.
@@ -691,6 +739,11 @@ struct LayoutRecord
   
   # Variant layouts (for enums)
   variants: Vec[VariantLayout]
+
+  # The enum's niche (Some for a NICHED enum layout — the payload-less
+  # variant is encoded in the payload type's unused bit pattern, the tag
+  # word is gone; None for every tagged record and every non-enum).
+  niche: Option[NicheSpec]
   
   # Tag info (for enums)
   tag_offset: Int        # Offset of discriminant tag (0 for all enums)
@@ -1710,19 +1763,25 @@ end
 #     inline tagged image { tag @ tag_layout.offset, payload @
 #     payload_offset }. This is the encoding every registered enum uses
 #     today (the aggregate/heap-image convention).
+#   Niched: the value IS the payload word of the single payload variant;
+#     the payload-less variant is encoded by the payload type's niche
+#     (NicheSpec.encoded_niche). No tag word: tag_layout is {0, 0} and
+#     payload_offset is 0. The niche spec lives in EnumLayout.niche.
 #   InlineTagged: the value IS the inline tagged image (tag + payload
 #     fields in the value's storage). Reserved — no registered enum uses it
 #     today; the model supports it.
 #   Opaque: no resolvable enum layout (unregistered/unresolved). Consumers
 #     must fail closed instead of guessing.
 #
-# The memory IMAGE is always the inline tagged aggregate the engine
-# computes (compute_enum_layout / LayoutCategory::TaggedUnion): tag at
-# tag_layout.offset (0), payload at payload_offset (8). Niche optimization,
-# when it exists, lives in `niches` — never in codegen.
+# The memory IMAGE of a TAGGED enum is the inline tagged aggregate the
+# engine computes (compute_enum_layout / LayoutCategory::TaggedUnion): tag
+# at tag_layout.offset (0), payload at payload_offset (8). A NICHED enum
+# has no tag: its image is exactly the payload. The niche decision lives in
+# `niche` — never in codegen.
 
 enum EnumValueRepresentation
   TaggedPtr(Int)    # register word: raw disc < threshold, heap ptr >= threshold
+  Niched            # register word IS the payload; the tag is the niche
   InlineTagged      # the value is the inline tagged image itself
   Opaque            # unresolved: no representation (fail closed)
 end
@@ -1743,6 +1802,10 @@ struct EnumLayout
   payload_offset: Int
   variant_layouts: Vec[VariantLayout]
   niches: Vec[EnumNiche]
+  # The NICHED form's spec (Some exactly when representation is Niched):
+  # kind + the niche's bit width + the invalid pattern the payload-less
+  # variant stores. None for every tagged form.
+  niche: Option[NicheSpec]
 end
 
 # The inline-tag threshold of the TaggedPtr encoding: register values below
@@ -1753,19 +1816,194 @@ end
 # the EnumLayout and never contains it.
 def enum_inline_tag_threshold() -> Int = 256
 
+# ———————————————————————————————————————————————————————————————
+# Niche analysis — the single unused-bit-pattern authority
+# ———————————————————————————————————————————————————————————————
+# niche_of_type answers the unused-bit-pattern question for a payload
+# type. The analyzer is deliberately conservative: it reports a niche only
+# for patterns the language itself guarantees invalid:
+#   Ptr / PtrMut / RefInternal -> PointerNull (0)
+#   Bool                       -> BoolRange (2)
+#   a registered NonZero-style single-integer-field wrapper -> NonZero (0)
+# Every other type (integers, floats, strings, handles, structs, enums)
+# has no guaranteed-invalid pattern and reports None. `engine` is read
+# only — the type's DEFINITION is the authority, and a generic payload is
+# substituted under the concrete args before the field is inspected.
+pub def niche_of_type(engine: LayoutEngine, ty: Type) -> Option[NicheSpec]
+  match ty
+  when Type::Ptr(_) then
+    Option::Some(NicheSpec {
+      kind: NicheKind::PointerNull,
+      bits: engine.target.pointer_size * 8,
+      encoded_niche: 0
+    })
+  when Type::PtrMut(_) then
+    Option::Some(NicheSpec {
+      kind: NicheKind::PointerNull,
+      bits: engine.target.pointer_size * 8,
+      encoded_niche: 0
+    })
+  when Type::RefInternal(_, _) then
+    Option::Some(NicheSpec {
+      kind: NicheKind::PointerNull,
+      bits: engine.target.pointer_size * 8,
+      encoded_niche: 0
+    })
+  when Type::Bool then
+    Option::Some(NicheSpec {
+      kind: NicheKind::BoolRange,
+      bits: 1,
+      encoded_niche: 2
+    })
+  when Type::Adt(tid, _) then
+    let wrapper_name = lookup_type_name(engine, tid.id)
+    if is_nonzero_wrapper_name(&wrapper_name) then
+      match substituted_type_def(engine, ty)
+      when Option::Some(td) then
+        match td.kind
+        when MirTypeDefKind::Struct(fields) then
+          if fields.len() == 1 then
+            let field_bits = niche_integer_bits(&fields[0].ty)
+            if field_bits > 0 then
+              Option::Some(NicheSpec {
+                kind: NicheKind::NonZero,
+                bits: field_bits,
+                encoded_niche: 0
+              })
+            else
+              Option::None
+            end
+          else
+            Option::None
+          end
+        when _ then Option::None
+        end
+      when Option::None then Option::None
+      end
+    else
+      Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+# The NonZero-style wrapper name gate (NonZero, NonZeroU8, ...): the
+# forward-compatible detector for the registered wrapper types whose
+# contract excludes the all-zero pattern. No std wrapper is registered
+# today; a test/synthetic def of this name family exercises the row.
+def is_nonzero_wrapper_name(name: String) -> Bool
+  name == "NonZero" || name.starts_with("NonZero") || name.ends_with("::NonZero")
+end
+
+# The bit width of an integer-like type (0 for anything else).
+def niche_integer_bits(ty: Type) -> Int
+  match ty
+  when Type::I8 | Type::U8 then 8
+  when Type::I16 | Type::U16 then 16
+  when Type::I32 | Type::U32 then 32
+  when Type::I64 | Type::U64 | Type::Int | Type::UInt | Type::ISize | Type::USize then 64
+  when Type::I128 | Type::U128 then 128
+  when _ then 0
+  end
+end
+
+# The DECLARATION index of a niched enum's payload-less variant (the
+# variant whose payload_size is 0 — exactly one exists in a niched layout;
+# -1 for a layout that is not niched/consistent).
+pub def enum_layout_niche_payloadless_index(el: EnumLayout) -> Int
+  var i = 0
+  while i < el.variant_layouts.len() do
+    if el.variant_layouts[i].payload_size == 0 then
+      return i
+    end
+    i = i + 1
+  end
+  -1
+end
+
+# The DECLARATION index of a niched enum's payload variant (payload_size
+# > 0; -1 when absent).
+pub def enum_layout_niche_payload_index(el: EnumLayout) -> Int
+  var i = 0
+  while i < el.variant_layouts.len() do
+    if el.variant_layouts[i].payload_size > 0 then
+      return i
+    end
+    i = i + 1
+  end
+  -1
+end
+
+# True when a field type is structurally zero-sized (Unit / Never / an
+# all-zero tuple / a zero-length fixed array) — the payload-less arm of
+# the niche gate (Result[T, Unit]'s zero-sized-error variant).
+def niche_field_is_zero_sized(ty: Type) -> Bool
+  match ty
+  when Type::Unit then true
+  when Type::Never then true
+  when Type::Tuple(elems) then
+    var all_zero = true
+    for e in elems do
+      if !niche_field_is_zero_sized(e) then
+        all_zero = false
+      end
+    end
+    all_zero
+  when Type::FixedArray(_, n) then n == 0
+  when _ then false
+  end
+end
+
+# The payload type of a (niched) registered enum: the single non-zero-
+# sized field of its payload variant, substituted under the concrete Adt
+# args. Option::None when the type is not a registered enum with that
+# shape.
+pub def enum_niche_payload_type(engine: LayoutEngine, ty: Type) -> Option[Type]
+  match ty
+  when Type::Adt(_, _) then
+    match substituted_type_def(engine, ty)
+    when Option::Some(td) then
+      match td.kind
+      when MirTypeDefKind::Enum(variants) then
+        var i = 0
+        while i < variants.len() do
+          if variants[i].fields.len() == 1 then
+            let fty = variants[i].fields[0]
+            if !niche_field_is_zero_sized(fty) then
+              return Option::Some(fty)
+            end
+          end
+          i = i + 1
+        end
+        Option::None
+      when _ then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
 # The EnumLayout projection of a TaggedUnion record (Option::None for
-# non-enum records).
+# non-enum records). A record carrying a niche projects to the Niched
+# representation: no tag, payload at offset 0.
 def enum_layout_from_record(rec: LayoutRecord) -> Option[EnumLayout]
   if rec.category == LayoutCategory::TaggedUnion then
+    let rec_niche = rec.niche.clone()
+    let rep = match rec_niche
+    when Option::Some(_) then EnumValueRepresentation::Niched
+    when Option::None then EnumValueRepresentation::TaggedPtr(enum_inline_tag_threshold())
+    end
     Option::Some(EnumLayout {
-      representation: EnumValueRepresentation::TaggedPtr(enum_inline_tag_threshold()),
+      representation: rep,
       tag_layout: EnumTagLayout {
         offset: rec.tag_offset,
         size: rec.tag_size
       },
       payload_offset: rec.payload_offset,
       variant_layouts: rec.variants.clone(),
-      niches: Vec::new()
+      niches: Vec::new(),
+      niche: rec_niche
     })
   else
     Option::None
@@ -2040,6 +2278,7 @@ def compute_struct_layout(inout engine: LayoutEngine, ty: Type, fields: Vec[MirF
     field_count: fields.len(),
     fields: field_layouts,
     variants: Vec::new(),
+    niche: Option::None,
     tag_offset: 0,
     tag_size: 0,
     header_size: 0,
@@ -2127,6 +2366,7 @@ def closure_object_record(inout engine: LayoutEngine, ty: Type) -> LayoutRecord
         field_count: field_layouts.len(),
         fields: field_layouts,
         variants: Vec::new(),
+        niche: Option::None,
         tag_offset: 0,
         tag_size: 0,
         header_size: 0,
@@ -2239,6 +2479,118 @@ def compute_enum_layout(inout engine: LayoutEngine, ty: Type, variants: Vec[MirV
     })
     variant_idx = variant_idx + 1
   end
+
+  # ———————————————————————————————————————————————————————————————
+  # NICHE OPTIMIZATION — the payload-less variant encoded in the payload
+  # type's unused bit pattern (Option[Ptr[T]], Option[NonZero],
+  # Result[small, zero-sized-error]). The gate is exact and conservative:
+  #   - exactly TWO variants: one payload-less (payload_size == 0; its
+  #     fields may be zero-sized, e.g. Result[..., Unit]'s error arm) and
+  #     one single-field payload variant;
+  #   - the payload type reports a niche (niche_of_type) whose storage
+  #     size is exactly one target word (the frame/register model stores
+  #     every enum value in one word);
+  #   - the declaration carries NO layout attributes — an attributed
+  #     (@repr(C)/@packed/@align(N)) enum keeps the frozen tagged image.
+  # The niched image IS the payload: no tag word (tag_size 0), payload at
+  # offset 0. Consumers read EnumValueRepresentation::Niched and emit /
+  # test the payload word (see the enum-representation section).
+  # ———————————————————————————————————————————————————————————————
+  if variants.len() == 2 && !attrs.is_packed && !attrs.is_repr_c && declared_align <= 1 then
+    var niche_zero_idx = -1
+    var niche_payload_idx = -1
+    var niche_probe = 0
+    while niche_probe < 2 do
+      if variant_layouts[niche_probe].payload_size == 0 then
+        niche_zero_idx = niche_probe
+      elsif variants[niche_probe].fields.len() == 1 then
+        niche_payload_idx = niche_probe
+      end
+      niche_probe = niche_probe + 1
+    end
+    if niche_zero_idx >= 0 && niche_payload_idx >= 0 then
+      let niche_pty = variants[niche_payload_idx].fields[0]
+      match niche_of_type(engine, &niche_pty)
+      when Option::Some(niche_spec) then
+        let niche_psize = repr_storage_size(engine, &niche_pty)
+        if niche_psize == engine.target.pointer_size then
+          # The payload variant's field is the WHOLE value: its field
+          # offset is 0 (not the tagged image's 8).
+          var niched_variants = Vec::new()
+          var nv_idx = 0
+          while nv_idx < variant_layouts.len() do
+            let nv = variant_layouts[nv_idx]
+            var niched_fields = Vec::new()
+            var nfi = 0
+            while nfi < nv.fields.len() do
+              let nf = nv.fields[nfi]
+              niched_fields.push(FieldLayout {
+                name: nf.name.clone(),
+                offset: 0,
+                size: nf.size,
+                align: nf.align,
+                type_id: nf.type_id
+              })
+              nfi = nfi + 1
+            end
+            niched_variants.push(VariantLayout {
+              name: nv.name.clone(),
+              discriminant: nv.discriminant,
+              payload_offset: 0,
+              payload_size: nv.payload_size,
+              fields: niched_fields
+            })
+            nv_idx = nv_idx + 1
+          end
+          # The flat list keeps the [tag, v0.., v1..] shape codegen's
+          # flat-index walk expects; the tag entry is a ZERO-SIZE slot so
+          # flat index 1 + Σ(prior fields) still resolves the payload
+          # field at offset 0.
+          var niched_flat = Vec::new()
+          niched_flat.push(FieldLayout {
+            name: "tag",
+            offset: 0,
+            size: 0,
+            align: 1,
+            type_id: -1
+          })
+          var nf_parent = 0
+          while nf_parent < niched_variants.len() do
+            let fv = niched_variants[nf_parent]
+            var nf_child = 0
+            while nf_child < fv.fields.len() do
+              niched_flat.push(fv.fields[nf_child].clone())
+              nf_child = nf_child + 1
+            end
+            nf_parent = nf_parent + 1
+          end
+          let niche_align = repr_storage_align(engine, &niche_pty)
+          let niched_name = lookup_type_name(engine, type_id)
+          let niched_hash = compute_layout_hash(&niched_name, niche_psize, niche_align, variants.len())
+          return LayoutRecord {
+            type_id: type_id,
+            name: niched_name,
+            category: LayoutCategory::TaggedUnion,
+            repr: Repr::Inline,
+            size: niche_psize,
+            align: niche_align,
+            stride: niche_psize,
+            field_count: variants.len(),
+            fields: niched_flat,
+            variants: niched_variants,
+            niche: Option::Some(niche_spec),
+            tag_offset: 0,
+            tag_size: 0,
+            header_size: 0,
+            payload_offset: 0,
+            layout_attrs: attrs,
+            hash: niched_hash
+          }
+        end
+      when Option::None then ()
+      end
+    end
+  end
   
   # Total size: tag (8 bytes) + max_payload (aligned)
   let payload_total = layout_align_up(max_payload_size, max_align)
@@ -2281,6 +2633,7 @@ def compute_enum_layout(inout engine: LayoutEngine, ty: Type, variants: Vec[MirV
     field_count: variants.len(),
     fields: flat_fields,
     variants: variant_layouts,
+    niche: Option::None,
     tag_offset: 0,      # F3: tag at offset 0
     tag_size: 8,        # F3: tag is 8 bytes
     header_size: 0,
@@ -2425,6 +2778,7 @@ def compute_vector_layout(inout engine: LayoutEngine, ty: Type, fields: Vec[MirF
     field_count: rec.field_count,
     fields: rec.fields,
     variants: rec.variants,
+    niche: Option::None,
     tag_offset: 0,
     tag_size: 0,
     header_size: 0,
@@ -2849,6 +3203,133 @@ def validate_layout(inout engine: LayoutEngine, assertion: LayoutAssertion) -> R
 end
 
 # ———————————————————————————————————————————————————————————————
+# ENUM-LAYOUT CONSISTENCY (the verifier lane): the tagged form's frozen
+# invariant (tag 8 at offset 0 / payload at 8) and the niched form's
+# invariants (a niche spec exactly when the representation is Niched; no
+# tag; payload at offset 0; exactly one payload-less and one payload
+# variant). Returns the typed failure instead of panicking so the
+# verifier/tests can assert acceptance AND rejection rows.
+# ———————————————————————————————————————————————————————————————
+pub def validate_enum_layout_consistency(inout engine: LayoutEngine, ty: Type) -> Result[Unit, LayoutError]
+  let el = match enum_layout_for_type(engine, ty)
+  when Option::Some(e) then e
+  when Option::None then
+    return Result::Err(LayoutError {
+      class: LayoutFailureClass::UNSUPPORTED_TYPE,
+      message: "Type is not a registered enum (no EnumLayout) — no consistency check",
+      type_name: mir_type_identity_key(ty),
+      expected: 0,
+      actual: 0,
+      context: "validate_enum_layout_consistency"
+    })
+  end
+  let el_niche = el.niche.clone()
+  match el_niche
+  when Option::Some(spec) then
+    # The niched form: the representation MUST be Niched, there is NO tag,
+    # the payload starts at 0, and exactly one variant is payload-less.
+    match el.representation
+    when EnumValueRepresentation::Niched then ()
+    when _ then
+      return Result::Err(LayoutError {
+        class: LayoutFailureClass::LAYOUT_COMPUTATION_BUG,
+        message: "A niche spec exists but the representation is not Niched",
+        type_name: mir_type_identity_key(ty),
+        expected: 0,
+        actual: 0,
+        context: "validate_enum_layout_consistency:representation"
+      })
+    end
+    if el.tag_layout.offset != 0 || el.tag_layout.size != 0 then
+      return Result::Err(LayoutError {
+        class: LayoutFailureClass::LAYOUT_COMPUTATION_BUG,
+        message: "A niched enum must not carry a tag (tag_layout must be {offset 0, size 0})",
+        type_name: mir_type_identity_key(ty),
+        expected: 0,
+        actual: el.tag_layout.size,
+        context: "validate_enum_layout_consistency:tag"
+      })
+    end
+    if el.payload_offset != 0 then
+      return Result::Err(LayoutError {
+        class: LayoutFailureClass::LAYOUT_COMPUTATION_BUG,
+        message: "A niched enum's payload starts at offset 0",
+        type_name: mir_type_identity_key(ty),
+        expected: 0,
+        actual: el.payload_offset,
+        context: "validate_enum_layout_consistency:payload_offset"
+      })
+    end
+    if enum_layout_niche_payloadless_index(el.clone()) < 0 then
+      return Result::Err(LayoutError {
+        class: LayoutFailureClass::LAYOUT_COMPUTATION_BUG,
+        message: "A niched enum requires exactly one payload-less variant (the variant encoded by the niche)",
+        type_name: mir_type_identity_key(ty),
+        expected: 1,
+        actual: 0,
+        context: "validate_enum_layout_consistency:payloadless"
+      })
+    end
+    if enum_layout_niche_payload_index(el.clone()) < 0 then
+      return Result::Err(LayoutError {
+        class: LayoutFailureClass::LAYOUT_COMPUTATION_BUG,
+        message: "A niched enum requires exactly one payload variant (whose type carries the niche)",
+        type_name: mir_type_identity_key(ty),
+        expected: 1,
+        actual: 0,
+        context: "validate_enum_layout_consistency:payload"
+      })
+    end
+    if spec.bits <= 0 then
+      return Result::Err(LayoutError {
+        class: LayoutFailureClass::LAYOUT_COMPUTATION_BUG,
+        message: "A niche spec must carry a positive bit width",
+        type_name: mir_type_identity_key(ty),
+        expected: 1,
+        actual: spec.bits,
+        context: "validate_enum_layout_consistency:bits"
+      })
+    end
+    Result::Ok(())
+  when Option::None then
+    match el.representation
+    when EnumValueRepresentation::TaggedPtr(_) then
+      # The tagged form's frozen {tag @ 0, payload @ 8} invariant.
+      if el.tag_layout.offset != 0 || el.tag_layout.size != 8 then
+        return Result::Err(LayoutError {
+          class: LayoutFailureClass::LAYOUT_COMPUTATION_BUG,
+          message: "A tagged enum's tag must be the frozen 8-byte word at offset 0",
+          type_name: mir_type_identity_key(ty),
+          expected: 8,
+          actual: el.tag_layout.size,
+          context: "validate_enum_layout_consistency:tagged_tag"
+        })
+      end
+      Result::Ok(())
+    when EnumValueRepresentation::Niched then
+      Result::Err(LayoutError {
+        class: LayoutFailureClass::LAYOUT_COMPUTATION_BUG,
+        message: "The Niched representation requires a niche spec",
+        type_name: mir_type_identity_key(ty),
+        expected: 0,
+        actual: 0,
+        context: "validate_enum_layout_consistency:missing_niche"
+      })
+    when EnumValueRepresentation::InlineTagged then Result::Ok(())
+    when EnumValueRepresentation::Opaque then
+      Result::Err(LayoutError {
+        class: LayoutFailureClass::UNSUPPORTED_TYPE,
+        message: "An opaque (unresolved) EnumLayout cannot be verified",
+        type_name: mir_type_identity_key(ty),
+        expected: 0,
+        actual: 0,
+        context: "validate_enum_layout_consistency:opaque"
+      })
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # Layout Table Dump (Step 4)
 # ———————————————————————————————————————————————————————————————
 
@@ -3174,6 +3655,24 @@ def classify_value_category(inout engine: LayoutEngine, ty: Type) -> Result[Valu
           match el.representation
           when EnumValueRepresentation::TaggedPtr(_) then
             Result::Ok(ValueCategory::Scalar(engine.target.pointer_size))
+          when EnumValueRepresentation::Niched then
+            # The niched VALUE is exactly the payload word (the payload-less
+            # variant stores the niche in the same word), so the enum's
+            # category is its payload type's category — a pointer/NonZero
+            # payload classifies Scalar, never TaggedPtr.
+            match enum_niche_payload_type(engine, ty)
+            when Option::Some(niche_payload_ty) then
+              classify_value_category(engine, &niche_payload_ty)
+            when Option::None then
+              Result::Err(LayoutError {
+                class: LayoutFailureClass::LAYOUT_COMPUTATION_BUG,
+                message: "Niched enum layout has no resolvable payload type (the payload variant is missing)",
+                type_name: "type#" + tid.id.to_string(),
+                expected: 0,
+                actual: 0,
+                context: "classify_value_category"
+              })
+            end
           when EnumValueRepresentation::InlineTagged then
             inline_aggregate_category(engine, ty)
           when EnumValueRepresentation::Opaque then
@@ -3383,6 +3882,7 @@ def compute_all_layouts(inout engine: LayoutEngine) -> Unit
         field_count: 0,
         fields: Vec::new(),
         variants: Vec::new(),
+        niche: Option::None,
         tag_offset: 0,
         tag_size: 0,
         header_size: 0,
@@ -3422,43 +3922,45 @@ end
 # THE PLAN RECORD (AbiCallPlan):
 #   args: Vec[AbiParam] — one entry per declared parameter, in
 #     declaration order.  An aggregate that occupies several physical
-#     registers is still ONE entry; its `location` carries every register
-#     it consumes, comma-separated, in ABI order ("x0,x1").
+#     registers is still ONE entry; its AbiParam.location is the typed
+#     AbiLocation (kind + register names / stack offset).
 #   ret: AbiReturn — the result crossing.  VoidT for a zero-sized result,
 #     GprT/GprPairT for the integer word(s), FprT/FprPairT for the
 #     floating-point/vector register file, SRetT for the indirect
-#     (caller-supplied buffer) crossing.
+#     (caller-supplied buffer) crossing.  Every non-void variant carries
+#     the result's AbiValueClass, so the return class renders through the
+#     same helper as an argument's.
 #   variadic: Bool — the declaration is variadic ("extern def f(a, ...)").
 #   stack_arg_bytes: Int — the total caller-stack bytes the classified
 #     parameters occupy (0 when every parameter rode a register file).
 #
-# AbiParam.class_word vocabulary (the crossing class, not the value's
-# source-language type):
-#   "zero"    — no payload (zero-sized); consumes no slot.
-#   "int"     — the value itself travels in a general register/stack slot
-#                (integers, Bool, Char, pointers/handles, and the
-#                canonical ONE-word enum TaggedPtr value — see item 29).
-#   "float"   — the value travels in the floating-point register file
-#                when the target's float_abi is Hard, else in a general
-#                slot at its width (Soft targets).
-#   "vector"  — a SIMD vector slot (the 16-byte vector row).
-#   "pair"    — a 16-byte aggregate image in the INTERNAL convention: the
-#                slot carries the image ADDRESS (indirect = true), exactly
-#                the compiler's by-reference aggregate crossing.
-#   "memory"  — a >16-byte aggregate image in the INTERNAL convention:
-#                the slot carries the image ADDRESS (indirect = true).
-# AbiParam.location is the register/file name the target's own backend
-# consumes (desc.arg_regs entries: "x0"/"rdi"/"r0"/"a0"; the FP names
-# "d0"/"xmm0"/"fa0") or "stack+<byte-offset>" / "none".  The strings are
-# the SAME names the desc's register lists carry, so a backend consumes a
-# location without an arch conditional of its own.
+# THE CLASS VOCABULARY MAPPING (third-audit item 41): the old literal
+# words map onto the typed AbiValueClass, whose canonical RENDER is the
+# width-carrying form the persisted ABI surface rows and abi_report
+# already carry:
+#   "zero"          -> AbiValueClass::Zero          -> "zero"
+#   "int" (scalar)  -> ScalarInt(width)             -> "scalar:<width>"
+#   "int" (enum)    -> TaggedPtr(width)             -> "scalar:<width>"
+#   "int" (C pair)  -> PairInt(a, b)                -> "pair:<a>:<b>"
+#   "float"         -> ScalarFloat(width)           -> "scalar:<width>"
+#   "pair"          -> PairInt(a, b)                -> "pair:<a>:<b>"
+#   "vector"        -> Vector(width)                -> "vector:<width>"
+#   "memory"        -> ByAddress(size)              -> "by-address:<size>"
+# (The old ExternC pair-overflow arm rendered "memory" while placing a
+# by-value composite on the stack; it now carries ByAddress(size) with
+# indirect = false — the location and size are unchanged.)
+# AbiParam.location: the typed AbiLocation.  Its register names are the
+# SAME names the desc's register lists carry ("x0"/"rdi"/"r0"/"a0" and
+# the FP names "d0"/"xmm0"/"fa0"), so a backend consumes a location
+# without an arch conditional of its own; the stack form is the typed
+# StackOffset.
 # AbiParam.indirect is true exactly when the location carries an ADDRESS
 # of the payload (the internal pair/memory aggregate convention, and the
-# 16-byte vector row's address-in-slot convention).  AbiParam.extension is
-# the boundary extension of a narrow integer ("none"/"sign"/"zero").
-# AbiParam.alignment and .size are the payload's byte alignment and size
-# (0/1 for the zero class) — consumers size their copies from these, never
-# from a rounded slot.
+# 16-byte vector row's address-in-slot convention).  AbiParam.extension
+# is the typed boundary extension of a narrow integer (None / SignExtend
+# / ZeroExtend).  AbiParam.alignment and .size are the payload's byte
+# alignment and size (0/1 for the zero class) — consumers size their
+# copies from these, never from a rounded slot.
 #
 # FLAVORS (why the plan has a flavor at all):
 #   AbiFlavor::InternalValue — the compiler's OWN whole-program convention
@@ -3476,9 +3978,10 @@ end
 # pointer-width word (layout_engine's EnumValueRepresentation::TaggedPtr:
 # a raw discriminant below the 256-byte inline-tag threshold, or a heap
 # pointer to the inline {tag @ 0, payload @ 8} image).  The plan therefore
-# classifies EVERY TaggedPtr enum — payload-carrying or not — as
-# "int"/pointer in the InternalValue flavor, and as "int" in the ExternC
-# flavor only when the enum is payload-LESS (a payloaded enum's TaggedPtr
+# classifies EVERY TaggedPtr enum — payload-carrying or not — as the
+# AbiValueClass::TaggedPtr class (rendering "scalar:<pointer width>") in
+# the InternalValue flavor, and as the same class in the ExternC flavor
+# only when the enum is payload-LESS (a payloaded enum's TaggedPtr
 # word is a compiler-private encoding, NOT an FFI value, so ExternC
 # classifies it fail-closed).  See classify_enum_crossing below for the
 # one per-enum crossing authority; lir.tg's LIR-internal inline-image
@@ -3489,20 +3992,102 @@ pub enum AbiFlavor
   ExternC
 end
 
+# ———————————————————————————————————————————————————————————————
+# THE TYPED CARRIERS (third-audit item 41)
+# ———————————————————————————————————————————————————————————————
+# AbiParam's class/location/extension were Strings every consumer
+# compared against literals.  They are structured values now; strings
+# exist ONLY at the report boundary (abi_value_class_word /
+# abi_location_text / abi_extension_word / abi_return_text below).
+#
+# AbiValueClass — WHAT crosses.  The classifier emits exactly:
+#   Zero           the zero-sized payload (consumes no slot)
+#   ScalarInt(w)   one general-class word of w bytes (integers, Bool,
+#                  Char, pointers/handles)
+#   ScalarFloat(w) one floating-point word of w bytes (a Hard target
+#                  places it in the FP file, a Soft target in a general
+#                  slot at w bytes — the placement, not the class, is the
+#                  target's rule)
+#   PairInt(a, b)  the two-eightbyte aggregate image (the internal
+#                  by-reference crossing; the C two-GP-register
+#                  composite — placement is the flavor's rule)
+#   Vector(w)      a SIMD vector slot (the 16-byte register row)
+#   ByAddress(sz)  the address-carried image (the internal aggregate
+#                  convention; the C by-value stacked composite)
+#   TaggedPtr(w)   the canonical ONE-word registered-enum value (audit
+#                  item 29); renders "scalar:<w>" so the persisted ABI
+#                  surface rows stay byte-identical
+# The remaining variants are the RESERVED structured forms of documented
+# gaps — no classifier path constructs them yet, and abi_place_value
+# fails closed on them:
+#   PairFloat(a, b) / MixedPair(a, b) — the AAPCS64/SysV HFA/SSE
+#                  aggregate classes (audit P1-13; the member-type scan
+#                  lands them)
+#   EnumInline(sz) — the LIR-internal inline-image enum crossing
+#                  (AbiEnumCrossing::InlineImage; LIR's own aggregate
+#                  machinery carries that crossing today)
+#
+# AbiLocation — WHERE it crosses: a typed kind (None / Register /
+# RegisterPairGpr / RegisterPairFp / StackOffset) plus the target's own
+# register NAME strings (data, not a vocabulary — "x0"/"rdi"/"d0"/"fa0")
+# and the stack byte offset.  The audit sketch also lists an "Indirect"
+# kind; indirectness deliberately stays the typed AbiParam.indirect Bool
+# instead: the location must still name the register that carries the
+# address, so folding it into the kind would lose the register.
+#
+# AbiExtension — the boundary extension of a narrow integer: None (the
+# value is already canonical), SignExtend, ZeroExtend; AnyRegister is
+# reserved (no path emits it yet).
+
+pub enum AbiValueClass
+  Zero
+  ScalarInt(width: Int)
+  ScalarFloat(width: Int)
+  PairInt(width_a: Int, width_b: Int)
+  PairFloat(width_a: Int, width_b: Int)
+  MixedPair(width_a: Int, width_b: Int)
+  Vector(width: Int)
+  ByAddress(size: Int)
+  TaggedPtr(width: Int)
+  EnumInline(size: Int)
+end
+
+pub enum AbiLocationKind
+  None
+  Register
+  RegisterPairGpr
+  RegisterPairFp
+  StackOffset
+end
+
+pub struct AbiLocation
+  kind: AbiLocationKind
+  reg_a: String
+  reg_b: String
+  offset: Int
+end
+
+pub enum AbiExtension
+  None
+  SignExtend
+  ZeroExtend
+  AnyRegister
+end
+
 pub enum AbiReturn
   VoidT
-  GprT
-  GprPairT
-  FprT
-  FprPairT
-  SRetT
+  GprT(class: AbiValueClass)
+  GprPairT(class: AbiValueClass)
+  FprT(class: AbiValueClass)
+  FprPairT(class: AbiValueClass)
+  SRetT(class: AbiValueClass)
 end
 
 pub struct AbiParam
-  class_word: String
-  location: String
+  value_class: AbiValueClass
+  location: AbiLocation
   indirect: Bool
-  extension: String
+  extension: AbiExtension
   alignment: Int
   # The payload byte size.  The audit's AbiParam shape carries the five
   # fields before this one; `size` is the additive sixth because every
@@ -3541,6 +4126,78 @@ end
 # Plan helpers
 # ———————————————————————————————————————————————————————————————
 
+# ———————————————————————————————————————————————————————————————
+# The report-boundary renders (third-audit item 41): the ONLY functions
+# that turn the typed carriers into text.  Consumers match the typed
+# values; reports and serialization call these.
+# ———————————————————————————————————————————————————————————————
+
+# The canonical class word: Zero -> "zero", the scalar/tagged-pointer
+# classes -> "scalar:<width>", the pair classes -> "pair:<a>:<b>",
+# Vector -> "vector:<width>", ByAddress/EnumInline ->
+# "by-address:<size>" — byte-identical to the old vocabulary.
+pub def abi_value_class_word(cls: AbiValueClass) -> String
+  match cls
+  when AbiValueClass::Zero then "zero"
+  when AbiValueClass::ScalarInt(w) then "scalar:" + w.to_string()
+  when AbiValueClass::ScalarFloat(w) then "scalar:" + w.to_string()
+  when AbiValueClass::PairInt(a, b) then "pair:" + a.to_string() + ":" + b.to_string()
+  when AbiValueClass::PairFloat(a, b) then "pair:" + a.to_string() + ":" + b.to_string()
+  when AbiValueClass::MixedPair(a, b) then "pair:" + a.to_string() + ":" + b.to_string()
+  when AbiValueClass::Vector(w) then "vector:" + w.to_string()
+  when AbiValueClass::ByAddress(sz) then "by-address:" + sz.to_string()
+  when AbiValueClass::TaggedPtr(w) then "scalar:" + w.to_string()
+  when AbiValueClass::EnumInline(sz) then "by-address:" + sz.to_string()
+  end
+end
+
+# The location constructors: the kind is typed, the names are data.
+pub def abi_location_none() -> AbiLocation
+  AbiLocation { kind: AbiLocationKind::None, reg_a: "".to_string(), reg_b: "".to_string(), offset: 0 }
+end
+
+pub def abi_location_register(name: String) -> AbiLocation
+  AbiLocation { kind: AbiLocationKind::Register, reg_a: name, reg_b: "".to_string(), offset: 0 }
+end
+
+pub def abi_location_pair_gpr(a: String, b: String) -> AbiLocation
+  AbiLocation { kind: AbiLocationKind::RegisterPairGpr, reg_a: a, reg_b: b, offset: 0 }
+end
+
+# The two-FP-register pair, reserved for the HFA/SSE aggregate classes
+# (audit P1-13): no path constructs it yet.
+pub def abi_location_pair_fp(a: String, b: String) -> AbiLocation
+  AbiLocation { kind: AbiLocationKind::RegisterPairFp, reg_a: a, reg_b: b, offset: 0 }
+end
+
+pub def abi_location_stack(offset: Int) -> AbiLocation
+  AbiLocation { kind: AbiLocationKind::StackOffset, reg_a: "".to_string(), reg_b: "".to_string(), offset: offset }
+end
+
+# The canonical location text: "none", the register name, the
+# comma-joined pair ("x0,x1") or "stack+<offset>" — byte-identical to
+# the old string vocabulary.
+pub def abi_location_text(loc: AbiLocation) -> String
+  match loc.kind
+  when AbiLocationKind::None then "none"
+  when AbiLocationKind::Register then loc.reg_a.clone()
+  when AbiLocationKind::RegisterPairGpr then loc.reg_a.clone() + "," + loc.reg_b.clone()
+  when AbiLocationKind::RegisterPairFp then loc.reg_a.clone() + "," + loc.reg_b.clone()
+  when AbiLocationKind::StackOffset then "stack+" + loc.offset.to_string()
+  end
+end
+
+# The canonical extension word: "none"/"sign"/"zero"; the reserved
+# AnyRegister renders "any".
+pub def abi_extension_word(ext: AbiExtension) -> String
+  match ext
+  when AbiExtension::None then "none"
+  when AbiExtension::SignExtend then "sign"
+  when AbiExtension::ZeroExtend then "zero"
+  when AbiExtension::AnyRegister then "any"
+  end
+end
+
 def abi_is_float_type(ty: Type) -> Bool
   match ty
   when Type::Float then true
@@ -3559,20 +4216,35 @@ def abi_float_width(ty: Type) -> Int
   end
 end
 
-# The boundary extension of a narrow integer value: signed narrows
-# sign-extend, unsigned narrows (and Bool/Char) zero-extend, the
-# full-word types are already canonical.
-def abi_extension_of(ty: Type) -> String
+# The typed class of a ValueCategory under a type (floatness is the
+# type's property, not the category's).  This is the projection the
+# snapshot builder uses for its persisted class rows, so those rows are
+# rendered from the SAME typed class the plan carries.
+pub def abi_value_class_of_category(ty: Type, cat: ValueCategory) -> AbiValueClass
+  match cat
+  when ValueCategory::ZeroSized then AbiValueClass::Zero
+  when ValueCategory::Scalar(w) then
+    if abi_is_float_type(ty) then AbiValueClass::ScalarFloat(w) else AbiValueClass::ScalarInt(w) end
+  when ValueCategory::ScalarPair(w1, w2) then AbiValueClass::PairInt(w1, w2)
+  when ValueCategory::Vector(w) then AbiValueClass::Vector(w)
+  when ValueCategory::ByAddress(sz) then AbiValueClass::ByAddress(sz)
+  end
+end
+
+# The typed boundary extension of a narrow integer value: signed
+# narrows sign-extend, unsigned narrows (and Bool/Char) zero-extend, the
+# full-word types are already canonical (None).
+def abi_extension_of(ty: Type) -> AbiExtension
   match ty
-  when Type::I8 then "sign"
-  when Type::I16 then "sign"
-  when Type::I32 then "sign"
-  when Type::U8 then "zero"
-  when Type::U16 then "zero"
-  when Type::U32 then "zero"
-  when Type::Bool then "zero"
-  when Type::Char then "zero"
-  when _ then "none"
+  when Type::I8 then AbiExtension::SignExtend
+  when Type::I16 then AbiExtension::SignExtend
+  when Type::I32 then AbiExtension::SignExtend
+  when Type::U8 then AbiExtension::ZeroExtend
+  when Type::U16 then AbiExtension::ZeroExtend
+  when Type::U32 then AbiExtension::ZeroExtend
+  when Type::Bool then AbiExtension::ZeroExtend
+  when Type::Char then AbiExtension::ZeroExtend
+  when _ then AbiExtension::None
   end
 end
 
@@ -3586,14 +4258,12 @@ def abi_fpr_available(desc: TargetDesc) -> Bool
   end
 end
 
-# The target's integer argument-register name at position `index`, or the
-# caller-stack name the consumer uses beyond the register file.
+# The target's integer argument-register name at position `index`.  The
+# caller guards `index < desc.arg_regs.len()` (every plan site does); the
+# stack location is the typed AbiLocationKind::StackOffset, never a name
+# string, so no out-of-range fallback exists here.
 def abi_gpr_name(desc: TargetDesc, index: Int) -> String
-  if index >= 0 && index < desc.arg_regs.len() then
-    desc.arg_regs[index].clone()
-  else
-    "stack+" + index.to_string()
-  end
+  desc.arg_regs[index].clone()
 end
 
 # The target's floating-point argument-register name at position `index`
@@ -3640,19 +4310,23 @@ end
 # aggregate machinery uses (lir_agg_is_scalar_class / lir_agg_sret_words
 # route through this function) and the direct emitter's
 # ValueCategory::Scalar/ScalarPair/ByAddress mapping mirrors:
-#   size 0       -> "zero"   (no payload)
-#   1..8         -> "int"    (one word crossing by value)
-#   9..16        -> "pair"   (the two-word image: by reference internally)
-#   >16          -> "memory" (the by-address image: by reference internally)
-pub def abi_internal_image_class(size: Int) -> String
+#   size 0       -> Zero          (no payload)
+#   1..8         -> ScalarInt(w)  (one word crossing by value)
+#   9..16        -> PairInt(8,8)  (the two-eightbyte image: by reference
+#                                  internally)
+#   >16          -> ByAddress(sz) (the by-address image: by reference
+#                                  internally)
+# (third-audit item 41): the result is the typed class, so the LIR
+# cross-checks compare variants, never class words.
+pub def abi_internal_image_class(size: Int) -> AbiValueClass
   if size == 0 then
-    "zero"
+    AbiValueClass::Zero
   elsif size <= 8 then
-    "int"
+    AbiValueClass::ScalarInt(size)
   elsif size <= 16 then
-    "pair"
+    AbiValueClass::PairInt(8, 8)
   else
-    "memory"
+    AbiValueClass::ByAddress(size)
   end
 end
 
@@ -3665,6 +4339,29 @@ def abi_is_taggedptr_enum(inout engine: LayoutEngine, ty: Type) -> Bool
         match el.representation
         when EnumValueRepresentation::TaggedPtr(_) then true
         when _ then false
+        end
+      when Option::None then false
+      end
+    else
+      false
+    end
+  when _ then false
+  end
+end
+
+# True when the registered enum's EnumLayout is the NICHED form (the
+# payload word with the payload-less variant in the payload's niche).
+# Niched layouts are the direct pipeline's internal value encoding only;
+# the ABI authority below refuses them at every crossing.
+def abi_is_niched_enum(inout engine: LayoutEngine, ty: Type) -> Bool
+  match ty
+  when Type::Adt(tid, _) then
+    if is_enum_type_def(engine, tid.id) then
+      match enum_layout_for_type(engine, ty)
+      when Option::Some(el) then
+        match el.niche
+        when Option::Some(_) then true
+        when Option::None then false
         end
       when Option::None then false
       end
@@ -3713,11 +4410,28 @@ end
 #     (its word IS the raw discriminant), fail-closed for a payloaded one
 #     (the heap-pointer encoding is compiler-private);
 #   InlineTagged enum -> InlineScalar when its whole image is one word
-#     (<= 8 bytes), else InlineImage (the by-reference inline image).
+#     (<= 8 bytes), else InlineImage (the by-reference inline image);
+#   Niched enum -> FAIL CLOSED in both flavors: the niched layout is the
+#     direct pipeline's INTERNAL encoding (the payload word with the
+#     payload-less variant in the payload's niche — see NicheSpec). It has
+#     no canonical crossing: the canonical representation is the ABI
+#     authority's TaggedPtr value word, and a niched value must be
+#     re-encoded (marshalled) before it crosses. Refusing here is what
+#     keeps a niched layout from crossing as TaggedPtr silently.
 pub def classify_enum_crossing(inout engine: LayoutEngine, desc: TargetDesc, flavor: AbiFlavor, ty: Type) -> Result[AbiEnumCrossing, LayoutError]
   let internal_convention = match flavor
   when AbiFlavor::InternalValue then true
   when AbiFlavor::ExternC then false
+  end
+  if abi_is_niched_enum(engine, ty) then
+    return Result::Err(LayoutError {
+      class: LayoutFailureClass::UNSUPPORTED_TYPE,
+      message: "A niched enum layout (the payload word with the payload-less variant encoded in the payload type's niche) is the direct pipeline's INTERNAL representation and has no canonical ABI crossing: the canonical enum crossing is the EnumLayout's TaggedPtr value word / the LIR-internal inline image (audit item 29). Marshalling between the niched internal value and the canonical crossing is required at the boundary",
+      type_name: mir_type_identity_key(ty),
+      expected: 0,
+      actual: 0,
+      context: "classify_enum_crossing"
+    })
   end
   if abi_is_taggedptr_enum(engine, ty) then
     if !internal_convention && abi_enum_has_payload(engine, ty) then
@@ -3790,136 +4504,154 @@ def abi_enum_max_payload(inout engine: LayoutEngine, ty: Type) -> Int
   end
 end
 
-# The generic image of a parameter type in the requested flavor:
-# (class_word, size, align, is_float).  For the InternalValue flavor the
-# aggregate classes keep the compiler's by-reference crossing; for the
-# ExternC flavor a <=16-byte composite maps to the two-integer-register
-# C class ("int" with size <= 16 and indirect = false — see
-# abi_place_value) and a larger one to the memory class.
+# The generic image of a parameter type: (AbiValueClass, size, align).
+# The class is flavor-independent — the flavor decides only the CROSSING
+# (the internal by-reference aggregate vs the C two-register composite)
+# in abi_place_value.  For a <=16-byte composite that is the PairInt
+# class crossing in two integer registers by value under ExternC, and a
+# >16-byte one takes the by-value stack placement.
 # (AUDIT P1-13 — HFA/HVA, documented gap): the classifier has no
 # float-member information, so a float-containing composite is classified
 # by its size like an all-integer one; the C plan therefore reports the
 # GP-register class for a two-F64/two-F32 aggregate where AAPCS64/SysV
 # would use FP/SSE registers.  The gap is closed by a member-type scan in
-# a later slice, never by a consumer-side rule.
-def abi_value_image(inout engine: LayoutEngine, cat: ValueCategory, ty: Type, flavor: AbiFlavor) -> Result[(String, Int, Int, Bool), LayoutError]
-  let internal_convention = match flavor
-  when AbiFlavor::InternalValue then true
-  when AbiFlavor::ExternC then false
+# a later slice, never by a consumer-side rule (the typed
+# PairFloat/MixedPair classes are its reserved forms).
+def abi_value_image(inout engine: LayoutEngine, cat: ValueCategory, ty: Type) -> Result[(AbiValueClass, Int, Int), LayoutError]
+  # (third-audit item 29 + 41): a registered TaggedPtr enum's crossing
+  # is its own class — the canonical ONE value word, rendered
+  # "scalar:<pointer width>" — never a plain scalar.
+  if abi_is_taggedptr_enum(engine, ty) then
+    let pw = engine.target.pointer_size
+    let sa = abi_value_size_align(engine, ty)
+    return Result::Ok((AbiValueClass::TaggedPtr(pw), pw, sa.1))
   end
   match cat
   when ValueCategory::ZeroSized then
-    Result::Ok(("zero", 0, 1, false))
+    Result::Ok((AbiValueClass::Zero, 0, 1))
   when ValueCategory::Scalar(w) then
     if abi_is_float_type(ty) then
-      Result::Ok(("float", w, w, true))
+      Result::Ok((AbiValueClass::ScalarFloat(w), w, w))
     else
       let sa = abi_value_size_align(engine, ty)
-      Result::Ok(("int", w, sa.1, false))
+      Result::Ok((AbiValueClass::ScalarInt(w), w, sa.1))
     end
-  when ValueCategory::ScalarPair(_, _) then
+  when ValueCategory::ScalarPair(w1, w2) then
     let sa = abi_value_size_align(engine, ty)
-    if internal_convention then
-      Result::Ok(("pair", sa.0, sa.1, false))
-    else
-      Result::Ok(("int", sa.0, sa.1, false))
-    end
+    Result::Ok((AbiValueClass::PairInt(w1, w2), sa.0, sa.1))
   when ValueCategory::ByAddress(sz) then
-    if internal_convention then
-      Result::Ok(("memory", sz, engine.target.pointer_align, false))
-    else
-      Result::Ok(("memory", sz, engine.target.pointer_align, false))
-    end
+    Result::Ok((AbiValueClass::ByAddress(sz), sz, engine.target.pointer_align))
   when ValueCategory::Vector(w) then
-    Result::Ok(("vector", w, w, true))
+    Result::Ok((AbiValueClass::Vector(w), w, w))
   end
 end
 
 # Place ONE classified value: consume the per-class register positions and
 # the shared caller-stack stream, and return the AbiParam.  This is the
-# ONLY place a location is formed for the plan; consumers read the answer.
-def abi_place_value(desc: TargetDesc, flavor: AbiFlavor, class_word: String, size: Int, align: Int, extension: String, inout gp_pos: Int, inout fp_pos: Int, inout stack_bytes: Int) -> AbiParam
+# ONLY place a location is formed for the plan; consumers read the typed
+# answer.  (third-audit item 41): the class/location/extension outputs
+# are structured values; the only strings formed here are the target's
+# own register names.  The reserved classes (PairFloat / MixedPair /
+# EnumInline) fail closed — no classifier path constructs them yet.
+def abi_place_value(desc: TargetDesc, flavor: AbiFlavor, class: AbiValueClass, size: Int, align: Int, extension: AbiExtension, inout gp_pos: Int, inout fp_pos: Int, inout stack_bytes: Int) -> AbiParam
   let gpr_count = desc.arg_regs.len()
   let fpr_count = if abi_fpr_available(desc) then 8 else 0 end
   let internal_convention = match flavor
   when AbiFlavor::InternalValue then true
   when AbiFlavor::ExternC then false
   end
-  match class_word
-  when "zero" then
+  match class
+  when AbiValueClass::Zero then
     AbiParam {
-      class_word: "zero",
-      location: "none",
+      value_class: AbiValueClass::Zero,
+      location: abi_location_none(),
       indirect: false,
-      extension: "none",
+      extension: AbiExtension::None,
       alignment: 1,
       size: 0
     }
-  when "float" then
+  when AbiValueClass::ScalarFloat(w) then
     if fp_pos < fpr_count then
-      let loc = abi_fpr_name(desc, fp_pos)
+      let loc = abi_location_register(abi_fpr_name(desc, fp_pos))
       fp_pos = fp_pos + 1
-      AbiParam { class_word: "float", location: loc, indirect: false, extension: "none", alignment: align, size: size }
+      AbiParam { value_class: AbiValueClass::ScalarFloat(w), location: loc, indirect: false, extension: AbiExtension::None, alignment: align, size: size }
     elsif gp_pos < gpr_count then
       # A Soft-float target: the float crosses in a general slot at its
-      # width (the plan says "float"; the location names the general
-      # register the backend consumes, so the emitter needs no extra
-      # arch rule).
-      let loc = abi_gpr_name(desc, gp_pos)
+      # width (the class stays ScalarFloat; the location names the
+      # general register the backend consumes, so the emitter needs no
+      # extra arch rule).
+      let loc = abi_location_register(abi_gpr_name(desc, gp_pos))
       gp_pos = gp_pos + 1
-      AbiParam { class_word: "float", location: loc, indirect: false, extension: "none", alignment: align, size: size }
+      AbiParam { value_class: AbiValueClass::ScalarFloat(w), location: loc, indirect: false, extension: AbiExtension::None, alignment: align, size: size }
     else
       let off = stack_bytes
       stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
-      AbiParam { class_word: "float", location: "stack+" + off.to_string(), indirect: false, extension: "none", alignment: align, size: size }
+      AbiParam { value_class: AbiValueClass::ScalarFloat(w), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
     end
-  when "int" then
+  when AbiValueClass::ScalarInt(w) then
     if gp_pos < gpr_count then
-      let loc = abi_gpr_name(desc, gp_pos)
+      let loc = abi_location_register(abi_gpr_name(desc, gp_pos))
       gp_pos = gp_pos + 1
-      AbiParam { class_word: "int", location: loc, indirect: false, extension: extension, alignment: align, size: size }
+      AbiParam { value_class: AbiValueClass::ScalarInt(w), location: loc, indirect: false, extension: extension, alignment: align, size: size }
     else
       let off = stack_bytes
       stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
-      AbiParam { class_word: "int", location: "stack+" + off.to_string(), indirect: false, extension: "none", alignment: align, size: size }
+      AbiParam { value_class: AbiValueClass::ScalarInt(w), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
     end
-  when "pair" then
+  when AbiValueClass::TaggedPtr(w) then
+    # The canonical ONE-word registered enum (audit item 29): one
+    # general slot exactly like a scalar word, but its own typed class.
+    if gp_pos < gpr_count then
+      let loc = abi_location_register(abi_gpr_name(desc, gp_pos))
+      gp_pos = gp_pos + 1
+      AbiParam { value_class: AbiValueClass::TaggedPtr(w), location: loc, indirect: false, extension: extension, alignment: align, size: size }
+    else
+      let off = stack_bytes
+      stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+      AbiParam { value_class: AbiValueClass::TaggedPtr(w), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
+    end
+  when AbiValueClass::PairInt(a, b) then
     if internal_convention then
       # The compiler's internal 16-byte aggregate: ONE general-class slot
       # carries the image ADDRESS.
       if gp_pos < gpr_count then
-        let loc = abi_gpr_name(desc, gp_pos)
+        let loc = abi_location_register(abi_gpr_name(desc, gp_pos))
         gp_pos = gp_pos + 1
-        AbiParam { class_word: "pair", location: loc, indirect: true, extension: "none", alignment: align, size: size }
+        AbiParam { value_class: AbiValueClass::PairInt(a, b), location: loc, indirect: true, extension: AbiExtension::None, alignment: align, size: size }
       else
         let off = stack_bytes
         stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
-        AbiParam { class_word: "pair", location: "stack+" + off.to_string(), indirect: true, extension: "none", alignment: align, size: size }
+        AbiParam { value_class: AbiValueClass::PairInt(a, b), location: abi_location_stack(off), indirect: true, extension: AbiExtension::None, alignment: align, size: size }
       end
     else
       # The C composite class: <=16 bytes crosses in TWO integer
       # registers (both must exist; otherwise the whole composite goes to
-      # the stack).
+      # the stack by value).
       if gp_pos + 1 < gpr_count then
-        let loc = abi_gpr_name(desc, gp_pos) + "," + abi_gpr_name(desc, gp_pos + 1)
+        let a_reg = abi_gpr_name(desc, gp_pos)
+        let b_reg = abi_gpr_name(desc, gp_pos + 1)
         gp_pos = gp_pos + 2
-        AbiParam { class_word: "int", location: loc, indirect: false, extension: "none", alignment: align, size: size }
+        AbiParam { value_class: AbiValueClass::PairInt(a, b), location: abi_location_pair_gpr(a_reg, b_reg), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
       else
         let off = stack_bytes
         stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
-        AbiParam { class_word: "memory", location: "stack+" + off.to_string(), indirect: false, extension: "none", alignment: align, size: size }
+        AbiParam { value_class: AbiValueClass::ByAddress(size), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
       end
     end
-  when "memory" then
+  when AbiValueClass::PairFloat(_, _) then
+    panic("abi_place_value: the PairFloat class is the reserved structured form of the AAPCS64/SysV HFA/SSE aggregate class (audit P1-13): no classifier path emits it yet — the member-type scan must add its FP-register placement (fail-closed)")
+  when AbiValueClass::MixedPair(_, _) then
+    panic("abi_place_value: the MixedPair class is the reserved structured form of the mixed float/integer aggregate class (audit P1-13): no classifier path emits it yet — the member-type scan must add its placement (fail-closed)")
+  when AbiValueClass::ByAddress(sz) then
     if internal_convention then
       if gp_pos < gpr_count then
-        let loc = abi_gpr_name(desc, gp_pos)
+        let loc = abi_location_register(abi_gpr_name(desc, gp_pos))
         gp_pos = gp_pos + 1
-        AbiParam { class_word: "memory", location: loc, indirect: true, extension: "none", alignment: align, size: size }
+        AbiParam { value_class: AbiValueClass::ByAddress(sz), location: loc, indirect: true, extension: AbiExtension::None, alignment: align, size: size }
       else
         let off = stack_bytes
         stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
-        AbiParam { class_word: "memory", location: "stack+" + off.to_string(), indirect: true, extension: "none", alignment: align, size: size }
+        AbiParam { value_class: AbiValueClass::ByAddress(sz), location: abi_location_stack(off), indirect: true, extension: AbiExtension::None, alignment: align, size: size }
       end
     else
       # C passes a >16-byte composite BY VALUE on the stack (the caller
@@ -3928,26 +4660,26 @@ def abi_place_value(desc: TargetDesc, flavor: AbiFlavor, class_word: String, siz
       let off = stack_bytes
       let slot = abi_stack_slot_size(desc, internal_convention, size)
       stack_bytes = stack_bytes + slot
-      AbiParam { class_word: "memory", location: "stack+" + off.to_string(), indirect: false, extension: "none", alignment: align, size: size }
+      AbiParam { value_class: AbiValueClass::ByAddress(sz), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
     end
-  when "vector" then
+  when AbiValueClass::Vector(w) then
     if !internal_convention && fp_pos < fpr_count then
-      let loc = abi_fpr_name(desc, fp_pos)
+      let loc = abi_location_register(abi_fpr_name(desc, fp_pos))
       fp_pos = fp_pos + 1
-      AbiParam { class_word: "vector", location: loc, indirect: false, extension: "none", alignment: align, size: size }
+      AbiParam { value_class: AbiValueClass::Vector(w), location: loc, indirect: false, extension: AbiExtension::None, alignment: align, size: size }
     elsif gp_pos < gpr_count then
       # The internal vector row and the FPU-less C target both carry the
       # address in a general slot.
-      let loc = abi_gpr_name(desc, gp_pos)
+      let loc = abi_location_register(abi_gpr_name(desc, gp_pos))
       gp_pos = gp_pos + 1
-      AbiParam { class_word: "vector", location: loc, indirect: true, extension: "none", alignment: align, size: size }
+      AbiParam { value_class: AbiValueClass::Vector(w), location: loc, indirect: true, extension: AbiExtension::None, alignment: align, size: size }
     else
       let off = stack_bytes
       stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
-      AbiParam { class_word: "vector", location: "stack+" + off.to_string(), indirect: true, extension: "none", alignment: align, size: size }
+      AbiParam { value_class: AbiValueClass::Vector(w), location: abi_location_stack(off), indirect: true, extension: AbiExtension::None, alignment: align, size: size }
     end
-  when _ then
-    panic("abi_place_value: unknown ABI class word '" + class_word + "' (the plan's class vocabulary is closed: zero/int/float/vector/pair/memory)")
+  when AbiValueClass::EnumInline(_) then
+    panic("abi_place_value: the EnumInline class is the reserved structured form of the LIR-internal inline-image enum crossing (audit item 29): classify_call_plan never emits it — LIR's own aggregate machinery carries that crossing (fail-closed)")
   end
 end
 
@@ -3962,6 +4694,16 @@ def abi_classify_return(inout engine: LayoutEngine, desc: TargetDesc, flavor: Ab
   when AbiFlavor::InternalValue then true
   when AbiFlavor::ExternC then false
   end
+  if abi_is_niched_enum(engine, ret_ty) && !internal_convention then
+    return Result::Err(LayoutError {
+      class: LayoutFailureClass::UNSUPPORTED_TYPE,
+      message: "A niched enum has no ExternC return crossing (the niched layout is the direct pipeline's internal payload-word encoding; the canonical crossing is the EnumLayout's TaggedPtr value word — marshal at the boundary). The InternalValue convention classifies it by its payload word (classify_call_plan)",
+      type_name: mir_type_identity_key(ret_ty),
+      expected: 0,
+      actual: 0,
+      context: "abi_classify_return"
+    })
+  end
   if abi_is_taggedptr_enum(engine, ret_ty) then
     if !internal_convention && abi_enum_has_payload(engine, ret_ty) then
       return Result::Err(LayoutError {
@@ -3973,7 +4715,8 @@ def abi_classify_return(inout engine: LayoutEngine, desc: TargetDesc, flavor: Ab
         context: "abi_classify_return"
       })
     end
-    return Result::Ok(AbiReturn::GprT)
+    # (third-audit item 41): the return carries its typed class.
+    return Result::Ok(AbiReturn::GprT(AbiValueClass::TaggedPtr(engine.target.pointer_size)))
   end
   match classify_value_category(engine, ret_ty)
   when Result::Err(e) then Result::Err(e)
@@ -3981,18 +4724,21 @@ def abi_classify_return(inout engine: LayoutEngine, desc: TargetDesc, flavor: Ab
     match cat
     when ValueCategory::ZeroSized then
       Result::Ok(AbiReturn::VoidT)
-    when ValueCategory::Scalar(_) then
+    when ValueCategory::Scalar(w) then
+      let cls = if abi_is_float_type(ret_ty) then AbiValueClass::ScalarFloat(w) else AbiValueClass::ScalarInt(w) end
       if abi_is_float_type(ret_ty) && abi_fpr_available(desc) then
-        Result::Ok(AbiReturn::FprT)
+        Result::Ok(AbiReturn::FprT(cls))
       else
-        Result::Ok(AbiReturn::GprT)
+        Result::Ok(AbiReturn::GprT(cls))
       end
-    when ValueCategory::ScalarPair(_, _) then
-      if internal_convention then Result::Ok(AbiReturn::SRetT) else Result::Ok(AbiReturn::GprPairT) end
-    when ValueCategory::ByAddress(_) then
-      Result::Ok(AbiReturn::SRetT)
-    when ValueCategory::Vector(_) then
-      if abi_fpr_available(desc) then Result::Ok(AbiReturn::FprPairT) else Result::Ok(AbiReturn::GprT) end
+    when ValueCategory::ScalarPair(w1, w2) then
+      let cls = AbiValueClass::PairInt(w1, w2)
+      if internal_convention then Result::Ok(AbiReturn::SRetT(cls)) else Result::Ok(AbiReturn::GprPairT(cls)) end
+    when ValueCategory::ByAddress(sz) then
+      Result::Ok(AbiReturn::SRetT(AbiValueClass::ByAddress(sz)))
+    when ValueCategory::Vector(w) then
+      let cls = AbiValueClass::Vector(w)
+      if abi_fpr_available(desc) then Result::Ok(AbiReturn::FprPairT(cls)) else Result::Ok(AbiReturn::GprT(cls)) end
     end
   end
 end
@@ -4003,8 +4749,22 @@ end
 # plan's variants, so the two AbiReturn vocabularies can never be confused.
 pub def abi_return_uses_sret(ret: AbiReturn) -> Bool
   match ret
-  when AbiReturn::SRetT then true
+  when AbiReturn::SRetT(_) then true
   when _ then false
+  end
+end
+
+# The canonical return render (third-audit item 41): the delivery rule
+# ("direct:" | "sret:") plus abi_value_class_word of the carried class —
+# byte-identical to the persisted ABI surface rows' ret vocabulary.
+pub def abi_return_text(ret: AbiReturn) -> String
+  match ret
+  when AbiReturn::VoidT then "direct:zero"
+  when AbiReturn::GprT(c) then "direct:" + abi_value_class_word(c)
+  when AbiReturn::GprPairT(c) then "direct:" + abi_value_class_word(c)
+  when AbiReturn::FprT(c) then "direct:" + abi_value_class_word(c)
+  when AbiReturn::FprPairT(c) then "direct:" + abi_value_class_word(c)
+  when AbiReturn::SRetT(c) then "sret:" + abi_value_class_word(c)
   end
 end
 
@@ -4025,8 +4785,9 @@ pub def classify_call_plan(inout engine: LayoutEngine, desc: TargetDesc, flavor:
   while pi < param_tys.len() do
     let ty = param_tys[pi].clone()
     # FFI-safety gates (ExternC only): String is not a C boundary value
-    # (use FfiStr) and a payloaded tagged enum's TaggedPtr word is
-    # compiler-private.  Both fail closed with the reason.
+    # (use FfiStr), a payloaded tagged enum's TaggedPtr word is
+    # compiler-private, and a NICHE layout is the direct pipeline's internal
+    # encoding with no canonical crossing.  All fail closed with the reason.
     if !internal_convention then
       match ty
       when Type::String then
@@ -4040,6 +4801,16 @@ pub def classify_call_plan(inout engine: LayoutEngine, desc: TargetDesc, flavor:
         })
       when _ then ()
       end
+      if abi_is_niched_enum(engine, ty) then
+        return Result::Err(LayoutError {
+          class: LayoutFailureClass::UNSUPPORTED_TYPE,
+          message: "A niched enum layout is not an FFI-safe extern C parameter: the niched form (the payload word with the payload-less variant in the payload type's niche) is the direct pipeline's internal encoding — marshal it to the canonical ABI shape (or a @repr(C) struct) at the boundary",
+          type_name: mir_type_identity_key(ty),
+          expected: 0,
+          actual: 0,
+          context: "classify_call_plan"
+        })
+      end
     end
     let cat = match classify_value_category(engine, ty)
     when Result::Ok(c) then c
@@ -4051,7 +4822,7 @@ pub def classify_call_plan(inout engine: LayoutEngine, desc: TargetDesc, flavor:
       when Result::Err(e) then return Result::Err(e)
       end
     end
-    let img = match abi_value_image(engine, cat, ty, flavor)
+    let img = match abi_value_image(engine, cat, ty)
     when Result::Ok(i) then i
     when Result::Err(e) then return Result::Err(e)
     end

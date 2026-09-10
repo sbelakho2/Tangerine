@@ -1,0 +1,603 @@
+# tests/layout/niche_layout_test.tg — the NICHE OPTIMIZATION suite
+# (third-audit item 47: real niche optimization for small ADTs).
+#
+# A niche is a bit pattern of a payload type that no valid value of that
+# type can occupy. A two-variant enum with one payload-less variant and
+# one single-word payload variant whose payload type HAS a niche drops the
+# tag entirely and stores the payload-less variant IN the niche:
+#
+#   enum Option[Ptr[T]]      => tiny: None = 0 (null), Some(p) = p
+#   enum Option[NonZero]     => the all-zero pattern is the None
+#   enum Result[Ptr[T], ()]  => the zero-sized error arm is the niche
+#
+# The layout engine is the single niche authority (NicheKind/NicheSpec +
+# niche_of_type): this suite asserts the model, the resulting EnumLayout
+# (representation Niched, no tag, payload at 0, size == payload size),
+# the verifier acceptance (validate_enum_layout_consistency), the
+# fail-closed ABI crossing (classify_enum_crossing refuses niched forms),
+# and — in the lane that lowers/executes code — the construction,
+# discriminant and downcast BEHAVIOR of source-level niched enums.
+#
+# Run with: tg run tests/layout/niche_layout_test.tg
+
+use std::core::{Option, Result, Int, String, UInt, Bool, Unit, panic}
+use std::collections::{Vec}
+use std::alloc::{size_of as runtime_size_of}
+use tg_compiler::layout_engine::{
+  LayoutEngine, TargetDescriptor, aarch64_target,
+  layout_engine_new, layout_engine_register_types, compute_all_layouts,
+  size_of, align_of, stride_of, field_offset, field_size,
+  discriminant_offset, payload_offset,
+  classify_value_category, ValueCategory, layout_error_to_string,
+  classify_enum_crossing, AbiFlavor, AbiEnumCrossing,
+  enum_layout_for_type, EnumValueRepresentation, NicheKind, NicheSpec,
+  niche_of_type, enum_layout_niche_payloadless_index, enum_layout_niche_payload_index,
+  validate_enum_layout_consistency
+}
+use tg_compiler::ast::{LayoutAttrs, layout_attrs_plain}
+use tg_compiler::token::{span_dummy}
+use tg_compiler::types::{Type, TypeId}
+use tg_compiler::ids::{GenericParamId, DefId, ModuleId}
+use tg_compiler::mir::{MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef}
+
+mut tests_passed = 0
+mut tests_failed = 0
+
+def check(cond: Bool, name: String) -> Unit
+  if cond then
+    tests_passed = tests_passed + 1
+    println("[PASS] " + name)
+  else
+    tests_failed = tests_failed + 1
+    println("[FAIL] " + name)
+  end
+end
+
+def check_eq(expected: Int, actual: Int, name: String) -> Unit
+  if expected == actual then
+    tests_passed = tests_passed + 1
+    println("[PASS] " + name + " (expected=" + expected.to_string() + ", actual=" + actual.to_string() + ")")
+  else
+    tests_failed = tests_failed + 1
+    println("[FAIL] " + name + " (expected=" + expected.to_string() + ", actual=" + actual.to_string() + ")")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The engine fixture: Option[T]/ResultPair[T]/NonZero/… registered
+# through the SAME MirTypeDef surface the compiler uses.
+# ———————————————————————————————————————————————————————————————
+
+def gpid0() -> GenericParamId
+  GenericParamId { owner: DefId { module: ModuleId { id: 0 }, index: 0 }, index: 0 }
+end
+
+def niche_test_defs() -> Vec[MirTypeDef]
+  var defs = Vec::new()
+
+  # id 1: Option[T] = Some(T) | None (std's order: Some = variant 0).
+  var option_some_fields = Vec::new()
+  option_some_fields.push(Type::Param(gpid0()))
+  var option_variants = Vec::new()
+  option_variants.push(MirVariantDef { name: "Some".to_string(), discriminant: 0, fields: option_some_fields })
+  option_variants.push(MirVariantDef { name: "None".to_string(), discriminant: 1, fields: Vec::new() })
+  defs.push(MirTypeDef {
+    id: TypeId { id: 1 },
+    name: "Option".to_string(),
+    kind: MirTypeDefKind::Enum(option_variants),
+    generic_params: Vec::from([gpid0()]),
+    layout: layout_attrs_plain(span_dummy())
+  })
+
+  # id 2: NonZero { raw: U64 } — the NonZero-style single-integer wrapper
+  # whose name is the niche contract (no all-zero value).
+  var nz_fields = Vec::new()
+  nz_fields.push(MirFieldDef { name: "raw".to_string(), ty: Type::U64 })
+  defs.push(MirTypeDef {
+    id: TypeId { id: 2 },
+    name: "NonZero".to_string(),
+    kind: MirTypeDefKind::Struct(nz_fields),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  })
+
+  # id 3: ResultPair[T] = Ok(T) | Err(Unit) — the zero-sized-error arm.
+  var res_ok_fields = Vec::new()
+  res_ok_fields.push(Type::Param(gpid0()))
+  var res_err_fields = Vec::new()
+  res_err_fields.push(Type::Unit)
+  var res_variants = Vec::new()
+  res_variants.push(MirVariantDef { name: "Ok".to_string(), discriminant: 0, fields: res_ok_fields })
+  res_variants.push(MirVariantDef { name: "Err".to_string(), discriminant: 1, fields: res_err_fields })
+  defs.push(MirTypeDef {
+    id: TypeId { id: 3 },
+    name: "ResultPair".to_string(),
+    kind: MirTypeDefKind::Enum(res_variants),
+    generic_params: Vec::from([gpid0()]),
+    layout: layout_attrs_plain(span_dummy())
+  })
+
+  # id 4: TwoPayload = A(Int) | B(Int) — TWO payloads never niche.
+  var two_fields_a = Vec::new()
+  two_fields_a.push(Type::Int)
+  var two_fields_b = Vec::new()
+  two_fields_b.push(Type::Int)
+  var two_variants = Vec::new()
+  two_variants.push(MirVariantDef { name: "A".to_string(), discriminant: 0, fields: two_fields_a })
+  two_variants.push(MirVariantDef { name: "B".to_string(), discriminant: 1, fields: two_fields_b })
+  defs.push(MirTypeDef {
+    id: TypeId { id: 4 },
+    name: "TwoPayload".to_string(),
+    kind: MirTypeDefKind::Enum(two_variants),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  })
+
+  # id 5: Color = Red | Green — all payload-less stays tagged.
+  var color_variants = Vec::new()
+  color_variants.push(MirVariantDef { name: "Red".to_string(), discriminant: 0, fields: Vec::new() })
+  color_variants.push(MirVariantDef { name: "Green".to_string(), discriminant: 1, fields: Vec::new() })
+  defs.push(MirTypeDef {
+    id: TypeId { id: 5 },
+    name: "Color".to_string(),
+    kind: MirTypeDefKind::Enum(color_variants),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  })
+
+  # id 6: BoolSlot = Off | On(Bool) — BoolRange is modeled but not applied
+  # (a 1-byte payload would break the one-word frame store), so tagged.
+  var boolslot_fields = Vec::new()
+  boolslot_fields.push(Type::Bool)
+  var boolslot_variants = Vec::new()
+  boolslot_variants.push(MirVariantDef { name: "Off".to_string(), discriminant: 0, fields: Vec::new() })
+  boolslot_variants.push(MirVariantDef { name: "On".to_string(), discriminant: 1, fields: boolslot_fields })
+  defs.push(MirTypeDef {
+    id: TypeId { id: 6 },
+    name: "BoolSlot".to_string(),
+    kind: MirTypeDefKind::Enum(boolslot_variants),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  })
+
+  # id 7: NestedOpt = Nope | Yep(Option[Ptr[Int]]) — an enum-typed payload
+  # gets NO second niche, so the outer enum stays tagged.
+  var nested_opt_ptr = Type::Adt(TypeId { id: 1 }, Vec::from([Type::Ptr(Type::Int)]))
+  var nested_fields = Vec::new()
+  nested_fields.push(nested_opt_ptr)
+  var nested_variants = Vec::new()
+  nested_variants.push(MirVariantDef { name: "Nope".to_string(), discriminant: 0, fields: Vec::new() })
+  nested_variants.push(MirVariantDef { name: "Yep".to_string(), discriminant: 1, fields: nested_fields })
+  defs.push(MirTypeDef {
+    id: TypeId { id: 7 },
+    name: "NestedOpt".to_string(),
+    kind: MirTypeDefKind::Enum(nested_variants),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  })
+
+  defs
+end
+
+def build_engine() -> LayoutEngine
+  let target = aarch64_target()
+  mut engine = layout_engine_new(target)
+  layout_engine_register_types(&mut engine, &niche_test_defs())
+  compute_all_layouts(&mut engine)
+  engine
+end
+
+def opt_ty(payload: Type) -> Type
+  Type::Adt(TypeId { id: 1 }, Vec::from([payload]))
+end
+
+def result_ty(payload: Type) -> Type
+  Type::Adt(TypeId { id: 3 }, Vec::from([payload]))
+end
+
+def nonzero_ty() -> Type
+  Type::Adt(TypeId { id: 2 }, Vec::new())
+end
+
+def niche_kind_id(k: NicheKind) -> Int
+  match k
+  when NicheKind::None then 0
+  when NicheKind::PointerNull then 1
+  when NicheKind::NonZero then 2
+  when NicheKind::BoolRange then 3
+  end
+end
+
+def check_niche(spec_opt: Option[NicheSpec], exp_kind: Int, exp_bits: Int, exp_enc: Int, name: String) -> Unit
+  match spec_opt
+  when Option::Some(spec) then
+    check_eq(exp_kind, niche_kind_id(spec.kind), name + " (kind)")
+    check_eq(exp_bits, spec.bits, name + " (bits)")
+    check_eq(exp_enc, spec.encoded_niche, name + " (encoded_niche)")
+  when Option::None then
+    check(false, name + " (expected a niche, got None)")
+  end
+end
+
+def check_no_niche(spec_opt: Option[NicheSpec], name: String) -> Unit
+  match spec_opt
+  when Option::Some(_) then
+    check(false, name + " (expected no niche)")
+  when Option::None then
+    check(true, name)
+  end
+end
+
+def check_niched(el: EnumLayout, exp_kind: Int, name: String) -> Unit
+  let is_niched = match el.representation
+  when EnumValueRepresentation::Niched then true
+  when _ then false
+  end
+  check(is_niched, name + " (representation Niched)")
+  check_eq(0, el.tag_layout.offset, name + " (tag offset 0)")
+  check_eq(0, el.tag_layout.size, name + " (NO tag word)")
+  check_eq(0, el.payload_offset, name + " (payload @ 0)")
+  match el.niche
+  when Option::Some(spec) then
+    check_eq(exp_kind, niche_kind_id(spec.kind), name + " (niche kind)")
+    check(spec.bits > 0, name + " (niche bits positive)")
+  when Option::None then
+    check(false, name + " (niche spec present)")
+  end
+end
+
+def check_tagged(el: EnumLayout, name: String) -> Unit
+  let is_tagged = match el.representation
+  when EnumValueRepresentation::TaggedPtr(_) then true
+  when _ then false
+  end
+  check(is_tagged, name + " (representation TaggedPtr)")
+  check_eq(8, el.tag_layout.size, name + " (8-byte tag)")
+  match el.niche
+  when Option::Some(_) then check(false, name + " (no niche spec)")
+  when Option::None then check(true, name)
+  end
+end
+
+def check_verifier_ok(engine: LayoutEngine, ty: Type, name: String) -> Unit
+  mut e = engine
+  match validate_enum_layout_consistency(&mut e, ty)
+  when Result::Ok(_) then check(true, name)
+  when Result::Err(err) then check(false, name + " — " + layout_error_to_string(err))
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. The niche model: niche_of_type
+# ———————————————————————————————————————————————————————————————
+def test_niche_model() -> Unit
+  let engine = build_engine()
+  check_niche(niche_of_type(engine, &Type::Ptr(Type::Int)), 1, 64, 0, "N1: Ptr[Int] -> PointerNull(0)")
+  check_niche(niche_of_type(engine, &Type::PtrMut(Type::Int)), 1, 64, 0, "N2: PtrMut[Int] -> PointerNull(0)")
+  check_niche(niche_of_type(engine, &Type::RefInternal(Type::Int, false)), 1, 64, 0, "N3: RefInternal -> PointerNull(0)")
+  check_niche(niche_of_type(engine, &Type::Bool), 3, 1, 2, "N4: Bool -> BoolRange(2)")
+  check_niche(niche_of_type(engine, &nonzero_ty()), 2, 64, 0, "N5: NonZero{raw:U64} -> NonZero(0)")
+  check_no_niche(niche_of_type(engine, &Type::Int), "N6: Int has no unused pattern")
+  check_no_niche(niche_of_type(engine, &Type::UInt), "N7: UInt has no unused pattern")
+  check_no_niche(niche_of_type(engine, &Type::String), "N8: String handle has no modeled niche")
+  check_no_niche(niche_of_type(engine, &opt_ty(Type::Int)), "N9: a tagged enum payload gets no second niche")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. The resulting EnumLayout — niched vs tagged shapes
+# ———————————————————————————————————————————————————————————————
+def test_niched_layout_shape() -> Unit
+  mut engine = build_engine()
+  let ty = opt_ty(Type::Ptr(Type::Int))
+  check_eq(8, size_of(&mut engine, &ty), "L1: Option[Ptr[Int]] size == pointer size (no tag)")
+  check_eq(8, align_of(&mut engine, &ty), "L2: align 8")
+  check_eq(8, stride_of(&mut engine, &ty), "L3: stride == size (no tail)")
+  check_eq(0, payload_offset(&mut engine, &ty), "L4: payload @ 0")
+  check_eq(0, discriminant_offset(&mut engine, &ty), "L5: no tag slot at 0 either")
+  check_eq(0, field_offset(&mut engine, &ty, 1), "L6: payload field (flat 1) @ 0")
+  check_eq(8, field_size(&mut engine, &ty, 1), "L7: payload field size 8")
+  check_eq(0, field_size(&mut engine, &ty, 0), "L8: the flat-0 tag slot is zero-sized")
+  match enum_layout_for_type(&mut engine, ty)
+  when Option::Some(el) then
+    check_niched(el, 1, "L9: Option[Ptr[Int]]")
+  when Option::None then
+    check(false, "L9: Option[Ptr[Int]] has an EnumLayout")
+  end
+  check_verifier_ok(engine, ty, "L10: verifier accepts the niched Option[Ptr[Int]]")
+end
+
+def test_nonzero_layout() -> Unit
+  mut engine = build_engine()
+  let ty = opt_ty(nonzero_ty())
+  check_eq(8, size_of(&mut engine, &ty), "Z1: Option[NonZero] size == 8 (the zero pattern is None)")
+  match enum_layout_for_type(&mut engine, ty)
+  when Option::Some(el) then
+    check_niched(el, 2, "Z2: Option[NonZero]")
+  when Option::None then
+    check(false, "Z2: Option[NonZero] has an EnumLayout")
+  end
+  check_verifier_ok(engine, ty, "Z3: verifier accepts the NonZero-niched form")
+end
+
+def test_zero_sized_error_layout() -> Unit
+  mut engine = build_engine()
+  let ty = result_ty(Type::Ptr(Type::Int))
+  check_eq(8, size_of(&mut engine, &ty), "R1: Result[Ptr[Int], Unit] size == 8 (no tag)")
+  match enum_layout_for_type(&mut engine, ty)
+  when Option::Some(el) then
+    check_niched(el, 1, "R2: Result[Ptr[Int], Unit]")
+    let zero_i = enum_layout_niche_payloadless_index(el)
+    let payload_i = enum_layout_niche_payload_index(el)
+    check_eq(1, zero_i, "R3: the zero-sized-error variant is the niche variant")
+    check_eq(0, payload_i, "R4: the Ok payload variant")
+  when Option::None then
+    check(false, "R2: Result[Ptr[Int], Unit] has an EnumLayout")
+  end
+  check_verifier_ok(engine, ty, "R5: verifier accepts the zero-sized-error niche")
+end
+
+def test_tagged_shapes_stay_tagged() -> Unit
+  mut engine = build_engine()
+  let int_opt = opt_ty(Type::Int)
+  check_eq(16, size_of(&mut engine, &int_opt), "T1: Option[Int] stays 16 (no unused pattern)")
+  check_eq(8, payload_offset(&mut engine, &int_opt), "T2: Option[Int] payload stays @ 8")
+  check_eq(0, discriminant_offset(&mut engine, &int_opt), "T3: Option[Int] tag stays @ 0")
+  match enum_layout_for_type(&mut engine, int_opt)
+  when Option::Some(el) then check_tagged(el, "T4: Option[Int]")
+  when Option::None then check(false, "T4: Option[Int] has an EnumLayout")
+  end
+  check_verifier_ok(engine, int_opt, "T5: verifier accepts the tagged Option[Int]")
+
+  let bool_opt = opt_ty(Type::Bool)
+  check_eq(16, size_of(&mut engine, &bool_opt), "T6: Option[Bool] stays tagged (BoolRange modeled, not applied)")
+
+  let two = Type::Adt(TypeId { id: 4 }, Vec::new())
+  check_eq(16, size_of(&mut engine, &two), "T7: a two-payload enum stays tagged")
+  match enum_layout_for_type(&mut engine, two)
+  when Option::Some(el) then check_tagged(el, "T8: TwoPayload")
+  when Option::None then check(false, "T8: TwoPayload has an EnumLayout")
+  end
+
+  let color = Type::Adt(TypeId { id: 5 }, Vec::new())
+  check_eq(8, size_of(&mut engine, &color), "T9: an all-payload-less enum stays tagged (8-byte tag word)")
+  match enum_layout_for_type(&mut engine, color)
+  when Option::Some(el) then check_tagged(el, "T10: Color")
+  when Option::None then check(false, "T10: Color has an EnumLayout")
+  end
+
+  let nested = Type::Adt(TypeId { id: 7 }, Vec::new())
+  check_eq(16, size_of(&mut engine, &nested), "T11: Option[Option[Ptr]] needs a second niche -> tagged")
+  match enum_layout_for_type(&mut engine, nested)
+  when Option::Some(el) then check_tagged(el, "T12: NestedOpt")
+  when Option::None then check(false, "T12: NestedOpt has an EnumLayout")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. Value category + the ABI authority (interop)
+# ———————————————————————————————————————————————————————————————
+def test_value_category_and_crossing() -> Unit
+  mut engine = build_engine()
+  let opt_ptr = opt_ty(Type::Ptr(Type::Int))
+  match classify_value_category(&mut engine, opt_ptr)
+  when Result::Ok(cat) then
+    let scalar8 = match cat
+    when ValueCategory::Scalar(w) then w == 8
+    when _ then false
+    end
+    check(scalar8, "C1: a niched enum classifies as the payload word Scalar(8)")
+  when Result::Err(err) then check(false, "C1: " + layout_error_to_string(err))
+  end
+
+  # A niched enum must NOT cross any ABI boundary as a TaggedPtr: the
+  # canonical crossing is the ABI authority's, and it refuses the niched
+  # internal encoding (documented marshalling boundary).
+  match classify_enum_crossing(&mut engine, aarch64_target(), AbiFlavor::InternalValue, opt_ptr)
+  when Result::Ok(_) then check(false, "I1: a niched enum must fail closed at an InternalValue crossing")
+  when Result::Err(err) then
+    check(layout_error_to_string(err).contains("niched"), "I1: the refusal names the niched layout")
+  end
+  match classify_enum_crossing(&mut engine, aarch64_target(), AbiFlavor::ExternC, opt_ptr)
+  when Result::Ok(_) then check(false, "I2: a niched enum must fail closed at an ExternC crossing")
+  when Result::Err(err) then
+    check(layout_error_to_string(err).contains("niched"), "I2: the ExternC refusal names the niched layout")
+  end
+
+  # A payloaded TAGGED enum keeps its canonical ValueWord crossing.
+  let opt_int = opt_ty(Type::Int)
+  match classify_enum_crossing(&mut engine, aarch64_target(), AbiFlavor::InternalValue, opt_int)
+  when Result::Ok(crossing) then
+    let value_word = match crossing
+    when AbiEnumCrossing::ValueWord then true
+    when _ then false
+    end
+    check(value_word, "I3: the tagged enum crossing stays the canonical ValueWord")
+  when Result::Err(err) then check(false, "I3: " + layout_error_to_string(err))
+  end
+
+  # Verifier rejection row: a non-enum cannot be enum-validated.
+  match validate_enum_layout_consistency(&mut engine, Type::Int)
+  when Result::Ok(_) then check(false, "V1: validate_enum_layout_consistency rejects a non-enum")
+  when Result::Err(err) then
+    check(layout_error_to_string(err).contains("not a registered enum"), "V1: the non-enum rejection is the typed UNSUPPORTED_TYPE")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. Behavior rows — the lane that lowers/executes MIR
+# ———————————————————————————————————————————————————————————————
+# The source definitions below are compiled by the compiler under test;
+# their construction/discriminant/downcast paths exercise the codegen
+# niche arms end-to-end (the engine rows above prove the layout).
+
+struct NonZero
+  raw: UInt
+end
+
+enum PtrSlot
+  Empty
+  Has(Ptr[Int])
+end
+
+enum NonZeroSlot
+  Missing
+  Present(NonZero)
+end
+
+enum TwoPayload
+  Left(Int)
+  Right(Int)
+end
+
+def behavior_ptr_slot() -> Unit
+  let x: Int = 41
+  var p: Ptr[Int] = Ptr::null()
+  unsafe "niched payload address" do
+    p = &x as Ptr[Int]
+  end
+  let empty: PtrSlot = PtrSlot::Empty
+  let filled: PtrSlot = PtrSlot::Has(p)
+  mut empty_ok = false
+  mut filled_ok = false
+  match empty
+  when PtrSlot::Empty then empty_ok = true
+  when PtrSlot::Has(_) then ()
+  end
+  match filled
+  when PtrSlot::Has(q) then
+    unsafe "niched payload round-trip" do
+      if *q == 41 then filled_ok = true end
+    end
+  when PtrSlot::Empty then ()
+  end
+  check(empty_ok, "B1: niched PtrSlot::Empty discriminates through the niche value")
+  check(filled_ok, "B2: niched PtrSlot::Has downcasts to the payload word")
+end
+
+def behavior_option_ptr() -> Unit
+  let x: Int = 7
+  var p: Ptr[Int] = Ptr::null()
+  unsafe "niched payload address" do
+    p = &x as Ptr[Int]
+  end
+  let none_val: Option[Ptr[Int]] = Option::None
+  let some_val: Option[Ptr[Int]] = Option::Some(p)
+  check(none_val.is_none(), "B3: Option[Ptr[Int]]::None is None (niche discriminant)")
+  check(some_val.is_some(), "B4: Option[Ptr[Int]]::Some is Some (payload discriminant)")
+  let got = some_val.unwrap()
+  mut unwrap_ok = false
+  unsafe "niched Option unwrap" do
+    if *got == 7 then unwrap_ok = true end
+  end
+  check(unwrap_ok, "B5: unwrap of a niched Option[Ptr[Int]] reads the pointer payload")
+  let defaulted = none_val.unwrap_or(p)
+  mut or_ok = false
+  unsafe "niched Option unwrap_or" do
+    if *defaulted == 7 then or_ok = true end
+  end
+  check(or_ok, "B6: unwrap_or of a niched None takes the default")
+end
+
+def behavior_nonzero_slot() -> Unit
+  let missing: NonZeroSlot = NonZeroSlot::Missing
+  let present: NonZeroSlot = NonZeroSlot::Present(NonZero { raw: 9 })
+  mut missing_ok = false
+  mut present_ok = false
+  match missing
+  when NonZeroSlot::Missing then missing_ok = true
+  when NonZeroSlot::Present(_) then ()
+  end
+  match present
+  when NonZeroSlot::Present(v) then
+    if v.raw == 9 then present_ok = true end
+  when NonZeroSlot::Missing then ()
+  end
+  check(missing_ok, "B7: NonZero-niched Missing discriminates through the zero pattern")
+  check(present_ok, "B8: NonZero-niched Present downcasts to the wrapper word")
+end
+
+def behavior_result_zero_sized_error() -> Unit
+  let x: Int = 5
+  var p: Ptr[Int] = Ptr::null()
+  unsafe "niched payload address" do
+    p = &x as Ptr[Int]
+  end
+  let bad: Result[Ptr[Int], Unit] = Result::Err(())
+  let good: Result[Ptr[Int], Unit] = Result::Ok(p)
+  mut bad_ok = false
+  mut good_ok = false
+  match bad
+  when Result::Err(_) then bad_ok = true
+  when Result::Ok(_) then ()
+  end
+  match good
+  when Result::Ok(q) then
+    unsafe "zero-sized-error niche payload" do
+      if *q == 5 then good_ok = true end
+    end
+  when Result::Err(_) then ()
+  end
+  check(bad_ok, "B9: Result[Ptr[Int], Unit]::Err is the niche (no tag)")
+  check(good_ok, "B10: Result[Ptr[Int], Unit]::Ok downcasts to the payload")
+end
+
+def behavior_tagged_enum_still_works() -> Unit
+  let a: TwoPayload = TwoPayload::Left(11)
+  let b: TwoPayload = TwoPayload::Right(22)
+  mut a_ok = false
+  mut b_ok = false
+  match a
+  when TwoPayload::Left(v) then
+    if v == 11 then a_ok = true end
+  when TwoPayload::Right(_) then ()
+  end
+  match b
+  when TwoPayload::Right(v) then
+    if v == 22 then b_ok = true end
+  when TwoPayload::Left(_) then ()
+  end
+  check(a_ok, "B11: a two-payload (tagged) enum still discriminates")
+  check(b_ok, "B12: a two-payload (tagged) enum still downcasts")
+end
+
+def behavior_sizes() -> Unit
+  check_eq(8, runtime_size_of[PtrSlot]() as Int, "S1: PtrSlot is one word (niched)")
+  check_eq(8, runtime_size_of[Option[Ptr[Int]]]() as Int, "S2: Option[Ptr[Int]] is one word (niched)")
+  check_eq(8, runtime_size_of[Option[NonZero]]() as Int, "S3: Option[NonZero] is one word (niched)")
+  check_eq(8, runtime_size_of[Result[Ptr[Int], Unit]]() as Int, "S4: Result[Ptr[Int], Unit] is one word (niched)")
+  check_eq(16, runtime_size_of[TwoPayload]() as Int, "S5: a two-payload enum stays tagged (16)")
+  check_eq(16, runtime_size_of[Option[Int]]() as Int, "S6: Option[Int] stays tagged (16)")
+end
+
+# ———————————————————————————————————————————————————————————————
+# Main
+# ———————————————————————————————————————————————————————————————
+
+def main() -> Int
+  println("========================================")
+  println("Niche Optimization Suite (third-audit item 47)")
+  println("========================================")
+  println("\n--- 1. The niche model ---")
+  test_niche_model()
+  println("\n--- 2. The niched EnumLayout ---")
+  test_niched_layout_shape()
+  test_nonzero_layout()
+  test_zero_sized_error_layout()
+  test_tagged_shapes_stay_tagged()
+  println("\n--- 3. Value category + crossings ---")
+  test_value_category_and_crossing()
+  println("\n--- 4. Construction/discriminant/downcast behavior ---")
+  behavior_sizes()
+  behavior_ptr_slot()
+  behavior_option_ptr()
+  behavior_nonzero_slot()
+  behavior_result_zero_sized_error()
+  behavior_tagged_enum_still_works()
+  println("\n========================================")
+  println("Results: " + tests_passed.to_string() + " passed, " + tests_failed.to_string() + " failed")
+  println("========================================")
+  if tests_failed > 0 then
+    panic("NICHE LAYOUT TESTS FAILED")
+  end
+  0
+end

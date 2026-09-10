@@ -114,7 +114,14 @@
 #     convention — a call to an EXTERN symbol carrying a payloaded
 #     enum — fails closed with the lir_enum_crossing_rule reason (the
 #     whole-program entries enforce it: see
-#     lir_check_extern_enum_calls). By-value aggregate ARGUMENTS are implemented on the
+#     lir_check_extern_enum_calls). (third-audit item 42: the
+#     representation is the VERSIONED enum ABI `inline-image-v1` — every
+#     payloaded-enum function carries its version marker, the
+#     whole-program routes enforce one version per program, the verifier
+#     rejects an unversioned crossing, a payloaded-enum function is never
+#     exported as public ABI, and the object metadata carries the version
+#     word; see the versioned-ABI + boundary-rules section below.)
+#     By-value aggregate ARGUMENTS are implemented on the
 #     same program-level aarch64 route as the caller-side mirror of the
 #     aggregate-param slice: an admitted plain-struct argument (a whole
 #     plain-struct local with empty projections, carried by MIR as a
@@ -1130,7 +1137,15 @@ use tg_compiler::asm::{
 }
 use tg_compiler::object::{ObjectFile, build_object}
 use tg_compiler::linker::{LinkerInput, link_executable}
-use tg_compiler::runtime::{runtime_ctx_new, emit_all_runtime}
+use tg_compiler::runtime::{runtime_ctx_new, emit_all_runtime, emit_tg_cov_dump}
+# (third-audit item 34 — the runtime producer): the compile-time emission
+# plan (coverage_graph.tg section 2b) the LIR route consumes — the
+# per-function counter tables with their global bases, the pre-rendered
+# trace rows and the tg.cov.table.v1 text the object embeds.
+use tg_compiler::coverage_graph::{
+  CoverageEmissionPlan, CoverageFnPlan, coverage_emission_plan_disabled,
+  coverage_block_id_of, coverage_edge_id
+}
  use tg_compiler::codegen::{
    CodegenCtx, codegen_new, emit_argc_argv_data, emit_allocator_runtime_data,
    emit_runtime_str_concat, emit_runtime_str_chars, emit_save_argc_argv,
@@ -1157,6 +1172,7 @@ use tg_compiler::layout_engine::{
   layout_engine_register_types,
   classify_call_plan, AbiFlavor,
   abi_internal_image_class, classify_enum_crossing, AbiEnumCrossing,
+  AbiValueClass, abi_value_class_word,
   is_simd_vector_type_name
 }
 
@@ -1805,6 +1821,23 @@ struct LirFunction
   # rejects aggregate locals, so no aggregate argument can ever lower
   # there).
   agg_call_args: Map[Int, Vec[LirAggCallArg]] = Map::new()
+  # THE PER-FUNCTION ENUM-ABI VERSION MARKER (third-audit item 42):
+  # Option::Some(v) iff the function's DECLARED signature takes or
+  # returns an admitted payloaded tagged-enum — a boundary crossing under
+  # the LIR-internal inline-image convention — with v the version the
+  # function was lowered under; Option::None for every function without
+  # such a crossing. Attached at lowering from lir_fn_enum_abi_marker
+  # (the same lir_ty_is_payloaded_enum authority the extern guard reads)
+  # and preserved by every rebuild (lir_peephole). The companion
+  # enum_abi_crossing is the evidence bit the verifier pairs with the
+  # marker (a marker without a crossing and a crossing without a marker
+  # both fail closed — lir_verify_enum_abi).
+  enum_abi_version: Option[LirEnumAbiVersion] = Option::None
+  # The declared payloaded-enum crossing evidence (see enum_abi_version):
+  # TRUE iff the function's declared signature has at least one admitted
+  # payloaded tagged-enum parameter or return. The verifier's
+  # no-unversioned-crossing rule is exactly this bit => Some(version).
+  enum_abi_crossing: Bool = false
 end
 
 enum LirValue
@@ -3599,16 +3632,14 @@ end
 # the enum crossings ride the plain-struct records with no kind
 # field.)
 def lir_agg_sret_words(shape: LirAggShape) -> Int
-  # (audit item 28): the image class comes from the ONE ABI authority —
-  # layout_engine's abi_internal_image_class, the size rule
-  # classify_call_plan itself uses for plain aggregates.  "pair"/"memory"
-  # are the sret classes (by-reference + caller-supplied buffer); "int"/
-  # "zero" are not.
-  let cls = abi_internal_image_class(shape.size)
-  if cls == "pair" || cls == "memory" then
-    shape.words
-  else
-    0
+  # (audit item 28; third-audit item 41): the image class comes from the
+  # ONE ABI authority — layout_engine's TYPED abi_internal_image_class.
+  # The pair/by-address classes are the sret classes (by-reference +
+  # caller-supplied buffer); Zero/ScalarInt are not.
+  match abi_internal_image_class(shape.size)
+  when AbiValueClass::PairInt(_, _) then shape.words
+  when AbiValueClass::ByAddress(_) then shape.words
+  when _ then 0
   end
 end
 
@@ -3624,12 +3655,16 @@ end
 # lir_agg_sret_words test (> 0) covers the sret classes; admitted
 # shapes always satisfy exactly one of the two.
 def lir_agg_is_scalar_class(shape: LirAggShape) -> Bool
-  # (audit item 28): the ONE ABI authority's image class, not a local size
-  # test.  "int" is the value-word class; "zero" (unreachable for admitted
-  # shapes — the shape gate rejects zero-field aggregates) stays in the
-  # value-word family, preserving the former `size <= 8` answer exactly.
-  let cls = abi_internal_image_class(shape.size)
-  cls == "int" || cls == "zero"
+  # (audit item 28; third-audit item 41): the ONE ABI authority's typed
+  # image class, not a local size test.  ScalarInt is the value-word
+  # class; Zero (unreachable for admitted shapes — the shape gate rejects
+  # zero-field aggregates) stays in the value-word family, preserving the
+  # former `size <= 8` answer exactly.
+  match abi_internal_image_class(shape.size)
+  when AbiValueClass::ScalarInt(_) then true
+  when AbiValueClass::Zero then true
+  when _ then false
+  end
 end
 
 # The image record of a tagged-enum shape as an aggregate image shape —
@@ -3700,31 +3735,49 @@ def lir_canonical_enum_crossing_word(type_defs: Map[Int, MirTypeDef], ty: Type) 
   end
 end
 
-# The plan class word of ONE scalar value type (a value the LIR walk keeps
-# in a machine word / FP register).  This is the scalar half of audit item
-# 28: the walk's float-vs-general decision is checked against the plan,
-# never re-derived.  The engine is built per question (the call is a
+# The plan class of ONE scalar value type (a value the LIR walk keeps in
+# a machine word / FP register), as the TYPED AbiValueClass.  This is the
+# scalar half of audit item 28: the walk's float-vs-general decision is
+# checked against the plan, never re-derived; third-audit item 41 makes
+# the comparison typed.  The engine is built per question (the call is a
 # compile-time boundary, not an emission hot path) and the plan flavor is
 # the compiler's InternalValue convention the LIR route implements.
-def lir_plan_scalar_class_word(ty: Type) -> String
+def lir_plan_scalar_class(ty: Type) -> Result[AbiValueClass, String]
   mut engine = layout_engine_new(aarch64_target())
   match classify_call_plan(&mut engine, aarch64_desc(), AbiFlavor::InternalValue, Vec::from([ty.clone()]), Type::Unit, false)
-  when Result::Ok(plan) then plan.args[0].class_word.clone()
-  when Result::Err(e) then "fail-closed: " + e.message.clone()
+  when Result::Ok(plan) then Result::Ok(plan.args[0].value_class.clone())
+  when Result::Err(e) then Result::Err("fail-closed: " + e.message.clone())
   end
 end
 
-# (audit item 28): fail-closed cross-check of one scalar class decision
-# against the plan.  The walk decides float-vs-general from
-# lir_fp_width_of; this asks the plan the same question and refuses to
-# lower on ANY disagreement, so the LIR walk and the direct route can
-# never silently classify the same type differently.
-def lir_check_scalar_class_plan(ty: Type, expected: String, site: String) -> Result[Unit, String]
-  let cls = lir_plan_scalar_class_word(ty)
-  if cls == expected then
-    Result::Ok(())
-  else
-    Result::Err("lir: ABI plan divergence at " + site + ": the plan classifies " + mir_type_identity_key(ty) + " as '" + cls + "' while the walk uses '" + expected + "' (audit item 28: classify_call_plan is the ONE ABI authority; fail-closed)")
+# (audit item 28; third-audit item 41): fail-closed cross-check of one
+# scalar class decision against the plan.  The walk decides
+# float-vs-general from lir_fp_width_of; this asks the plan the same
+# question and refuses to lower on ANY disagreement, so the LIR walk and
+# the direct route can never silently classify the same type differently.
+# The comparison is a typed family match over AbiValueClass — the plan's
+# class never becomes a string on the decision path.
+def lir_check_scalar_class_plan(ty: Type, expected_float: Bool, site: String) -> Result[Unit, String]
+  match lir_plan_scalar_class(ty)
+  when Result::Err(e) then
+    Result::Err("lir: ABI plan divergence at " + site + ": " + e)
+  when Result::Ok(cls) then
+    match cls
+    when AbiValueClass::ScalarFloat(w) then
+      if expected_float then
+        Result::Ok(())
+      else
+        Result::Err("lir: ABI plan divergence at " + site + ": the plan classifies " + mir_type_identity_key(ty) + " as '" + abi_value_class_word(AbiValueClass::ScalarFloat(w)) + "' while the walk uses the general class (audit item 28: classify_call_plan is the ONE ABI authority; fail-closed)")
+      end
+    when AbiValueClass::ScalarInt(w) then
+      if expected_float then
+        Result::Err("lir: ABI plan divergence at " + site + ": the plan classifies " + mir_type_identity_key(ty) + " as '" + abi_value_class_word(AbiValueClass::ScalarInt(w)) + "' while the walk uses the float class (audit item 28: classify_call_plan is the ONE ABI authority; fail-closed)")
+      else
+        Result::Ok(())
+      end
+    when _ then
+      Result::Err("lir: ABI plan divergence at " + site + ": the plan classifies " + mir_type_identity_key(ty) + " as a non-scalar class while the walk uses a scalar word (audit item 28: classify_call_plan is the ONE ABI authority; fail-closed)")
+    end
   end
 end
 
@@ -3781,7 +3834,7 @@ end
 #   - aggregate returns (both routes use the caller-supplied sret buffer
 #     for the pair/memory classes — category_uses_sret's policy);
 #   - scalar classes and their positional geometry (the walk consults
-#     lir_plan_scalar_class_word at every float/general decision and
+#     lir_plan_scalar_class at every float/general decision and
 #     refuses to lower on any plan disagreement);
 #   - FFI-unsafe payloaded enums and Strings crossing an extern boundary
 #     (both fail closed with the plan's named reason).
@@ -3807,6 +3860,124 @@ end
 # lir_enum_crossing_kind(image_size) == "inline-image".
 def lir_enum_crossing_rule() -> String
   "a tagged enum whose image carries payload words crossing a call boundary with a NON-LIR (extern) callee: the ONE representation authority (layout_engine.classify_enum_crossing — audit item 29) classifies every registered TaggedPtr enum as ValueWord — ONE crossing word — the TaggedPtr value encoding (layout_engine.tg's EnumValueRepresentation::TaggedPtr: a raw discriminant below the 256-byte inline-tag threshold, or a heap pointer at/above it to the inline {tag @ 0, payload @ 8} image), and the extern's callee side reads that value word. This slice keeps enum images inline in fixed frame slots and crosses a payloaded image by reference between LIR-compiled functions (the declared internal adaptation, lir_enum_crossing_kind: the sret x8 copy-out for returns/destinations and the image address in the argument/parameter's ONE slot for calls/parameters), so the extern-boundary crossing — whose word would be the heap pointer this slice cannot materialize — fails closed here. Payload-less enums, plain-struct aggregates, aggregate sret returns and every scalar class are derived from the SAME classify_call_plan table and agree between the routes; the payloaded-enum boundary conversion and its exact remaining step (the missing LIR heap path) are documented in the engineering note above. Locals, construction, discriminant reads, downcast payload access and whole-value copies of payloaded enums DO lower inside a function, and payload-less enums cross extern boundaries by their raw-discriminant tag word (the same value word in both conventions)"
+end
+
+# ── THE VERSIONED ENUM ABI (third-audit item 42) ──────────────────────
+# The LIR-internal payloaded-enum representation declared above
+# (lir_enum_crossing_kind: "inline-image") is an EXPLICIT VERSIONED ABI,
+# never an implicit convention that can drift from the canonical
+# representation:
+#   - the version type below is the ONE vocabulary (today exactly
+#     InlineImageV1 — the by-reference inline image lir_enum_crossing_rule
+#     describes);
+#   - every LIR function whose DECLARED signature takes or returns an
+#     admitted payloaded tagged-enum records the version it lowered under
+#     (LirFunction.enum_abi_version; attached at lowering from
+#     lir_fn_enum_abi_marker — the same lir_ty_is_payloaded_enum
+#     authority the extern guard reads);
+#   - the whole-program routes record the single program-wide version and
+#     fail closed on any function marker that differs (uniformity rule:
+#     ONE PROGRAM = ONE VERSION — lir_check_enum_abi_program);
+#   - verify_lir refuses a crossing with no version and a version with no
+#     crossing (lir_verify_enum_abi — no unversioned crossing exists);
+#   - a separate/cached object embeds the version word in its metadata
+#     (lir_emit_enum_abi_note: the `tg.abi.enumver` symbol points at the
+#     NUL-terminated "inline-image-v1" bytes), and a consumer parses the
+#     word with lir_enum_abi_version_of_word, refusing unknown words
+#     instead of guessing (lir_check_enum_abi_word).
+# A future representation is a NEW VARIANT: every exhaustive match over
+# the type (the word render, the boundary-message renders, the note) must
+# name it, so the internal and canonical representations can never
+# diverge silently.
+pub enum LirEnumAbiVersion
+  # The inline-image v1 convention: a payloaded tagged-enum crosses
+  # between LIR-compiled functions BY REFERENCE (the sret x8 copy-out for
+  # returns/destinations, the image address in the argument/parameter's
+  # ONE slot) with the image kept inline in fixed frame slots. It is NOT
+  # a canonical crossing: layout_engine.classify_enum_crossing classifies
+  # the same enum as AbiEnumCrossing::ValueWord (the TaggedPtr value
+  # word) — see lir_enum_crossing_rule and the boundary rules below.
+  InlineImageV1
+end
+
+# The version this route implements — the ONE constructor every producer
+# reads (never a version literal at a call site; a future bump lands here
+# and every exhaustive match fails to compile until it is updated).
+pub def lir_enum_abi_version() -> LirEnumAbiVersion
+  LirEnumAbiVersion::InlineImageV1
+end
+
+# The persisted/boundary word of a version ("inline-image-v1"): the SAME
+# spelling the object metadata note carries and every boundary message
+# names.
+pub def lir_enum_abi_version_word(v: LirEnumAbiVersion) -> String
+  match v
+  when LirEnumAbiVersion::InlineImageV1 then "inline-image-v1"
+  end
+end
+
+# Parse a version word from object metadata or a foreign producer:
+# Option::None for an unknown word — callers fail closed on None, they
+# never guess a version (third-audit item 42 boundary rule (d)).
+pub def lir_enum_abi_version_of_word(word: String) -> Option[LirEnumAbiVersion]
+  if word == "inline-image-v1" then
+    Option::Some(LirEnumAbiVersion::InlineImageV1)
+  else
+    Option::None
+  end
+end
+
+# ── THE BOUNDARY RULES (third-audit item 42) ──────────────────────────
+# Explicit, one function per boundary; the gates and messages read these
+# rows instead of re-deriving the prose. The four rules of v1:
+#   (a) LIR-to-LIR calls: inline-image-v1, no conversion. Both sides were
+#       lowered by the same whole-program route under the same version,
+#       and the per-function markers + the program uniformity check keep
+#       one program = one version.
+#   (b) extern/FFI: fail closed with the authoritative reason.
+#       classify_enum_crossing's canonical answer for a registered enum
+#       is the TaggedPtr value word (AbiEnumCrossing::ValueWord); the LIR
+#       route cannot materialize a heap-pointer word (no allocation path
+#       in this slice), so a non-LIR counterpart cannot receive the
+#       inline image. The refusal names the version, the canonical
+#       representation and the conversion requirement
+#       (lir_enum_abi_extern_refusal).
+#   (c) object/executable exports: a function whose signature
+#       takes/returns a payloaded enum is NOT exported as stable public
+#       ABI in v1. The LIR writers register it with LOCAL binding
+#       (lir_fn_export_binding); a REQUIRED export (the OS entry —
+#       main/_start/mainCRTStartup) fails closed
+#       (lir_check_fn_enum_abi_export). The stable boundary remains the
+#       canonical TaggedPtr word the direct pipeline produces.
+#   (d) separate/cached objects: the version is embedded in the object
+#       metadata — the `tg.abi.enumver` symbol whose target bytes are the
+#       NUL-terminated version word (lir_emit_enum_abi_note). A consumer
+#       parses it with lir_enum_abi_version_of_word and fails closed on a
+#       differing or unknown word (lir_check_enum_abi_word).
+pub def lir_enum_abi_rule_lir_call() -> String
+  "(a) LIR-to-LIR: a payloaded tagged-enum crosses between LIR-compiled functions under `" + lir_enum_abi_version_word(lir_enum_abi_version()) + "` (the by-reference inline image); no conversion — both sides were lowered by the same whole-program route under the same version and the per-function markers + the program uniformity rule keep one program = one version"
+end
+
+pub def lir_enum_abi_rule_extern() -> String
+  "(b) extern/FFI: a payloaded tagged-enum crossing to a non-LIR (extern) callee fails closed — the callee follows the canonical representation (layout_engine.classify_enum_crossing: the ONE TaggedPtr value word) and the LIR-internal `" + lir_enum_abi_version_word(lir_enum_abi_version()) + "` inline image cannot be converted to it without the allocation path this slice does not implement"
+end
+
+pub def lir_enum_abi_rule_export() -> String
+  "(c) object/executable exports: a function that takes or returns a payloaded tagged-enum is NOT a stable public ABI export in `" + lir_enum_abi_version_word(lir_enum_abi_version()) + "` — the LIR writers register it with LOCAL binding (lir_fn_export_binding); a required export (the OS entry main/_start/mainCRTStartup) fails closed, because the inline-image crossing is internal-only and the stable boundary is the canonical TaggedPtr value word"
+end
+
+pub def lir_enum_abi_rule_objects() -> String
+  "(d) separate/cached objects: the object metadata carries the program's enum ABI version — the `" + lir_enum_abi_note_label() + "` symbol points at the NUL-terminated version word `" + lir_enum_abi_version_word(lir_enum_abi_version()) + "`; a consumer parses it with lir_enum_abi_version_of_word and fails closed on a differing or unknown word (no guessing across an object boundary)"
+end
+
+# All four rules, in order — the lane/test row source.
+pub def lir_enum_abi_boundary_rules() -> Vec[String]
+  Vec::from([
+    lir_enum_abi_rule_lir_call(),
+    lir_enum_abi_rule_extern(),
+    lir_enum_abi_rule_export(),
+    lir_enum_abi_rule_objects()
+  ])
 end
 
 # The width record of an integer type: storage bits and signedness. The
@@ -8596,7 +8767,7 @@ def lir_lower_call(inout ctx: LirLowerCtx, block_id: Int, callee_name: String, d
         end
         match lir_fp_width_of(aty)
         when Option::Some(_) then
-          match lir_check_scalar_class_plan(aty, "float", "call argument " + ai.to_string() + " of " + ctx.fn_name)
+          match lir_check_scalar_class_plan(aty, true, "call argument " + ai.to_string() + " of " + ctx.fn_name)
           when Result::Err(e) then return Result::Err(e)
           when Result::Ok(_) then ()
           end
@@ -8642,7 +8813,7 @@ def lir_lower_call(inout ctx: LirLowerCtx, block_id: Int, callee_name: String, d
           fp_pos = fp_pos + 1
         when Option::None then
           # A GENERAL-class value argument (integer/Bool word).
-          match lir_check_scalar_class_plan(aty, "int", "call argument " + ai.to_string() + " of " + ctx.fn_name)
+          match lir_check_scalar_class_plan(aty, false, "call argument " + ai.to_string() + " of " + ctx.fn_name)
           when Result::Err(e) then return Result::Err(e)
           when Result::Ok(_) then ()
           end
@@ -10430,7 +10601,7 @@ def lower_mir_fn_to_lir_mode_ty(f: MirFunction, div_ok: Bool, width_ok: Bool, fp
     let pty = f.params[bi].ty
     match lir_fp_width_of(pty)
     when Option::Some(fw) then
-      match lir_check_scalar_class_plan(pty, "float", "parameter " + f.params[bi].name + " of " + f.name)
+      match lir_check_scalar_class_plan(pty, true, "parameter " + f.params[bi].name + " of " + f.name)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
       end
@@ -10490,7 +10661,7 @@ def lower_mir_fn_to_lir_mode_ty(f: MirFunction, div_ok: Bool, width_ok: Bool, fp
         # pointer/ref ADDRESS word — the pointer/atomic slice's word
         # admission binds Ptr/PtrMut/RefInternal parameters exactly like
         # any scalar word).
-        match lir_check_scalar_class_plan(pty, "int", "parameter " + f.params[bi].name + " of " + f.name)
+        match lir_check_scalar_class_plan(pty, false, "parameter " + f.params[bi].name + " of " + f.name)
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(_) then ()
         end
@@ -10990,6 +11161,14 @@ def lower_mir_fn_to_lir_mode_ty(f: MirFunction, div_ok: Bool, width_ok: Bool, fp
     end
     api = api + 1
   end
+  # The per-function enum-ABI version marker (third-audit item 42): the
+  # signature scan is the SAME lir_ty_is_payloaded_enum authority the
+  # extern guard reads, so the marker can never name a crossing this
+  # route would not lower under the inline-image convention. Attached
+  # HERE — the one LirFunction construction the lowering performs — and
+  # carried unchanged through lir_peephole.
+  let enum_abi_crossing = lir_fn_has_payloaded_enum_crossing(type_defs, f)
+  let enum_abi_marker = if enum_abi_crossing then Option::Some(lir_enum_abi_version()) else Option::None end
   let entry = if f.blocks.len() > 0 then f.blocks[0].id.id else 0 end
   Result::Ok(LirFunction {
     name: f.name.clone(),
@@ -11009,7 +11188,9 @@ def lower_mir_fn_to_lir_mode_ty(f: MirFunction, div_ok: Bool, width_ok: Bool, fp
     sret_base_slot: sret_base_slot,
     sret_call_slots: ctx.sret_call_slots,
     agg_call_args: ctx.agg_call_args,
-    agg_params: agg_params
+    agg_params: agg_params,
+    enum_abi_version: enum_abi_marker,
+    enum_abi_crossing: enum_abi_crossing
   })
 end
 
@@ -11085,7 +11266,9 @@ def lir_peephole(f: LirFunction) -> LirFunction
     sret_base_slot: f.sret_base_slot,
     sret_call_slots: f.sret_call_slots,
     agg_call_args: f.agg_call_args,
-    agg_params: f.agg_params.clone()
+    agg_params: f.agg_params.clone(),
+    enum_abi_version: f.enum_abi_version,
+    enum_abi_crossing: f.enum_abi_crossing
   }
 end
 # ———————————————————————————————————————————————————————————————
@@ -11187,6 +11370,17 @@ end
 # finalize pass below derives every spill/reload record from the FINAL
 # phys values, so an evicted or rematerialized unit can never leave a
 # stale record.
+#
+# (third-audit item 39 — the profile hotness PREREQUISITE, recorded at
+# this exact site): policy 1's per-vreg cost is the LOOP-DEPTH weight
+# only (10^loop_depth over lir_loop_depths). It does NOT read the
+# stable-keyed PGO hotness the inliner consumes: the LIR route's driver
+# (lir_compile_object / the x86-64 route) receives no MirProgram
+# profile, so MirProgram.pgo_profile never reaches this allocator. A
+# profile-aware spill policy needs the route to thread a function
+# hotness factor into lir_alloc_registers_a64 and scale the cost (or
+# the eviction comparison) by it; without a profile nothing changes —
+# the defaults here ARE the documented no-profile behavior.
 
 struct LirSeg
   start: Int
@@ -14995,6 +15189,32 @@ def lir_verify_remat(f: LirFunction, alloc: LirAlloc, inout out: Vec[String]) ->
   end
 end
 
+# THE ENUM-ABI VERSION RULE (third-audit item 42): the LIR-internal
+# payloaded-enum representation is VERSIONED; a payloaded-enum crossing
+# may exist ONLY under a known version. The marker is attached at
+# lowering exactly when the declared signature takes or returns an
+# admitted payloaded tagged-enum (enum_abi_crossing), so this rule
+# rejects both asymmetric states:
+#   - a crossing with NO version — the unversioned crossing the item
+#     forbids (a foreign/hand-built/older marker state);
+#   - a version with NO crossing — a stale/foreign marker would version
+#     a function that never crosses, silently mislabeling it.
+# The version itself is typed: every variant is a known version by
+# construction (a future variant must be added to the exhaustive word
+# render before it can be written anywhere).
+def lir_verify_enum_abi(f: LirFunction, inout out: Vec[String]) -> Unit
+  match f.enum_abi_version
+  when Option::Some(v) then
+    if !f.enum_abi_crossing then
+      out.push("lir-verify: abi: function " + f.name + " carries enum ABI version `" + lir_enum_abi_version_word(v) + "` but declares no payloaded-enum crossing (the marker is attached exactly to a crossing; a stale/foreign marker would silently version the wrong function — fail-closed, third-audit item 42)")
+    end
+  when Option::None then
+    if f.enum_abi_crossing then
+      out.push("lir-verify: abi: function " + f.name + " crosses a payloaded tagged-enum with NO enum ABI version (the LIR-internal inline-image representation is versioned and an unversioned crossing is forbidden — fail-closed, third-audit item 42)")
+    end
+  end
+end
+
 # The mandatory verification gate (audit item 26). Returns the sorted
 # list of "lir-verify:"-prefixed violations; an empty list means the
 # lowered + allocated function is valid for the route's emitter.
@@ -15007,6 +15227,10 @@ pub def verify_lir(f: LirFunction, alloc: LirAlloc, route: LirVerifyRoute) -> Ve
   # step, exclusivity with the FP class, and the fixed-slot image
   # preassignment every memory-resident vector vreg needs.
   lir_verify_vector_tables(f, out)
+  # The enum-ABI version rule (third-audit item 42): every payloaded-enum
+  # crossing names a known version, and no version exists without a
+  # crossing.
+  lir_verify_enum_abi(f, out)
   # The per-block statement rules (class/legal/fixed-register/ABI) —
   # one walk, with the per-block argument-move accounting collected for
   # the block's terminator check. Unreachable blocks are skipped (their
@@ -16585,9 +16809,16 @@ end
 # aggregate-argument slice), the stack-slot
 # cleanup, the result capture into the dest vreg and the jump to the
 # success block (fixups are resolved later, at the whole-buffer level).
-def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, kind: LirTermKind, pos: Int, externs: Set[String], defined: Set[String], sret_base: Option[Int], agg_args: Vec[LirAggCallArg]) -> Unit
+def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, src_block: Int, kind: LirTermKind, pos: Int, externs: Set[String], defined: Set[String], sret_base: Option[Int], agg_args: Vec[LirAggCallArg], cov: Option[CoverageFnPlan]) -> Unit
   match kind
   when LirTermKind::LirJump(target) then
+    # (third-audit item 34) the taken goto edge's counter, bumped before
+    # the branch (the bump is flag-neutral and uses X16/X17 only).
+    match cov
+    when Option::Some(c) then
+      lir_emit_cov_bump_a64(ctx, lir_cov_edge_slot(c.clone(), src_block, target, "goto".to_string()))
+    when Option::None then ()
+    end
     let lbl = lir_block_label(fn_name, target)
     a64_b(&mut ctx.text, lbl)
   when LirTermKind::LirSwitch(vreg, arms, default_target) then
@@ -16595,18 +16826,49 @@ def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, kind:
     var ai = 0
     while ai < arms.len() do
       let arm = arms[ai]
+      let slot = match cov
+      when Option::Some(c) then lir_cov_edge_slot(c.clone(), src_block, arm.target, "switch".to_string())
+      when Option::None then -1
+      end
       if arm.value == 0 then
         # Encoder-supported zero-test fusion (Slice 5): cbz equals
         # cmp r, #0 + b.eq and is flag-neutral, so later arms' compares
-        # are unaffected.
+        # are unaffected. With a coverage slot the taken path is routed
+        # through the bump (cbnz over it), so the counter is bumped only
+        # when this arm actually transfers control.
         let lbl = lir_block_label(fn_name, arm.target)
-        a64_cbz(&mut ctx.text, operand, lbl)
+        if slot >= 0 then
+          let skip = ".Lcov_sw." + ctx.fn_counter.to_string()
+          ctx.fn_counter = ctx.fn_counter + 1
+          a64_cbnz(&mut ctx.text, operand, skip.clone())
+          lir_emit_cov_bump_a64(ctx, slot)
+          a64_b(&mut ctx.text, lbl)
+          def_label(&mut ctx.text, skip)
+        else
+          a64_cbz(&mut ctx.text, operand, lbl)
+        end
       else
         let lbl = lir_block_label(fn_name, arm.target)
-        lir_emit_cmp_imm(ctx, operand, arm.value)
-        a64_bcond(&mut ctx.text, lir_cond_code(LirCond::LirEq), lbl)
+        if slot >= 0 then
+          let skip = ".Lcov_sw." + ctx.fn_counter.to_string()
+          ctx.fn_counter = ctx.fn_counter + 1
+          lir_emit_cmp_imm(ctx, operand, arm.value)
+          a64_bcond(&mut ctx.text, lir_cond_code(LirCond::LirNe), skip.clone())
+          lir_emit_cov_bump_a64(ctx, slot)
+          a64_b(&mut ctx.text, lbl)
+          def_label(&mut ctx.text, skip)
+        else
+          lir_emit_cmp_imm(ctx, operand, arm.value)
+          a64_bcond(&mut ctx.text, lir_cond_code(LirCond::LirEq), lbl)
+        end
       end
       ai = ai + 1
+    end
+    match cov
+    when Option::Some(c) then
+      lir_emit_cov_bump_a64(ctx,
+        lir_cov_edge_slot(c.clone(), src_block, default_target, "switch-default".to_string()))
+    when Option::None then ()
     end
     let dlbl = lir_block_label(fn_name, default_target)
     a64_b(&mut ctx.text, dlbl)
@@ -16673,6 +16935,20 @@ def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, kind:
         end
       when Option::None then ()
       end
+    end
+    # (third-audit item 34) the exit-time coverage dump: before the user
+    # main/_start epilogue (LR/FP/SP still valid) call _tg_cov_dump with
+    # X0 saved on the stack (the dump clobbers the caller-saved file and
+    # the helper preserves x19-x28). Only the entry function dumps; other
+    # returns are untouched.
+    match cov
+    when Option::Some(c) then
+      if fn_name == "main" || fn_name == "_start" then
+        a64_stp_pre(&mut ctx.text, A64::X0, A64::XZR, A64::SP, -16)
+        a64_bl(&mut ctx.text, "_tg_cov_dump")
+        a64_ldp_post(&mut ctx.text, A64::X0, A64::XZR, A64::SP, 16)
+      end
+    when Option::None then ()
     end
     lir_emit_epilogue(ctx, alloc)
   when LirTermKind::LirTrap then
@@ -16794,6 +17070,15 @@ def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, kind:
           lir_emit_slot_store(ctx, dt.reg, dt.store_slot)
         end
       end
+    when Option::None then ()
+    end
+    # (third-audit item 34) the call-success edge's counter, bumped after
+    # the result capture so no live value is clobbered (X16/X17 scratch,
+    # flag-neutral).
+    match cov
+    when Option::Some(c) then
+      lir_emit_cov_bump_a64(ctx,
+        lir_cov_edge_slot(c.clone(), src_block, success, "call-success".to_string()))
     when Option::None then ()
     end
     let lbl = lir_block_label(fn_name, success)
@@ -17073,10 +17358,189 @@ def lir_macc_try(inout ctx: CodegenCtx, alloc: LirAlloc, stmts: Vec[LirStmt], te
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# Coverage emission (third-audit item 34 — the runtime producer)
+# ———————————————————————————————————————————————————————————————
+# The LIR half of the coverage contract documented at lir_emit_fn's block
+# loop: the program-level .bss counter array + the embedded row blob +
+# the tg.cov.table.v1 text + the dump path constants (emitted by
+# lir_emit_coverage_data_a64), the per-point counter bumps (emitted by
+# lir_emit_cov_bump_a64 at block entries and classified terminators), and
+# the exit-time dump call (emitted by lir_emit_term's Ret arm for the user
+# main/_start). The compile-time plan is coverage_graph.tg's
+# coverage_emission_plan_of_functions.
+
+# Emit one counter bump: materialize the program counter array symbol in
+# X16, add the GLOBAL slot's byte offset (global_index * 8 — the function's
+# base is already folded in), load the 8-byte count, add 1, store. This is
+# the exact ldr/add/ldr/add/str sequence of the emission-site note.
+# X16/X17 are the emitter's never-allocated scratch pair; the sequence sets
+# no flags (invariant I1) and clobbers no live vreg.
+def lir_emit_cov_bump_a64(inout ctx: CodegenCtx, slot_index: Int) -> Unit
+  if slot_index < 0 then
+    return ()
+  end
+  add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_cov_counters".to_string(), 0)
+  emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X16))
+  add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_cov_counters".to_string(), 0)
+  a64_add_rri(&mut ctx.text, A64::X16, A64::X16, 0)
+  let byte_off = slot_index * 8
+  if byte_off <= 4095 then
+    a64_add_rri(&mut ctx.text, A64::X16, A64::X16, byte_off as u32)
+  else
+    a64_mov_ri(&mut ctx.text, A64::X15, byte_off)
+    a64_add_rrr(&mut ctx.text, A64::X16, A64::X16, A64::X15)
+  end
+  a64_ldr(&mut ctx.text, A64::X17, A64::X16, 0)
+  a64_add_rri(&mut ctx.text, A64::X17, A64::X17, 1)
+  a64_str(&mut ctx.text, A64::X17, A64::X16, 0)
+end
+
+# The GLOBAL counter index of the classified edge from `from_block` to
+# `to_block` of the function's table (-1 when the edge carries no slot or
+# the plan is disabled).
+def lir_cov_edge_slot(cov: CoverageFnPlan, from_block: Int, to_block: Int, kind: String) -> Int
+  let from_key = coverage_block_id_of(cov.fn_key.clone(), from_block)
+  let to_key = coverage_block_id_of(cov.fn_key.clone(), to_block)
+  let edge_id = coverage_edge_id(from_key, to_key, kind)
+  match cov.table.edge_counters.get(edge_id.clone())
+  when Option::Some(local_index) then cov.base + local_index
+  when Option::None then -1
+  end
+end
+
+# Emit one .data u64 slot under a global symbol.
+def lir_emit_cov_data_u64(inout buf: CodeBuffer, name: String, value: Int) -> Unit
+  while buf_pos(&buf) % 8 != 0 do
+    emit8(&mut buf, 0)
+  end
+  add_symbol(&mut buf, AsmSymbol {
+    name: name.clone(),
+    section: Section::Data,
+    offset: buf_pos(&buf),
+    size: 8,
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
+  def_label(&mut buf, name)
+  emit64_le(&mut buf, value as u64)
+end
+
+# Emit one NUL-terminated .data byte blob under a global symbol.
+def lir_emit_cov_data_blob(inout buf: CodeBuffer, name: String, text: String) -> Unit
+  while buf_pos(&buf) % 8 != 0 do
+    emit8(&mut buf, 0)
+  end
+  add_symbol(&mut buf, AsmSymbol {
+    name: name.clone(),
+    section: Section::Data,
+    offset: buf_pos(&buf),
+    size: text.len() + 1,
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
+  def_label(&mut buf, name)
+  var i = 0
+  while i < text.len() do
+    emit8(&mut buf, text.char_at(i) as u8)
+    i = i + 1
+  end
+  emit8(&mut buf, 0)
+end
+
+# Emit the whole-program coverage data of an enabled plan:
+#   1. `.bss`: `_tg_cov_counters`, one 8-byte slot per global counter
+#      (Section::Bss, SymKind::Data). A zero-counter program keeps one
+#      dummy slot so the runtime's ADRP relocation has a real target.
+#   2. `.data`: `_tg_cov_total` (the counter count), `_tg_cov_path_len` +
+#      `_tg_cov_path_text` (the dump path; "-" selects stdout at runtime),
+#      `_tg_cov_header` ("tg.cov.trace.v1\n"), `_tg_cov_test_prefix`
+#      ("test|") and `_tg_cov_newline` ("\n").
+#   3. `.rodata`: `_tg_cov_rows` — the runtime-readable projection of
+#      coverage_table_render: one 16-byte record per global index
+#      {u64 text offset from the blob base, u64 text length}, then the
+#      concatenated pre-rendered trace row texts in the same order (so the
+#      runtime dump never parses text); and `_tg_cov_table` — the rendered
+#      `tg.cov.table.v1` text of every function's table (the audit
+#      artifact).
+def lir_emit_coverage_data_a64(inout ctx: CodegenCtx, plan: CoverageEmissionPlan) -> Unit
+  if !plan.enabled then
+    return ()
+  end
+
+  # 1. the program-level counter array.
+  while ctx.bss_size % 8 != 0 do
+    ctx.bss_size = ctx.bss_size + 1
+  end
+  let counter_size = if plan.total > 0 then plan.total * 8 else 8 end
+  ctx.bss_symbols.push(AsmSymbol {
+    name: "_tg_cov_counters".to_string(),
+    section: Section::Bss,
+    offset: ctx.bss_size,
+    size: counter_size,
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
+  ctx.bss_size = ctx.bss_size + counter_size
+
+  # 2. the path/header constants and the counter count.
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_cov_total".to_string(), plan.total)
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_cov_path_len".to_string(), plan.out_path.len())
+  lir_emit_cov_data_blob(&mut ctx.data, "_tg_cov_path_text".to_string(), plan.out_path.clone())
+  lir_emit_cov_data_blob(&mut ctx.data, "_tg_cov_header".to_string(), "tg.cov.trace.v1\n".to_string())
+  lir_emit_cov_data_blob(&mut ctx.data, "_tg_cov_test_prefix".to_string(), "test|".to_string())
+  lir_emit_cov_data_blob(&mut ctx.data, "_tg_cov_newline".to_string(), "\n".to_string())
+
+  # 3a. the row-record blob.
+  while buf_pos(&ctx.rodata) % 8 != 0 do
+    emit8(&mut ctx.rodata, 0)
+  end
+  def_label(&mut ctx.rodata, "_tg_cov_rows".to_string())
+  let row_count = plan.rows.len()
+  let rec_bytes = row_count * 16
+  var offsets: Vec[Int] = Vec::new()
+  var text_total = 0
+  for r in plan.rows do
+    offsets.push(text_total)
+    text_total = text_total + r.len()
+  end
+  var ri = 0
+  while ri < row_count do
+    emit64_le(&mut ctx.rodata, (rec_bytes + offsets[ri]) as u64)
+    emit64_le(&mut ctx.rodata, plan.rows[ri].len() as u64)
+    ri = ri + 1
+  end
+  for r in plan.rows do
+    var ci = 0
+    while ci < r.len() do
+      emit8(&mut ctx.rodata, r.char_at(ci) as u8)
+      ci = ci + 1
+    end
+  end
+  while buf_pos(&ctx.rodata) % 8 != 0 do
+    emit8(&mut ctx.rodata, 0)
+  end
+
+  # 3b. the rendered tg.cov.table.v1 text (audit/cross-check artifact).
+  while buf_pos(&ctx.rodata) % 8 != 0 do
+    emit8(&mut ctx.rodata, 0)
+  end
+  def_label(&mut ctx.rodata, "_tg_cov_table".to_string())
+  var ti = 0
+  while ti < plan.table_text.len() do
+    emit8(&mut ctx.rodata, plan.table_text.char_at(ti) as u8)
+    ti = ti + 1
+  end
+  emit8(&mut ctx.rodata, 0)
+  while buf_pos(&ctx.rodata) % 8 != 0 do
+    emit8(&mut ctx.rodata, 0)
+  end
+end
+
 # Emit an entire function: symbol, prologue, entry capture for
 # main/_start, blocks (statements then terminator), walking positions
 # exactly like lir_linearize (I3).
-def lir_emit_fn(inout ctx: CodegenCtx, f: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String]) -> Unit
+def lir_emit_fn(inout ctx: CodegenCtx, f: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String], cov: Option[CoverageFnPlan]) -> Unit
   # Symbol + entry label (block 0's label is defined by the block loop).
   # (P1-18 @cold): an attr_cold function's symbol is routed into the
   # cold section (Section::ColdText — the .text.cold region); its body
@@ -17085,12 +17549,20 @@ def lir_emit_fn(inout ctx: CodegenCtx, f: LirFunction, alloc: LirAlloc, externs:
   align_to(&mut ctx.text, 4, Arch::AArch64)
   let fn_start = buf_pos(&ctx.text)
   let fn_section = if f.attr_cold then Section::ColdText else Section::Text end
+  # THE ABI-STABILITY BOUNDARY (third-audit item 42 boundary rule (c)):
+  # a function carrying the payloaded-enum ABI marker is emitted with
+  # LOCAL binding — it is internal to the object, never a public ABI
+  # export (the inline-image crossing is not the canonical TaggedPtr
+  # word). In-object LIR-to-LIR calls resolve through the labels above,
+  # so local binding preserves every internal call; a required export
+  # (the OS entry) already failed closed at the route gate.
+  let fn_binding = lir_fn_export_binding(f)
   add_symbol(&mut ctx.text, AsmSymbol {
     name: f.name.clone(),
     section: fn_section,
     offset: fn_start,
     size: 0,
-    binding: SymBinding::Global,
+    binding: fn_binding,
     kind: SymKind::Func
   })
   def_label(&mut ctx.text, f.name.clone())
@@ -17191,6 +17663,53 @@ def lir_emit_fn(inout ctx: CodegenCtx, f: LirFunction, alloc: LirAlloc, externs:
   while bi < f.blocks.len() do
     let b = f.blocks[bi]
     def_label(&mut ctx.text, lir_block_label(f.name.clone(), b.id))
+    # —————————————————————————————————————————————————————————————
+    # (third-audit item 34 — the coverage counter bump; LANDED). The
+    # self-hosted test route runs LINKED BINARIES (driver.tg
+    # compile_and_run_tests -> bootstrap_call_argv), not a VM, so the
+    # counter bump lives HERE, behind the driver's --coverage option:
+    #   1. compile-time plan: coverage_graph.tg's
+    #      coverage_emission_plan_of_functions assigns every non-extern
+    #      MIR function its table (coverage_table_of_mir_function: one
+    #      dense counter per MIR block in Vec order — the SAME order
+    #      lower_mir_fn_to_lir preserves — then one per classified
+    #      coverage_terminator_edges edge) and a program-global base.
+    #   2. object: ONE program-level .bss counter array (Section::Bss,
+    #      SymKind::Data, size 8 * total counters) plus the embedded
+    #      row blob / tg.cov.table.v1 text — lir_emit_coverage_data_a64.
+    #   3. here: immediately after this def_label, emit the counted
+    #      block's bump — the aarch64 sequence `adrp/add X16,
+    #      _tg_cov_counters`; `add X16, X16, #8*global_index`;
+    #      `ldr X17, [X16]`; `add X17, X17, #1`; `str X17, [X16]`
+    #      (lir_emit_cov_bump_a64; the function's plan base is folded
+    #      into the global index). The bump precedes all statement
+    #      emission of the block; block 0's bump sits after the prologue /
+    #      entry capture above. LIR-synthesized blocks (pointer/atomic
+    #      dispatch arms, the assert trap block — ids absent from the MIR
+    #      table) carry no counter and emit nothing. X16/X17 are this
+    #      emitter's never-allocated scratch pair.
+    #   4. edges: lir_emit_term bumps the classified edge counter only on
+    #      the actually-taken path (goto / switch arms / switch-default /
+    #      call-success).
+    #   5. dump: at process exit the linked runtime writes the counter
+    #      array out in the tg.cov.trace.v1 grammar (coverage_graph.tg):
+    #      first `test|<argv[1]>` when the entry captured a test name
+    #      (the `tg test` harness convention), then one pre-rendered point
+    #      row per nonzero slot in global index order, read from the
+    #      embedded row blob. lir_emit_term's Ret arm calls `_tg_cov_dump`
+    #      (runtime.tg emit_tg_cov_dump) before the epilogue of the user
+    #      main/_start when the plan is enabled.
+    # —————————————————————————————————————————————————————————————
+    match cov
+    when Option::Some(c) then
+      let block_key = coverage_block_id_of(c.fn_key.clone(), b.id)
+      match c.table.block_counters.get(block_key.clone())
+      when Option::Some(local_index) then
+        lir_emit_cov_bump_a64(ctx, c.base + local_index)
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
     var si = 0
     while si < b.stmts.len() do
       # A MARKED VECTOR statement (LirStmt.vec — audit item 34) emits
@@ -17254,7 +17773,7 @@ def lir_emit_fn(inout ctx: CodegenCtx, f: LirFunction, alloc: LirAlloc, externs:
     when Option::Some(list) then list.clone()
     when Option::None then Vec::new()
     end
-    lir_emit_term(ctx, alloc, f.name.clone(), b.term.kind, pos, externs, defined, sret_base, agg_args)
+    lir_emit_term(ctx, alloc, f.name.clone(), b.id, b.term.kind, pos, externs, defined, sret_base, agg_args, cov)
     pos = pos + 1
     bi = bi + 1
   end
@@ -17582,6 +18101,53 @@ def lir_ty_is_payloaded_enum(type_defs: Map[Int, MirTypeDef], ty: Type) -> Bool
   end
 end
 
+# Whether the DECLARED signature of a MIR function takes or returns an
+# admitted payloaded tagged-enum — exactly the crossing the per-function
+# enum-ABI version marker covers (third-audit item 42). The scan reads
+# the SAME lir_ty_is_payloaded_enum authority the extern guard uses, so
+# the marker can never name a crossing the route would not lower under
+# the inline-image convention. Payloaded-enum LOCALS alone do not mark
+# the function (no boundary crossing exists); payload-less enums do not
+# either (the value-word crossing agrees with the canonical word).
+pub def lir_fn_has_payloaded_enum_crossing(type_defs: Map[Int, MirTypeDef], f: MirFunction) -> Bool
+  var hit = false
+  var i = 0
+  while i < f.params.len() do
+    let pty = f.params[i].ty.clone()
+    if lir_ty_is_payloaded_enum(type_defs, pty) then
+      hit = true
+    end
+    i = i + 1
+  end
+  if lir_ty_is_payloaded_enum(type_defs, f.ret_type.clone()) then
+    hit = true
+  end
+  hit
+end
+
+# The per-function version marker (third-audit item 42): Option::Some(v)
+# iff the declared signature takes or returns an admitted payloaded
+# tagged-enum, with v the version this route lowers under; Option::None
+# for every function without such a crossing. Attached once at lowering
+# (lower_mir_fn_to_lir_mode_ty) and preserved by every LirFunction
+# rebuild (lir_peephole); the verifier pairs it with the evidence bit
+# LirFunction.enum_abi_crossing.
+pub def lir_fn_enum_abi_marker(type_defs: Map[Int, MirTypeDef], f: MirFunction) -> Option[LirEnumAbiVersion]
+  if lir_fn_has_payloaded_enum_crossing(type_defs, f) then
+    Option::Some(lir_enum_abi_version())
+  else
+    Option::None
+  end
+end
+
+# The sharpened extern-boundary refusal (third-audit item 42 boundary
+# rule (b)): ONE message naming the LIR-internal version, the canonical
+# representation and the conversion requirement. `site` describes the
+# crossing ("the call destination", "argument 0", ...).
+pub def lir_enum_abi_extern_refusal(fn_name: String, target: String, site: String, canonical_word: String) -> String
+  "lir: function " + fn_name + " crosses a payloaded tagged-enum at " + site + " of the extern call to `" + target + "` under the LIR-internal enum ABI `" + lir_enum_abi_version_word(lir_enum_abi_version()) + "` (the by-reference inline image), while the non-LIR callee follows the canonical representation `" + canonical_word + "` (the ONE TaggedPtr value word from layout_engine.classify_enum_crossing — a raw discriminant below the inline-tag threshold or a heap pointer to the inline {tag @ 0, payload @ 8} image). A boundary conversion (inline image <-> canonical value word) is required; the inline-image -> canonical direction needs the heap/allocation path this slice does not implement, so the crossing fails closed (third-audit item 42 boundary rule (b); audit item 29) — " + lir_enum_crossing_rule()
+end
+
 # THE EXTERN-BOUNDARY ENUM GUARD — the ONLY remaining
 # lir_enum_crossing_rule enforcement site (see the rule's section and
 # the LIR-internal enum ABI note): the LIR-internal by-reference
@@ -17630,7 +18196,7 @@ def lir_check_extern_enum_calls(f: MirFunction, type_defs: Map[Int, MirTypeDef],
           match mir_opt_local_type(f, dest.local.id)
           when Option::Some(dty) then
             if lir_ty_is_payloaded_enum(type_defs, dty) then
-              return Result::Err("lir: function " + f.name + " calls extern `" + target + "` into a payloaded-enum destination — the plan authority's canonical crossing for that type is `" + lir_canonical_enum_crossing_word(type_defs.clone(), dty.clone()) + "` (audit item 29) — " + lir_enum_crossing_rule())
+              return Result::Err(lir_enum_abi_extern_refusal(f.name.clone(), target.clone(), "the call destination", lir_canonical_enum_crossing_word(type_defs.clone(), dty.clone())))
             end
           when Option::None then ()
           end
@@ -17665,7 +18231,7 @@ def lir_check_extern_enum_calls(f: MirFunction, type_defs: Map[Int, MirTypeDef],
           match aty_o
           when Option::Some(aty) then
             if lir_ty_is_payloaded_enum(type_defs, aty) then
-              return Result::Err("lir: function " + f.name + " calls extern `" + target + "` with a payloaded-enum argument " + ai.to_string() + " — the plan authority's canonical crossing for that type is `" + lir_canonical_enum_crossing_word(type_defs.clone(), aty.clone()) + "` (audit item 29) — " + lir_enum_crossing_rule())
+              return Result::Err(lir_enum_abi_extern_refusal(f.name.clone(), target.clone(), "argument " + ai.to_string(), lir_canonical_enum_crossing_word(type_defs.clone(), aty.clone())))
             end
           when Option::None then ()
           end
@@ -17678,6 +18244,123 @@ def lir_check_extern_enum_calls(f: MirFunction, type_defs: Map[Int, MirTypeDef],
     bi = bi + 1
   end
   Result::Ok(())
+end
+
+# THE ENUM-ABI UNIFORMITY CHECK (third-audit item 42): ONE PROGRAM = ONE
+# VERSION. The whole-program route records the version once
+# (`program_version` — lir_enum_abi_version at the route entry) and runs
+# this check on every lowered function; a marker naming a different
+# version fails closed, and a payloaded-enum crossing with NO marker
+# fails closed as the unversioned arm. Both arms name the function and
+# the program version, so a mixed/foreign lowering can never reach the
+# writers silently.
+pub def lir_check_enum_abi_program(f: LirFunction, program_version: LirEnumAbiVersion) -> Result[Unit, String]
+  match f.enum_abi_version
+  when Option::Some(v) then
+    if lir_enum_abi_version_word(v) != lir_enum_abi_version_word(program_version) then
+      Result::Err("lir: function " + f.name + " was lowered under enum ABI version `" + lir_enum_abi_version_word(v) + "` while the program is compiled under `" + lir_enum_abi_version_word(program_version) + "` (uniformity rule: one program = one enum ABI version — a mixed-version program cannot cross enums coherently; fail-closed, third-audit item 42)")
+    else
+      Result::Ok(())
+    end
+  when Option::None then
+    if f.enum_abi_crossing then
+      Result::Err("lir: function " + f.name + " takes/returns a payloaded tagged-enum with NO enum ABI version marker (the program is compiled under `" + lir_enum_abi_version_word(program_version) + "`) — an unversioned crossing fails closed (third-audit item 42)")
+    else
+      Result::Ok(())
+    end
+  end
+end
+
+# THE CACHED-OBJECT BOUNDARY CHECK (third-audit item 42 boundary rule
+# (d)): the object metadata's version WORD against the consumer's
+# version. An unknown word is refused exactly like a differing one —
+# lir_enum_abi_version_of_word never guesses a version.
+pub def lir_check_enum_abi_word(marker_word: String, program_version: LirEnumAbiVersion) -> Result[Unit, String]
+  let word = marker_word.clone()
+  match lir_enum_abi_version_of_word(word.clone())
+  when Option::Some(v) then
+    if lir_enum_abi_version_word(v) != lir_enum_abi_version_word(program_version) then
+      Result::Err("lir: object enum ABI version `" + word + "` does not match this compiler's `" + lir_enum_abi_version_word(program_version) + "` (third-audit item 42 boundary rule (d): a differing version needs a boundary conversion — fail-closed)")
+    else
+      Result::Ok(())
+    end
+  when Option::None then
+    Result::Err("lir: unknown object enum ABI version `" + word + "` (this compiler implements `" + lir_enum_abi_version_word(program_version) + "`; the word is never guessed — fail-closed, third-audit item 42 boundary rule (d))")
+  end
+end
+
+# THE ABI-STABILITY BOUNDARY (third-audit item 42 boundary rule (c)):
+# a function whose signature crosses a payloaded tagged-enum uses the
+# LIR-internal `inline-image-v1` representation, which is NOT a stable
+# public ABI (the canonical representation is the TaggedPtr value word —
+# lir_enum_crossing_rule). v1 therefore never exports such a function as
+# a public/global ABI symbol: the writers register it with LOCAL binding,
+# which keeps every LIR-to-LIR call inside the object working (the
+# route's calls resolve through in-object labels) while hiding the
+# non-canonical crossing from the link surface. A REQUIRED export — the
+# OS entry symbol (main / _start / mainCRTStartup) — has no internal-only
+# fallback and fails closed (lir_check_fn_enum_abi_export).
+pub def lir_fn_export_binding(f: LirFunction) -> SymBinding
+  if f.enum_abi_crossing then
+    SymBinding::Local
+  else
+    SymBinding::Global
+  end
+end
+
+# The names the OS/loader requires as defined global symbols (the
+# routes' entry selection: main on macOS, _start on Linux, mainCRTStartup
+# on Windows).
+pub def lir_entry_symbol_required(name: String) -> Bool
+  name == "main" || name == "_start" || name == "mainCRTStartup"
+end
+
+# The required-export gate (boundary rule (c)): a payloaded-enum function
+# must not be a public ABI symbol; the OS entry is the one required
+# export the route cannot make local, so it fails closed with the full
+# version / canonical-representation / conversion reason. A
+# payloaded-enum function with any other name is emitted LOCAL by the
+# writers and passes here.
+pub def lir_check_fn_enum_abi_export(f: LirFunction) -> Result[Unit, String]
+  if f.enum_abi_crossing && lir_entry_symbol_required(f.name.clone()) then
+    Result::Err("lir: function `" + f.name + "` takes/returns a payloaded tagged-enum (LIR-internal enum ABI `" + lir_enum_abi_version_word(lir_enum_abi_version()) + "`, the by-reference inline image) and is a REQUIRED export symbol (the OS entry) — the inline-image crossing is not a stable public ABI: the canonical representation is the TaggedPtr value word (layout_engine.classify_enum_crossing) and converting it needs the allocation path this slice does not implement; v1 refuses to export it (move the enum crossing behind an internal function with a stable signature — fail-closed)")
+  else
+    Result::Ok(())
+  end
+end
+
+# THE OBJECT-METADATA ENUM-ABI NOTE (third-audit item 42 boundary rule
+# (d)): a separate/cached LIR object states which enum ABI version its
+# functions were lowered under. The object writers carry symbols and
+# section bytes (there is no custom-section mechanism), so the note is a
+# GLOBAL data symbol named `tg.abi.enumver` whose target is the
+# NUL-terminated version word ("inline-image-v1") in .rodata: a consumer
+# reads the bytes at the symbol and parses them with
+# lir_enum_abi_version_of_word (refusing unknown words —
+# lir_check_enum_abi_word). Emitted exactly when at least one lowered
+# function carries the enum ABI marker, so a program with no
+# payloaded-enum crossing keeps its pre-note object bytes.
+pub def lir_enum_abi_note_label() -> String
+  "tg.abi.enumver"
+end
+
+def lir_emit_enum_abi_note(inout ctx: CodegenCtx) -> Unit
+  let word = lir_enum_abi_version_word(lir_enum_abi_version())
+  let note_off = buf_pos(&ctx.rodata)
+  var i = 0
+  while i < word.len() do
+    emit8(&mut ctx.rodata, word.char_at(i) as u8)
+    i = i + 1
+  end
+  emit8(&mut ctx.rodata, 0)
+  add_symbol(&mut ctx.rodata, AsmSymbol {
+    name: lir_enum_abi_note_label(),
+    section: Section::Rodata,
+    offset: note_off,
+    size: word.len(),
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
 end
 
 # Convert the final text labels into local symbols and assemble the
@@ -17778,12 +18461,15 @@ end
 # (P1-18 @cold) Lower and emit ONE program function on the aarch64
 # LIR route: the extern-boundary enum guard, the program-level lowering
 # (lower_mir_fn_to_lir_prog — the a64 div/width model and the
-# aggregate/deinit slices), the callee validation, the peephole, the
-# register allocation and lir_emit_fn. Shared by the whole-program
-# drivers' two function passes (the hot pass and the deferred @cold
-# pass — see lir_compile_object / lir_link_object), so every function
-# takes the identical lowering path whichever pass emits it.
-def lir_lower_emit_prog_a64(inout ctx: CodegenCtx, f: MirFunction, type_defs: Map[Int, MirTypeDef], deinit_plans: Map[String, DeinitPlan], finalizer_names: Map[Int, String], glue_names: Set[String], externs: Set[String], defined: Set[String]) -> Result[Unit, String]
+# aggregate/deinit slices), the enum-ABI uniformity + export gates, the
+# callee validation, the peephole, the register allocation and
+# lir_emit_fn. Shared by the whole-program drivers' two function passes
+# (the hot pass and the deferred @cold pass — see lir_compile_object /
+# lir_link_object), so every function takes the identical lowering path
+# whichever pass emits it. Returns TRUE when the function carries the
+# payloaded-enum ABI marker (the whole-program route accumulates this to
+# decide whether to emit the object-metadata version note).
+def lir_lower_emit_prog_a64(inout ctx: CodegenCtx, f: MirFunction, type_defs: Map[Int, MirTypeDef], deinit_plans: Map[String, DeinitPlan], finalizer_names: Map[Int, String], glue_names: Set[String], externs: Set[String], defined: Set[String], program_enum_abi: LirEnumAbiVersion, cov: Option[CoverageFnPlan]) -> Result[Bool, String]
   match lir_check_extern_enum_calls(f, type_defs, externs)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(_) then ()
@@ -17792,6 +18478,19 @@ def lir_lower_emit_prog_a64(inout ctx: CodegenCtx, f: MirFunction, type_defs: Ma
   when Result::Err(e) then
     return Result::Err(e)
   when Result::Ok(lf) then lf
+  end
+  # The enum-ABI gates (third-audit item 42): the per-function marker
+  # must match the program-wide version (uniformity: one program = one
+  # version) and a required export (the OS entry) must not carry the
+  # internal inline-image crossing at all. Both run before allocation so
+  # a failing program never reaches the writers.
+  match lir_check_enum_abi_program(lir_fn, program_enum_abi)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
+  end
+  match lir_check_fn_enum_abi_export(lir_fn)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
   end
   match lir_validate_callees(lir_fn, defined, externs)
   when Result::Err(e) then return Result::Err(e)
@@ -17808,8 +18507,8 @@ def lir_lower_emit_prog_a64(inout ctx: CodegenCtx, f: MirFunction, type_defs: Ma
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(_) then ()
   end
-  lir_emit_fn(&mut ctx, peeped, alloc, externs, defined)
-  Result::Ok(())
+  lir_emit_fn(&mut ctx, peeped, alloc, externs, defined, cov)
+  Result::Ok(lir_fn.enum_abi_crossing)
 end
 
 # Compile the whole program through LIR into an object file's bytes.
@@ -17820,6 +18519,15 @@ end
 # (MirStaticRef reads) emit the ADRP+ADD relocation pair + LDR against
 # the emitted symbols.
 def lir_compile_object(program: MirProgram, target: AsmTarget) -> Result[Vec[u8], String]
+  lir_compile_object_cov(program, target, coverage_emission_plan_disabled())
+end
+
+# The coverage-plan-aware object entry (third-audit item 34): identical to
+# lir_compile_object except the enabled plan's .bss counter array, embedded
+# row blob, tg.cov.table.v1 text and per-point counter bumps are emitted,
+# and the runtime's _tg_cov_dump is merged. A disabled plan emits the
+# byte-identical pre-coverage object.
+pub def lir_compile_object_cov(program: MirProgram, target: AsmTarget, cov_plan: CoverageEmissionPlan) -> Result[Vec[u8], String]
   if target.arch != Arch::AArch64 then
     return Result::Err("lir: the LIR route is aarch64-only in this slice (machine legalization for x86-64 is not implemented)")
   end
@@ -17837,6 +18545,20 @@ def lir_compile_object(program: MirProgram, target: AsmTarget) -> Result[Vec[u8]
   match lir_emit_program_statics_a64(&mut ctx, program)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(_) then ()
+  end
+  # (third-audit item 34) the coverage data of an enabled plan: the .bss
+  # counter array, the .data path/header constants and the .rodata row
+  # blob + tg.cov.table.v1 text. A disabled plan emits nothing.
+  lir_emit_coverage_data_a64(&mut ctx, cov_plan.clone())
+  # The per-function coverage lookup map, built ONCE: a lowering call
+  # clones only the function's own record (its table), never the whole
+  # plan (whose row/table text can be megabytes for large programs).
+  var cov_fns: Map[String, CoverageFnPlan] = Map::new()
+  var cfi = 0
+  while cfi < cov_plan.functions.len() do
+    let fn_plan = cov_plan.functions[cfi]
+    cov_fns.insert(fn_plan.fn_name.clone(), fn_plan.clone())
+    cfi = cfi + 1
   end
   var externs: Set[String] = Set::new()
   var defined: Set[String] = Set::new()
@@ -17866,6 +18588,16 @@ def lir_compile_object(program: MirProgram, target: AsmTarget) -> Result[Vec[u8]
   for (_, glue_nm) in program.drop_glue_fns do
     glue_names.insert(glue_nm.clone())
   end
+  # THE PROGRAM-WIDE ENUM ABI VERSION (third-audit item 42): the route
+  # records the ONE version every function is compiled under (uniformity
+  # rule: one program = one version — lir_check_enum_abi_program fails
+  # closed on any function marker that differs). `uses_enum_abi`
+  # accumulates whether ANY emitted function carries the payloaded-enum
+  # marker, which decides whether the object-metadata version note is
+  # emitted (lir_emit_enum_abi_note) — an enum-free program keeps its
+  # pre-note object bytes.
+  let program_enum_abi = lir_enum_abi_version()
+  var uses_enum_abi = false
   var fi = 0
   while fi < program.functions.len() do
     let f = program.functions[fi]
@@ -17899,9 +18631,9 @@ def lir_compile_object(program: MirProgram, target: AsmTarget) -> Result[Vec[u8]
       # in lir_emit_fn routes them into (Section::ColdText). Programs
       # without @cold functions take the cold pass as a zero-iteration
       # no-op and the stream is byte-identical to the pre-@cold layout.
-      match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, externs, defined)
+      match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, externs, defined, program_enum_abi, cov_fns.get(f.name.clone()))
       when Result::Err(e) then return Result::Err(e)
-      when Result::Ok(_) then ()
+      when Result::Ok(used) then if used then uses_enum_abi = true end
       end
     end
     fi = fi + 1
@@ -17914,6 +18646,12 @@ def lir_compile_object(program: MirProgram, target: AsmTarget) -> Result[Vec[u8]
   emit_runtime_str_chars(&mut ctx)
   var runtime_ctx = runtime_ctx_new(target.clone())
   emit_all_runtime(&mut runtime_ctx)
+  # (third-audit item 34) the exit-time dump helper exists only in a
+  # coverage build (its _tg_cov_* data symbols are emitted above); the
+  # user main's Return calls it before the epilogue.
+  if cov_plan.enabled then
+    emit_tg_cov_dump(&mut runtime_ctx)
+  end
   merge_code_buffer(&mut ctx.text, &runtime_ctx.text)
 
   # (P1-18 @cold — the deferred COLD pass): lower and emit the
@@ -17944,9 +18682,9 @@ def lir_compile_object(program: MirProgram, target: AsmTarget) -> Result[Vec[u8]
     while fi < program.functions.len() do
       let f = program.functions[fi]
       if !f.is_extern && f.attr_cold then
-        match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, externs, defined)
+        match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, externs, defined, program_enum_abi, cov_fns.get(f.name.clone()))
         when Result::Err(e) then return Result::Err(e)
-        when Result::Ok(_) then ()
+        when Result::Ok(used) then if used then uses_enum_abi = true end
         end
       end
       fi = fi + 1
@@ -17976,6 +18714,15 @@ def lir_compile_object(program: MirProgram, target: AsmTarget) -> Result[Vec[u8]
   emit_argc_argv_data(&mut ctx)
   emit_allocator_runtime_data(&mut ctx)
 
+  # The object-metadata enum-ABI note (third-audit item 42 boundary rule
+  # (d)): a program whose functions cross payloaded enums states its
+  # inline-image version in the object metadata (`tg.abi.enumver` = the
+  # NUL-terminated "inline-image-v1" bytes); a program with no such
+  # crossing keeps its pre-note object bytes.
+  if uses_enum_abi then
+    lir_emit_enum_abi_note(&mut ctx)
+  end
+
   let obj = lir_object_file(&mut ctx, target)
   let obj_bytes = build_object(&obj)
   Result::Ok(obj_bytes)
@@ -17987,6 +18734,12 @@ def lir_compile_executable(program: MirProgram, target: AsmTarget, output_path: 
   lir_link_object(program, target, output_path)
 end
 
+# The coverage-plan-aware executable entry (third-audit item 34); the
+# driver routes here when --coverage built an enabled plan.
+pub def lir_compile_executable_cov(program: MirProgram, target: AsmTarget, output_path: String, cov_plan: CoverageEmissionPlan) -> Result[Unit, String]
+  lir_link_object_cov(program, target, output_path, cov_plan)
+end
+
 # The executable route shares lir_compile_object's emission and then
 # performs the link (entry by OS, mirroring generate_executable).
 # Program statics lower exactly as in lir_compile_object (the scalar
@@ -17994,6 +18747,14 @@ end
 # references' ADRP/ADD pairs and the .data/.bss symbols like the
 # direct emitter's _tg_saved_* references).
 def lir_link_object(program: MirProgram, target: AsmTarget, output_path: String) -> Result[Unit, String]
+  lir_link_object_cov(program, target, output_path, coverage_emission_plan_disabled())
+end
+
+# The coverage-plan-aware link entry (third-audit item 34): identical to
+# lir_link_object except the enabled plan's counters/rows/bumps are emitted
+# and the merged runtime carries _tg_cov_dump (called from the user main's
+# Return). A disabled plan emits the byte-identical pre-coverage image.
+pub def lir_link_object_cov(program: MirProgram, target: AsmTarget, output_path: String, cov_plan: CoverageEmissionPlan) -> Result[Unit, String]
   var ctx = codegen_new(target.clone())
   # The whole-program static label table + the statics' data emission
   # (the lir_compile_object wiring — the table feeds MirStaticRef
@@ -18004,6 +18765,18 @@ def lir_link_object(program: MirProgram, target: AsmTarget, output_path: String)
   match lir_emit_program_statics_a64(&mut ctx, program)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(_) then ()
+  end
+  # (third-audit item 34) the enabled plan's coverage data (same wiring as
+  # lir_compile_object_cov): .bss counters, .data constants, .rodata rows.
+  lir_emit_coverage_data_a64(&mut ctx, cov_plan.clone())
+  # The per-function coverage lookup map, built ONCE (same reason as
+  # lir_compile_object_cov: never clone the whole plan per function).
+  var cov_fns: Map[String, CoverageFnPlan] = Map::new()
+  var cfi = 0
+  while cfi < cov_plan.functions.len() do
+    let fn_plan = cov_plan.functions[cfi]
+    cov_fns.insert(fn_plan.fn_name.clone(), fn_plan.clone())
+    cfi = cfi + 1
   end
   var externs: Set[String] = Set::new()
   var defined: Set[String] = Set::new()
@@ -18023,6 +18796,11 @@ def lir_link_object(program: MirProgram, target: AsmTarget, output_path: String)
   for (_, glue_nm) in program.drop_glue_fns do
     glue_names.insert(glue_nm.clone())
   end
+  # THE PROGRAM-WIDE ENUM ABI VERSION (third-audit item 42 — same wiring
+  # as lir_compile_object): one version for the whole program; the
+  # accumulator decides the object-metadata note.
+  let program_enum_abi = lir_enum_abi_version()
+  var uses_enum_abi = false
   var fi = 0
   while fi < program.functions.len() do
     let f = program.functions[fi]
@@ -18053,9 +18831,9 @@ def lir_link_object(program: MirProgram, target: AsmTarget, output_path: String)
       # .text.cold region their symbols are routed into (see
       # lir_emit_fn's Section::ColdText registration). Programs without
       # @cold functions take the cold pass as a zero-iteration no-op.
-      match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, externs, defined)
+      match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, externs, defined, program_enum_abi, cov_fns.get(f.name.clone()))
       when Result::Err(e) then return Result::Err(e)
-      when Result::Ok(_) then ()
+      when Result::Ok(used) then if used then uses_enum_abi = true end
       end
     end
     fi = fi + 1
@@ -18064,6 +18842,12 @@ def lir_link_object(program: MirProgram, target: AsmTarget, output_path: String)
   emit_runtime_str_chars(&mut ctx)
   var runtime_ctx = runtime_ctx_new(target.clone())
   emit_all_runtime(&mut runtime_ctx)
+  # (third-audit item 34) the exit-time dump helper exists only in a
+  # coverage build (its _tg_cov_* data symbols are emitted above); the
+  # user main's Return calls it before the epilogue.
+  if cov_plan.enabled then
+    emit_tg_cov_dump(&mut runtime_ctx)
+  end
   merge_code_buffer(&mut ctx.text, &runtime_ctx.text)
 
   # (P1-18 @cold — the deferred COLD pass, mirroring
@@ -18087,9 +18871,9 @@ def lir_link_object(program: MirProgram, target: AsmTarget, output_path: String)
     while fi < program.functions.len() do
       let f = program.functions[fi]
       if !f.is_extern && f.attr_cold then
-        match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, externs, defined)
+        match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, externs, defined, program_enum_abi, cov_fns.get(f.name.clone()))
         when Result::Err(e) then return Result::Err(e)
-        when Result::Ok(_) then ()
+        when Result::Ok(used) then if used then uses_enum_abi = true end
         end
       end
       fi = fi + 1
@@ -18115,6 +18899,13 @@ def lir_link_object(program: MirProgram, target: AsmTarget, output_path: String)
   emit_argc_argv_data(&mut ctx)
   emit_allocator_runtime_data(&mut ctx)
 
+  # The object-metadata enum-ABI note (third-audit item 42 boundary rule
+  # (d) — same wiring as lir_compile_object): emitted exactly when a
+  # function carries the payloaded-enum marker.
+  if uses_enum_abi then
+    lir_emit_enum_abi_note(&mut ctx)
+  end
+
   let obj = lir_object_file(&mut ctx, target.clone())
   let entry = match target.os
   when OsAbi::MacOS then "main"
@@ -18132,4 +18923,30 @@ def lir_link_object(program: MirProgram, target: AsmTarget, output_path: String)
   }
   let link_result = link_executable(&input)
   link_result
+end
+
+# ———————————————————————————————————————————————————————————————
+# (third-audit item 45) The budget pass's LIR frame-size accessor
+# ———————————————————————————————————————————————————————————————
+# The @budget STACK_BYTES guarantee's EXACT derivation (static-proof) is
+# the allocation's frame_bytes: one entry per function emission name. The
+# MIR budget pass consumes the map via
+# mir.check_budget_annotations_mir_with_frames; a consumer holding the
+# lowered + allocated LIR artifacts builds it with lir_frame_bytes_map
+# (functions and their allocations in the same order), a consumer holding
+# only the allocation calls lir_frame_bytes_of. The MIR-only pipeline (no
+# LIR allocation yet) leaves the map empty and the pass falls back to the
+# documented MIR-derived bound (static-bound).
+pub def lir_frame_bytes_of(alloc: LirAlloc) -> Int
+  alloc.frame_bytes
+end
+
+pub def lir_frame_bytes_map(fns: Vec[LirFunction], allocs: Vec[LirAlloc]) -> Map[String, Int]
+  var out: Map[String, Int] = Map::new()
+  var i = 0
+  while i < fns.len() && i < allocs.len() do
+    out.insert(fns[i].name.clone(), allocs[i].frame_bytes)
+    i = i + 1
+  end
+  out
 end

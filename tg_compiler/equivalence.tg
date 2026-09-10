@@ -152,7 +152,13 @@
 # proof-domain string), equivalence_tested (caller-supplied run outcomes
 # ONLY), equivalence_counterexample, equivalence_unknown,
 # equivalence_result_is_proven / equivalence_result_is_counterexample /
-# equivalence_result_level / equivalence_result_render. The scaffold texts are
+# equivalence_result_level / equivalence_result_render /
+# equivalence_level_rank / equivalence_result_satisfies (the third-audit
+# item 32 refactor-gating ladder: the evidence-strength rank of a level and
+# the predicate the §36 ChangeBudget's EquivalenceRequirement consumes —
+# a proven result must rank at or above the configured minimum, and
+# TestedNoCounterexample satisfies only when the requirement does not
+# demand a proof). The scaffold texts are
 # exact: "bounded domain requires an evaluator" (L3) and "differential
 # requires a runner" (L4) - always level Unknown, never equivalence.
 
@@ -163,7 +169,7 @@ use tg_compiler::mir::{
   MirFunction, MirStatement, MirStatementKind, MirRvalue, MirRvalueKind, MirBinOp, MirUnOp,
   CastKind, MirOperand, MirOperandKind, MirConstant, MirConstantKind, MirTerminator,
   MirTerminatorKind, Place, Projection, AggregateKind, AssertMessage, MirContractKind,
-  MirCallArg, MirCallValue
+  MirCallArg, MirCallValue, PurityStatus, purity_status_is_proven_pure
 }
 use tg_compiler::types::{Type, ConstExprT, AccessEffect}
 use tg_compiler::ids::{
@@ -184,6 +190,10 @@ enum ProofDomain
   SymbolicFinite
   BoundedDomain
   Differential
+  # (third-audit item 25) The compiler-proven purity domain: the
+  # ProvenUnderConstraints license equivalence_check_pure claims for a
+  # pair of ProvenPure functions with equal normalized MIR.
+  CompilerProvenPure
 end
 
 # The six equivalence LEVELS (audit item 55) - WHAT a result may claim. The
@@ -217,6 +227,7 @@ pub def proof_domain_text(d: ProofDomain) -> String
   when ProofDomain::SymbolicFinite then "symbolic-finite"
   when ProofDomain::BoundedDomain then "bounded-domain"
   when ProofDomain::Differential then "differential"
+  when ProofDomain::CompilerProvenPure then "compiler-proven-pure"
   end
 end
 
@@ -320,6 +331,58 @@ pub def equivalence_result_is_counterexample(r: EquivalenceResult) -> Bool
   when EquivalenceResult::EquivalenceOutcome(level, _) then
     match level
     when EquivalenceLevel::Counterexample then true
+    when _ then false
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# (third audit item 32) The refactor-gating ladder
+# ———————————————————————————————————————————————————————————————
+# The equivalence requirement lives on the §36 ChangeBudget (change_budget.tg
+# EquivalenceRequirement): a budget may demand an EquivalenceResult at or
+# above a configured level, and separately demand that the result be a
+# PROOF. The two predicates below are the gating vocabulary the budget
+# consumes; they change nothing about what the layers claim.
+
+# The evidence-strength rank of a level: Counterexample (-2) < Unknown (-1)
+# < TestedNoCounterexample (0) < StructurallyEquivalent (1) <
+# ProvenForFiniteDomain (2) < ProvenUnderConstraints (3). The three PROVEN
+# levels sit above the evidence-only levels; the rank NEVER turns a
+# non-proof into a proof — equivalence_result_satisfies consults it only
+# for results that equivalence_result_is_proven already accepted (audit
+# item 55's claim discipline).
+pub def equivalence_level_rank(level: EquivalenceLevel) -> Int
+  match level
+  when EquivalenceLevel::Counterexample then -2
+  when EquivalenceLevel::Unknown then -1
+  when EquivalenceLevel::TestedNoCounterexample then 0
+  when EquivalenceLevel::StructurallyEquivalent then 1
+  when EquivalenceLevel::ProvenForFiniteDomain then 2
+  when EquivalenceLevel::ProvenUnderConstraints then 3
+  end
+end
+
+# Whether a result satisfies an equivalence requirement (the §36
+# ChangeBudget's configured minimum — third audit item 32's refactor gate):
+#   - a PROVEN result satisfies exactly when its level rank is at least the
+#     minimum level's rank (a structural proof does not satisfy a
+#     finite-domain minimum);
+#   - TestedNoCounterexample is EVIDENCE, never a proof (audit item 55: "do
+#     not mark equivalent merely because tests pass"): it satisfies ONLY
+#     when require_proven is false — a budget that does not demand a proof
+#     accepts the caller's differential/property run as evidence;
+#   - Unknown and Counterexample never satisfy.
+pub def equivalence_result_satisfies(
+  r: EquivalenceResult,
+  minimum_level: EquivalenceLevel,
+  require_proven: Bool
+) -> Bool
+  if equivalence_result_is_proven(&r) then
+    equivalence_level_rank(equivalence_result_level(&r)) >= equivalence_level_rank(minimum_level)
+  else
+    match equivalence_result_level(&r)
+    when EquivalenceLevel::TestedNoCounterexample then !require_proven
     when _ then false
     end
   end
@@ -1448,7 +1511,17 @@ end
 # TestedNoCounterexample level is never produced by the driver (only a
 # caller-supplied run may, through equivalence_tested).
 
-pub def equivalence_check(old_fn: MirFunction, new_fn: MirFunction, domain_depth: Int) -> EquivalenceResult
+# `proven_pure_pair` (third-audit item 25) is the purity privilege: TRUE
+# only when the caller established BOTH functions ProvenPure through the
+# compiler's purity theorem (equivalence_check_pure is the sanctioned
+# wrapper). It upgrades an L1 normalized-MIR equality from the structural
+# level to ProvenUnderConstraints over the "compiler-proven-pure" domain
+# (identical normalized bodies of two effect-free, externally-uncoupled,
+# deterministic functions are extensionally equal, and the purity proof
+# supplies the semantic license the structural level alone does not
+# claim). FALSE (the default) keeps the layered driver byte-for-byte as
+# before.
+pub def equivalence_check(old_fn: MirFunction, new_fn: MirFunction, domain_depth: Int, proven_pure_pair: Bool = false) -> EquivalenceResult
   if old_fn.is_extern then
     return equivalence_unknown("old fn '" + old_fn.name.clone() +
       "' is an extern declaration (no body to compare - behavioral equivalence cannot be established from MIR)")
@@ -1488,6 +1561,9 @@ pub def equivalence_check(old_fn: MirFunction, new_fn: MirFunction, domain_depth
       di = di + 1
     end
     if same then
+      if proven_pure_pair then
+        return equivalence_constraint_proof(proof_domain_text(ProofDomain::CompilerProvenPure))
+      end
       return equivalence_structural(proof_domain_text(ProofDomain::NormalizedHash))
     end
   else
@@ -1509,6 +1585,31 @@ pub def equivalence_check(old_fn: MirFunction, new_fn: MirFunction, domain_depth
   equivalence_unknown("no layer proved equivalence (old '" + old_fn.name.clone() +
     "' vs new '" + new_fn.name.clone() + "'): " + l1_diff + " | " + eq_result_reason(&r2) +
     " | " + eq_result_reason(&r3) + " | " + eq_result_reason(&r4))
+end
+
+# (third-audit item 25) The purity-privileged entry point: the caller
+# resolves BOTH functions' PurityStatus through the compiler's purity
+# theorem (purity_status_of over MirProgram.purity, or the statuses the
+# purity pass reported) and hands them in. When both are ProvenPure, an
+# L1 normalized-MIR equality is upgraded from the structural level to
+# ProvenUnderConstraints over the explicit "compiler-proven-pure" domain:
+# two identical normalized bodies that are proven effect-free,
+# externally-uncoupled and deterministic compute the same function over
+# the whole shared signature domain, and no observable can distinguish
+# them — the purity proof carries exactly the semantic license the
+# structural level alone does not claim. Any pair that is not ProvenPure
+# on BOTH sides falls through to the IDENTICAL layered driver as before
+# (no claim is weakened, and no assertion is ever fabricated from a
+# status the caller did not establish).
+pub def equivalence_check_pure(
+  old_fn: MirFunction,
+  new_fn: MirFunction,
+  domain_depth: Int,
+  old_status: PurityStatus,
+  new_status: PurityStatus
+) -> EquivalenceResult
+  let both_pure = purity_status_is_proven_pure(&old_status) && purity_status_is_proven_pure(&new_status)
+  equivalence_check(old_fn, new_fn, domain_depth, both_pure)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1649,4 +1750,61 @@ def test_equivalence_level_predicate_rows() -> Unit
     &equivalence_tested(true, "corpus d1")), "predicate: tested(true) is not a counterexample")
   eq_test_check(!equivalence_result_is_counterexample(
     &equivalence_structural("normalized-mir")), "predicate: proven results are not counterexamples")
+end
+
+# Row 6 - (third-audit item 25) the compiler-proven purity domain word: the
+# ProvenUnderConstraints claim equivalence_check_pure may produce for a
+# ProvenPure pair carries the explicit "compiler-proven-pure" domain text.
+@test
+def test_equivalence_purity_domain_row() -> Unit
+  eq_test_check_text("compiler-proven-pure",
+    proof_domain_text(ProofDomain::CompilerProvenPure), "purity proof-domain word")
+  let r = equivalence_constraint_proof(proof_domain_text(ProofDomain::CompilerProvenPure))
+  eq_test_check_text("proven-under-constraints: compiler-proven-pure",
+    equivalence_result_render(&r), "purity constraint render")
+  eq_test_check(equivalence_result_is_proven(&r), "a compiler-proven-pure result is proven")
+end
+
+# Row 7 - (third-audit item 32) the refactor-gating ladder: the strict rank
+# order (counterexample < unknown < tested < structural < finite <
+# constraints) and the satisfaction predicate — a proven result must rank
+# at or above the configured minimum, TestedNoCounterexample satisfies only
+# when require_proven is false, and Unknown / Counterexample never satisfy.
+@test
+def test_equivalence_requirement_gating_rows() -> Unit
+  eq_test_check(equivalence_level_rank(EquivalenceLevel::Counterexample) <
+    equivalence_level_rank(EquivalenceLevel::Unknown), "rank: counterexample < unknown")
+  eq_test_check(equivalence_level_rank(EquivalenceLevel::Unknown) <
+    equivalence_level_rank(EquivalenceLevel::TestedNoCounterexample), "rank: unknown < tested")
+  eq_test_check(equivalence_level_rank(EquivalenceLevel::TestedNoCounterexample) <
+    equivalence_level_rank(EquivalenceLevel::StructurallyEquivalent), "rank: tested < structural")
+  eq_test_check(equivalence_level_rank(EquivalenceLevel::StructurallyEquivalent) <
+    equivalence_level_rank(EquivalenceLevel::ProvenForFiniteDomain), "rank: structural < finite")
+  eq_test_check(equivalence_level_rank(EquivalenceLevel::ProvenForFiniteDomain) <
+    equivalence_level_rank(EquivalenceLevel::ProvenUnderConstraints), "rank: finite < constraints")
+
+  eq_test_check(equivalence_result_satisfies(
+    &equivalence_structural("normalized-mir"),
+    EquivalenceLevel::StructurallyEquivalent, true), "structural proof satisfies the default minimum")
+  eq_test_check(equivalence_result_satisfies(
+    &equivalence_proven_finite("symbolic-finite"),
+    EquivalenceLevel::StructurallyEquivalent, true), "finite proof satisfies the structural minimum")
+  eq_test_check(!equivalence_result_satisfies(
+    &equivalence_structural("normalized-mir"),
+    EquivalenceLevel::ProvenForFiniteDomain, true), "structural proof is below the finite minimum")
+  eq_test_check(equivalence_result_satisfies(
+    &equivalence_constraint_proof("bounded-domain"),
+    EquivalenceLevel::ProvenForFiniteDomain, true), "constraint proof satisfies the finite minimum")
+  eq_test_check(!equivalence_result_satisfies(
+    &equivalence_tested(true, "corpus d1"), EquivalenceLevel::StructurallyEquivalent, true),
+    "a tested run never satisfies a proof demand")
+  eq_test_check(equivalence_result_satisfies(
+    &equivalence_tested(true, "corpus d1"), EquivalenceLevel::StructurallyEquivalent, false),
+    "a tested run satisfies a budget that does not demand a proof")
+  eq_test_check(!equivalence_result_satisfies(
+    &equivalence_unknown("a reason"), EquivalenceLevel::StructurallyEquivalent, false),
+    "an unknown never satisfies (even without a proof demand)")
+  eq_test_check(!equivalence_result_satisfies(
+    &equivalence_counterexample("()", "1", "2"), EquivalenceLevel::StructurallyEquivalent, false),
+    "a counterexample never satisfies")
 end

@@ -1,0 +1,1468 @@
+# Tangerine Compiler — Semantic Planning (third-audit item 48, first slice)
+# Self-hosting compiler written in Tangerine
+#
+# SCOPE OF THIS SLICE. Audit item 48's full subject is an evolution-plan
+# family (plan synthesis, plan application, plan validation). This module
+# implements ONLY the first slice: the WELL-DEFINED PROGRAM-KNOWLEDGE
+# MACHINERY that is mechanically derivable from artifacts that already
+# exist in this tree — the §29 SemanticSnapshot, the §31 SemanticDelta (its
+# typed deltas and ownership/effect/capability/contract rows), the
+# third-audit item-18 typed SemanticDependencyGraph, the third-audit item-38
+# convention-derived call alias facts, and the §36 ChangeBudget. Nothing
+# here synthesizes edits, applies edits or claims an application; every
+# value is a pure projection of those records.
+#
+# WHAT IS DERIVABLE, AND FROM WHERE:
+#   SemanticWriteSet   — SemanticDelta.created + SemanticDelta.modified
+#                        (the writer keys) plus the delta's OWNERSHIP row
+#                        targets ("<function.key>|<place>") and EFFECT row
+#                        targets (the effect row key IS the function key).
+#                        The diff core guarantees a changed effect/ownership
+#                        row also marks its entity modified, so the entity
+#                        list and the row-target list agree; the row targets
+#                        are carried because they are the finer write units
+#                        a merge planner keys on.
+#   SemanticReadSet    — the observer envelope of the delta: the delta's
+#                        already-computed call closure (SemanticDelta
+#                        .affected, produced by semantic_delta_of over the
+#                        snapshot's call rows), the changed call rows'
+#                        endpoints (SemanticDelta.call_delta.from / .to),
+#                        and — when the caller supplies the typed
+#                        dependency graph — the typed graph dependents of
+#                        every write key (TypeUse user; LayoutDependency
+#                        dependent_type; GenericInstantiation instance_key;
+#                        ConstEvalDependency dependent; DerivedBody
+#                        derived_key; TraitImpl/TraitSelection self
+#                        types + selected methods; AbiDependency surface
+#                        owner; ContractReference owning function). See the
+#                        section doc for why the envelope is a conservative
+#                        over-approximation.
+#   EffectResourceSet  — the delta's typed effect rows (EffectSummaryView
+#                        before/after bits + capability ids) and the typed
+#                        capability rows (Presence before/after).
+#   RiskVector         — the typed delta row counts + the §36
+#                        budget_verify violation list (the risk word is
+#                        forced critical by ANY violation: exceeding the
+#                        declared envelope is the fail-closed maximum).
+#   MemoryFact         — third-audit item 38's mir_alias_facts_of_call
+#                        (CallMutationRegion: barrier + per-root
+#                        read/write/exclusive/consume facts), walked over
+#                        every call terminator of a MirProgram.
+#   MergeRisk          — two deltas' write sets (semantic_write_set_of_delta)
+#                        and their affected envelopes.
+#
+# DETERMINISM. Every list this module returns is sorted by byte order and
+# deduped (planning_sorted_keys), so consumers can compare records field by
+# field; no Map iteration order, insertion order or hash order ever reaches
+# a result.
+#
+# TABLE OF CONTENTS:
+#   1. The typed records (SemanticWriteSet / SemanticReadSet /
+#      EffectResourceSet / RiskVector / MemoryFact / MergeRisk).
+#   2. Collection + text helpers.
+#   3. SemanticWriteSet / SemanticReadSet.
+#   4. EffectResourceSet.
+#   5. RiskVector.
+#   6. MemoryFact (semantic_memory_facts_of_mir).
+#   7. MergeRisk (semantic_merge_risk).
+#   8. The executable lane rows (semantic_planning_lane_check and the four
+#      sub-lanes). No test-file-only fixtures: the rows are exported
+#      functions a behavior lane calls, the semantic_delta.tg /
+#      change_budget.tg sibling style.
+
+use std::collections::{Vec, Map, Set}
+
+use tg_compiler::types::{AccessEffect, Type}
+use tg_compiler::token::{span_dummy}
+use tg_compiler::stable_ids::{StableDeclId, stable_decl_of_key}
+use tg_compiler::semantic_model::{
+  SemanticDependencyGraph, TypeUseEdge, TraitImplEdge, TraitSelectionEdge,
+  GenericInstantiationEdge, LayoutDependencyEdge, ConstEvalDependencyEdge,
+  DerivedBodyEdge, ContractReferenceEdge, AbiDependencyEdge
+}
+use tg_compiler::semantic_delta::{
+  SemanticDelta, EntityDelta, EdgeDelta, DeltaKind, OwnershipDelta, EffectDelta,
+  CapabilityDelta, ContractDelta, ContractSemantic, EffectSummaryView, Presence,
+  AbiDeltaView, AbiSurfaceView, ContractCompatibility, ContractRelation,
+  contract_relation_of, contract_compatibility_of,
+  semantic_delta_empty, semantic_delta_rows_diff
+}
+use tg_compiler::change_budget::{ChangeBudget, budget_verify}
+use tg_compiler::mir::{
+  MirProgram, MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId,
+  MirStatement, MirTerminator, MirTerminatorKind, MirCallArg, MirCallValue,
+  MirOperand, MirOperandKind, MirConstant, MirConstantKind,
+  place_local, operand_copy, mir_alias_facts_of_call,
+  call_may_read, call_may_write, call_root_is_exclusive, call_consumes_root
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 1. THE TYPED RECORDS
+# ═══════════════════════════════════════════════════════════════
+
+# The keys one change WRITES. Each key is a canonical stable id text in the
+# §31 key domain:
+#   - a created / modified entity's stable key ("path::name#signature");
+#   - an ownership row target "<function.key>|<place>" (the place-level
+#     write unit — the §31 ownership rows are keyed "fn|place");
+#   - an effect row target, which is the function key itself (the §31
+#     effect row key is the function's declaration key).
+# REMOVED entity keys are NOT write keys in this slice: a deletion removes
+# the key rather than writing a surviving one; the diff core records it in
+# SemanticDelta.removed and the §36 symbol gate owns it (documented scope
+# decision, not an omission). Capability row targets are likewise not write
+# keys — they are resources (EffectResourceSet), and the owning function is
+# already a modified writer when its capability rows changed.
+pub struct SemanticWriteSet
+  keys: Vec[String] = Vec::new()
+end
+
+# The observer envelope of one change (see semantic_read_set_of_delta).
+pub struct SemanticReadSet
+  keys: Vec[String] = Vec::new()
+end
+
+# The effect / capability / allocation resources one change NEWLY uses,
+# all projected from the typed before/after rows of the delta (never from
+# rendered text):
+#   effects       — the §11 dirty-class words newly carried by an effect
+#                   row's after view (after.bits & !before.bits, one entry
+#                   per class): alloc | block | io | spawn | sleep | panic |
+#                   unsafe (the §11 bit order; the "alloc" spelling matches
+#                   change_budget.tg's class-word vocabulary).
+#   capabilities  — the canonical "cap<id>" texts NEWLY present: every
+#                   capability row whose presence toggled Absent -> Present,
+#                   plus every capability-id text an effect row's after
+#                   view newly carries (normalized to "cap<id>" so the two
+#                   sources share one key domain).
+#   allocations   — the function keys of the effect rows whose after view
+#                   newly carries the alloc class (bit 1) — exactly the
+#                   row set §36 check 8 counts (budget_allocation_alloc_row_count).
+# Lists are sorted and deduped.
+pub struct EffectResourceSet
+  effects: Vec[String] = Vec::new()
+  capabilities: Vec[String] = Vec::new()
+  allocations: Vec[String] = Vec::new()
+end
+
+# The risk profile of one change against one §36 ChangeBudget.
+# COUNTING RULES (each from TYPED rows, never rendered text):
+#   api_breaks        — the symmetric-difference row count of the public-api
+#                       surface (semantic_delta_rows_diff over the typed
+#                       before/after AbiSurfaceView rows).
+#   abi_breaks        — the same count for the abi surface.
+#   effect_additions  — the number of newly added §11 class bits across all
+#                       effect rows (per row, per class).
+#   capability_additions — the number of created capability edges plus the
+#                       number of capability ids newly appearing in effect
+#                       views (per row, per id).
+#   unsafe_additions  — the count of CREATED UnsafeFact rows.
+#   ownership_changes — the ownership row count.
+#   contract_breaks   — the contract rows whose kind-aware classification
+#                       (contract_compatibility_of over contract_relation_of
+#                       of the row's typed before/after projections) is
+#                       Breaking or Unknown (Unknown fails closed).
+#   affected_count    — SemanticDelta.affected.len() (the call closure).
+# BUDGET VIOLATIONS participate through the score (not through a field):
+# every budget_verify row forces the score to the critical band, because a
+# change outside its declared envelope is never low risk.
+# RISK WORD — the documented threshold rule:
+#   score = 100*budget_violations + 40*(abi_breaks + contract_breaks)
+#         + 25*unsafe_additions + 15*api_breaks
+#         + 10*(effect_additions + capability_additions)
+#         + 2*ownership_changes + min(affected_count, 100)
+#   word  = "low"      when score == 0
+#           "medium"   when 1 <= score < 10
+#           "high"     when 10 <= score < 40
+#           "critical" when score >= 40
+#   The weights order the classes by compatibility impact: envelope
+#   violations and compatibility breaks (abi / contract) outrank unsafe
+#   additions, which outrank api breaks, effect/capability growth and
+#   ownership churn; affected_count is a bounded tiebreak.
+pub struct RiskVector
+  api_breaks: Int
+  abi_breaks: Int
+  effect_additions: Int
+  capability_additions: Int
+  unsafe_additions: Int
+  ownership_changes: Int
+  contract_breaks: Int
+  affected_count: Int
+  risk_word: String
+end
+
+# ONE call-site root fact (third-audit item 38's convention model lifted to
+# a report row):
+#   function  — the containing MirFunction's name (presentation identity;
+#               the call site itself is not carried — see the section doc).
+#   root      — the accessed local root's NAME ("local#<id>" when the MIR
+#               local carries no name). The local id is the semantic
+#               identity; the name is the display form this record carries.
+#   may_read / may_write / exclusive / consumed — the CallMutationRegion
+#               facts for that root (exclusive = inout's no-alias proof;
+#               consumed = sink's last-read ownership transfer).
+# A "set" argument is may_write=true with may_read=false (the callee never
+# reads the incoming value; initialize has no field of its own here — this
+# record's field set is exactly the slice's — and the initializes fact
+# remains available through mir.tg's call_initializes_root for consumers
+# that need it).
+pub struct MemoryFact
+  function: String
+  root: String
+  may_read: Bool
+  may_write: Bool
+  exclusive: Bool
+  consumed: Bool
+end
+
+# The merge-conflict prediction of TWO concurrent deltas (a and b).
+#   overlapping_symbols — the exact intersection of the two affected
+#                         envelopes (a.affected ∩ b.affected), sorted.
+#   write_conflicts     — the write keys of the two deltas that conflict:
+#                         a pair (ka, kb) conflicts when ka == kb OR when
+#                         both keys share the same OWNER ROOT (the text
+#                         before the first '|'; a bare symbol key roots to
+#                         itself, an ownership target "fn|place" roots to
+#                         its owning function). Both keys of every
+#                         conflicting pair are listed, sorted and deduped.
+#   verdict             — the documented decision, in precedence order:
+#                         "conflict"    when write_conflicts is non-empty;
+#                         "review"      when write_conflicts is empty but
+#                                       the deltas interact through the
+#                                       dependency envelope —
+#                                       overlapping_symbols non-empty OR a
+#                                       write key of one side appears in
+#                                       the other side's affected set
+#                                       (cross-read);
+#                         "independent" otherwise.
+pub struct MergeRisk
+  overlapping_symbols: Vec[String] = Vec::new()
+  write_conflicts: Vec[String] = Vec::new()
+  verdict: String
+end
+
+# ═══════════════════════════════════════════════════════════════
+# 2. COLLECTION + TEXT HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def planning_bool_text(b: Bool) -> String
+  if b then "true" else "false" end
+end
+
+def planning_keys_has(keys: Vec[String], want: String) -> Bool
+  for k in keys do
+    if k == want then
+      return true
+    end
+  end
+  false
+end
+
+# Append a key if absent (membership only; callers sort at the boundary).
+def planning_keys_add(inout keys: Vec[String], key: String) -> Unit
+  if !planning_keys_has(&keys, key.clone()) then
+    keys.push(key)
+  end
+  ()
+end
+
+# Sort + dedupe a key list in place (the module's determinism boundary).
+def planning_sorted_keys(inout keys: Vec[String]) -> Unit
+  keys.sort_by(|x, y| x < y)
+  var out: Vec[String] = Vec::new()
+  for k in keys do
+    if out.is_empty() then
+      out.push(k.clone())
+    elsif out[out.len() - 1] != k then
+      out.push(k.clone())
+    end
+  end
+  keys = out
+  ()
+end
+
+def planning_text_lists_same(a: Vec[String], b: Vec[String]) -> Bool
+  if a.len() != b.len() then
+    return false
+  end
+  var i = 0
+  while i < a.len() do
+    if a[i] != b[i] then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+# The owner root of a write key: everything before the first '|'. A bare
+# symbol key roots to itself; an ownership target "fn.key|place" roots to
+# its owning function. (Uses the first '|' because the §31 function keys
+# never contain '|' — same assumption change_budget.tg's contract-row
+# helpers document.)
+def planning_key_root(key: String) -> String
+  var i = 0
+  while i < key.len() do
+    if key.slice(i, i + 1) == "|" then
+      return key.slice(0, i)
+    end
+    i = i + 1
+  end
+  key.clone()
+end
+
+# The owning def key of an ABI surface id ("fn:<key>" / "type:<key>"; ""
+# outside the grammar). Mirrors semantic_delta.tg's private helper — the
+# graph rows are the SAME canonical surface-id domain.
+def planning_surface_owner_key(surface_id: String) -> String
+  if surface_id.starts_with("fn:") then
+    return surface_id.slice(3, surface_id.len())
+  end
+  if surface_id.starts_with("type:") then
+    return surface_id.slice(5, surface_id.len())
+  end
+  "".to_string()
+end
+
+# The owning function key of a StableContractId text: everything before the
+# first '|' (contract ids always open with the fn key).
+def planning_contract_owner_key(contract_id: String) -> String
+  var i = 0
+  while i < contract_id.len() do
+    if contract_id.slice(i, i + 1) == "|" then
+      return contract_id.slice(0, i)
+    end
+    i = i + 1
+  end
+  contract_id.clone()
+end
+
+# ═══════════════════════════════════════════════════════════════
+# 3. SemanticWriteSet / SemanticReadSet
+# ═══════════════════════════════════════════════════════════════
+
+# The write set of ONE delta. See SemanticWriteSet's doc for the exact key
+# derivation and the documented removed/capability exclusions.
+pub def semantic_write_set_of_delta(delta: SemanticDelta) -> SemanticWriteSet
+  var keys: Vec[String] = Vec::new()
+  for k in delta.created do
+    planning_keys_add(&mut keys, k.clone())
+  end
+  for e in delta.modified do
+    planning_keys_add(&mut keys, e.stable_id.clone())
+  end
+  for row in delta.effect_delta do
+    planning_keys_add(&mut keys, row.function.clone())
+  end
+  for row in delta.ownership_delta do
+    planning_keys_add(&mut keys, row.function.clone() + "|" + row.place.clone())
+  end
+  planning_sorted_keys(&mut keys)
+  SemanticWriteSet { keys: keys }
+end
+
+# The typed-graph dependents of one write key, appended to `keys`:
+#   TypeUse               used_type -> user
+#   LayoutDependency      source_type -> dependent_type (the typed
+#                         field-containment row; contains-type and
+#                         layout-dependent are the same family)
+#   GenericInstantiation  template -> instance_key
+#   ConstEvalDependency   referenced_const -> dependent
+#   DerivedBody           source_type -> derived_key
+#   TraitImpl             trait -> self_type (and self_type -> the
+#                         selections that dispatch through its impl)
+#   TraitSelection        trait -> selected method (function), method ->
+#                         self type (via the impl_key join)
+#   AbiDependency         type_key -> surface owner
+#   ContractReference     referenced_symbol -> contracting function
+# The walk is the read-side twin of semantic_delta.tg's affected_closure
+# graph expansion; unlike that closure it is NOT transitively closed (it is
+# one typed hop per write key), because the read set is the directly
+# observing frontier, not the full impact closure (delta.affected carries
+# the call closure).
+def planning_graph_dependents(graph: SemanticDependencyGraph, key: String, inout keys: Vec[String]) -> Unit
+  for e in graph.type_uses do
+    if e.used_type == key then
+      planning_keys_add(&mut keys, e.user.clone())
+    end
+  end
+  for e in graph.layout_dependencies do
+    if e.source_type == key then
+      planning_keys_add(&mut keys, e.dependent_type.clone())
+    end
+  end
+  for e in graph.generic_instantiations do
+    if e.template == key then
+      planning_keys_add(&mut keys, e.instance_key.clone())
+    end
+  end
+  for e in graph.const_eval_dependencies do
+    if e.referenced_const == key then
+      planning_keys_add(&mut keys, e.dependent.clone())
+    end
+  end
+  for e in graph.derived_bodies do
+    if e.source_type == key then
+      planning_keys_add(&mut keys, e.derived_key.clone())
+    end
+  end
+  # The Implements family: trait -> self types / selected methods, method ->
+  # self type, self type -> selected methods (the join identity is the
+  # impl_key, never enqueued).
+  var impl_self_of: Map[String, String] = Map::new()
+  for e in graph.trait_impls do
+    impl_self_of.insert(e.impl_key.clone(), e.self_type.clone())
+    if e.trait_key == key && e.self_type.len() > 0 then
+      planning_keys_add(&mut keys, e.self_type.clone())
+    end
+  end
+  for e in graph.trait_selections do
+    if e.trait_key == key then
+      planning_keys_add(&mut keys, e.function.clone())
+    end
+    match impl_self_of.get(e.impl_key.clone())
+    when Option::Some(st) then
+      if st == key then
+        planning_keys_add(&mut keys, e.function.clone())
+      end
+      if e.function == key && st.len() > 0 then
+        planning_keys_add(&mut keys, st.clone())
+      end
+    when Option::None then ()
+    end
+  end
+  for e in graph.abi_dependencies do
+    if e.type_key == key then
+      let owner = planning_surface_owner_key(e.surface_id.clone())
+      if owner.len() > 0 then
+        planning_keys_add(&mut keys, owner)
+      end
+    end
+  end
+  for e in graph.contract_references do
+    if e.referenced_symbol == key then
+      let owner = planning_contract_owner_key(e.contract_id.clone())
+      if owner.len() > 0 then
+        planning_keys_add(&mut keys, owner)
+      end
+    end
+  end
+  ()
+end
+
+# The read set (observer envelope) of ONE delta.
+#
+# DERIVATION:
+#   1. SemanticDelta.affected — the call closure semantic_delta_of already
+#      computed over the snapshots' call rows (the §31 seed-closure core).
+#   2. SemanticDelta.call_delta endpoints — the from/to keys of every
+#      CHANGED call row (a caller observes its callee).
+#   3. With Option::Some(graph): the typed-graph dependents of every write
+#      key (planning_graph_dependents).
+#
+# CONSERVATIVE OVER-APPROXIMATION (documented gap): the delta alone cannot
+# separate a seed from an observer — the CALL edge direction lives in the
+# snapshot's call rows, which the delta does not carry — so `affected`
+# includes the seeds and the read set keeps them. The WRITE SET is the
+# exact writer list; the read set is the invalidation envelope. This is
+# the fail-closed direction for planning: an unnecessary observer row
+# overstates risk, it never hides one. Passing the typed graph adds only
+# the family rows the third-audit item-18 graph actually persists; call
+# direction for UNCHANGED call rows remains the snapshot's (§32 index)
+# authority, exactly as affected_closure documents.
+#
+# The graph parameter is defaulted so semantic_read_set_of_delta(delta)
+# answers from the delta alone (the specified single-argument call).
+pub def semantic_read_set_of_delta(
+  delta: SemanticDelta,
+  graph: Option[SemanticDependencyGraph] = Option::None
+) -> SemanticReadSet
+  var keys: Vec[String] = Vec::new()
+  for k in delta.affected do
+    planning_keys_add(&mut keys, k.clone())
+  end
+  for e in delta.call_delta do
+    planning_keys_add(&mut keys, e.from.clone())
+    planning_keys_add(&mut keys, e.to.clone())
+  end
+  match graph
+  when Option::Some(g) then
+    let writes = semantic_write_set_of_delta(&delta)
+    for w in writes.keys do
+      planning_graph_dependents(&g, w.clone(), &mut keys)
+    end
+  when Option::None then ()
+  end
+  planning_sorted_keys(&mut keys)
+  SemanticReadSet { keys: keys }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# 4. EffectResourceSet
+# ═══════════════════════════════════════════════════════════════
+
+# The §11 dirty-class band in bit order (the change_budget.tg class_bits).
+def planning_class_bits() -> Vec[Int]
+  Vec::from([1, 2, 4, 8, 16, 32, 64])
+end
+
+# Whether a §11 dirty word carries the class of the given bit.
+def planning_word_has_class(word: Int, bit: Int) -> Bool
+  (word / bit) % 2 == 1
+end
+
+# The class word of a §11 dirty-class bit (the change_budget.tg vocabulary —
+# the same words the budget violation rows render).
+def planning_class_word(bit: Int) -> String
+  if bit == 1 then "alloc"
+  elsif bit == 2 then "block"
+  elsif bit == 4 then "io"
+  elsif bit == 8 then "spawn"
+  elsif bit == 16 then "sleep"
+  elsif bit == 32 then "panic"
+  else "unsafe"
+  end
+end
+
+# after.bits & !before.bits, per class bit (the §31 row lifecycle never
+# participates — a Created row's before view is empty).
+def planning_effect_added_class(row: EffectDelta, bit: Int) -> Bool
+  planning_word_has_class(row.after.bits, bit) && !planning_word_has_class(row.before.bits, bit)
+end
+
+# after.capabilities - before.capabilities.
+def planning_effect_added_cap(row: EffectDelta, id_text: String) -> Bool
+  if row.before.capabilities.contains(&id_text) then
+    return false
+  end
+  row.after.capabilities.contains(&id_text)
+end
+
+# The canonical "cap<id>" text of an effect-view capability entry (the raw
+# id text normalizes to the capability row's own "cap<id>" domain).
+def planning_capability_text(id_text: String) -> String
+  if id_text.starts_with("cap") then
+    return id_text.clone()
+  end
+  "cap" + id_text
+end
+
+# Build the resource set of ONE delta (see EffectResourceSet's doc for the
+# exact derivation).
+pub def effect_resource_set_of_delta(delta: SemanticDelta) -> EffectResourceSet
+  var effects: Vec[String] = Vec::new()
+  var capabilities: Vec[String] = Vec::new()
+  var allocations: Vec[String] = Vec::new()
+  for row in delta.effect_delta do
+    for bit in planning_class_bits() do
+      if planning_effect_added_class(&row, bit) then
+        planning_keys_add(&mut effects, planning_class_word(bit))
+      end
+    end
+    for id_text in row.after.capabilities do
+      if planning_effect_added_cap(&row, id_text.clone()) then
+        planning_keys_add(&mut capabilities, planning_capability_text(id_text.clone()))
+      end
+    end
+    if planning_effect_added_class(&row, 1) then
+      planning_keys_add(&mut allocations, row.function.clone())
+    end
+  end
+  for row in delta.capability_delta do
+    match row.before
+    when Presence::Present then ()
+    when Presence::Absent then
+      match row.after
+      when Presence::Absent then ()
+      when Presence::Present then
+        planning_keys_add(&mut capabilities, row.capability.clone())
+      end
+    end
+  end
+  planning_sorted_keys(&mut effects)
+  planning_sorted_keys(&mut capabilities)
+  planning_sorted_keys(&mut allocations)
+  EffectResourceSet { effects: effects, capabilities: capabilities, allocations: allocations }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# 5. RiskVector
+# ═══════════════════════════════════════════════════════════════
+
+# The kind word of a contract row: the before side's kind when the clause
+# existed before, else the after side's kind ("" for a both-None row, which
+# the delta never emits).
+def planning_contract_row_kind(row: ContractDelta) -> String
+  match row.before
+  when Option::Some(bv) then bv.kind.clone()
+  when Option::None then
+    match row.after
+    when Option::Some(av) then av.kind.clone()
+    when Option::None then "".to_string()
+    end
+  end
+end
+
+# The relation of a contract row's typed before/after projections. A
+# both-None row is never emitted; the fallback keeps the record total.
+def planning_contract_row_relation(row: ContractDelta) -> ContractRelation
+  match row.before
+  when Option::Some(bv) then
+    match row.after
+    when Option::Some(av) then
+      contract_relation_of(Option::Some(bv), Option::Some(av))
+    when Option::None then
+      let empty_after: Option[ContractSemantic] = Option::None
+      contract_relation_of(Option::Some(bv), empty_after)
+    end
+  when Option::None then
+    match row.after
+    when Option::Some(av) then
+      contract_relation_of(Option::None, Option::Some(av))
+    when Option::None then
+      let empty_before: Option[ContractSemantic] = Option::None
+      let empty_after2: Option[ContractSemantic] = Option::None
+      contract_relation_of(empty_before, empty_after2)
+    end
+  end
+end
+
+# The documented risk score (the RiskVector doc's weights). `violations` is
+# the budget_verify row count.
+def planning_risk_score(
+  api_breaks: Int,
+  abi_breaks: Int,
+  effect_additions: Int,
+  capability_additions: Int,
+  unsafe_additions: Int,
+  ownership_changes: Int,
+  contract_breaks: Int,
+  affected_count: Int,
+  violations: Int
+) -> Int
+  let affected_term = if affected_count > 100 then 100 else affected_count end
+  100 * violations + 40 * (abi_breaks + contract_breaks) +
+    25 * unsafe_additions + 15 * api_breaks +
+    10 * (effect_additions + capability_additions) +
+    2 * ownership_changes + affected_term
+end
+
+# The documented score -> word thresholds.
+def planning_risk_word(score: Int) -> String
+  if score == 0 then
+    "low"
+  elsif score < 10 then
+    "medium"
+  elsif score < 40 then
+    "high"
+  else
+    "critical"
+  end
+end
+
+# Compute the RiskVector of ONE delta against ONE §36 ChangeBudget. The
+# budget participates through budget_verify: ANY violation forces the
+# critical band (a change outside its declared envelope is never low
+# risk); the counts themselves are typed-delta projections.
+pub def risk_vector_of_delta(delta: SemanticDelta, budget: ChangeBudget) -> RiskVector
+  let api_breaks = semantic_delta_rows_diff(&delta.public_api_delta.before.rows,
+    &delta.public_api_delta.after.rows).len()
+  let abi_breaks = semantic_delta_rows_diff(&delta.abi_delta.before.rows,
+    &delta.abi_delta.after.rows).len()
+  var effect_additions = 0
+  var capability_additions = 0
+  for row in delta.effect_delta do
+    for bit in planning_class_bits() do
+      if planning_effect_added_class(&row, bit) then
+        effect_additions = effect_additions + 1
+      end
+    end
+    for id_text in row.after.capabilities do
+      if planning_effect_added_cap(&row, id_text.clone()) then
+        capability_additions = capability_additions + 1
+      end
+    end
+  end
+  for row in delta.capability_delta do
+    match row.before
+    when Presence::Present then ()
+    when Presence::Absent then
+      match row.after
+      when Presence::Absent then ()
+      when Presence::Present then capability_additions = capability_additions + 1
+      end
+    end
+  end
+  let ownership_changes = delta.ownership_delta.len()
+  let unsafe_additions = delta.unsafe_delta.created.len()
+  var contract_breaks = 0
+  for row in delta.contract_delta do
+    let kind = planning_contract_row_kind(&row)
+    let rel = planning_contract_row_relation(&row)
+    match contract_compatibility_of(&kind, &rel)
+    when ContractCompatibility::Compatible then ()
+    when ContractCompatibility::Breaking then contract_breaks = contract_breaks + 1
+    when ContractCompatibility::Unknown then contract_breaks = contract_breaks + 1
+    end
+  end
+  let affected_count = delta.affected.len()
+  let violations = budget_verify(&budget, &delta).len()
+  let score = planning_risk_score(api_breaks, abi_breaks, effect_additions,
+    capability_additions, unsafe_additions, ownership_changes, contract_breaks,
+    affected_count, violations)
+  RiskVector {
+    api_breaks: api_breaks,
+    abi_breaks: abi_breaks,
+    effect_additions: effect_additions,
+    capability_additions: capability_additions,
+    unsafe_additions: unsafe_additions,
+    ownership_changes: ownership_changes,
+    contract_breaks: contract_breaks,
+    affected_count: affected_count,
+    risk_word: planning_risk_word(score)
+  }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# 6. MemoryFact — semantic_memory_facts_of_mir
+# ═══════════════════════════════════════════════════════════════
+
+# The display text of one MemoryFact (the lane's comparison carrier).
+def planning_memory_fact_text(fact: MemoryFact) -> String
+  fact.function + "|" + fact.root + "|read=" + planning_bool_text(fact.may_read) +
+    "|write=" + planning_bool_text(fact.may_write) +
+    "|exclusive=" + planning_bool_text(fact.exclusive) +
+    "|consumed=" + planning_bool_text(fact.consumed)
+end
+
+# The local root's name (the "local#<id>" fallback for an unnamed local).
+def planning_root_name(names: Map[Int, String], lid: Int) -> String
+  match names.get(lid)
+  when Option::Some(name) then name.clone()
+  when Option::None then "local#" + lid.to_string()
+  end
+end
+
+# List the per-call memory facts of a MIR program — one MemoryFact per
+# call-site root the third-audit item-38 region touches.
+#
+# DERIVATION: every function's every terminator is fed through
+# mir_alias_facts_of_call (the convention-derived CallMutationRegion). A
+# non-call terminator yields Option::None and contributes nothing.
+#   - non-barrier region: one fact per key of region.roots (only touched
+#     roots), with may_read/may_write/exclusive/consumed read through the
+#     mir.tg predicates.
+#   - barrier region (conservative ALL — an indirect/intrinsic call or a
+#     pointer-shaped argument): one fact for EVERY local root of the
+#     function, may_read = may_write = true (the barrier answer), with the
+#     recorded exclusivity/consume facts where the region carries them.
+# ROWS: one fact per (call site, root occurrence) — a function with two
+# calls touching the same root contributes the root twice, because the
+# facts are per call (site identity itself is not part of MemoryFact; the
+# function + root pair is the record's identity and duplicates are the
+# documented per-call multiplicity). The result is sorted by the fact's
+# canonical text (function, root, flags), so duplicate rows are adjacent
+# and deterministic.
+# EMPTY when no MirProgram is supplied (Option::None) or the program has
+# no call terminators.
+pub def semantic_memory_facts_of_mir(program: Option[MirProgram] = Option::None) -> Vec[MemoryFact]
+  var out: Vec[MemoryFact] = Vec::new()
+  match program
+  when Option::Some(p) then
+    var fi = 0
+    while fi < p.functions.len() do
+      let function_name = p.functions[fi].name.clone()
+      var local_names: Map[Int, String] = Map::new()
+      var li = 0
+      while li < p.functions[fi].locals.len() do
+        let local = p.functions[fi].locals[li]
+        local_names.insert(local.id.id, local.name.clone())
+        li = li + 1
+      end
+      var bi = 0
+      while bi < p.functions[fi].blocks.len() do
+        let f = p.functions[fi]
+        let term = p.functions[fi].blocks[bi].terminator
+        match mir_alias_facts_of_call(f, &term)
+        when Option::Some(region) then
+          var lids: Vec[Int] = Vec::new()
+          if region.barrier then
+            var lj = 0
+            while lj < p.functions[fi].locals.len() do
+              lids.push(p.functions[fi].locals[lj].id.id)
+              lj = lj + 1
+            end
+          else
+            for (lid, _) in region.roots.entries() do
+              lids.push(lid)
+            end
+          end
+          for lid in lids do
+            out.push(MemoryFact {
+              function: function_name.clone(),
+              root: planning_root_name(&local_names, lid),
+              may_read: call_may_read(&region, lid),
+              may_write: call_may_write(&region, lid),
+              exclusive: call_root_is_exclusive(&region, lid),
+              consumed: call_consumes_root(&region, lid)
+            })
+          end
+        when Option::None then ()
+        end
+        bi = bi + 1
+      end
+      fi = fi + 1
+    end
+  when Option::None then ()
+  end
+  out.sort_by(|x, y| planning_memory_fact_text(x) < planning_memory_fact_text(y))
+  out
+end
+
+# ═══════════════════════════════════════════════════════════════
+# 7. MergeRisk — semantic_merge_risk
+# ═══════════════════════════════════════════════════════════════
+
+# Predict the merge risk of two deltas (see MergeRisk's doc for the exact
+# rules). Deterministic: every list is sorted and deduped.
+pub def semantic_merge_risk(a: SemanticDelta, b: SemanticDelta) -> MergeRisk
+  let wa = semantic_write_set_of_delta(&a)
+  let wb = semantic_write_set_of_delta(&b)
+  var overlaps: Vec[String] = Vec::new()
+  for k in a.affected do
+    if b.affected.contains(&k) then
+      planning_keys_add(&mut overlaps, k.clone())
+    end
+  end
+  var conflicts: Vec[String] = Vec::new()
+  for ka in wa.keys do
+    for kb in wb.keys do
+      if ka == kb || planning_key_root(&ka) == planning_key_root(&kb) then
+        planning_keys_add(&mut conflicts, ka.clone())
+        planning_keys_add(&mut conflicts, kb.clone())
+      end
+    end
+  end
+  planning_sorted_keys(&mut overlaps)
+  planning_sorted_keys(&mut conflicts)
+  var cross_read = false
+  for ka in wa.keys do
+    if b.affected.contains(&ka) then
+      cross_read = true
+    end
+  end
+  for kb in wb.keys do
+    if a.affected.contains(&kb) then
+      cross_read = true
+    end
+  end
+  let verdict = if conflicts.len() > 0 then
+    "conflict"
+  elsif overlaps.len() > 0 || cross_read then
+    "review"
+  else
+    "independent"
+  end
+  MergeRisk { overlapping_symbols: overlaps, write_conflicts: conflicts, verdict: verdict }
+end
+
+# ═══════════════════════════════════════════════════════════════
+# 8. THE EXECUTABLE LANE ROWS
+# ═══════════════════════════════════════════════════════════════
+# The sibling style of semantic_delta.tg's affected_closure_lane_check: the
+# rows build hand-made §31 deltas (and, for the memory lane, hand-made MIR)
+# and compare the module's answers against the documented expectations.
+# Each sub-lane returns the mismatch rows (empty = the lane verifies); the
+# aggregate semantic_planning_lane_check runs them all.
+#
+#   W1 — the write set of a hand-made delta: a created symbol, a modified
+#        symbol with an ownership row target and an effect row target.
+#   W2 — the read set without a graph (affected + changed call endpoints).
+#   W3 — the read set with the typed dependency graph (one row per family:
+#        TypeUse / LayoutDependency / GenericInstantiation /
+#        ConstEvalDependency / DerivedBody / TraitImpl+TraitSelection /
+#        AbiDependency / ContractReference).
+#   R1 — the empty delta against an empty budget: low, all counts zero.
+#   R2 — a modified symbol with allowed_symbols: medium (the affected
+#        tiebreak only).
+#   R3 — one effect addition with allowed_effect_additions: high.
+#   R4 — a public-api row replacement with the count fallback: critical
+#        (the violation forces the band) + api_breaks 2 (the symmetric
+#        difference of one replaced row).
+#   R5 — an abi row replacement: critical from abi_breaks alone (2).
+#   R6 — a Pre strengthening contract row: contract_breaks 1, critical.
+#   E1 — the EffectResourceSet of the W1 delta (classes, capability
+#        normalization, allocation rows).
+#   M1 — merge of disjoint deltas: independent.
+#   M2 — shared affected key only: review.
+#   M3 — the same write key (every conflicting key under that owner is
+#        listed): conflict.
+#   M4 — different ownership targets under one owner root: conflict.
+#   F1 — no MirProgram: empty facts.
+#   F2 — the let/inout/sink call fixture: four facts (read / read+write+
+#        exclusive / read+consumed / destination write).
+#   F3 — the pointer-argument barrier fixture: every local root read+write.
+
+def planning_lane_bool(inout out: Vec[String], name: String, ok: Bool) -> Unit
+  if !ok then
+    out.push(name + ": assertion failed")
+  end
+  ()
+end
+
+def planning_lane_int(inout out: Vec[String], name: String, got: Int, expected: Int) -> Unit
+  if got != expected then
+    out.push(name + ": expected " + expected.to_string() + ", got " + got.to_string())
+  end
+  ()
+end
+
+def planning_lane_text(inout out: Vec[String], name: String, got: String, expected: String) -> Unit
+  if got != expected then
+    out.push(name + ": expected " + expected + ", got " + got)
+  end
+  ()
+end
+
+def planning_lane_keys(inout out: Vec[String], name: String, got: Vec[String], expected: Vec[String]) -> Unit
+  if !planning_text_lists_same(&got, &expected) then
+    out.push(name + ": expected [" + expected.join(",") + "], got [" + got.join(",") + "]")
+  end
+  ()
+end
+
+# The W1 delta: create m::C, modify m::B with a place-p ownership change and
+# an effect row 0 -> {alloc, block, io} plus capability "3", a created
+# capability edge cap1, the call edge A -> B and the closure affected
+# {A, B}.
+def planning_lane_delta_a() -> SemanticDelta
+  var d = semantic_delta_empty()
+  d.created = Vec::from(["m::C#fn()->unit".to_string()])
+  var modified: Vec[EntityDelta] = Vec::new()
+  modified.push(EntityDelta {
+    stable_id: "m::B#fn()->unit".to_string(),
+    signature_changed: false,
+    mir_changed: true,
+    effects_changed: true,
+    capabilities_changed: true,
+    ownership_changed: true,
+    contracts_changed: false,
+    abi_changed: false,
+    kind: DeltaKind::Modified
+  })
+  d.modified = modified
+  var ownership: Vec[OwnershipDelta] = Vec::new()
+  ownership.push(OwnershipDelta {
+    function: "m::B#fn()->unit".to_string(),
+    place: "p".to_string(),
+    before: "let".to_string(),
+    after: "inout".to_string()
+  })
+  d.ownership_delta = ownership
+  var effects: Vec[EffectDelta] = Vec::new()
+  var after_caps: Vec[String] = Vec::new()
+  after_caps.push("3".to_string())
+  effects.push(EffectDelta {
+    function: "m::B#fn()->unit".to_string(),
+    before: EffectSummaryView { bits: 0, capabilities: Vec::new() },
+    after: EffectSummaryView { bits: 7, capabilities: after_caps }
+  })
+  d.effect_delta = effects
+  var caps: Vec[CapabilityDelta] = Vec::new()
+  caps.push(CapabilityDelta {
+    function: "m::B#fn()->unit".to_string(),
+    capability: "cap1".to_string(),
+    before: Presence::Absent,
+    after: Presence::Present
+  })
+  d.capability_delta = caps
+  var affected: Vec[String] = Vec::new()
+  affected.push("m::A#fn()->unit".to_string())
+  affected.push("m::B#fn()->unit".to_string())
+  d.affected = affected
+  var calls: Vec[EdgeDelta] = Vec::new()
+  calls.push(EdgeDelta {
+    key: "m::A#fn()->unit|m::B#fn()->unit|0".to_string(),
+    kind: DeltaKind::Modified,
+    from: "m::A#fn()->unit".to_string(),
+    to: "m::B#fn()->unit".to_string()
+  })
+  d.call_delta = calls
+  d
+end
+
+# A row-only delta: create an unrelated symbol and observe it (the merge
+# test's disjoint side).
+def planning_lane_delta_other() -> SemanticDelta
+  var d = semantic_delta_empty()
+  d.created = Vec::from(["m::Z#fn()->unit".to_string()])
+  d.affected = Vec::from(["m::Z#fn()->unit".to_string()])
+  d
+end
+
+# Overlap through the affected envelope: the other delta also observes A.
+def planning_lane_delta_review() -> SemanticDelta
+  var d = semantic_delta_empty()
+  d.created = Vec::from(["m::Z#fn()->unit".to_string()])
+  var affected: Vec[String] = Vec::new()
+  affected.push("m::Z#fn()->unit".to_string())
+  affected.push("m::A#fn()->unit".to_string())
+  d.affected = affected
+  d
+end
+
+# The same write key as delta A (m::B).
+def planning_lane_delta_conflict_exact() -> SemanticDelta
+  var d = semantic_delta_empty()
+  var modified: Vec[EntityDelta] = Vec::new()
+  modified.push(EntityDelta {
+    stable_id: "m::B#fn()->unit".to_string(),
+    signature_changed: false,
+    mir_changed: true,
+    effects_changed: false,
+    capabilities_changed: false,
+    ownership_changed: false,
+    contracts_changed: false,
+    abi_changed: false,
+    kind: DeltaKind::Modified
+  })
+  d.modified = modified
+  d
+end
+
+# A DIFFERENT ownership target under the same owner root (m::B|q vs
+# m::B|p and the bare m::B).
+def planning_lane_delta_conflict_root() -> SemanticDelta
+  var d = semantic_delta_empty()
+  var ownership: Vec[OwnershipDelta] = Vec::new()
+  ownership.push(OwnershipDelta {
+    function: "m::B#fn()->unit".to_string(),
+    place: "q".to_string(),
+    before: "let".to_string(),
+    after: "sink".to_string()
+  })
+  d.ownership_delta = ownership
+  d
+end
+
+# The typed dependency graph of the W3 row: one row per family, all
+# pointing at the delta-A write keys (m::B / m::C).
+def planning_lane_graph() -> SemanticDependencyGraph
+  var g = SemanticDependencyGraph {}
+  g.type_uses = Vec::from([
+    TypeUseEdge { user: "m::T#struct{f:B}".to_string(), used_type: "m::B#fn()->unit".to_string() }
+  ])
+  g.layout_dependencies = Vec::from([
+    LayoutDependencyEdge { dependent_type: "m::D#struct{g:B}".to_string(), source_type: "m::B#fn()->unit".to_string() }
+  ])
+  g.generic_instantiations = Vec::from([
+    GenericInstantiationEdge { instance_key: "instance::m::G$Int".to_string(), template: "m::B#fn()->unit".to_string() }
+  ])
+  g.const_eval_dependencies = Vec::from([
+    ConstEvalDependencyEdge { dependent: "m::lower#fn()->int".to_string(), referenced_const: "m::B#fn()->unit".to_string() }
+  ])
+  g.derived_bodies = Vec::from([
+    DerivedBodyEdge { derived_key: "derived::d::_dispatch".to_string(), source_type: "m::B#fn()->unit".to_string() }
+  ])
+  g.trait_impls = Vec::from([
+    TraitImplEdge {
+      impl_key: "impl::m::S#struct{v:int}|as|m::B#fn()->unit".to_string(),
+      trait_key: "m::B#fn()->unit".to_string(),
+      self_type: "m::S#struct{v:int}".to_string()
+    }
+  ])
+  g.trait_selections = Vec::from([
+    TraitSelectionEdge {
+      function: "m::S::f#fn()->unit".to_string(),
+      trait_key: "m::B#fn()->unit".to_string(),
+      impl_key: "impl::m::S#struct{v:int}|as|m::B#fn()->unit".to_string()
+    }
+  ])
+  g.abi_dependencies = Vec::from([
+    AbiDependencyEdge { surface_id: "fn:m::F#fn(let:T[m::B])->unit".to_string(), type_key: "m::B#fn()->unit".to_string() }
+  ])
+  g.contract_references = Vec::from([
+    ContractReferenceEdge {
+      contract_id: "m::S::f#fn()->unit|Pre|bingt(path(m::C),int(0))".to_string(),
+      referenced_symbol: "m::C#fn()->unit".to_string()
+    }
+  ])
+  g
+end
+
+def planning_lane_write_read_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  let d = planning_lane_delta_a()
+
+  # W1 — the write set: modified B + created C + ownership target B|p
+  # (the effect target B is already the modified key; deduped).
+  let w = semantic_write_set_of_delta(&d)
+  planning_lane_keys(&mut out, "W1-write-set", w.keys.clone(), Vec::from([
+    "m::B#fn()->unit".to_string(),
+    "m::B#fn()->unit|p".to_string(),
+    "m::C#fn()->unit".to_string()
+  ]))
+
+  # W2 — the read set from the delta alone: affected {A, B} plus the call
+  # endpoints {A, B}.
+  let r = semantic_read_set_of_delta(&d)
+  planning_lane_keys(&mut out, "W2-read-set-delta", r.keys.clone(), Vec::from([
+    "m::A#fn()->unit".to_string(),
+    "m::B#fn()->unit".to_string()
+  ]))
+
+  # W3 — the read set with the typed graph: baseline plus one dependent per
+  # family (sorted).
+  let g = planning_lane_graph()
+  let rg = semantic_read_set_of_delta(&d, Option::Some(g))
+  planning_lane_keys(&mut out, "W3-read-set-graph", rg.keys.clone(), Vec::from([
+    "derived::d::_dispatch".to_string(),
+    "instance::m::G$Int".to_string(),
+    "m::A#fn()->unit".to_string(),
+    "m::B#fn()->unit".to_string(),
+    "m::D#struct{g:B}".to_string(),
+    "m::F#fn(let:T[m::B])->unit".to_string(),
+    "m::S#struct{v:int}".to_string(),
+    "m::S::f#fn()->unit".to_string(),
+    "m::T#struct{f:B}".to_string(),
+    "m::lower#fn()->int".to_string()
+  ]))
+
+  # E1 — the resource set: the three added class bits, the normalized
+  # capability texts (capability row cap1 + effect-view id 3 -> cap3), the
+  # allocation functions of the newly-alloc rows.
+  let res = effect_resource_set_of_delta(&d)
+  planning_lane_keys(&mut out, "E1-resources-effects", res.effects.clone(), Vec::from([
+    "alloc".to_string(), "block".to_string(), "io".to_string()
+  ]))
+  planning_lane_keys(&mut out, "E1-resources-capabilities", res.capabilities.clone(), Vec::from([
+    "cap1".to_string(), "cap3".to_string()
+  ]))
+  planning_lane_keys(&mut out, "E1-resources-allocations", res.allocations.clone(), Vec::from([
+    "m::B#fn()->unit".to_string()
+  ]))
+  out
+end
+
+# The R4 public-api delta: one replaced surface row (the symmetric
+# difference is the two rows — api_breaks 2).
+def planning_lane_api_delta() -> SemanticDelta
+  var d = semantic_delta_empty()
+  d.public_api_delta = AbiDeltaView {
+    surface_id: "api".to_string(),
+    before: AbiSurfaceView { rows: Vec::from(["0xaa Function m::pub#fn()->unit".to_string()]) },
+    after: AbiSurfaceView { rows: Vec::from(["0xbb Function m::pub#fn()->unit".to_string()]) }
+  }
+  d
+end
+
+# The R5 abi delta: one replaced surface row (abi_breaks 2).
+def planning_lane_abi_delta() -> SemanticDelta
+  var d = semantic_delta_empty()
+  d.abi_delta = AbiDeltaView {
+    surface_id: "abi".to_string(),
+    before: AbiSurfaceView { rows: Vec::from(["surface=fn:m::pub#fn()->unit;symbol=m::pub#fn()->unit;size=8".to_string()]) },
+    after: AbiSurfaceView { rows: Vec::from(["surface=fn:m::pub#fn()->unit;symbol=m::pub#fn()->unit;size=16".to_string()]) }
+  }
+  d
+end
+
+# The R2 delta: one modified symbol, no rows.
+def planning_lane_modified_only() -> SemanticDelta
+  var d = semantic_delta_empty()
+  var modified: Vec[EntityDelta] = Vec::new()
+  modified.push(EntityDelta {
+    stable_id: "m::B#fn()->unit".to_string(),
+    signature_changed: false,
+    mir_changed: true,
+    effects_changed: false,
+    capabilities_changed: false,
+    ownership_changed: false,
+    contracts_changed: false,
+    abi_changed: false,
+    kind: DeltaKind::Modified
+  })
+  d.modified = modified
+  d.affected = Vec::from(["m::B#fn()->unit".to_string()])
+  d
+end
+
+# The R3 delta: one effect row newly carrying spawn (bit 8).
+def planning_lane_effect_delta() -> SemanticDelta
+  var d = semantic_delta_empty()
+  var effects: Vec[EffectDelta] = Vec::new()
+  effects.push(EffectDelta {
+    function: "m::B#fn()->unit".to_string(),
+    before: EffectSummaryView { bits: 0, capabilities: Vec::new() },
+    after: EffectSummaryView { bits: 8, capabilities: Vec::new() }
+  })
+  d.effect_delta = effects
+  d
+end
+
+# The R6 delta: a Pre clause strengthened (x > 0 -> x > 1) — the
+# kind-aware orientation classifies it Breaking.
+def planning_lane_contract_delta() -> SemanticDelta
+  var d = semantic_delta_empty()
+  var rows: Vec[ContractDelta] = Vec::new()
+  rows.push(ContractDelta {
+    contract_id: "m::B#fn()->unit|Pre|bingt(ident(x),int(0))".to_string(),
+    before: Option::Some(ContractSemantic {
+      kind: "Pre".to_string(),
+      expression_fingerprint: "0xpre0".to_string(),
+      canonical_text: "bingt(ident(x),int(0))".to_string(),
+      message: Option::None
+    }),
+    after: Option::Some(ContractSemantic {
+      kind: "Pre".to_string(),
+      expression_fingerprint: "0xpre1".to_string(),
+      canonical_text: "bingt(ident(x),int(1))".to_string(),
+      message: Option::None
+    })
+  })
+  d.contract_delta = rows
+  d
+end
+
+def planning_risk_expect(
+  inout out: Vec[String],
+  name: String,
+  rv: RiskVector,
+  api: Int,
+  abi: Int,
+  eff: Int,
+  cap: Int,
+  uns: Int,
+  ownership: Int,
+  contract: Int,
+  affected: Int,
+  word: String
+) -> Unit
+  planning_lane_int(&mut out, name + "-api", rv.api_breaks, api)
+  planning_lane_int(&mut out, name + "-abi", rv.abi_breaks, abi)
+  planning_lane_int(&mut out, name + "-effect", rv.effect_additions, eff)
+  planning_lane_int(&mut out, name + "-capability", rv.capability_additions, cap)
+  planning_lane_int(&mut out, name + "-unsafe", rv.unsafe_additions, uns)
+  planning_lane_int(&mut out, name + "-ownership", rv.ownership_changes, ownership)
+  planning_lane_int(&mut out, name + "-contract", rv.contract_breaks, contract)
+  planning_lane_int(&mut out, name + "-affected", rv.affected_count, affected)
+  planning_lane_text(&mut out, name + "-word", rv.risk_word, word)
+end
+
+def planning_lane_risk_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # R1 — the empty delta under the fail-closed empty budget: no rows, no
+  # violations, score 0 -> low.
+  planning_risk_expect(&mut out, "R1-empty", risk_vector_of_delta(&semantic_delta_empty(), &ChangeBudget {}),
+    0, 0, 0, 0, 0, 0, 0, 0, "low")
+
+  # R2 — a modified symbol whose declaration the budget allows and whose
+  # affected tiebreak is 1 -> medium.
+  let b_key = "m::B#fn()->unit".to_string()
+  var syms: Set[StableDeclId] = Set::new()
+  syms.insert(stable_decl_of_key(&b_key))
+  let budget_r2 = ChangeBudget { allowed_symbols: syms }
+  planning_risk_expect(&mut out, "R2-modified", risk_vector_of_delta(&planning_lane_modified_only(), &budget_r2),
+    0, 0, 0, 0, 0, 0, 0, 1, "medium")
+
+  # R3 — one newly added spawn class, the budget authorizing the row's
+  # function key -> high (score 10).
+  var effect_allow: Set[String] = Set::new()
+  effect_allow.insert("m::B#fn()->unit".to_string())
+  let budget_r3 = ChangeBudget { allowed_effect_additions: effect_allow }
+  planning_risk_expect(&mut out, "R3-effect", risk_vector_of_delta(&planning_lane_effect_delta(), &budget_r3),
+    0, 0, 1, 0, 0, 0, 0, 0, "high")
+
+  # R4 — one replaced public-api row under the count fallback: api_breaks 2
+  # and the violation forces critical.
+  planning_risk_expect(&mut out, "R4-api", risk_vector_of_delta(&planning_lane_api_delta(), &ChangeBudget {}),
+    2, 0, 0, 0, 0, 0, 0, 0, "critical")
+
+  # R5 — one replaced abi row: abi_breaks 2 alone is critical.
+  planning_risk_expect(&mut out, "R5-abi", risk_vector_of_delta(&planning_lane_abi_delta(), &ChangeBudget {}),
+    0, 2, 0, 0, 0, 0, 0, 0, "critical")
+
+  # R6 — a Pre strengthening: contract_breaks 1 -> critical.
+  planning_risk_expect(&mut out, "R6-contract", risk_vector_of_delta(&planning_lane_contract_delta(), &ChangeBudget {}),
+    0, 0, 0, 0, 0, 0, 1, 0, "critical")
+
+  out
+end
+
+def planning_lane_merge_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  let a = planning_lane_delta_a()
+
+  # M1 — disjoint write + affected sets: independent.
+  let m1 = semantic_merge_risk(&a, &planning_lane_delta_other())
+  planning_lane_keys(&mut out, "M1-overlaps", m1.overlapping_symbols.clone(), Vec::new())
+  planning_lane_keys(&mut out, "M1-conflicts", m1.write_conflicts.clone(), Vec::new())
+  planning_lane_text(&mut out, "M1-verdict", m1.verdict.clone(), "independent")
+
+  # M2 — writes disjoint, but both deltas affect m::A: review.
+  let m2 = semantic_merge_risk(&a, &planning_lane_delta_review())
+  planning_lane_keys(&mut out, "M2-overlaps", m2.overlapping_symbols.clone(), Vec::from([
+    "m::A#fn()->unit".to_string()
+  ]))
+  planning_lane_keys(&mut out, "M2-conflicts", m2.write_conflicts.clone(), Vec::new())
+  planning_lane_text(&mut out, "M2-verdict", m2.verdict.clone(), "review")
+
+  # M3 — both write m::B: conflict (the same key plus A's m::B|p write,
+  # whose owner root is m::B too).
+  let m3 = semantic_merge_risk(&a, &planning_lane_delta_conflict_exact())
+  planning_lane_keys(&mut out, "M3-conflicts", m3.write_conflicts.clone(), Vec::from([
+    "m::B#fn()->unit".to_string(),
+    "m::B#fn()->unit|p".to_string()
+  ]))
+  planning_lane_text(&mut out, "M3-verdict", m3.verdict.clone(), "conflict")
+
+  # M4 — m::B|q vs the m::B / m::B|p writes: same owner root -> conflict
+  # (the union of the conflicting keys, sorted).
+  let m4 = semantic_merge_risk(&a, &planning_lane_delta_conflict_root())
+  planning_lane_keys(&mut out, "M4-conflicts", m4.write_conflicts.clone(), Vec::from([
+    "m::B#fn()->unit".to_string(),
+    "m::B#fn()->unit|p".to_string(),
+    "m::B#fn()->unit|q".to_string()
+  ]))
+  planning_lane_text(&mut out, "M4-verdict", m4.verdict.clone(), "conflict")
+
+  out
+end
+
+def planning_lane_local(lid: Int, name: String, ty: Type) -> MirLocal
+  MirLocal { id: MirLocalId { id: lid }, name: name, ty: ty, is_mut: false, span: span_dummy() }
+end
+
+def planning_lane_block(id: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: id }, statements: stmts, terminator: term }
+end
+
+def planning_lane_arg(effect: AccessEffect, lid: Int) -> MirCallArg
+  MirCallArg {
+    effect: effect,
+    value: MirCallValue::Value(operand_copy(place_local(MirLocalId { id: lid })))
+  }
+end
+
+def planning_lane_call(name: String, dest_lid: Int, args: Vec[MirCallArg], success: Int) -> MirTerminator
+  MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: place_local(MirLocalId { id: dest_lid }),
+      func: MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirFnItem(name),
+          ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+          instance: Option::None
+        })
+      },
+      args: args,
+      success: MirBlockId { id: success },
+      unwind: Option::None,
+      intrinsic: Option::None
+    },
+    span: span_dummy()
+  }
+end
+
+def planning_lane_return() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def planning_lane_fn(name: String, locals: Vec[MirLocal], blocks: Vec[MirBlock]) -> MirFunction
+  MirFunction {
+    name: name,
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "",
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+# The F2/F3 fixture: one let/inout/sink call function and one
+# pointer-argument barrier function.
+def planning_lane_memory_fixture() -> MirProgram
+  var locals_a: Vec[MirLocal] = Vec::new()
+  locals_a.push(planning_lane_local(0, "_ret", Type::Unit))
+  locals_a.push(planning_lane_local(1, "a", Type::Int))
+  locals_a.push(planning_lane_local(2, "b", Type::Int))
+  locals_a.push(planning_lane_local(3, "c", Type::Int))
+  locals_a.push(planning_lane_local(4, "dest", Type::Int))
+  var args_a: Vec[MirCallArg] = Vec::new()
+  args_a.push(planning_lane_arg(AccessEffect::Read, 1))
+  args_a.push(planning_lane_arg(AccessEffect::Modify, 2))
+  args_a.push(planning_lane_arg(AccessEffect::Consume, 3))
+  var blocks_a: Vec[MirBlock] = Vec::new()
+  blocks_a.push(planning_lane_block(0, Vec::new(),
+    planning_lane_call("lane_let_inout_sink".to_string(), 4, args_a, 1)))
+  blocks_a.push(planning_lane_block(1, Vec::new(), planning_lane_return()))
+
+  var locals_b: Vec[MirLocal] = Vec::new()
+  locals_b.push(planning_lane_local(0, "_ret", Type::Unit))
+  locals_b.push(planning_lane_local(1, "p", Type::Ptr(Type::Int)))
+  locals_b.push(planning_lane_local(2, "q", Type::Int))
+  locals_b.push(planning_lane_local(3, "out", Type::Int))
+  var args_b: Vec[MirCallArg] = Vec::new()
+  args_b.push(planning_lane_arg(AccessEffect::Read, 1))
+  var blocks_b: Vec[MirBlock] = Vec::new()
+  blocks_b.push(planning_lane_block(0, Vec::new(),
+    planning_lane_call("lane_barrier".to_string(), 3, args_b, 1)))
+  blocks_b.push(planning_lane_block(1, Vec::new(), planning_lane_return()))
+
+  var functions: Vec[MirFunction] = Vec::new()
+  functions.push(planning_lane_fn("mem_lane".to_string(), locals_a, blocks_a))
+  functions.push(planning_lane_fn("mem_barrier".to_string(), locals_b, blocks_b))
+  MirProgram { functions: functions, statics: Vec::new(), types: Vec::new() }
+end
+
+def planning_lane_memory_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # F1 — no MirProgram: no facts.
+  planning_lane_bool(&mut out, "F1-empty", semantic_memory_facts_of_mir().is_empty())
+
+  # F2/F3 — the fixture's facts, rendered and sorted by the canonical text.
+  let program = planning_lane_memory_fixture()
+  let facts = semantic_memory_facts_of_mir(Option::Some(program))
+  var got: Vec[String] = Vec::new()
+  for fact in facts do
+    got.push(planning_memory_fact_text(&fact))
+  end
+  planning_lane_keys(&mut out, "F2-facts", got, Vec::from([
+    "mem_barrier|_ret|read=true|write=true|exclusive=false|consumed=false",
+    "mem_barrier|out|read=true|write=true|exclusive=false|consumed=false",
+    "mem_barrier|p|read=true|write=true|exclusive=false|consumed=false",
+    "mem_barrier|q|read=true|write=true|exclusive=false|consumed=false",
+    "mem_lane|a|read=true|write=false|exclusive=false|consumed=false",
+    "mem_lane|b|read=true|write=true|exclusive=true|consumed=false",
+    "mem_lane|c|read=true|write=false|exclusive=false|consumed=true",
+    "mem_lane|dest|read=false|write=true|exclusive=false|consumed=false"
+  ]))
+  out
+end
+
+# Run every sub-lane; the returned list names every mismatch (empty = the
+# whole lane verifies). Exported for a behavior lane.
+pub def semantic_planning_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  for row in planning_lane_write_read_check() do
+    out.push(row)
+  end
+  for row in planning_lane_risk_check() do
+    out.push(row)
+  end
+  for row in planning_lane_merge_check() do
+    out.push(row)
+  end
+  for row in planning_lane_memory_check() do
+    out.push(row)
+  end
+  out
+end

@@ -33,6 +33,7 @@ use tg_compiler::asm::{
   a64_ldrb, a64_strb, a64_ldrh, a64_strh, a64_ldr_w, a64_str_w,
   a64_ldr_post, a64_stp_pre, a64_ldp_post,
   a64_bl, a64_blr, a64_ret, a64_b, a64_bcond, a64_brk,
+  a64_cbz, a64_cbnz,
   a64_svc, a64_udf, a64_nop, a64_lsl, a64_lsl_rrr,
   a64_sdiv_rrr, a64_udiv, a64_msub, a64_csel, a64_add_rrr_lsl, a64_lsr,
   a64_cc_eq, a64_cc_ne, a64_cc_lt, a64_cc_le, a64_cc_gt, a64_cc_ge, a64_cc_cs, a64_cc_cc,
@@ -102,6 +103,177 @@ def emit_all_runtime(inout ctx: RuntimeEmitCtx) -> Unit
   emit_wasi_host_runtime(ctx)
   emit_bump_alloc_runtime(ctx)
   emit_tg_clock_ns(ctx)
+end
+
+# ———————————————————————————————————————————————————————————————
+# The coverage counter dump (third-audit item 34 — the runtime producer)
+# ———————————————————————————————————————————————————————————————
+# _tg_cov_dump() writes the program's coverage counters in the
+# tg.cov.trace.v1 grammar (coverage_graph.tg) to the compiled-in dump path
+# and returns. Callers: the LIR route emits a call before every Return of
+# the user "main"/"_start" when --coverage is on (see lir.tg's
+# lir_emit_term); the helper is emitted into the runtime stream ONLY for
+# those builds (emit_tg_cov_dump is called by lir_compile_object_cov /
+# lir_link_object_cov when the emission plan is enabled), so every symbol
+# it references exists in that object:
+#   _tg_cov_path_len / _tg_cov_path_text — the dump path ("-" = stdout)
+#   _tg_cov_header                      — "tg.cov.trace.v1\n" (17 bytes)
+#   _tg_cov_test_prefix / _tg_cov_newline — "test|" / "\n"
+#   _tg_saved_argc / _tg_saved_argv     — the entry capture; argv[1] (the
+#                                         `tg test` test name convention)
+#                                         is bound as `test|<argv[1]>`
+#   _tg_cov_total / _tg_cov_counters    — the global counter count and the
+#                                         program-level .bss counter array
+#   _tg_cov_rows                        — the embedded row blob: one 16-byte
+#                                         record per counter index
+#                                         {u64 offset from blob base,
+#                                         u64 length} then the pre-rendered
+#                                         trace row texts, INDEX order.
+# The dump is deterministic: rows are emitted in global index order, and
+# only slots whose 8-byte count is > 0 produce a line. I/O is best-effort
+# (a failed open leaves no trace; a failed write is ignored) — the dump
+# never changes the program's exit status. The routine preserves x19-x28
+# and clobbers x0-x18 (AAPCS).
+def emit_tg_cov_dump(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_cov_dump")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    let open_lbl = fresh_label(ctx, ".Lcov_open")
+    let have_fd_lbl = fresh_label(ctx, ".Lcov_have_fd")
+    let header_lbl = fresh_label(ctx, ".Lcov_header")
+    let no_test_lbl = fresh_label(ctx, ".Lcov_no_test")
+    let test_len_lbl = fresh_label(ctx, ".Lcov_test_len")
+    let test_done_lbl = fresh_label(ctx, ".Lcov_test_done")
+    let loop_lbl = fresh_label(ctx, ".Lcov_loop")
+    let skip_lbl = fresh_label(ctx, ".Lcov_skip")
+    let done_lbl = fresh_label(ctx, ".Lcov_done")
+    let no_close_lbl = fresh_label(ctx, ".Lcov_no_close")
+
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X25, A64::X26, A64::SP, -16)
+
+    # The "-" path selects stdout without opening a file.
+    cov_a64_addr(ctx, A64::X9, "_tg_cov_path_len".to_string())
+    a64_ldr(&mut ctx.text, A64::X9, A64::X9, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 1)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), open_lbl.clone())
+    cov_a64_addr(ctx, A64::X9, "_tg_cov_path_text".to_string())
+    a64_ldrb(&mut ctx.text, A64::X10, A64::X9, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X10, 45)   # '-'
+    a64_bcond(&mut ctx.text, a64_cc_ne(), open_lbl.clone())
+    a64_mov_ri(&mut ctx.text, A64::X19, 1)
+    a64_b(&mut ctx.text, header_lbl.clone())
+
+    def_label(&mut ctx.text, open_lbl.clone())
+    cov_a64_addr(ctx, A64::X0, "_tg_cov_path_text".to_string())
+    a64_mov_ri(&mut ctx.text, A64::X1, 577)   # O_WRONLY|O_CREAT|O_TRUNC
+    a64_mov_ri(&mut ctx.text, A64::X2, 420)   # 0644
+    a64_bl(&mut ctx.text, "libc_open")
+    a64_cmp_ri(&mut ctx.text, A64::X0, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), have_fd_lbl.clone())
+    a64_mov_ri(&mut ctx.text, A64::X19, 0)    # no fd: the dump is skipped
+    a64_b(&mut ctx.text, done_lbl.clone())
+    def_label(&mut ctx.text, have_fd_lbl.clone())
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)
+
+    def_label(&mut ctx.text, header_lbl.clone())
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+    cov_a64_addr(ctx, A64::X1, "_tg_cov_header".to_string())
+    a64_mov_ri(&mut ctx.text, A64::X2, 17)
+    a64_bl(&mut ctx.text, "_tg_posix_write")
+
+    # The optional test bind: argv[1] when the entry captured it.
+    cov_a64_addr(ctx, A64::X9, "_tg_saved_argc".to_string())
+    a64_ldr(&mut ctx.text, A64::X9, A64::X9, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 2)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), no_test_lbl.clone())
+    cov_a64_addr(ctx, A64::X9, "_tg_saved_argv".to_string())
+    a64_ldr(&mut ctx.text, A64::X9, A64::X9, 0)
+    a64_cbz(&mut ctx.text, A64::X9, no_test_lbl.clone())
+    a64_ldr(&mut ctx.text, A64::X20, A64::X9, 8)
+    a64_cbz(&mut ctx.text, A64::X20, no_test_lbl.clone())
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X20)
+    def_label(&mut ctx.text, test_len_lbl.clone())
+    a64_ldrb(&mut ctx.text, A64::X22, A64::X21, 0)
+    a64_cbz(&mut ctx.text, A64::X22, test_done_lbl.clone())
+    a64_add_rri(&mut ctx.text, A64::X21, A64::X21, 1)
+    a64_b(&mut ctx.text, test_len_lbl.clone())
+    def_label(&mut ctx.text, test_done_lbl.clone())
+    a64_sub_rrr(&mut ctx.text, A64::X2, A64::X21, A64::X20)
+    a64_cbz(&mut ctx.text, A64::X2, no_test_lbl.clone())
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+    cov_a64_addr(ctx, A64::X1, "_tg_cov_test_prefix".to_string())
+    a64_mov_ri(&mut ctx.text, A64::X2, 5)
+    a64_bl(&mut ctx.text, "_tg_posix_write")
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X20)
+    a64_sub_rrr(&mut ctx.text, A64::X2, A64::X21, A64::X20)
+    a64_bl(&mut ctx.text, "_tg_posix_write")
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+    cov_a64_addr(ctx, A64::X1, "_tg_cov_newline".to_string())
+    a64_mov_ri(&mut ctx.text, A64::X2, 1)
+    a64_bl(&mut ctx.text, "_tg_posix_write")
+
+    # One line per nonzero counter, in global index order.
+    def_label(&mut ctx.text, no_test_lbl.clone())
+    cov_a64_addr(ctx, A64::X20, "_tg_cov_counters".to_string())
+    cov_a64_addr(ctx, A64::X23, "_tg_cov_rows".to_string())
+    cov_a64_addr(ctx, A64::X22, "_tg_cov_total".to_string())
+    a64_ldr(&mut ctx.text, A64::X22, A64::X22, 0)
+    a64_mov_ri(&mut ctx.text, A64::X21, 0)
+    def_label(&mut ctx.text, loop_lbl.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X21, A64::X22)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), done_lbl.clone())
+    a64_add_rrr_lsl(&mut ctx.text, A64::X10, A64::X20, A64::X21, 3)
+    a64_ldr(&mut ctx.text, A64::X10, A64::X10, 0)
+    a64_cbz(&mut ctx.text, A64::X10, skip_lbl.clone())
+    a64_add_rrr_lsl(&mut ctx.text, A64::X11, A64::X23, A64::X21, 4)
+    a64_ldr(&mut ctx.text, A64::X24, A64::X11, 0)
+    a64_ldr(&mut ctx.text, A64::X25, A64::X11, 8)
+    a64_add_rrr(&mut ctx.text, A64::X24, A64::X23, A64::X24)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+    a64_mov_rr(&mut ctx.text, A64::X1, A64::X24)
+    a64_mov_rr(&mut ctx.text, A64::X2, A64::X25)
+    a64_bl(&mut ctx.text, "_tg_posix_write")
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+    cov_a64_addr(ctx, A64::X1, "_tg_cov_newline".to_string())
+    a64_mov_ri(&mut ctx.text, A64::X2, 1)
+    a64_bl(&mut ctx.text, "_tg_posix_write")
+    def_label(&mut ctx.text, skip_lbl.clone())
+    a64_add_rri(&mut ctx.text, A64::X21, A64::X21, 1)
+    a64_b(&mut ctx.text, loop_lbl.clone())
+
+    def_label(&mut ctx.text, done_lbl.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X19, 2)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), no_close_lbl.clone())
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+    a64_bl(&mut ctx.text, "_tg_posix_close")
+    def_label(&mut ctx.text, no_close_lbl.clone())
+    a64_ldp_post(&mut ctx.text, A64::X25, A64::X26, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    # The x86-64 LIR route rejects --coverage before emission (no counter
+    # data exists); a defensive empty body keeps the arch match total.
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# The ADRP+ADD address-materialization pair for one of the coverage data
+# symbols (the runtime's global-data reference convention — see the
+# allocator runtime's _tg_alloc_* references).
+def cov_a64_addr(inout ctx: RuntimeEmitCtx, reg: A64, sym: String) -> Unit
+  add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, sym.clone(), 0)
+  emit32_le(&mut ctx.text, 0x90000000 | a64_code(reg))
+  add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, sym.clone(), 0)
+  a64_add_rri(&mut ctx.text, reg, reg, 0)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -853,10 +1025,17 @@ end
 # closed with a trap instead of fabricating a record. The budget state (the
 # former __tg_budget_* .data counter table) moved into each budgeted
 # function's STACK FRAME (FrameInfo.budget_alloc_offset /
-# budget_time_offset — per-invocation counters and entry stamps, nesting-
-# and concurrency-safe); the runtime emits no budget data symbols and the
+# budget_time_offset / budget_instr_offset — per-invocation counters,
+# entry stamps and the executed-statement counter, nesting- and
+# concurrency-safe); the runtime emits no budget data symbols and the
 # budget enforcement arms are real (see the budget arms in
-# codegen_statement).
+# codegen_statement). The three per-frame slots are the materialized
+# @budget guarantees (third-audit item 45): the ALLOCATION counter
+# (incremented at every MirBudgetConsume("alloc", _)), the TIME entry
+# stamp + exit elapsed check (__tg_clock_ns below), and the INSTRUCTIONS
+# counter (incremented once per emitted statement, checked at every
+# MirReturn by MirBudgetConsume("instructions", _)); a path exceeding any
+# declared limit traps (budget exhausted).
 # _tg_regex_match: the kernel-closure regex matcher (the documented simple
 # subset — the literal substring search; the anchored ^...$ forms).
 # ABI: X0/RDI = text ptr, X1/RSI = text len, X2/RDX = pattern ptr,
