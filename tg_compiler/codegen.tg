@@ -5198,6 +5198,21 @@ def emit_enum_eq_helper_body(inout ctx: CodegenCtx, ty: Type) -> Unit
     emit_jcc(ctx, CondKind::Eq, lbl_true.clone())
     emit_load_mem(ctx, dst, fp, saved_left_offset as i32)
     emit_load_mem(ctx, scratch, fp, saved_right_offset as i32)
+    # A NonZero-style ADT payload's word is the wrapper's heap IMAGE
+    # address (codegen aggregates are heap-backed): compare its single
+    # integer field at the field's layout offset. A pointer/Bool scalar
+    # payload compares the word directly.
+    match enum_niche_payload_type(ctx.layout_engine.clone(), ty)
+    when Option::Some(eq_payload_ty) then
+      match eq_payload_ty
+      when Type::Adt(_, _) then
+        let eq_wrapper_field_off = field_offset(&mut ctx.layout_engine, &eq_payload_ty, 0)
+        emit_load_mem(ctx, dst, dst, eq_wrapper_field_off as i32)
+        emit_load_mem(ctx, scratch, scratch, eq_wrapper_field_off as i32)
+      when _ then ()
+      end
+    when Option::None then ()
+    end
     emit_cmp_rr(ctx, dst, scratch)
     emit_jcc(ctx, CondKind::Eq, lbl_true.clone())
     emit_jmp(ctx, lbl_false.clone())
@@ -5851,13 +5866,17 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
         when Projection::Field(fid) then
  # the offset comes from the layout engine, resolved through
  # the CONCRETE projected type (— the place's current type
-          # carries the Adt args; a generic def's field is substituted).
+           # carries the Adt args; a generic def's field is substituted).
           let field_off = projected_field_offset(ctx, &fid, &downcast_variant, &current_ty)
           emit_add_ri(ctx, base, field_off as i32)
+          # A field of an address-backed value is an address; a niched
+          # enum field's storage lives exactly there.
+          niched_store_addr_known = true
           current_ty = projected_field_type(ctx, &fid, &downcast_variant, &current_ty)
         when Projection::TupleIndex(idx) then
           let field_off = projected_tuple_offset(ctx, &current_ty, idx)
           emit_add_ri(ctx, base, field_off as i32)
+          niched_store_addr_known = true
           current_ty = projected_tuple_type(ctx, &current_ty, idx)
         when Projection::Variant(vid) then
           downcast_variant = Option::Some(vid)
@@ -6983,24 +7002,48 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
  # the offset comes from the layout engine, resolved through
  # the CONCRETE projected type.
         let offset = projected_field_offset(ctx, &fid, &downcast_variant, &current_ty)
+        let addr_field_ty = projected_field_type(ctx, &fid, &downcast_variant, &current_ty)
         if is_last then
           if offset != 0 then
             emit_add_ri(ctx, dst, offset as i32)
           end
+          niched_addr_known = true
         else
-          emit_load_mem(ctx, dst, dst, offset as i32)
+          let next_is_variant = projection_is_variant(&place.projections[i + 1])
+          if next_is_variant && enum_layout_is_niched(ctx, &addr_field_ty) then
+            # The field IS the niched enum's inline storage: keep its
+            # ADDRESS (the next Variant downcast must not dereference it).
+            if offset != 0 then
+              emit_add_ri(ctx, dst, offset as i32)
+            end
+            niched_addr_known = true
+          else
+            emit_load_mem(ctx, dst, dst, offset as i32)
+            niched_addr_known = false
+          end
         end
-        current_ty = projected_field_type(ctx, &fid, &downcast_variant, &current_ty)
+        current_ty = addr_field_ty
       when Projection::TupleIndex(idx) then
         let offset = projected_tuple_offset(ctx, &current_ty, idx)
+        let addr_tuple_ty = projected_tuple_type(ctx, &current_ty, idx)
         if is_last then
           if offset != 0 then
             emit_add_ri(ctx, dst, offset as i32)
           end
+          niched_addr_known = true
         else
-          emit_load_mem(ctx, dst, dst, offset as i32)
+          let next_is_variant = projection_is_variant(&place.projections[i + 1])
+          if next_is_variant && enum_layout_is_niched(ctx, &addr_tuple_ty) then
+            if offset != 0 then
+              emit_add_ri(ctx, dst, offset as i32)
+            end
+            niched_addr_known = true
+          else
+            emit_load_mem(ctx, dst, dst, offset as i32)
+            niched_addr_known = false
+          end
         end
-        current_ty = projected_tuple_type(ctx, &current_ty, idx)
+        current_ty = addr_tuple_ty
       when Projection::ProjIndex(local_id) then
         let is_byte_indexed = is_string_like_type(ctx, &current_ty)
         if is_heap_collection_type(ctx, &current_ty) then
@@ -8065,8 +8108,8 @@ def codegen_terminator(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, term: Mi
   when MirTerminatorKind::MirUnreachable then
     emit_trap(ctx)
 
-  when MirTerminatorKind::MirCall(dest, callee, args, success, unwind, intrinsic) then
-    codegen_call(ctx, fctx, dest, callee, args, success, unwind, intrinsic)
+  when MirTerminatorKind::MirCall(dest, callee, args, success, unwind, intrinsic, tail) then
+    codegen_call(ctx, fctx, dest, callee, args, success, unwind, intrinsic, tail)
 
   when MirTerminatorKind::MirDeinit(place, deinit_instance, target, unwind) then
     codegen_finalizer_call(ctx, fctx, &place, &deinit_instance)
@@ -8381,7 +8424,36 @@ def resolve_callee_label(ctx: CodegenCtx, name: String) -> String
   end  end
 end
 
-def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, callee: MirOperand, args: Vec[MirCallArg], success: MirBlockId, unwind: Option[MirBlockId], intrinsic: Option[IntrinsicId]) -> Unit
+# The map/set record-visit runtime helpers whose FIXED runtime ABI returns
+# the pre-niche TAGGED enum image word in the return register (the
+# __intrinsic_{map,set}_visit_{begin,next} family; runtime.tg's
+# emit_tg_map_visit_*). A niched destination must decode that word (see
+# codegen_call's decode_visit_tagged_return).
+def is_visit_runtime_enum_name(name: String) -> Bool
+  name == "__intrinsic_map_visit_begin" ||
+    name == "__intrinsic_map_visit_next" ||
+    name == "__intrinsic_set_visit_begin" ||
+    name == "__intrinsic_set_visit_next"
+end
+
+# (third-audit item 37) The direct route's tail-jump emission gate as one
+# pure predicate — codegen_call consults it and the lane suite pins its
+# rows. ADVISORY marker: FALSE means "emit the ordinary call" (correctness
+# never depends on it). Inputs:
+#   tail                 the MIR pass's marker;
+#   direct_compiled      the callee is a MirFnItem present in reachable_fns
+#                        (not an extern/variadic extern, no intrinsic);
+#   closure_shift        the closure capture shift (must be 0);
+#   eff_total_args       effective argument slots, max_ra the register count
+#                        (must fit: the frame restore discards stack slots);
+#   sret                 the call lowers through the sret return ABI (the
+#                        copy-out is an epilogue action a jump skips);
+#   dest_is_return_place dest is the bare return place (local 0).
+pub def codegen_tail_eligible(tail: Bool, direct_compiled: Bool, closure_shift: Int, eff_total_args: Int, max_ra: Int, sret: Bool, dest_is_return_place: Bool) -> Bool
+  tail && direct_compiled && closure_shift == 0 && eff_total_args <= max_ra && !sret && dest_is_return_place
+end
+
+def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, callee: MirOperand, args: Vec[MirCallArg], success: MirBlockId, unwind: Option[MirBlockId], intrinsic: Option[IntrinsicId], tail: Bool) -> Unit
   let arch   = ctx.target.arch
   let rr     = ret_reg(arch)
   let scratch = scratch2_reg(arch)
@@ -8403,7 +8475,9 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
   let dest_ty = place_type(ctx, fctx, dest)
   var sret_dest_off: i32 = 0
   var sret_dest_ok = false
+  var dest_sret_class = false
   if classify_return(ctx, fctx, dest, &dest_ty) == AbiReturn::IndirectSret then
+    dest_sret_class = true
     match fctx.var_locs.get(dest.local.id)
     when Option::Some(loc) then
       match loc
@@ -8446,6 +8520,10 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
     end
   end
   var did_sret = false
+  # The map/set record-visit runtime helpers return the PRE-NICHE tagged
+  # {tag, payload} image word (their fixed runtime ABI): decode it into the
+  # niched form the destination type's EnumLayout now uses.
+  var decode_visit_tagged_return = false
   # The intrinsic arms that materialize the FULL result image into the
   # destination place themselves (the ArrayGet/ArrayRemove ScalarPair/
   # ByAddress paths) report it through codegen_intrinsic's Bool result;
@@ -8657,6 +8735,31 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
     closure_ptr_depth = 1 + (eff_total_args - max_ra)
   end
 
+  # (third-audit item 37) Tail-call emission gate — the marker is ADVISORY:
+  # the MIR pass proved the call is in tail position; this route re-checks
+  # the conditions its own frame/ABI machinery needs through
+  # codegen_tail_eligible (direct compiled callee, no closure shift, all
+  # arguments register-resident, non-sret, return-place destination) and
+  # falls back to the ordinary call when any fails (correctness never
+  # depends on the marker).
+  var direct_compiled = false
+  match intrinsic
+  when Option::None then
+    match callee.kind
+    when MirOperandKind::MirConstant(cst) then
+      match cst.kind
+      when MirConstantKind::MirFnItem(tail_fn_name) then
+        if !ctx.extern_variadic_fns.contains(&tail_fn_name) && ctx.reachable_fns.contains(&tail_fn_name) then
+          direct_compiled = true
+        end
+      when _ then ()
+      end
+    when _ then ()
+    end
+  when Option::Some(_) then ()
+  end
+  let tail_ok = codegen_tail_eligible(tail, direct_compiled, closure_shift, eff_total_args, max_ra, dest_sret_class, dest.local.id == 0 && dest.projections.is_empty())
+
   # Call the function
   match callee.kind
   when MirOperandKind::MirConstant(cst) then
@@ -8667,6 +8770,9 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
       var resolved_fn_name = fn_name.clone()
       if fn_name.len() > 1 && fn_name.slice(0, 1) == "." then
         resolved_fn_name = resolve_dot_method(ctx, fctx, fn_name, &arg_ops)
+      end
+      if is_visit_runtime_enum_name(&resolved_fn_name) && enum_layout_is_niched(ctx, &dest_ty) then
+        decode_visit_tagged_return = true
       end
       let intr_name = bare_intrinsic_name(&resolved_fn_name)
  # (IntrinsicId at check time): the ONE semantic classification —
@@ -8857,6 +8963,16 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
             # instance name to the emitted body's label. The label itself comes
             # from the single authority resolve_callee_label.
             let resolved = resolve_callee_label(ctx, &resolved_fn_name)
+            if tail_ok then
+              # Tail jump: restore the caller's callee-saved registers and
+              # frame (no ret), then branch to the callee entry. The callee
+              # returns to OUR caller with its own return value in rr — the
+              # destination store, stack-arg cleanup and success jump are
+              # all skipped by the return below.
+              codegen_tail_restore(ctx, fctx)
+              emit_jmp(ctx, resolved)
+              return
+            end
             if sret_dest_ok then
               # Pass &dest in x8 for sret-returning callee
               emit_lea_fp(ctx, PhysReg::A64Reg(A64::X8), sret_dest_off)
@@ -8915,6 +9031,23 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
   end
 
   # Store return value
+  if decode_visit_tagged_return then
+    # The record-visit runtime helpers return the TAGGED image word
+    # {tag @ 0, payload @ 8} in the return register (their fixed runtime
+    # ABI, predating the niche layout): the payload-less discriminant word
+    # becomes the niche, every other word yields the payload from +8.
+    let visit_niche_spec = enum_niche_spec_strict(ctx, &dest_ty)
+    let visit_payloadless_disc = enum_niche_payloadless_discriminant(ctx, &dest_ty)
+    let lbl_visit_niche = next_codegen_label(ctx, ".Lvisit_niche.")
+    let lbl_visit_done = next_codegen_label(ctx, ".Lvisit_done.")
+    emit_cmp_ri(ctx, rr, visit_payloadless_disc as i32)
+    emit_jcc(ctx, CondKind::Eq, lbl_visit_niche.clone())
+    emit_load_mem(ctx, rr, rr, 8)
+    emit_jmp(ctx, lbl_visit_done.clone())
+    def_label(&mut ctx.text, lbl_visit_niche)
+    emit_mov_ri(ctx, rr, visit_niche_spec.encoded_niche as i64)
+    def_label(&mut ctx.text, lbl_visit_done)
+  end
   if !did_sret && !intrinsic_did_materialize then
     store_place(ctx, fctx, dest, rr)
   end
@@ -11777,6 +11910,62 @@ def codegen_epilogue(inout ctx: CodegenCtx, fctx: FnCodegenCtx) -> Unit
     # ldp fp, lr, [sp], #16  (post-index: restore fp and lr)
     a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
     a64_ret(&mut ctx.text)
+  end
+end
+
+# (third-audit item 37) The tail-jump frame restore: the callee-saved
+# restore + frame deallocation + fp/ra restore that codegen_epilogue
+# performs, with the `ret` replaced by the caller's `emit_jmp` to the callee
+# entry. It deliberately does NOT load local 0 — the callee's return value
+# is already the caller's (the MIR mark requires the same return type
+# identity, so the same return class/register) — and it does not run the
+# sret copy-out (the codegen_call emission gate excludes sret). The restore
+# order matches codegen_epilogue exactly.
+def codegen_tail_restore(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx) -> Unit
+  let arch = ctx.target.arch
+  let fp = fp_reg(arch)
+  let sp = sp_reg(arch)
+  match arch
+  when Arch::X86_64 then
+    let saved = fctx.frame.saved_regs
+    var si = 0
+    while si < saved.len() do
+      let abs_off = fctx.frame.stack_size - (si * 8)
+      match saved[si]
+      when PhysReg::X64Reg(r) then
+        emit_load_mem(ctx, PhysReg::X64Reg(r), fp, -(abs_off as i32))
+      when _ then ()
+      end
+      si = si + 1
+    end
+    if fctx.frame.stack_size > 0 then
+      emit_add_ri(ctx, sp, fctx.frame.stack_size as i32)
+    end
+    emit_pop(ctx, fp)
+  when Arch::AArch64 then
+    let saved = fctx.frame.saved_regs
+    let ss = fctx.frame.stack_size
+    var si = 0
+    while si < saved.len() do
+      let abs_off = ss - (si * 8)
+      match saved[si]
+      when PhysReg::A64Reg(a) then
+        if abs_off <= 256 then
+          a64_ldur(&mut ctx.text, a, A64::FP, -(abs_off as i32))
+        elsif abs_off <= 4095 then
+          a64_sub_rri(&mut ctx.text, A64::X15, A64::FP, abs_off as u32)
+          a64_ldur(&mut ctx.text, a, A64::X15, 0)
+        else
+          a64_mov_ri(&mut ctx.text, A64::X15, abs_off as i64)
+          a64_sub_rrr(&mut ctx.text, A64::X15, A64::FP, A64::X15)
+          a64_ldur(&mut ctx.text, a, A64::X15, 0)
+        end
+      when _ then ()
+      end
+      si = si + 1
+    end
+    a64_mov_rr(&mut ctx.text, A64::SP, A64::FP)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
   end
 end
 

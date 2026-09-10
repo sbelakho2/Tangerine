@@ -1,0 +1,805 @@
+# tests/lir_niched_enum_test.tg — the NICHE-OPTIMIZED enum slice of the
+# LIR route (third-audit item 47): niched enums lower as ONE payload
+# word with the absent variant encoded by the payload type's niche.
+#
+# The layout engine and the direct pipeline already lower niched enums
+# (tests/layout/niche_layout_test.tg). This suite pins the LIR side:
+#   - the shape mirror: Option[Ptr[Int]] admits a ONE-word niched shape
+#     (words == 1, size == 8, niche == Some(PointerNull)) while
+#     Option[Int] keeps the tagged 16-byte inline image;
+#   - the crossing rows: a declared signature taking/returning
+#     Option[Ptr[Int]] is a niched crossing (one word, value-word
+#     kind, NO enum-ABI version marker) that lowers and verifies clean;
+#     Option[Int] still takes the payloaded-tagged inline-image version
+#     path (Some(InlineImageV1));
+#   - construction/discriminant/downcast: the lowered body writes the
+#     payload word or the niche sentinel into word 0, normalizes the
+#     discriminant with a Cmp/Cset pair, and reads the payload back from
+#     word 0 — no tag word anywhere;
+#   - the Option intrinsic slice: is_none on a &self receiver lowers
+#     inline against the niched word;
+#   - the boundary rows: the canonical ExternC authority refuses the
+#     niched flavor (the extern guard mirrors that answer), the binding
+#     is LOCAL, and a required export fails closed with the niched
+#     reason.
+#
+# Run with: tg test tests/lir_niched_enum_test.tg
+
+use std::core::{Option, Result, UInt, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::asm::SymBinding
+use tg_compiler::ast::layout_attrs_plain
+use tg_compiler::ids::{TypeId, VariantId, FieldId, IntrinsicId, GenericParamId, DefId, ModuleId}
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId, MirStatement,
+  MirStatementKind, MirRvalue, MirRvalueKind, MirOperand, MirOperandKind,
+  MirConstant, MirConstantKind, MirTerminator, MirTerminatorKind,
+  MirTypeDef, MirTypeDefKind, MirVariantDef, MirCallArg, MirCallValue,
+  AggregateKind, Place, Projection, place_local
+}
+use tg_compiler::token::span_dummy
+use tg_compiler::types::{Type, AccessEffect}
+use tg_compiler::lir::{
+  LirFunction, LirVerifyRoute, LirAggShapeKind, LirStmtKind, LirCond,
+  LirTermKind, LirValue,
+  lir_plain_struct_shape, lir_enum_crossing_kind, lir_ty_is_niched_enum,
+  lir_fn_has_niched_enum_crossing, lir_fn_has_payloaded_enum_crossing,
+  lir_fn_enum_abi_marker, lir_niched_enum_extern_refusal,
+  lir_check_extern_enum_calls, lir_fn_export_binding,
+  lir_check_fn_enum_abi_export, lir_check_enum_abi_program,
+  lir_enum_abi_version, lir_enum_abi_version_word,
+  lower_mir_fn_to_lir_prog, lir_peephole, lir_alloc_registers_a64,
+  verify_lir
+}
+
+# ———————————————————————————————————————————————————————————————
+# Fixtures: Option[T] = Some(T) | None (the std declaration order; the
+# NONE discriminant is 1, so the sentinel normalization is non-trivial)
+# and the concrete Option[Ptr[Int]] / Option[Int] types.
+# ———————————————————————————————————————————————————————————————
+
+def niche_gpid0() -> GenericParamId
+  GenericParamId {
+    owner: DefId { module: ModuleId { id: 0 }, index: 0 },
+    index: 0
+  }
+end
+
+def niche_option_def() -> MirTypeDef
+  var some_fields = Vec::new()
+  some_fields.push(Type::Param(niche_gpid0()))
+  MirTypeDef {
+    id: TypeId { id: 100 },
+    name: "Option".to_string(),
+    kind: MirTypeDefKind::Enum(Vec::from([
+      MirVariantDef { name: "Some".to_string(), discriminant: 0, fields: some_fields },
+      MirVariantDef { name: "None".to_string(), discriminant: 1, fields: Vec::new() }
+    ])),
+    generic_params: Vec::from([niche_gpid0()]),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def niche_result_pair_def() -> MirTypeDef
+  var ok_fields = Vec::new()
+  ok_fields.push(Type::Param(niche_gpid0()))
+  var err_fields = Vec::new()
+  err_fields.push(Type::Unit)
+  MirTypeDef {
+    id: TypeId { id: 101 },
+    name: "ResultPair".to_string(),
+    kind: MirTypeDefKind::Enum(Vec::from([
+      MirVariantDef { name: "Ok".to_string(), discriminant: 0, fields: ok_fields },
+      MirVariantDef { name: "Err".to_string(), discriminant: 1, fields: err_fields }
+    ])),
+    generic_params: Vec::from([niche_gpid0()]),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def niche_type_defs() -> Map[Int, MirTypeDef]
+  var defs: Map[Int, MirTypeDef] = Map::new()
+  defs.insert(100, niche_option_def())
+  defs.insert(101, niche_result_pair_def())
+  defs
+end
+
+def niche_option_ptr_ty() -> Type
+  Type::Adt(TypeId { id: 100 }, Vec::from([Type::Ptr(Type::Int)]))
+end
+
+def niche_option_int_ty() -> Type
+  Type::Adt(TypeId { id: 100 }, Vec::from([Type::Int]))
+end
+
+def niche_result_ptr_ty() -> Type
+  Type::Adt(TypeId { id: 101 }, Vec::from([Type::Ptr(Type::Int)]))
+end
+
+def niche_lower(f: MirFunction, type_defs: Map[Int, MirTypeDef]) -> LirFunction
+  match lower_mir_fn_to_lir_prog(f, type_defs, Map::new(), Map::new(), Set::new(), Map::new())
+  when Result::Err(e) then panic("niched-enum test lowering failed: " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def niche_verify_clean(f: LirFunction) -> Unit
+  let alloc = lir_alloc_registers_a64(f)
+  let violations = verify_lir(f, alloc, LirVerifyRoute::LirVerifyA64)
+  var first = ""
+  if violations.len() > 0 then first = violations[0] end
+  assert(violations.len() == 0, "a niched-enum function must verify clean; first violation: " + first)
+end
+
+def niche_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal { id: MirLocalId { id: id }, name: name, ty: ty, is_mut: is_mut, span: span_dummy() }
+end
+
+def niche_block(bid: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: bid }, statements: stmts, terminator: term }
+end
+
+def niche_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def niche_int_operand(v: Int) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirInt(v),
+      ty: Type::Int,
+      instance: Option::None
+    })
+  }
+end
+
+def niche_copy_operand(p: Place) -> MirOperand
+  MirOperand { kind: MirOperandKind::MirCopy(p) }
+end
+
+def niche_unit_operand() -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirUnit,
+      ty: Type::Unit,
+      instance: Option::None
+    })
+  }
+end
+
+def niche_assign_stmt(dst: Place, rv: MirRvalue) -> MirStatement
+  MirStatement { kind: MirStatementKind::MirAssign(dst, rv), span: span_dummy() }
+end
+
+# One-parameter Unit-return function (locals[0] is the return place, the
+# parameter is local 1) — the existing enum-ABI suite's shape.
+def niche_param_fn(name: String, param_ty: Type) -> MirFunction
+  MirFunction {
+    name: name,
+    params: Vec::from([niche_local(1, "v", param_ty, false)]),
+    ret_type: Type::Unit,
+    locals: Vec::from([
+      niche_local(0, "_ret", Type::Unit, true),
+      niche_local(1, "v", param_ty, false)
+    ]),
+    blocks: Vec::from([niche_block(0, Vec::new(), niche_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+# A no-parameter function returning the given enum type through the
+# return place (local 0).
+def niche_ret_fn(name: String, ret_ty: Type) -> MirFunction
+  MirFunction {
+    name: name,
+    params: Vec::new(),
+    ret_type: ret_ty.clone(),
+    locals: Vec::from([niche_local(0, "_ret", ret_ty, true)]),
+    blocks: Vec::from([niche_block(0, Vec::new(), niche_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def niche_stmt_has_cset_eq(f: LirFunction) -> Bool
+  var hit = false
+  for b in f.blocks do
+    for s in b.stmts do
+      match s.kind
+      when LirStmtKind::LirCset(cond, _) then
+        match cond
+        when LirCond::LirEq then hit = true
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+  hit
+end
+
+def niche_stmt_has_move_imm(f: LirFunction, v: Int) -> Bool
+  var hit = false
+  for b in f.blocks do
+    for s in b.stmts do
+      match s.kind
+      when LirStmtKind::LirMove(_, src) then
+        match src
+        when LirValue::LirImm(x) then
+          if x == v then hit = true end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+  hit
+end
+
+def niche_fn_has_switch_term(f: LirFunction) -> Bool
+  var hit = false
+  for b in f.blocks do
+    match b.term.kind
+    when LirTermKind::LirSwitch(_, _, _) then hit = true
+    when _ then ()
+    end
+  end
+  hit
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. the shape rows: one-word niched vs the tagged inline image
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_lir_niched_shape_rows() -> Unit
+  let defs = niche_type_defs()
+  match lir_plain_struct_shape(defs, niche_option_ptr_ty())
+  when Result::Err(e) then panic("Option[Ptr[Int]] must admit a shape: " + e)
+  when Result::Ok(o) then
+    match o
+    when Option::Some(kind) then
+      match kind
+      when LirAggShapeKind::LirAggEnum(eshape) then
+        assert(eshape.words == 1, "a niched enum image is ONE word, got " + eshape.words.to_string())
+        assert(eshape.size == 8, "a niched enum image is 8 bytes, got " + eshape.size.to_string())
+        match eshape.niche
+        when Option::Some(spec) then
+          assert(spec.encoded_niche == 0, "the pointer niche pattern is the invalid null word (0)")
+        when Option::None then
+          panic("Option[Ptr[Int]] must admit the niched shape (niche == Some)")
+        end
+        assert(lir_enum_crossing_kind(eshape.size) == "value-word", "a niched enum crosses by its one value word")
+      when LirAggShapeKind::LirAggStruct(_) then panic("Option[Ptr[Int]] must not admit a struct shape")
+      end
+    when Option::None then panic("Option[Ptr[Int]] must admit an enum shape")
+    end
+  end
+
+  # The tagged CONTROL: Option[Int] has NO niche (Int has none) and keeps
+  # the tag + payload 16-byte inline image.
+  match lir_plain_struct_shape(defs, niche_option_int_ty())
+  when Result::Err(e) then panic("Option[Int] must admit the tagged shape: " + e)
+  when Result::Ok(o) then
+    match o
+    when Option::Some(kind) then
+      match kind
+      when LirAggShapeKind::LirAggEnum(eshape) then
+        assert(eshape.size == 16, "Option[Int] keeps the 16-byte tag+payload image, got " + eshape.size.to_string())
+        match eshape.niche
+        when Option::Some(_) then panic("Option[Int] must NOT be niched")
+        when Option::None then ()
+        end
+      when LirAggShapeKind::LirAggStruct(_) then panic("Option[Int] must not admit a struct shape")
+      end
+    when Option::None then panic("Option[Int] must admit an enum shape")
+    end
+  end
+
+  assert(lir_ty_is_niched_enum(defs, niche_option_ptr_ty()), "Option[Ptr[Int]] must classify as a niched enum")
+  assert(!lir_ty_is_niched_enum(defs, niche_option_int_ty()), "Option[Int] must not classify as a niched enum")
+
+  # ResultPair[Ptr[Int], Unit]-style: the payload-less arm carries a
+  # zero-sized Unit field, which the niched shape must drop (no machine
+  # word) while still admitting the one-word niched form.
+  match lir_plain_struct_shape(defs, niche_result_ptr_ty())
+  when Result::Err(e) then panic("ResultPair[Ptr[Int], Unit] must admit the niched shape: " + e)
+  when Result::Ok(o) then
+    match o
+    when Option::Some(kind) then
+      match kind
+      when LirAggShapeKind::LirAggEnum(eshape) then
+        assert(eshape.words == 1 && eshape.size == 8, "the zero-sized error arm keeps the ONE-word niched image")
+        match eshape.niche
+        when Option::Some(_) then ()
+        when Option::None then panic("ResultPair[Ptr[Int], Unit] must be niched")
+        end
+      when LirAggShapeKind::LirAggStruct(_) then panic("ResultPair[Ptr[Int], Unit] must not admit a struct shape")
+      end
+    when Option::None then panic("ResultPair[Ptr[Int], Unit] must admit an enum shape")
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. the crossing rows: niched signatures lower (no refusal, no version
+#    marker); Option[Int] keeps the inline-image version path
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_lir_niched_signature_rows() -> Unit
+  let defs = niche_type_defs()
+  let opt_ptr = niche_option_ptr_ty()
+
+  # The scan rows.
+  let crosser_f = niche_param_fn("niched_crosser", opt_ptr.clone())
+  assert(lir_fn_has_niched_enum_crossing(defs, crosser_f), "an Option[Ptr[Int]] parameter must be a niched crossing")
+  assert(!lir_fn_has_payloaded_enum_crossing(defs, crosser_f), "a niched crossing is not a payloaded-tagged crossing")
+  match lir_fn_enum_abi_marker(defs, crosser_f)
+  when Option::Some(_) then panic("a niched crossing must NOT carry an enum-ABI version marker")
+  when Option::None then ()
+  end
+
+  # The lowered signature: one-word by VALUE (no sret, no aggregate-param
+  # machine bind) and the niched evidence bit, no version.
+  let lf = niche_lower(crosser_f, defs)
+  assert(lf.niched_enum_crossing, "the lowered niched crossing must set the niched evidence bit")
+  assert(!lf.enum_abi_crossing, "the lowered niched crossing must not set the payloaded evidence bit")
+  match lf.enum_abi_version
+  when Option::Some(_) then panic("the lowered niched crossing must not carry a version marker")
+  when Option::None then ()
+  end
+  assert(lf.sret_words == 0, "a niched parameter must not open the sret protocol")
+  assert(lf.agg_params.len() == 0, "a niched parameter crosses by VALUE (no machine aggregate bind)")
+  niche_verify_clean(lir_peephole(lf))
+  match lir_check_enum_abi_program(lf, lir_enum_abi_version())
+  when Result::Err(e) then panic("a version-free niched crossing must pass the program check: " + e)
+  when Result::Ok(_) then ()
+  end
+
+  # A niched RETURN through the return place lowers too.
+  let ret_fn = niche_ret_fn("niched_ret", opt_ptr.clone())
+  assert(lir_fn_has_niched_enum_crossing(defs, ret_fn), "an Option[Ptr[Int]] return must be a niched crossing")
+  let lf_ret = niche_lower(ret_fn, defs)
+  assert(lf_ret.sret_words == 0, "a niched return crosses as the one value word (no sret)")
+  niche_verify_clean(lir_peephole(lf_ret))
+
+  # The TAGGED control: Option[Int] stays on the versioned inline-image
+  # path (marker Some(InlineImageV1), evidence bit, no niched bit).
+  let tagged_fn = niche_param_fn("tagged_crosser", niche_option_int_ty())
+  assert(lir_fn_has_payloaded_enum_crossing(defs, tagged_fn), "an Option[Int] parameter is a payloaded-tagged crossing")
+  assert(!lir_fn_has_niched_enum_crossing(defs, tagged_fn), "Option[Int] is not a niched crossing")
+  match lir_fn_enum_abi_marker(defs, tagged_fn)
+  when Option::Some(mv) then
+    assert(lir_enum_abi_version_word(mv) == "inline-image-v1", "Option[Int] still names inline-image-v1")
+  when Option::None then
+    panic("an Option[Int] parameter must still carry the inline-image version marker")
+  end
+  let lf_tagged = niche_lower(tagged_fn, defs)
+  assert(lf_tagged.enum_abi_crossing, "the tagged control must set the payloaded evidence bit")
+  assert(!lf_tagged.niched_enum_crossing, "the tagged control must not set the niched evidence bit")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. construction/discriminant/downcast: word 0 carries the payload or
+#    the sentinel; the discriminant normalizes; the downcast reads word 0
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_lir_niched_construction_rows() -> Unit
+  let defs = niche_type_defs()
+  let opt_ptr = niche_option_ptr_ty()
+  let opt_place = place_local(MirLocalId { id: 1 })
+  let none_place = place_local(MirLocalId { id: 2 })
+  let ptr_place = place_local(MirLocalId { id: 3 })
+  let disc_place = place_local(MirLocalId { id: 4 })
+
+  # p = 0: the pointer payload local must be DEFINED before the Some
+  # construction consumes it (the verifier's def-before-use rule).
+  let init_ptr_stmt = niche_assign_stmt(
+    ptr_place.clone(),
+    MirRvalue { kind: MirRvalueKind::MirMove(niche_int_operand(0)) }
+  )
+  # opt = Some(p): the tag constant (0) plus the pointer payload. With
+  # the niched shape the payload IS the whole value (word 0).
+  let some_stmt = niche_assign_stmt(
+    opt_place.clone(),
+    MirRvalue { kind: MirRvalueKind::MirAggregate(
+      AggregateKind::Struct(TypeId { id: 100 }, Vec::new()),
+      Vec::from([niche_int_operand(0), niche_copy_operand(ptr_place.clone())])) }
+  )
+  # disc = discriminant(opt): the niched normalization (word == sentinel
+  # ? None_disc : Some_disc).
+  let disc_stmt = niche_assign_stmt(
+    disc_place.clone(),
+    MirRvalue { kind: MirRvalueKind::MirDiscriminant(opt_place.clone()) }
+  )
+  # p = opt.Some.0 — the downcast payload read from word 0.
+  let downcast_place = Place {
+    local: MirLocalId { id: 1 },
+    projections: Vec::from([
+      Projection::Variant(VariantId { owner: TypeId { id: 100 }, index: 0 as UInt }),
+      Projection::Field(FieldId { owner: TypeId { id: 100 }, index: 0 })
+    ])
+  }
+  let downcast_stmt = niche_assign_stmt(
+    ptr_place.clone(),
+    MirRvalue { kind: MirRvalueKind::MirCopy(downcast_place) }
+  )
+  # opt2 = None: the sentinel store (the niche pattern 0; the None
+  # discriminant is 1, which must NOT appear as a stored tag).
+  let none_stmt = niche_assign_stmt(
+    none_place.clone(),
+    MirRvalue { kind: MirRvalueKind::MirAggregate(
+      AggregateKind::Struct(TypeId { id: 100 }, Vec::new()),
+      Vec::from([niche_int_operand(1)])) }
+  )
+  let disc2_place = place_local(MirLocalId { id: 5 })
+  let disc2_stmt = niche_assign_stmt(
+    disc2_place.clone(),
+    MirRvalue { kind: MirRvalueKind::MirDiscriminant(none_place.clone()) }
+  )
+  # res = Err(()): the payload-less arm of a ResultPair[Ptr, Unit] — the
+  # typed MIR carries the Unit payload operand, which the niched
+  # construction must IGNORE (no machine word) while storing the
+  # sentinel; the Err discriminant (1) is never stored as a tag.
+  let res_place = place_local(MirLocalId { id: 6 })
+  let res_err_stmt = niche_assign_stmt(
+    res_place.clone(),
+    MirRvalue { kind: MirRvalueKind::MirAggregate(
+      AggregateKind::Struct(TypeId { id: 101 }, Vec::new()),
+      Vec::from([niche_int_operand(1), niche_unit_operand()])) }
+  )
+  let res_disc_place = place_local(MirLocalId { id: 7 })
+  let res_disc_stmt = niche_assign_stmt(
+    res_disc_place.clone(),
+    MirRvalue { kind: MirRvalueKind::MirDiscriminant(res_place.clone()) }
+  )
+
+  let f = MirFunction {
+    name: "niched_body".to_string(),
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: Vec::from([
+      niche_local(0, "_ret", Type::Unit, true),
+      niche_local(1, "opt", opt_ptr.clone(), true),
+      niche_local(2, "opt2", opt_ptr.clone(), true),
+      niche_local(3, "p", Type::Ptr(Type::Int), true),
+      niche_local(4, "disc", Type::Int, true),
+      niche_local(5, "disc2", Type::Int, true),
+      niche_local(6, "res", niche_result_ptr_ty(), true),
+      niche_local(7, "res_disc", Type::Int, true)
+    ]),
+    blocks: Vec::from([niche_block(0, Vec::from([
+      init_ptr_stmt, some_stmt, disc_stmt, downcast_stmt, none_stmt, disc2_stmt,
+      res_err_stmt, res_disc_stmt
+    ]), niche_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+  let lf = niche_lower(f, defs)
+  # Locals only: no boundary crossing exists, so no evidence bits.
+  assert(!lf.niched_enum_crossing, "a locals-only niched function is not a crossing")
+  # The discriminant normalization emitted the Cmp/Cset pair.
+  assert(niche_stmt_has_cset_eq(lf), "the niched discriminant read must normalize with a Cmp/Cset pair")
+  # The None construction stored the SENTINEL (0), never the None
+  # discriminant (1) into the value word.
+  assert(niche_stmt_has_move_imm(lf, 0), "the none construction must store the niche sentinel word 0")
+  assert(!niche_stmt_has_move_imm(lf, 1), "the none construction must NOT store the tag discriminant 1 (the tag word is gone)")
+  niche_verify_clean(lir_peephole(lf))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. the Option intrinsic slice: is_none on a &self niched receiver
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_lir_niched_intrinsic_rows() -> Unit
+  let defs = niche_type_defs()
+  let opt_ptr = niche_option_ptr_ty()
+  let opt_place = place_local(MirLocalId { id: 1 })
+  let ref_place = place_local(MirLocalId { id: 2 })
+  let bool_place = place_local(MirLocalId { id: 3 })
+
+  # opt = None (the sentinel), ref = &opt, b = is_none(ref).
+  let none_stmt = niche_assign_stmt(
+    opt_place.clone(),
+    MirRvalue { kind: MirRvalueKind::MirAggregate(
+      AggregateKind::Struct(TypeId { id: 100 }, Vec::new()),
+      Vec::from([niche_int_operand(1)])) }
+  )
+  let ref_stmt = niche_assign_stmt(
+    ref_place.clone(),
+    MirRvalue { kind: MirRvalueKind::MirRef(opt_place.clone()) }
+  )
+  let call_term = MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: bool_place.clone(),
+      func: MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirFnItem("Option::is_none".to_string()),
+        ty: Type::Unit,
+        instance: Option::None
+      }) },
+      args: Vec::from([MirCallArg {
+        effect: AccessEffect::Read,
+        value: MirCallValue::Value(niche_copy_operand(ref_place.clone()))
+      }]),
+      success: MirBlockId { id: 1 },
+      unwind: Option::None,
+      intrinsic: Option::Some(IntrinsicId::IsNone),
+      tail: false
+    },
+    span: span_dummy()
+  }
+  let f = MirFunction {
+    name: "niched_is_none".to_string(),
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: Vec::from([
+      niche_local(0, "_ret", Type::Unit, true),
+      niche_local(1, "opt", opt_ptr.clone(), true),
+      niche_local(2, "r", Type::RefInternal(opt_ptr.clone(), false), true),
+      niche_local(3, "b", Type::Bool, true)
+    ]),
+    blocks: Vec::from([
+      niche_block(0, Vec::from([none_stmt, ref_stmt]), call_term),
+      niche_block(1, Vec::new(), niche_ret_term())
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+  let lf = niche_lower(f, defs)
+  # is_none on the niched receiver is a tag-word-free Cmp/Cset over the
+  # value word (the absent case is word == sentinel).
+  assert(niche_stmt_has_cset_eq(lf), "is_none must lower to a Cmp/Cset over the niched word")
+  niche_verify_clean(lir_peephole(lf))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 5. unwrap / unwrap_or: the trap-guarded payload and the default path
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_lir_niched_unwrap_rows() -> Unit
+  let defs = niche_type_defs()
+  let opt_ty = niche_option_ptr_ty()
+
+  # (a) some = Some(p); x = unwrap(&some): the success arm moves the
+  # value word to the destination, the sentinel arm traps.
+  let a_opt = place_local(MirLocalId { id: 1 })
+  let a_ref = place_local(MirLocalId { id: 2 })
+  let a_p = place_local(MirLocalId { id: 3 })
+  let a_x = place_local(MirLocalId { id: 4 })
+  let a_stmts = Vec::from([
+    niche_assign_stmt(a_p.clone(), MirRvalue { kind: MirRvalueKind::MirMove(niche_int_operand(7)) }),
+    niche_assign_stmt(a_opt.clone(), MirRvalue { kind: MirRvalueKind::MirAggregate(
+      AggregateKind::Struct(TypeId { id: 100 }, Vec::new()),
+      Vec::from([niche_int_operand(0), niche_copy_operand(a_p.clone())])) }),
+    niche_assign_stmt(a_ref.clone(), MirRvalue { kind: MirRvalueKind::MirRef(a_opt.clone()) })
+  ])
+  let a_f = MirFunction {
+    name: "niched_unwrap".to_string(),
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: Vec::from([
+      niche_local(0, "_ret", Type::Unit, true),
+      niche_local(1, "some", opt_ty.clone(), true),
+      niche_local(2, "r", Type::RefInternal(opt_ty.clone(), false), true),
+      niche_local(3, "p", Type::Ptr(Type::Int), true),
+      niche_local(4, "x", Type::Ptr(Type::Int), true)
+    ]),
+    blocks: Vec::from([
+      niche_block(0, a_stmts, MirTerminator {
+        kind: MirTerminatorKind::MirCall {
+          dest: a_x.clone(),
+          func: MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirFnItem("Option::unwrap".to_string()),
+            ty: Type::Unit,
+            instance: Option::None
+          }) },
+          args: Vec::from([MirCallArg {
+            effect: AccessEffect::Read,
+            value: MirCallValue::Value(niche_copy_operand(a_ref.clone()))
+          }]),
+          success: MirBlockId { id: 1 },
+          unwind: Option::None,
+          intrinsic: Option::Some(IntrinsicId::Unwrap),
+          tail: false
+        },
+        span: span_dummy()
+      }),
+      niche_block(1, Vec::new(), niche_ret_term())
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+  let a_lf = niche_lower(a_f, defs)
+  assert(niche_fn_has_switch_term(a_lf), "unwrap must dispatch on the niched word (success vs trap)")
+  niche_verify_clean(lir_peephole(a_lf))
+
+  # (b) none = None; x = unwrap_or(&none, d): the sentinel arm yields the
+  # default operand, the payload arm yields the value word.
+  let b_opt = place_local(MirLocalId { id: 1 })
+  let b_ref = place_local(MirLocalId { id: 2 })
+  let b_d = place_local(MirLocalId { id: 3 })
+  let b_x = place_local(MirLocalId { id: 4 })
+  let b_stmts = Vec::from([
+    niche_assign_stmt(b_d.clone(), MirRvalue { kind: MirRvalueKind::MirMove(niche_int_operand(9)) }),
+    niche_assign_stmt(b_opt.clone(), MirRvalue { kind: MirRvalueKind::MirAggregate(
+      AggregateKind::Struct(TypeId { id: 100 }, Vec::new()),
+      Vec::from([niche_int_operand(1)])) }),
+    niche_assign_stmt(b_ref.clone(), MirRvalue { kind: MirRvalueKind::MirRef(b_opt.clone()) })
+  ])
+  let b_f = MirFunction {
+    name: "niched_unwrap_or".to_string(),
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: Vec::from([
+      niche_local(0, "_ret", Type::Unit, true),
+      niche_local(1, "none", opt_ty.clone(), true),
+      niche_local(2, "r", Type::RefInternal(opt_ty.clone(), false), true),
+      niche_local(3, "d", Type::Ptr(Type::Int), true),
+      niche_local(4, "x", Type::Ptr(Type::Int), true)
+    ]),
+    blocks: Vec::from([
+      niche_block(0, b_stmts, MirTerminator {
+        kind: MirTerminatorKind::MirCall {
+          dest: b_x.clone(),
+          func: MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirFnItem("Option::unwrap_or".to_string()),
+            ty: Type::Unit,
+            instance: Option::None
+          }) },
+          args: Vec::from([
+            MirCallArg {
+              effect: AccessEffect::Read,
+              value: MirCallValue::Value(niche_copy_operand(b_ref.clone()))
+            },
+            MirCallArg {
+              effect: AccessEffect::Read,
+              value: MirCallValue::Value(niche_copy_operand(b_d.clone()))
+            }
+          ]),
+          success: MirBlockId { id: 1 },
+          unwind: Option::None,
+          intrinsic: Option::Some(IntrinsicId::UnwrapOr),
+          tail: false
+        },
+        span: span_dummy()
+      }),
+      niche_block(1, Vec::new(), niche_ret_term())
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+  let b_lf = niche_lower(b_f, defs)
+  assert(niche_fn_has_switch_term(b_lf), "unwrap_or must dispatch on the niched word (default vs payload)")
+  niche_verify_clean(lir_peephole(b_lf))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 6. the boundary rows: extern refusal (mirroring the authority), LOCAL
+#    binding, required-export refusal
+# ———————————————————————————————————————————————————————————————
+
+def niche_extern_call_fn(name: String, arg_ty: Type) -> MirFunction
+  # f(v: arg_ty) { ext_fn(v); } — one call block whose argument carries
+  # the enum type through a whole local (the guard's operand rule).
+  let opt_place = place_local(MirLocalId { id: 1 })
+  let call_term = MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: place_local(MirLocalId { id: 0 }),
+      func: MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirFnItem("ext_fn".to_string()),
+        ty: Type::Unit,
+        instance: Option::None
+      }) },
+      args: Vec::from([MirCallArg {
+        effect: AccessEffect::Read,
+        value: MirCallValue::Value(niche_copy_operand(opt_place))
+      }]),
+      success: MirBlockId { id: 1 },
+      unwind: Option::None,
+      intrinsic: Option::None,
+      tail: false
+    },
+    span: span_dummy()
+  }
+  MirFunction {
+    name: name.to_string(),
+    params: Vec::from([niche_local(1, "v", arg_ty.clone(), false)]),
+    ret_type: Type::Unit,
+    locals: Vec::from([
+      niche_local(0, "_ret", Type::Unit, true),
+      niche_local(1, "v", arg_ty, false)
+    ]),
+    blocks: Vec::from([
+      niche_block(0, Vec::new(), call_term),
+      niche_block(1, Vec::new(), niche_ret_term())
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+@test
+def test_lir_niched_boundary_rows() -> Unit
+  let defs = niche_type_defs()
+  let opt_ptr = niche_option_ptr_ty()
+
+  # The canonical ExternC authority refuses the niched flavor: the
+  # refusal message names the niched spelling and reads the authority's
+  # fail-closed answer.
+  let msg = lir_niched_enum_extern_refusal(
+    "caller", "ext_fn", "argument 0",
+    "fail-closed: A niched enum layout"
+  )
+  assert(msg.contains("NICHED"), "the niched extern refusal must name the niched crossing")
+  assert(msg.contains("fail-closed"), "the niched extern refusal must carry the authority's refusal")
+  assert(msg.contains("ExternC"), "the niched extern refusal must name the canonical flavor")
+
+  # The extern guard: a niched-enum argument to an extern fails closed
+  # (the payloaded-tagged message must not be used).
+  let extern_f = niche_extern_call_fn("extern_niched", opt_ptr.clone())
+  var externs: Set[String] = Set::new()
+  externs.insert("ext_fn".to_string())
+  match lir_check_extern_enum_calls(extern_f, defs, externs)
+  when Result::Err(e) then
+    assert(e.contains("NICHED"), "the extern guard must refuse a niched-enum argument; got: " + e)
+  when Result::Ok(_) then
+    panic("a niched-enum argument to an extern must fail closed")
+  end
+
+  # The binding rows: a niched crossing is LOCAL (not a stable public
+  # ABI), and a required export (the OS entry) fails closed.
+  let crosser = niche_lower(niche_param_fn("internal_niched", opt_ptr.clone()), defs)
+  assert(lir_fn_export_binding(crosser) == SymBinding::Local, "a niched crossing function must be emitted Local")
+  match lir_check_fn_enum_abi_export(crosser)
+  when Result::Err(e) then panic("a non-entry niched crossing must pass the export gate: " + e)
+  when Result::Ok(_) then ()
+  end
+  let entry = niche_lower(niche_param_fn("_start", opt_ptr.clone()), defs)
+  match lir_check_fn_enum_abi_export(entry)
+  when Result::Err(e) then
+    assert(e.contains("REQUIRED export") && e.contains("NICHED"), "the required-export refusal must name the required export and the niched crossing")
+  when Result::Ok(_) then
+    panic("a niched-enum OS entry must fail closed")
+  end
+end

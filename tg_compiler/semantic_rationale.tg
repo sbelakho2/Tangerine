@@ -1,0 +1,1367 @@
+# Tangerine Compiler — Semantic Rationale + Tool Discovery (Tier-4)
+# Self-hosting compiler written in Tangerine
+#
+# TWO well-defined Tier-4 pieces, one module, no gate change:
+#
+# 1. COMPILER-GROUNDED PERSISTENT RATIONALE HISTORY. ONE RationaleRecord is
+#    the compiler's own decision record (never prose): a revision text, a
+#    kind word, a subject, a decision, a reason and typed evidence rows,
+#    identified by a 128-bit stable digest. The history is grounded in the
+#    FIVE implemented decision sources that already exist in this tree:
+#      optimization — mir.tg's OptimizationDecision rows (the inliner's
+#                     reject rows, bounds-check retentions, access-fact
+#                     forwarding rejects, SCCP ambiguous-branch retentions
+#                     and mem2reg dominance rejects; mir.tg:16571 struct,
+#                     opt_decisions_of_mir at mir.tg:16750);
+#      diagnostic   — semantic_diagnostics.tg's DiagnosticRecord rows
+#                     (semantic_diagnostics.tg:261; the persistent store
+#                     form with the stable id, message, span, semantic
+#                     class and typed related rows);
+#      delta        — ONE SemanticDelta summary row (semantic_delta.tg:352
+#                     struct; semantic_delta_digest at semantic_delta.tg:2550
+#                     and the canonical text at semantic_delta.tg:2494);
+#      budget       — change_budget.tg's budget_verify violation rows
+#                     (change_budget.tg:730; the "budget:"-prefixed list,
+#                     empty = the delta verifies);
+#      equivalence  — equivalence.tg's EquivalenceResult LEVEL + detail
+#                     (equivalence.tg:219; equivalence_level_word at
+#                     equivalence.tg:237, equivalence_result_render at
+#                     equivalence.tg:395; TestedNoCounterexample is never
+#                     promoted to a proof here).
+#    RationaleStore is the append-only store; rationale_store_add is
+#    idempotent by the record's stable digest (the digest IS the identity;
+#    the text is format only). rationale_store_save/_load carry the one
+#    line-per-record text form "rev|kind|subject|decision|reason|
+#    evidence-joined" (fields escaped so every byte round-trips: '|', ';',
+#    '\', CR/LF and the empty string); rationale_store_load is TOTAL
+#    (malformed lines are skipped — a store text is persistent cargo, never
+#    the identity authority). rationale_for_subject returns the subject's
+#    records in deterministic (revision, kind, decision, digest) order and
+#    rationale_digest / rationale_store_digest content-address one record /
+#    the whole history.
+#    PERSISTENCE CONVENTION (the driver store convention: accept/produce
+#    text): the sibling artifact is "<snapshot>.rationale", written and
+#    loaded exactly like driver.tg's declaration-lineage sibling
+#    ("<snapshot>.lineages"): compile_snapshot_serve_route loads the text
+#    at build start (driver.tg:4069-4081, read_file -> rationale_store_load,
+#    empty store when absent), and after a successful build adds the
+#    in-scope decision records and writes rationale_store_save's text back
+#    beside the snapshot (driver.tg:4115-4145; skipped when the store is
+#    empty). THE WIRED FEED: the optimization decision journal
+#    (opt_decisions_of_mir over the finalized MirProgram — the route's
+#    capturing optimizer entry) grounds one "optimization" record per
+#    OptimizationDecision. The other four grounded sources (diagnostic /
+#    delta / budget / equivalence) are ready in the plumbing but not in
+#    scope at that boundary: the route computes no SemanticDelta, no
+#    ChangeBudget and no EquivalenceResult, and diagnostics exist only on
+#    the error path (the route fails closed before the boundary).
+#
+# 2. DYNAMIC SEMANTIC-TOOL DISCOVERY. ONE SemanticTool row per implemented
+#    semantic operation family — the surface automated consumers enumerate
+#    instead of hardcoding (the audit's ask). The list is built from TWO
+#    live sources and one static metadata table, never invented names:
+#      a. the §39 OPERATION REGISTRY WALK: semantic_server.tg's
+#         server_operations() (semantic_server.tg:595-662) is iterated at
+#         call time; every registered name appears in the tool list. A
+#         registered name with no explicit metadata row would still appear
+#         (conservative "experimental" default, requires_mir from the
+#         handler family), so the registry can never silently shrink the
+#         surface.
+#      b. the §38 QUERY-DISPATCH + EXPORT SUPPLEMENT: the op names
+#         semantic_query.tg's query() dispatches (semantic_query.tg:2398)
+#         plus the implemented engine exports not carried by the registry
+#         (change_affected / change_semantic_diff semantic_query.tg:1013 /
+#         1022, abi_inspect semantic_query.tg:1038, hole_constraints
+#         semantic_query.tg:2257, type_use semantic_query.tg:1755,
+#         semantic_slice.tg's mir graph engines, perf_report.tg's report /
+#         fact engines, abi_report.tg's report / diff engines, and this
+#         module's own rationale surface).
+#    The wire-response families (third-audit item 22's twelve typed records)
+#    are not duplicated as synthetic op names: each carrying tool's outputs
+#    field names them ("wire:CallersResponse", ... "wire:PlanResponse").
+#    Stability vocabulary: "stable" = the long-standing session families
+#    (index / explain / type / ownership / contract / symbol / snapshot /
+#    plan / service) that answer from the session snapshot+index; 
+#     "experimental" = the third-audit families that answer from
+#    caller-supplied artifacts (the final MirProgram, ingested coverage
+#    traces, EventTraces, retained stores, LirAlloc, TypedProgram, a
+#    SemanticDelta) or carry a documented unavailable form. semantic_tools
+#    is deterministic byte-sorted and deduped; tool_for / tools_requiring_mir
+#    / tools_requiring_coverage / tools_requiring_store are the filters.
+#    REGISTRY FINDING (PATCHED — see the two comments below): "mir.block" is
+#    dispatched by §38 query() (semantic_query.tg:2428) and is NOW registered
+#    in server_operations() beside the other seven mir graph ops
+#    (semantic_server.tg), so the registry walk carries it with no discovery
+#    change.
+#
+# TABLE OF CONTENTS:
+#   1. RationaleRecord / RationaleStore + the text codec.
+#   2. The five grounded source constructors.
+#   3. The store API (add / save / load / subject query / digests).
+#   4. SemanticTool + the discovery surface.
+#   5. The executable lanes (rationale_lane_check, semantic_tools_lane_check,
+#      the aggregate semantic_rationale_lane_check).
+
+use std::collections::{Vec}
+
+use tg_compiler::ids::{StableDigest, stable_digest_of}
+use tg_compiler::semantic_model::{semantic_digest_render}
+use tg_compiler::mir::{OptimizationDecision}
+use tg_compiler::semantic_diagnostics::{
+  DiagnosticRecord, stable_diagnostic_id_text, stable_diagnostic_id_of
+}
+use tg_compiler::semantic_delta::{
+  SemanticDelta, semantic_delta_digest, semantic_delta_empty
+}
+use tg_compiler::change_budget::{ChangeBudget, budget_verify}
+use tg_compiler::equivalence::{
+  EquivalenceResult, equivalence_level_word, equivalence_result_render,
+  equivalence_structural, equivalence_unknown
+}
+use tg_compiler::semantic_server::{ServerOperation, server_operations}
+
+# ═══════════════════════════════════════════════════════════════
+# 1. THE RATIONALE RECORD + STORE
+# ═══════════════════════════════════════════════════════════════
+# revision is the compile revision text the decision was taken under (the
+# §30 snapshot revision render at the driver boundary; a bare label in a
+# hand-built store). kind is one of the five grounded words "optimization"
+# / "diagnostic" / "delta" / "budget" / "equivalence". subject is the
+# stable key / handle the decision is ABOUT (a def stable key, a diagnostic
+# owner, "delta:<digest>", a caller-supplied budget subject, ...). decision
+# is the fixed decision word; reason is the evidence text; evidence is the
+# typed row list. digest_hi / digest_lo ARE the identity (the 128-bit
+# stable digest of the canonical escaped record line); the fields are
+# cargo. The digest words are NEVER serialized — save/load recomputes them,
+# so a loaded record is identity-equal to the stored one.
+
+pub struct RationaleRecord
+  revision: String = ""
+  kind: String = ""
+  subject: String = ""
+  decision: String = ""
+  reason: String = ""
+  evidence: Vec[String] = Vec::new()
+  digest_hi: UInt = 0
+  digest_lo: UInt = 0
+end
+
+pub struct RationaleStore
+  records: Vec[RationaleRecord] = Vec::new()
+end
+
+pub def rationale_store_new() -> RationaleStore
+  RationaleStore { records: Vec::new() }
+end
+
+# The generic constructor: the digest is NOT set here (rationale_digest /
+# rationale_store_add set it; rationale_record_with_digest seals a copy).
+pub def rationale_record_new(
+  revision: String,
+  kind: String,
+  subject: String,
+  decision: String,
+  reason: String,
+  evidence: Vec[String]
+) -> RationaleRecord
+  RationaleRecord {
+    revision: revision,
+    kind: kind,
+    subject: subject,
+    decision: decision,
+    reason: reason,
+    evidence: evidence
+  }
+end
+
+# ———— The text codec ————
+# One record is ONE line: "rev|kind|subject|decision|reason|e1;e2;...".
+# Every field and every evidence row is escaped so the separators are
+# unambiguous: '\' -> "\\", '|' -> "\p", ';' -> "\s", LF -> "\n", CR ->
+# "\r", and the EMPTY string -> "\e" (so an empty evidence row and the
+# empty evidence list stay distinguishable). The escape makes the text an
+# exact round-trip codec; the digest of the canonical line is the identity,
+# so even a hypothetical escaping slip cannot fake identity.
+
+def rationale_escape(s: String) -> String
+  if s.len() == 0 then
+    return "\\e"
+  end
+  var out = ""
+  var i = 0
+  while i < s.len() do
+    let ch = s.slice(i, i + 1)
+    if ch == "\\" then
+      out = out + "\\\\"
+    elsif ch == "|" then
+      out = out + "\\p"
+    elsif ch == ";" then
+      out = out + "\\s"
+    elsif ch == "\n" then
+      out = out + "\\n"
+    elsif ch == "\r" then
+      out = out + "\\r"
+    else
+      out = out + ch
+    end
+    i = i + 1
+  end
+  out
+end
+
+def rationale_unescape(s: String) -> String
+  var out = ""
+  var i = 0
+  while i < s.len() do
+    let ch = s.slice(i, i + 1)
+    if ch == "\\" && i + 1 < s.len() then
+      let nxt = s.slice(i + 1, i + 2)
+      if nxt == "\\" then
+        out = out + "\\"
+      elsif nxt == "p" then
+        out = out + "|"
+      elsif nxt == "s" then
+        out = out + ";"
+      elsif nxt == "n" then
+        out = out + "\n"
+      elsif nxt == "r" then
+        out = out + "\r"
+      elsif nxt == "e" then
+        out = out + ""
+      else
+        out = out + nxt
+      end
+      i = i + 2
+    else
+      out = out + ch
+      i = i + 1
+    end
+  end
+  out
+end
+
+# Split on unescaped separators (a backslash keeps its next byte in the
+# current part, so "\|" never splits and "\;" survives the evidence split).
+def rationale_split_unescaped(s: String, sep: String) -> Vec[String]
+  var parts: Vec[String] = Vec::new()
+  var current = ""
+  var i = 0
+  while i < s.len() do
+    let ch = s.slice(i, i + 1)
+    if ch == "\\" && i + 1 < s.len() then
+      current = current + ch + s.slice(i + 1, i + 2)
+      i = i + 2
+    elsif ch == sep then
+      parts.push(current.clone())
+      current = ""
+      i = i + 1
+    else
+      current = current + ch
+      i = i + 1
+    end
+  end
+  parts.push(current)
+  parts
+end
+
+def rationale_evidence_text(evidence: Vec[String]) -> String
+  var out = ""
+  var i = 0
+  while i < evidence.len() do
+    if i > 0 then
+      out = out + ";"
+    end
+    out = out + rationale_escape(evidence[i].clone())
+    i = i + 1
+  end
+  out
+end
+
+# The canonical identity text (the save line WITHOUT the trailing newline).
+# The digest is computed over exactly this text; the record's own digest
+# fields never participate.
+def rationale_identity_text(record: RationaleRecord) -> String
+  rationale_escape(record.revision.clone()) + "|" +
+    rationale_escape(record.kind.clone()) + "|" +
+    rationale_escape(record.subject.clone()) + "|" +
+    rationale_escape(record.decision.clone()) + "|" +
+    rationale_escape(record.reason.clone()) + "|" +
+    rationale_evidence_text(record.evidence.clone())
+end
+
+# The identity digest of one record.
+pub def rationale_digest(record: RationaleRecord) -> StableDigest
+  stable_digest_of(&rationale_identity_text(record))
+end
+
+# The record's canonical save line (trailing newline included).
+pub def rationale_record_text(record: RationaleRecord) -> String
+  rationale_identity_text(record) + "\n"
+end
+
+# The record with its identity digest fields sealed. rationale_store_add
+# returns the digest; this constructor is for callers that need the sealed
+# record value itself.
+pub def rationale_record_with_digest(record: RationaleRecord) -> RationaleRecord
+  let digest = rationale_digest(record.clone())
+  var out = record.clone()
+  out.digest_hi = digest.hi
+  out.digest_lo = digest.lo
+  out
+end
+
+# ═══════════════════════════════════════════════════════════════
+# 2. THE FIVE GROUNDED SOURCE CONSTRUCTORS
+# ═══════════════════════════════════════════════════════════════
+
+# OptimizationDecision -> "optimization". subject = the containing fn key
+# (d.symbol), decision = the pass' fixed decision word, reason = the
+# recorded evidence text, evidence = the pass + the site locator.
+pub def rationale_of_optimization_decision(
+  revision: String, decision: OptimizationDecision
+) -> RationaleRecord
+  var evidence: Vec[String] = Vec::new()
+  evidence.push("pass:" + decision.pass.clone())
+  evidence.push("site:" + decision.site.clone())
+  RationaleRecord {
+    revision: revision,
+    kind: "optimization".to_string(),
+    subject: decision.symbol.clone(),
+    decision: decision.decision.clone(),
+    reason: decision.reason.clone(),
+    evidence: evidence
+  }
+end
+
+# DiagnosticRecord -> "diagnostic". subject = the stable id's owner, decision
+# = the diagnostic code, reason = the recorded message, evidence = the
+# canonical id render + the semantic class + every typed related row (the
+# store form's payload rows; the message NEVER re-enters the derivation
+# rows — it is the reason text).
+pub def rationale_of_diagnostic_record(
+  revision: String, record: DiagnosticRecord
+) -> RationaleRecord
+  var evidence: Vec[String] = Vec::new()
+  evidence.push("diagnostic:" + stable_diagnostic_id_text(record.id.clone()))
+  evidence.push("semantic-kind:" + record.semantic_kind.clone())
+  for row in record.related do
+    evidence.push(row.clone())
+  end
+  RationaleRecord {
+    revision: revision,
+    kind: "diagnostic".to_string(),
+    subject: record.id.owner.clone(),
+    decision: record.id.code.clone(),
+    reason: record.message.clone(),
+    evidence: evidence
+  }
+end
+
+# ONE deterministic summary row of a delta: the per-table row counts plus
+# the closure size. This is the delta record's reason text (and the audit's
+# "SemanticDelta summary row").
+pub def semantic_delta_summary_row(delta: SemanticDelta) -> String
+  "created:" + delta.created.len().to_string() +
+    " removed:" + delta.removed.len().to_string() +
+    " modified:" + delta.modified.len().to_string() +
+    " call:" + delta.call_delta.len().to_string() +
+    " effect:" + delta.effect_delta.len().to_string() +
+    " capability:" + delta.capability_delta.len().to_string() +
+    " ownership:" + delta.ownership_delta.len().to_string() +
+    " contract:" + delta.contract_delta.len().to_string() +
+    " unsafe-created:" + delta.unsafe_delta.created.len().to_string() +
+    " unsafe-removed:" + delta.unsafe_delta.removed.len().to_string() +
+    " affected:" + delta.affected.len().to_string()
+end
+
+# SemanticDelta -> "delta". subject = "delta:<content-addressed digest
+# render>" (the delta's own identity), decision = "delta-summary", reason =
+# the summary row, evidence = the digest row.
+pub def rationale_of_delta(revision: String, delta: SemanticDelta) -> RationaleRecord
+  let digest = semantic_delta_digest(&delta)
+  let digest_text = semantic_digest_render(&digest)
+  RationaleRecord {
+    revision: revision,
+    kind: "delta".to_string(),
+    subject: "delta:" + digest_text.clone(),
+    decision: "delta-summary".to_string(),
+    reason: semantic_delta_summary_row(&delta),
+    evidence: Vec::from(["digest:" + digest_text])
+  }
+end
+
+# budget_verify rows -> "budget". Empty violations = "budget-verified" with
+# reason "no violations"; any violation = "budget-violated" with the first
+# violation as the reason and the whole fail-closed list as evidence.
+pub def rationale_of_budget_rows(
+  revision: String, subject: String, violations: Vec[String]
+) -> RationaleRecord
+  var decision = "budget-verified".to_string()
+  var reason = "no violations".to_string()
+  if violations.len() > 0 then
+    decision = "budget-violated".to_string()
+    reason = violations[0].clone()
+  end
+  RationaleRecord {
+    revision: revision,
+    kind: "budget".to_string(),
+    subject: subject,
+    decision: decision,
+    reason: reason,
+    evidence: violations
+  }
+end
+
+# The budget source in one call: the §36 verifier runs HERE (budget_verify)
+# and its rows ground the record.
+pub def rationale_of_budget(
+  revision: String, subject: String, budget: ChangeBudget, delta: SemanticDelta
+) -> RationaleRecord
+  rationale_of_budget_rows(revision, subject, budget_verify(&budget, &delta))
+end
+
+# EquivalenceResult -> "equivalence". decision = the exact level word,
+# reason = the result's detail text, evidence = the level + the canonical
+# render. The level word is read through equivalence_level_word, never
+# inferred from the detail (the claim discipline travels with the level).
+pub def rationale_of_equivalence(
+  revision: String, subject: String, result: EquivalenceResult
+) -> RationaleRecord
+  let render = equivalence_result_render(result.clone())
+  match result
+  when EquivalenceResult::EquivalenceOutcome(level, detail) then
+    let word = equivalence_level_word(level)
+    var evidence: Vec[String] = Vec::new()
+    evidence.push("level:" + word.clone())
+    evidence.push("render:" + render)
+    RationaleRecord {
+      revision: revision,
+      kind: "equivalence".to_string(),
+      subject: subject,
+      decision: word,
+      reason: detail,
+      evidence: evidence
+    }
+  end
+end
+
+# ═══════════════════════════════════════════════════════════════
+# 3. THE STORE API
+# ═══════════════════════════════════════════════════════════════
+
+# Append ONE record: the digest is recomputed from the record content (the
+# caller's digest fields are ignored), and a record whose digest is already
+# stored is IDEMPOTENT — the existing digest is returned and no second row
+# is appended (the diagnostic_store_add idempotency rule).
+pub def rationale_store_add(
+  inout store: RationaleStore, record: RationaleRecord
+) -> StableDigest
+  let digest = rationale_digest(record.clone())
+  var i = 0
+  while i < store.records.len() do
+    if store.records[i].digest_hi == digest.hi && store.records[i].digest_lo == digest.lo then
+      return digest
+    end
+    i = i + 1
+  end
+  var stored = record.clone()
+  stored.digest_hi = digest.hi
+  stored.digest_lo = digest.lo
+  store.records.push(stored)
+  digest
+end
+
+pub def rationale_store_add_all(
+  inout store: RationaleStore, records: Vec[RationaleRecord]
+) -> Vec[StableDigest]
+  var out: Vec[StableDigest] = Vec::new()
+  for record in records do
+    out.push(rationale_store_add(store, record.clone()))
+  end
+  out
+end
+
+pub def rationale_store_len(store: RationaleStore) -> Int
+  store.records.len()
+end
+
+# The deterministic record order: revision, then kind, then decision, then
+# the identity digest render (the final tiebreak). No insertion order and
+# no Map order ever reaches a query.
+def rationale_record_sort_key(record: RationaleRecord) -> String
+  record.revision.clone() + "|" + record.kind.clone() + "|" +
+    record.decision.clone() + "|" + semantic_digest_render(&rationale_digest(record.clone()))
+end
+
+def rationale_record_sort_lt(a: RationaleRecord, b: RationaleRecord) -> Bool
+  rationale_record_sort_key(a.clone()) < rationale_record_sort_key(b.clone())
+end
+
+pub def rationale_store_all(store: RationaleStore) -> Vec[RationaleRecord]
+  var out: Vec[RationaleRecord] = Vec::new()
+  for record in store.records do
+    out.push(record.clone())
+  end
+  out.sort_by(|a, b| rationale_record_sort_lt(a, b))
+  out
+end
+
+# The records of ONE subject, in the deterministic order above (exact
+# subject equality — the subject is the caller's canonical key text).
+pub def rationale_for_subject(
+  store: RationaleStore, subject: String
+) -> Vec[RationaleRecord]
+  var out: Vec[RationaleRecord] = Vec::new()
+  for record in store.records do
+    if record.subject == subject then
+      out.push(record.clone())
+    end
+  end
+  out.sort_by(|a, b| rationale_record_sort_lt(a, b))
+  out
+end
+
+# The canonical store text: one record line per record, in INSERTION order
+# (the history order). Not the identity — load recomputes each record's
+# digest.
+pub def rationale_store_save(store: RationaleStore) -> String
+  var out = ""
+  for record in store.records do
+    out = out + rationale_record_text(record.clone())
+  end
+  out
+end
+
+# The store of a canonical store text: every line parses the 6-column
+# grammar and its fields are unescaped; the identity digests are RECOMPUTED
+# (the text carries no digest words). TOTAL loader: a malformed line is
+# skipped, never a fabricated record. Duplicate records collapse through
+# rationale_store_add's idempotency.
+pub def rationale_store_load(text: String) -> RationaleStore
+  var store = rationale_store_new()
+  for line in text.lines() do
+    let parts = rationale_split_unescaped(line.clone(), "|")
+    if parts.len() == 6 then
+      let evidence_text = parts[5].clone()
+      var evidence: Vec[String] = Vec::new()
+      if evidence_text.len() > 0 then
+        for part in rationale_split_unescaped(evidence_text.clone(), ";") do
+          evidence.push(rationale_unescape(part.clone()))
+        end
+      end
+      let record = RationaleRecord {
+        revision: rationale_unescape(parts[0].clone()),
+        kind: rationale_unescape(parts[1].clone()),
+        subject: rationale_unescape(parts[2].clone()),
+        decision: rationale_unescape(parts[3].clone()),
+        reason: rationale_unescape(parts[4].clone()),
+        evidence: evidence
+      }
+      rationale_store_add(&mut store, record)
+    end
+  end
+  store
+end
+
+# The content-addressed digest of the whole history: over the SORTED records
+# (order-independent — two stores holding the same records digest equal
+# whatever their insertion order was).
+pub def rationale_store_digest(store: RationaleStore) -> StableDigest
+  var text = ""
+  for record in rationale_store_all(store.clone()) do
+    text = text + rationale_record_text(record.clone())
+  end
+  stable_digest_of(&text)
+end
+
+# ═══════════════════════════════════════════════════════════════
+# 4. THE SEMANTIC-TOOL DISCOVERY SURFACE
+# ═══════════════════════════════════════════════════════════════
+# ONE SemanticTool per implemented semantic operation family. capability is
+# the handler/operation family word; inputs / outputs are the honest
+# argument and answer descriptions (the wire-record families are named as
+# "wire:<Record>" in outputs — the third-audit item-22 typed records, not
+# synthetic op names); stability is "stable" or "experimental" per the
+# module doc's rule; requires_mir / requires_coverage / requires_store say
+# which caller-supplied artifact the FULL answer needs (an op may still
+# answer a documented "<op>_unavailable" form without it).
+
+pub struct SemanticTool
+  name: String = ""
+  capability: String = ""
+  inputs: String = ""
+  outputs: String = ""
+  stability: String = ""
+  requires_mir: Bool = false
+  requires_coverage: Bool = false
+  requires_store: Bool = false
+end
+
+def semantic_tool_row(
+  name: String,
+  capability: String,
+  inputs: String,
+  outputs: String,
+  stability: String,
+  requires_mir: Bool,
+  requires_coverage: Bool,
+  requires_store: Bool
+) -> SemanticTool
+  SemanticTool {
+    name: name,
+    capability: capability,
+    inputs: inputs,
+    outputs: outputs,
+    stability: stability,
+    requires_mir: requires_mir,
+    requires_coverage: requires_coverage,
+    requires_store: requires_store
+  }
+end
+
+def tool_index(name: String, inputs: String, outputs: String) -> SemanticTool
+  semantic_tool_row(name, "index", inputs, outputs, "stable", false, false, false)
+end
+
+def tool_index_coverage(name: String, inputs: String, outputs: String) -> SemanticTool
+  semantic_tool_row(name, "index", inputs, outputs, "experimental", false, true, false)
+end
+
+def tool_explain(name: String, inputs: String, outputs: String) -> SemanticTool
+  semantic_tool_row(name, "explain", inputs, outputs, "stable", false, false, false)
+end
+
+def tool_mir(name: String, inputs: String, outputs: String) -> SemanticTool
+  semantic_tool_row(name, "mir", inputs, outputs, "experimental", true, false, false)
+end
+
+def tool_session(
+  name: String, capability: String, inputs: String, outputs: String
+) -> SemanticTool
+  semantic_tool_row(name, capability, inputs, outputs, "stable", false, false, false)
+end
+
+def tool_experimental(
+  name: String,
+  capability: String,
+  inputs: String,
+  outputs: String,
+  requires_mir: Bool,
+  requires_coverage: Bool,
+  requires_store: Bool
+) -> SemanticTool
+  semantic_tool_row(name, capability, inputs, outputs, "experimental",
+    requires_mir, requires_coverage, requires_store)
+end
+
+# The explicit metadata rows for every name of the §39 registry (59 ops) —
+# the audit's enumeration, anchored per family in the module doc. A
+# registry name absent here still appears via the conservative default row
+# below; the lane pins that every CURRENT registry name resolves here.
+def semantic_tool_table() -> Vec[SemanticTool]
+  Vec::from([
+    # ———— §39 registry: the index family (§32 SemanticIndex) ————
+    tool_index("callers", "fn stable key", "wire:CallersResponse: sorted caller fn stable keys"),
+    tool_index("callees", "fn stable key", "wire:CalleesResponse: sorted callee fn stable keys"),
+    tool_index("types", "symbol stable key", "wire:TypeResponse: type stable keys of the symbol"),
+    tool_index("effects", "fn stable key", "wire:EffectsResponse: the §11 effect summary row"),
+    tool_index("capabilities", "fn stable key", "wire:EffectsResponse: capability row keys"),
+    tool_index("purity.get", "fn stable key", "ordered purity status + evidence rows"),
+    tool_index("contracts", "fn stable key", "wire:ContractResponse: contract row keys"),
+    tool_index("fields", "type stable key", "wire:TypeResponse: field rows"),
+    tool_index("impls", "type or trait stable key", "sorted impl row keys"),
+    tool_index("properties", "type stable key", "sorted property rows"),
+    tool_index("mir_function", "fn stable key", "wire:MirFunctionResponse: coarse MIR summary rows"),
+    tool_index("symbol_get", "def key or symbol name", "wire:SymbolsResponse: matching symbol stable keys"),
+    tool_index("symbol_search", "name substring", "wire:SymbolsResponse: matching symbol stable keys"),
+    tool_index("contract_list", "fn stable key", "wire:ContractResponse: contract clause rows"),
+    tool_index("type_explain", "type stable key", "type explanation rows"),
+    tool_index("ownership_explain", "symbol or place key", "sorted ownership row keys"),
+    tool_index_coverage("test.affected", "changed symbol stable key", "covering test stable keys (empty without ingested coverage)"),
+    tool_index_coverage("coverage.affected", "symbol stable key", "coverage point rows (empty without ingested coverage)"),
+
+    # ———— §39 registry: the mir family (needs the session's final MIR) ————
+    tool_mir("mir_slice", "<slice kind>|<fn key>|<anchor>", "sorted §33 statement keys + the typed MirSlice payload"),
+    tool_mir("mir.dominators", "fn stable key", "sorted dominator block rows"),
+    tool_mir("mir.postdominators", "fn stable key", "sorted postdominator block rows"),
+    tool_mir("mir.loops", "fn stable key", "sorted natural-loop rows"),
+    tool_mir("mir.control", "fn stable key", "sorted control-dependence rows"),
+    tool_mir("mir.path", "fn stable key|node key", "the path's sorted statement keys"),
+    tool_mir("mir.reaching", "fn stable key|use node key", "sorted reaching-definition rows"),
+    tool_mir("mir.diff", "fn stable key A|fn stable key B", "normalized-MIR diff rows"),
+    # The §38 dispatch arm that was missing from the §39 registry
+    # (semantic_query.tg:2428 dispatches mir.block; the server_operations
+    # Vec listed the other seven graph ops): the registry row is NOW
+    # registered (semantic_server.tg's mir family), so the registry walk
+    # resolves this metadata row directly. The supplemental list still
+    # carries a deduped backup entry (registry rows win).
+    tool_mir("mir.block", "block key <fn>#B<id>", "sorted stable statement-id rows"),
+
+    # ———— §39 registry: the explain family (audit item 52 trees) ————
+    tool_explain("type.explain", "type stable key", "indented derivation tree lines"),
+    tool_explain("trait.resolve", "subject stable key", "typed impl keys (the §38 index answer)"),
+    tool_explain("trait.explain", "subject stable key", "indented derivation tree lines"),
+    tool_explain("ownership.explain", "symbol or place key", "indented derivation tree lines"),
+    tool_explain("effect.explain", "fn stable key", "indented derivation tree lines"),
+    tool_explain("capability.explain", "fn stable key", "indented derivation tree lines"),
+    tool_explain("layout.explain", "type stable key", "indented tree lines (the documented 'not available from snapshot rows' leaf without a layout row)"),
+    tool_explain("optimization.explain", "fn stable key", "indented tree lines (the documented not-available leaf: no optimization rows ride a snapshot)"),
+    tool_experimental("diagnostic.explain", "explain", "diagnostic id render or store index", "indented derivation tree lines", false, false, true),
+
+    # ———— §39 registry: type / ownership / contract / symbol families ————
+    tool_session("type.get", "type", "type stable key", "wire:TypeResponse: the type row"),
+    tool_session("type.layout", "type", "type stable key", "layout / alignment rows"),
+    tool_session("type.properties", "type", "type stable key", "sorted property rows"),
+    tool_session("ownership.moves", "ownership", "fn stable key", "wire:OwnershipResponse: move rows"),
+    tool_session("ownership.drop_plan", "ownership", "fn stable key", "wire:OwnershipResponse: drop-plan rows"),
+    tool_session("contract.obligations", "contract", "fn stable key", "wire:ContractResponse: recorded obligation rows"),
+    tool_session("contract.verify", "contract", "fn stable key", "contract verification rows"),
+    tool_session("symbol.references", "symbol", "symbol stable key", "sorted reference rows"),
+
+    # ———— §39 registry: snapshot / plan / edit / diagnostic / replay / service ————
+    tool_session("snapshot.get", "snapshot", "none (uses the session snapshot)", "revision + table summary rows"),
+    tool_experimental("snapshot.diff", "snapshot", "none (delta-scoped)", "snapshot.diff_unavailable (use session_delta / semantic_delta_of)", false, false, false),
+    tool_experimental("edit.apply", "edit", "source + the edit payload grammar", "edited source + expected §31 delta rows", false, false, false),
+    tool_session("build.plan", "plan", "none (uses the session evidence)", "wire:PlanResponse: build plan rows"),
+    tool_session("verify.plan", "plan", "none (uses the session evidence)", "wire:PlanResponse: verification plan rows"),
+    tool_experimental("diagnostic.get", "diagnostic", "diagnostic id render or store index", "wire:DiagnosticResponse: record rows", false, false, true),
+    tool_experimental("diagnostic.repair_context", "diagnostic", "diagnostic id render or store index", "repair context rows", false, false, true),
+    tool_experimental("replay.trace_rows", "replay", "EventTrace payload", "canonical event rows", false, false, false),
+    tool_experimental("replay.digest", "replay", "EventTrace payload", "the trace digest row", false, false, false),
+    tool_experimental("replay.writes_to", "replay", "EventTrace + place", "event rows writing the place", false, false, false),
+    tool_experimental("replay.value_at", "replay", "EventTrace + place", "value rows", false, false, false),
+    tool_experimental("replay.causal_predecessors", "replay", "EventTrace + event index", "causal predecessor rows", false, false, false),
+    tool_experimental("replay.first_divergence", "replay", "two EventTraces", "first-divergence rows", false, false, false),
+    tool_experimental("replay.minimal_causal_slice", "replay", "EventTrace + event index", "minimal causal slice rows", false, false, false),
+    tool_session("revision", "service", "none", "the revision digest render")
+  ])
+end
+
+# The §38-dispatch / export supplement: implemented operations that the §39
+# registry does not carry (delta-scoped probes, the ABI / perf report
+# engines, the typed-hole surface, the missing registry row mir.block, and
+# this module's rationale surface). Names are the callers' real exported
+# operation names; nothing synthetic is invented.
+def semantic_tools_supplemental() -> Vec[SemanticTool]
+  Vec::from([
+    tool_session("type.use", "type", "type stable key", "sorted use-of-type rows"),
+    tool_experimental("change.affected", "change", "SemanticDelta + stable key", "affected-closure membership (Bool)", false, false, false),
+    tool_experimental("change.semantic_diff", "change", "SemanticDelta", "wire:DeltaResponse: modified stable ids + affected closure", false, false, false),
+    tool_experimental("abi.inspect", "abi", "SemanticDelta", "wire:AbiResponse: changed ABI surface rows", false, false, false),
+    tool_experimental("abi.diff", "abi", "two ABI row sets", "layout / arg-location diff rows", false, false, false),
+    tool_experimental("abi.ffi_report", "abi", "symbol stable key + snapshot", "FfiReport rows", false, false, false),
+    tool_experimental("abi.rows", "abi", "SemanticSnapshot", "canonical ABI surface row texts", false, false, false),
+    tool_experimental("perf.report.mir", "perf", "optimized MirFunction", "PerfReport aggregates", true, false, false),
+    tool_experimental("perf.report.lir", "perf", "LirAlloc", "PerfReport aggregates (spills / reloads / stack bytes)", false, false, false),
+    tool_experimental("perf.reports", "perf", "optimized MirProgram", "per-function PerfReports sorted by fn key", true, false, false),
+    tool_experimental("perf.facts.mir", "perf", "MirFunction", "labeled PerfFact rows + provenance", true, false, false),
+    tool_experimental("perf.facts.lir", "perf", "LirAlloc", "labeled PerfFact rows + provenance", false, false, false),
+    tool_experimental("hole.constraints", "holes", "TypedProgram + hole node id", "typed-hole constraint rows", false, false, false),
+    tool_experimental("mir.block", "mir", "block key <fn>#B<id>", "sorted stable statement-id rows", true, false, false),
+    tool_experimental("rationale.add", "rationale", "RationaleRecord", "record identity digest (idempotent)", false, false, true),
+    tool_experimental("rationale.save", "rationale", "RationaleStore", "JSONL store text", false, false, true),
+    tool_experimental("rationale.load", "rationale", "JSONL store text", "RationaleStore (total; malformed lines skipped)", false, false, false),
+    tool_experimental("rationale.for_subject", "rationale", "subject text", "sorted matching records", false, false, true),
+    tool_experimental("rationale.store_digest", "rationale", "RationaleStore", "content-addressed history digest", false, false, true)
+  ])
+end
+
+def semantic_tool_lookup(name: String) -> Option[SemanticTool]
+  for tool in semantic_tool_table() do
+    if tool.name == name then
+      return Option::Some(tool.clone())
+    end
+  end
+  Option::None
+end
+
+def semantic_tools_has(tools: Vec[SemanticTool], name: String) -> Bool
+  for tool in tools do
+    if tool.name == name then
+      return true
+    end
+  end
+  false
+end
+
+# The conservative default for a registry name with no explicit metadata
+# row: it is still listed (never silently dropped) with experimental
+# stability and the requires flags its handler family implies.
+def semantic_tool_default(op: ServerOperation) -> SemanticTool
+  semantic_tool_row(
+    op.name.clone(),
+    op.handler_kind.clone(),
+    "registry:" + op.handler_kind.clone(),
+    "registry:" + op.handler_kind.clone(),
+    "experimental",
+    op.handler_kind == "mir",
+    false,
+    op.handler_kind == "diagnostic"
+  )
+end
+
+# (a) the live registry walk: every §39 server_operations() name, explicit
+# metadata when the table has it, the conservative default otherwise.
+def semantic_tools_from_registry() -> Vec[SemanticTool]
+  var out: Vec[SemanticTool] = Vec::new()
+  for op in server_operations() do
+    match semantic_tool_lookup(op.name.clone())
+    when Option::Some(tool) then
+      if !semantic_tools_has(out.clone(), tool.name.clone()) then
+        out.push(tool)
+      end
+    when Option::None then
+      if !semantic_tools_has(out.clone(), op.name.clone()) then
+        out.push(semantic_tool_default(op.clone()))
+      end
+    end
+  end
+  out
+end
+
+# The discovery surface: registry walk + supplement, deduped by name
+# (registry rows win), byte-sorted by name. Deterministic on every call.
+pub def semantic_tools() -> Vec[SemanticTool]
+  var out = semantic_tools_from_registry()
+  for tool in semantic_tools_supplemental() do
+    if !semantic_tools_has(out.clone(), tool.name.clone()) then
+      out.push(tool)
+    end
+  end
+  out.sort_by(|a, b| a.name < b.name)
+  out
+end
+
+pub def tool_for(name: String) -> Option[SemanticTool]
+  for tool in semantic_tools() do
+    if tool.name == name then
+      return Option::Some(tool.clone())
+    end
+  end
+  Option::None
+end
+
+pub def tools_requiring_mir() -> Vec[SemanticTool]
+  var out: Vec[SemanticTool] = Vec::new()
+  for tool in semantic_tools() do
+    if tool.requires_mir then
+      out.push(tool.clone())
+    end
+  end
+  out
+end
+
+pub def tools_requiring_coverage() -> Vec[SemanticTool]
+  var out: Vec[SemanticTool] = Vec::new()
+  for tool in semantic_tools() do
+    if tool.requires_coverage then
+      out.push(tool.clone())
+    end
+  end
+  out
+end
+
+pub def tools_requiring_store() -> Vec[SemanticTool]
+  var out: Vec[SemanticTool] = Vec::new()
+  for tool in semantic_tools() do
+    if tool.requires_store then
+      out.push(tool.clone())
+    end
+  end
+  out
+end
+
+# ═══════════════════════════════════════════════════════════════
+# 5. THE EXECUTABLE LANES
+# ═══════════════════════════════════════════════════════════════
+# The sibling lane style (semantic_diagnostics_lane_check /
+# semantic_planning_lane_check): each helper row returns the mismatch texts;
+# an empty list verifies. R1-R4 are the rationale history rows, T1-T3 the
+# tool-discovery rows.
+
+def rationale_lane_bool(inout out: Vec[String], name: String, ok: Bool) -> Unit
+  if !ok then
+    out.push(name + ": expected true")
+  end
+  ()
+end
+
+def rationale_lane_int(inout out: Vec[String], name: String, got: Int, expected: Int) -> Unit
+  if got != expected then
+    out.push(name + ": expected " + expected.to_string() + ", got " + got.to_string())
+  end
+  ()
+end
+
+def rationale_lane_text(inout out: Vec[String], name: String, got: String, expected: String) -> Unit
+  if got != expected then
+    out.push(name + ": expected '" + expected + "', got '" + got + "'")
+  end
+  ()
+end
+
+def rationale_lane_rows(
+  inout out: Vec[String], name: String, got: Vec[String], expected: Vec[String]
+) -> Unit
+  if got.len() != expected.len() then
+    out.push(name + ": expected " + expected.len().to_string() + " rows, got " + got.len().to_string())
+    return ()
+  end
+  var i = 0
+  while i < got.len() do
+    if got[i] != expected[i] then
+      out.push(name + "[" + i.to_string() + "]: expected '" + expected[i].clone() + "', got '" + got[i].clone() + "'")
+    end
+    i = i + 1
+  end
+  ()
+end
+
+def tool_name_rows(tools: Vec[SemanticTool]) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  for tool in tools do
+    out.push(tool.name.clone())
+  end
+  out
+end
+
+# ———— The grounded-source fixtures ————
+
+def rationale_lane_optimization() -> RationaleRecord
+  rationale_of_optimization_decision("rev-1".to_string(), OptimizationDecision {
+    pass: "inline".to_string(),
+    symbol: "m::f#fn()->unit".to_string(),
+    site: "lane.tg:3-9".to_string(),
+    decision: "inline-rejected".to_string(),
+    reason: "callee too large: 120 statements".to_string()
+  })
+end
+
+def rationale_lane_diagnostic() -> RationaleRecord
+  let id = stable_diagnostic_id_of(
+    "m::f#fn()->unit".to_string(),
+    "r".to_string(),
+    "E0201".to_string(),
+    "".to_string(),
+    0
+  )
+  rationale_of_diagnostic_record("rev-2".to_string(), DiagnosticRecord {
+    id: id,
+    message: "use of moved value `r`".to_string(),
+    span: "lane.tg:7".to_string(),
+    semantic_kind: "ownership".to_string(),
+    related: Vec::from([
+      "place:r".to_string(),
+      "state_before:consumed".to_string()
+    ])
+  })
+end
+
+def rationale_lane_delta() -> RationaleRecord
+  rationale_of_delta("rev-3".to_string(), semantic_delta_empty())
+end
+
+def rationale_lane_delta_created() -> SemanticDelta
+  var delta = semantic_delta_empty()
+  delta.created = Vec::from(["m::g#fn()->unit".to_string()])
+  delta
+end
+
+# The escaping stress record: separators in every field, a real newline in
+# the reason, and an EMPTY evidence row (the "\e" codec path).
+def rationale_lane_escaped() -> RationaleRecord
+  RationaleRecord {
+    revision: "rev|4".to_string(),
+    kind: "delta".to_string(),
+    subject: "m::f#fn()->unit|part".to_string(),
+    decision: "a;b".to_string(),
+    reason: "line1\nline2".to_string(),
+    evidence: Vec::from([
+      "e|1;2".to_string(),
+      "".to_string(),
+      "plain".to_string()
+    ])
+  }
+end
+
+# R1-R4: the five grounded kinds, the store semantics (idempotency, digest
+# determinism, order-independent history digest), the subject query and the
+# save/load round-trip.
+pub def rationale_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # ———— R1: the five grounded kinds ————
+  let opt = rationale_lane_optimization()
+  rationale_lane_text(&mut out, "r1-optimization-kind", opt.kind.clone(), "optimization")
+  rationale_lane_text(&mut out, "r1-optimization-subject", opt.subject.clone(), "m::f#fn()->unit")
+  rationale_lane_text(&mut out, "r1-optimization-decision", opt.decision.clone(), "inline-rejected")
+  rationale_lane_rows(&mut out, "r1-optimization-evidence", opt.evidence.clone(), Vec::from([
+    "pass:inline".to_string(),
+    "site:lane.tg:3-9".to_string()
+  ]))
+
+  let diag = rationale_lane_diagnostic()
+  rationale_lane_text(&mut out, "r1-diagnostic-kind", diag.kind.clone(), "diagnostic")
+  rationale_lane_text(&mut out, "r1-diagnostic-subject", diag.subject.clone(), "m::f#fn()->unit")
+  rationale_lane_text(&mut out, "r1-diagnostic-decision", diag.decision.clone(), "E0201")
+  rationale_lane_text(&mut out, "r1-diagnostic-reason", diag.reason.clone(), "use of moved value `r`")
+  rationale_lane_int(&mut out, "r1-diagnostic-evidence-len", diag.evidence.len(), 4)
+  if diag.evidence.len() == 4 then
+    rationale_lane_bool(&mut out, "r1-diagnostic-id-row", diag.evidence[0].starts_with("diagnostic:"))
+    rationale_lane_text(&mut out, "r1-diagnostic-related", diag.evidence[2].clone(), "place:r")
+  end
+
+  let delta = rationale_lane_delta()
+  rationale_lane_text(&mut out, "r1-delta-kind", delta.kind.clone(), "delta")
+  rationale_lane_bool(&mut out, "r1-delta-subject", delta.subject.starts_with("delta:"))
+  rationale_lane_text(&mut out, "r1-delta-decision", delta.decision.clone(), "delta-summary")
+  rationale_lane_bool(&mut out, "r1-delta-summary-row",
+    delta.reason.contains("created:0") && delta.reason.contains("affected:0"))
+  rationale_lane_int(&mut out, "r1-delta-evidence-len", delta.evidence.len(), 1)
+
+  let budget_ok = rationale_of_budget(
+    "rev-4".to_string(),
+    "change:empty".to_string(),
+    ChangeBudget {},
+    semantic_delta_empty()
+  )
+  rationale_lane_text(&mut out, "r1-budget-verified-kind", budget_ok.kind.clone(), "budget")
+  rationale_lane_text(&mut out, "r1-budget-verified-decision", budget_ok.decision.clone(), "budget-verified")
+  rationale_lane_text(&mut out, "r1-budget-verified-reason", budget_ok.reason.clone(), "no violations")
+  rationale_lane_int(&mut out, "r1-budget-verified-evidence", budget_ok.evidence.len(), 0)
+
+  let budget_bad = rationale_of_budget(
+    "rev-4".to_string(),
+    "change:created".to_string(),
+    ChangeBudget {},
+    rationale_lane_delta_created()
+  )
+  rationale_lane_text(&mut out, "r1-budget-violated-decision", budget_bad.decision.clone(), "budget-violated")
+  rationale_lane_int(&mut out, "r1-budget-violated-evidence", budget_bad.evidence.len(), 1)
+  if budget_bad.evidence.len() == 1 then
+    rationale_lane_bool(&mut out, "r1-budget-violated-row",
+      budget_bad.evidence[0].starts_with("budget:"))
+  end
+
+  let eq = rationale_of_equivalence(
+    "rev-5".to_string(),
+    "m::f#fn()->unit".to_string(),
+    equivalence_structural("normalized-mir".to_string())
+  )
+  rationale_lane_text(&mut out, "r1-equivalence-kind", eq.kind.clone(), "equivalence")
+  rationale_lane_text(&mut out, "r1-equivalence-decision", eq.decision.clone(), "structurally-equivalent")
+  rationale_lane_text(&mut out, "r1-equivalence-reason", eq.reason.clone(), "normalized-mir")
+  rationale_lane_int(&mut out, "r1-equivalence-evidence", eq.evidence.len(), 2)
+
+  let unk = rationale_of_equivalence(
+    "rev-5".to_string(),
+    "m::f#fn()->unit".to_string(),
+    equivalence_unknown("bounded domain requires an evaluator".to_string())
+  )
+  rationale_lane_text(&mut out, "r1-unknown-decision", unk.decision.clone(), "unknown")
+
+  # ———— R2: add + idempotency + digest determinism ————
+  var store = rationale_store_new()
+  let d1 = rationale_store_add(&mut store, opt.clone())
+  let d1_again = rationale_store_add(&mut store, opt.clone())
+  rationale_lane_bool(&mut out, "r2-idempotent-digest", d1.hi == d1_again.hi && d1.lo == d1_again.lo)
+  rationale_lane_int(&mut out, "r2-idempotent-len", rationale_store_len(store.clone()), 1)
+  let d2 = rationale_store_add(&mut store, diag.clone())
+  let d3 = rationale_store_add(&mut store, delta.clone())
+  rationale_lane_int(&mut out, "r2-store-len", rationale_store_len(store.clone()), 3)
+  rationale_lane_bool(&mut out, "r2-distinct-digests",
+    (d2.hi != d1.hi || d2.lo != d1.lo) && (d3.hi != d2.hi || d3.lo != d2.lo))
+  let computed = rationale_digest(opt.clone())
+  rationale_lane_bool(&mut out, "r2-returned-digest",
+    computed.hi == d1.hi && computed.lo == d1.lo)
+  if store.records.len() == 3 then
+    rationale_lane_bool(&mut out, "r2-stored-digest-sealed",
+      store.records[0].digest_hi == d1.hi && store.records[0].digest_lo == d1.lo)
+  end
+  let sealed = rationale_record_with_digest(opt.clone())
+  rationale_lane_bool(&mut out, "r2-sealed-constructor",
+    sealed.digest_hi == d1.hi && sealed.digest_lo == d1.lo)
+  var all_store = rationale_store_new()
+  let all_digests = rationale_store_add_all(&mut all_store, Vec::from([
+    opt.clone(),
+    diag.clone(),
+    opt.clone()
+  ]))
+  rationale_lane_int(&mut out, "r2-add-all-digests", all_digests.len(), 3)
+  rationale_lane_int(&mut out, "r2-add-all-len", rationale_store_len(all_store.clone()), 2)
+  let generic = rationale_record_new(
+    "rev-6".to_string(),
+    "budget".to_string(),
+    "m::f#fn()->unit".to_string(),
+    "budget-verified".to_string(),
+    "no violations".to_string(),
+    Vec::from(["row".to_string()])
+  )
+  rationale_lane_int(&mut out, "r2-record-new-evidence", generic.evidence.len(), 1)
+  var changed = opt.clone()
+  changed.reason = "different reason".to_string()
+  let d_changed = rationale_digest(changed.clone())
+  rationale_lane_bool(&mut out, "r2-digest-field-sensitive",
+    d_changed.hi != d1.hi || d_changed.lo != d1.lo)
+
+  # The history digest is over the SORTED records: insertion order cannot
+  # change it.
+  var store_a = rationale_store_new()
+  let _a1 = rationale_store_add(&mut store_a, opt.clone())
+  let _a2 = rationale_store_add(&mut store_a, diag.clone())
+  var store_b = rationale_store_new()
+  let _b1 = rationale_store_add(&mut store_b, diag.clone())
+  let _b2 = rationale_store_add(&mut store_b, opt.clone())
+  let history_a = rationale_store_digest(store_a.clone())
+  let history_b = rationale_store_digest(store_b.clone())
+  rationale_lane_bool(&mut out, "r2-history-digest-order-independent",
+    history_a.hi == history_b.hi && history_a.lo == history_b.lo)
+
+  # ———— R3: the subject query ————
+  var subject_store = rationale_store_new()
+  let _s1 = rationale_store_add(&mut subject_store, opt.clone())
+  var opt_late = opt.clone()
+  opt_late.revision = "rev-2".to_string()
+  opt_late.decision = "bounds-check-retained".to_string()
+  let _s2 = rationale_store_add(&mut subject_store, opt_late.clone())
+  let _s3 = rationale_store_add(&mut subject_store, delta.clone())
+  let found = rationale_for_subject(subject_store.clone(), "m::f#fn()->unit".to_string())
+  rationale_lane_int(&mut out, "r3-subject-count", found.len(), 2)
+  if found.len() == 2 then
+    rationale_lane_text(&mut out, "r3-subject-sorted-first", found[0].revision.clone(), "rev-1")
+    rationale_lane_text(&mut out, "r3-subject-sorted-second", found[1].revision.clone(), "rev-2")
+  end
+  rationale_lane_int(&mut out, "r3-subject-absent",
+    rationale_for_subject(subject_store.clone(), "no::such#fn()->unit".to_string()).len(), 0)
+  rationale_lane_int(&mut out, "r3-subject-delta",
+    rationale_for_subject(subject_store.clone(), delta.subject.clone()).len(), 1)
+
+  # ———— R4: save / load round-trip ————
+  let text = rationale_store_save(store.clone())
+  let loaded = rationale_store_load(text.clone())
+  rationale_lane_int(&mut out, "r4-load-len", rationale_store_len(loaded.clone()), 3)
+  rationale_lane_text(&mut out, "r4-save-load-save", rationale_store_save(loaded.clone()), text.clone())
+  let original_all = rationale_store_all(store.clone())
+  let loaded_all = rationale_store_all(loaded.clone())
+  rationale_lane_int(&mut out, "r4-all-len", loaded_all.len(), original_all.len())
+  var i = 0
+  while i < original_all.len() && i < loaded_all.len() do
+    let digest_a = rationale_digest(original_all[i].clone())
+    let digest_b = rationale_digest(loaded_all[i].clone())
+    if digest_a.hi != digest_b.hi || digest_a.lo != digest_b.lo then
+      out.push("r4-record-digest[" + i.to_string() + "]: loaded digest differs")
+    end
+    i = i + 1
+  end
+  rationale_lane_bool(&mut out, "r4-history-digest-round-trip",
+    rationale_store_digest(store.clone()).hi == rationale_store_digest(loaded.clone()).hi &&
+    rationale_store_digest(store.clone()).lo == rationale_store_digest(loaded.clone()).lo)
+
+  # The escaping codec: separators, a real newline and an empty evidence row
+  # all round-trip byte-exactly.
+  var escaped_store = rationale_store_new()
+  let escaped = rationale_lane_escaped()
+  let escaped_digest = rationale_store_add(&mut escaped_store, escaped.clone())
+  let escaped_text = rationale_store_save(escaped_store.clone())
+  let escaped_loaded = rationale_store_load(escaped_text.clone())
+  rationale_lane_int(&mut out, "r4-escaped-len", rationale_store_len(escaped_loaded.clone()), 1)
+  if rationale_store_len(escaped_loaded.clone()) == 1 then
+    let back = rationale_store_all(escaped_loaded.clone())[0].clone()
+    rationale_lane_text(&mut out, "r4-escaped-revision", back.revision.clone(), "rev|4")
+    rationale_lane_text(&mut out, "r4-escaped-subject", back.subject.clone(), "m::f#fn()->unit|part")
+    rationale_lane_text(&mut out, "r4-escaped-decision", back.decision.clone(), "a;b")
+    rationale_lane_text(&mut out, "r4-escaped-reason", back.reason.clone(), "line1\nline2")
+    rationale_lane_int(&mut out, "r4-escaped-evidence-len", back.evidence.len(), 3)
+    if back.evidence.len() == 3 then
+      rationale_lane_text(&mut out, "r4-escaped-evidence-0", back.evidence[0].clone(), "e|1;2")
+      rationale_lane_text(&mut out, "r4-escaped-evidence-1", back.evidence[1].clone(), "")
+      rationale_lane_text(&mut out, "r4-escaped-evidence-2", back.evidence[2].clone(), "plain")
+    end
+    let back_digest = rationale_digest(back.clone())
+    rationale_lane_bool(&mut out, "r4-escaped-digest",
+      back_digest.hi == escaped_digest.hi && back_digest.lo == escaped_digest.lo)
+  end
+
+  # The total loader: malformed / short / empty texts never fabricate rows.
+  rationale_lane_int(&mut out, "r4-empty-text",
+    rationale_store_len(rationale_store_load("".to_string())), 0)
+  rationale_lane_int(&mut out, "r4-malformed-text",
+    rationale_store_len(rationale_store_load("not a store line".to_string())), 0)
+  rationale_lane_int(&mut out, "r4-short-line",
+    rationale_store_len(rationale_store_load("a|b|c".to_string())), 0)
+
+  out
+end
+
+# T1-T3: the discovery surface — sorted deterministic enumeration, registry
+# coverage, the audited count, the named ops' flags and the filter views.
+pub def semantic_tools_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  let tools = semantic_tools()
+
+  # ———— T1: sorted, deduped, registry-covered ————
+  rationale_lane_int(&mut out, "t1-tool-count", tools.len(), 77)
+  var sorted = true
+  var i = 1
+  while i < tools.len() do
+    if tools[i - 1].name > tools[i].name then
+      sorted = false
+    end
+    i = i + 1
+  end
+  rationale_lane_bool(&mut out, "t1-sorted", sorted)
+  var unique = true
+  i = 1
+  while i < tools.len() do
+    if tools[i - 1].name == tools[i].name then
+      unique = false
+    end
+    i = i + 1
+  end
+  rationale_lane_bool(&mut out, "t1-unique", unique)
+
+  let registry = server_operations()
+  rationale_lane_int(&mut out, "t1-registry-count", registry.len(), 59)
+  var covered = true
+  var missing = ""
+  for op in registry do
+    match semantic_tool_lookup(op.name.clone())
+    when Option::Some(_) then ()
+    when Option::None then
+      covered = false
+      missing = op.name.clone()
+    end
+  end
+  rationale_lane_bool(&mut out, "t1-registry-metadata-covered", covered)
+  if !covered then
+    out.push("t1-registry-metadata-missing: " + missing)
+  end
+  var listed = true
+  for op in registry do
+    var found = false
+    for tool in tools do
+      if tool.name == op.name then
+        found = true
+      end
+    end
+    if !found then
+      listed = false
+    end
+  end
+  rationale_lane_bool(&mut out, "t1-registry-listed", listed)
+
+  # ———— T2: the named ops' capability metadata ————
+  match tool_for("mir.dominators".to_string())
+  when Option::Some(tool) then
+    rationale_lane_bool(&mut out, "t2-dominators-mir", tool.requires_mir)
+    rationale_lane_bool(&mut out, "t2-dominators-coverage", !tool.requires_coverage)
+    rationale_lane_bool(&mut out, "t2-dominators-store", !tool.requires_store)
+    rationale_lane_text(&mut out, "t2-dominators-stability", tool.stability.clone(), "experimental")
+    rationale_lane_text(&mut out, "t2-dominators-capability", tool.capability.clone(), "mir")
+  when Option::None then
+    out.push("t2-dominators: expected Some, got None")
+  end
+  match tool_for("coverage.affected".to_string())
+  when Option::Some(tool) then
+    rationale_lane_bool(&mut out, "t2-coverage-flag", tool.requires_coverage)
+    rationale_lane_bool(&mut out, "t2-coverage-mir", !tool.requires_mir)
+  when Option::None then
+    out.push("t2-coverage: expected Some, got None")
+  end
+  # The §39 registry spells the op "symbol_get" (there is no dotted
+  # "symbol.get" name in the dispatch): it requires NOTHING extra.
+  match tool_for("symbol_get".to_string())
+  when Option::Some(tool) then
+    rationale_lane_bool(&mut out, "t2-symbol-get-requires-nothing",
+      !tool.requires_mir && !tool.requires_coverage && !tool.requires_store)
+    rationale_lane_text(&mut out, "t2-symbol-get-stability", tool.stability.clone(), "stable")
+  when Option::None then
+    out.push("t2-symbol-get: expected Some, got None")
+  end
+  match tool_for("diagnostic.get".to_string())
+  when Option::Some(tool) then
+    rationale_lane_bool(&mut out, "t2-diagnostic-store", tool.requires_store)
+  when Option::None then
+    out.push("t2-diagnostic-store: expected Some, got None")
+  end
+  match tool_for("rationale.for_subject".to_string())
+  when Option::Some(tool) then
+    rationale_lane_bool(&mut out, "t2-rationale-store", tool.requires_store)
+  when Option::None then
+    out.push("t2-rationale-store: expected Some, got None")
+  end
+  # The registry-gap finding: mir.block is implemented by the §38 dispatch
+  # but absent from server_operations; the discovery surface carries it.
+  match tool_for("mir.block".to_string())
+  when Option::Some(tool) then
+    rationale_lane_bool(&mut out, "t2-mir-block-flag", tool.requires_mir)
+  when Option::None then
+    out.push("t2-mir-block: expected Some, got None")
+  end
+  # The supplement's engine families are present.
+  for engine_name in Vec::from([
+    "type.use".to_string(),
+    "change.semantic_diff".to_string(),
+    "abi.inspect".to_string(),
+    "perf.reports".to_string(),
+    "hole.constraints".to_string()
+  ]) do
+    match tool_for(engine_name.clone())
+    when Option::Some(_) then ()
+    when Option::None then
+      out.push("t2-engine-missing: " + engine_name.clone())
+    end
+  end
+
+  # ———— T3: the filter views ————
+  let mir_tools = tools_requiring_mir()
+  rationale_lane_int(&mut out, "t3-mir-count", mir_tools.len(), 12)
+  rationale_lane_rows(&mut out, "t3-mir-names", tool_name_rows(mir_tools.clone()), Vec::from([
+    "mir.block".to_string(),
+    "mir.control".to_string(),
+    "mir.diff".to_string(),
+    "mir.dominators".to_string(),
+    "mir.loops".to_string(),
+    "mir.path".to_string(),
+    "mir.postdominators".to_string(),
+    "mir.reaching".to_string(),
+    "mir_slice".to_string(),
+    "perf.facts.mir".to_string(),
+    "perf.report.mir".to_string(),
+    "perf.reports".to_string()
+  ]))
+  let coverage_tools = tools_requiring_coverage()
+  rationale_lane_rows(&mut out, "t3-coverage-names", tool_name_rows(coverage_tools.clone()), Vec::from([
+    "coverage.affected".to_string(),
+    "test.affected".to_string()
+  ]))
+  let store_tools = tools_requiring_store()
+  rationale_lane_int(&mut out, "t3-store-count", store_tools.len(), 7)
+  rationale_lane_rows(&mut out, "t3-store-names", tool_name_rows(store_tools.clone()), Vec::from([
+    "diagnostic.explain".to_string(),
+    "diagnostic.get".to_string(),
+    "diagnostic.repair_context".to_string(),
+    "rationale.add".to_string(),
+    "rationale.for_subject".to_string(),
+    "rationale.save".to_string(),
+    "rationale.store_digest".to_string()
+  ]))
+  match tool_for("no.such.tool".to_string())
+  when Option::Some(_) then
+    out.push("t3-absent: expected None, got Some")
+  when Option::None then ()
+  end
+
+  out
+end
+
+pub def semantic_rationale_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  for row in rationale_lane_check() do
+    out.push(row.clone())
+  end
+  for row in semantic_tools_lane_check() do
+    out.push(row.clone())
+  end
+  out
+end

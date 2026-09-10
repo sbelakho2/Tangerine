@@ -1090,7 +1090,7 @@ use tg_compiler::types::{
   SimdIntrinsicKind, SimdLane,
   simd_intrinsic_kind_of, simd_intrinsic_lane_of
 }
-use tg_compiler::ids::{GenericParamId, TypeId, InstanceId, DefId, def_id_numeric}
+use tg_compiler::ids::{GenericParamId, TypeId, InstanceId, DefId, def_id_numeric, IntrinsicId}
 use tg_compiler::mir::{
   MirProgram, MirStatic, MirFunction, MirBlock, MirLocal, MirStatement,
   MirStatementKind, MirTerminator, MirTerminatorKind,
@@ -1173,6 +1173,7 @@ use tg_compiler::layout_engine::{
   classify_call_plan, AbiFlavor,
   abi_internal_image_class, classify_enum_crossing, AbiEnumCrossing,
   AbiValueClass, abi_value_class_word,
+  NicheKind, NicheSpec,
   is_simd_vector_type_name
 }
 
@@ -1838,6 +1839,27 @@ struct LirFunction
   # payloaded tagged-enum parameter or return. The verifier's
   # no-unversioned-crossing rule is exactly this bit => Some(version).
   enum_abi_crossing: Bool = false
+  # THE DECLARED NICHED-ENUM CROSSING EVIDENCE: TRUE iff the function's
+  # declared signature has at least one admitted NICHED enum parameter or
+  # return (one payload word; the payload-less variant in the payload
+  # type's niche). The niched crossing is a one-word scalar crossing that
+  # AGREES between the LIR route and the direct route under the
+  # compiler's InternalValue convention (layout_engine.classify_enum_crossing
+  # answers ValueWord), so it needs NO enum ABI version marker — but the
+  # canonical EXTERN C flavor has no permitted crossing for it (the
+  # authority fails closed), so the crossing stays route-internal: the
+  # writers emit such a function LOCAL and a required export fails closed
+  # (lir_fn_export_binding / lir_check_fn_enum_abi_export). Attached at
+  # lowering from lir_fn_has_niched_enum_crossing and preserved by every
+  # rebuild (lir_peephole).
+  niched_enum_crossing: Bool = false
+  # (third-audit item 37) Tail-call recognition state — the block ids whose
+  # MirCall terminator was marked tail = true by the MIR optimizer. Copied
+  # from LirLowerCtx at assembly and preserved by every rebuild
+  # (lir_peephole). Purely advisory: the aarch64/x86-64 emitters re-check
+  # their route's frame/ABI conditions before emitting a frame-restoring
+  # branch, and every other route ignores it.
+  tail_call_blocks: Set[Int] = Set::new()
 end
 
 enum LirValue
@@ -3082,15 +3104,33 @@ struct LirAggVariant
   fields: Vec[LirAggField] # payload fields; word == slot in the image
 end
 
-# The admitted image record of a tagged-enum local: the union image of
-# the tag word and every variant's payload words, mirroring the direct
-# enum layout (tag @ byte 0; payload words at the engine's absolute
-# offsets — every admitted payload field starts on an 8-byte boundary,
-# so its word == byte_off / 8).
+# The admitted image record of a tagged-enum OR niched-enum local.
+# TAGGED (niche == None): the union image of the tag word and every
+# variant's payload words, mirroring the direct enum layout (tag @ byte
+# 0; payload words at the engine's absolute offsets — every admitted
+# payload field starts on an 8-byte boundary, so its word == byte_off / 8).
+# NICHED (niche == Some(spec)): the value is ONE word — the payload image:
+#   words = 1, size = 8 (the pointer-size payload store size), no tag
+#   word; the single payload variant's one field sits at word 0 / byte 0
+#   (its LirAggField.byte_off is 0 and its word is 0), and the
+#   payload-less variant has NO payload fields (its zero-sized fields are
+#   not machine words — Result[Ptr, Unit]'s Unit arm). The absent case is
+#   the niche pattern (NicheSpec.encoded_niche) stored in the one word;
+#   see lir_lower_enum_construction / the MirDiscriminant normalization.
+# The niche mirror follows layout_engine's gate exactly for the shapes
+# this slice can represent: exactly two variants, one payload-less (all
+# fields structurally zero-sized) and one single-field payload whose
+# substituted type is a pointer/ref WORD (Ptr/PtrMut/RefInternal — the
+# only NicheKind LIR lowers as a machine word); a NonZero-wrapper payload
+# is niched by the engine but its Adt payload has no LIR word lowering,
+# so such an enum keeps failing closed at this shape gate. The mirror
+# applies only when the declaration carries no @repr(C)/@packed/@align
+# attribute (the engine's gate).
 struct LirEnumShape
-  words: Int                 # image slots (tag word + payload union)
+  words: Int                 # image slots (tag word + payload union; 1 for a niched enum)
   size: Int                  # the direct layout's total byte size (mirror)
   variants: Vec[LirAggVariant]   # declaration order
+  niche: Option[NicheSpec]   # Some iff the enum is the NICHED form (one payload word)
 end
 
 # The direct layout byte size of a FIELD scalar of the aggregate slice
@@ -3314,6 +3354,71 @@ end
 # ... — every payload field starts on its own 8-byte boundary — and the
 # image slot count is the direct total size / 8: total = align_up(8 +
 # align_up(max over variants of the payload byte sum, 8), 8).
+#
+# THE NICHE MIRROR: before the tagged placement, the SAME conservative
+# gate layout_engine.compute_enum_layout applies is mirrored for the
+# shapes this slice can represent (see LirEnumShape.niche): exactly two
+# variants with one payload-less (all fields structurally zero-sized)
+# and one single-field payload whose substituted type is a pointer/ref
+# word (the PointerNull niche kinds) and no @repr(C) attribute. Such an
+# enum takes the NICHED shape — ONE payload word at word 0, no tag —
+# matching the engine's niched record (size/align = the payload's, tag
+# size 0, payload offset 0).
+
+# Is a field type structurally zero-sized (Unit / Never / an all-zero
+# tuple / a zero-length fixed array) — the mirror of layout_engine's
+# niche_field_is_zero_sized, used only by the niche gate above.
+def lir_niche_field_is_zero_sized(ty: Type) -> Bool
+  match ty
+  when Type::Unit then true
+  when Type::Never then true
+  when Type::Tuple(elems) then
+    var all_zero = true
+    for e in elems do
+      if !lir_niche_field_is_zero_sized(e) then
+        all_zero = false
+      end
+    end
+    all_zero
+  when Type::FixedArray(_, n) then n == 0
+  when _ then false
+  end
+end
+
+# True when every field of the variant is structurally zero-sized (its
+# payload byte sum is 0 in the engine's gate; zero fields included).
+def lir_variant_fields_zero_sized(td_params: Vec[GenericParamId], args: Vec[Type], v: MirVariantDef) -> Bool
+  var all_zero = true
+  var fi = 0
+  while fi < v.fields.len() do
+    let fty = match lir_subst_type_arg(td_params, args, v.fields[fi])
+    when Option::Some(t) then t
+    when Option::None then
+      return false
+    end
+    if !lir_niche_field_is_zero_sized(fty) then
+      all_zero = false
+    end
+    fi = fi + 1
+  end
+  all_zero
+end
+
+# Is the (substituted) payload type a pointer/ref WORD — the PointerNull
+# niche kinds (Ptr/PtrMut/RefInternal) that this slice represents as a
+# single machine word? (The engine also models Bool's second pattern and
+# NonZero wrappers; neither is applied here: a Bool payload is 1 byte —
+# not the one-word store — and a NonZero wrapper is an Adt payload with
+# no LIR word lowering.)
+def lir_niche_word_payload(ty: Type) -> Bool
+  match ty
+  when Type::Ptr(_) then true
+  when Type::PtrMut(_) then true
+  when Type::RefInternal(_, _) then true
+  when _ then false
+  end
+end
+
 def lir_tagged_enum_shape(tid: TypeId, args: Vec[Type], td: MirTypeDef, variants: Vec[MirVariantDef]) -> Result[Option[LirAggShapeKind], String]
   let td_name = td.name.clone()
   let td_params = td.generic_params.clone()
@@ -3327,6 +3432,61 @@ def lir_tagged_enum_shape(tid: TypeId, args: Vec[Type], td: MirTypeDef, variants
   end
   if variants.len() == 0 then
     return Result::Err("enum " + td_name + " has no variants; zero-variant (uninhabited) enum locals are not implemented")
+  end
+  # ── THE NICHE MIRROR (see the function doc): the engine's gate is
+  # exactly two variants, one payload_size == 0 and one single-field
+  # payload whose type reports a one-word niche, with no layout
+  # attribute; this slice mirrors it for the PointerNull word payloads.
+  if variants.len() == 2 && !td.layout.is_repr_c then
+    var niche_zero_idx = -1
+    var niche_payload_idx = -1
+    var niche_probe = 0
+    while niche_probe < 2 do
+      if lir_variant_fields_zero_sized(td_params.clone(), args.clone(), variants[niche_probe]) then
+        niche_zero_idx = niche_probe
+      elsif variants[niche_probe].fields.len() == 1 then
+        niche_payload_idx = niche_probe
+      end
+      niche_probe = niche_probe + 1
+    end
+    if niche_zero_idx >= 0 && niche_payload_idx >= 0 then
+      let niche_pty = match lir_subst_type_arg(td_params.clone(), args.clone(), variants[niche_payload_idx].fields[0])
+      when Option::Some(t) then t
+      when Option::None then
+        return Result::Err("enum " + td_name + " variant " + variants[niche_payload_idx].name + " payload field 0 has an unresolved generic parameter type (concrete-arg substitution is not implemented for that shape)")
+      end
+      if lir_niche_word_payload(niche_pty.clone()) then
+        var niched_variants: Vec[LirAggVariant] = Vec::new()
+        var nv = 0
+        while nv < 2 do
+          var niched_fields: Vec[LirAggField] = Vec::new()
+          if nv == niche_payload_idx then
+            # The payload variant's single field IS the whole value:
+            # word 0 / byte 0 (the engine's niched record places it at
+            # offset 0, not the tagged image's 8).
+            niched_fields.push(LirAggField { name: "", word: 0, byte_off: 0, ty: niche_pty.clone() })
+          end
+          niched_variants.push(LirAggVariant {
+            name: variants[nv].name.clone(),
+            discriminant: variants[nv].discriminant,
+            fields: niched_fields
+          })
+          nv = nv + 1
+        end
+        # The niche descriptor: PointerNull(0) at the route's pointer
+        # width (the LIR aggregate/enum slice is the 64-bit program
+        # routes; the engine's spec for the same payload reports the
+        # target's pointer bits, and encoded_niche 0 is the invalid null
+        # pattern). bits is informational here — the lowering reads
+        # encoded_niche.
+        return Result::Ok(Option::Some(LirAggShapeKind::LirAggEnum(LirEnumShape {
+          words: 1,
+          size: 8,
+          variants: niched_variants,
+          niche: Option::Some(NicheSpec { kind: NicheKind::PointerNull, bits: 64, encoded_niche: 0 })
+        })))
+      end
+    end
   end
   var out_variants: Vec[LirAggVariant] = Vec::new()
   var max_payload_sum = 0
@@ -3386,7 +3546,7 @@ def lir_tagged_enum_shape(tid: TypeId, args: Vec[Type], td: MirTypeDef, variants
   end
   let size = lir_layout_align_up(8 + lir_layout_align_up(max_payload_sum, 8), 8)
   let words = size / 8
-  Result::Ok(Option::Some(LirAggShapeKind::LirAggEnum(LirEnumShape { words: words, size: size, variants: out_variants })))
+  Result::Ok(Option::Some(LirAggShapeKind::LirAggEnum(LirEnumShape { words: words, size: size, variants: out_variants, niche: Option::None })))
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -3669,19 +3829,54 @@ end
 
 # The image record of a tagged-enum shape as an aggregate image shape —
 # the words/size the shared class tests read (an enum's image never has
-# struct fields; payload access goes through the variant table).
+# struct fields; payload access goes through the variant table). A
+# niched enum's image is its ONE payload word, so the shared class tests
+# answer ScalarInt exactly like any scalar word.
 def lir_enum_image_shape(eshape: LirEnumShape) -> LirAggShape
   LirAggShape { words: eshape.words, size: eshape.size, fields: Vec::new() }
 end
 
+# The DECLARATION index of a niched LirEnumShape's payload-less variant
+# (the variant whose admitted payload field list is empty — exactly one
+# exists in a niched shape; -1 when absent/not niched). The mirror of
+# layout_engine.enum_layout_niche_payloadless_index over the LIR shape
+# table.
+def lir_enum_shape_niche_payloadless_index(eshape: LirEnumShape) -> Int
+  var i = 0
+  while i < eshape.variants.len() do
+    if eshape.variants[i].fields.len() == 0 then
+      return i
+    end
+    i = i + 1
+  end
+  -1
+end
+
+# The DECLARATION index of a niched LirEnumShape's payload variant (the
+# variant carrying the single payload word; -1 when absent/not niched).
+def lir_enum_shape_niche_payload_index(eshape: LirEnumShape) -> Int
+  var i = 0
+  while i < eshape.variants.len() do
+    if eshape.variants[i].fields.len() > 0 then
+      return i
+    end
+    i = i + 1
+  end
+  -1
+end
+
 # THE LIR ENUM IMAGE CROSSING KIND (audit item 29) — the LIR-side
 # declaration over the ONE representation authority:
-#   "value-word"   — the enum image IS the crossing word (a payload-less
-#                    enum's 8-byte tag image).  This is the SAME word the
-#                    canonical TaggedPtr representation carries, so the
-#                    LIR route and the direct route agree bit-for-bit.
-#   "inline-image" — the payloaded enum's LIR-INTERNAL adaptation: the
-#                    inline image crosses BY REFERENCE (the sret x8
+#   "value-word"   — the enum image IS the crossing word: a payload-less
+#                    tagged enum's 8-byte tag image, AND a NICHED enum's
+#                    one payload word (size 8 under the niche mirror), so
+#                    the LIR route crosses niched enums BY VALUE exactly
+#                    like the words the direct route's InternalValue
+#                    convention uses (classify_enum_crossing answers
+#                    ValueWord for a niched enum under InternalValue). No
+#                    inline image and no version marker are involved.
+#   "inline-image" — the payloaded tagged enum's LIR-INTERNAL adaptation:
+#                    the inline image crosses BY REFERENCE (the sret x8
 #                    copy-out for returns/destinations, the image address
 #                    in the argument/parameter's ONE slot).  The
 #                    canonical answer for the same type is
@@ -3702,15 +3897,24 @@ def lir_enum_crossing_kind(image_size: Int) -> String
 end
 
 # Ask the ONE representation authority about a concrete enum Type and
-# return its canonical crossing word.  Used at the LIR surface gates
+# return its crossing word under `flavor`.  Used at the LIR surface gates
 # (where the Type is available) to record/assert the declared adaptation:
-# a TaggedPtr enum yields AbiEnumCrossing::ValueWord — that is the
-# canonical answer; LIR crosses a PAYLOADED one by the internal
-# inline-image adaptation, and the extern guard rejects any non-LIR
-# counterpart, so the two routes can never silently disagree.  (An
-# InlineTagged payload-less enum yields InlineScalar — the same word both
-# routes use.)
+# a TaggedPtr enum yields AbiEnumCrossing::ValueWord under InternalValue —
+# that is the canonical answer; under ExternC a payloaded one fails
+# closed (the reason is returned as the "fail-closed: ..." word) — and a
+# NICHED enum yields ValueWord under InternalValue while ExternC fails
+# closed with the authority's niched reason, which is exactly the answer
+# the extern guard mirrors.  (An InlineTagged payload-less enum yields
+# InlineScalar — the same word both routes use.)
 def lir_canonical_enum_crossing_word(type_defs: Map[Int, MirTypeDef], ty: Type) -> String
+  lir_canonical_enum_crossing_word_flavor(type_defs, AbiFlavor::InternalValue, ty)
+end
+
+# The flavor-taking form of lir_canonical_enum_crossing_word: the SAME
+# engine/authority question under an explicit flavor, so the extern guard
+# can record the ExternC answer (the canonical boundary) while the
+# internal gates record the InternalValue answer.
+def lir_canonical_enum_crossing_word_flavor(type_defs: Map[Int, MirTypeDef], flavor: AbiFlavor, ty: Type) -> String
   mut engine = layout_engine_new(aarch64_target())
   # The engine must know the program's type definitions: the enum's
   # EnumLayout is a computed record.  The LIR route carries the program
@@ -3723,7 +3927,7 @@ def lir_canonical_enum_crossing_word(type_defs: Map[Int, MirTypeDef], ty: Type) 
   # No compute_all_layouts sweep here: the authority computes the enum's
   # concrete layout on miss (enum_layout_for_type), so this error-path
   # question cannot ICE on an unrelated program type.
-  match classify_enum_crossing(&mut engine, aarch64_desc(), AbiFlavor::InternalValue, ty)
+  match classify_enum_crossing(&mut engine, aarch64_desc(), flavor, ty)
   when Result::Ok(c)
     match c
     when AbiEnumCrossing::ValueWord then "value-word"
@@ -3859,7 +4063,7 @@ end
 # lir_canonical_enum_crossing_word(ty) == "value-word" while
 # lir_enum_crossing_kind(image_size) == "inline-image".
 def lir_enum_crossing_rule() -> String
-  "a tagged enum whose image carries payload words crossing a call boundary with a NON-LIR (extern) callee: the ONE representation authority (layout_engine.classify_enum_crossing — audit item 29) classifies every registered TaggedPtr enum as ValueWord — ONE crossing word — the TaggedPtr value encoding (layout_engine.tg's EnumValueRepresentation::TaggedPtr: a raw discriminant below the 256-byte inline-tag threshold, or a heap pointer at/above it to the inline {tag @ 0, payload @ 8} image), and the extern's callee side reads that value word. This slice keeps enum images inline in fixed frame slots and crosses a payloaded image by reference between LIR-compiled functions (the declared internal adaptation, lir_enum_crossing_kind: the sret x8 copy-out for returns/destinations and the image address in the argument/parameter's ONE slot for calls/parameters), so the extern-boundary crossing — whose word would be the heap pointer this slice cannot materialize — fails closed here. Payload-less enums, plain-struct aggregates, aggregate sret returns and every scalar class are derived from the SAME classify_call_plan table and agree between the routes; the payloaded-enum boundary conversion and its exact remaining step (the missing LIR heap path) are documented in the engineering note above. Locals, construction, discriminant reads, downcast payload access and whole-value copies of payloaded enums DO lower inside a function, and payload-less enums cross extern boundaries by their raw-discriminant tag word (the same value word in both conventions)"
+  "a tagged enum whose image carries payload words crossing a call boundary with a NON-LIR (extern) callee: the ONE representation authority (layout_engine.classify_enum_crossing — audit item 29) classifies every registered TaggedPtr enum as ValueWord — ONE crossing word — the TaggedPtr value encoding (layout_engine.tg's EnumValueRepresentation::TaggedPtr: a raw discriminant below the 256-byte inline-tag threshold, or a heap pointer at/above it to the inline {tag @ 0, payload @ 8} image), and the extern's callee side reads that value word. This slice keeps enum images inline in fixed frame slots and crosses a payloaded image by reference between LIR-compiled functions (the declared internal adaptation, lir_enum_crossing_kind: the sret x8 copy-out for returns/destinations and the image address in the argument/parameter's ONE slot for calls/parameters), so the extern-boundary crossing — whose word would be the heap pointer this slice cannot materialize — fails closed here. Payload-less enums, plain-struct aggregates, aggregate sret returns and every scalar class are derived from the SAME classify_call_plan table and agree between the routes; the payloaded-enum boundary conversion and its exact remaining step (the missing LIR heap path) are documented in the engineering note above. Locals, construction, discriminant reads, downcast payload access and whole-value copies of payloaded enums DO lower inside a function, and payload-less enums cross extern boundaries by their raw-discriminant tag word (the same value word in both conventions). NICHEd enums are NOT part of this rule: their value is ONE word under the compiler's InternalValue convention (lir_enum_crossing_kind answers value-word for the one-word niched image; classify_enum_crossing answers ValueWord), so they cross internally by value exactly like a scalar word (construction stores the payload or the niche sentinel, the discriminant normalizes the word against the sentinel, downcasts read the payload word), and only the canonical EXTERN C flavor — for which the authority permits no crossing — fails closed (the extern guard mirrors that answer)"
 end
 
 # ── THE VERSIONED ENUM ABI (third-audit item 42) ──────────────────────
@@ -3885,6 +4089,16 @@ end
 #     NUL-terminated "inline-image-v1" bytes), and a consumer parses the
 #     word with lir_enum_abi_version_of_word, refusing unknown words
 #     instead of guessing (lir_check_enum_abi_word).
+# NICHED enums are OUTSIDE this versioned model: their image is the ONE
+# payload word (LirEnumShape.niche), so they need no inline-image version
+# marker — a function whose only enum crossings are niched carries
+# enum_abi_version = None and its niched_enum_crossing evidence bit, and
+# the verifier accepts exactly that state. The marker is attached ONLY
+# for an admitted payloaded TAGGED enum (lir_ty_is_payloaded_enum); a
+# niched enum is never payloaded under that authority (its image size is
+# the one word). The export/containment rules still apply to the niched
+# crossing (its ExternC flavor has no permitted canonical form — see the
+# authority), so it is emitted LOCAL like the inline-image crossing.
 # A future representation is a NEW VARIANT: every exhaustive match over
 # the type (the word render, the boundary-message renders, the note) must
 # name it, so the internal and canonical representations can never
@@ -4152,6 +4366,13 @@ struct LirLowerCtx
   # copied onto the LirFunction at assembly, where the aarch64 call
   # emitter reads it (the sret_call_slots pattern).
   agg_call_args: Map[Int, Vec[LirAggCallArg]]
+  # (third-audit item 37) Tail-call recognition state: the block ids whose
+  # MirCall terminator carried tail = true (collected by the MirCall
+  # lowering and copied onto the LirFunction at assembly). The aarch64 and
+  # x86-64 LIR emitters consult it and emit a frame-restoring branch when
+  # their own ABI checks pass; every other route simply ignores the set
+  # (correctness never depends on it).
+  tail_call_blocks: Set[Int]
   # One function-wide scratch virtual register for parallel-move cycles
   scratch: Int
   # The FP counterparts of ctx.scratch for parallel-move cycles over
@@ -4534,6 +4755,7 @@ def lir_lower_ctx_new(f: MirFunction, div_ok: Bool, param_stack_mode: Bool, cm_a
     block_terms: block_terms,
     sret_call_slots: sret_call_slots,
     agg_call_args: agg_call_args,
+    tail_call_blocks: Set::new(),
     scratch: scratch,
     scratch_fp32: scratch_fp32,
     scratch_fp64: scratch_fp64,
@@ -6809,15 +7031,20 @@ def lir_lower_scalar_dst(inout ctx: LirLowerCtx, block_id: Int, dst_ty: Type, ds
   when MirRvalueKind::MirAggregate(_, _) then
     Result::Err("lir: " + ctx.fn_name + ": aggregate construction into a scalar-word destination does not lower (rvalue and destination types disagree — fail-closed)")
   when MirRvalueKind::MirDiscriminant(disc_place) then
-    # A discriminant read: dst <- the enum's TAG WORD. The tag is the
-    # image's word 0 — construction stored the raw discriminant there —
-    # so the read is an ordinary load of the whole enum local's first
-    # fixed word vreg (the direct emitter's load-then-normalize is a
-    # REGISTER-encoding matter of its TaggedPtr value words (raw tag
-    # below the inline-tag threshold / heap pointer above); this slice's
-    # inline images carry the raw tag in the tag word by construction,
-    # so no normalization exists here). The destination is the integer
-    # word the match lowering reads the discriminant into.
+    # A discriminant read: dst <- the enum's discriminant. For a TAGGED
+    # enum the tag is the image's word 0 — construction stored the raw
+    # discriminant there — so the read is an ordinary load of the whole
+    # enum local's first fixed word vreg (the direct emitter's
+    # load-then-normalize is a REGISTER-encoding matter of its TaggedPtr
+    # value words (raw tag below the inline-tag threshold / heap pointer
+    # above); this slice's inline images carry the raw tag in the tag
+    # word by construction, so no normalization exists there). For a
+    # NICHED enum the value word is the payload (or the niche sentinel),
+    # so the read NORMALIZES it exactly like
+    # normalize_enum_value_to_tag's Niched arm: word == the niche pattern
+    # => the payload-less variant's discriminant, else the payload
+    # variant's. The destination is the integer word the match lowering
+    # reads the discriminant into.
     if !lir_is_int_word(dst_ty) then
       return Result::Err("lir: " + ctx.fn_name + ": discriminant reads into a non-integer destination do not lower (typed MIR reads discriminants into Int words — fail-closed)")
     end
@@ -6829,12 +7056,17 @@ def lir_lower_scalar_dst(inout ctx: LirLowerCtx, block_id: Int, dst_ty: Type, ds
         match ctx.agg_of.get(src_id)
         when Option::Some(src_agg) then
           match src_agg.enum_shape
-          when Option::Some(_) then
-            let tag_v = src_agg.word_vregs[0]
-            if dst_v != tag_v then
-              lir_emit_move_vreg(ctx, block_id, dst_v, LirValue::LirReg(tag_v))
+          when Option::Some(eshape) then
+            match eshape.niche
+            when Option::Some(_) then
+              lir_lower_niched_enum_discriminant(ctx, block_id, dst_v, src_agg.word_vregs[0], eshape)
+            when Option::None then
+              let tag_v = src_agg.word_vregs[0]
+              if dst_v != tag_v then
+                lir_emit_move_vreg(ctx, block_id, dst_v, LirValue::LirReg(tag_v))
+              end
+              Result::Ok(())
             end
-            Result::Ok(())
           when Option::None then
             Result::Err("lir: " + ctx.fn_name + ": discriminant read over a plain-struct local does not lower (typed MIR reads discriminants of enum values only — fail-closed)")
           end
@@ -6842,7 +7074,7 @@ def lir_lower_scalar_dst(inout ctx: LirLowerCtx, block_id: Int, dst_ty: Type, ds
           Result::Err("lir: " + ctx.fn_name + ": discriminant read over a non-aggregate local (fail-closed)")
         end
       when _ then
-        Result::Err("lir: " + ctx.fn_name + ": discriminant reads lower over a whole tagged-enum local only (the scrutinee's tag word; projected/downcast discriminant places do not occur in typed MIR — fail-closed)")
+        Result::Err("lir: " + ctx.fn_name + ": discriminant reads lower over a whole tagged/niched-enum local only (the scrutinee's tag word or value word; projected/downcast discriminant places do not occur in typed MIR — fail-closed)")
       end
     end
   when MirRvalueKind::MirLen(_) then
@@ -6983,20 +7215,26 @@ def lir_lower_agg_construction(inout ctx: LirLowerCtx, block_id: Int, dst_id: In
 end
 
 # Enum construction: MirAggregate(Struct(enum_tid, ...), ops) over a
-# whole tagged-enum local, mirroring the direct emitter's
-# codegen_aggregate enum arm EXACTLY: the aggregate's FIRST operand is
+# whole tagged-enum OR niched-enum local, mirroring the direct emitter's
+# codegen_aggregate enum arms EXACTLY: the aggregate's FIRST operand is
 # the tag — the constructed variant's raw discriminant, always a
 # MirInt constant written by the MIR lowering (lr_enum_construct /
-# lr_enum_record_construct) — and it is stored into the image's tag
-# word (byte 0). The remaining operands are the constructed variant's
-# PAYLOAD fields in declaration order (the direct emitter resolves the
-# variant from the tag via the discriminant and stores payload operand
-# k at the variant's k-th payload field offset — enum payloads carry no
-# names, so the literal names are ignored, exactly as codegen ignores
-# them), each stored as a full canonical word into its payload word
-# slot. A construction that omits payload fields or stores into a
-# variant whose payload shape differs is a typed-MIR divergence
-# (fail-closed).
+# lr_enum_record_construct). For a TAGGED enum it is stored into the
+# image's tag word (byte 0) and the remaining operands are the
+# constructed variant's PAYLOAD fields in declaration order (the direct
+# emitter resolves the variant from the tag via the discriminant and
+# stores payload operand k at the variant's k-th payload field offset —
+# enum payloads carry no names, so the literal names are ignored,
+# exactly as codegen ignores them), each stored as a full canonical
+# word into its payload word slot. For a NICHED enum (see LirEnumShape)
+# the value is the ONE payload word: a payload-variant construction
+# stores its single payload operand into word 0, and a payload-less
+# construction stores the niche sentinel (spec.encoded_niche) there —
+# the mirror of codegen_aggregate_niched (no tag store, no heap image);
+# the payload-less variant's structurally zero-sized operands (the
+# Result::Err(()) Unit operand) carry no machine word and are ignored. A
+# construction that omits payload fields or stores into a variant whose
+# payload shape differs is a typed-MIR divergence (fail-closed).
 def lir_lower_enum_construction(inout ctx: LirLowerCtx, block_id: Int, dst_id: Int, agg: LirAggLocal, eshape: LirEnumShape, operands: Vec[MirOperand]) -> Result[Unit, String]
   if operands.len() == 0 then
     return Result::Err("lir: " + ctx.fn_name + ": enum construction carries no tag operand (the MIR lowering always writes the discriminant constant first — fail-closed)")
@@ -7027,6 +7265,31 @@ def lir_lower_enum_construction(inout ctx: LirLowerCtx, block_id: Int, dst_id: I
     return Result::Err("lir: " + ctx.fn_name + ": enum construction tag " + tag.to_string() + " matches no variant of the destination enum (typed MIR never produces this — fail-closed)")
   end
   let variant = eshape.variants[vidx]
+  # ── THE NICHED CONSTRUCTION (mirror of codegen_aggregate_niched): the
+  # constructed variant's discriminant is compared against the niche
+  # variant's — but here the variant record IS the shape's variant, so
+  # "payload-less" is exactly "no admitted payload field": write the
+  # sentinel; otherwise the single payload operand becomes the value
+  # word.
+  match eshape.niche
+  when Option::Some(spec) then
+    if variant.fields.len() == 0 then
+      # The payload-less variant IS the niche value. The variant's
+      # structurally zero-sized operands (e.g. Result::Err(())) have no
+      # machine words and are ignored, exactly like the direct emitter.
+      lir_emit_move_vreg(ctx, block_id, agg.word_vregs[0], LirValue::LirImm(spec.encoded_niche))
+      return Result::Ok(())
+    end
+    if variant.fields.len() != 1 then
+      return Result::Err("lir: " + ctx.fn_name + ": niched enum construction of variant " + variant.name + " sees " + variant.fields.len().to_string() + " admitted payload fields (a niched shape has exactly one payload field — the shape gate and the lowering disagree; fail-closed)")
+    end
+    if operands.len() < 2 then
+      return Result::Err("lir: " + ctx.fn_name + ": niched enum construction of payload variant " + variant.name + " carries no payload operand (typed MIR writes the tag plus the variant's payload — fail-closed)")
+    end
+    let pf = variant.fields[0]
+    return lir_lower_move_value(ctx, block_id, pf.ty.clone(), agg.word_vregs[0], operands[1])
+  when Option::None then ()
+  end
   if operands.len() != 1 + variant.fields.len() then
     return Result::Err("lir: " + ctx.fn_name + ": enum construction of variant " + variant.name + " carries " + operands.len().to_string() + " operands for a variant with " + variant.fields.len().to_string() + " payload fields (typed MIR writes exactly the tag plus the variant's payload operands — fail-closed)")
   end
@@ -7044,6 +7307,42 @@ def lir_lower_enum_construction(inout ctx: LirLowerCtx, block_id: Int, dst_id: I
     when Result::Ok(_) then ()
     end
     oi = oi + 1
+  end
+  Result::Ok(())
+end
+
+# THE NICHED DISCRIMINANT NORMALIZATION (the mirror of codegen.tg's
+# normalize_enum_value_to_tag Niched arm): emit
+#   eq = (word == spec.encoded_niche) ? 1 : 0
+#   dst = payload_disc + eq * (niche_disc - payload_disc)
+# — a branchless Cmp/Cset/Mul/Add sequence over the value word. If
+# dst_v IS word_v the compare still reads the word before the Cset
+# overwrites it. The Cmp/Cset pair must stay adjacent (invariant I1: a
+# LirCset reads the flags of the most recent LirCmp). The discriminants
+# come from the shape's variant table (declaration order, found by the
+# payload-field-count split — the same key the engine's niched records
+# use).
+def lir_lower_niched_enum_discriminant(inout ctx: LirLowerCtx, block_id: Int, dst_v: Int, word_v: Int, eshape: LirEnumShape) -> Result[Unit, String]
+  let spec = match eshape.niche
+  when Option::Some(s) then s
+  when Option::None then
+    return Result::Err("lir: " + ctx.fn_name + ": internal error: niched discriminant normalization without a niche spec (fail-closed)")
+  end
+  let zero_idx = lir_enum_shape_niche_payloadless_index(eshape)
+  let pay_idx = lir_enum_shape_niche_payload_index(eshape)
+  if zero_idx < 0 || pay_idx < 0 then
+    return Result::Err("lir: " + ctx.fn_name + ": a niched enum shape needs exactly one payload-less and one payload variant (the shape gate and the lowering disagree — fail-closed)")
+  end
+  let niche_disc = eshape.variants[zero_idx].discriminant
+  let payload_disc = eshape.variants[pay_idx].discriminant
+  lir_append_stmt(ctx, block_id, LirStmtKind::LirCmp(LirValue::LirReg(word_v), LirValue::LirImm(spec.encoded_niche)))
+  lir_append_stmt(ctx, block_id, LirStmtKind::LirCset(LirCond::LirEq, dst_v))
+  let k = niche_disc - payload_disc
+  if k != 0 then
+    lir_append_stmt(ctx, block_id, LirStmtKind::LirBinop(LirBinOp::LirMul, dst_v, LirValue::LirReg(dst_v), LirValue::LirImm(k)))
+  end
+  if payload_disc != 0 then
+    lir_append_stmt(ctx, block_id, LirStmtKind::LirBinop(LirBinOp::LirAdd, dst_v, LirValue::LirReg(dst_v), LirValue::LirImm(payload_disc)))
   end
   Result::Ok(())
 end
@@ -8071,7 +8370,7 @@ def lir_lower_terminator(inout ctx: LirLowerCtx, f: MirFunction, block: MirBlock
   when MirTerminatorKind::MirAbort then
     lir_set_term(ctx, block_id, LirTermKind::LirTrap)
     Result::Ok(())
-  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic, tail } then
     match lir_lower_phi_edges(ctx, f, block)
     when Result::Err(e) then return Result::Err(e)
     when Result::Ok(_) then ()
@@ -8082,7 +8381,18 @@ def lir_lower_terminator(inout ctx: LirLowerCtx, f: MirFunction, block: MirBlock
     when Option::None then ()
     end
     match intrinsic
-    when Option::Some(_) then
+    when Option::Some(iid) then
+      # THE OPTION/RESULT INTRINSIC SLICE (is_some/is_none/unwrap/
+      # unwrap_or): a classified call with one of those ids lowers INLINE
+      # against the admitted enum receiver (see the Option/Result
+      # intrinsic section), written directly into the call destination.
+      # A non-enum receiver (Map::unwrap, String::unwrap_or, ...) fails
+      # closed inside the lowering with the receiver-shape reason.
+      match lir_option_intrinsic_of(iid)
+      when Option::Some(okind) then
+        return lir_lower_option_intrinsic(ctx, block_id, okind, dest, args, success)
+      when Option::None then ()
+      end
       # (audit item 34 — the explicit SIMD sub-domain): a call the
       # checker classified as a SIMD intrinsic (types.tg's
       # simd_intrinsic_kind_of router — the __intrinsic_simd_<op>_<lane>
@@ -8134,7 +8444,7 @@ def lir_lower_terminator(inout ctx: LirLowerCtx, f: MirFunction, block: MirBlock
         if (ctx.div_ok && !ctx.param_stack_mode || ctx.cm_atomics || ctx.rv_atomics) && callee_name.starts_with("__intrinsic_atomic_") then
           lir_lower_atomic_call(ctx, block_id, callee_name, dest, args, success)
         else
-          lir_lower_call(ctx, block_id, callee_name, dest, args, success)
+          lir_lower_call(ctx, block_id, callee_name, dest, args, success, tail)
         end
       when _ then
         Result::Err("lir: " + ctx.fn_name + ": non-function-item call operands do not lower (fn items only; indirect calls through function values are not implemented)")
@@ -8331,9 +8641,19 @@ end
 # caller slots on the aarch64 mode, 4-byte AAPCS words (even in count,
 # padding included) on the cortex-m mode), and register the call
 # terminator (SP cleanup and the success jump are emitted with it).
-def lir_lower_call(inout ctx: LirLowerCtx, block_id: Int, callee_name: String, dest: Place, args: Vec[MirCallArg], success: MirBlockId) -> Result[Unit, String]
+def lir_lower_call(inout ctx: LirLowerCtx, block_id: Int, callee_name: String, dest: Place, args: Vec[MirCallArg], success: MirBlockId, tail: Bool) -> Result[Unit, String]
   if args.len() > 32 then
     return Result::Err("lir: " + ctx.fn_name + ": calls with more than 32 arguments do not lower (fail-closed; the caller-slot area below that is bounded by construction)")
+  end
+  # (third-audit item 37) Tail-call recognition: the MIR marker is copied
+  # onto the LIR function's per-block set when the call is in tail
+  # position AND the destination is still the bare return place (local 0 —
+  # a defense-in-depth re-check of the MIR condition the validator /
+  # emitter would otherwise re-derive). The aarch64 and x86-64 emitters
+  # consult the set and re-check their own frame/ABI conditions; routes
+  # that never read the set simply ignore the marker.
+  if tail && dest.local.id == 0 && dest.projections.is_empty() then
+    ctx.tail_call_blocks.insert(block_id)
   end
   # Destination: a scalar destination (a whole scalar local — an
   # integer/Bool word OR a float local — or a scalar field of a
@@ -9642,6 +9962,339 @@ end
 # STRICT FP: the f-lane binops emit exactly one FADD/FSUB/FMUL group
 # per lane set — the scalar float slice's strict rules (one rounding,
 # no contraction/reassociation, RNE, subnormals) hold unchanged.
+
+# ———————————————————————————————————————————————————————————————
+# Option/Result intrinsic slice (is_some / is_none / unwrap / unwrap_or)
+# ———————————————————————————————————————————————————————————————
+# The MIR marks the classified Option/Result method calls with
+# IntrinsicId::{IsSome, IsNone, Unwrap, UnwrapOr}; their receiver is a
+# borrowed pointer/reference to the enum (mir_recv_operand's re-borrow).
+# This slice lowers them INLINE for an admitted enum receiver — niched OR
+# tagged — mirroring codegen.tg's intrinsic arms against the LIR image
+# model:
+#   - the enum word / tag is loaded from [receiver + 0] (niched: the
+#     value word; tagged: the tag word);
+#   - is_some/is_none: niched -> word != / == encoded_niche; tagged ->
+#     tag == / != the success variant's discriminant (Some/Ok are
+#     declaration variant 0; a variant named Some/Ok wins when present)
+#     — then LirCset into the Bool destination;
+#   - unwrap/unwrap_or: the success variant (variants[0]) must carry
+#     exactly ONE general-word payload field. A niched success IS the
+#     loaded word (the payload image); a tagged success loads the payload
+#     at the field's image byte offset (one 8-byte word — the LIR image
+#     stores canonical words). An unwrap failure TRAPS; an unwrap_or
+#     failure yields the default operand.
+# Float payloads (the destination's FP class record) and every
+# unsupported receiver type (non-enum/aggregate receivers: Map::unwrap,
+# String::unwrap_or, ...) fail closed. The arms run only where the enum
+# shape is admitted (the whole-program a64/x86 routes); routes without a
+# type-def table cannot see an admitted enum receiver and fail closed.
+
+enum LirOptionIntrinsicKind
+  LirOptIsSome
+  LirOptIsNone
+  LirOptUnwrap
+  LirOptUnwrapOr
+end
+
+def lir_option_intrinsic_of(iid: IntrinsicId) -> Option[LirOptionIntrinsicKind]
+  match iid
+  when IntrinsicId::IsSome then Option::Some(LirOptionIntrinsicKind::LirOptIsSome)
+  when IntrinsicId::IsNone then Option::Some(LirOptionIntrinsicKind::LirOptIsNone)
+  when IntrinsicId::Unwrap then Option::Some(LirOptionIntrinsicKind::LirOptUnwrap)
+  when IntrinsicId::UnwrapOr then Option::Some(LirOptionIntrinsicKind::LirOptUnwrapOr)
+  when _ then Option::None
+  end
+end
+
+# Strip one receiver pointer/ref layer (RefInternal/Ptr/PtrMut) — the
+# codegen.tg strip_receiver_ptr_like_type mirror, local to this slice.
+def lir_strip_receiver_ptr_like(ty: Type) -> Type
+  match ty
+  when Type::RefInternal(inner, _) then lir_strip_receiver_ptr_like(inner)
+  when Type::Ptr(inner) then lir_strip_receiver_ptr_like(inner)
+  when Type::PtrMut(inner) then lir_strip_receiver_ptr_like(inner)
+  when other then other.clone()
+  end
+end
+
+# Emit one marked register-indirect 8-byte word LOAD:
+# dst <- [base + off] (the pointer/atomic slice's LirPtrLoad statement
+# shape — the same one lir_lower_deref_word_read uses; the intrinsic
+# receiver is not a Place, so the read is emitted directly).
+def lir_push_marked_word_load(inout ctx: LirLowerCtx, block_id: Int, dst: Int, base: Int, off: Int) -> Unit
+  var stmt = LirStmt {
+    kind: LirStmtKind::LirUnop(LirUnOp::LirNeg, dst, base),
+    div: Option::None,
+    ptr: Option::Some(LirPtrOp::LirPtrLoad(dst, base, off, 8, false))
+  }
+  lir_block_push(ctx, block_id, stmt)
+end
+
+# The receiver word vreg + the stripped pointee enum type of an
+# Option/Result intrinsic call (args[0]). The receiver must be a
+# pointer/ref word (the MIR's &self); Option::None when the call carries
+# no receiver.
+def lir_option_receiver(inout ctx: LirLowerCtx, block_id: Int, args: Vec[MirCallArg]) -> Result[Option[(Int, Type)], String]
+  if args.len() < 1 then
+    return Result::Ok(Option::None)
+  end
+  var rty: Type = Type::Unit
+  match args[0].value
+  when MirCallValue::Place(p) then
+    match lir_place_ty(ctx, p)
+    when Result::Ok(t) then rty = t
+    when Result::Err(e) then return Result::Err(e)
+    end
+  when MirCallValue::Value(op) then
+    match lir_operand_ty(ctx, op)
+    when Result::Ok(t) then rty = t
+    when Result::Err(e) then return Result::Err(e)
+    end
+  end
+  if !lir_is_ptr_word(rty) then
+    return Result::Err("lir: " + ctx.fn_name + ": Option/Result intrinsic receiver is not a pointer/reference word (the MIR passes &self; an intrinsic on a non-enum receiver does not lower — fail-closed)")
+  end
+  let rv = match args[0].value
+  when MirCallValue::Place(p) then
+    match lir_place_src_vreg(ctx, p)
+    when Result::Ok(v) then v
+    when Result::Err(e) then return Result::Err(e)
+    end
+  when MirCallValue::Value(op) then
+    match lir_value_of_operand(ctx, block_id, op)
+    when Result::Ok(v) then v
+    when Result::Err(e) then return Result::Err(e)
+    end
+  end
+  Result::Ok(Option::Some((rv, lir_strip_receiver_ptr_like(rty))))
+end
+
+# The admitted enum shape of an Option/Result intrinsic receiver.
+def lir_option_receiver_shape(ctx: LirLowerCtx, enum_ty: Type) -> Result[LirEnumShape, String]
+  match lir_plain_struct_shape(ctx.type_defs, enum_ty)
+  when Result::Err(e) then
+    Result::Err("lir: " + ctx.fn_name + ": Option/Result intrinsic receiver: " + e)
+  when Result::Ok(o) then
+    match o
+    when Option::Some(kind) then
+      match kind
+      when LirAggShapeKind::LirAggEnum(eshape) then Result::Ok(eshape)
+      when LirAggShapeKind::LirAggStruct(_) then
+        Result::Err("lir: " + ctx.fn_name + ": Option/Result intrinsic receiver is a plain-struct aggregate (not an enum — fail-closed)")
+      end
+    when Option::None then
+      Result::Err("lir: " + ctx.fn_name + ": Option/Result intrinsic receiver is not an admitted enum (Map::unwrap / String::unwrap_or-class intrinsics on non-enum receivers do not lower — fail-closed)")
+    end
+  end
+end
+
+# The scalar destination word of an Option/Result intrinsic result (a
+# whole scalar local / scalar field / enum payload field); Unit and the
+# aggregate/deref forms fail closed (the atomic-result destination rule).
+def lir_option_dest_v(inout ctx: LirLowerCtx, dest: Place, what: String) -> Result[Int, String]
+  match lir_classify_place(ctx, dest)
+  when Result::Err(e) then Result::Err(e)
+  when Result::Ok(shape) then
+    match shape
+    when LirPlaceShape::LirPlaceUnit(_) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a scalar result but the call destination is Unit (a typed-MIR divergence; fail-closed)")
+    when LirPlaceShape::LirPlaceScalarLocal(dst_id) then
+      match lir_vreg_of_local(ctx, dst_id)
+      when Result::Ok(v) then Result::Ok(v)
+      when Result::Err(e) then Result::Err(e)
+      end
+    when LirPlaceShape::LirPlaceField(lid, fidx) then
+      Result::Ok(lir_agg_word_vreg(ctx, lid, fidx))
+    when LirPlaceShape::LirPlaceEnumField(lid, vidx, fidx) then
+      let payload_word = match ctx.agg_of.get(lid)
+      when Option::Some(agg) then
+        match agg.enum_shape
+        when Option::Some(eshape) then eshape.variants[vidx].fields[fidx].word
+        when Option::None then return Result::Err("lir: " + ctx.fn_name + ": enum payload destination of a non-enum local (fail-closed)")
+        end
+      when Option::None then return Result::Err("lir: " + ctx.fn_name + ": enum payload destination of a non-aggregate local (fail-closed)")
+      end
+      Result::Ok(lir_agg_word_vreg(ctx, lid, payload_word))
+    when LirPlaceShape::LirPlaceAggLocal(_) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a scalar result but the call destination is a whole aggregate local (fail-closed)")
+    when LirPlaceShape::LirPlaceDerefWord(_, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a scalar result but the call destination is a deref place (a post-call store is not carried; fail-closed)")
+    end
+  end
+end
+
+# Resolve one Option/Result intrinsic scalar argument (the unwrap_or
+# default) to a word vreg — the atomic-call argument rule (place-like
+# operands through the word-value funnel, a whole scalar Place accepted).
+def lir_option_arg_v(inout ctx: LirLowerCtx, block_id: Int, args: Vec[MirCallArg], idx: Int, what: String) -> Result[Int, String]
+  if idx >= args.len() then
+    return Result::Err("lir: " + ctx.fn_name + ": Option/Result intrinsic is missing its " + what + " argument (the call carries " + args.len().to_string() + " arguments; fail-closed)")
+  end
+  match args[idx].value
+  when MirCallValue::Place(p) then
+    match lir_classify_place(ctx, p)
+    when Result::Err(e) then Result::Err(e)
+    when Result::Ok(shape) then
+      match shape
+      when LirPlaceShape::LirPlaceScalarLocal(id) then
+        match lir_vreg_of_local(ctx, id)
+        when Result::Ok(v) then Result::Ok(v)
+        when Result::Err(e) then Result::Err(e)
+        end
+      when _ then Result::Err("lir: " + ctx.fn_name + ": by-reference (Place) " + what + " arguments do not lower (the value crosses as a word; fail-closed)")
+      end
+    end
+  when MirCallValue::Value(op) then lir_value_of_operand(ctx, block_id, op)
+  end
+end
+
+# The discriminant of the success variant of an Option/Result-shaped
+# admitted enum: the first declaration variant (Some/Ok are variant 0 —
+# codegen's enum_first_variant_discriminant contract), preferring a
+# variant NAMED Some/Ok when the shape carries one.
+def lir_enum_shape_success_disc(eshape: LirEnumShape) -> Int
+  var named = -1
+  for v in eshape.variants do
+    if v.name == "Some" || v.name == "Ok" then
+      named = v.discriminant
+    end
+  end
+  if named >= 0 then
+    named
+  elsif eshape.variants.len() > 0 then
+    eshape.variants[0].discriminant
+  else
+    0
+  end
+end
+
+# Lower one Option/Result intrinsic call inline (the router in
+# lir_lower_terminator; see the section header). Ends block_id with its
+# own terminator and writes the result — or the unwrap_or default — into
+# the call destination.
+def lir_lower_option_intrinsic(inout ctx: LirLowerCtx, block_id: Int, kind: LirOptionIntrinsicKind, dest: Place, args: Vec[MirCallArg], success: MirBlockId) -> Result[Unit, String]
+  let recv_o = match lir_option_receiver(ctx, block_id, args)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(o) then o
+  end
+  let recv = match recv_o
+  when Option::Some(r) then r
+  when Option::None then
+    return Result::Err("lir: " + ctx.fn_name + ": Option/Result intrinsic call carries no receiver argument (fail-closed)")
+  end
+  let recv_v = recv.0
+  let enum_ty = recv.1
+  let eshape = match lir_option_receiver_shape(ctx, enum_ty)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(e) then e
+  end
+  # The enum word / tag word: [receiver + 0] (the niched value word, or
+  # the tagged image's tag word).
+  let w = lir_fresh_vreg(ctx)
+  lir_push_marked_word_load(ctx, block_id, w, recv_v, 0)
+  match kind
+  when LirOptionIntrinsicKind::LirOptIsSome | LirOptionIntrinsicKind::LirOptIsNone then
+    let dst_v = match lir_option_dest_v(ctx, dest, "is_some/is_none")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(v) then v
+    end
+    let is_some = kind == LirOptionIntrinsicKind::LirOptIsSome
+    match eshape.niche
+    when Option::Some(spec) then
+      # The absent case is the placeholder pattern: present == word does
+      # NOT equal the niche pattern.
+      lir_append_stmt(ctx, block_id, LirStmtKind::LirCmp(LirValue::LirReg(w), LirValue::LirImm(spec.encoded_niche)))
+      lir_append_stmt(ctx, block_id, LirStmtKind::LirCset(if is_some then LirCond::LirNe else LirCond::LirEq end, dst_v))
+    when Option::None then
+      # The tag word: present == the success variant's discriminant.
+      let success_disc = lir_enum_shape_success_disc(eshape)
+      lir_append_stmt(ctx, block_id, LirStmtKind::LirCmp(LirValue::LirReg(w), LirValue::LirImm(success_disc)))
+      lir_append_stmt(ctx, block_id, LirStmtKind::LirCset(if is_some then LirCond::LirEq else LirCond::LirNe end, dst_v))
+    end
+    lir_set_term(ctx, block_id, LirTermKind::LirJump(success.id))
+    Result::Ok(())
+  when LirOptionIntrinsicKind::LirOptUnwrap | LirOptionIntrinsicKind::LirOptUnwrapOr then
+    if eshape.variants.len() == 0 then
+      return Result::Err("lir: " + ctx.fn_name + ": unwrap/unwrap_or over an enum with no variants (fail-closed)")
+    end
+    let succ = eshape.variants[0]
+    if succ.fields.len() != 1 then
+      return Result::Err("lir: " + ctx.fn_name + ": unwrap/unwrap_or success variant " + succ.name + " carries " + succ.fields.len().to_string() + " payload fields (the intrinsic contract needs exactly one payload field — fail-closed)")
+    end
+    let pf = succ.fields[0]
+    let dst_v = match lir_option_dest_v(ctx, dest, "unwrap/unwrap_or")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(v) then v
+    end
+    match lir_ctx_fp_width_of(ctx, dst_v)
+    when Option::Some(_) then
+      return Result::Err("lir: " + ctx.fn_name + ": unwrap/unwrap_or of a FLOAT payload does not lower (the payload load is a general-word rule; the float payload slice is not implemented — fail-closed)")
+    when Option::None then ()
+    end
+    let success_disc = succ.discriminant
+    let ok_blk = lir_fresh_dispatch_block(ctx)
+    if kind == LirOptionIntrinsicKind::LirOptUnwrap then
+      ctx.trap_used = true
+      var arms: Vec[LirSwitchArm] = Vec::new()
+      match eshape.niche
+      when Option::Some(spec) then
+        arms.push(LirSwitchArm { value: spec.encoded_niche, target: lir_trap_block_id() })
+      when Option::None then
+        arms.push(LirSwitchArm { value: success_disc, target: ok_blk })
+      end
+      let default_target = match eshape.niche
+      when Option::Some(_) then ok_blk
+      when Option::None then lir_trap_block_id()
+      end
+      lir_set_term(ctx, block_id, LirTermKind::LirSwitch(w, arms, default_target))
+      # The success path: the payload word (niched: the loaded word
+      # itself; tagged: the field's image word).
+      match eshape.niche
+      when Option::Some(_) then
+        if dst_v != w then
+          lir_emit_move_vreg(ctx, ok_blk, dst_v, LirValue::LirReg(w))
+        end
+      when Option::None then
+        lir_push_marked_word_load(ctx, ok_blk, dst_v, recv_v, pf.byte_off)
+      end
+      lir_set_term(ctx, ok_blk, LirTermKind::LirJump(success.id))
+      Result::Ok(())
+    else
+      let none_blk = lir_fresh_dispatch_block(ctx)
+      var arms: Vec[LirSwitchArm] = Vec::new()
+      match eshape.niche
+      when Option::Some(spec) then
+        arms.push(LirSwitchArm { value: spec.encoded_niche, target: none_blk })
+      when Option::None then
+        arms.push(LirSwitchArm { value: success_disc, target: ok_blk })
+      end
+      let default_target = match eshape.niche
+      when Option::Some(_) then ok_blk
+      when Option::None then none_blk
+      end
+      lir_set_term(ctx, block_id, LirTermKind::LirSwitch(w, arms, default_target))
+      match eshape.niche
+      when Option::Some(_) then
+        if dst_v != w then
+          lir_emit_move_vreg(ctx, ok_blk, dst_v, LirValue::LirReg(w))
+        end
+      when Option::None then
+        lir_push_marked_word_load(ctx, ok_blk, dst_v, recv_v, pf.byte_off)
+      end
+      lir_set_term(ctx, ok_blk, LirTermKind::LirJump(success.id))
+      let default_v = match lir_option_arg_v(ctx, none_blk, args, 1, "default")
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(v) then v
+      end
+      if dst_v != default_v then
+        lir_emit_move_vreg(ctx, none_blk, dst_v, LirValue::LirReg(default_v))
+      end
+      lir_set_term(ctx, none_blk, LirTermKind::LirJump(success.id))
+      Result::Ok(())
+    end
+  end
+end
 
 # The VECTOR vreg of a whole vector place operand (the direct emitter's
 # `simd_operand_address` place requirement mirror: constant and
@@ -11166,9 +11819,13 @@ def lower_mir_fn_to_lir_mode_ty(f: MirFunction, div_ok: Bool, width_ok: Bool, fp
   # extern guard reads, so the marker can never name a crossing this
   # route would not lower under the inline-image convention. Attached
   # HERE — the one LirFunction construction the lowering performs — and
-  # carried unchanged through lir_peephole.
+  # carried unchanged through lir_peephole. The NICHED crossing evidence
+  # (a one-word internal value; no inline image, so NO version marker)
+  # is attached beside it from the same-shape lir_ty_is_niched_enum
+  # authority.
   let enum_abi_crossing = lir_fn_has_payloaded_enum_crossing(type_defs, f)
   let enum_abi_marker = if enum_abi_crossing then Option::Some(lir_enum_abi_version()) else Option::None end
+  let niched_enum_crossing = lir_fn_has_niched_enum_crossing(type_defs, f)
   let entry = if f.blocks.len() > 0 then f.blocks[0].id.id else 0 end
   Result::Ok(LirFunction {
     name: f.name.clone(),
@@ -11190,7 +11847,9 @@ def lower_mir_fn_to_lir_mode_ty(f: MirFunction, div_ok: Bool, width_ok: Bool, fp
     agg_call_args: ctx.agg_call_args,
     agg_params: agg_params,
     enum_abi_version: enum_abi_marker,
-    enum_abi_crossing: enum_abi_crossing
+    enum_abi_crossing: enum_abi_crossing,
+    niched_enum_crossing: niched_enum_crossing,
+    tail_call_blocks: ctx.tail_call_blocks
   })
 end
 
@@ -11268,8 +11927,9 @@ def lir_peephole(f: LirFunction) -> LirFunction
     agg_call_args: f.agg_call_args,
     agg_params: f.agg_params.clone(),
     enum_abi_version: f.enum_abi_version,
-    enum_abi_crossing: f.enum_abi_crossing
-  }
+    enum_abi_crossing: f.enum_abi_crossing,
+    niched_enum_crossing: f.niched_enum_crossing,
+    tail_call_blocks: f.tail_call_blocks}
 end
 # ———————————————————————————————————————————————————————————————
 # Linear-scan register allocation (Slice 3)
@@ -15202,6 +15862,12 @@ end
 # The version itself is typed: every variant is a known version by
 # construction (a future variant must be added to the exhaustive word
 # render before it can be written anywhere).
+# A NICHED crossing (LirFunction.niched_enum_crossing) is NOT an
+# inline-image crossing: the value is one word under the compiler's
+# InternalValue convention, so it carries NO version marker and is
+# accepted here version-free (its bit is the route-internal containment
+# evidence the export rules read, mirroring the authority's refusal of
+# the ExternC flavor).
 def lir_verify_enum_abi(f: LirFunction, inout out: Vec[String]) -> Unit
   match f.enum_abi_version
   when Option::Some(v) then
@@ -16801,6 +17467,21 @@ def lir_emit_epilogue(inout ctx: CodegenCtx, alloc: LirAlloc) -> Unit
   a64_ret(&mut ctx.text)
 end
 
+# (third-audit item 37) The tail-jump frame restore: the epilogue's
+# callee-saved restore + frame release, WITHOUT the ret (the LirCall tail
+# arm branches to the callee entry instead; the callee returns to our
+# caller through the LR this restore reloaded). The return value is never
+# touched here — the callee's x0/v0 is already the caller's result.
+def lir_emit_tail_restore(inout ctx: CodegenCtx, alloc: LirAlloc) -> Unit
+  var si = 0
+  while si < alloc.cc_used.len() do
+    lir_emit_mem8(ctx, lir_reg_a64(alloc.cc_used[si]), A64::FP, -(alloc.frame_bytes - 8 * si), true)
+    si = si + 1
+  end
+  a64_mov_rr(&mut ctx.text, A64::SP, A64::FP)
+  a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+end
+
 # Emit one terminator at position `pos`. The call terminator also runs
 # the pre-call spill stores, the caller-side sret setup (x8 = &dest
 # when `sret_base` is Some — see the LirCall arm), the caller-side
@@ -16809,7 +17490,7 @@ end
 # aggregate-argument slice), the stack-slot
 # cleanup, the result capture into the dest vreg and the jump to the
 # success block (fixups are resolved later, at the whole-buffer level).
-def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, src_block: Int, kind: LirTermKind, pos: Int, externs: Set[String], defined: Set[String], sret_base: Option[Int], agg_args: Vec[LirAggCallArg], cov: Option[CoverageFnPlan]) -> Unit
+def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, src_block: Int, kind: LirTermKind, pos: Int, externs: Set[String], defined: Set[String], sret_base: Option[Int], agg_args: Vec[LirAggCallArg], cov: Option[CoverageFnPlan], tail: Bool) -> Unit
   match kind
   when LirTermKind::LirJump(target) then
     # (third-audit item 34) the taken goto edge's counter, bumped before
@@ -17029,6 +17710,41 @@ def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, src_b
     # pushes are ordinary statements); nothing else reads it here (the
     # aggregate-argument records above carry the aggregate slots).
     let is_extern = externs.contains(&target) || !defined.contains(&target)
+    # (third-audit item 37) Tail-jump emission — the marker is ADVISORY:
+    # this route re-checks the conditions its frame machinery needs and
+    # otherwise falls through to the ordinary call path (correctness is
+    # never affected by the marker).
+    #   E1 a locally emitted callee (never an extern: the branch would need
+    #      a PLT-style relocation this route does not carry);
+    #   E2 no stack arguments (stack_args == 0) — the frame restore
+    #      discards the caller's pushed slots;
+    #   E3 no caller-side sret (sret_base == None) — the sret copy-out is
+    #      an epilogue action a tail jump skips (the MIR mark's same-type
+    #      rule makes caller and callee sret postures agree, but this
+    #      slice only models the value-return form).
+    # On the tail path the callee's result (x0/v0) IS the caller's return
+    # value; the result capture, the stack cleanup and the success jump
+    # are skipped.
+    var tail_ok = tail && !is_extern && stack_args == 0
+    match sret_base
+    when Option::Some(_) then tail_ok = false
+    when Option::None then ()
+    end
+    if tail_ok then
+      # The call-success edge is still TAKEN (the callee returns to our
+      # caller), so the coverage counter is bumped exactly as the ordinary
+      # path does — before the frame restore (X16/X17 scratch,
+      # flag-neutral).
+      match cov
+      when Option::Some(c) then
+        lir_emit_cov_bump_a64(ctx,
+          lir_cov_edge_slot(c.clone(), src_block, success, "call-success".to_string()))
+      when Option::None then ()
+      end
+      lir_emit_tail_restore(ctx, alloc)
+      a64_b(&mut ctx.text, target.clone())
+      return
+    end
     if is_extern then
       add_reloc(&mut ctx.text, RelocKind::R_AARCH64_CALL26, target.clone(), 0)
       emit32_le(&mut ctx.text, 0x94000000)
@@ -17773,7 +18489,8 @@ def lir_emit_fn(inout ctx: CodegenCtx, f: LirFunction, alloc: LirAlloc, externs:
     when Option::Some(list) then list.clone()
     when Option::None then Vec::new()
     end
-    lir_emit_term(ctx, alloc, f.name.clone(), b.id, b.term.kind, pos, externs, defined, sret_base, agg_args, cov)
+    let is_tail = f.tail_call_blocks.contains(&b.id)
+    lir_emit_term(ctx, alloc, f.name.clone(), b.id, b.term.kind, pos, externs, defined, sret_base, agg_args, cov, is_tail)
     pos = pos + 1
     bi = bi + 1
   end
@@ -18125,6 +18842,59 @@ pub def lir_fn_has_payloaded_enum_crossing(type_defs: Map[Int, MirTypeDef], f: M
   hit
 end
 
+# Is `ty` an ADMITTED NICHED enum — the one-word value whose payload
+# variant field (or absent case) rides the single word? Inside the route
+# the niched value crosses BY VALUE (lir_enum_crossing_kind answers
+# "value-word" for its 8-byte image) and the canonical InternalValue
+# authority agrees (layout_engine.classify_enum_crossing answers
+# ValueWord for a niched enum under InternalValue). The canonical EXTERN
+# C flavor has no permitted form — classify_enum_crossing fails closed
+# — so, exactly like an admitted payloaded tagged enum, the crossing is
+# route-internal and must not reach a non-LIR callee (the extern guard
+# below refuses it, reading the authority's ExternC answer into the
+# message).
+def lir_ty_is_niched_enum(type_defs: Map[Int, MirTypeDef], ty: Type) -> Bool
+  match lir_plain_struct_shape(type_defs, ty)
+  when Result::Err(_) then false
+  when Result::Ok(o) then
+    match o
+    when Option::Some(kind) then
+      match kind
+      when LirAggShapeKind::LirAggStruct(_) then false
+      when LirAggShapeKind::LirAggEnum(eshape) then
+        match eshape.niche
+        when Option::Some(_) then true
+        when Option::None then false
+        end
+      end
+    when Option::None then false
+    end
+  end
+end
+
+# Whether the DECLARED signature of a MIR function takes or returns an
+# admitted NICHED enum — the crossing the LirFunction.niched_enum_crossing
+# evidence bit records. The scan reads the SAME lir_ty_is_niched_enum
+# shape authority the extern guard uses. Niched-enum LOCALS alone do not
+# set the bit (no boundary crossing exists), and the bit requires NO
+# enum-ABI version marker: the niched crossing is a one-word scalar
+# crossing, not an inline image.
+pub def lir_fn_has_niched_enum_crossing(type_defs: Map[Int, MirTypeDef], f: MirFunction) -> Bool
+  var hit = false
+  var i = 0
+  while i < f.params.len() do
+    let pty = f.params[i].ty.clone()
+    if lir_ty_is_niched_enum(type_defs, pty) then
+      hit = true
+    end
+    i = i + 1
+  end
+  if lir_ty_is_niched_enum(type_defs, f.ret_type.clone()) then
+    hit = true
+  end
+  hit
+end
+
 # The per-function version marker (third-audit item 42): Option::Some(v)
 # iff the declared signature takes or returns an admitted payloaded
 # tagged-enum, with v the version this route lowers under; Option::None
@@ -18148,6 +18918,18 @@ pub def lir_enum_abi_extern_refusal(fn_name: String, target: String, site: Strin
   "lir: function " + fn_name + " crosses a payloaded tagged-enum at " + site + " of the extern call to `" + target + "` under the LIR-internal enum ABI `" + lir_enum_abi_version_word(lir_enum_abi_version()) + "` (the by-reference inline image), while the non-LIR callee follows the canonical representation `" + canonical_word + "` (the ONE TaggedPtr value word from layout_engine.classify_enum_crossing — a raw discriminant below the inline-tag threshold or a heap pointer to the inline {tag @ 0, payload @ 8} image). A boundary conversion (inline image <-> canonical value word) is required; the inline-image -> canonical direction needs the heap/allocation path this slice does not implement, so the crossing fails closed (third-audit item 42 boundary rule (b); audit item 29) — " + lir_enum_crossing_rule()
 end
 
+# The NICHED-enum counterpart of the extern refusal: the niched value IS
+# one word (the payload, or the payload type's niche pattern for the
+# absent variant) and the canonical InternalValue authority answers
+# ValueWord for it, but the canonical EXTERN C flavor permits no crossing
+# (classify_enum_crossing fails closed — the authority's own ExternC
+# answer is included in the message), so the crossing to a non-LIR callee
+# fails closed. `site` describes the crossing ("the call destination",
+# "argument 0", ...).
+pub def lir_niched_enum_extern_refusal(fn_name: String, target: String, site: String, canonical_extern_word: String) -> String
+  "lir: function " + fn_name + " crosses a NICHED enum at " + site + " of the extern call to `" + target + "` (the niched value is ONE word — the payload word, or the payload type's niche pattern for the absent variant — a word-identical internal crossing under layout_engine.classify_enum_crossing's InternalValue flavor, which answers ValueWord). The canonical EXTERN C crossing has no permitted form: the authority's ExternC answer is `" + canonical_extern_word + "` (the non-LIR callee follows the canonical representation, the EnumLayout's TaggedPtr value word, which the niched word cannot satisfy without marshalling), so the crossing fails closed (third-audit item 42 boundary rule (b); audit item 29)"
+end
+
 # THE EXTERN-BOUNDARY ENUM GUARD — the ONLY remaining
 # lir_enum_crossing_rule enforcement site (see the rule's section and
 # the LIR-internal enum ABI note): the LIR-internal by-reference
@@ -18161,7 +18943,12 @@ end
 # payloaded tagged-enum image fails closed here (a payload-less enum
 # crosses by its raw-discriminant tag word in BOTH conventions, so
 # payload-less extern crossings keep lowering; the caller's tag word is
-# exactly the value word the direct callee expects). The guard runs on
+# exactly the value word the direct callee expects). A NICHED enum is
+# refused the same way: its one-word value IS the LIR route's internal
+# crossing (word-identical under InternalValue), but the canonical
+# ExternC flavor has no permitted form (classify_enum_crossing fails
+# closed), so the crossing stays route-internal — the guard records the
+# authority's ExternC answer in the refusal. The guard runs on
 # the MIR function in the whole-program entries (lir_compile_object /
 # lir_link_object), where the extern table and the argument/
 # destination types both still exist — per-function lowering sees
@@ -18190,13 +18977,20 @@ def lir_check_extern_enum_calls(f: MirFunction, type_defs: Map[Int, MirTypeDef],
         # LIR callee would copy the image words out through the x8 it
         # receives), while the extern callee returns its one TaggedPtr
         # VALUE word in x0 — the destination's words would never be
-        # written (fail closed). Projected destinations are scalar
-        # captures and cannot carry a payloaded-enum type.
+        # written (fail closed). A NICHED-enum destination takes the
+        # same refusal: its one word would be written by a LIR callee,
+        # while the extern callee's returned word is the canonical
+        # representation the authority refuses for the niched flavor.
+        # Projected destinations are scalar captures and cannot carry
+        # an enum type.
         if dest.projections.len() == 0 then
           match mir_opt_local_type(f, dest.local.id)
           when Option::Some(dty) then
             if lir_ty_is_payloaded_enum(type_defs, dty) then
               return Result::Err(lir_enum_abi_extern_refusal(f.name.clone(), target.clone(), "the call destination", lir_canonical_enum_crossing_word(type_defs.clone(), dty.clone())))
+            end
+            if lir_ty_is_niched_enum(type_defs, dty) then
+              return Result::Err(lir_niched_enum_extern_refusal(f.name.clone(), target.clone(), "the call destination", lir_canonical_enum_crossing_word_flavor(type_defs.clone(), AbiFlavor::ExternC, dty.clone())))
             end
           when Option::None then ()
           end
@@ -18205,7 +18999,10 @@ def lir_check_extern_enum_calls(f: MirFunction, type_defs: Map[Int, MirTypeDef],
         # the source image group's frame address in its ONE ABI slot
         # (the aggregate-argument slice), while the extern callee reads
         # its one TaggedPtr VALUE word — it would dereference the frame
-        # address as a heap pointer (fail closed). A payloaded-enum type
+        # address as a heap pointer (fail closed). A niched-enum
+        # argument lowers as its one internal word, which the extern
+        # callee would read under the canonical (refused) flavor — the
+        # same refusal. An enum type
         # can only reach a call through a whole-enum local/operand
         # (every projection of an enum is a scalar), so the operand
         # type check below mirrors the caller-side crossing exactly.
@@ -18232,6 +19029,9 @@ def lir_check_extern_enum_calls(f: MirFunction, type_defs: Map[Int, MirTypeDef],
           when Option::Some(aty) then
             if lir_ty_is_payloaded_enum(type_defs, aty) then
               return Result::Err(lir_enum_abi_extern_refusal(f.name.clone(), target.clone(), "argument " + ai.to_string(), lir_canonical_enum_crossing_word(type_defs.clone(), aty.clone())))
+            end
+            if lir_ty_is_niched_enum(type_defs, aty) then
+              return Result::Err(lir_niched_enum_extern_refusal(f.name.clone(), target.clone(), "argument " + ai.to_string(), lir_canonical_enum_crossing_word_flavor(type_defs.clone(), AbiFlavor::ExternC, aty.clone())))
             end
           when Option::None then ()
           end
@@ -18297,11 +19097,16 @@ end
 # a public/global ABI symbol: the writers register it with LOCAL binding,
 # which keeps every LIR-to-LIR call inside the object working (the
 # route's calls resolve through in-object labels) while hiding the
-# non-canonical crossing from the link surface. A REQUIRED export — the
+# non-canonical crossing from the link surface. A NICHED-enum function
+# takes the SAME Local binding: its one-word crossing is word-identical
+# only under the compiler's InternalValue flavor, while the canonical
+# EXTERN C crossing has no permitted form (classify_enum_crossing fails
+# closed), so it is not a stable public ABI either — mirroring the
+# authority. A REQUIRED export — the
 # OS entry symbol (main / _start / mainCRTStartup) — has no internal-only
 # fallback and fails closed (lir_check_fn_enum_abi_export).
 pub def lir_fn_export_binding(f: LirFunction) -> SymBinding
-  if f.enum_abi_crossing then
+  if f.enum_abi_crossing || f.niched_enum_crossing then
     SymBinding::Local
   else
     SymBinding::Global
@@ -18320,10 +19125,15 @@ end
 # export the route cannot make local, so it fails closed with the full
 # version / canonical-representation / conversion reason. A
 # payloaded-enum function with any other name is emitted LOCAL by the
-# writers and passes here.
+# writers and passes here. A NICHED-enum function fails closed the same
+# way: its one-word internal crossing has no permitted canonical ExternC
+# form (classify_enum_crossing refuses the flavor), so it cannot be a
+# required public export — mirror the authority.
 pub def lir_check_fn_enum_abi_export(f: LirFunction) -> Result[Unit, String]
   if f.enum_abi_crossing && lir_entry_symbol_required(f.name.clone()) then
     Result::Err("lir: function `" + f.name + "` takes/returns a payloaded tagged-enum (LIR-internal enum ABI `" + lir_enum_abi_version_word(lir_enum_abi_version()) + "`, the by-reference inline image) and is a REQUIRED export symbol (the OS entry) — the inline-image crossing is not a stable public ABI: the canonical representation is the TaggedPtr value word (layout_engine.classify_enum_crossing) and converting it needs the allocation path this slice does not implement; v1 refuses to export it (move the enum crossing behind an internal function with a stable signature — fail-closed)")
+  elsif f.niched_enum_crossing && lir_entry_symbol_required(f.name.clone()) then
+    Result::Err("lir: function `" + f.name + "` takes/returns a NICHED enum (the one-word payload image with the absent variant in the payload type's niche) and is a REQUIRED export symbol (the OS entry) — the canonical EXTERN C crossing has no permitted form for the niched flavor (layout_engine.classify_enum_crossing fails closed under ExternC: the canonical representation would be the EnumLayout's TaggedPtr value word and the niched word cannot satisfy it without marshalling), so the one-word internal crossing is not a stable public ABI; v1 refuses to export it (move the enum crossing behind an internal function with a stable signature — fail-closed)")
   else
     Result::Ok(())
   end

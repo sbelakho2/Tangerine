@@ -101,6 +101,11 @@ SUITES=(
   # budget_classification_of rule, the derivation-aware static
   # classification and the violation-row derivation).
   "tests/budget_guarantees_test.tg"
+  # Tier-4: the compiler-grounded persistent rationale history (the five
+  # decision sources, the text save/load and the record / history digests)
+  # + the dynamic semantic-tool discovery surface (the registry walk, the
+  # audited enumeration and the requires_* filters).
+  "tests/semantic_rationale_test.tg"
 )
 
 FAILED=0
