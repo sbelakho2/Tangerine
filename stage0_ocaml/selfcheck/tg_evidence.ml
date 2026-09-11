@@ -169,7 +169,11 @@ let () =
       let frontend = if n_errors = 0 then "PASS" else "FAIL" in
       let structural, mono_gate, pre, post, residual =
         if n_errors = 0 then begin
-          let prog = Driver.lower_closure ctx in
+          match
+            (try Ok (Driver.lower_closure ctx) with e -> Error (Printexc.to_string e))
+          with
+          | Error _ -> ("FAIL", "SKIPPED", 0, 0, 0)
+          | Ok prog ->
           let query_sigs =
             Driver.closure_query_sigs ~lowered:(Some prog) ctx.Driver.ctx_env
           in

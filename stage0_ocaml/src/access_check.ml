@@ -262,10 +262,18 @@ let effects_of_convention (c : Access_effect.t) : Access_effect.read_effect =
          replay: it walks one straight-line sequence per item with no
          branch/path information (mutually-exclusive arms and loops
          conflated, impl-block method scopes and declaration-round
-         records merged into one timeline), so the authoritative
-         path-sensitive CFG dataflow (resource_check.ml, over the
-         lowered MIR) remains the ownership authority; this replay is
-         the additional diagnostic.
+         records merged into one timeline).  Two recorded-channel
+         identity limits are DOCUMENTED and remain: (i) sibling scopes
+         (match arms, if arms) bind with the same next_local_id, so two
+         distinct arm variables can share one numeric root, and (ii)
+         a_item is the enclosing item summary (all methods of a
+         module's impl blocks share one bucket; bodies checked outside
+         the item loop record "<none>").  Both make the per-item lattice
+         an over-approximation, so the authoritative path-sensitive CFG
+         dataflow (resource_check.ml, over the lowered MIR) remains the
+         ownership authority; the driver's CALL_ARGUMENT_ACCESS_SANITY
+         lane consumes the CFG results (run_closure_access + the CFG
+         dataflow), never this replay.
 
    HONEST BOUNDARY: the pass walks the RECORDED typed channels — the
    full CFG-based stage (finalize_plan + edge_cleanup consumed by MIR)
@@ -309,22 +317,33 @@ let path_to_string (p : access_path) : string =
     p.projections;
   Buffer.contents buf
 
-(* The first integrated semantic pass (re-audit P0-11).  Consumes the
-   closure's recorded typed access channel (accumulated per call
-   argument by the typechecker; each record carries the argument's type)
-   and returns the finding list.  `resolve` maps a nominal type id to
-   its definition shape so the copy authority can decide which tracked
-   roots are genuinely owned: the queries route through the ONE engine
-   (Type_properties — audit item 3), whose nominal resolver is this
-   def-shape resolver lifted with structural_resolver and overlaid with
-   the compilation's ?lang_items record (owning LangItems answer their
-   direct properties; no def-shape recursion is re-derived here).
-   ?lang_items is None when the caller has no LangItems record (raw
-   replay fixtures): def-less owning LangItem instances then answer
-   through the def shape or the engine's conservative Unknown. *)
-let run_closure ?(lang_items : Lang_items.t option = None)
+(* The recorded-channel pass (re-audit P0-11).  Consumes the closure's
+   recorded typed access channel (accumulated per call argument by the
+   typechecker; each record carries the argument's type) and returns the
+   two finding families separately:
+     - fst: the per-call (statement-group) access-effect matrix findings
+       (ACCESS-CONFLICT) — path-independent (one call's argument list is
+       evaluated together) and therefore sound on the recorded channel;
+     - snd: the per-item linear ownership replay findings
+       (STATE-CONFLICT) — the diagnostic replay with the documented
+       sibling-scope/bucket conflation boundary below.  It is NOT the
+       ownership authority: the path-sensitive CFG resource dataflow
+       (resource_check.ml) is, and the driver's CALL_ARGUMENT_ACCESS_SANITY
+       lane consumes THAT (run_closure_access + the CFG results) instead
+       of this replay.
+   `resolve` maps a nominal type id to its definition shape so the copy
+   authority can decide which tracked roots are genuinely owned: the
+   queries route through the ONE engine (Type_properties — audit item 3),
+   whose nominal resolver is this def-shape resolver lifted with
+   structural_resolver and overlaid with the compilation's ?lang_items
+   record (owning LangItems answer their direct properties; no def-shape
+   recursion is re-derived here).  ?lang_items is None when the caller has
+   no LangItems record (raw replay fixtures): def-less owning LangItem
+   instances then answer through the def shape or the engine's
+   conservative Unknown. *)
+let run_closure_parts ?(lang_items : Lang_items.t option = None)
     (resolve : Ids.Type_id.t -> Type_repr.t option) (accesses : access list) :
-    finding list =
+    finding list * finding list =
   (* the channel is recorded by prepending: restore program order *)
   let accesses = List.rev accesses in
   (* the ONE copy authority: a per-run instance cache (bound to the
@@ -465,4 +484,24 @@ let run_closure ?(lang_items : Lang_items.t option = None)
           (List.rev env.Resource_check.errors))
       (List.rev !item_order)
   in
+  (call_findings, item_findings)
+
+(* the ACCESS-CONFLICT half: the per-call effect matrix over the recorded
+   statement groups.  This is the half the driver's
+   CALL_ARGUMENT_ACCESS_SANITY lane consumes from the recorded channel. *)
+let run_closure_access ?(lang_items : Lang_items.t option = None)
+    (resolve : Ids.Type_id.t -> Type_repr.t option) (accesses : access list) :
+    finding list =
+  fst (run_closure_parts ~lang_items resolve accesses)
+
+(* both halves, in emission order (access conflicts first).  The snd half
+   is the STATE-CONFLICT per-item linear replay: a DIAGNOSTIC with the
+   documented root-identity limits (sibling scopes/buckets); it is not
+   the lane's authority — the CFG resource dataflow is.  Kept as the
+   recorded-channel replay pinned by the tg_access_resource selfcheck
+   (straight-line fixtures). *)
+let run_closure ?(lang_items : Lang_items.t option = None)
+    (resolve : Ids.Type_id.t -> Type_repr.t option) (accesses : access list) :
+    finding list =
+  let call_findings, item_findings = run_closure_parts ~lang_items resolve accesses in
   call_findings @ item_findings

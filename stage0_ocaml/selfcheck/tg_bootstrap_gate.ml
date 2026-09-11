@@ -245,20 +245,24 @@ let verify_subset_rejection (name : string) (code : string) (src : string) : uni
           (String.concat "; " got);
       Printf.printf "  subset firewall: `%s` -> %s: PASS\n" name code
 
-(* The first integrated access/resource semantic pass (re-audit P0-11):
-   the driver runs Access_check.run_closure over the closure env's
-   RECORDED typed channels (one access record per checked call argument
-   — place path + callee-side read effect — accumulated across the
-   closure by the typechecker).  The pass checks the access-effect
-   conflict matrix per statement group and replays the operations on
-   Resource_check's ownership state lattice per item; findings are
+(* The first integrated access/resource semantic pass (re-audit P0-11),
+   now a CFG-dataflow consumer (re-audit alignment): the driver composes
+   the lane as (a) the per-call access-effect matrix over the closure
+   env's RECORDED typed channels (one access record per checked call
+   argument — place path + callee-side read effect) and (b) the
+   authoritative path-sensitive CFG resource dataflow results
+   (resource_check.ml over the lowered MIR), which already checks every
+   call argument's Move/Consume operands per path.  The old linear
+   per-item replay is NOT consumed: its recorded root identity is not
+   unique within a bucket (sibling scopes restart LocalIds; impl-block
+   methods share an item key; declaration rounds duplicate records), so
+   it reported branch/bucket artifacts on the closure.  findings are
    reported, nothing is rewritten.
 
-   HONEST NOTE: the pass walks the recorded typed channels — the full
-   CFG-based stage (finalize_plan + edge_cleanup consumed by MIR)
-   remains future work.  The sentinel (access_resource_integrated =
-   false) is GONE: the gate now RUNS the pass and reports findings;
-   the debt gate's exit behavior is unchanged (additive reporting). *)
+   HONEST NOTE: the CFG half is present exactly when the closure lowered
+   (zero typecheck debt) — the same condition under which the gate
+   enforces this lane; while debt remains the semantic stages are
+   deferred and the gate exits before the lane's hard check. *)
 
 let run_and_report_access_resource (ctx : Driver.closure_ctx) : int =
   let findings = Driver.run_access_resource_pass ctx in
@@ -463,9 +467,10 @@ let () =
        Printf.printf "  [6/10] call-argument access sanity\n";
        if n_access_findings > 0 then
          fail
-           "call-argument access findings on the closure (%d) — the sanity walk must be clean \
-            before closure PASS (this is CALL_ARGUMENT_ACCESS_SANITY, not the native \
-            ownership/resource pass; the CFG-based cleanup-plan stage remains future work)"
+           "call-argument access findings on the closure (%d) — the lane must be clean \
+            before closure PASS: the recorded-channel access matrix plus the authoritative \
+            path-sensitive CFG resource dataflow (resource_check.ml over the lowered MIR, \
+            which checks every call argument's Move/Consume operands per path)"
            n_access_findings;
        (match stages.Driver.bs_prog with
         | None -> fail "lowering produced no program"

@@ -1,13 +1,24 @@
 (* tg_access_resource.ml — the FIRST INTEGRATED SEMANTIC PASS self-check
-   (re-audit P0-11).
+   (re-audit P0-11; CFG-consumer re-audit alignment).
 
-   Proves Access_check.run_closure over the typechecker's RECORDED typed
-   channels — the integrated path is exactly what the driver's
-   bootstrap-check runs after the typecheck phase:
+   Two pinned halves:
 
-     parse -> typecheck (the oracle accumulates one access record per
-     checked call argument: place path + callee-side read effect) ->
-     Access_check.run_closure env.state.oracle.o_accesses
+   (1) the RECORDED-CHANNEL pass (Access_check.run_closure) over the
+   typechecker's typed channels: parse -> typecheck (the oracle
+   accumulates one access record per checked call argument: place path +
+   callee-side read effect) -> Access_check.run_closure
+   env.state.oracle.o_accesses.  This pass is the driver lane's
+   path-independent ACCESS-MATRIX half plus the diagnostic linear
+   ownership replay (whose sibling-scope / item-bucket identity limits
+   are documented in access_check.ml — it is NOT the pipeline's
+   ownership authority).
+
+   (2) the pipeline lane's ownership authority: the path-sensitive CFG
+   resource dataflow (Resource_check.cfg_check_program) over lowered
+   Seed MIR, whose Call terminator arm checks every call argument's
+   Move/Consume operands per path.  The straight-line call-argument
+   move probes at the end pin its detection of double-move,
+   use-after-consume and the Copy-typed negative.
 
    Each tiny inline program is typechecked FIRST (must be 0 type errors,
    so the recorded channel is the honest one), then the pass runs:
@@ -31,7 +42,11 @@
        (regression: the pass must not manufacture its own conflict by
        treating the first sight as a re-initialization);
    (h) a SECOND Initialize on a Live owned local must still produce a
-       re-initialization state finding.
+       re-initialization state finding;
+   (i) the CFG dataflow must reject a second sink call argument of one
+       owned local (the whole-value second consume is a use-after-consume),
+       reject a read after a sink argument (use-after-consume), and leave
+       a Copy-typed local's sink arguments clean.
 
    The state cases use GENUINELY OWNED types (String / a struct with a
    String field): on a Copy scalar (Int) a sink is a copy, so the
@@ -311,6 +326,63 @@ end
   ignore
     (expect_findings "h: second Initialize on a Live owned local" env_h 1 "state-conflict"
        "re-initialization");
+
+  (* ── the lane's ownership authority: the CFG resource dataflow.  The
+     pipeline's CALL_ARGUMENT_ACCESS_SANITY lane consumes the
+     path-sensitive CFG results (resource_check.ml) instead of the
+     linear replay above; its Call terminator arm steps every argument
+     operand through the same consume/read transfers the lowered
+     compiler's call arguments hit.  These hand-built Seed MIR probes
+     pin the straight-line call-argument move shapes the lane must
+     still detect: a second sink argument of one owned local (the
+     whole-value second consume is a use-after-consume), a read after a
+     sink argument (use-after-consume), and a Copy-typed local's sink
+     arguments (copies, no finding). *)
+  let cfg_probe (name : string) (local_ty : Type_repr.t) (second : Seed_mir.operand) :
+      string list =
+    let place1 : Seed_mir.place = { Seed_mir.root = Seed_mir.Local 1; projections = [] } in
+    let dest : Seed_mir.place = { Seed_mir.root = Seed_mir.Local 2; projections = [] } in
+    let callee =
+      Seed_mir.User
+        (Instance_id.make ~callable:(Ids.Callable_id.make 9001) ~type_args:[||])
+    in
+    let call arg =
+      Seed_mir.Call
+        ( dest, callee,
+          [| { Seed_mir.effect_ = Access_effect.Consume; value = arg } |],
+          1, None )
+    in
+    let fn =
+      {
+        Seed_mir.name;
+        instance = Instance_id.make ~callable:(Ids.Callable_id.make 9000) ~type_args:[||];
+        params =
+          [| { Type_repr.pt_convention = Access_effect.Sink; pt_type = local_ty } |];
+        locals = [| Type_repr.Unit; local_ty; Type_repr.Unit |];
+        blocks =
+          [|
+            { Seed_mir.id = 0; statements = []; terminator = call (Seed_mir.Move place1) };
+            { Seed_mir.id = 1; statements = []; terminator = call second };
+            { Seed_mir.id = 2; statements = []; terminator = Seed_mir.Ret };
+          |];
+        entry = 0;
+      }
+    in
+    Resource_check.cfg_check_program
+      { Seed_mir.functions = [| fn |]; statics = [||]; types = [||] }
+  in
+  let place1 : Seed_mir.place = { Seed_mir.root = Seed_mir.Local 1; projections = [] } in
+  let cfg_double = cfg_probe "cfg_double_sink" Type_repr.String (Seed_mir.Move place1) in
+  check "cfg-authority: a second sink call argument of one owned local is rejected"
+    (List.exists (fun e -> contains_sub e "use-after-consume") cfg_double);
+  let cfg_after = cfg_probe "cfg_sink_then_read" Type_repr.String (Seed_mir.Copy place1) in
+  check "cfg-authority: a read after a sink call argument is a use-after-consume"
+    (List.exists (fun e -> contains_sub e "use-after-consume") cfg_after);
+  let cfg_copy =
+    cfg_probe "cfg_copy_sink" (Type_repr.Int Type_repr.Int) (Seed_mir.Move place1)
+  in
+  check "cfg-authority: a Copy-typed local's sink arguments are copies (no finding)"
+    (cfg_copy = []);
 
   if !failures = 0 then begin
     Printf.printf "tg_access_resource: ALL PASS\n";

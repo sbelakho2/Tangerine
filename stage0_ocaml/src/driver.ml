@@ -539,6 +539,43 @@ let typed_patterns_of (env : Typecheck.env) :
     ((Ids.Node_id.t * int) * Typed_pattern.t) list =
   Hashtbl.fold (fun key tp acc -> (key, tp) :: acc) env.Typecheck.typed_patterns []
 
+(* The lowering lookup tables, built ONCE per closure: the per-function
+   assoc-list conversion of the four typed channels is quadratic over a
+   ~40k-function closure and turns the post-typecheck lowering into a
+   GC-bound wall.  The list builders above survive for the selfcheck
+   callers and any consumer that still wants a list. *)
+let typed_nodes_table_of (env : Typecheck.env) :
+    (Ids.Node_id.t, Mir_lower.typed_node) Hashtbl.t =
+  let t = Hashtbl.create (Hashtbl.length env.Typecheck.typed_nodes * 2 + 16) in
+  Hashtbl.iter
+    (fun key (node : Typecheck.typed_node) ->
+      Hashtbl.replace t key
+        {
+          Mir_lower.tn_type = node.Typecheck.tn_type;
+          tn_cast_target = node.Typecheck.tn_cast_target;
+          tn_call = node.Typecheck.tn_call;
+        })
+    env.Typecheck.typed_nodes;
+  t
+
+let typed_patterns_table_of (env : Typecheck.env) :
+    (Ids.Node_id.t * int, Typed_pattern.t) Hashtbl.t =
+  let t = Hashtbl.create (Hashtbl.length env.Typecheck.typed_patterns * 2 + 16) in
+  Hashtbl.iter (fun k v -> Hashtbl.replace t k v) env.Typecheck.typed_patterns;
+  t
+
+let typed_for_patterns_table_of (env : Typecheck.env) :
+    (Ids.Node_id.t, Typecheck.typed_for) Hashtbl.t =
+  let t = Hashtbl.create (Hashtbl.length env.Typecheck.typed_for_patterns * 2 + 16) in
+  Hashtbl.iter (fun k v -> Hashtbl.replace t k v) env.Typecheck.typed_for_patterns;
+  t
+
+let typed_let_patterns_table_of (env : Typecheck.env) :
+    (Ids.Node_id.t, Typed_pattern.t) Hashtbl.t =
+  let t = Hashtbl.create (Hashtbl.length env.Typecheck.typed_let_patterns * 2 + 16) in
+  Hashtbl.iter (fun k v -> Hashtbl.replace t k v) env.Typecheck.typed_let_patterns;
+  t
+
 let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lower.func_env =
   (* both the qualified key and the bare name resolve (flat namespace) *)
   let bare_keys (n : string) : string list =
@@ -972,6 +1009,10 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
     (List.length program.Ast.items)
     (List.length funcs);
   let base = lowering_env_of ~items:program.Ast.items env in
+  let typed_nodes_tbl = typed_nodes_table_of env in
+  let typed_patterns_tbl = typed_patterns_table_of env in
+  let typed_for_patterns_tbl = typed_for_patterns_table_of env in
+  let typed_let_patterns_tbl = typed_let_patterns_table_of env in
   let mir_funcs =
     List.mapi
       (fun i d ->
@@ -993,10 +1034,9 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
         let conventions =
           Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params
         in
-        Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of env)
-                    ~typed_patterns:(typed_patterns_of env)
-                    ~typed_for_patterns:(typed_for_patterns_of env)
-                    ~typed_let_patterns:(typed_let_patterns_of env)
+        Mir_lower.lower_function_with_variants ~typed_nodes_tbl
+                    ~typed_patterns_tbl ~typed_for_patterns_tbl
+                    ~typed_let_patterns_tbl
           (user_variant_table env)
           { base with Mir_lower.fn_ret }
           d.Ast.fn_sig.Ast.sig_name callable template_args conventions d)
@@ -1116,6 +1156,10 @@ let cmd_interpret (args : string list) : int =
                   program.Ast.items
               in
               let base = lowering_env_of ~items:program.Ast.items env in
+              let typed_nodes_tbl = typed_nodes_table_of env in
+              let typed_patterns_tbl = typed_patterns_table_of env in
+              let typed_for_patterns_tbl = typed_for_patterns_table_of env in
+              let typed_let_patterns_tbl = typed_let_patterns_table_of env in
               let mir_funcs =
                 List.mapi
                   (fun i d ->
@@ -1124,10 +1168,9 @@ let cmd_interpret (args : string list) : int =
                       | Some ts -> (ts.Typecheck.ts_return, Ids.Callable_id.to_int ts.Typecheck.ts_callable)
                       | None -> (Type_repr.Unit, i)
                     in
-                    Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of env)
-                    ~typed_patterns:(typed_patterns_of env)
-                    ~typed_for_patterns:(typed_for_patterns_of env)
-                    ~typed_let_patterns:(typed_let_patterns_of env)
+                    Mir_lower.lower_function_with_variants ~typed_nodes_tbl
+                    ~typed_patterns_tbl ~typed_for_patterns_tbl
+                    ~typed_let_patterns_tbl
                       (user_variant_table env)
                       { base with Mir_lower.fn_ret }
                       d.Ast.fn_sig.Ast.sig_name callable [||] [||] d)
@@ -2128,6 +2171,12 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
   in
   let base = lowering_env_of ~items:all_items ctx.ctx_env in
   let variants = user_variant_table ctx.ctx_env in
+  (* the four typed channels as shared lookup tables (built once, not per
+     function — see typed_nodes_table_of) *)
+  let typed_nodes_tbl = typed_nodes_table_of ctx.ctx_env in
+  let typed_patterns_tbl = typed_patterns_table_of ctx.ctx_env in
+  let typed_for_patterns_tbl = typed_for_patterns_table_of ctx.ctx_env in
+  let typed_let_patterns_tbl = typed_let_patterns_table_of ctx.ctx_env in
   let mir_funcs = ref [] in
   let lowered_methods = ref 0 in
   (* TANGERINE_DEBUG_DUP: record every lowering with its provenance so the
@@ -2248,10 +2297,10 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
           if is_canonical_decl ("fn::" ^ qname) fd.Ast.fn_span then begin
             let f =
               Mir_lower.lower_function_with_variants
-                ~typed_for_patterns:(typed_for_patterns_of ctx.ctx_env)
-                ~typed_let_patterns:(typed_let_patterns_of ctx.ctx_env)
-                ~typed_nodes:(typed_nodes_of ctx.ctx_env)
-                      ~typed_patterns:(typed_patterns_of ctx.ctx_env)
+                ~typed_nodes_tbl
+                ~typed_patterns_tbl
+                ~typed_for_patterns_tbl
+                ~typed_let_patterns_tbl
                 variants
                 { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
                 fd.Ast.fn_sig.Ast.sig_name
@@ -2289,10 +2338,10 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
                       if is_canonical_decl reg_key m.Ast.fn_span then begin
                         let f =
                           Mir_lower.lower_function_with_variants
-                            ~typed_nodes:(typed_nodes_of ctx.ctx_env)
-                            ~typed_patterns:(typed_patterns_of ctx.ctx_env)
-                            ~typed_for_patterns:(typed_for_patterns_of ctx.ctx_env)
-                            ~typed_let_patterns:(typed_let_patterns_of ctx.ctx_env)
+                            ~typed_nodes_tbl
+                            ~typed_patterns_tbl
+                            ~typed_for_patterns_tbl
+                            ~typed_let_patterns_tbl
                             variants
                             { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
                             m.Ast.fn_sig.Ast.sig_name
@@ -2336,10 +2385,9 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
   List.iter
     (fun (qname, ts, fd : string * Typecheck.typed_signature * Ast.function_decl) ->
       let f =
-        Mir_lower.lower_function_with_variants ~typed_nodes:(typed_nodes_of ctx.ctx_env)
-                    ~typed_patterns:(typed_patterns_of ctx.ctx_env)
-                    ~typed_for_patterns:(typed_for_patterns_of ctx.ctx_env)
-                    ~typed_let_patterns:(typed_let_patterns_of ctx.ctx_env)
+        Mir_lower.lower_function_with_variants ~typed_nodes_tbl
+                    ~typed_patterns_tbl ~typed_for_patterns_tbl
+                    ~typed_let_patterns_tbl
           variants
           { base with Mir_lower.fn_ret = ts.Typecheck.ts_return }
           qname
@@ -4361,26 +4409,30 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
     oc_skipped = stats = None;
   }
 
-(* ── CALL_ARGUMENT_ACCESS_SANITY (re-audit P0-11; re-audit P0 #2 label) ─
-   After the typecheck phase, walk the closure env's RECORDED typed
-   channels: the typechecker accumulates one Access_check.access per
-   checked call argument (place path + callee-side read effect) across
-   the whole closure (the channel is not reset per item).  The pass
-   (a) feeds the access-effect conflict matrix per statement group (one
-   call's argument list) and (b) replays the recorded operations on
-   Resource_check's per-local state lattice per item; findings are
-   returned, nothing in the typechecker is rewritten.
+(* ── CALL_ARGUMENT_ACCESS_SANITY (re-audit P0-11; re-audit P0 #2 label;
+   CFG-consumer alignment) ────────────────────────────────────────────
+   The lane is composed of TWO halves over the call arguments of the
+   closure (nothing in the typechecker is rewritten):
+     (a) the path-independent ACCESS MATRIX over the recorded typed
+         channels: the typechecker accumulates one Access_check.access
+         per checked call argument (place path + callee-side read
+         effect) across the whole closure, and each statement group
+         (one call's argument list) runs the effect-pair matrix;
+     (b) the authoritative path-sensitive CFG RESOURCE DATAFLOW
+         (resource_check.ml over the lowered MIR): its Call terminator
+         arm checks every argument's Move/Consume operands per path,
+         and it is the ownership authority the recorded-channel linear
+         replay is documented NOT to be (sibling scopes restart
+         LocalIds and impl-block methods share one item key, so on the
+         closure that replay reported branch/bucket artifacts, never
+         ownership conflicts).
 
-   HONEST LABEL — THIS IS NOT THE OWNERSHIP PASS.  It is a SANITY
-   replay of call-argument accesses recorded during typechecking: the
-   roots are the typed LocalIds of the argument bindings (shadowed
-   locals are distinct roots), the effects are the callee-side
-   conventions, and the replay walks a simplified resource-state
-   lattice.  It does NOT perform the native ownership stage: the real
-   CFG-based pass (finalize_plan + edge_cleanup consumed by MIR) is
-   future work, and nothing about seed equivalence rests on this
-   stage's findings.  Additive by construction: it reports findings
-   and cannot change the typecheck debt. *)
+   The CFG half is present exactly when the closure lowered (zero
+   typecheck debt) — the same condition under which the gate enforces
+   the lane; while debt remains, the semantic stages are deferred and
+   the gate exits before the lane's hard check.  Additive by
+   construction: the lane reports findings and cannot change the
+   typecheck debt. *)
 
 (* Nominal-definition lookup for the copy-authority resolver (mirror of
    seed_mir.def_repr / mir_verify.find_type, read-only): a struct
@@ -4414,48 +4466,98 @@ let nominal_def_of_tid (env : Typecheck.env) (tid : Ids.Type_id.t) : Type_repr.t
                        Type_repr.Never ))
       | None -> Typecheck.type_by_name env name)
 
-let run_access_resource_pass (ctx : closure_ctx) : Access_check.finding list =
-  (* the compilation's LangItems record overlays the engine's resolver
-     (the access replay consumes the same owned answers as the
-     verifier/drop planner: owning LangItems answer their direct
-     properties, never their def shapes) *)
-  Access_check.run_closure
+let cfg_state_findings (ctx : closure_ctx) : (string * string) list =
+  (* the authoritative path-sensitive ownership dataflow over the lowered
+     MIR (function name, message) — empty only when no lowered program
+     exists (typecheck debt: the semantic stages are deferred) *)
+  match ctx.ctx_cfg_program with
+  | None -> []
+  | Some prog ->
+      Resource_check.cfg_check_program_items
+        ~lang_items:(Some (Typecheck.lang_items_of_env ctx.ctx_env))
+        prog
+
+let cfg_finding (item, message) : Access_check.finding =
+  { Access_check.f_item = item; f_kind = "state-conflict"; f_message = message }
+
+(* The lane's recorded-channel half: the per-call effect matrix
+   (path-independent — one call's argument list is evaluated together, so
+   the matrix is sound on the recorded groups). *)
+let access_conflict_findings (ctx : closure_ctx) : Access_check.finding list =
+  Access_check.run_closure_access
     ~lang_items:(Some (Typecheck.lang_items_of_env ctx.ctx_env))
     (nominal_def_of_tid ctx.ctx_env)
     ctx.ctx_env.Typecheck.state.oracle.o_accesses
 
+let run_access_resource_pass (ctx : closure_ctx) : Access_check.finding list =
+  (* CALL_ARGUMENT_ACCESS_SANITY = the recorded-channel access matrix +
+     the CFG resource dataflow results.  The linear per-item replay is NOT
+     consumed: its root identity is not unique within a bucket (sibling
+     scopes restart next_local_id; impl-block methods share one item key;
+     declaration rounds duplicate records), so on the closure it reports
+     branch/bucket artifacts, not ownership conflicts.  The CFG pass is
+     the documented ownership authority and it already checks every call
+     argument's Move/Consume operands per path (resource_check.ml's Call
+     terminator arm), so consuming its results is the lane's integrity
+     check — strictly stronger than the linear replay, which it replaces. *)
+  access_conflict_findings ctx @ List.map cfg_finding (cfg_state_findings ctx)
+
 let report_access_resource_pass (ctx : closure_ctx) : unit =
-  let findings = run_access_resource_pass ctx in
+  let cfg_items = cfg_state_findings ctx in
+  let findings = access_conflict_findings ctx @ List.map cfg_finding cfg_items in
   let recorded = List.rev ctx.ctx_env.Typecheck.state.oracle.o_accesses in
   let n_places =
     List.length (List.filter (fun (a : Access_check.access) -> a.a_path <> None) recorded)
   in
   Printf.printf
-    "  call-argument access sanity (the linear replay — the CFG resource dataflow below is the authoritative path-sensitive pass): %d call-argument accesses (%d place paths, roots keyed by LocalId), %d finding(s)\n"
+    "  call-argument access sanity (the recorded-channel matrix + the CFG resource dataflow — the authoritative path-sensitive pass): %d call-argument accesses (%d place paths, roots keyed by LocalId), %d finding(s)\n"
     (List.length recorded) n_places (List.length findings);
   let status = if findings = [] then "PASS" else "FAIL" in
   Printf.printf "  CALL_ARGUMENT_ACCESS_SANITY = %s (%d finding(s))\n" status
     (List.length findings);
+  (match Sys.getenv_opt "TANGERINE_DEBUG_ACCESS_FINDINGS" with
+   | None -> ()
+   | Some path ->
+       let oc = open_out path in
+       List.iter
+         (fun (f : Access_check.finding) ->
+           Printf.fprintf oc "FINDING\t%s\t%s\t%s\n" f.Access_check.f_kind
+             f.Access_check.f_item f.Access_check.f_message)
+         findings;
+       List.iter
+         (fun (a : Access_check.access) ->
+           let loc =
+             match
+               Span.resolve (Module_graph.source_map ctx.ctx_graph) a.Access_check.a_span
+             with
+             | Some (file, line, col) -> Printf.sprintf "%s:%d:%d" file line col
+             | None -> "<synthetic>"
+           in
+           Printf.fprintf oc "ACCESS\t%s\t%d\t%s\t%s\t%s\n" a.Access_check.a_item
+             a.Access_check.a_call
+             (match a.Access_check.a_path with
+              | Some p -> Access_check.path_to_string p
+              | None -> "-")
+             (Access_check.effect_to_string a.Access_check.a_effect) loc)
+         recorded;
+       close_out oc);
   (* re-audit P0-E: the CFG resource dataflow — the path-sensitive
      lattice over the MIR control flow (merge joins, loop fixpoints,
      conditional-initialization and use-after-consume per path) — the
-     authoritative ownership stage; the linear replay remains an
-     additional diagnostic.  The pass consumes the compilation's
-     LangItems record so its owned answers (audit item 3: the ONE
-     Type_properties authority over the program's def table) match the
-     verifier/drop planner exactly. *)
-  let cfg_findings =
-    match ctx.ctx_cfg_program with
-    | None -> []
-    | Some prog ->
-        Resource_check.cfg_check_program
-          ~lang_items:(Some (Typecheck.lang_items_of_env ctx.ctx_env))
-          prog
-  in
-  let cfg_status = if cfg_findings = [] then "PASS" else "FAIL" in
+     authoritative ownership stage; the recorded-channel matrix above is
+     the path-independent access half of the lane.  The pass consumes
+     the compilation's LangItems record so its owned answers (audit item
+     3: the ONE Type_properties authority over the program's def table)
+     match the verifier/drop planner exactly. *)
+  let cfg_status = if cfg_items = [] then "PASS" else "FAIL" in
   Printf.printf "  CFG_RESOURCE_DATAFLOW = %s (%d finding(s))\n" cfg_status
-    (List.length cfg_findings);
-  List.iter (fun f -> Printf.printf "    %s\n" f) cfg_findings;
+    (List.length cfg_items);
+  (match ctx.ctx_cfg_program with
+   | None ->
+       Printf.printf
+         "    (ownership half deferred: no mono'd program available — the CFG dataflow consumes the mono def table)\n"
+   | Some _ -> ());
+  List.iter (fun (item, message) -> Printf.printf "    %s: %s\n" item message) cfg_items;
   let printed = ref 0 in
   List.iter
     (fun (f : Access_check.finding) ->
@@ -4615,7 +4717,23 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
             bs_oracle_incomplete = true;
           }
       else begin
-        let prog = lower_closure ctx in
+        match (try Ok (lower_closure ctx) with e -> Error (Printexc.to_string e)) with
+        | Error _ ->
+            (* lowering failed before any MIR existed: the gate reports the
+               recorded-channel lane and fails at the lowering stage *)
+            Ok
+              {
+                bs_ctx = ctx;
+                bs_debt = measured_debt;
+                bs_prog = None;
+                bs_mir_verify_ok = false;
+                bs_mono = None;
+                bs_host_report = None;
+                bs_vm_code = None;
+                bs_artifact = None;
+                bs_oracle_incomplete = true;
+              }
+        | Ok prog ->
         let tpl_ok =
           match
             Mir_verify.require_valid_template
@@ -4670,8 +4788,14 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                     bs_artifact = None;
                     bs_oracle_incomplete = oracle_incomplete;
                   }
-            | Ok mo ->
-                debug_missing_user_callees ctx mo.mo_program;
+                     | Ok mo ->
+                         debug_missing_user_callees ctx mo.mo_program;
+                (* the CFG resource dataflow (the lane's ownership
+                   authority) runs over the MONO'd program: only the
+                   mono'd def table carries the instantiated generic
+                   defs the dataflow's field/variant classification
+                   resolves, so the template MIR is not a sound input. *)
+                ctx.ctx_cfg_program <- Some mo.mo_program;
                 if mo.mo_residual_type_params > 0 || oracle_incomplete then
                   Ok
                     {
@@ -4777,22 +4901,37 @@ let cmd_bootstrap_check (args : string list) : int =
        Printf.printf "  typecheck: %d modules, %d items, %d errors (%d rounds)\n"
          ctx.ctx_graph.Module_graph.node_count ctx.ctx_items (List.length ctx.ctx_type_errors)
          ctx.ctx_decl_rounds;
-       report_access_resource_pass ctx;
-       List.iter (fun e -> Printf.printf "    %s\n" e) (List.sort compare ctx.ctx_type_errors);
+       flush stdout;
        if ctx.ctx_type_errors <> [] then begin
+         (* no lowered program exists: the lane reports the recorded-channel
+            access matrix; the CFG ownership half is deferred with the
+            semantic stages (the gate's hard lane runs only at zero debt) *)
+         report_access_resource_pass ctx;
+         List.iter (fun e -> Printf.printf "    %s\n" e) (List.sort compare ctx.ctx_type_errors);
          (* honest: lowering/mono are unreachable — print the oracle rows
             with zeros and the skipped note, then fail the gate *)
          ignore (print_oracle_rows ctx.ctx_audit (oracle_of_ctx ctx None));
-         Printf.printf "  mono: skipped (typecheck gate failed)\n";
-         Printf.printf "  FRONTEND_SEMANTIC_GATE = FAIL\n";
-         Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
-         Printf.printf "EVIDENCE_MIR template_verify=skipped concrete_verify=skipped\n";
-         Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
-         Printf.printf "  RESULT: FAIL\n";
-         1
+          Printf.printf "  mono: skipped (typecheck gate failed)\n";
+          Printf.printf "  FRONTEND_SEMANTIC_GATE = FAIL\n";
+          Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
+          Printf.printf "EVIDENCE_MIR template_verify=skipped concrete_verify=skipped\n";
+          Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
+          Printf.printf "  RESULT: FAIL\n";
+          1
        end
        else begin
-         let prog = lower_closure ctx in
+         match
+           (try Ok (lower_closure ctx) with e -> Error (Printexc.to_string e))
+         with
+         | Error m ->
+             (* the lane still reports (the recorded-channel matrix; the CFG
+                ownership half has no program to consume) and the lowering
+                failure becomes a named gate failure, never a crash *)
+             report_access_resource_pass ctx;
+             Printf.printf "  SEED_MIR_LOWERING = FAIL (%s)\n" m;
+             Printf.printf "  RESULT: FAIL\n";
+             1
+         | Ok prog ->
          (match
             Mir_verify.require_valid_template
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
@@ -4920,16 +5059,17 @@ let cmd_bootstrap_check (args : string list) : int =
                            if want_dump f.Seed_mir.name then
                              Printf.printf "  --- fn %s ---\n%s\n" f.Seed_mir.name
                                (Seed_mir.print_function f))
-                         prog.Seed_mir.functions));
-              Printf.printf "EVIDENCE_MIR template_verify=fail concrete_verify=skipped\n";
+                          prog.Seed_mir.functions));
+               report_access_resource_pass ctx;
+               Printf.printf "EVIDENCE_MIR template_verify=fail concrete_verify=skipped\n";
               Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
               Printf.printf "  RESULT = WIP\n";
               1
-          | Ok () ->
-              Printf.printf "  SEED_MIR_STRUCTURAL_GATE = PASS (%d functions)\n"
-                (Array.length prog.Seed_mir.functions);
-              debug_mono_poison_names ctx prog;
-        let stats =
+           | Ok () ->
+               Printf.printf "  SEED_MIR_STRUCTURAL_GATE = PASS (%d functions)\n"
+                 (Array.length prog.Seed_mir.functions);
+               debug_mono_poison_names ctx prog;
+         let stats =
           count_mir_stats
             ~exclude_callables:(List.map fst ctx.ctx_env.Typecheck.state.derived_sigs)
             prog
@@ -4940,6 +5080,7 @@ let cmd_bootstrap_check (args : string list) : int =
               (match resolve_bootstrap_entry prog opts.entry with
                | None ->
                    Printf.printf "  mono: skipped (no entry function in the closure)\n";
+                   report_access_resource_pass ctx;
                    Printf.printf "EVIDENCE_MIR template_verify=pass concrete_verify=skipped\n";
                    Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
                    Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
@@ -4947,11 +5088,11 @@ let cmd_bootstrap_check (args : string list) : int =
                    1
                | Some (entry_name, entry) -> (
                    debug_mono_poison_names ctx prog;
-                   let mono_query_sigs =
-                     closure_query_sigs ~lowered:(Some prog) ctx.ctx_env
-                   in
-                   match
-                     run_mono_phase ~entry_name ~entry
+                    let mono_query_sigs =
+                      closure_query_sigs ~lowered:(Some prog) ctx.ctx_env
+                    in
+                    match
+                      run_mono_phase ~entry_name ~entry
                        ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                           ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                        ~generic_types:(closure_generic_types ctx.ctx_env)
@@ -4959,6 +5100,7 @@ let cmd_bootstrap_check (args : string list) : int =
                        prog
                    with
                    | Error _ ->
+                       report_access_resource_pass ctx;
                        Printf.printf "EVIDENCE_MIR template_verify=pass concrete_verify=skipped\n";
                        Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
                        Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
@@ -4966,12 +5108,19 @@ let cmd_bootstrap_check (args : string list) : int =
                        1
                     | Ok mo ->
                         debug_missing_user_callees ctx mo.mo_program;
+                        (* the CFG resource dataflow (the lane's ownership
+                           authority) runs over the MONO'd program: only
+                           the mono'd def table carries the instantiated
+                           generic defs the dataflow's field/variant
+                           classification resolves, so the template MIR
+                           is not a sound input. *)
+                        ctx.ctx_cfg_program <- Some mo.mo_program;
                         (* audit P0 fix: the post-mono concrete verification
                            is a recorded fact (same check tg_evidence runs);
                            it does not change the gate's verdicts *)
-                        let concrete_ok =
-                         match
-                           Mir_verify.require_valid_concrete
+                         let concrete_ok =
+                          match
+                            Mir_verify.require_valid_concrete
                              ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                           ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                              ~query_sigs:mo.mo_query_sigs
@@ -4982,8 +5131,9 @@ let cmd_bootstrap_check (args : string list) : int =
                          | Ok () -> true
                          | Error _ -> false
                        in
-                       Printf.printf "EVIDENCE_MIR template_verify=pass concrete_verify=%s\n"
-                         (if concrete_ok then "pass" else "fail");
+                         Printf.printf "EVIDENCE_MIR template_verify=pass concrete_verify=%s\n"
+                          (if concrete_ok then "pass" else "fail");
+                        report_access_resource_pass ctx;
                        if mo.mo_residual_type_params > 0 || incomplete then begin
                          Printf.printf "EVIDENCE_HOST reachable_closure=skipped\n";
                          Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
@@ -5005,8 +5155,8 @@ let cmd_bootstrap_check (args : string list) : int =
                              "bootstrap_check.out" ]
                          in
                          let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
-                         let host = Host.create ~repo_root:opts.repo_root ~argv in
-                         let reachable = collect_reachable_host_ids mo.mo_program in
+                          let host = Host.create ~repo_root:opts.repo_root ~argv in
+                          let reachable = collect_reachable_host_ids mo.mo_program in
                          let reachable_names =
                            List.map
                              (fun id ->
@@ -5026,16 +5176,16 @@ let cmd_bootstrap_check (args : string list) : int =
                               Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = INCOMPLETE\n";
                               Printf.printf "  RESULT: FAIL\n";
                               1
-                          | Ok report ->
-                              Printf.printf
-                                "  REACHABLE_HOST_CLOSURE = PASS (%d reachable host id(s) [%s], %d with executable bindings, all exact typed signatures)\n"
+                           | Ok report ->
+                               Printf.printf
+                                 "  REACHABLE_HOST_CLOSURE = PASS (%d reachable host id(s) [%s], %d with executable bindings, all exact typed signatures)\n"
                                 report.Host.declared (String.concat ", " reachable_names)
                                 report.Host.implemented;
                               Printf.printf "EVIDENCE_HOST reachable_closure=pass reachable=%d declared=%d implemented=%d\n"
                                 (List.length reachable) report.Host.declared report.Host.implemented;
-                              Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
-                              (match
-                                 Vm.run_li ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
+                               Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
+                               (match
+                                  Vm.run_li ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                                    ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host
                                with
                                | Error e ->
@@ -5047,10 +5197,10 @@ let cmd_bootstrap_check (args : string list) : int =
                                      Printf.printf "  kernel stderr:\n%s\n" err;
                                    Printf.printf "  VM bootstrap run TRAPPED: %s\n"
                                      e.Vm.message;
-                                   Printf.printf "  RESULT: FAIL\n";
-                                   1
-                               | Ok code ->
-                                   let out = Host.stdout_contents host in
+                                    Printf.printf "  RESULT: FAIL\n";
+                                    1
+                                | Ok code ->
+                                    let out = Host.stdout_contents host in
                                    if out <> "" then
                                      Printf.printf "  kernel stdout:\n%s\n" out;
                                    Printf.printf "  VM bootstrap run: exit %d\n" code;

@@ -811,5 +811,65 @@ end
          exit 1
        end);;
 
+(* ── leg 5: a TUPLE receiver clones through the derived channel — the
+   checker mints the elementwise clone (it has no nominal owner to
+   register under), the lowering resolves the call through the recorded
+   TC_derived callee (the structural-receiver owner candidates are
+   empty, exactly like the checker's dispatch), the synthesized body
+   clones each element through the element's own registered Clone, and
+   the original tuple stays independent.  This is the pipeline shape the
+   bootstrap kernel's `rows[i].clone()` on (String, String) vectors
+   reaches. ────────────────────────────────────────────────────────── *)
+let () =
+  Printf.printf
+    "tg_derived_clone leg 5 (tuple receiver clones elementwise through the derived channel):\n";
+  let src = {|
+impl Clone for String
+  def clone(self: Self) -> String
+    self + "!"
+  end
+end
+
+def main() -> Int
+  let t = ("hi", "xy")
+  let c = t.clone()
+  c.0.len() + c.1.len() + t.0.len() + t.1.len()
+end
+|} in
+  let env, prog_ast = check_ok src in
+  let string_clone_callable = (clone_method_ts env "String").Typecheck.ts_callable in
+  let sigs = derived_clone_sigs env in
+  (match sigs with
+   | [ (_, ts) ] -> (
+       (match ts.Typecheck.ts_params.(0).Type_repr.pt_type with
+        | Type_repr.Tuple [| Type_repr.String; Type_repr.String |] ->
+            Printf.printf "  mint: PASS (one derived clone sig with the (String, String) receiver)\n"
+        | _ ->
+            Printf.printf "  mint: FAIL (unexpected derived receiver)\n";
+            exit 1);
+       let fn = Mir_derive.synthesize env ts in
+       let clone_calls =
+         List.filter
+           (fun (_, callee) ->
+             match callable_of_callee callee with
+             | Some c -> Ids.Callable_id.compare c string_clone_callable = 0
+             | None -> false)
+           (calls_of fn)
+       in
+       if List.length (calls_of fn) = 2 && List.length clone_calls = 2 then
+         Printf.printf
+           "  body: PASS (exactly two clone calls, both the registered String::clone — one per tuple element)\n"
+       else begin
+         Printf.printf "  body: FAIL (%d clone calls, %d through String::clone, expected 2/2)\n"
+           (List.length (calls_of fn)) (List.length clone_calls);
+         exit 1
+       end)
+   | _ ->
+       Printf.printf "  mint: FAIL (%d derived clone sigs, expected 1)\n" (List.length sigs);
+       exit 1);
+  (* program_of lowers main through the REAL Mir_lower: a tuple receiver
+     used to fail closed with the non-nominal Seed_bug here *)
+  run_main env prog_ast 10;;
+
 let () =
   Printf.printf "tg_derived_clone: ALL LEGS PASS\n"

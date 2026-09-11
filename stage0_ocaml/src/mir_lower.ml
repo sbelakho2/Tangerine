@@ -399,35 +399,35 @@ type lower_state = {
   variants : variant_table;              (* enum variant/constructor identity *)
   mutable defer_stack : Ast.block_body list;  (* function-level defer bodies; head = most recent *)
   (* the persistent typed-node channel: NodeId -> the typechecker's
-     resolved node ([] = channel absent) *)
-  typed_nodes : (Ids.Node_id.t * typed_node) list;
+     resolved node (distinct empty table = channel absent) *)
+  typed_nodes : (Ids.Node_id.t, typed_node) Hashtbl.t;
   (* the typed-pattern channel (re-audit P0 #3): (match NodeId, arm
      index) -> the arm's SEMANTIC pattern tree, resolved ONCE by the
-     typechecker ([] = channel absent — hand-built selfcheck envs; the
+     typechecker (empty = channel absent — hand-built selfcheck envs; the
      driver path always carries the channel, so a missing entry there is
      a checker/lowerer contradiction and fails loudly) *)
-  typed_patterns : ((Ids.Node_id.t * int) * Typed_pattern.t) list;
+  typed_patterns : (Ids.Node_id.t * int, Typed_pattern.t) Hashtbl.t;
   (* the typed-iterable channel (the audit): ForExpr NodeId -> the
      loop's SEMANTIC pattern + resolved element type — the lowering
      consumes this instead of re-interpreting the raw pattern syntax *)
-  typed_for_patterns : (Ids.Node_id.t * Typecheck.typed_for) list;
-  typed_let_patterns : (Ids.Node_id.t * Typed_pattern.t) list;
+  typed_for_patterns : (Ids.Node_id.t, Typecheck.typed_for) Hashtbl.t;
+  typed_let_patterns : (Ids.Node_id.t, Typed_pattern.t) Hashtbl.t;
 }
 
 (* The typed-iterable lookup: the ForExpr's semantic pattern + element
    type from the typechecker's channel. *)
 let typed_for_of (st : lower_state) (node_id : Ids.Node_id.t) :
     Typecheck.typed_for option =
-  List.assoc_opt node_id st.typed_for_patterns
+  Hashtbl.find_opt st.typed_for_patterns node_id
 
 let typed_let_of (st : lower_state) (node_id : Ids.Node_id.t) :
     Typed_pattern.t option =
-  List.assoc_opt node_id st.typed_let_patterns
+  Hashtbl.find_opt st.typed_let_patterns node_id
 
 (* The typed-node channel lookup: the typechecker's resolved node for an
    expr's NodeId, when the channel is present. *)
 let typed_node_of (st : lower_state) (node_id : Ids.Node_id.t) : typed_node option =
-  List.assoc_opt node_id st.typed_nodes
+  Hashtbl.find_opt st.typed_nodes node_id
 
 (* ── The callee class (audit P0-5) ────────────────────────────────
    The checker's classed record is AUTHORITATIVE when present: the Call
@@ -468,7 +468,7 @@ let call_result_ty (st : lower_state) (node_id : Ids.Node_id.t)
 (* The typed-pattern channel lookup: the typechecker's semantic pattern
    tree for a match arm (match NodeId, arm index). *)
 let typed_pattern_of (st : lower_state) (key : Ids.Node_id.t * int) : Typed_pattern.t option =
-  List.assoc_opt key st.typed_patterns
+  Hashtbl.find_opt st.typed_patterns key
 
 let new_block (st : lower_state) : int =
   let id = st.next_block in
@@ -1787,12 +1787,14 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           set_terminator st (Seed_mir.Goto b);
           (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
       | None -> seed_bug "break outside loop in lowering")
-   | Ast.NextExpr _ -> (
+   | Ast.NextExpr (_, sp) -> (
        match st.continue_target with
        | Some b ->
            set_terminator st (Seed_mir.Goto b);
            (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
-       | None -> seed_bug "next outside loop in lowering")
+       | None ->
+           seed_bug "next outside loop in lowering (file#%d[%d..%d))" sp.Span.file_id
+             sp.Span.start sp.Span.end_)
    | Ast.Assign (_, target, value, _) ->
        (* the assign TRANSFER rule: assigning an owning value into a
           destination is a MOVE of the source (the seed has no
@@ -3142,7 +3144,7 @@ and lower_match (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
      checker/lowerer contradiction that fails loudly; when the channel
      is absent (hand-built selfcheck envs), lowering falls back to the
      syntax-driven interpretation. *)
-  if st.typed_patterns = [] then lower_match_syntactic env st m
+  if Hashtbl.length st.typed_patterns = 0 then lower_match_syntactic env st m
   else lower_match_typed env st nid m
 
 and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_expr) :
@@ -5266,12 +5268,30 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                      (Seed_mir.print_type rty) (Seed_mir.print_type env.fn_ret));
                 seed_bug
                   "method call `%s`: the receiver is a generic parameter or reference (the seed resolves such receivers only through the Clone/Iterator trait contracts)" mname)
+        | Type_repr.Tuple _ | Type_repr.Raw_ptr _ ->
+            (* audit P0-4/P0-12: a STRUCTURAL receiver (tuple / raw
+               pointer) has no nominal owner — the checker's method
+               dispatch gives it no base owners (primitive_name answers
+               None for both and the nominal-name tables are
+               per-declaration), so the only methods it can resolve are
+               the DERIVED channel's clone/to_string/eq: the minted
+               TC_derived contract whose body Mir_derive synthesizes per
+               element (tuple/fixed-array structural clone and render).
+               [] keeps the receiver out of the registered (owner,
+               method) table exactly like the checker's empty
+               base_owners — a same-named user nominal can never hijack
+               the structural receiver's dispatch — and the
+               methods-lookup fallback below lowers the call through the
+               checker-resolved derived callee.  Types outside the
+               derived channel (Unit/Never/Function/...) cannot carry a
+               checked method call and stay fail-closed below. *)
+            []
         | _ ->
             (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
                Printf.eprintf "DEBUG-MRECV mname=%s rty=%s env=%s\n" mname
                  (Seed_mir.print_type rty) (Seed_mir.print_type env.fn_ret));
-            seed_bug "method call `%s`: the receiver is not a nominal (found %s)" mname
-              (Seed_mir.print_type rty)
+            seed_bug "method call `%s`: the receiver is not a nominal (found %s) at file#%d[%d..%d)" mname
+              (Seed_mir.print_type rty) span.Span.file_id span.Span.start span.Span.end_
       in
       (* the kernel's owner aliases (the checker's try_aliases): a `str`
          receiver spells String-owner methods and vice versa; the
@@ -5480,8 +5500,8 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                (copy_place st rp2, recv_dest_ty))
             | _ ->
                 seed_bug
-                  "method call `%s`: type `%s` has no method instance in the lowering env's methods table"
-                  mname owner)
+                  "method call `%s`: receiver type `%s` (owner candidate `%s`) has no method instance in the lowering env's methods table and no derived channel"
+                  mname (Seed_mir.print_type rty) owner)
        | Some me -> (
            if Array.length me.me_params = 0 then
              seed_bug
@@ -5719,10 +5739,41 @@ let lower_function_with_variants
     ?(typed_patterns : ((Ids.Node_id.t * int) * Typed_pattern.t) list = [])
     ?(typed_for_patterns : (Ids.Node_id.t * Typecheck.typed_for) list = [])
     ?(typed_let_patterns : (Ids.Node_id.t * Typed_pattern.t) list = [])
+    (* prebuilt shared lookup tables (the driver builds them ONCE for the
+       whole closure): the per-function assoc-list conversion below is
+       O(channel) per function — quadratic over a 40k-function closure —
+       and the resulting list lookups are O(channel) per query.  When a
+       table is supplied the list argument is ignored; when absent (the
+       selfcheck callers) the list converts exactly as before. *)
+    ?typed_nodes_tbl ?typed_patterns_tbl ?typed_for_patterns_tbl
+    ?typed_let_patterns_tbl
     ?(param_tys_opt : Type_repr.t array option) (variants : variant_table)
     (env : func_env) (name : string)
     (callable : int) (template_args : Type_repr.t array)
     (param_conventions : Access_effect.t array) (fn : Ast.function_decl) : Seed_mir.function_ =
+  (* first-occurrence-wins, exactly like List.assoc_opt: iterate the list
+     reversed into the table so the earliest entry is the final binding *)
+  let table_of (type k v) (list : (k * v) list) : (k, v) Hashtbl.t =
+    let t = Hashtbl.create (List.length list * 2 + 16) in
+    List.iter (fun (k, v) -> Hashtbl.replace t k v) (List.rev list);
+    t
+  in
+  let typed_nodes =
+    match typed_nodes_tbl with Some t -> t | None -> table_of typed_nodes
+  in
+  let typed_patterns =
+    match typed_patterns_tbl with Some t -> t | None -> table_of typed_patterns
+  in
+  let typed_for_patterns =
+    match typed_for_patterns_tbl with
+    | Some t -> t
+    | None -> table_of typed_for_patterns
+  in
+  let typed_let_patterns =
+    match typed_let_patterns_tbl with
+    | Some t -> t
+    | None -> table_of typed_let_patterns
+  in
   (if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
      Printf.eprintf "DEBUG-FNLOWER %s\n" name);
   let st =

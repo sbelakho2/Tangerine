@@ -611,12 +611,21 @@ let cfg_check_function (cache : Type_properties.cache)
       let in_s =
         match preds.(bid) with
         | [] -> in_states.(bid)
-        | ps -> List.fold_left (fun acc p -> states_join acc out_states.(p)) [] ps
+        | ps ->
+            (* the ENTRY seed must survive: the worklist starts at the
+               entry, but a lowered entry block can itself have a
+               predecessor (bb0 -> entry); joining only the visited
+               predecessors would drop the param Live seeding and report
+               spurious uninitialized reads *)
+            let acc = if bid = f.Seed_mir.entry then in_states.(bid) else [] in
+            List.fold_left (fun acc p -> states_join acc out_states.(p)) acc ps
       in
       let in_c =
         match preds.(bid) with
         | [] -> in_chains.(bid)
-        | ps -> List.fold_left (fun acc p -> chain_rows_join acc out_chains.(p)) [] ps
+        | ps ->
+            let acc = if bid = f.Seed_mir.entry then in_chains.(bid) else [] in
+            List.fold_left (fun acc p -> chain_rows_join acc out_chains.(p)) acc ps
       in
       in_states.(bid) <- in_s;
       in_chains.(bid) <- in_c;
@@ -922,7 +931,11 @@ let cfg_check_function (cache : Type_properties.cache)
     List.rev !errors
   end
 
-(* cfg_check_program — the CFG resource dataflow over a whole program.
+(* cfg_check_program_items — the CFG resource dataflow over a whole
+   program, findings attributed to their lowered function name.  The
+   consumer is the driver's CALL_ARGUMENT_ACCESS_SANITY lane (the
+   recorded-channel access matrix plus THIS path-sensitive ownership
+   dataflow), so a state finding names the MIR function it belongs to.
    ?lang_items is the compilation's LangItems record (optional: raw-MIR
    fixtures may omit it — a def-less owning LangItem then answers
    through the def table or the engine's conservative Unknown).  The
@@ -932,11 +945,22 @@ let cfg_check_function (cache : Type_properties.cache)
    the LangItems overlay, and the property cache is created per entry
    — one cache per def table, never shared across two tables, exactly
    like Mir_verify.require_valid_* / Drop_plan.of_program. *)
-let cfg_check_program ?(lang_items : Lang_items.t option = None)
-    (prog : Seed_mir.program) : string list =
+let cfg_check_program_items ?(lang_items : Lang_items.t option = None)
+    (prog : Seed_mir.program) : (string * string) list =
   let cache = Type_properties.create_cache () in
   let resolve =
     Type_properties.with_lang_items lang_items
       (Type_properties.structural_resolver (resolve_named prog))
   in
-  List.concat_map (cfg_check_function cache resolve prog) (Array.to_list prog.Seed_mir.functions)
+  List.concat_map
+    (fun (f : Seed_mir.function_) ->
+      List.map
+        (fun m -> (f.Seed_mir.name, m))
+        (cfg_check_function cache resolve prog f))
+    (Array.to_list prog.Seed_mir.functions)
+
+(* cfg_check_program — the message-only view of the same pass (the
+   historical entry point). *)
+let cfg_check_program ?(lang_items : Lang_items.t option = None)
+    (prog : Seed_mir.program) : string list =
+  List.map snd (cfg_check_program_items ~lang_items prog)

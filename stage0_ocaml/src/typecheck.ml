@@ -10039,6 +10039,7 @@ let record_module_debt (env : env) (program : Ast.program) (errors : string list
   let printed = String.concat "\n" block in
   if printed <> st.debt_last_printed then begin
     List.iter print_endline block;
+    flush stdout;
     st.debt_last_printed <- printed
   end
 
