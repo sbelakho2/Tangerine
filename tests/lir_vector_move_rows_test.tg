@@ -1,0 +1,357 @@
+# tests/lir_vector_move_rows_test.tg — the LIR WHOLE-VECTOR MOVE/COPY
+# slice (the vector class's memory-resident slot-image moves).
+#
+# What this suite pins:
+#   1. THE v128 COPY ROW (aarch64): a whole vector local copied into
+#      another lowers to ONE marked LirVecMove whose lane payload is the
+#      128-bit descriptor, whose dst/src are the two locals' vector
+#      vregs, and whose images stay memory-resident (phys = -1) at their
+#      fixed 2x8-byte slot bases (0 and 2) — verify_lir stays clean.
+#   2. THE ASSIGNMENT-MOVE ROW: the MirMovePlace operand form lowers to
+#      the SAME whole-image move marker (a vector "move" is a whole
+#      image copy — the vector class has no drops and no register
+#      form).
+#   3. THE v256 ROW (x86-64 AVX desc): the baseline x86-64 desc refuses
+#      the 256-bit vector function (naming the descriptor) and the AVX2
+#      desc lowers the copy to a 256-bit LirVecMove with each image
+#      homed at a 4x8-byte slot span; verify_lir is clean on the x86_64
+#      route.
+#   4. THE STALE-NOTE GATE: lir.tg's module header no longer claims that
+#      vector parameters/returns "do not lower this stage" or that
+#      scalar whole-vector moves/copies fail closed — the live state
+#      names the whole-vector move slice.
+#
+# Run with: tg test tests/lir_vector_move_rows_test.tg
+
+use std::core::{Option, Result, Unit, Bool, Int, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use std::fs::{read_to_string}
+use tg_compiler::ast::layout_attrs_plain
+use tg_compiler::ids::{TypeId, MirLocalId, MirBlockId}
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirBlock, MirStatement, MirStatementKind,
+  MirOperand, MirOperandKind, MirRvalue, MirRvalueKind,
+  MirTerminator, MirTerminatorKind,
+  MirTypeDef, MirTypeDefKind, MirFieldDef,
+  Place, place_local
+}
+use tg_compiler::token::span_dummy
+use tg_compiler::types::Type
+use tg_compiler::target_desc::{TargetDesc, x86_64_desc}
+use tg_compiler::lir::{
+  LirAlloc, LirFunction, LirVecOp, LirVerifyRoute,
+  lower_mir_fn_to_lir_prog, lower_mir_fn_to_lir_mode_ty,
+  lir_alloc_registers_a64, verify_lir
+}
+
+# ———————————————————————————————————————————————————————————————
+# Fixtures: the SIMD vector type universe (Vec4 = v128, Vec8 = v256).
+# ———————————————————————————————————————————————————————————————
+
+def lvm_vec_def(tid: Int, name: String, lane: Type, lanes: Int) -> MirTypeDef
+  var fields: Vec[MirFieldDef] = Vec::new()
+  var i = 0
+  while i < lanes do
+    fields.push(MirFieldDef { name: "e" + i.to_string(), ty: lane.clone() })
+    i = i + 1
+  end
+  MirTypeDef {
+    id: TypeId { id: tid },
+    name: name,
+    kind: MirTypeDefKind::Struct(fields),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def lvm_type_defs() -> Map[Int, MirTypeDef]
+  var defs: Map[Int, MirTypeDef] = Map::new()
+  defs.insert(300, lvm_vec_def(300, "Vec4", Type::F32, 4))
+  defs.insert(301, lvm_vec_def(301, "Vec8", Type::F32, 8))
+  defs
+end
+
+def lvm_vec4_ty() -> Type
+  Type::Adt(TypeId { id: 300 }, Vec::from([Type::F32]))
+end
+
+def lvm_vec8_ty() -> Type
+  Type::Adt(TypeId { id: 301 }, Vec::from([Type::F32]))
+end
+
+# An AVX2-advertising x86-64 description (the v256 admission opt-in; no
+# canonical desc carries the tokens).
+def lvm_avx2_desc() -> TargetDesc
+  var d = x86_64_desc()
+  d.name = "x86_64+avx2"
+  d.isa_features = Vec::from(["sse2", "avx", "avx2"])
+  d
+end
+
+# ———————————————————————————————————————————————————————————————
+# MIR fixtures: `b = a` (whole-vector copy or move-place) and return.
+# ———————————————————————————————————————————————————————————————
+
+def lvm_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal { id: MirLocalId { id: id }, name: name, ty: ty, is_mut: is_mut, span: span_dummy() }
+end
+
+def lvm_block(bid: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: bid }, statements: stmts, terminator: term }
+end
+
+def lvm_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def lvm_place(id: Int) -> Place
+  place_local(MirLocalId { id: id })
+end
+
+# A function with two vector locals a (id 1, the parameter) and b
+# (id 2): block 0 assigns `b = <move-form>(a)` and returns Unit. The
+# whole-vector move is the statement under test; `move_place` selects
+# MirMovePlace over MirCopy.
+def lvm_copy_fn(name: String, vec_ty: Type, move_place: Bool) -> MirFunction
+  var src_op = MirOperand { kind: MirOperandKind::MirCopy(lvm_place(1)) }
+  if move_place then
+    src_op = MirOperand { kind: MirOperandKind::MirMovePlace(lvm_place(1)) }
+  end
+  let assign = MirStatement {
+    kind: MirStatementKind::MirAssign(
+      lvm_place(2),
+      MirRvalue { kind: MirRvalueKind::MirMove(src_op) }
+    ),
+    span: span_dummy()
+  }
+  MirFunction {
+    name: name,
+    params: Vec::from([lvm_local(1, "a", vec_ty.clone(), false)]),
+    ret_type: Type::Unit,
+    locals: Vec::from([
+      lvm_local(0, "ret", Type::Unit, false),
+      lvm_local(1, "a", vec_ty.clone(), false),
+      lvm_local(2, "b", vec_ty.clone(), true)
+    ]),
+    blocks: Vec::from([lvm_block(0, Vec::from([assign]), lvm_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Lowering helpers.
+# ———————————————————————————————————————————————————————————————
+
+def lvm_lower(f: MirFunction, defs: Map[Int, MirTypeDef]) -> LirFunction
+  match lower_mir_fn_to_lir_prog(f, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Err(e) then panic("whole-vector move lowering failed closed: " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def lvm_lower_x86(f: MirFunction, defs: Map[Int, MirTypeDef], desc: TargetDesc) -> Result[LirFunction, String]
+  lower_mir_fn_to_lir_mode_ty(f, true, true, false, false, false, false, false, false, desc, true, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+end
+
+def lvm_first(v: Vec[String]) -> String
+  if v.len() > 0 then v[0] else "" end
+end
+
+# The vector vreg the entry ABI bind defines (the parameter's image).
+def lvm_bind_vreg(lf: LirFunction) -> Int
+  var v = -1
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].vec
+      when Option::Some(vop) then
+        match vop
+        when LirVecOp::LirVecAbiBind(_, dst, _) then v = dst
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  v
+end
+
+# The whole-image move marker: (dst vreg, src vreg, lane bits).
+def lvm_find_move(lf: LirFunction) -> Option[(Int, Int, Int)]
+  var found: Option[(Int, Int, Int)] = Option::None
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].vec
+      when Option::Some(vop) then
+        match vop
+        when LirVecOp::LirVecMove(lane, dst, src) then found = Option::Some((dst, src, lane.bits))
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  found
+end
+
+def lvm_vec_slots(lf: LirFunction, v: Int) -> Int
+  match lf.agg_word_slots.get(v)
+  when Option::Some(s) then s
+  when Option::None then -1
+  end
+end
+
+# All of a vreg's segments must be memory-resident (phys = -1) and share
+# the given fixed slot base; returns whether the check held.
+def lvm_mem_resident_at(alloc: LirAlloc, v: Int, base: Int) -> Bool
+  match alloc.segs_of.get(v)
+  when Option::Some(segs) then
+    var ok = segs.len() > 0
+    var si = 0
+    while si < segs.len() do
+      if segs[si].phys >= 0 then ok = false end
+      if segs[si].slot != base then ok = false end
+      si = si + 1
+    end
+    ok
+  when Option::None then false
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. The v128 copy row (aarch64).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_whole_vector_v128_copy_row_aarch64() -> Unit
+  let defs = lvm_type_defs()
+  let lf = lvm_lower(lvm_copy_fn("vec_copy", lvm_vec4_ty(), false), defs)
+  let a_v = lvm_bind_vreg(lf.clone())
+  assert(a_v >= 0, "the vector parameter binds a vector vreg")
+  var m_dst = -1
+  var m_src = -1
+  var m_bits = 0
+  match lvm_find_move(lf.clone())
+  when Option::Some(mv) then
+    m_dst = mv.0
+    m_src = mv.1
+    m_bits = mv.2
+  when Option::None then panic("the whole-vector copy emitted no LirVecMove marker")
+  end
+  assert(m_src == a_v, "the copy source is the parameter's vector vreg")
+  assert(m_dst != a_v, "the copy destination is the other vector local's vreg")
+  assert(m_bits == 128, "the pinned lane payload is the 128-bit image")
+  assert(lf.vector_widths.contains_key(&m_dst), "the copy destination is vector-class")
+  assert(lf.vector_widths.contains_key(&m_src), "the copy source is vector-class")
+  # The 2x8-byte slot math: the parameter image opens the vector slot
+  # region at 0 and the destination sits two 8-byte slots above it —
+  # four reserved slots for the two v128 images.
+  assert(lvm_vec_slots(lf.clone(), m_src) == 0, "the first v128 image opens the slot region at base 0")
+  assert(lvm_vec_slots(lf.clone(), m_dst) == 2, "the second v128 image sits at base 2 (2x8 bytes above)")
+  assert(lf.agg_slots >= 4, "two v128 images reserve four 8-byte slots")
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  assert(lvm_mem_resident_at(alloc, m_src, 0), "the source image stays memory-resident at its fixed base 0")
+  assert(lvm_mem_resident_at(alloc, m_dst, 2), "the destination image stays memory-resident at its fixed base 2")
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyA64)
+  assert(violations.len() == 0, "the v128 copy row must verify clean; first: " + lvm_first(violations))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. The assignment-move row (MirMovePlace -> the same whole-image move).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_whole_vector_assignment_move_row_aarch64() -> Unit
+  let defs = lvm_type_defs()
+  let lf = lvm_lower(lvm_copy_fn("vec_assign", lvm_vec4_ty(), true), defs)
+  let a_v = lvm_bind_vreg(lf.clone())
+  assert(a_v >= 0, "the vector parameter binds a vector vreg")
+  match lvm_find_move(lf.clone())
+  when Option::Some(mv) then
+    assert(mv.1 == a_v, "the assignment-move source is the parameter's vector vreg")
+    assert(mv.2 == 128, "the assignment-move carries the 128-bit lane payload")
+    assert(lvm_vec_slots(lf.clone(), mv.0) == 2, "the destination image keeps its fixed 2-slot base")
+  when Option::None then panic("the whole-vector assignment emitted no LirVecMove marker")
+  end
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyA64)
+  assert(violations.len() == 0, "the whole-vector assignment row must verify clean; first: " + lvm_first(violations))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. The v256 copy row (the AVX2 x86-64 desc; the baseline refuses).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_whole_vector_v256_copy_row_avx() -> Unit
+  let defs = lvm_type_defs()
+  # The baseline x86-64 desc refuses the 256-bit vector function,
+  # naming the descriptor and the width.
+  match lvm_lower_x86(lvm_copy_fn("v256_base", lvm_vec8_ty(), false), defs.clone(), x86_64_desc())
+  when Result::Err(e) then
+    assert(e.contains("x86_64"), "the v256 refusal names the descriptor: " + e)
+    assert(e.contains("256"), "the v256 refusal names the width: " + e)
+  when Result::Ok(_) then panic("the baseline x86-64 desc must refuse a 256-bit vector function")
+  end
+  # The AVX2 desc admits it: one 256-bit move marker and two 4x8-byte
+  # fixed slot spans.
+  let lf = match lvm_lower_x86(lvm_copy_fn("v256_avx", lvm_vec8_ty(), false), defs.clone(), lvm_avx2_desc())
+  when Result::Err(e) then panic("the AVX2 desc must admit the 256-bit copy function: " + e)
+  when Result::Ok(v) then v
+  end
+  let a_v = lvm_bind_vreg(lf.clone())
+  assert(a_v >= 0, "the v256 parameter binds a vector vreg")
+  var m_dst = -1
+  var m_src = -1
+  match lvm_find_move(lf.clone())
+  when Option::Some(mv) then
+    m_dst = mv.0
+    m_src = mv.1
+    assert(mv.2 == 256, "the pinned lane payload is the 256-bit image")
+  when Option::None then panic("the whole-vector v256 copy emitted no LirVecMove marker")
+  end
+  assert(m_src == a_v, "the v256 copy source is the parameter's vector vreg")
+  let src_base = lvm_vec_slots(lf.clone(), m_src)
+  let dst_base = lvm_vec_slots(lf.clone(), m_dst)
+  assert(src_base == 0, "the first v256 image opens the slot region at base 0")
+  assert(dst_base == src_base + 4, "the second v256 image sits four 8-byte slots above the first (4x8 bytes)")
+  assert(lf.agg_slots >= 8, "two v256 images reserve eight 8-byte slots")
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  assert(lvm_mem_resident_at(alloc, m_src, src_base), "the v256 source image stays memory-resident at its fixed base")
+  assert(lvm_mem_resident_at(alloc, m_dst, dst_base), "the v256 destination image stays memory-resident at its fixed base")
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyX86_64)
+  assert(violations.len() == 0, "the v256 copy row must verify clean on the x86_64 route; first: " + lvm_first(violations))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. The stale-note gate (lir.tg's live header state).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_vector_move_stale_notes_are_gone() -> Unit
+  match read_to_string("tg_compiler/lir.tg")
+  when Result::Ok(src) then
+    assert(!src.contains("do not lower this stage"), "the stale 'do not lower this stage' note is gone from lir.tg")
+    assert(!src.contains("scalar moves/copies/reads of a whole vector"), "the stale whole-vector scalar-move refusal note is gone from lir.tg")
+    assert(!src.contains("vector PARAMETERS and RETURNS do not lower"), "the stale vector ABI note is gone from lir.tg")
+    assert(!src.contains("scalar moves/\n#     copies of a whole vector still fail closed"), "the stale vector-slice header note is gone from lir.tg")
+    assert(src.contains("vector MOVES/COPIES/READS all lower"), "the header names the live whole-vector move slice")
+    assert(src.contains("LirVecMove"), "the header and marker name LirVecMove")
+  when Result::Err(e) then
+    assert(false, "cannot read tg_compiler/lir.tg: " + e.to_string())
+  end
+end

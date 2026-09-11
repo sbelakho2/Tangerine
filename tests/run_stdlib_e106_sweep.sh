@@ -13,7 +13,7 @@
 # committed artifacts are diffed). It is compiler-free, so it runs before
 # the binary check below.
 #
-# Then every shipped std module (std/*.tg, currently 131 files) must:
+# Then every shipped std module (std/*.tg, currently 134 files) must:
 #   1. PASS `tg check` — the driver's check command (driver.tg cmd_check,
 #      stop_after = StopAfter::Mir) runs the FULL semantic pipeline per
 #      module: lex/parse, the imported-dependency merge, the @cfg target

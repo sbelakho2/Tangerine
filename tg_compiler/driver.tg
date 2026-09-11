@@ -44,7 +44,7 @@ use tg_compiler::resolver::{resolve_names}
 use tg_compiler::access_check::{access_check}
 use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_context_new, AnalyzedProgram}
 use tg_compiler::mir::{lower_to_mir, MirProgram, MirFunction, optimize_mir, opt_decisions_of_mir, pretty_print_mir, instrument_for_pgo, verify_mir, check_effect_class_annotations_mir, check_purity_annotations_mir, check_budget_annotations_mir}
-use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target, stamp_tail_abi_plans}
+use tg_compiler::codegen::{generate_native, generate_executable, generate_object_file, detect_host_target, stamp_tail_abi_plans, stamp_slp_vector_facility_desc}
 use tg_compiler::lir::{
   lir_compile_object_cov, lir_compile_executable_cov, lir_target_desc
 }
@@ -3527,6 +3527,51 @@ def compile_lir_route_x86(mir: MirProgram, opts: CompilerOptions, out_path: Stri
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# THE SLP ROUTE-TARGET RESOLUTION (audit item 34 residual)
+# ———————————————————————————————————————————————————————————————
+# The EFFECTIVE LIR-route target's descriptor, resolved BEFORE
+# optimize_mir so the SLP target-capability stamp names the real
+# emission target — never the host. A cross `--target
+# thumbv7m-none-eabi` (or any M-profile/RISC-V desc) compile on an
+# aarch64 host must NOT vectorize: those LIR emitters have no vector
+# arm, and a stamped-true flag would make slp_vectorize emit
+# __intrinsic_simd_* calls lir_simd_preflight must fail closed. The
+# resolution mirrors the backend dispatch below step for step:
+#   1. the embedded route's explicit desc (compile_to_embedded_route);
+#   2. the legacy TANGERINE_LIR_TARGET alias through the ONE
+#      triple -> desc table (target_desc_of_triple) when it is not the
+#      "aarch64" default;
+#   3. the --target triple's desc (the x86_64 experiment, and any
+#      desc'd triple the dispatch would resolve);
+#   4. the aarch64 host slice (lir_target_desc).
+# Option::None = no resolvable desc (the dispatch below fails closed
+# before emission); the program then keeps the fail-closed default flag
+# (slp_vector_facility = false), so the pass stays a no-op.
+def lir_route_slp_desc(route_desc: Option[TargetDesc], opts: CompilerOptions) -> Option[TargetDesc]
+  match route_desc
+  when Option::Some(d) then return Option::Some(d)
+  when Option::None then ()
+  end
+  match lir_route_backend_name()
+  when Result::Err(_) then
+    return Option::None
+  when Result::Ok(b) then
+    if b != "aarch64" then
+      return target_desc_of_triple(b)
+    end
+  end
+  match opts.target_triple
+  when Option::Some(tt) then
+    match target_desc_of_triple(tt)
+    when Option::Some(d2) then return Option::Some(d2)
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+  Option::Some(lir_target_desc())
+end
+
 def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: String, route_desc: Option[TargetDesc]) -> Result[Unit, String]
   if files.len() != 1 then
     return Result::Err("the LIR pipeline requires exactly one input file (use --codegen=direct for the direct debug/bootstrap emitter)")
@@ -3603,6 +3648,15 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
   # (fourth-audit P1-10) the authoritative AbiCallPlan oracle (the host
   # arch here; cross routes ignore the advisory marker) before the tail pass.
   stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
+  # (audit item 34 residual) the SLP target-capability stamp on the SAME
+  # seam: the EFFECTIVE route target's desc (never the host), resolved by
+  # lir_route_slp_desc above — a vector-less desc leaves the flag false,
+  # so slp_vectorize never emits __intrinsic_simd_* calls this route's
+  # backend cannot lower.
+  match lir_route_slp_desc(route_desc.clone(), opts.clone())
+  when Option::Some(d) then stamp_slp_vector_facility_desc(&mut mir, d)
+  when Option::None then ()
+  end
   # (the differential-corpus lane's structural fallback) --dump-abi-plans:
   # print the per-function AbiCallPlan signatures the tail-call pass
   # consumes (the ONE classify_call_plan authority, stamped just above)
@@ -4328,21 +4382,26 @@ def compile_snapshot_serve_route(
   when Result::Ok(_) then ()
   when Result::Err(me) then return Result::Err("monomorphization failed with " + me.len().to_string() + " error(s)")
   end
-  # (fourth-audit P1-10) the authoritative AbiCallPlan oracle before the tail pass.
-  stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
-  optimize_mir(&mut mir, opts.opt_level)
-  let post_errs = verify_mir(&mir)
-  if !post_errs.is_empty() then
-    return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
-  end
   # The ONE target resolution of the route: the host arch's canonical
   # TargetDesc (mirrors the LIR route's host default); the builder stamps
-  # the snapshot's full StableTargetId from it (item 9).
+  # the snapshot's full StableTargetId from it (item 9). Resolved HERE,
+  # before the optimizer, so the SLP target-capability stamp below names
+  # the SAME desc the snapshot later records.
   var target_desc = match detect_host_target().arch
   when Arch::AArch64 then aarch64_desc()
   when Arch::X86_64 then x86_64_desc()
   when _ then
     return Result::Err("the TANGERINE_SNAPSHOT route has no TargetDesc for this host (aarch64/x86-64 only) — unset TANGERINE_SNAPSHOT to use the direct emitter")
+  end
+  # (fourth-audit P1-10) the authoritative AbiCallPlan oracle before the tail pass.
+  stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
+  # (audit item 34 residual) the SLP target-capability stamp on the same
+  # seam, keyed on the route's own desc.
+  stamp_slp_vector_facility_desc(&mut mir, target_desc.clone())
+  optimize_mir(&mut mir, opts.opt_level)
+  let post_errs = verify_mir(&mir)
+  if !post_errs.is_empty() then
+    return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
   end
   # The persistent declaration-lineage store (third-audit item 11): the
   # SIBLING artifact of the snapshot file. Loaded when present so repeated

@@ -38,9 +38,13 @@
 #     shuffle when (and only when) the target description advertises
 #     the ssse3 token — the baseline x86_64 desc does not, so the
 #     shuffle arm fails closed with the named SSSE3 rule; the packed
-#     multiply exists only for the 16-bit lane class (PMULLW) and the
-#     f32/f64 classes (MULPS/MULPD) — byte/dword/qword packed multiply
-#     fails closed (pmulld is SSE4.1);
+#     multiply covers the 16-bit lane class (PMULLW), the 32-bit lane
+#     classes (the full-lane multiply is the SSE2 PMULUDQ-twice +
+#     pshufd/punpckldq sequence, upgraded to the single PMULLD when the
+#     desc advertises the sse41 token) and f32/f64 (MULPS/MULPD); the
+#     byte and qword packed multiplies fail closed with the named ISA
+#     rule (no PMULLB exists through AVX2; VPMULLQ is AVX-512DQ), never
+#     a scalar fallback;
 #   - POINTER/ATOMICS: the plain deref forms (LirPtrLea/Addr/Load/Store
 #     at the authority's 1/2/4/8 widths with the signed/unsigned load
 #     split) and the x86-TSO atomic forms (plain MOV loads and Relaxed
@@ -116,10 +120,19 @@
 #     float beyond xmm7 (eight), and an sret call with more than five
 #     general arguments all fail closed;
 #   - fixed general vregs 6/7 (arguments 7..8);
-#   - vector shuffle without the ssse3 token (pshufb is SSSE3; the
-#     baseline x86_64 desc is SSE2-only) and the SSE2-absent packed
-#     multiplies (i8/i32/i64);
-#   - the shared shape gates: v256 vectors (desc-leg v128 only), Char/
+#   - vector shuffle without the ssse3 token on v128 / without the
+#     avx2 token on v256 (pshufb / vpshufb; the baseline x86_64 desc is
+#     SSE2-only — a runtime per-byte select has no SSE2 encoding) and
+#     the no-SIMD-class packed multiplies (i8/i64 — no PMULLB/VPMULLQ
+#     exists through AVX2; the 32-bit lane multiply never fails closed:
+#     it uses the SSE4.1 PMULLD under the desc's sse41 token and the
+#     SSE2 PMULUDQ sequence otherwise);
+#   - v256 without the desc's avx token (the ymm envelope: loads/stores,
+#     the FP/logical VEX forms and every vector ABI crossing) and the
+#     256-bit INTEGER VEX forms (VPADD/VPADDQ/VPADDD/VPSUB*/VPMULLW/
+#     VPMULLD ymm) without the avx2 token — every gate names the
+#     descriptor;
+#   - the shared shape gates: Char/
 #     I64/U64/I128/U128/string, tuple/array/@packed/@align/zst aggregate
 #     layouts, sub-word fields sharing or straddling a word, and
 #     payloaded-enum crossings to extern symbols
@@ -155,7 +168,10 @@ use tg_compiler::lir::{
   lir_is_fixed_fp_id, lir_fixed_fp_base, lir_fp_width_of,
   lir_alloc_fp_width_of, lir_seg_at, lir_reload_at, lir_block_label,
   lir_slot_offset, lir_simd_lane_of_vector_lane, lir_vector_lane_name,
-  lir_vector_elem_bits, lir_vector_elem_is_float, lir_static_scalar_ok,
+  lir_vector_elem_bits, lir_vector_elem_is_float,
+  lir_vector_lane_narrow, lir_vector_lane_widen, lir_vec_shift_form_ok,
+  lir_vec_binop_is_compare, lir_vec_binop_name,
+  lir_static_scalar_ok,
   lir_static_init_word_value, lir_static_unsupported_type_rule,
   lir_scalar_word_size, lir_is_bool_word,
   LirVerifyRoute, verify_lir, lir_verify_fail_err
@@ -909,6 +925,479 @@ def x86_movdqu_store(base: X64, disp: Int, s: Int) -> Vec[u8] = x86_sse_mr(0xF3,
 def x86_pshufb_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr3(0x66, 0x38, 0x00, d, s)
 
 # ———————————————————————————————————————————————————————————————
+# SSE2 lane-class matrix encoders — the remaining lane classes/ops of
+# the vector surface (bitwise, integer/float compares, shifts,
+# immediate shuffles, lane moves, packed float div/sqrt and the packed
+# conversions). Every byte row was hand-derived from the Intel SDM
+# opcode maps and cross-checked with the same offline clang/objdump
+# methodology as the rows above; the tests pin every row.
+# Hand-verified patterns (clang -target x86_64 + objdump -d) for this
+# group — one per encoder:
+#   pandn xmm0,xmm1 = 66 0F DF C1; pcmpeqb = 66 0F 74 C1;
+#   pcmpeqw = 66 0F 75 C1; pcmpeqd = 66 0F 76 C1;
+#   pcmpeqq = 66 0F 38 29 C1; pcmpgtb = 66 0F 64 C1;
+#   pcmpgtw = 66 0F 65 C1; pcmpgtd = 66 0F 66 C1;
+#   pmuludq xmm2,xmm1 = 66 0F F4 D1; pmulld = 66 0F 38 40 C1;
+#   punpckldq xmm2,xmm0 = 66 0F 62 D0; punpckhdq = 66 0F 6A D0;
+#   pshufd xmm0,xmm0,0xB1 = 66 0F 70 C0 B1;
+#   pshuflw xmm0,xmm1,0x1B = F2 0F 70 C1 1B;
+#   pshufhw = F3 0F 70 C1 1B;
+#   psllw xmm1,3 = 66 0F 71 F1 03; pslld = 66 0F 72 F1 03;
+#   psllq = 66 0F 73 F1 03; psrlw = 66 0F 71 D1 03;
+#   psrld = 66 0F 72 D1 03; psrlq = 66 0F 73 D1 03;
+#   psraw = 66 0F 71 E1 03; psrad = 66 0F 72 E1 03;
+#   psllw xmm0,xmm1 = 66 0F F1 C1; pslld = 66 0F F2 C1;
+#   psllq = 66 0F F3 C1; psrlw = 66 0F D1 C1; psrld = 66 0F D2 C1;
+#   psrlq = 66 0F D3 C1; psraw = 66 0F E1 C1; psrad = 66 0F E2 C1;
+#   cmpeqps xmm0,xmm1 = 0F C2 C1 00; cmpltps = 0F C2 C1 01;
+#   cmpeqpd = 66 0F C2 C1 00; sqrtps = 0F 51 C1; sqrtpd = 66 0F 51 C1;
+#   divps = 0F 5E C1; divpd = 66 0F 5E C1;
+#   movmskps eax,xmm0 = 0F 50 C0; movmskps r10d,xmm15 = 45 0F 50 D7;
+#   pextrd eax,xmm0,2 = 66 0F 3A 16 C0 02;
+#   pinsrd xmm0,eax,2 = 66 0F 3A 22 C0 02;
+#   cvtps2pd = 0F 5A C1; cvtpd2ps = 66 0F 5A C1;
+#   cvtps2dq = 66 0F 5B C1; cvtdq2ps = 0F 5B C1;
+#   cvtpd2dq = F2 0F E6 C1; cvttpd2dq = 66 0F E6 C1.
+# (The v256 VEX forms the tests additionally pin: vmovdqu ymm =
+# C4 E1 7E 6F/7F, vpmulld ymm = C4 E2 7D 40, vpmullw ymm = C4 E1 7D D5,
+# vaddps ymm = C4 E1 7C 58 — the 3-byte VEX the x86_vex_prefix helper
+# always emits.)
+# ———————————————————————————————————————————————————————————————
+# PANDN xmm, xmm — 66 0F DF /r (dst = (~dst) & src; the ANDNOT form the
+# aarch64 intrinsic surface spells BIC).
+def x86_pandn_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0xDF, d, s)
+
+# Packed equality compares (all-ones in a lane on equality): PCMEQB/W/D
+# — 66 0F 74/75/76. PCMEQQ — 66 0F 38 29 is SSE4.1; the SSE2 i64x2
+# equality sequence (pcmpeqd + pshufd 0xB1 + pand) is
+# x86_emit_vec_eq_i64_sse2 below, so the i64x2 lane class is served on
+# the baseline without the token.
+def x86_pcmpeqb_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x74, d, s)
+def x86_pcmpeqw_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x75, d, s)
+def x86_pcmpeqd_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x76, d, s)
+def x86_pcmpeqq_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr3(0x66, 0x38, 0x29, d, s)
+
+# Packed SIGNED greater-than compares: PCMPGTB/W/D — 66 0F 64/65/66
+# (less-than is the same encoder with the operands swapped). The
+# UNSIGNED byte/word compares need the 0x80-bias trick over a
+# materialized constant vector and have no arm on this route.
+def x86_pcmpgtb_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x64, d, s)
+def x86_pcmpgtw_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x65, d, s)
+def x86_pcmpgtd_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x66, d, s)
+
+# The 32x32->64 widening multiply of the even lanes — PMULUDQ
+# 66 0F F4 (the SSE2 building block of the full 32-bit lane multiply).
+# PMULLD (the full 32-bit lane multiply) — 66 0F 38 40 is SSE4.1.
+def x86_pmuludq_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0xF4, d, s)
+def x86_pmulld_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr3(0x66, 0x38, 0x40, d, s)
+
+# The dword unpack pair — PUNPCKLDQ 66 0F 62 / PUNPCKHDQ 66 0F 6A (the
+# interleave that reassembles the two PMULUDQ half-products; also the
+# lane-insert building block).
+def x86_punpckldq_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x62, d, s)
+def x86_punpckhdq_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x6A, d, s)
+
+# The byte/word unpack pairs — PUNPCKLBW 66 0F 60 / PUNPCKLWD 66 0F 61
+# and the high-half twins 66 0F 68 / 66 0F 69. The explicit widening
+# unpack uses PUNPCK{L,H}{BW,WD} with the SAME register as both operands
+# (every element duplicated into its pair slot) followed by the
+# arithmetic right shift that sign-extends the widened half.
+# verified: punpcklbw xmm0,xmm1 = 66 0F 60 C1; punpcklwd = 66 0F 61 C1;
+#           punpckhbw = 66 0F 68 C1; punpckhwd = 66 0F 69 C1.
+def x86_punpcklbw_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x60, d, s)
+def x86_punpcklwd_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x61, d, s)
+def x86_punpckhbw_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x68, d, s)
+def x86_punpckhwd_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x69, d, s)
+
+# The signed saturating pack pair — PACKSSWB 66 0F 63 (word→byte),
+# PACKSSDW 66 0F 6B (dword→word): the destination's low half takes the
+# first operand's lanes, the high half the second's, saturating to the
+# signed narrow range.
+# verified: packsswb xmm0,xmm1 = 66 0F 63 C1; packssdw = 66 0F 6B C1.
+def x86_packsswb_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x63, d, s)
+def x86_packssdw_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x6B, d, s)
+
+# PEXTRW r32, xmm, imm8 — 66 0F C5 /r ib (SSE2; reg = the GP
+# destination, rm = the XMM source). PINSRW xmm, r32, imm8 —
+# 66 0F C4 /r ib (SSE2; reg = the XMM destination, rm = the GP source).
+# verified: pextrw eax,xmm1,3 = 66 0F C5 C1 03;
+#           pinsrw xmm0,eax,3 = 66 0F C4 C0 03.
+def x86_pextrw_r32_xmm(dst: X64, s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(0x66)
+  if x64_hi(dst) || s >= 8 then
+    out.push(x86_rex_bits(false, x64_hi(dst), false, s >= 8))
+  end
+  out.push(0x0F)
+  out.push(0xC5)
+  out.push(x86_modrm(3, x64_code(dst) as Int, s))
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_pinsrw_xmm_r32(d: Int, src: X64, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(0x66)
+  if d >= 8 || x64_hi(src) then
+    out.push(x86_rex_bits(false, d >= 8, false, x64_hi(src)))
+  end
+  out.push(0x0F)
+  out.push(0xC4)
+  out.push(x86_modrm(3, d, x64_code(src) as Int))
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+# The SSE4.1 lane moves: PEXTRB r/m8, xmm, imm8 — 66 0F 3A 14 /r ib
+# (reg = the XMM source, rm = the GPR destination); PINSRB — 66 0F 3A
+# 20 /r ib (reg = the XMM destination, rm = the GPR source); PINSRQ —
+# 66 REX.W 0F 3A 22 /r ib (x86-64 only; the qword GP source). The
+# desc's sse41 token gates every one (the named refusal rule).
+# verified: pextrb eax,xmm1,3 = 66 0F 3A 14 C8 03;
+#           pinsrb xmm0,eax,3 = 66 0F 3A 20 C0 03;
+#           pinsrq xmm0,rax,1 = 66 48 0F 3A 22 C0 01.
+def x86_pextrb_r32_xmm(dst: X64, s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(0x66)
+  if x64_hi(dst) || s >= 8 then
+    out.push(x86_rex_bits(false, x64_hi(dst), false, s >= 8))
+  end
+  out.push(0x0F)
+  out.push(0x3A)
+  out.push(0x14)
+  out.push(x86_modrm(3, s, x64_code(dst) as Int))
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_pinsrb_xmm_r32(d: Int, src: X64, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(0x66)
+  if d >= 8 || x64_hi(src) then
+    out.push(x86_rex_bits(false, d >= 8, false, x64_hi(src)))
+  end
+  out.push(0x0F)
+  out.push(0x3A)
+  out.push(0x20)
+  out.push(x86_modrm(3, d, x64_code(src) as Int))
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_pinsrq_xmm_r64(d: Int, src: X64, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(0x66)
+  out.push(x86_rex_bits(true, d >= 8, false, x64_hi(src)))
+  out.push(0x0F)
+  out.push(0x3A)
+  out.push(0x22)
+  out.push(x86_modrm(3, d, x64_code(src) as Int))
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+# The immediate shuffles: PSHUFD — 66 0F 70 /r ib (all four dwords);
+# PSHUFLW — F2 0F 70 /r ib (the low four words; the upper 64 bits are
+# copied); PSHUFHW — F3 0F 70 /r ib (the high four words). A SPLAT is
+# the all-zero imm32 (every output dword selects source dword 0).
+def x86_pshufd_rr(d: Int, s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0x66, 0x70, d, s)
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_pshuflw_rr(d: Int, s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0xF2, 0x70, d, s)
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_pshufhw_rr(d: Int, s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0xF3, 0x70, d, s)
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+# The counted per-lane shifts by an imm8 (the /ext group forms on
+# 66 0F 71/72/73: /6 logical left, /2 logical right, /4 arithmetic
+# right — word/dword/qword; there is NO qword arithmetic right shift
+# before AVX-512). The variable-count forms take the count from the low
+# 64 bits of the second XMM operand: PSLLW/D/Q — 66 0F F1/F2/F3;
+# PSRLW/D/Q — 66 0F D1/D2/D3; PSRAW/D — 66 0F E1/E2. There is no SSE2
+# byte shift (no PSLLB/PSRLB/PSRAB): a byte-lane shift is a PSLLW/PSRLW
+# plus a materialized per-lane mask constant, which this route has no
+# vector constant pool for, so the byte lane class gates on that
+# capability rather than fabricating a mask.
+def x86_psllw_imm(s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0x66, 0x71, 6, s)
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_pslld_imm(s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0x66, 0x72, 6, s)
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_psllq_imm(s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0x66, 0x73, 6, s)
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_psrlw_imm(s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0x66, 0x71, 2, s)
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_psrld_imm(s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0x66, 0x72, 2, s)
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_psrlq_imm(s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0x66, 0x73, 2, s)
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_psraw_imm(s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0x66, 0x71, 4, s)
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_psrad_imm(s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0x66, 0x72, 4, s)
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_psllw_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0xF1, d, s)
+def x86_pslld_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0xF2, d, s)
+def x86_psllq_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0xF3, d, s)
+def x86_psrlw_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0xD1, d, s)
+def x86_psrld_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0xD2, d, s)
+def x86_psrlq_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0xD3, d, s)
+def x86_psraw_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0xE1, d, s)
+def x86_psrad_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0xE2, d, s)
+
+# Packed float compares with the imm8 predicate — CMPPS 0F C2 /r ib,
+# CMPPD 66 0F C2 /r ib. Predicates: 0 EQ, 1 LT, 2 LE, 3 UNORD, 4 NEQ,
+# 5 NLT, 6 NLE, 7 ORD; GT is LT with the operands swapped.
+def x86_cmpps_rr(d: Int, s: Int, pred: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0, 0xC2, d, s)
+  out.push((pred & 0xFF) as u8)
+  out
+end
+
+def x86_cmppd_rr(d: Int, s: Int, pred: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_sse_rr(0x66, 0xC2, d, s)
+  out.push((pred & 0xFF) as u8)
+  out
+end
+
+# Packed float divide and square root: DIVPS 0F 5E / DIVPD 66 0F 5E;
+# SQRTPS 0F 51 / SQRTPD 66 0F 51.
+def x86_divps_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0, 0x5E, d, s)
+def x86_divpd_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x5E, d, s)
+def x86_sqrtps_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0, 0x51, d, s)
+def x86_sqrtpd_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x51, d, s)
+
+# MOVMSKPS r32, xmm — 0F 50 /r: the sign bit of each float lane packed
+# into the low four GPR bits (the lane-mask materialization after a
+# CMPPS/CMPPD result, whose true lanes are all-ones).
+def x86_movmskps_r32_xmm(dst: X64, s: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  if x64_hi(dst) || s >= 8 then
+    out.push(x86_rex_bits(false, x64_hi(dst), false, s >= 8))
+  end
+  out.push(0x0F)
+  out.push(0x50)
+  out.push(x86_modrm(3, x64_code(dst) as Int, s))
+  out
+end
+
+# The SSE4.1 lane extract/insert: PEXTRD r/m32, xmm, imm8 — 66 0F 3A
+# 16 /r ib (reg = the XMM source, rm = the GPR destination); PINSRD
+# xmm, r/m32, imm8 — 66 0F 3A 22 /r ib (reg = the XMM destination). On
+# SSE2 the extract is PSHUFD (broadcast the lane to lane 0) + MOVD
+# (x86_emit_vec_extract_i32_sse2 below); the insert blend needs a
+# materialized lane mask (the punpck/shufps sequence), so it stays
+# sse41-gated on this route.
+def x86_pextrd_r32_xmm(dst: X64, s: Int, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(0x66)
+  if x64_hi(dst) || s >= 8 then
+    out.push(x86_rex_bits(false, s >= 8, false, x64_hi(dst)))
+  end
+  out.push(0x0F)
+  out.push(0x3A)
+  out.push(0x16)
+  out.push(x86_modrm(3, s, x64_code(dst) as Int))
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+def x86_pinsrd_xmm_r32(d: Int, src: X64, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  out.push(0x66)
+  if d >= 8 || x64_hi(src) then
+    out.push(x86_rex_bits(false, d >= 8, false, x64_hi(src)))
+  end
+  out.push(0x0F)
+  out.push(0x3A)
+  out.push(0x22)
+  out.push(x86_modrm(3, d, x64_code(src) as Int))
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+# The packed conversions: CVTPS2PD 0F 5A / CVTPD2PS 66 0F 5A;
+# CVTPS2DQ 66 0F 5B / CVTDQ2PS 0F 5B; CVTPD2DQ F2 0F E6 /
+# CVTTPD2DQ 66 0F E6 (the truncating twin).
+def x86_cvtps2pd_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0, 0x5A, d, s)
+def x86_cvtpd2ps_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x5A, d, s)
+def x86_cvtps2dq_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0x5B, d, s)
+def x86_cvtdq2ps_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0, 0x5B, d, s)
+def x86_cvtpd2dq_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0xF2, 0xE6, d, s)
+def x86_cvttpd2dq_rr(d: Int, s: Int) -> Vec[u8] = x86_sse_rr(0x66, 0xE6, d, s)
+
+# ———————————————————————————————————————————————————————————————
+# VEX-encoded AVX forms (the v256 vector class — audit item 34 + the
+# vector-ABI slice)
+# ———————————————————————————————————————————————————————————————
+# The 3-byte VEX prefix (always the 3-byte form: one byte longer than
+# the 2-byte form but legal for every register combination, and the only
+# shape that can carry the B extension a high base register needs).
+# Layout (Intel SDM):
+#   C4 [R̄ X̄ B̄ mmmmm] [W v̄vvvv L pp]
+# mmmmm: 00001 = 0F, 00010 = 0F38, 00011 = 0F3A.
+# pp: 00 = none, 01 = 66, 10 = F3, 11 = F2.
+# L: 0 = 128-bit, 1 = 256-bit.
+# VEX.vvvv is the INVERTED first-source register: the caller passes the
+# RAW inverted field value (15 for the no-source/reserved forms,
+# (reg ^ 15) & 15 for a source — this backend has no unary ~).
+# R/X/B are the inverted extensions of ModRM.reg / SIB.index /
+# ModRM.rm-base; the register form uses R only, the memory form R + B.
+def x86_vex_prefix(reg_ext: Bool, base_ext: Bool, map: Int, vvvv: Int, l: Bool, pp: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  let r_bar = if reg_ext then 0 else 1 end
+  let b_bar = if base_ext then 0 else 1 end
+  out.push(0xC4)
+  out.push(((r_bar << 7) | (1 << 6) | (b_bar << 5) | (map & 0x1F)) as u8)
+  let lv = if l then 1 else 0 end
+  out.push((((vvvv & 0xF) << 3) | (lv << 2) | (pp & 3)) as u8)
+  out
+end
+
+# The VEX pp field of a legacy SSE mandatory prefix (the binop table's
+# prefix column: 0x66 -> 66, 0xF3 -> F3, 0xF2 -> F2, 0 -> none).
+def x86_vex_pp(prefix: Int) -> Int
+  if prefix == 0x66 then 1
+  elsif prefix == 0xF3 then 2
+  elsif prefix == 0xF2 then 3
+  else 0
+  end
+end
+
+# VMOVDQU xmm/ymm, [base + disp] — VEX.F3.0F.WIG 6F /r (AVX; the L bit
+# selects the 128/256-bit operand). VEX.vvvv is reserved (raw 1111).
+def x86_vmovdqu_load(d: Int, base: X64, disp: Int, is256: Bool) -> Vec[u8]
+  var out: Vec[u8] = x86_vex_prefix(d >= 8, x64_hi(base), 1, 15, is256, 2)
+  out.push(0x6F)
+  x86_append_mem(out, d, base, disp)
+  out
+end
+
+# VMOVDQU [base + disp], xmm/ymm — VEX.F3.0F.WIG 7F /r.
+def x86_vmovdqu_store(base: X64, disp: Int, s: Int, is256: Bool) -> Vec[u8]
+  var out: Vec[u8] = x86_vex_prefix(s >= 8, x64_hi(base), 1, 15, is256, 2)
+  out.push(0x7F)
+  x86_append_mem(out, s, base, disp)
+  out
+end
+
+# A three-operand VEX register form: d = s1 op s2 (VEX.NDS — VEX.vvvv
+# carries the inverted first source, ModRM.reg the destination,
+# ModRM.rm the second source).
+def x86_vex_rrr(map: Int, pp: Int, opcode: Int, d: Int, s1: Int, s2: Int, is256: Bool) -> Vec[u8]
+  var out: Vec[u8] = x86_vex_prefix(d >= 8, false, map, (s1 ^ 15) & 15, is256, pp)
+  out.push(opcode as u8)
+  out.push(x86_modrm(3, d, s2))
+  out
+end
+
+# VPSHUFB xmm/ymm (VEX 66.0F38.00 /r, AVX2 for the 256-bit form): each
+# 128-bit lane shuffles within itself — the same per-half TBL semantics
+# the aarch64 arm and the mask semantics use.
+def x86_vex_pshufb(d: Int, s1: Int, s2: Int, is256: Bool) -> Vec[u8]
+  x86_vex_rrr(2, 1, 0x00, d, s1, s2, is256)
+end
+
+# VANDNPS xmm/ymm (VEX.0F 55 /r; AVX1): d = ~s1 & s2 — the 256-bit
+# and-not the explicit surface uses as a & ~b with the operands staged
+# (s1 = b, s2 = a). Bit-identical for every integer lane class (the
+# same AVX1-FP-logical convention the 256-bit AND/OR/XOR arm uses).
+# verified: vandnps ymm0,ymm1,ymm2 = C5 F4 55 C2.
+def x86_vex_andnps_rrr(d: Int, s1: Int, s2: Int, is256: Bool) -> Vec[u8]
+  x86_vex_rrr(1, 0, 0x55, d, s1, s2, is256)
+end
+
+# The AVX2 per-lane variable shifts (VEX.66.0F38 47/45/46 /r):
+# VPSLLVD / VPSRLVD / VPSRAVD — d = s1 shifted by the per-lane dword
+# counts of s2 (the ONLY per-lane variable shift forms before the
+# AVX-512 VPSLLVW/VPSLLVQ). verified, ymm:
+#   vpsllvd ymm0,ymm1,ymm2 = C4 E2 75 47 C2;
+#   vpsrlvd = C4 E2 75 45 C2; vpsravd = C4 E2 75 46 C2;
+#   the xmm form = C4 E2 71 47/45/46 C2 (L=0).
+def x86_vex_vpsllvd_rrr(d: Int, s1: Int, s2: Int, is256: Bool) -> Vec[u8]
+  x86_vex_rrr(2, 1, 0x47, d, s1, s2, is256)
+end
+
+def x86_vex_vpsrlvd_rrr(d: Int, s1: Int, s2: Int, is256: Bool) -> Vec[u8]
+  x86_vex_rrr(2, 1, 0x45, d, s1, s2, is256)
+end
+
+def x86_vex_vpsravd_rrr(d: Int, s1: Int, s2: Int, is256: Bool) -> Vec[u8]
+  x86_vex_rrr(2, 1, 0x46, d, s1, s2, is256)
+end
+
+# A VEX shift-by-immediate (VEX.66.0F 71/72/73 /ext ib). The VEX form
+# is unusual: VEX.vvvv is the DESTINATION and ModRM.rm the source (the
+# inverse of the three-same NDS layout), ModRM.reg carries the opcode
+# extension (6 = left, 2 = logical right, 4 = arithmetic right) and the
+# opcode selects the element (71 = word, 72 = dword, 73 = qword). W is
+# WIG for every form. verified: vpsllw ymm0,ymm1,3 = C5 FD 71 F1 03
+# (our always-3-byte prefix emits C4 E1 7D 71 F1 03, the same
+# instruction); vpsrlw = /2, vpsraw = /4.
+def x86_vex_shift_imm(d: Int, s: Int, opcode: Int, ext: Int, is256: Bool, imm: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_vex_prefix(d >= 8, false, 1, (d ^ 15) & 15, is256, 1)
+  out.push(opcode as u8)
+  out.push(x86_modrm(3, ext, s))
+  out.push((imm & 0xFF) as u8)
+  out
+end
+
+# The reserved-vvvv VEX form (VEX.vvvv = 1111): the AVX2 broadcasts
+# VPBROADCASTB/W/D/Q (VEX.66.0F38 78/79/58/59 /r) with the GP
+# destination reg field and the XMM source rm field (the source is an
+# xmm register previously loaded with VMOVD/VMOVQ — the AVX2 baseline
+# has no GP-source broadcast form; that is AVX-512's EVEX shape).
+# verified, ymm: vpbroadcastd ymm0,xmm0 = C4 E2 7D 58 C0;
+# vpbroadcastq = C4 E2 7D 59 C0; vpbroadcastb = C4 E2 7D 78 C0;
+# vpbroadcastw = C4 E2 7D 79 C0 (the xmm forms use 79/7D… L=0).
+def x86_vex_broadcast(d: Int, s: Int, is256: Bool, opcode: Int) -> Vec[u8]
+  var out: Vec[u8] = x86_vex_prefix(d >= 8, false, 2, 15, is256, 1)
+  out.push(opcode as u8)
+  out.push(x86_modrm(3, d, s))
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
 # Sized ALU / memory / atomic encoders — the pointer/atomic slice
 # ———————————————————————————————————————————————————————————————
 # The 1/2/4-byte memory forms of the scalar width classes: the LIR
@@ -1289,6 +1778,22 @@ struct X86Emit
   # canonical x86_64 description carries no ssse3, so the arm fails
   # closed with the named rule until a desc opts in.
   ssse3_ok: Bool
+  # The AVX/AVX2 tokens (the v256 vector arm's gate — audit item 34 +
+  # the vector-ABI slice): `avx_ok` admits the 256-bit load/store, the
+  # three-operand float/logical VEX forms and the vector ABI crossings
+  # in the ymm file; `avx2_ok` additionally admits the 256-bit INTEGER
+  # VEX forms (VPADDB/W/D/Q, VPSUB*, VPMULLW, VPSHUFB ymm). The
+  # canonical x86_64 description carries neither, so every v256
+  # statement fails closed at emission with the desc's name.
+  avx_ok: Bool
+  avx2_ok: Bool
+  # The SSE4.1 token: it upgrades the 32-bit lane multiply to the
+  # single-instruction PMULLD (the SSE2 baseline always serves the
+  # same lane class through the PMULUDQ-twice sequence) and admits the
+  # SSE4.1-only lane extract/insert forms. The canonical x86_64
+  # description carries no sse41 token, so the baseline sequences are
+  # the default and every SSE4.1-only form names the token.
+  sse41_ok: Bool
 end
 
 def x86_emit_new() -> X86Emit
@@ -1302,7 +1807,10 @@ def x86_emit_new() -> X86Emit
     data: Vec::new(),
     bss_size: 0,
     label_counter: 0,
-    ssse3_ok: false
+    ssse3_ok: false,
+    avx_ok: false,
+    avx2_ok: false,
+    sse41_ok: false
   }
 end
 
@@ -1865,11 +2373,13 @@ def x86_validate_atomic_width(fn_name: String, w: Int, what: String) -> Result[U
   end
 end
 
-# The vector marker surface: v128 envelopes only (the lowering
-# gate already rejects v256/512), and the lane descriptor must be a
-# well-formed intrinsic-family descriptor. The per-lane opcode legality
-# (SSE2 has no byte/dword/qword packed multiply) and the SSSE3 pshufb
-# shuffle rule are checked at emission with named errors.
+# The vector marker surface: v128 (SSE2) and v256 (the AVX/AVX2 arm —
+# the emitter gates the desc's tokens) envelopes, with a well-formed
+# intrinsic-family lane descriptor. The per-lane opcode legality (SSE2
+# serves the 16-bit PMULLW and the 32-bit PMULUDQ sequence; the byte
+# and qword packed multiplies have no x86 instruction through AVX2 and
+# the SSE4.1-only PMULLD is token-gated), the SSSE3 pshufb shuffle rule
+# and the v256 token gates are checked at emission with named errors.
 def x86_validate_vec_stmt(fn_name: String, vop: LirVecOp) -> Result[Unit, String]
   match vop
   when LirVecOp::LirVecBinop(_, lane, dst, a, b) then
@@ -1906,6 +2416,20 @@ def x86_validate_vec_stmt(fn_name: String, vop: LirVecOp) -> Result[Unit, String
     when Result::Ok(_) then ()
     end
     x86_validate_ordinary(fn_name, ptr, "a vector store pointer")
+  when LirVecOp::LirVecMove(lane, dst, src) then
+    # The whole-image slot copy (the whole-vector move/copy slice): a
+    # pure byte-image move between two vector-class fixed-slot images,
+    # so the width-only lane gate applies (like the ABI moves) and both
+    # operands are ordinary (vector-class) vregs.
+    match x86_validate_vec_lane_abi(fn_name, lane)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    match x86_validate_ordinary(fn_name, dst, "a vector move destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    x86_validate_ordinary(fn_name, src, "a vector move source")
   when LirVecOp::LirVecShuffle(lane, dst, a, mask) then
     match x86_validate_vec_lane(fn_name, lane)
     when Result::Err(e) then return Result::Err(e)
@@ -1920,12 +2444,189 @@ def x86_validate_vec_stmt(fn_name: String, vop: LirVecOp) -> Result[Unit, String
     when Result::Ok(_) then ()
     end
     x86_validate_ordinary(fn_name, mask, "a vector shuffle mask")
+  when LirVecOp::LirVecAbiBind(lane, dst, _) then
+    # The vector parameter entry bind (audit item 34 stage 2): a v128 or
+    # v256 image stored from the ABI vector register into the
+    # parameter's fixed slot. The index bound is the verifier's rule.
+    # The ABI moves are pure byte-image loads/stores, so an
+    # unsigned-lane vector parameter (canonical class data with no
+    # intrinsic spelling) is legal here — the width is the only gate.
+    match x86_validate_vec_lane_abi(fn_name, lane)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    x86_validate_ordinary(fn_name, dst, "a vector ABI bind destination")
+  when LirVecOp::LirVecAbiArg(lane, src, _) then
+    # The call-argument ABI move: a v128 or v256 image loaded from the
+    # source's fixed slot into the ABI vector register (width-only gate).
+    match x86_validate_vec_lane_abi(fn_name, lane)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    x86_validate_ordinary(fn_name, src, "a vector ABI argument source")
+  when LirVecOp::LirVecShiftImm(lane, form, dst, a, amount) then
+    match x86_validate_vec_lane(fn_name, lane)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    if !lir_vec_shift_form_ok(form) then
+      return Result::Err("x86_64: " + fn_name + ": a vector shift form " + form.to_string() + " is outside the marker's 0=shl/1=lsr/2=asr vocabulary — fail-closed")
+    end
+    let eb = lir_vector_elem_bits(lane.elem_kind.clone())
+    if amount < 0 || amount >= eb then
+      return Result::Err("x86_64: " + fn_name + ": a vector shift immediate " + amount.to_string() + " is outside 0.." + (eb - 1).to_string() + " for the " + lir_vector_lane_name(lane) + " lane class — fail-closed")
+    end
+    match x86_validate_ordinary(fn_name, dst, "a vector shift destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    x86_validate_ordinary(fn_name, a, "a vector shift source")
+  when LirVecOp::LirVecShiftVec(lane, form, dst, a, counts) then
+    match x86_validate_vec_lane(fn_name, lane)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    if !lir_vec_shift_form_ok(form) then
+      return Result::Err("x86_64: " + fn_name + ": a vector shift form " + form.to_string() + " is outside the marker's 0=shl/1=lsr/2=asr vocabulary — fail-closed")
+    end
+    match x86_validate_ordinary(fn_name, dst, "a vector shift destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    match x86_validate_ordinary(fn_name, a, "a vector shift source")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    x86_validate_ordinary(fn_name, counts, "a vector shift counts operand")
+  when LirVecOp::LirVecSplat(lane, dst, src) then
+    match x86_validate_vec_lane(fn_name, lane)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    match x86_validate_ordinary(fn_name, dst, "a vector splat destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    x86_validate_ordinary(fn_name, src, "a vector splat source")
+  when LirVecOp::LirVecExtract(lane, dst, src, index) then
+    match x86_validate_vec_lane(fn_name, lane)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    if index < 0 || index >= lane.lanes then
+      return Result::Err("x86_64: " + fn_name + ": a vector extract lane index " + index.to_string() + " is outside 0.." + (lane.lanes - 1).to_string() + " for the " + lir_vector_lane_name(lane) + " lane class — fail-closed")
+    end
+    match x86_validate_ordinary(fn_name, dst, "a vector extract destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    x86_validate_ordinary(fn_name, src, "a vector extract source")
+  when LirVecOp::LirVecInsert(lane, dst, src, elem, index) then
+    match x86_validate_vec_lane(fn_name, lane)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    if index < 0 || index >= lane.lanes then
+      return Result::Err("x86_64: " + fn_name + ": a vector insert lane index " + index.to_string() + " is outside 0.." + (lane.lanes - 1).to_string() + " for the " + lir_vector_lane_name(lane) + " lane class — fail-closed")
+    end
+    match x86_validate_ordinary(fn_name, dst, "a vector insert destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    match x86_validate_ordinary(fn_name, src, "a vector insert base vector")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    x86_validate_ordinary(fn_name, elem, "a vector insert element")
+  when LirVecOp::LirVecPack(from_lane, to_lane, dst, a, b) then
+    match x86_validate_vec_lane(fn_name, from_lane)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    match x86_validate_vec_lane(fn_name, to_lane)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    match x86_validate_vec_narrow_pair(fn_name, from_lane, to_lane, "pack")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    match x86_validate_ordinary(fn_name, dst, "a vector pack destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    match x86_validate_ordinary(fn_name, a, "a vector pack low operand")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    x86_validate_ordinary(fn_name, b, "a vector pack high operand")
+  when LirVecOp::LirVecUnpack(from_lane, to_lane, hi, dst, a) then
+    match x86_validate_vec_lane(fn_name, from_lane)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    match x86_validate_vec_lane(fn_name, to_lane)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    match x86_validate_vec_widen_pair(fn_name, from_lane, to_lane, "unpack")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    if hi != 0 && hi != 1 then
+      return Result::Err("x86_64: " + fn_name + ": an unpack half selector " + hi.to_string() + " is outside the marker's 0=low/1=high vocabulary — fail-closed")
+    end
+    match x86_validate_ordinary(fn_name, dst, "a vector unpack destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    x86_validate_ordinary(fn_name, a, "a vector unpack source")
   end
 end
 
+# The pack lane-pair rule: to_lane must be the half-width signed narrow
+# target of from_lane (i32x4→i16x8 / i16x8→i8x16).
+def x86_validate_vec_narrow_pair(fn_name: String, from_lane: LirVectorLane, to_lane: LirVectorLane, what: String) -> Result[Unit, String]
+  match lir_vector_lane_narrow(from_lane)
+  when Option::Some(want) then
+    if want.elem_kind != to_lane.elem_kind || want.lanes != to_lane.lanes || want.bits != to_lane.bits then
+      Result::Err("x86_64: " + fn_name + ": " + what + " target " + lir_vector_lane_name(to_lane) + " is not the half-width signed narrow target " + lir_vector_lane_name(want) + " of " + lir_vector_lane_name(from_lane) + " — fail-closed")
+    else
+      Result::Ok(())
+    end
+  when Option::None then
+    Result::Err("x86_64: " + fn_name + ": " + what + " source " + lir_vector_lane_name(from_lane) + " has no half-width signed narrow target (the packed surface is i32x4→i16x8 / i16x8→i8x16) — fail-closed")
+  end
+end
+
+# The unpack lane-pair rule: to_lane must be the double-width signed
+# widen target of from_lane (i16x8→i32x4 / i8x16→i16x8).
+def x86_validate_vec_widen_pair(fn_name: String, from_lane: LirVectorLane, to_lane: LirVectorLane, what: String) -> Result[Unit, String]
+  match lir_vector_lane_widen(from_lane)
+  when Option::Some(want) then
+    if want.elem_kind != to_lane.elem_kind || want.lanes != to_lane.lanes || want.bits != to_lane.bits then
+      Result::Err("x86_64: " + fn_name + ": " + what + " target " + lir_vector_lane_name(to_lane) + " is not the double-width signed widen target " + lir_vector_lane_name(want) + " of " + lir_vector_lane_name(from_lane) + " — fail-closed")
+    else
+      Result::Ok(())
+    end
+  when Option::None then
+    Result::Err("x86_64: " + fn_name + ": " + what + " source " + lir_vector_lane_name(from_lane) + " has no double-width signed widen target (the widening surface is i16x8→i32x4 / i8x16→i16x8) — fail-closed")
+  end
+end
+
+# The ABI-move width gate: 128/256 bits only, no intrinsic-family
+# requirement (the bind/argument markers move whole byte images).
+def x86_validate_vec_lane_abi(fn_name: String, lane: LirVectorLane) -> Result[Unit, String]
+  if lane.bits != 128 && lane.bits != 256 then
+    return Result::Err("x86_64: " + fn_name + ": a vector ABI crossing carries a " + lane.bits.to_string() + "-bit lane image (" + lir_vector_lane_name(lane) + "); the x86-64 vector arm crosses v128 (SSE2) and v256 (AVX/AVX2, gated on the desc's tokens) only — fail-closed")
+  end
+  Result::Ok(())
+end
+
 def x86_validate_vec_lane(fn_name: String, lane: LirVectorLane) -> Result[Unit, String]
-  if lane.bits != 128 then
-    return Result::Err("x86_64: " + fn_name + ": a vector statement carries a " + lane.bits.to_string() + "-bit lane image (" + lir_vector_lane_name(lane) + "); the x86-64 vector arm emits v128 only (SSE2) — fail-closed")
+  match x86_validate_vec_lane_abi(fn_name, lane)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(_) then ()
   end
   if lir_simd_lane_of_vector_lane(lane) == Option::None then
     return Result::Err("x86_64: " + fn_name + ": a vector statement carries the lane kind `" + lir_vector_lane_name(lane) + "`, which has no SIMD intrinsic-family encoding on this route — fail-closed")
@@ -1943,25 +2644,38 @@ def x86_validate_signature(f: LirFunction) -> Result[Unit, String]
   let fn_name = f.name.clone()
   var gp = 0
   var fp = 0
+  var stack_float = false
   var pi = 0
   while pi < f.params.len() do
-    match lir_fp_width_of(f.params[pi].ty.clone())
-    when Option::Some(_) then fp = fp + 1
-    when Option::None then gp = gp + 1
+    # The SIMD&FP file is shared by scalar floats and SIMD vectors: both
+    # consume a file position (the vector class is identified by the
+    # vector class table, the float class by fp_widths — the lowering's
+    # class authorities).  A vector beyond xmm0..7 crosses through the
+    # vector byte-image stack slots (the vector stack stream); a scalar
+    # float beyond the file keeps the fail-closed scalar stack stream.
+    if f.vector_widths.contains_key(&f.params[pi]) then
+      fp = fp + 1
+    elsif f.fp_widths.contains_key(&f.params[pi]) then
+      fp = fp + 1
+      if fp > 8 then
+        stack_float = true
+      end
+    else
+      gp = gp + 1
     end
     pi = pi + 1
   end
   if f.sret_words > 0 then
     if gp > 5 then
-      return Result::Err("x86_64: " + fn_name + ": an sret-returning function has " + gp.to_string() + " general-class parameters — the SysV hidden return pointer consumes rdi, so only five general parameters fit rsi/rdx/rcx/r8/r9 (the stack-argument stream is fail-closed) — fail-closed")
+      return Result::Err("x86_64: " + fn_name + ": an sret-returning function has " + gp.to_string() + " general-class parameters — the SysV hidden return pointer consumes rdi, so only five general parameters fit rsi/rdx/rcx/r8/r9; the scalar/float stack-argument stream is fail-closed — fail-closed")
     end
   else
     if gp > 6 then
-      return Result::Err("x86_64: " + fn_name + ": " + gp.to_string() + " general-class parameters — SysV passes only the first six in registers (rdi/rsi/rdx/rcx/r8/r9); the stack-argument stream is fail-closed")
+      return Result::Err("x86_64: " + fn_name + ": " + gp.to_string() + " general-class parameters — SysV passes only the first six in registers (rdi/rsi/rdx/rcx/r8/r9); the scalar/float stack stream is fail-closed")
     end
   end
-  if fp > 8 then
-    return Result::Err("x86_64: " + fn_name + ": " + fp.to_string() + " floating-point parameters — SysV passes only the first eight in xmm0..xmm7; the stack-argument stream is fail-closed")
+  if stack_float then
+    return Result::Err("x86_64: " + fn_name + ": a floating-point parameter beyond xmm0..xmm7 — SysV passes the first eight file positions in registers and the scalar float stack stream is fail-closed (only vector byte images stack)")
   end
   Result::Ok(())
 end
@@ -2085,8 +2799,18 @@ def x86_validate_fn(f: LirFunction) -> Result[Unit, String]
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(_) then ()
         end
-      when LirStmtKind::LirLoadFrame(_, off) then
-        return Result::Err("x86_64: " + fn_name + ": stack-parameter loads (LirLoadFrame at [FP+" + off.to_string() + "]) do not lower — SysV stack slots are 8 bytes, not the lowering's 16-byte aarch64 caller slots, so the SysV stack-argument stream is fail-closed")
+      when LirStmtKind::LirLoadFrame(dst, off) then
+        # A vector stack-parameter bind (the stacked-vector slice) is
+        # the one served LirLoadFrame: the image crosses BY VALUE at the
+        # 16-byte caller-slot geometry; every scalar/float stack bind
+        # keeps the named SysV-stream refusal.
+        if f.vector_widths.contains_key(&dst) then
+          if off < 16 || (off - 16) % 16 != 0 then
+            return Result::Err("x86_64: " + fn_name + ": a vector stack-parameter bind at [rbp+" + off.to_string() + "] — the SysV vector caller slots sit at 16 + 16*k (16-byte aligned) — fail-closed")
+          end
+        else
+          return Result::Err("x86_64: " + fn_name + ": scalar/float stack-parameter loads (LirLoadFrame at [rbp+" + off.to_string() + "]) do not lower — the SysV scalar/float stack-argument stream is fail-closed (only vector byte images stack)")
+        end
       when LirStmtKind::LirStaticLoad(dst, _) then
         if lir_is_fixed_fp_id(dst) then
           return Result::Err("x86_64: " + fn_name + ": a static load into fixed float vreg " + dst.to_string() + " (fail-closed)")
@@ -2095,8 +2819,12 @@ def x86_validate_fn(f: LirFunction) -> Result[Unit, String]
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(_) then ()
         end
-      when LirStmtKind::LirPushArg(_) then
-        return Result::Err("x86_64: " + fn_name + ": caller stack-argument pushes (LirPushArg) do not lower — the SysV stack-argument stream is fail-closed")
+      when LirStmtKind::LirPushArg(vreg) then
+        # A stacked vector byte image is served (movdqu/vmovdqu push);
+        # every scalar/float/general push keeps the SysV-stream refusal.
+        if !f.vector_widths.contains_key(&vreg) then
+          return Result::Err("x86_64: " + fn_name + ": caller stack-argument pushes (LirPushArg) do not lower for scalar/float/general values — the SysV stream is fail-closed (only vector byte images stack)")
+        end
       when LirStmtKind::LirFMove(dst, src) then
         match x86_validate_fp_vreg(fn_name, dst, "a float move destination")
         when Result::Err(e) then return Result::Err(e)
@@ -2189,7 +2917,22 @@ def x86_validate_fn(f: LirFunction) -> Result[Unit, String]
       end
     when LirTermKind::LirCall(target, args, stack_args, dest, _) then
       if stack_args != 0 then
-        return Result::Err("x86_64: " + fn_name + ": call to `" + target + "` carries caller stack slots — the SysV stack-argument stream is fail-closed")
+        # Only the vector byte-image stack slots are served: every push
+        # in the block must be a vector-class vreg (the emitter restores
+        # exactly 16*stack_args bytes).
+        var nonvector_push = false
+        var pvi = 0
+        while pvi < block.stmts.len() do
+          match block.stmts[pvi].kind
+          when LirStmtKind::LirPushArg(pv) then
+            if !f.vector_widths.contains_key(&pv) then nonvector_push = true end
+          when _ then ()
+          end
+          pvi = pvi + 1
+        end
+        if nonvector_push then
+          return Result::Err("x86_64: " + fn_name + ": call to `" + target + "` carries scalar/float/general caller stack slots — only vector byte images stack on this route (the SysV scalar/float stack stream is fail-closed)")
+        end
       end
       var ai = 0
       while ai < args.len() do
@@ -3365,20 +4108,30 @@ def x86_emit_ptr_stmt(inout xe: X86Emit, alloc: LirAlloc, pop: LirPtrOp, pos: In
 end
 
 # ———————————————————————————————————————————————————————————————
-# Vector statement emission (SSE2, v128)
+# Vector statement emission (SSE2 baseline, v128; VEX/AVX2 v256)
 # ———————————————————————————————————————————————————————————————
 # Vector values are memory-resident (fixed slots in the aggregate
 # region); the SSE2 ops run on xmm0/xmm1 transients (fixed float ids
-# 8/9 — dead at every vector statement by the fixed-vreg invariant).
-# The packed opcode table covers the lane classes SSE2 can serve:
+# 8/9 — dead at every vector statement by the fixed-vreg invariant),
+# and the multi-instruction 32-bit multiply sequence additionally uses
+# xmm2, which the same invariant leaves dead (the fixed ABI file
+# appears only in entry binds and pre-call argument moves).
+# The binop plan covers every lane class the ISA can serve on the
+# baseline:
 #   and/or/xor: PAND/POR/PXOR (all lanes);
 #   add/sub:    PADDB/W/D/Q, PSUBB/W/D/Q, ADDPS/PD, SUBPS/PD;
-#   mul:        f32/f64 MULPS/MULPD and the 16-bit PMULLW only —
-#               SSE2 has no byte/dword/qword packed multiply (pmulld is
-#               SSE4.1), so those lane classes fail closed with the
-#               named SSE2 rule (never silently scalarized).
-# Shuffle: pshufb is SSSE3; the x86_64 description advertises no ssse3
-# token, so the arm fails closed until a description opts in.
+#   mul:        f32/f64 MULPS/MULPD; PMULLW (16-bit lanes); the full
+#               32-bit lane multiply as the SSE2 PMULUDQ-twice +
+#               pshufd/punpckldq sequence, upgraded to the single
+#               PMULLD when the desc advertises the sse41 token.
+# The byte and qword packed multiplies have NO x86 SIMD instruction
+# through AVX2 (PMULLW is the 16-bit low product; PMULLB does not
+# exist before AVX-512 and VPMULLQ is AVX-512DQ), so those lane
+# classes fail closed with the named ISA rule — never silently
+# scalarized.
+# Shuffle: pshufb is SSSE3; the baseline x86_64 description advertises
+# no ssse3 token (and no SSE2 encoding exists for a runtime per-byte
+# select), so the arm fails closed until a description opts in.
 def x86_vec_slot_disp(alloc: LirAlloc, vreg: Int, pos: Int, what: String) -> Result[Int, String]
   match alloc.segs_of.get(vreg)
   when Option::Some(segs) then
@@ -3396,53 +4149,537 @@ def x86_vec_slot_disp(alloc: LirAlloc, vreg: Int, pos: Int, what: String) -> Res
   end
 end
 
-# The (prefix, opcode) of a vector binop for a lane descriptor, or the
-# named SSE2 gap.
-def x86_vec_binop_opcode(op: LirVecBinOp, elem: String) -> Result[(Int, Int), String]
+# The SSE2 full 32-bit lane multiply sequence (PMULLD is SSE4.1). The
+# two PMULUDQ even-lane products (lanes 0/2 and 1/3), their pshufd 0x08
+# normalization and the punpckldq interleave rebuild the four modular
+# 32-bit lane products: the low 32 bits of each 64-bit product are the
+# exact lane product for both the signed and unsigned lane classes.
+# xmm2 is the sequence temp; dst is [rbp+da], operands [rbp+aa]/[rbp+ba].
+def x86_emit_vec_mul32_sse2(inout xe: X86Emit, da: Int, aa: Int, ba: Int) -> Unit
+  x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
+  x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, ba))
+  x86_emit(&mut xe.buf, x86_movdqu_load(2, X64::RBP, aa))
+  x86_emit(&mut xe.buf, x86_pmuludq_rr(2, 1))
+  x86_emit(&mut xe.buf, x86_pshufd_rr(0, 0, 0xB1))
+  x86_emit(&mut xe.buf, x86_pshufd_rr(1, 1, 0xB1))
+  x86_emit(&mut xe.buf, x86_pmuludq_rr(0, 1))
+  x86_emit(&mut xe.buf, x86_pshufd_rr(2, 2, 0x08))
+  x86_emit(&mut xe.buf, x86_pshufd_rr(0, 0, 0x08))
+  x86_emit(&mut xe.buf, x86_punpckldq_rr(2, 0))
+  x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 2))
+end
+
+# PMULLD (SSE4.1) — the one-instruction full 32-bit lane multiply used
+# when the target description advertises the sse41 token.
+def x86_emit_vec_mul32_sse41(inout xe: X86Emit, da: Int, aa: Int, ba: Int) -> Unit
+  x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
+  x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, ba))
+  x86_emit(&mut xe.buf, x86_pmulld_rr(0, 1))
+  x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+end
+
+# The SSE2 i64x2 equality result (all-ones per equal qword): PCMPEQQ is
+# SSE4.1, so compare the dword halves (pcmpeqd), fold each qword with
+# its pshufd 0xB1-swapped sibling and AND — every dword pair equal iff
+# the full qword is equal. The result lands in d (the lane mask of the
+# equality the language's compare surface returns); xmm2 is the temp.
+def x86_emit_vec_eq_i64_sse2(inout xe: X86Emit, d: Int, s: Int) -> Unit
+  x86_emit(&mut xe.buf, x86_pcmpeqd_rr(d, s))
+  x86_emit(&mut xe.buf, x86_pshufd_rr(2, d, 0xB1))
+  x86_emit(&mut xe.buf, x86_pand_rr(d, 2))
+end
+
+# The SSE2 i32 lane extract (PEXTRD is SSE4.1): pshufd broadcasts the
+# requested lane into lane 0 (imm = lane * 0x55 repeats the 2-bit lane
+# index in all four imm fields) and movd moves it to the GPR.
+def x86_emit_vec_extract_i32_sse2(inout xe: X86Emit, dst: X64, v: Int, lane: Int) -> Unit
+  x86_emit(&mut xe.buf, x86_pshufd_rr(2, v, lane * 0x55))
+  x86_emit(&mut xe.buf, x86_movd_r32_xmm(dst, 2))
+end
+
+# A vector binop's emission plan. X86VecSse carries the legacy-SSE
+# (mandatory prefix, opcode) pair — the v256 arm VEX-encodes the same
+# opcode with the prefix's pp field. The 32-bit integer multiply has no
+# single SSE2 instruction: X86VecMul32Sse2 is the two-PMULUDQ +
+# shuffle/unpack sequence and X86VecMul32Sse41 is the one-instruction
+# PMULLD available when the description advertises the sse41 token.
+enum X86VecBinopPlan
+  X86VecSse(Int, Int)
+  X86VecMul32Sse2
+  X86VecMul32Sse41
+end
+
+# The vector binop emission plan for one lane class, or the named
+# ISA/feature rule that refuses it. `sse41_ok` is the target
+# description's SSE4.1 token (xe.sse41_ok): it upgrades the 32-bit
+# integer multiply to PMULLD; the SSE2 PMULUDQ sequence is the
+# baseline every x86-64 description serves.
+def x86_vec_binop_plan(op: LirVecBinOp, elem: String, sse41_ok: Bool) -> Result[X86VecBinopPlan, String]
   let eb = lir_vector_elem_bits(elem)
   let isf = lir_vector_elem_is_float(elem)
+  if eb == 0 then
+    return Result::Err("x86_64: the `" + elem + "` lane class is not a canonical vector element kind (i8/u8/i16/u16/i32/u32/i64/u64/f32/f64) — fail-closed")
+  end
   match op
-  when LirVecBinOp::LirVecAnd then Result::Ok((0x66, 0xDB))
-  when LirVecBinOp::LirVecOr then Result::Ok((0x66, 0xEB))
-  when LirVecBinOp::LirVecXor then Result::Ok((0x66, 0xEF))
+  when LirVecBinOp::LirVecAnd then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xDB))
+  when LirVecBinOp::LirVecOr then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xEB))
+  when LirVecBinOp::LirVecXor then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xEF))
+  when LirVecBinOp::LirVecAndNot then
+    # The and-not plan is stage data only: the emission stages the
+    # operands b,a for PANDN (d = ~d & s), so the plan's (prefix,
+    # opcode) pair is the SSE2 PANDN row.
+    Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xDF))
+  when LirVecBinOp::LirVecEq | LirVecBinOp::LirVecLt | LirVecBinOp::LirVecGt | LirVecBinOp::LirVecLe | LirVecBinOp::LirVecGe then
+    # The compares have their own planner (x86_vec_cmp_plan — the
+    # operand-swap/invert and the SSE2 i64-eq sequence); a compare
+    # reaching the arithmetic plan is an internal routing error.
+    Result::Err("x86_64: internal error: compare binop `" + lir_vec_binop_name(op) + "` reached the arithmetic plan (x86_vec_cmp_plan owns it) — fail-closed")
   when LirVecBinOp::LirVecAdd then
-    if eb == 8 then Result::Ok((0x66, 0xFC))
-    elsif eb == 16 then Result::Ok((0x66, 0xFD))
-    elsif eb == 32 && !isf then Result::Ok((0x66, 0xFE))
-    elsif eb == 32 && isf then Result::Ok((0, 0x58))
-    elsif eb == 64 && !isf then Result::Ok((0x66, 0xD4))
-    elsif eb == 64 && isf then Result::Ok((0x66, 0x58))
-    else Result::Err("x86_64: no vector add encoding for the " + elem + " lane class (fail-closed)")
+    if eb == 8 then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xFC))
+    elsif eb == 16 then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xFD))
+    elsif eb == 32 && !isf then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xFE))
+    elsif eb == 32 && isf then Result::Ok(X86VecBinopPlan::X86VecSse(0, 0x58))
+    elsif eb == 64 && !isf then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xD4))
+    elsif eb == 64 && isf then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0x58))
+    else Result::Err("x86_64: no vector add encoding for the " + elem + " lane class — fail-closed")
     end
   when LirVecBinOp::LirVecSub then
-    if eb == 8 then Result::Ok((0x66, 0xF8))
-    elsif eb == 16 then Result::Ok((0x66, 0xF9))
-    elsif eb == 32 && !isf then Result::Ok((0x66, 0xFA))
-    elsif eb == 32 && isf then Result::Ok((0, 0x5C))
-    elsif eb == 64 && !isf then Result::Ok((0x66, 0xFB))
-    elsif eb == 64 && isf then Result::Ok((0x66, 0x5C))
-    else Result::Err("x86_64: no vector sub encoding for the " + elem + " lane class (fail-closed)")
+    if eb == 8 then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xF8))
+    elsif eb == 16 then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xF9))
+    elsif eb == 32 && !isf then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xFA))
+    elsif eb == 32 && isf then Result::Ok(X86VecBinopPlan::X86VecSse(0, 0x5C))
+    elsif eb == 64 && !isf then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xFB))
+    elsif eb == 64 && isf then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0x5C))
+    else Result::Err("x86_64: no vector sub encoding for the " + elem + " lane class — fail-closed")
     end
   when LirVecBinOp::LirVecMul then
-    if eb == 16 && !isf then
-      Result::Ok((0x66, 0xD5))
-    elsif eb == 32 && isf then
-      Result::Ok((0, 0x59))
-    elsif eb == 64 && isf then
-      Result::Ok((0x66, 0x59))
+    if isf then
+      if eb == 32 then Result::Ok(X86VecBinopPlan::X86VecSse(0, 0x59))
+      elsif eb == 64 then Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0x59))
+      else Result::Err("x86_64: no packed floating multiply for the " + elem + " lane class — fail-closed")
+      end
+    elsif eb == 16 then
+      Result::Ok(X86VecBinopPlan::X86VecSse(0x66, 0xD5))
+    elsif eb == 32 then
+      if sse41_ok then Result::Ok(X86VecBinopPlan::X86VecMul32Sse41)
+      else Result::Ok(X86VecBinopPlan::X86VecMul32Sse2)
+      end
+    elsif eb == 8 then
+      Result::Err("x86_64: SSE2 has no packed 8-bit integer multiply and no x86 SIMD class before AVX-512 defines PMULLB — PMULLW is the 16-bit low product only; fail-closed")
+    elsif eb == 64 then
+      Result::Err("x86_64: SSE2 has no packed 64-bit integer multiply: PMULUDQ is the widening 32x32->64 even-lane product, not a 64x64 lane multiply, and VPMULLQ is AVX-512DQ; fail-closed")
     else
-      Result::Err("x86_64: SSE2 has no packed multiply for the " + elem + " lane class (byte/word integer multiply only exists as the widening PMULLW at 16 bits, and pmulld is an SSE4.1 instruction) — fail-closed")
+      Result::Err("x86_64: no packed integer multiply for the " + elem + " lane class — fail-closed")
     end
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The explicit-op extension emission (compare / shift / splat / lane
+# moves / and-not / pack-unpack) — the x86 side of the completed
+# surface. The base binop/load/store/shuffle arms above are unchanged;
+# these helpers carry the same memory-resident slot discipline (xmm0/
+# xmm1/xmm2 transients, movdqu/vmovdqu image loads and stores).
+# ———————————————————————————————————————————————————————————————
+
+# The compare plan form tokens: 0 = plain (a op b), 1 = swap (b op a),
+# 2 = invert (NOT of the plain result), 3 = swap + invert.
+enum X86VecCmpPlan
+  X86VecCmpInt(Int, Int)
+  X86VecCmpEq64Sse2
+  X86VecCmpF32(Int)
+  X86VecCmpF64(Int)
+end
+
+def x86_vec_cmp_int_eq_op(eb: Int) -> Int
+  if eb == 8 then 0x74 elsif eb == 16 then 0x75 else 0x76 end
+end
+
+def x86_vec_cmp_int_gt_op(eb: Int) -> Int
+  if eb == 8 then 0x64 elsif eb == 16 then 0x65 else 0x66 end
+end
+
+# The compare emission plan for one op/lane pair: the integer eq/gt
+# rows, the SSE2 i64-eq sequence, the float CMPPS/CMPPD predicate rows.
+# lt is gt with the operands swapped; le/ge add the all-ones XOR
+# inversion. The float gt/ge and the 64-bit ordering compares fail
+# closed with the named surface/ISA rules.
+def x86_vec_cmp_plan(op: LirVecBinOp, elem: String) -> Result[X86VecCmpPlan, String]
+  let eb = lir_vector_elem_bits(elem)
+  let isf = lir_vector_elem_is_float(elem)
+  if eb == 0 then
+    return Result::Err("x86_64: the `" + elem + "` lane class is not a canonical vector element kind (i8/u8/i16/u16/i32/u32/i64/u64/f32/f64) — fail-closed")
+  end
+  match op
+  when LirVecBinOp::LirVecEq then
+    if isf then
+      if eb == 32 then Result::Ok(X86VecCmpPlan::X86VecCmpF32(0))
+      else Result::Ok(X86VecCmpPlan::X86VecCmpF64(0))
+      end
+    elsif eb == 64 then
+      Result::Ok(X86VecCmpPlan::X86VecCmpEq64Sse2)
+    else
+      Result::Ok(X86VecCmpPlan::X86VecCmpInt(x86_vec_cmp_int_eq_op(eb), 0))
+    end
+  when LirVecBinOp::LirVecGt then
+    if isf then
+      Result::Err("x86_64: the explicit float compare surface is eq/lt/le; `gt` on the " + elem + " lane class is not in the surface — fail-closed")
+    elsif eb == 64 then
+      Result::Err("x86_64: SSE2 has no packed 64-bit signed compare (PCMPGTQ is SSE4.2; the explicit 64-bit integer compare surface is equality only) — fail-closed")
+    else
+      Result::Ok(X86VecCmpPlan::X86VecCmpInt(x86_vec_cmp_int_gt_op(eb), 0))
+    end
+  when LirVecBinOp::LirVecLt then
+    if isf then
+      if eb == 32 then Result::Ok(X86VecCmpPlan::X86VecCmpF32(1))
+      else Result::Ok(X86VecCmpPlan::X86VecCmpF64(1))
+      end
+    elsif eb == 64 then
+      Result::Err("x86_64: SSE2 has no packed 64-bit signed compare (PCMPGTQ is SSE4.2; the explicit 64-bit integer compare surface is equality only) — fail-closed")
+    else
+      Result::Ok(X86VecCmpPlan::X86VecCmpInt(x86_vec_cmp_int_gt_op(eb), 1))
+    end
+  when LirVecBinOp::LirVecLe then
+    if isf then
+      if eb == 32 then Result::Ok(X86VecCmpPlan::X86VecCmpF32(2))
+      else Result::Ok(X86VecCmpPlan::X86VecCmpF64(2))
+      end
+    elsif eb == 64 then
+      Result::Err("x86_64: SSE2 has no packed 64-bit signed compare (PCMPGTQ is SSE4.2; the explicit 64-bit integer compare surface is equality only) — fail-closed")
+    else
+      Result::Ok(X86VecCmpPlan::X86VecCmpInt(x86_vec_cmp_int_gt_op(eb), 2))
+    end
+  when LirVecBinOp::LirVecGe then
+    if isf then
+      Result::Err("x86_64: the explicit float compare surface is eq/lt/le; `ge` on the " + elem + " lane class is not in the surface — fail-closed")
+    elsif eb == 64 then
+      Result::Err("x86_64: SSE2 has no packed 64-bit signed compare (PCMPGTQ is SSE4.2; the explicit 64-bit integer compare surface is equality only) — fail-closed")
+    else
+      Result::Ok(X86VecCmpPlan::X86VecCmpInt(x86_vec_cmp_int_gt_op(eb), 3))
+    end
+  when _ then
+    Result::Err("x86_64: internal error: non-compare binop `" + lir_vec_binop_name(op) + "` reached x86_vec_cmp_plan — fail-closed")
+  end
+end
+
+# The and-not emission: b is staged into xmm0 (the PANDN destination
+# operand, complemented) and a into xmm1 (the source), so PANDN
+# computes ~b & a = a & ~b. v256 uses the AVX1 VANDNPS ymm form.
+def x86_emit_vec_andnot(inout xe: X86Emit, da: Int, aa: Int, ba: Int, is256: Bool) -> Result[Unit, String]
+  if is256 then
+    if !xe.avx_ok then
+      return Result::Err("x86_64: a 256-bit vector and-not needs the AVX 256-bit envelope (VANDNPS ymm), but the target description's isa_features advertise no avx/avx2 token (the x86_64 baseline is SSE2-only) — fail-closed")
+    end
+    x86_emit(&mut xe.buf, x86_vmovdqu_load(0, X64::RBP, ba, true))
+    x86_emit(&mut xe.buf, x86_vmovdqu_load(1, X64::RBP, aa, true))
+    x86_emit(&mut xe.buf, x86_vex_andnps_rrr(0, 0, 1, true))
+    x86_emit(&mut xe.buf, x86_vmovdqu_store(X64::RBP, da, 0, true))
+    Result::Ok(())
+  else
+    x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, ba))
+    x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, aa))
+    x86_emit(&mut xe.buf, x86_pandn_rr(0, 1))
+    x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+    Result::Ok(())
+  end
+end
+
+# The compare emission: stage the operands in xmm0/xmm1, run the plan's
+# instruction (with the swap and the all-ones inversion when the form
+# asks), and store the mask image. The i64 equality runs the SSE2
+# dword sequence.
+def x86_emit_vec_cmp(inout xe: X86Emit, op: LirVecBinOp, lane: LirVectorLane, da: Int, aa: Int, ba: Int) -> Result[Unit, String]
+  let plan = match x86_vec_cmp_plan(op, lane.elem_kind.clone())
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(pl) then pl
+  end
+  match plan
+  when X86VecCmpPlan::X86VecCmpInt(opcode, form) then
+    if form == 1 || form == 3 then
+      x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, aa))
+      x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, ba))
+    else
+      x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
+      x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, ba))
+    end
+    x86_emit(&mut xe.buf, x86_sse_rr(0x66, opcode, 0, 1))
+    if form == 2 || form == 3 then
+      x86_emit(&mut xe.buf, x86_pcmpeqd_rr(2, 2))
+      x86_emit(&mut xe.buf, x86_pxor_rr(0, 2))
+    end
+  when X86VecCmpPlan::X86VecCmpEq64Sse2 then
+    x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
+    x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, ba))
+    x86_emit_vec_eq_i64_sse2(xe, 0, 1)
+  when X86VecCmpPlan::X86VecCmpF32(pred) then
+    x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
+    x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, ba))
+    x86_emit(&mut xe.buf, x86_cmpps_rr(0, 1, pred))
+  when X86VecCmpPlan::X86VecCmpF64(pred) then
+    x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
+    x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, ba))
+    x86_emit(&mut xe.buf, x86_cmppd_rr(0, 1, pred))
+  end
+  x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+  Result::Ok(())
+end
+
+# The general-register splat: v128 uses the SSE2 shuffle sequences
+# (MOVD/MOVQ plus PSHUFLW/PSHUFD; the byte form doubles PUNPCKLBW
+# before the pshufd broadcast — no SSSE3 needed); v256 uses VMOVD/VMOVQ
+# plus the AVX2 VPBROADCAST forms (gated on the desc's avx2 token).
+def x86_emit_vec_splat(inout xe: X86Emit, alloc: LirAlloc, lane: LirVectorLane, dst: Int, src: Int, pos: Int) -> Result[Unit, String]
+  let da = match x86_vec_slot_disp(alloc, dst, pos, "splat destination")
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(d) then d
+  end
+  let sb = match alloc.fp_widths.get(src)
+  when Option::Some(w) then
+    # The FP-class scalar lane (an f32/f64 splat): read its bit image
+    # into RAX (MOVD/MOVQ from the XMM holding the scalar) and
+    # broadcast the bits. A memory-resident scalar loads straight from
+    # its slot image (x86_fp_emit_use handles both cases at the class
+    # width).
+    let xr = x86_fp_emit_use(xe, alloc, src, pos, w, x86_fp_scratch())
+    if w == LirFpWidth::LirF64 then
+      x86_emit(&mut xe.buf, x86_movq_r64_xmm(X64::RAX, xr))
+    else
+      x86_emit(&mut xe.buf, x86_movd_r32_xmm(X64::RAX, xr))
+    end
+    X64::RAX
+  when Option::None then
+    x86_emit_use(xe, alloc, LirValue::LirReg(src), pos, X64::RAX)
+  end
+  let eb = lir_vector_elem_bits(lane.elem_kind.clone())
+  if lane.bits == 256 then
+    if !xe.avx2_ok then
+      return Result::Err("x86_64: a 256-bit vector splat needs the AVX2 broadcast forms (VMOVD/VMOVQ + VPBROADCASTB/W/D/Q ymm), but the target description's isa_features advertise no avx2 token — fail-closed")
+    end
+    if eb <= 32 then
+      x86_emit(&mut xe.buf, x86_movd_xmm_r32(0, sb))
+    else
+      x86_emit(&mut xe.buf, x86_movq_xmm_r64(0, sb))
+    end
+    let opcode = if eb == 8 then 0x78 elsif eb == 16 then 0x79 elsif eb == 32 then 0x58 else 0x59 end
+    x86_emit(&mut xe.buf, x86_vex_broadcast(0, 0, true, opcode))
+    x86_emit(&mut xe.buf, x86_vmovdqu_store(X64::RBP, da, 0, true))
+    Result::Ok(())
+  else
+    if eb == 8 then
+      x86_emit(&mut xe.buf, x86_movd_xmm_r32(0, sb))
+      x86_emit(&mut xe.buf, x86_punpcklbw_rr(0, 0))
+      x86_emit(&mut xe.buf, x86_punpcklbw_rr(0, 0))
+      x86_emit(&mut xe.buf, x86_pshufd_rr(0, 0, 0))
+    elsif eb == 16 then
+      x86_emit(&mut xe.buf, x86_movd_xmm_r32(0, sb))
+      x86_emit(&mut xe.buf, x86_pshuflw_rr(0, 0, 0))
+      x86_emit(&mut xe.buf, x86_pshufd_rr(0, 0, 0x44))
+    elsif eb == 32 then
+      x86_emit(&mut xe.buf, x86_movd_xmm_r32(0, sb))
+      x86_emit(&mut xe.buf, x86_pshufd_rr(0, 0, 0))
+    else
+      x86_emit(&mut xe.buf, x86_movq_xmm_r64(0, sb))
+      x86_emit(&mut xe.buf, x86_pshufd_rr(0, 0, 0x44))
+    end
+    x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+    Result::Ok(())
+  end
+end
+
+# The lane extract: x86 has no general SIMD lane read; the i16 lane is
+# PEXTRW (SSE2), the i32 lane the PSHUFD+MOVD sequence (SSE2), the i64
+# lane MOVQ or the pshufd 0x0E high-qword select (SSE2), and the i8 lane
+# PEXTRB (SSE4.1 — the desc token is the named gate).
+def x86_emit_vec_extract(inout xe: X86Emit, alloc: LirAlloc, lane: LirVectorLane, dst: Int, src: Int, index: Int, pos: Int) -> Result[Unit, String]
+  let sa = match x86_vec_slot_disp(alloc, src, pos, "extract source")
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(d) then d
+  end
+  x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, sa))
+  let dt = x86_def_target(alloc, dst, pos)
+  let eb = lir_vector_elem_bits(lane.elem_kind.clone())
+  if eb == 8 then
+    if !xe.sse41_ok then
+      return Result::Err("x86_64: an 8-bit lane extract needs PEXTRB, an SSE4.1 instruction; the target description's isa_features advertise no sse41 token — fail-closed")
+    end
+    x86_emit(&mut xe.buf, x86_pextrb_r32_xmm(dt.reg, 0, index))
+  elsif eb == 16 then
+    x86_emit(&mut xe.buf, x86_pextrw_r32_xmm(dt.reg, 0, index))
+  elsif eb == 32 then
+    x86_emit_vec_extract_i32_sse2(xe, dt.reg, 0, index)
+  else
+    if index == 0 then
+      x86_emit(&mut xe.buf, x86_movq_r64_xmm(dt.reg, 0))
+    else
+      x86_emit(&mut xe.buf, x86_pshufd_rr(2, 0, 0x0E))
+      x86_emit(&mut xe.buf, x86_movq_r64_xmm(dt.reg, 2))
+    end
+  end
+  x86_store_def(xe, dt)
+  Result::Ok(())
+end
+
+# The lane insert: load the base image, PINSRW (i16, SSE2) or the
+# SSE4.1 PINSRB/PINSRD/PINSRQ (the desc token is the named gate), store
+# the image back. The other lanes are preserved by the insert forms.
+def x86_emit_vec_insert(inout xe: X86Emit, alloc: LirAlloc, lane: LirVectorLane, dst: Int, src: Int, elem: Int, index: Int, pos: Int) -> Result[Unit, String]
+  let da = match x86_vec_slot_disp(alloc, dst, pos, "insert destination")
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(d) then d
+  end
+  let sa = match x86_vec_slot_disp(alloc, src, pos, "insert base vector")
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(d) then d
+  end
+  x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, sa))
+  let er = x86_emit_use(xe, alloc, LirValue::LirReg(elem), pos, X64::RAX)
+  let eb = lir_vector_elem_bits(lane.elem_kind.clone())
+  if eb == 8 then
+    if !xe.sse41_ok then
+      return Result::Err("x86_64: an 8-bit lane insert needs PINSRB, an SSE4.1 instruction; the target description's isa_features advertise no sse41 token — fail-closed")
+    end
+    x86_emit(&mut xe.buf, x86_pinsrb_xmm_r32(0, er, index))
+  elsif eb == 16 then
+    x86_emit(&mut xe.buf, x86_pinsrw_xmm_r32(0, er, index))
+  elsif eb == 32 then
+    if !xe.sse41_ok then
+      return Result::Err("x86_64: a 32-bit lane insert needs PINSRD, an SSE4.1 instruction; the target description's isa_features advertise no sse41 token — fail-closed")
+    end
+    x86_emit(&mut xe.buf, x86_pinsrd_xmm_r32(0, er, index))
+  else
+    if !xe.sse41_ok then
+      return Result::Err("x86_64: a 64-bit lane insert needs PINSRQ, an SSE4.1 instruction; the target description's isa_features advertise no sse41 token — fail-closed")
+    end
+    x86_emit(&mut xe.buf, x86_pinsrq_xmm_r64(0, er, index))
+  end
+  x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+  Result::Ok(())
+end
+
+# The signed saturating pack (PACKSSDW/PACKSSWB): a's lanes fill the low
+# half, b's the high half.
+def x86_emit_vec_pack(inout xe: X86Emit, from_bits: Int, da: Int, aa: Int, ba: Int) -> Result[Unit, String]
+  x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
+  x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, ba))
+  if from_bits == 32 then
+    x86_emit(&mut xe.buf, x86_packssdw_rr(0, 1))
+  else
+    x86_emit(&mut xe.buf, x86_packsswb_rr(0, 1))
+  end
+  x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+  Result::Ok(())
+end
+
+# The signed widening unpack: PUNPCK{L,H}{BW,WD} with the same register
+# duplicates each half's elements into their pair slots and the
+# arithmetic right shift sign-extends the widened half (PSRAW 8 /
+# PSRAD 16).
+def x86_emit_vec_unpack(inout xe: X86Emit, from_bits: Int, hi: Int, da: Int, aa: Int) -> Result[Unit, String]
+  x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
+  if from_bits == 16 then
+    if hi == 1 then
+      x86_emit(&mut xe.buf, x86_punpckhwd_rr(0, 0))
+    else
+      x86_emit(&mut xe.buf, x86_punpcklwd_rr(0, 0))
+    end
+    x86_emit(&mut xe.buf, x86_psrad_imm(0, 16))
+  else
+    if hi == 1 then
+      x86_emit(&mut xe.buf, x86_punpckhbw_rr(0, 0))
+    else
+      x86_emit(&mut xe.buf, x86_punpcklbw_rr(0, 0))
+    end
+    x86_emit(&mut xe.buf, x86_psraw_imm(0, 8))
+  end
+  x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+  Result::Ok(())
+end
+
+# The per-lane shift by an immediate: PSLLW/D/Q, PSRLW/D/Q, PSRAW/D
+# (the SSE2 counted forms). The byte lane class has no SSE2 shift (a
+# PSLLW/PSRLW plus a materialized mask constant would be needed and
+# this route has no vector constant pool); PSRAQ is AVX-512 — both fail
+# closed with the named ISA rule.
+def x86_emit_vec_shift_imm(inout xe: X86Emit, form: Int, elem: String, amount: Int, da: Int, aa: Int, is256: Bool) -> Result[Unit, String]
+  let eb = lir_vector_elem_bits(elem)
+  if eb == 8 then
+    return Result::Err("x86_64: SSE2 has no byte-lane shift (no PSLLB/PSRLB/PSRAB): a byte shift needs a PSLLW/PSRLW plus a materialized per-lane mask constant, and this route has no vector constant pool — the i8 lane class fails closed")
+  end
+  if form == 2 && eb == 64 then
+    return Result::Err("x86_64: there is no qword arithmetic right shift before AVX-512 (PSRAQ is AVX-512F); the i64 asr class fails closed")
+  end
+  let opcode = if eb == 16 then 0x71 elsif eb == 32 then 0x72 else 0x73 end
+  let ext = if form == 0 then 6 elsif form == 1 then 2 else 4 end
+  if is256 then
+    if !xe.avx2_ok then
+      return Result::Err("x86_64: a 256-bit vector shift needs the AVX2 256-bit integer shift forms (VPSLLW/VPSLLD/VPSLLQ/VPSRLW/VPSRLD/VPSRLQ/VPSRAW/VPSRAD ymm), but the target description's isa_features advertise no avx2 token — fail-closed")
+    end
+    x86_emit(&mut xe.buf, x86_vmovdqu_load(0, X64::RBP, aa, true))
+    x86_emit(&mut xe.buf, x86_vex_shift_imm(0, 0, opcode, ext, true, amount))
+    x86_emit(&mut xe.buf, x86_vmovdqu_store(X64::RBP, da, 0, true))
+    Result::Ok(())
+  else
+    x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
+    if eb == 16 then
+      if form == 0 then
+        x86_emit(&mut xe.buf, x86_psllw_imm(0, amount))
+      elsif form == 1 then
+        x86_emit(&mut xe.buf, x86_psrlw_imm(0, amount))
+      else
+        x86_emit(&mut xe.buf, x86_psraw_imm(0, amount))
+      end
+    elsif eb == 32 then
+      if form == 0 then
+        x86_emit(&mut xe.buf, x86_pslld_imm(0, amount))
+      elsif form == 1 then
+        x86_emit(&mut xe.buf, x86_psrld_imm(0, amount))
+      else
+        x86_emit(&mut xe.buf, x86_psrad_imm(0, amount))
+      end
+    else
+      if form == 0 then
+        x86_emit(&mut xe.buf, x86_psllq_imm(0, amount))
+      else
+        x86_emit(&mut xe.buf, x86_psrlq_imm(0, amount))
+      end
+    end
+    x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+    Result::Ok(())
+  end
+end
+
+# The per-lane variable shift: the AVX2 VPSLLVD/VPSRLVD/VPSRAVD forms
+# are the ONLY per-lane variable shifts before AVX-512 and they exist
+# for the dword lanes; every other lane class fails closed with the
+# named ISA rule. THE ONE RULE (shared with the aarch64 clamp
+# sequence): the count lanes are UNSIGNED and a count >= 32 shifts
+# every bit out — zero for VPSLLVD/VPSRLVD, sign fill for VPSRAVD —
+# exactly the hardware's dword semantics (the aarch64 side clamps its
+# signed-count SSHL/USHL to match).
+def x86_emit_vec_shift_vec(inout xe: X86Emit, form: Int, lane: LirVectorLane, da: Int, aa: Int, ca: Int, is256: Bool) -> Result[Unit, String]
+  if !xe.avx2_ok then
+    return Result::Err("x86_64: a per-lane variable shift needs the AVX2 VPSLLVD/VPSRLVD/VPSRAVD forms, but the target description's isa_features advertise no avx2 token — fail-closed")
+  end
+  if lane.elem_kind != "i32" && lane.elem_kind != "u32" then
+    return Result::Err("x86_64: per-lane variable shifts exist as the AVX2 dword forms (VPSLLVD/VPSRLVD/VPSRAVD) only; VPSLLVW/VPSLLVQ are AVX-512, so the " + lane.elem_kind + " lane class fails closed")
+  end
+  x86_emit(&mut xe.buf, x86_vmovdqu_load(0, X64::RBP, aa, is256))
+  x86_emit(&mut xe.buf, x86_vmovdqu_load(1, X64::RBP, ca, is256))
+  if form == 0 then
+    x86_emit(&mut xe.buf, x86_vex_vpsllvd_rrr(0, 0, 1, is256))
+  elsif form == 1 then
+    x86_emit(&mut xe.buf, x86_vex_vpsrlvd_rrr(0, 0, 1, is256))
+  else
+    x86_emit(&mut xe.buf, x86_vex_vpsravd_rrr(0, 0, 1, is256))
+  end
+  x86_emit(&mut xe.buf, x86_vmovdqu_store(X64::RBP, da, 0, is256))
+  Result::Ok(())
 end
 
 def x86_emit_vec_stmt(inout xe: X86Emit, alloc: LirAlloc, vop: LirVecOp, pos: Int) -> Result[Unit, String]
   match vop
   when LirVecOp::LirVecBinop(op, lane, dst, a, b) then
-    let bits = match x86_vec_binop_opcode(op, lane.elem_kind)
-    when Result::Err(e) then return Result::Err(e)
-    when Result::Ok(pr) then pr
-    end
+    let is256 = lane.bits == 256
     let da = match x86_vec_slot_disp(alloc, dst, pos, "binop destination")
     when Result::Err(e) then return Result::Err(e)
     when Result::Ok(d) then d
@@ -3455,19 +4692,108 @@ def x86_emit_vec_stmt(inout xe: X86Emit, alloc: LirAlloc, vop: LirVecOp, pos: In
     when Result::Err(e) then return Result::Err(e)
     when Result::Ok(d) then d
     end
-    x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
-    x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, ba))
-    x86_emit(&mut xe.buf, x86_sse_rr(bits.0, bits.1, 0, 1))
-    x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
-    Result::Ok(())
+    if !is256 then
+      # The explicit-extension tokens (andnot + the mask compares) route
+      # to their own planners; the base tokens keep the arithmetic plan.
+      match lir_vec_binop_intrinsic_kind(op)
+      when Option::Some(_) then
+        let plan = match x86_vec_binop_plan(op, lane.elem_kind, xe.sse41_ok)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(pl) then pl
+        end
+        match plan
+        when X86VecBinopPlan::X86VecSse(pr) then
+          x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
+          x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, ba))
+          x86_emit(&mut xe.buf, x86_sse_rr(pr.0, pr.1, 0, 1))
+          x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+        when X86VecBinopPlan::X86VecMul32Sse2 then
+          x86_emit_vec_mul32_sse2(xe, da, aa, ba)
+        when X86VecBinopPlan::X86VecMul32Sse41 then
+          x86_emit_vec_mul32_sse41(xe, da, aa, ba)
+        end
+        Result::Ok(())
+      when Option::None then
+        if lir_vec_binop_is_compare(op) then
+          x86_emit_vec_cmp(xe, op, lane, da, aa, ba)
+        else
+          x86_emit_vec_andnot(xe, da, aa, ba, false)
+        end
+      end
+    else
+      # The AVX/AVX2 256-bit arm (the desc's tokens, mirrored on xe).
+      # AND/OR/XOR use the AVX1 FP logical forms on ymm (bit-identical
+      # for the integer lane classes); every other binop uses the VEX
+      # pp/opcode of the legacy plan and needs AVX2 when its lane class
+      # is integer. The 32-bit integer multiply plans map to VPMULLD
+      # (VEX.256.66.0F38.40 — AVX2's own 256-bit form, not the SSE4.1
+      # PMULLD), so the v256 lane class is served on AVX2 without any
+      # SSE4.1 token.
+      if lir_vec_binop_is_compare(op) then
+        return Result::Err("x86_64: a 256-bit vector compare (`" + lir_vec_binop_name(op) + "` on the " + lane.elem_kind + " lane class) needs the AVX2 VPCMPEQ*/VPCMPGT* ymm forms, which are not in the stage-1 explicit-op envelope (v128 only) — fail-closed")
+      end
+      if !xe.avx_ok then
+        return Result::Err("x86_64: a 256-bit vector binop on the `" + lane.elem_kind + "` lane class needs the AVX 256-bit envelope, but the target description's isa_features advertise no avx/avx2 token (the x86_64 baseline is SSE2-only) — fail-closed")
+      end
+      if op == LirVecBinOp::LirVecAndNot then
+        # The and-not v256 form is the AVX1 VANDNPS ymm row (bitwise).
+        return x86_emit_vec_andnot(xe, da, aa, ba, true)
+      end
+      var pp = 0
+      var map = 1
+      var opcode = 0
+      var need_avx2 = false
+      match op
+      when LirVecBinOp::LirVecAnd then opcode = 0x54
+      when LirVecBinOp::LirVecOr then opcode = 0x56
+      when LirVecBinOp::LirVecXor then opcode = 0x57
+      when _ then
+        let plan = match x86_vec_binop_plan(op, lane.elem_kind, xe.sse41_ok)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(pl) then pl
+        end
+        match plan
+        when X86VecBinopPlan::X86VecSse(pr) then
+          pp = x86_vex_pp(pr.0)
+          opcode = pr.1
+          need_avx2 = !lir_vector_elem_is_float(lane.elem_kind)
+        when X86VecBinopPlan::X86VecMul32Sse2 then
+          pp = 1
+          map = 2
+          opcode = 0x40
+          need_avx2 = true
+        when X86VecBinopPlan::X86VecMul32Sse41 then
+          pp = 1
+          map = 2
+          opcode = 0x40
+          need_avx2 = true
+        end
+      end
+      if need_avx2 && !xe.avx2_ok then
+        return Result::Err("x86_64: a 256-bit integer vector binop (" + lane.elem_kind + ") needs the AVX2 256-bit integer forms (VPADD/VPADDQ/VPADDD/VPSUB*/VPMULLW/VPMULLD ymm), but the target description's isa_features advertise no avx2 token — fail-closed")
+      end
+      x86_emit(&mut xe.buf, x86_vmovdqu_load(0, X64::RBP, aa, true))
+      x86_emit(&mut xe.buf, x86_vmovdqu_load(1, X64::RBP, ba, true))
+      x86_emit(&mut xe.buf, x86_vex_rrr(map, pp, opcode, 0, 0, 1, true))
+      x86_emit(&mut xe.buf, x86_vmovdqu_store(X64::RBP, da, 0, true))
+      Result::Ok(())
+    end
   when LirVecOp::LirVecLoad(lane, dst, ptr) then
     let da = match x86_vec_slot_disp(alloc, dst, pos, "load destination")
     when Result::Err(e) then return Result::Err(e)
     when Result::Ok(d) then d
     end
     let pr = x86_emit_use(xe, alloc, LirValue::LirReg(ptr), pos, X64::RAX)
-    x86_emit(&mut xe.buf, x86_movdqu_load(0, pr, 0))
-    x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+    if lane.bits == 256 then
+      if !xe.avx_ok then
+        return Result::Err("x86_64: a 256-bit vector load needs the AVX envelope (VMOVDQU ymm), but the target description's isa_features advertise no avx/avx2 token — fail-closed")
+      end
+      x86_emit(&mut xe.buf, x86_vmovdqu_load(0, pr, 0, true))
+      x86_emit(&mut xe.buf, x86_vmovdqu_store(X64::RBP, da, 0, true))
+    else
+      x86_emit(&mut xe.buf, x86_movdqu_load(0, pr, 0))
+      x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+    end
     Result::Ok(())
   when LirVecOp::LirVecStore(lane, src, ptr) then
     let sa = match x86_vec_slot_disp(alloc, src, pos, "store source")
@@ -3475,13 +4801,43 @@ def x86_emit_vec_stmt(inout xe: X86Emit, alloc: LirAlloc, vop: LirVecOp, pos: In
     when Result::Ok(d) then d
     end
     let pr = x86_emit_use(xe, alloc, LirValue::LirReg(ptr), pos, X64::RAX)
-    x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, sa))
-    x86_emit(&mut xe.buf, x86_movdqu_store(pr, 0, 0))
+    if lane.bits == 256 then
+      if !xe.avx_ok then
+        return Result::Err("x86_64: a 256-bit vector store needs the AVX envelope (VMOVDQU ymm), but the target description's isa_features advertise no avx/avx2 token — fail-closed")
+      end
+      x86_emit(&mut xe.buf, x86_vmovdqu_load(0, X64::RBP, sa, true))
+      x86_emit(&mut xe.buf, x86_vmovdqu_store(pr, 0, 0, true))
+    else
+      x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, sa))
+      x86_emit(&mut xe.buf, x86_movdqu_store(pr, 0, 0))
+    end
+    Result::Ok(())
+  when LirVecOp::LirVecMove(lane, dst, src) then
+    # The whole-image slot copy (the whole-vector move/copy slice):
+    # load the source image from its fixed slot into xmm0 and store it
+    # into the destination's slot — movdqu (SSE2) for v128, vmovdqu
+    # (AVX) for v256, exactly the load/store arms' encoders.
+    let da = match x86_vec_slot_disp(alloc, dst, pos, "move destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    let sa = match x86_vec_slot_disp(alloc, src, pos, "move source")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    if lane.bits == 256 then
+      if !xe.avx_ok then
+        return Result::Err("x86_64: a 256-bit vector move needs the AVX envelope (VMOVDQU ymm), but the target description's isa_features advertise no avx/avx2 token — fail-closed")
+      end
+      x86_emit(&mut xe.buf, x86_vmovdqu_load(0, X64::RBP, sa, true))
+      x86_emit(&mut xe.buf, x86_vmovdqu_store(X64::RBP, da, 0, true))
+    else
+      x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, sa))
+      x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+    end
     Result::Ok(())
   when LirVecOp::LirVecShuffle(lane, dst, a, mask) then
-    if !xe.ssse3_ok then
-      return Result::Err("x86_64: vector shuffle (" + lane.elem_kind + " byte mask) needs PSHUFB, an SSSE3 instruction — the target description's isa_features advertise no ssse3 token (the x86_64 baseline is SSE2-only) — fail-closed")
-    end
+    let is256 = lane.bits == 256
     let da = match x86_vec_slot_disp(alloc, dst, pos, "shuffle destination")
     when Result::Err(e) then return Result::Err(e)
     when Result::Ok(d) then d
@@ -3494,11 +4850,136 @@ def x86_emit_vec_stmt(inout xe: X86Emit, alloc: LirAlloc, vop: LirVecOp, pos: In
     when Result::Err(e) then return Result::Err(e)
     when Result::Ok(d) then d
     end
-    x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
-    x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, ma))
-    x86_emit(&mut xe.buf, x86_pshufb_rr(0, 1))
-    x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+    if is256 then
+      # VPSHUFB ymm (AVX2): each 128-bit lane shuffles within itself —
+      # the same per-half semantics the aarch64 arm implements.
+      if !xe.avx2_ok then
+        return Result::Err("x86_64: a 256-bit vector shuffle needs VPSHUFB ymm (AVX2), but the target description's isa_features advertise no avx2 token — fail-closed")
+      end
+      x86_emit(&mut xe.buf, x86_vmovdqu_load(0, X64::RBP, aa, true))
+      x86_emit(&mut xe.buf, x86_vmovdqu_load(1, X64::RBP, ma, true))
+      x86_emit(&mut xe.buf, x86_vex_pshufb(0, 0, 1, true))
+      x86_emit(&mut xe.buf, x86_vmovdqu_store(X64::RBP, da, 0, true))
+      Result::Ok(())
+    else
+      if !xe.ssse3_ok then
+        return Result::Err("x86_64: vector shuffle (" + lane.elem_kind + " byte mask) needs PSHUFB, an SSSE3 instruction — the target description's isa_features advertise no ssse3 token (the x86_64 baseline is SSE2-only) — fail-closed")
+      end
+      x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, aa))
+      x86_emit(&mut xe.buf, x86_movdqu_load(1, X64::RBP, ma))
+      x86_emit(&mut xe.buf, x86_pshufb_rr(0, 1))
+      x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+      Result::Ok(())
+    end
+  when LirVecOp::LirVecAbiBind(lane, dst, index) then
+    # The vector parameter entry bind (audit item 34 stage 2): the ABI
+    # vector register at the plan's SIMD&FP-file position holds the
+    # caller's image; store it into the parameter vreg's fixed slot
+    # image.  A 256-bit image uses the ymm file (AVX).
+    let da = match x86_vec_slot_disp(alloc, dst, pos, "ABI bind destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    if lane.bits == 256 then
+      if !xe.avx_ok then
+        return Result::Err("x86_64: a 256-bit vector ABI bind needs the AVX ymm envelope, but the target description's isa_features advertise no avx/avx2 token — fail-closed")
+      end
+      x86_emit(&mut xe.buf, x86_vmovdqu_load(index, X64::RBP, da, true))
+      x86_emit(&mut xe.buf, x86_vmovdqu_store(X64::RBP, da, index, true))
+    else
+      x86_emit(&mut xe.buf, x86_movdqu_load(index, X64::RBP, da))
+      x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, index))
+    end
     Result::Ok(())
+  when LirVecOp::LirVecAbiArg(lane, src, index) then
+    # The call-argument ABI move: load the source's fixed slot image into
+    # the ABI vector register the plan assigned.
+    let sa = match x86_vec_slot_disp(alloc, src, pos, "ABI argument source")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    if lane.bits == 256 then
+      if !xe.avx_ok then
+        return Result::Err("x86_64: a 256-bit vector ABI argument needs the AVX ymm envelope, but the target description's isa_features advertise no avx/avx2 token — fail-closed")
+      end
+      x86_emit(&mut xe.buf, x86_vmovdqu_load(index, X64::RBP, sa, true))
+    else
+      x86_emit(&mut xe.buf, x86_movdqu_load(index, X64::RBP, sa))
+    end
+    Result::Ok(())
+  when LirVecOp::LirVecShiftImm(lane, form, dst, a, amount) then
+    if lane.bits == 256 && lane.bits != 0 then
+      # The v256 shift-immediate envelope is named (the v128 SSE2 forms
+      # are the baseline; the VEX.256 shift forms need avx2).
+      if !xe.avx2_ok then
+        return Result::Err("x86_64: a 256-bit vector shift needs the AVX2 256-bit integer shift forms, but the target description's isa_features advertise no avx2 token — fail-closed")
+      end
+    end
+    let da = match x86_vec_slot_disp(alloc, dst, pos, "shift destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    let aa = match x86_vec_slot_disp(alloc, a, pos, "shift source")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    x86_emit_vec_shift_imm(xe, form, lane.elem_kind.clone(), amount, da, aa, lane.bits == 256)
+  when LirVecOp::LirVecShiftVec(lane, form, dst, a, counts) then
+    let da = match x86_vec_slot_disp(alloc, dst, pos, "shift destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    let aa = match x86_vec_slot_disp(alloc, a, pos, "shift source")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    let ca = match x86_vec_slot_disp(alloc, counts, pos, "shift counts")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    x86_emit_vec_shift_vec(xe, form, lane, da, aa, ca, lane.bits == 256)
+  when LirVecOp::LirVecSplat(lane, dst, src) then
+    x86_emit_vec_splat(xe, alloc, lane, dst, src, pos)
+  when LirVecOp::LirVecExtract(lane, dst, src, index) then
+    if lane.bits == 256 then
+      return Result::Err("x86_64: a 256-bit vector lane extract needs the AVX2 VEX lane forms, which are not in the stage-1 explicit-op envelope (v128 only) — fail-closed")
+    end
+    x86_emit_vec_extract(xe, alloc, lane, dst, src, index, pos)
+  when LirVecOp::LirVecInsert(lane, dst, src, elem, index) then
+    if lane.bits == 256 then
+      return Result::Err("x86_64: a 256-bit vector lane insert needs the AVX2 VEX lane forms, which are not in the stage-1 explicit-op envelope (v128 only) — fail-closed")
+    end
+    x86_emit_vec_insert(xe, alloc, lane, dst, src, elem, index, pos)
+  when LirVecOp::LirVecPack(from_lane, to_lane, dst, a, b) then
+    if from_lane.bits == 256 then
+      return Result::Err("x86_64: a 256-bit vector pack (`" + lir_vector_lane_name(from_lane) + "`) needs the AVX2 VPACKSS* ymm forms, which are not in the stage-1 explicit-op envelope (v128 only) — fail-closed")
+    end
+    let da = match x86_vec_slot_disp(alloc, dst, pos, "pack destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    let aa = match x86_vec_slot_disp(alloc, a, pos, "pack low operand")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    let ba = match x86_vec_slot_disp(alloc, b, pos, "pack high operand")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    x86_emit_vec_pack(xe, lir_vector_elem_bits(from_lane.elem_kind.clone()), da, aa, ba)
+  when LirVecOp::LirVecUnpack(from_lane, to_lane, hi, dst, a) then
+    if from_lane.bits == 256 then
+      return Result::Err("x86_64: a 256-bit vector unpack (`" + lir_vector_lane_name(from_lane) + "`) needs the AVX2 VPUNPCK* ymm forms, which are not in the stage-1 explicit-op envelope (v128 only) — fail-closed")
+    end
+    let da = match x86_vec_slot_disp(alloc, dst, pos, "unpack destination")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    let aa = match x86_vec_slot_disp(alloc, a, pos, "unpack source")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(d) then d
+    end
+    x86_emit_vec_unpack(xe, lir_vector_elem_bits(from_lane.elem_kind.clone()), hi, da, aa)
   end
 end
 
@@ -3521,12 +5002,59 @@ def x86_emit_kind(inout xe: X86Emit, alloc: LirAlloc, kind: LirStmtKind, pos: In
     x86_emit_cmp(xe, alloc, left, right, pos)
   when LirStmtKind::LirCset(cond, dst) then
     x86_emit_cset(xe, alloc, cond, dst, pos)
-  when LirStmtKind::LirLoadFrame(_, off) then
-    Result::Err("x86_64: LirLoadFrame at [FP+" + off.to_string() + "] does not lower — the SysV stack-argument stream is fail-closed")
+  when LirStmtKind::LirLoadFrame(dst, off) then
+    match alloc.vector_widths.get(dst)
+    when Option::Some(bits) then
+      # A vector stack-parameter bind (the stacked-vector slice): load
+      # the 16/32-byte image BY VALUE from the caller slot at
+      # [rbp + off] and store it into the parameter vreg's fixed slot
+      # image.
+      let da = match x86_vec_slot_disp(alloc, dst, pos, "stack-parameter bind destination")
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(d) then d
+      end
+      if bits == 256 then
+        if !xe.avx_ok then
+          return Result::Err("x86_64: a 256-bit vector stack-parameter bind needs the AVX ymm envelope, but the target description's isa_features advertise no avx/avx2 token — fail-closed")
+        end
+        x86_emit(&mut xe.buf, x86_vmovdqu_load(0, X64::RBP, off, true))
+        x86_emit(&mut xe.buf, x86_vmovdqu_store(X64::RBP, da, 0, true))
+      else
+        x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, off))
+        x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, da, 0))
+      end
+      Result::Ok(())
+    when Option::None then
+      Result::Err("x86_64: scalar/float LirLoadFrame at [rbp+" + off.to_string() + "] does not lower — the SysV scalar/float stack-argument stream is fail-closed (only vector byte images stack)")
+    end
   when LirStmtKind::LirStaticLoad(dst, sym) then
     x86_emit_static_load(xe, alloc, dst, sym, pos)
-  when LirStmtKind::LirPushArg(_) then
-    Result::Err("x86_64: LirPushArg does not lower — the SysV stack-argument stream is fail-closed")
+  when LirStmtKind::LirPushArg(vreg) then
+    match alloc.vector_widths.get(vreg)
+    when Option::Some(bits) then
+      # A stacked vector argument: push the 16/32-byte image BY VALUE
+      # (sub rsp, slot; then the movdqu/vmovdqu store at the new [rsp]).
+      # The call term adds the units back through stack_args.
+      let sa = match x86_vec_slot_disp(alloc, vreg, pos, "stack argument source")
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(d) then d
+      end
+      if bits == 256 then
+        if !xe.avx_ok then
+          return Result::Err("x86_64: a 256-bit vector stack argument needs the AVX ymm envelope, but the target description's isa_features advertise no avx/avx2 token — fail-closed")
+        end
+        x86_emit(&mut xe.buf, x86_vmovdqu_load(0, X64::RBP, sa, true))
+        x86_emit(&mut xe.buf, x86_alu_ri(5, X64::RSP, 32))
+        x86_emit(&mut xe.buf, x86_vmovdqu_store(X64::RSP, 0, 0, true))
+      else
+        x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, sa))
+        x86_emit(&mut xe.buf, x86_alu_ri(5, X64::RSP, 16))
+        x86_emit(&mut xe.buf, x86_movdqu_store(X64::RSP, 0, 0))
+      end
+      Result::Ok(())
+    when Option::None then
+      Result::Err("x86_64: scalar/float/general LirPushArg does not lower — the SysV scalar/float stack-argument stream is fail-closed (only vector byte images stack)")
+    end
   when LirStmtKind::LirFMove(dst, src) then
     x86_emit_fp_move(xe, alloc, dst, src, pos)
   when LirStmtKind::LirFBinop(op, w, dst, left, right) then
@@ -3736,6 +5264,24 @@ def x86_emit_term(inout xe: X86Emit, alloc: LirAlloc, fn_name: String, kind: Lir
     else
       match opt_v
       when Option::Some(vreg) then
+        match alloc.vector_widths.get(vreg)
+        when Option::Some(bits) then
+          # A VECTOR return (audit item 34 stage 2): load the image from
+          # the vreg's fixed slot into the fixed vector return register
+          # (xmm0, or ymm0 for a 256-bit image — abi_vector_return_name).
+          let sd = match x86_vec_slot_disp(alloc, vreg, pos, "return vector")
+          when Result::Err(e) then return Result::Err(e)
+          when Result::Ok(d) then d
+          end
+          if bits == 256 then
+            if !xe.avx_ok then
+              return Result::Err("x86_64: a 256-bit vector return needs the AVX ymm envelope, but the target description's isa_features advertise no avx/avx2 token — fail-closed")
+            end
+            x86_emit(&mut xe.buf, x86_vmovdqu_load(0, X64::RBP, sd, true))
+          else
+            x86_emit(&mut xe.buf, x86_movdqu_load(0, X64::RBP, sd))
+          end
+        when Option::None then
         match alloc.fp_widths.get(vreg)
         when Option::Some(w) then
           # A float result crosses in xmm0 (fixed float id 8).
@@ -3749,6 +5295,7 @@ def x86_emit_term(inout xe: X86Emit, alloc: LirAlloc, fn_name: String, kind: Lir
             x86_emit(&mut xe.buf, x86_mov_rr(X64::RAX, sr))
           end
         end
+        end
       when Option::None then ()
       end
     end
@@ -3760,9 +5307,10 @@ def x86_emit_term(inout xe: X86Emit, alloc: LirAlloc, fn_name: String, kind: Lir
     x86_emit(&mut xe.buf, x86_ud2())
     Result::Ok(())
   when LirTermKind::LirCall(target, args, stack_args, dest, success) then
-    if stack_args != 0 then
-      return Result::Err("x86_64: call to `" + target + "` carries caller stack slots — the SysV stack-argument stream is fail-closed")
-    end
+    # stack_args counts 16-byte caller-slot units; only the vector
+    # byte-image pushes produce them (a scalar/float/general push is
+    # refused by x86_validate_fn), and the cleanup below adds exactly
+    # 16*stack_args bytes back to RSP.
     x86_emit_call_spills(xe, alloc, pos)
     # The syscall marker (__intrinsic_syscall1..6 — see LirSysOp): the
     # pre-call argument moves already placed the args in the fixed ABI
@@ -3849,9 +5397,33 @@ def x86_emit_term(inout xe: X86Emit, alloc: LirAlloc, fn_name: String, kind: Lir
         end
         x86_emit_call_label(xe, target)
       end
+      if stack_args != 0 then
+        # The vector byte-image caller slots: add their 16-byte units
+        # back to RSP (the LirPushArg vector arms reserved them before
+        # the call; a v256 push counted two units).
+        x86_emit(&mut xe.buf, x86_alu_ri(0, X64::RSP, 16 * stack_args))
+      end
     end
     match dest
     when Option::Some(dv) then
+      match alloc.vector_widths.get(dv)
+      when Option::Some(bits) then
+        # A VECTOR destination captures the fixed vector return register
+        # (xmm0 / ymm0) into the destination vreg's fixed slot image
+        # (audit item 34 stage 2).
+        let sd = match x86_vec_slot_disp(alloc, dv, pos, "vector call destination")
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(d) then d
+        end
+        if bits == 256 then
+          if !xe.avx_ok then
+            return Result::Err("x86_64: a 256-bit vector call result needs the AVX ymm envelope, but the target description's isa_features advertise no avx/avx2 token — fail-closed")
+          end
+          x86_emit(&mut xe.buf, x86_vmovdqu_store(X64::RBP, sd, 0, true))
+        else
+          x86_emit(&mut xe.buf, x86_movdqu_store(X64::RBP, sd, 0))
+        end
+      when Option::None then
       match alloc.fp_widths.get(dv)
       when Option::Some(w) then
         let dt = x86_fp_def_target(alloc, dv, pos)
@@ -3865,6 +5437,7 @@ def x86_emit_term(inout xe: X86Emit, alloc: LirAlloc, fn_name: String, kind: Lir
           x86_emit(&mut xe.buf, x86_mov_rr(dt.reg, X64::RAX))
         end
         x86_store_def(xe, dt)
+      end
       end
     when Option::None then ()
     end
@@ -4609,9 +6182,15 @@ def x86_64_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u
   end
   var xe = x86_emit_new()
   # The target description's isa_features decide the SSSE3 vector
-  # shuffle arm (pshufb); the baseline x86_64 description advertises
-  # SSE2 only, so the arm fails closed with the named rule.
+  # shuffle arm (pshufb), the SSE4.1 optional forms (the one-instruction
+  # PMULLD 32-bit lane multiply; the SSE2 sequence serves the baseline)
+  # and the AVX/AVX2 v256 arm (the ymm envelope and its 256-bit integer
+  # forms); the baseline x86_64 description advertises SSE2 only, so
+  # every optional-token arm fails closed with the named rule.
   xe.ssse3_ok = desc.isa_features.contains("ssse3")
+  xe.sse41_ok = desc.isa_features.contains("sse41")
+  xe.avx_ok = desc.isa_features.contains("avx") || desc.isa_features.contains("avx2")
+  xe.avx2_ok = desc.isa_features.contains("avx2")
   match x86_emit_program_statics(xe, program)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(_) then ()

@@ -1,0 +1,695 @@
+# tests/lir_vector_ext_op_rows_test.tg — the LIR EXPLICIT-OP EXTENSION
+# lane (the completed SIMD op surface's LIR rows).
+#
+# What this suite pins, per op class:
+#   1. THE LOWERING ROWS (aarch64): a MirCall to a
+#      __intrinsic_simd_<op>_<lane> extension name (andnot / the mask
+#      compares / the immediate and vector-count shifts / splat / lane
+#      extract-insert / the signed pack-unpack pairs) lowers to ONE
+#      marked LirVecOp statement of the expected marker shape and the
+#      whole function verifies clean through verify_lir. The float
+#      splat rows cover both the FP-class local source and the
+#      MirFloat constant (the LirFConst materialization).
+#   2. THE SEMANTIC-SET REFUSALS: the float gt/ge compares, the 64-bit
+#      integer ordering compares, the float lane extract/insert, the
+#      non-narrow pack source, the out-of-range shift immediate and the
+#      out-of-range lane index all fail closed at the lowering with the
+#      named rule (no marker is produced).
+#   2b. THE AARCH64 EMISSION ROWS (the vector-count shift): every
+#      integer lane class emits the unsigned-count clamp sequence (UMIN
+#      against a width splat, or CMHI + BIT for i64x2) before the
+#      signed-count SSHL/USHL, pinned instruction-for-instruction
+#      against the offline-assembled words.
+#   3. THE ROUTER COVERAGE: every extension name the std/simd.tg surface
+#      declares classifies (the lir_simd_ext_op_of half) — the model
+#      rows live in tests/lir_vector_model_test.tg; this file exercises
+#      the LOWERING half.
+#
+# Run with: tg test tests/lir_vector_ext_op_rows_test.tg
+
+use std::core::{Option, Result, Unit, Bool, Int, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::asm::{Arch, OsAbi, asm_target, A64V}
+use tg_compiler::ast::layout_attrs_plain
+use tg_compiler::codegen::codegen_new
+use tg_compiler::ids::{TypeId, MirLocalId, MirBlockId}
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirBlock, MirStatement,
+  MirOperand, MirOperandKind, MirConstant, MirConstantKind,
+  MirTerminator, MirTerminatorKind, MirCallArg, MirCallValue,
+  MirTypeDef, MirTypeDefKind, MirFieldDef,
+  Place, place_local
+}
+use tg_compiler::token::span_dummy
+use tg_compiler::types::{Type, AccessEffect}
+use tg_compiler::lir::{
+  LirFunction, LirVecOp, LirVecBinOp, LirVerifyRoute,
+  LirAlloc, LirSeg, LirVectorLane,
+  lower_mir_fn_to_lir_prog,
+  lir_alloc_registers_a64, verify_lir, lir_emit_vec_stmt
+}
+
+# ———————————————————————————————————————————————————————————————
+# Fixtures: the SIMD vector type universe (the Vec2/Vec4/Vec8/Vec16
+# name gate with concrete field rows).
+# ———————————————————————————————————————————————————————————————
+
+def lx_vec_def(tid: Int, name: String, lane: Type, lanes: Int) -> MirTypeDef
+  var fields: Vec[MirFieldDef] = Vec::new()
+  var i = 0
+  while i < lanes do
+    fields.push(MirFieldDef { name: "e" + i.to_string(), ty: lane.clone() })
+    i = i + 1
+  end
+  MirTypeDef {
+    id: TypeId { id: tid },
+    name: name,
+    kind: MirTypeDefKind::Struct(fields),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def lx_type_defs() -> Map[Int, MirTypeDef]
+  var defs: Map[Int, MirTypeDef] = Map::new()
+  defs.insert(300, lx_vec_def(300, "Vec4", Type::I32, 4))
+  defs.insert(301, lx_vec_def(301, "Vec8", Type::I16, 8))
+  defs.insert(302, lx_vec_def(302, "Vec16", Type::I8, 16))
+  defs.insert(303, lx_vec_def(303, "Vec2", Type::I64, 2))
+  defs.insert(304, lx_vec_def(304, "Vec4", Type::F32, 4))
+  defs.insert(305, lx_vec_def(305, "Vec2", Type::Float, 2))
+  defs
+end
+
+def lx_i32x4_ty() -> Type = Type::Adt(TypeId { id: 300 }, Vec::from([Type::I32]))
+def lx_i16x8_ty() -> Type = Type::Adt(TypeId { id: 301 }, Vec::from([Type::I16]))
+def lx_i8x16_ty() -> Type = Type::Adt(TypeId { id: 302 }, Vec::from([Type::I8]))
+def lx_i64x2_ty() -> Type = Type::Adt(TypeId { id: 303 }, Vec::from([Type::I64]))
+def lx_f32x4_ty() -> Type = Type::Adt(TypeId { id: 304 }, Vec::from([Type::F32]))
+def lx_f64x2_ty() -> Type = Type::Adt(TypeId { id: 305 }, Vec::from([Type::Float]))
+
+# ———————————————————————————————————————————————————————————————
+# MIR fixtures: one call to the extension intrinsic under test.
+#   local 0 = the Unit return place, ids 1/2 the call arguments (the
+#   vector/scalar parameters), id 3 the call destination.
+# ———————————————————————————————————————————————————————————————
+
+def lx_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal { id: MirLocalId { id: id }, name: name, ty: ty, is_mut: is_mut, span: span_dummy() }
+end
+
+def lx_block(bid: Int, term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: bid }, statements: Vec::new(), terminator: term }
+end
+
+def lx_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def lx_place(id: Int) -> Place = place_local(MirLocalId { id: id })
+
+def lx_place_arg(id: Int) -> MirCallArg
+  MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Place(lx_place(id)) }
+end
+
+def lx_int_arg(v: Int) -> MirCallArg
+  MirCallArg {
+    effect: AccessEffect::Read,
+    value: MirCallValue::Value(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirInt(v),
+        ty: Type::I32,
+        instance: Option::None
+      })
+    })
+  }
+end
+
+def lx_float_arg(v: Float) -> MirCallArg
+  MirCallArg {
+    effect: AccessEffect::Read,
+    value: MirCallValue::Value(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirFloat(v),
+        ty: Type::F32,
+        instance: Option::None
+      })
+    })
+  }
+end
+
+def lx_fn_item(name: String) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem(name),
+      ty: Type::Unit,
+      instance: Option::None
+    })
+  }
+end
+
+# The call fixture: `a` (and optionally `b`) are vector parameters, `c`
+# is the whole-local destination. `n_args` counts the place arguments;
+# `const_arg` < 0 appends no immediate.
+def lx_call_fn(name: String, callee: String, a_ty: Type, b_ty: Type, dest_ty: Type, n_args: Int, const_arg: Int) -> MirFunction
+  var args: Vec[MirCallArg] = Vec::new()
+  args.push(lx_place_arg(1))
+  var params: Vec[MirLocal] = Vec::from([lx_local(1, "a", a_ty.clone(), false)])
+  var locals: Vec[MirLocal] = Vec::from([
+    lx_local(0, "ret", Type::Unit, false),
+    lx_local(1, "a", a_ty.clone(), false)
+  ])
+  if n_args > 1 then
+    args.push(lx_place_arg(2))
+    params.push(lx_local(2, "b", b_ty.clone(), false))
+    locals.push(lx_local(2, "b", b_ty.clone(), false))
+  end
+  if const_arg >= 0 then
+    args.push(lx_int_arg(const_arg))
+  end
+  locals.push(lx_local(3, "c", dest_ty.clone(), true))
+  let call = MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: lx_place(3),
+      func: lx_fn_item(callee),
+      args: args,
+      success: MirBlockId { id: 1 },
+      unwind: Option::None,
+      intrinsic: Option::None,
+      tail: false
+    },
+    span: span_dummy()
+  }
+  MirFunction {
+    name: name,
+    params: params,
+    ret_type: Type::Unit,
+    locals: locals,
+    blocks: Vec::from([lx_block(0, call), lx_block(1, lx_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Lowering helpers.
+# ———————————————————————————————————————————————————————————————
+
+def lx_lower(f: MirFunction, defs: Map[Int, MirTypeDef]) -> LirFunction
+  match lower_mir_fn_to_lir_prog(f, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Err(e) then panic("vector extension lowering failed closed: " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def lx_lower_result(f: MirFunction, defs: Map[Int, MirTypeDef]) -> Result[LirFunction, String]
+  lower_mir_fn_to_lir_prog(f, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+end
+
+# The first marked vector statement of a lowered function.
+def lx_first_vec(lf: LirFunction) -> Option[LirVecOp]
+  var found: Option[LirVecOp] = Option::None
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].vec
+      when Option::Some(vop) then
+        if found == Option::None then found = Option::Some(vop) end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  found
+end
+
+def lx_first_violation(v: Vec[String]) -> String
+  if v.len() > 0 then v[0] else "" end
+end
+
+def lx_verify_clean(lf: LirFunction) -> Unit
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyA64)
+  if violations.len() != 0 then
+    panic("the extension lowering row must verify clean; first: " + lx_first_violation(violations))
+  end
+end
+
+# Assert the first marker is a binop with the expected token and lane.
+def lx_check_binop(lf: LirFunction, want_op: LirVecBinOp, want_lane: String) -> Unit
+  match lx_first_vec(lf)
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecBinop(op, lane, _, _, _) then
+      if op != want_op then
+        panic("the extension binop marker carries the wrong op token")
+      end
+      if lane.elem_kind + "x" + lane.lanes.to_string() != want_lane then
+        panic("the extension binop marker carries the wrong lane class")
+      end
+    when _ then panic("the extension call lowered to a non-binop marker")
+    end
+  when Option::None then panic("the extension call emitted no marker")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. The andnot / compare lowering + verify rows.
+# ———————————————————————————————————————————————————————————————
+
+def lx_binop_row(fn_name: String, callee: String, a_ty: Type, lane_name: String, want_op: LirVecBinOp) -> Unit
+  let defs = lx_type_defs()
+  let lf = lx_lower(lx_call_fn(fn_name, callee, a_ty.clone(), a_ty.clone(), a_ty, 2, -1), defs)
+  lx_check_binop(lf.clone(), want_op, lane_name)
+  lx_verify_clean(lf)
+end
+
+@test
+def test_ext_binop_lowering_rows() -> Unit
+  lx_binop_row("ext_andnot_i32", "__intrinsic_simd_andnot_i32x4", lx_i32x4_ty(), "i32x4", LirVecBinOp::LirVecAndNot)
+  lx_binop_row("ext_eq_i32", "__intrinsic_simd_eq_i32x4", lx_i32x4_ty(), "i32x4", LirVecBinOp::LirVecEq)
+  lx_binop_row("ext_lt_i16", "__intrinsic_simd_lt_i16x8", lx_i16x8_ty(), "i16x8", LirVecBinOp::LirVecLt)
+  lx_binop_row("ext_gt_i8", "__intrinsic_simd_gt_i8x16", lx_i8x16_ty(), "i8x16", LirVecBinOp::LirVecGt)
+  lx_binop_row("ext_le_i32", "__intrinsic_simd_le_i32x4", lx_i32x4_ty(), "i32x4", LirVecBinOp::LirVecLe)
+  lx_binop_row("ext_ge_i16", "__intrinsic_simd_ge_i16x8", lx_i16x8_ty(), "i16x8", LirVecBinOp::LirVecGe)
+  lx_binop_row("ext_eq_i64", "__intrinsic_simd_eq_i64x2", lx_i64x2_ty(), "i64x2", LirVecBinOp::LirVecEq)
+  lx_binop_row("ext_eq_f32", "__intrinsic_simd_eq_f32x4", lx_f32x4_ty(), "f32x4", LirVecBinOp::LirVecEq)
+  lx_binop_row("ext_lt_f64", "__intrinsic_simd_lt_f64x2", lx_f64x2_ty(), "f64x2", LirVecBinOp::LirVecLt)
+  lx_binop_row("ext_le_f32", "__intrinsic_simd_le_f32x4", lx_f32x4_ty(), "f32x4", LirVecBinOp::LirVecLe)
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. The shift / splat / lane / pack lowering + verify rows.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_ext_shift_imm_lowering_rows() -> Unit
+  let defs = lx_type_defs()
+  let lf = lx_lower(lx_call_fn("ext_shl_imm", "__intrinsic_simd_shl_imm_i32x4", lx_i32x4_ty(), lx_i32x4_ty(), lx_i32x4_ty(), 1, 3), defs)
+  match lx_first_vec(lf.clone())
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecShiftImm(lane, form, _, _, amount) then
+      if form != 0 || amount != 3 then panic("shl_imm must lower to form 0 with the amount 3") end
+      if lane.elem_kind != "i32" then panic("shl_imm must carry the i32 lane class") end
+    when _ then panic("shl_imm lowered to a non-shift marker")
+    end
+  when Option::None then panic("shl_imm emitted no marker")
+  end
+  lx_verify_clean(lf)
+end
+
+@test
+def test_ext_shift_vec_lowering_rows() -> Unit
+  let defs = lx_type_defs()
+  let lf = lx_lower(lx_call_fn("ext_sar_vec", "__intrinsic_simd_sar_i16x8", lx_i16x8_ty(), lx_i16x8_ty(), lx_i16x8_ty(), 2, -1), defs)
+  match lx_first_vec(lf.clone())
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecShiftVec(lane, form, _, _, _) then
+      if form != 2 then panic("sar must lower to the arithmetic shift form 2") end
+      if lane.elem_kind != "i16" then panic("sar must carry the i16 lane class") end
+    when _ then panic("the vector-count shift lowered to a non-shift marker")
+    end
+  when Option::None then panic("the vector-count shift emitted no marker")
+  end
+  lx_verify_clean(lf)
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2b. The aarch64 emission rows for the vector-count shift: the
+#     unsigned-count clamp sequence shared with the x86 rule. The raw
+#     count vector is clamped to the lane width (UMIN against a width
+#     splat for 8/16/32-bit lanes, CMHI + BIT for the 64-bit lanes —
+#     AdvSIMD has no 64-bit UMIN) before the signed-count SSHL/USHL,
+#     and the right forms negate the clamped count. The expected words
+#     are the offline-assembled little-endian words for the fixture
+#     slots (dst slot 2 [FP-24], a slot 0 [FP-8], counts slot 1
+#     [FP-16]).
+# ———————————————————————————————————————————————————————————————
+
+def lx_a64_slot_seg(vreg: Int, slot: Int) -> LirSeg
+  LirSeg { start: 0, end: 0, vreg: vreg, phys: -1, slot: slot, needs_reload: false }
+end
+
+def lx_a64_vec_alloc() -> LirAlloc
+  var segs: Map[Int, Vec[LirSeg]] = Map::new()
+  segs.insert(16, Vec::from([lx_a64_slot_seg(16, 0)]))
+  segs.insert(17, Vec::from([lx_a64_slot_seg(17, 1)]))
+  segs.insert(18, Vec::from([lx_a64_slot_seg(18, 2)]))
+  LirAlloc {
+    slots: 3,
+    frame_bytes: 16 * 4,
+    segs_of: segs,
+    spills: Vec::new(),
+    reloads: Vec::new()
+  }
+end
+
+def lx_a64_shift_vec_bytes(vop: LirVecOp) -> Vec[u8]
+  var ctx = codegen_new(asm_target(Arch::AArch64, OsAbi::Linux))
+  lir_emit_vec_stmt(&mut ctx, lx_a64_vec_alloc(), vop, 0)
+  ctx.text.bytes.clone()
+end
+
+def lx_vec_bytes_eq(a: Vec[u8], b: Vec[u8]) -> Bool
+  if a.len() != b.len() then return false end
+  var i = 0
+  while i < a.len() do
+    if a[i] != b[i] then return false end
+    i = i + 1
+  end
+  true
+end
+
+def lx_a64_shift_vec_row(what: String, vop: LirVecOp, want: Vec[u8]) -> Unit
+  let got = lx_a64_shift_vec_bytes(vop)
+  if !lx_vec_bytes_eq(got.clone(), want.clone()) then
+    panic("the aarch64 vector-count shift emission row `" + what + "` mismatches the hand-verified clamp sequence")
+  end
+end
+
+@test
+def test_ext_shift_vec_a64_emission_rows() -> Unit
+  let i8x16 = LirVectorLane { elem_kind: "i8".to_string(), lanes: 16, bits: 128 }
+  let i16x8 = LirVectorLane { elem_kind: "i16".to_string(), lanes: 8, bits: 128 }
+  let i32x4 = LirVectorLane { elem_kind: "i32".to_string(), lanes: 4, bits: 128 }
+  let i64x2 = LirVectorLane { elem_kind: "i64".to_string(), lanes: 2, bits: 128 }
+  # i8x16 shl: dup v2.16b + umin v1.16b (the 8-bit UMIN clamp).
+  lx_a64_shift_vec_row("i8x16 shl", LirVecOp::LirVecShiftVec(i8x16, 0, 18, 16, 17), Vec::from([
+    0xB0, 0x63, 0x00, 0xD1,
+    0xB1, 0x23, 0x00, 0xD1,
+    0xAF, 0x43, 0x00, 0xD1,
+    0x20, 0x02, 0xC0, 0x3D,
+    0xE1, 0x01, 0xC0, 0x3D,
+    0x11, 0x01, 0x80, 0xD2,
+    0x22, 0x0E, 0x01, 0x4E,
+    0x21, 0x6C, 0x22, 0x6E,
+    0x00, 0x44, 0x21, 0x4E,
+    0x00, 0x02, 0x80, 0x3D
+  ]))
+  # i16x8 lsr: dup v2.8h + umin v1.8h then neg v1.8h + ushl v0.8h.
+  lx_a64_shift_vec_row("i16x8 lsr", LirVecOp::LirVecShiftVec(i16x8, 1, 18, 16, 17), Vec::from([
+    0xB0, 0x63, 0x00, 0xD1,
+    0xB1, 0x23, 0x00, 0xD1,
+    0xAF, 0x43, 0x00, 0xD1,
+    0x20, 0x02, 0xC0, 0x3D,
+    0xE1, 0x01, 0xC0, 0x3D,
+    0x11, 0x02, 0x80, 0xD2,
+    0x22, 0x0E, 0x02, 0x4E,
+    0x21, 0x6C, 0x62, 0x6E,
+    0x21, 0xB8, 0x60, 0x6E,
+    0x00, 0x44, 0x61, 0x6E,
+    0x00, 0x02, 0x80, 0x3D
+  ]))
+  # i32x4 shl / lsr / asr: the dword clamp then SSHL / USHL / SSHL.
+  lx_a64_shift_vec_row("i32x4 shl", LirVecOp::LirVecShiftVec(i32x4, 0, 18, 16, 17), Vec::from([
+    0xB0, 0x63, 0x00, 0xD1,
+    0xB1, 0x23, 0x00, 0xD1,
+    0xAF, 0x43, 0x00, 0xD1,
+    0x20, 0x02, 0xC0, 0x3D,
+    0xE1, 0x01, 0xC0, 0x3D,
+    0x11, 0x04, 0x80, 0xD2,
+    0x22, 0x0E, 0x04, 0x4E,
+    0x21, 0x6C, 0xA2, 0x6E,
+    0x00, 0x44, 0xA1, 0x4E,
+    0x00, 0x02, 0x80, 0x3D
+  ]))
+  lx_a64_shift_vec_row("i32x4 lsr", LirVecOp::LirVecShiftVec(i32x4, 1, 18, 16, 17), Vec::from([
+    0xB0, 0x63, 0x00, 0xD1,
+    0xB1, 0x23, 0x00, 0xD1,
+    0xAF, 0x43, 0x00, 0xD1,
+    0x20, 0x02, 0xC0, 0x3D,
+    0xE1, 0x01, 0xC0, 0x3D,
+    0x11, 0x04, 0x80, 0xD2,
+    0x22, 0x0E, 0x04, 0x4E,
+    0x21, 0x6C, 0xA2, 0x6E,
+    0x21, 0xB8, 0xA0, 0x6E,
+    0x00, 0x44, 0xA1, 0x6E,
+    0x00, 0x02, 0x80, 0x3D
+  ]))
+  lx_a64_shift_vec_row("i32x4 asr", LirVecOp::LirVecShiftVec(i32x4, 2, 18, 16, 17), Vec::from([
+    0xB0, 0x63, 0x00, 0xD1,
+    0xB1, 0x23, 0x00, 0xD1,
+    0xAF, 0x43, 0x00, 0xD1,
+    0x20, 0x02, 0xC0, 0x3D,
+    0xE1, 0x01, 0xC0, 0x3D,
+    0x11, 0x04, 0x80, 0xD2,
+    0x22, 0x0E, 0x04, 0x4E,
+    0x21, 0x6C, 0xA2, 0x6E,
+    0x21, 0xB8, 0xA0, 0x6E,
+    0x00, 0x44, 0xA1, 0x4E,
+    0x00, 0x02, 0x80, 0x3D
+  ]))
+  # i64x2 shl / lsr / asr: the CMHI + BIT clamp (no 64-bit UMIN).
+  lx_a64_shift_vec_row("i64x2 shl", LirVecOp::LirVecShiftVec(i64x2, 0, 18, 16, 17), Vec::from([
+    0xB0, 0x63, 0x00, 0xD1,
+    0xB1, 0x23, 0x00, 0xD1,
+    0xAF, 0x43, 0x00, 0xD1,
+    0x20, 0x02, 0xC0, 0x3D,
+    0xE1, 0x01, 0xC0, 0x3D,
+    0x11, 0x08, 0x80, 0xD2,
+    0x22, 0x0E, 0x08, 0x4E,
+    0x23, 0x34, 0xE2, 0x6E,
+    0x41, 0x1C, 0xA3, 0x6E,
+    0x00, 0x44, 0xE1, 0x4E,
+    0x00, 0x02, 0x80, 0x3D
+  ]))
+  lx_a64_shift_vec_row("i64x2 lsr", LirVecOp::LirVecShiftVec(i64x2, 1, 18, 16, 17), Vec::from([
+    0xB0, 0x63, 0x00, 0xD1,
+    0xB1, 0x23, 0x00, 0xD1,
+    0xAF, 0x43, 0x00, 0xD1,
+    0x20, 0x02, 0xC0, 0x3D,
+    0xE1, 0x01, 0xC0, 0x3D,
+    0x11, 0x08, 0x80, 0xD2,
+    0x22, 0x0E, 0x08, 0x4E,
+    0x23, 0x34, 0xE2, 0x6E,
+    0x41, 0x1C, 0xA3, 0x6E,
+    0x21, 0xB8, 0xE0, 0x6E,
+    0x00, 0x44, 0xE1, 0x6E,
+    0x00, 0x02, 0x80, 0x3D
+  ]))
+  lx_a64_shift_vec_row("i64x2 asr", LirVecOp::LirVecShiftVec(i64x2, 2, 18, 16, 17), Vec::from([
+    0xB0, 0x63, 0x00, 0xD1,
+    0xB1, 0x23, 0x00, 0xD1,
+    0xAF, 0x43, 0x00, 0xD1,
+    0x20, 0x02, 0xC0, 0x3D,
+    0xE1, 0x01, 0xC0, 0x3D,
+    0x11, 0x08, 0x80, 0xD2,
+    0x22, 0x0E, 0x08, 0x4E,
+    0x23, 0x34, 0xE2, 0x6E,
+    0x41, 0x1C, 0xA3, 0x6E,
+    0x21, 0xB8, 0xE0, 0x6E,
+    0x00, 0x44, 0xE1, 0x4E,
+    0x00, 0x02, 0x80, 0x3D
+  ]))
+end
+
+@test
+def test_ext_splat_extract_insert_lowering_rows() -> Unit
+  let defs = lx_type_defs()
+  # splat: the scalar i32 parameter broadcasts into the vector dest.
+  let splat_fn = lx_call_fn("ext_splat", "__intrinsic_simd_splat_i32x4", Type::I32, Type::I32, lx_i32x4_ty(), 1, -1)
+  let splat_lf = lx_lower(splat_fn, defs.clone())
+  match lx_first_vec(splat_lf.clone())
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecSplat(lane, _, _) then
+      if lane.elem_kind != "i32" then panic("splat must carry the i32 lane class") end
+    when _ then panic("splat lowered to a non-splat marker")
+    end
+  when Option::None then panic("splat emitted no marker")
+  end
+  lx_verify_clean(splat_lf)
+  # float splat: the f32 source is FP-class and the marker stores its
+  # bit image; verify_lir accepts the FP-class scalar operand.
+  let fsplat_fn = lx_call_fn("ext_splat_f32", "__intrinsic_simd_splat_f32x4", Type::F32, Type::F32, lx_f32x4_ty(), 1, -1)
+  let fsplat_lf = lx_lower(fsplat_fn, defs.clone())
+  match lx_first_vec(fsplat_lf.clone())
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecSplat(lane, _, src) then
+      if lane.elem_kind != "f32" then panic("the f32 splat must carry the f32 lane class") end
+      if !fsplat_lf.fp_widths.contains_key(&src) then
+        panic("the f32 splat source must be recorded FP-class")
+      end
+    when _ then panic("the f32 splat lowered to a non-splat marker")
+    end
+  when Option::None then panic("the f32 splat emitted no marker")
+  end
+  lx_verify_clean(fsplat_lf)
+  # extract: the vector parameter's lane 2 into the scalar dest.
+  let extract_fn = lx_call_fn("ext_extract", "__intrinsic_simd_extract_i32x4", lx_i32x4_ty(), lx_i32x4_ty(), Type::I32, 1, 2)
+  let extract_lf = lx_lower(extract_fn, defs.clone())
+  match lx_first_vec(extract_lf.clone())
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecExtract(lane, _, _, index) then
+      if lane.elem_kind != "i32" || index != 2 then panic("extract must carry the i32 lane class at index 2") end
+    when _ then panic("extract lowered to a non-extract marker")
+    end
+  when Option::None then panic("extract emitted no marker")
+  end
+  lx_verify_clean(extract_lf)
+  # insert: the scalar parameter into lane 3 of the vector parameter.
+  let insert_fn = lx_call_fn("ext_insert", "__intrinsic_simd_insert_i16x8", lx_i16x8_ty(), Type::I16, lx_i16x8_ty(), 2, 3)
+  let insert_lf = lx_lower(insert_fn, defs.clone())
+  match lx_first_vec(insert_lf.clone())
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecInsert(lane, _, _, _, index) then
+      if lane.elem_kind != "i16" || index != 3 then panic("insert must carry the i16 lane class at index 3") end
+    when _ then panic("insert lowered to a non-insert marker")
+    end
+  when Option::None then panic("insert emitted no marker")
+  end
+  lx_verify_clean(insert_lf)
+end
+
+@test
+def test_ext_pack_unpack_lowering_rows() -> Unit
+  let defs = lx_type_defs()
+  # pack i32x4 -> i16x8.
+  let pack_fn = lx_call_fn("ext_pack", "__intrinsic_simd_pack_i32x4", lx_i32x4_ty(), lx_i32x4_ty(), lx_i16x8_ty(), 2, -1)
+  let pack_lf = lx_lower(pack_fn, defs.clone())
+  match lx_first_vec(pack_lf.clone())
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecPack(from_lane, to_lane, _, _, _) then
+      if from_lane.elem_kind != "i32" || to_lane.elem_kind != "i16" then
+        panic("pack must lower i32x4 into i16x8")
+      end
+    when _ then panic("pack lowered to a non-pack marker")
+    end
+  when Option::None then panic("pack emitted no marker")
+  end
+  lx_verify_clean(pack_lf)
+  # unpacklo i16x8 -> i32x4 and unpackhi i8x16 -> i16x8.
+  let ulo_fn = lx_call_fn("ext_unpacklo", "__intrinsic_simd_unpacklo_i16x8", lx_i16x8_ty(), lx_i16x8_ty(), lx_i32x4_ty(), 1, -1)
+  let ulo_lf = lx_lower(ulo_fn, defs.clone())
+  match lx_first_vec(ulo_lf.clone())
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecUnpack(from_lane, to_lane, hi, _, _) then
+      if from_lane.elem_kind != "i16" || to_lane.elem_kind != "i32" || hi != 0 then
+        panic("unpacklo must lower i16x8 into the i32x4 low half")
+      end
+    when _ then panic("unpacklo lowered to a non-unpack marker")
+    end
+  when Option::None then panic("unpacklo emitted no marker")
+  end
+  lx_verify_clean(ulo_lf)
+  let uhi_fn = lx_call_fn("ext_unpackhi", "__intrinsic_simd_unpackhi_i8x16", lx_i8x16_ty(), lx_i8x16_ty(), lx_i16x8_ty(), 1, -1)
+  let uhi_lf = lx_lower(uhi_fn, defs.clone())
+  match lx_first_vec(uhi_lf.clone())
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecUnpack(from_lane, to_lane, hi, _, _) then
+      if from_lane.elem_kind != "i8" || to_lane.elem_kind != "i16" || hi != 1 then
+        panic("unpackhi must lower i8x16 into the i16x8 high half")
+      end
+    when _ then panic("unpackhi lowered to a non-unpack marker")
+    end
+  when Option::None then panic("unpackhi emitted no marker")
+  end
+  lx_verify_clean(uhi_lf)
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. The float splat constant row (LirFConst materialization).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_ext_float_const_splat_row() -> Unit
+  let defs = lx_type_defs()
+  var args: Vec[MirCallArg] = Vec::new()
+  args.push(lx_float_arg(2.5))
+  var locals: Vec[MirLocal] = Vec::from([
+    lx_local(0, "ret", Type::Unit, false),
+    lx_local(3, "c", lx_f32x4_ty(), true)
+  ])
+  let call = MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: lx_place(3),
+      func: lx_fn_item("__intrinsic_simd_splat_f32x4"),
+      args: args,
+      success: MirBlockId { id: 1 },
+      unwind: Option::None,
+      intrinsic: Option::None,
+      tail: false
+    },
+    span: span_dummy()
+  }
+  let f = MirFunction {
+    name: "ext_splat_f32_const",
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: locals,
+    blocks: Vec::from([lx_block(0, call), lx_block(1, lx_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+  let lf = lx_lower(f, defs)
+  match lx_first_vec(lf.clone())
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecSplat(lane, _, src) then
+      if lane.elem_kind != "f32" then panic("the f32 const splat must carry the f32 lane class") end
+      if !lf.fp_widths.contains_key(&src) then
+        panic("the f32 const splat source must materialize as a fresh FP-class vreg")
+      end
+    when _ then panic("the f32 const splat lowered to a non-splat marker")
+    end
+  when Option::None then panic("the f32 const splat emitted no marker")
+  end
+  lx_verify_clean(lf)
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. The semantic-set refusal rows (the lowering names the rule; no
+#    marker is produced).
+# ———————————————————————————————————————————————————————————————
+
+def lx_expect_refusal(fn_name: String, f: MirFunction, defs: Map[Int, MirTypeDef], want: String) -> Unit
+  match lx_lower_result(f, defs)
+  when Result::Err(e) then
+    if !e.contains(want) then
+      panic(fn_name + " refusal must name `" + want + "`; got: " + e)
+    end
+  when Result::Ok(_) then panic(fn_name + " must fail closed")
+  end
+end
+
+@test
+def test_ext_lowering_refusal_rows() -> Unit
+  let defs = lx_type_defs()
+  # The float gt/ge are outside the explicit compare surface.
+  lx_expect_refusal("float gt", lx_call_fn("ext_gt_f32", "__intrinsic_simd_gt_f32x4", lx_f32x4_ty(), lx_f32x4_ty(), lx_f32x4_ty(), 2, -1), defs.clone(), "eq/lt/le")
+  lx_expect_refusal("float ge", lx_call_fn("ext_ge_f64", "__intrinsic_simd_ge_f64x2", lx_f64x2_ty(), lx_f64x2_ty(), lx_f64x2_ty(), 2, -1), defs.clone(), "eq/lt/le")
+  # The 64-bit integer ordering compares are equality only.
+  lx_expect_refusal("i64 lt", lx_call_fn("ext_lt_i64", "__intrinsic_simd_lt_i64x2", lx_i64x2_ty(), lx_i64x2_ty(), lx_i64x2_ty(), 2, -1), defs.clone(), "64-bit integer compare surface is equality only")
+  lx_expect_refusal("i64 ge", lx_call_fn("ext_ge_i64", "__intrinsic_simd_ge_i64x2", lx_i64x2_ty(), lx_i64x2_ty(), lx_i64x2_ty(), 2, -1), defs.clone(), "64-bit integer compare surface is equality only")
+  # The float lane extract/insert are outside the explicit surface.
+  lx_expect_refusal("float extract", lx_call_fn("ext_extract_f", "__intrinsic_simd_extract_f32x4", lx_f32x4_ty(), lx_f32x4_ty(), Type::I32, 1, 0), defs.clone(), "float lane")
+  lx_expect_refusal("float insert", lx_call_fn("ext_insert_f", "__intrinsic_simd_insert_f32x4", lx_f32x4_ty(), Type::I32, lx_f32x4_ty(), 2, 0), defs.clone(), "float lane")
+  # The pack source must have a half-width signed narrow target.
+  lx_expect_refusal("i8 pack", lx_call_fn("ext_pack_i8", "__intrinsic_simd_pack_i8x16", lx_i8x16_ty(), lx_i8x16_ty(), lx_i8x16_ty(), 2, -1), defs.clone(), "half-width")
+  # The shift immediate must be in-range.
+  lx_expect_refusal("shift imm range", lx_call_fn("ext_shl_bad", "__intrinsic_simd_shl_imm_i32x4", lx_i32x4_ty(), lx_i32x4_ty(), lx_i32x4_ty(), 1, 32), defs.clone(), "outside 0..31")
+  # The lane index must be in-range.
+  lx_expect_refusal("extract index", lx_call_fn("ext_extract_bad", "__intrinsic_simd_extract_i32x4", lx_i32x4_ty(), lx_i32x4_ty(), Type::I32, 1, 4), defs.clone(), "outside 0..3")
+  lx_expect_refusal("insert index", lx_call_fn("ext_insert_bad", "__intrinsic_simd_insert_i16x8", lx_i16x8_ty(), Type::I16, lx_i16x8_ty(), 2, 8), defs.clone(), "outside 0..7")
+end

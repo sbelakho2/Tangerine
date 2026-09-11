@@ -1,0 +1,986 @@
+# tests/lir_vector_abi_rows_test.tg — the LIR VECTOR PARAMS/RETURNS +
+# ABI CROSSINGS slice (audit item 34 stage 2).
+#
+# What this suite pins:
+#   1. THE PLAN ROWS (the classify_call_plan authority): a v128 vector
+#      parameter crosses in the shared SIMD&FP register file — "v0..v7"
+#      on aarch64, "xmm0..xmm7" on x86-64 — with the file index carried
+#      on the typed RegisterVector location; a 9th vector argument
+#      overflows to the caller stack BY VALUE; the return crosses in
+#      v0/xmm0/ymm0 (abi_vector_return_name) through the plan's FprT
+#      carrier; a 256-bit vector is promoted to the Vector(32) class in
+#      the ymm file ONLY on an x86-64 desc carrying the avx/avx2 tokens
+#      (otherwise the desc-free ByAddress(32) memory class stands);
+#      vector and float parameters share the file positionally
+#      (abi_vector_reg_count / abi_vector_arg_count — the x86 AL rule's
+#      inputs).
+#   2. THE LIR LANE ROWS (aarch64): a slice of parameter-to-return
+#      functions lowered with lower_mir_fn_to_lir_prog — the entry bind
+#      marker LirVecAbiBind carries the plan's index, the Ret carries
+#      the vector vreg, the vector image stays memory-resident
+#      (phys = -1) across a call, and verify_lir stays clean.
+#   3. THE v256 GATE: a 256-bit vector function fails closed on the
+#      baseline x86-64 desc (naming the descriptor) and lowers on an
+#      AVX2-advertising desc (a 4-slot 32-byte image); aarch64 never
+#      admits v256 even with synthetic AVX tokens (the ymm file is
+#      x86-64 SysV's).
+#   4. THE UNIFIED MIXED STREAM + STACKED VECTORS: a mixed F64/vec/F32
+#      signature places a=d0, b=v1, c=d2 through ONE plan-driven walk
+#      (the entry binds and the caller argument moves both consume the
+#      plan's shared SIMD&FP positions); vectors beyond the eight file
+#      positions cross BY VALUE on the caller stack — the caller emits
+#      a LirPushArg vector image (no ABI register marker), the callee
+#      binds with the LirLoadFrame vector image at the plan's slot
+#      (16 + 16*k), and verify_lir stays clean on the aarch64 route.
+#
+# Run with: tg test tests/lir_vector_abi_rows_test.tg
+
+use std::core::{Option, Result, Unit, Bool, Int, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::ast::layout_attrs_plain
+use tg_compiler::ids::{TypeId, MirLocalId, MirBlockId}
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirBlock, MirStatement,
+  MirOperand, MirOperandKind, MirConstant, MirConstantKind,
+  MirTerminator, MirTerminatorKind, MirCallArg, MirCallValue,
+  MirTypeDef, MirTypeDefKind, MirFieldDef,
+  Place, place_local
+}
+use tg_compiler::token::span_dummy
+use tg_compiler::types::{Type, AccessEffect}
+use tg_compiler::target_desc::{TargetDesc, aarch64_desc, x86_64_desc}
+use tg_compiler::layout_engine::{
+  LayoutEngine, aarch64_target, layout_engine_new, layout_engine_register_types,
+  classify_call_plan, AbiFlavor, AbiValueClass,
+  abi_value_class_word, abi_return_text, abi_return_uses_sret,
+  abi_location_text, abi_location_vector_index,
+  abi_vector_name, abi_vector_return_name,
+  vector_crossing_legal, vector_crossing_reason,
+  abi_vector_arg_count, abi_vector_reg_count
+}
+use tg_compiler::lir::{
+  LirFunction, LirStmtKind, LirVecOp, LirTermKind, LirVerifyRoute,
+  lower_mir_fn_to_lir_prog, lower_mir_fn_to_lir_mode_ty,
+  lir_alloc_registers_a64, verify_lir
+}
+
+# ———————————————————————————————————————————————————————————————
+# Fixtures: the SIMD vector type universe (concrete non-generic field
+# rows, the SIMD ABI probe's make_vec_def shape).
+# ———————————————————————————————————————————————————————————————
+
+def vab_vec_def(tid: Int, name: String, lane: Type, lanes: Int) -> MirTypeDef
+  var fields: Vec[MirFieldDef] = Vec::new()
+  var i = 0
+  while i < lanes do
+    fields.push(MirFieldDef { name: "e" + i.to_string(), ty: lane.clone() })
+    i = i + 1
+  end
+  MirTypeDef {
+    id: TypeId { id: tid },
+    name: name,
+    kind: MirTypeDefKind::Struct(fields),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def vab_type_defs() -> Map[Int, MirTypeDef]
+  var defs: Map[Int, MirTypeDef] = Map::new()
+  defs.insert(300, vab_vec_def(300, "Vec4", Type::F32, 4))
+  defs.insert(301, vab_vec_def(301, "Vec8", Type::F32, 8))
+  defs.insert(302, vab_vec_def(302, "Vec2", Type::Float, 2))
+  defs
+end
+
+def vab_vec4_ty() -> Type
+  Type::Adt(TypeId { id: 300 }, Vec::from([Type::F32]))
+end
+
+def vab_vec8_ty() -> Type
+  Type::Adt(TypeId { id: 301 }, Vec::from([Type::F32]))
+end
+
+def vab_vec2_ty() -> Type
+  Type::Adt(TypeId { id: 302 }, Vec::from([Type::Float]))
+end
+
+# An AVX2-advertising x86-64 description (the isa_features opt-in the
+# target-vector authority suite documents; no canonical desc carries it).
+def vab_avx2_desc() -> TargetDesc
+  var d = x86_64_desc()
+  d.name = "x86_64+avx2"
+  d.isa_features = Vec::from(["sse2", "avx", "avx2"])
+  d
+end
+
+# An aarch64 desc carrying synthetic AVX tokens: the width authority
+# still refuses v256 (the ymm file is x86-64 SysV's).
+def vab_avx_aarch64_desc() -> TargetDesc
+  var d = aarch64_desc()
+  d.name = "aarch64+avx"
+  d.isa_features = Vec::from(["avx", "avx2"])
+  d
+end
+
+def vab_engine(defs: Map[Int, MirTypeDef]) -> LayoutEngine
+  mut engine = layout_engine_new(aarch64_target())
+  var all: Vec[MirTypeDef] = Vec::new()
+  for (_, td) in defs do
+    all.push(td.clone())
+  end
+  layout_engine_register_types(&mut engine, &all)
+  engine
+end
+
+def vab_plan(desc: TargetDesc, params: Vec[Type], ret: Type) -> (AbiValueClass, Int, String)
+  mut engine = vab_engine(vab_type_defs())
+  match classify_call_plan(&mut engine, desc, AbiFlavor::InternalValue, params, ret, false)
+  when Result::Err(e) then
+    panic("vector ABI plan failed closed unexpectedly: " + e.message)
+  when Result::Ok(plan) then
+    (plan.args[0].value_class, plan.args[0].size, abi_location_text(plan.args[0].location.clone()))
+  end
+end
+
+def vab_class_word(cls: AbiValueClass) -> String
+  abi_value_class_word(cls)
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. The plan rows: v128 register crossings, shared file, overflow.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_vector_plan_aarch64_v128_rows() -> Unit
+  let d = aarch64_desc()
+  # A v128 parameter crosses in v0 (the first SIMD&FP file position).
+  let row0 = vab_plan(d.clone(), Vec::from([vab_vec4_ty()]), Type::Unit)
+  assert(vab_class_word(row0.0) == "vector:16", "a v128 param must classify Vector(16), got " + vab_class_word(row0.0))
+  assert(row0.1 == 16, "a v128 param payload is 16 bytes")
+  assert(row0.2 == "v0", "a v128 param crosses in v0, got " + row0.2)
+  # Three vector parameters occupy v0/v1/v2 in order.
+  mut engine = vab_engine(vab_type_defs())
+  match classify_call_plan(&mut engine, d.clone(), AbiFlavor::InternalValue, Vec::from([vab_vec4_ty(), vab_vec2_ty(), vab_vec4_ty()]), Type::Unit, false)
+  when Result::Err(e) then panic("three-vector plan failed closed: " + e.message)
+  when Result::Ok(plan) then
+    assert(plan.args.len() == 3, "three parameters yield three plan arguments")
+    assert(abi_location_vector_index(plan.args[0].location) == 0, "vector param 0 is file position 0")
+    assert(abi_location_vector_index(plan.args[1].location) == 1, "vector param 1 is file position 1")
+    assert(abi_location_vector_index(plan.args[2].location) == 2, "vector param 2 is file position 2")
+    assert(abi_location_text(plan.args[0].location.clone()) == "v0", "vector param 0 renders v0")
+    assert(abi_location_text(plan.args[1].location.clone()) == "v1", "vector param 1 renders v1")
+    assert(abi_location_text(plan.args[2].location.clone()) == "v2", "vector param 2 renders v2")
+  end
+  # The 9th vector argument overflows the eight-position file: it crosses
+  # BY VALUE on the caller stack (indirect = false — the image itself is
+  # the slot contents), rendered stack+<offset>.
+  mut engine9 = vab_engine(vab_type_defs())
+  var nine: Vec[Type] = Vec::new()
+  var i = 0
+  while i < 9 do
+    nine.push(vab_vec4_ty())
+    i = i + 1
+  end
+  match classify_call_plan(&mut engine9, d.clone(), AbiFlavor::InternalValue, nine, Type::Unit, false)
+  when Result::Err(e) then panic("nine-vector plan failed closed: " + e.message)
+  when Result::Ok(plan) then
+    assert(abi_location_vector_index(plan.args[8].location) == -1, "the 9th vector param is not a vector register crossing")
+    assert(abi_location_text(plan.args[8].location.clone()).starts_with("stack+"), "the 9th vector param crosses on the caller stack, got " + abi_location_text(plan.args[8].location.clone()))
+    assert(!plan.args[8].indirect, "a stacked vector argument crosses by value (the image is the payload)")
+    assert(plan.args[8].size == 16, "the stacked vector argument payload is 16 bytes")
+  end
+end
+
+@test
+def test_vector_return_plan_rows() -> Unit
+  # The vector return is the fixed v0/xmm0/ymm0 crossing: the plan's
+  # FprT carrier (never sret), rendered "direct:vector:<bytes>".
+  assert(abi_vector_return_name(aarch64_desc(), 128) == "v0", "aarch64 vector return is v0")
+  assert(abi_vector_return_name(x86_64_desc(), 128) == "xmm0", "x86-64 v128 return is xmm0")
+  assert(abi_vector_return_name(x86_64_desc(), 256) == "ymm0", "x86-64 v256 return is ymm0")
+  assert(abi_vector_name(aarch64_desc(), 5, 128) == "v5", "aarch64 vector file name at index 5")
+  assert(abi_vector_name(x86_64_desc(), 5, 256) == "ymm5", "x86-64 256-bit vector file name at index 5")
+  mut engine = vab_engine(vab_type_defs())
+  match classify_call_plan(&mut engine, aarch64_desc(), AbiFlavor::InternalValue, Vec::new(), vab_vec4_ty(), false)
+  when Result::Err(e) then panic("vector return plan failed closed: " + e.message)
+  when Result::Ok(plan) then
+    assert(abi_return_text(plan.ret) == "direct:vector:16", "a v128 return is direct:vector:16, got " + abi_return_text(plan.ret))
+    assert(!abi_return_uses_sret(plan.ret), "a v128 return does not use sret")
+  end
+  # A 32-byte vector return on the baseline x86-64 desc keeps the
+  # desc-free ByAddress(32) memory class (the SysV "else memory" rule);
+  # on the AVX2 desc it is promoted to the ymm0 vector return.
+  mut e_sse = vab_engine(vab_type_defs())
+  match classify_call_plan(&mut e_sse, x86_64_desc(), AbiFlavor::InternalValue, Vec::new(), vab_vec8_ty(), false)
+  when Result::Err(e) then panic("baseline v256 return plan failed closed: " + e.message)
+  when Result::Ok(plan) then
+    assert(abi_return_text(plan.ret) == "sret:by-address:32", "a v256 return without AVX stays the by-address sret class, got " + abi_return_text(plan.ret))
+    assert(abi_return_uses_sret(plan.ret), "a v256 return without AVX uses the memory sret class")
+  end
+  mut e_avx = vab_engine(vab_type_defs())
+  match classify_call_plan(&mut e_avx, vab_avx2_desc(), AbiFlavor::InternalValue, Vec::new(), vab_vec8_ty(), false)
+  when Result::Err(e) then panic("AVX v256 return plan failed closed: " + e.message)
+  when Result::Ok(plan) then
+    assert(abi_return_text(plan.ret) == "direct:vector:32", "a v256 return with AVX is direct:vector:32, got " + abi_return_text(plan.ret))
+    assert(!abi_return_uses_sret(plan.ret), "a v256 return with AVX is the ymm0 register crossing")
+  end
+end
+
+@test
+def test_vector_plan_shared_file_and_v256_rows() -> Unit
+  # The SIMD&FP file is ONE positional stream: a leading float consumes
+  # d0 and the following vector takes v1 (the same physical register
+  # file on AAPCS64).
+  mut engine = vab_engine(vab_type_defs())
+  match classify_call_plan(&mut engine, aarch64_desc(), AbiFlavor::InternalValue, Vec::from([Type::Float, vab_vec4_ty()]), Type::Unit, false)
+  when Result::Err(e) then panic("mixed float+vector plan failed closed: " + e.message)
+  when Result::Ok(plan) then
+    assert(abi_location_text(plan.args[0].location.clone()) == "d0", "the float takes d0")
+    assert(abi_location_text(plan.args[1].location.clone()) == "v1", "the vector takes the shared file's next position v1")
+    assert(abi_location_vector_index(plan.args[1].location) == 1, "the vector position is 1")
+  end
+  # v256 on x86-64 with AVX: the ymm register crossing.
+  let row_avx = vab_plan(vab_avx2_desc(), Vec::from([vab_vec8_ty()]), Type::Unit)
+  assert(vab_class_word(row_avx.0) == "vector:32", "an AVX v256 param must classify Vector(32), got " + vab_class_word(row_avx.0))
+  assert(row_avx.1 == 32, "the v256 payload is 32 bytes")
+  assert(row_avx.2 == "ymm0", "an AVX v256 param crosses in ymm0, got " + row_avx.2)
+  # v128 on x86-64: the shared SSE file's xmm0.
+  let row_x16 = vab_plan(x86_64_desc(), Vec::from([vab_vec4_ty()]), Type::Unit)
+  assert(vab_class_word(row_x16.0) == "vector:16", "an x86-64 v128 param is Vector(16), got " + vab_class_word(row_x16.0))
+  assert(row_x16.2 == "xmm0", "an x86-64 v128 param crosses in xmm0, got " + row_x16.2)
+  # v256 on the baseline x86-64 desc: no vector crossing (ByAddress memory).
+  let row_sse = vab_plan(x86_64_desc(), Vec::from([vab_vec8_ty()]), Type::Unit)
+  assert(vab_class_word(row_sse.0) == "by-address:32", "a v256 param without AVX is by-address:32, got " + vab_class_word(row_sse.0))
+  # aarch64 never models v256 even with synthetic AVX tokens.
+  assert(!vector_crossing_legal(vab_avx_aarch64_desc(), 256), "aarch64 must refuse v256 even with avx tokens (no ymm file)")
+  assert(vector_crossing_legal(vab_avx2_desc(), 256), "the AVX2 x86-64 desc admits v256")
+  assert(vector_crossing_legal(aarch64_desc(), 128), "aarch64 admits v128")
+  assert(!vector_crossing_legal(x86_64_desc(), 256), "baseline x86-64 refuses v256")
+  assert(vector_crossing_reason(x86_64_desc(), 256).contains("x86_64"), "the refusal names the descriptor")
+  # The x86 AL rule inputs: the vector-arg count and the file-position
+  # count (which includes scalar floats sharing the file).
+  mut e2 = vab_engine(vab_type_defs())
+  match classify_call_plan(&mut e2, aarch64_desc(), AbiFlavor::InternalValue, Vec::from([vab_vec4_ty(), vab_vec4_ty()]), Type::Unit, false)
+  when Result::Err(e) then panic("two-vector plan failed closed: " + e.message)
+  when Result::Ok(plan) then
+    assert(abi_vector_arg_count(plan.clone()) == 2, "two vector arguments")
+    assert(abi_vector_reg_count(plan) == 2, "two vector register positions")
+  end
+  mut e3 = vab_engine(vab_type_defs())
+  match classify_call_plan(&mut e3, aarch64_desc(), AbiFlavor::InternalValue, Vec::from([Type::Float, vab_vec4_ty()]), Type::Unit, false)
+  when Result::Err(e) then panic("float+vector plan failed closed: " + e.message)
+  when Result::Ok(plan) then
+    assert(abi_vector_arg_count(plan.clone()) == 1, "one vector argument")
+    assert(abi_vector_reg_count(plan) == 2, "the float shares the file: two positions")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. The LIR lane rows (aarch64): entry binds, returns, memory
+#    residency across a call and verify_lir.
+# ———————————————————————————————————————————————————————————————
+
+def vab_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal { id: MirLocalId { id: id }, name: name, ty: ty, is_mut: is_mut, span: span_dummy() }
+end
+
+def vab_block(bid: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: bid }, statements: stmts, terminator: term }
+end
+
+def vab_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def vab_fn_item(name: String) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem(name),
+      ty: Type::Unit,
+      instance: Option::None
+    })
+  }
+end
+
+def vab_call_term(dest: Place, callee: String, args: Vec[MirCallArg], success: Int) -> MirTerminator
+  MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: dest,
+      func: vab_fn_item(callee),
+      args: args,
+      success: MirBlockId { id: success },
+      unwind: Option::None,
+      intrinsic: Option::None,
+      tail: false
+    },
+    span: span_dummy()
+  }
+end
+
+def vab_vec_arg(local: Int) -> MirCallArg
+  MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Place(place_local(MirLocalId { id: local })) }
+end
+
+def vab_place(id: Int) -> Place
+  place_local(MirLocalId { id: id })
+end
+
+def vab_lower(f: MirFunction, defs: Map[Int, MirTypeDef]) -> LirFunction
+  match lower_mir_fn_to_lir_prog(f, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Err(e) then panic("vector lane lowering failed closed for " + f.name + ": " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def vab_find_bind(lf: LirFunction) -> Option[(Int, Int)]
+  var found: Option[(Int, Int)] = Option::None
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].vec
+      when Option::Some(vop) then
+        match vop
+        when LirVecOp::LirVecAbiBind(_, dst, index) then found = Option::Some((dst, index))
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  found
+end
+
+def vab_find_arg(lf: LirFunction) -> Option[(Int, Int)]
+  var found: Option[(Int, Int)] = Option::None
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].vec
+      when Option::Some(vop) then
+        match vop
+        when LirVecOp::LirVecAbiArg(_, src, index) then found = Option::Some((src, index))
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  found
+end
+
+@test
+def test_vector_param_return_row_aarch64() -> Unit
+  let defs = vab_type_defs()
+  # locals[0] IS the vector parameter (and the return place): the entry
+  # bind defines the same vreg the Ret reads, so the row is
+  # def-before-use clean.
+  let f = MirFunction {
+    name: "vec_identity".to_string(),
+    params: Vec::from([vab_local(0, "v", vab_vec4_ty(), false)]),
+    ret_type: vab_vec4_ty(),
+    locals: Vec::from([vab_local(0, "v", vab_vec4_ty(), false)]),
+    blocks: Vec::from([vab_block(0, Vec::new(), vab_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+  let lf = vab_lower(f, defs)
+  # The function's vector class table: one 128-bit image (the parameter).
+  assert(lf.vector_widths.len() == 1, "one vector vreg for the identity row")
+  var vv = -1
+  var bits = 0
+  for (k, w) in lf.vector_widths do
+    vv = k
+    bits = w
+  end
+  assert(bits == 128, "the identity vector is a 128-bit image")
+  # The entry bind marker carries the plan's file position 0 (v0).
+  match vab_find_bind(lf.clone())
+  when Option::Some(b) then
+    assert(b.0 == vv, "the ABI bind defines the parameter's vector vreg")
+    assert(b.1 == 0, "the ABI bind reads file position 0 (v0)")
+  when Option::None then panic("the vector parameter has no entry ABI bind marker")
+  end
+  # The Ret carries the vector vreg (the emitter moves it to v0).
+  let term = lf.blocks[lf.blocks.len() - 1].term
+  match term.kind
+  when LirTermKind::LirRet(Option::Some(rv)) then
+    assert(rv == vv, "the vector Ret carries the vector vreg")
+    assert(lf.vector_widths.contains_key(&rv), "the Ret operand is vector-class")
+  when _ then panic("the vector return row must end in a Ret carrying the vector vreg")
+  end
+  # The image is memory-resident at its fixed slot, spanning two 8-byte
+  # slots (128 bits), and the whole function verifies clean.
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  match alloc.segs_of.get(vv)
+  when Option::Some(segs) then
+    var all_mem = true
+    var si = 0
+    while si < segs.len() do
+      if segs[si].phys >= 0 then all_mem = false end
+      si = si + 1
+    end
+    assert(all_mem, "a vector vreg's segments are memory-resident (phys = -1)")
+    assert(segs[0].slot == 0, "the image sits at its fixed slot base 0")
+  when Option::None then panic("the vector vreg has no allocation segments")
+  end
+  assert(lf.agg_slots >= 2, "the vector image reserves two 8-byte slots")
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyA64)
+  assert(violations.len() == 0, "the v128 param/return row must verify clean; first: " + vab_first(violations))
+end
+
+def vab_first(v: Vec[String]) -> String
+  if v.len() > 0 then v[0] else "" end
+end
+
+@test
+def test_vector_spill_across_call_row_aarch64() -> Unit
+  let defs = vab_type_defs()
+  # locals[0] is the vector parameter (and the return place); the call
+  # passes it as a vector argument in block 0 and the Ret reads it in
+  # block 1, so the image is live ACROSS the call: memory-resident by
+  # construction, no register spill/cut.
+  let f = MirFunction {
+    name: "vec_across_call".to_string(),
+    params: Vec::from([vab_local(0, "v", vab_vec4_ty(), false)]),
+    ret_type: vab_vec4_ty(),
+    locals: Vec::from([
+      vab_local(0, "v", vab_vec4_ty(), false),
+      vab_local(1, "u", Type::Unit, false)
+    ]),
+    blocks: Vec::from([
+      vab_block(0, Vec::new(), vab_call_term(vab_place(1), "callee".to_string(), Vec::from([vab_vec_arg(0)]), 1)),
+      vab_block(1, Vec::new(), vab_ret_term())
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+  let lf = vab_lower(f, defs)
+  var vv = -1
+  for (k, _) in lf.vector_widths do
+    vv = k
+  end
+  assert(vv >= 0, "the call row has a vector vreg")
+  # The call's vector argument move marker: source vreg, file position 0.
+  match vab_find_arg(lf.clone())
+  when Option::Some(a) then
+    assert(a.0 == vv, "the ABI argument marker loads the vector vreg")
+    assert(a.1 == 0, "the vector argument crosses in v0")
+  when Option::None then panic("the vector call argument has no ABI move marker")
+  end
+  # The call terminator carries the vector vreg in its args list (the
+  # allocator's bookkeeping).
+  match lf.blocks[0].term.kind
+  when LirTermKind::LirCall(_, args, _, _, _) then
+    assert(args.len() == 1 && args[0] == vv, "the call's args carry the vector vreg")
+  when _ then panic("block 0 must end in the call")
+  end
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  # The call position cuts the interval into pre/post segments, but every
+  # segment stays memory-resident at the SAME fixed slot (a vector image
+  # never crosses in a register), and no spill/reload record names it.
+  match alloc.segs_of.get(vv)
+  when Option::Some(segs) then
+    assert(segs.len() >= 1, "the vector image has segments")
+    var all_mem = true
+    var same_slot = true
+    let base = segs[0].slot
+    var si = 0
+    while si < segs.len() do
+      if segs[si].phys >= 0 then all_mem = false end
+      if segs[si].slot != base then same_slot = false end
+      si = si + 1
+    end
+    assert(all_mem, "every segment of the vector image across the call is memory-resident (phys = -1)")
+    assert(same_slot, "the vector image keeps one fixed slot home across the call")
+  when Option::None then panic("the vector vreg has no segments")
+  end
+  var named = false
+  var si = 0
+  while si < alloc.spills.len() do
+    if alloc.spills[si].1 == vv then named = true end
+    si = si + 1
+  end
+  assert(!named, "a memory-resident vector image is never in the spill set")
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyA64)
+  assert(violations.len() == 0, "the vector-across-call row must verify clean; first: " + vab_first(violations))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. The v256 gate: AVX desc vs baseline refusal.
+# ———————————————————————————————————————————————————————————————
+
+def vab_lower_x86(f: MirFunction, defs: Map[Int, MirTypeDef], desc: TargetDesc) -> Result[LirFunction, String]
+  lower_mir_fn_to_lir_mode_ty(f, true, true, false, false, false, false, false, false, desc, true, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+end
+
+def vab_v256_fn(name: String) -> MirFunction
+  MirFunction {
+    name: name,
+    params: Vec::from([vab_local(0, "v", vab_vec8_ty(), false)]),
+    ret_type: vab_vec8_ty(),
+    locals: Vec::from([vab_local(0, "v", vab_vec8_ty(), false)]),
+    blocks: Vec::from([vab_block(0, Vec::new(), vab_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+@test
+def test_v256_admission_gated_by_avx_desc() -> Unit
+  let defs = vab_type_defs()
+  # The baseline x86-64 desc: v256 fails closed NAMING the descriptor.
+  match vab_lower_x86(vab_v256_fn("v256_baseline".to_string()), defs.clone(), x86_64_desc())
+  when Result::Err(e) then
+    assert(e.contains("x86_64"), "the v256 refusal names the descriptor: " + e)
+    assert(e.contains("256"), "the v256 refusal names the width: " + e)
+  when Result::Ok(_) then panic("the baseline x86-64 desc must refuse a 256-bit vector function")
+  end
+  # The AVX2 desc admits it: a 256-bit image, a 32-byte (4-slot) home,
+  # the entry bind in file position 0 and a clean verifier run on the
+  # x86_64 route.
+  let avx = vab_avx2_desc()
+  let lf = match vab_lower_x86(vab_v256_fn("v256_avx".to_string()), defs.clone(), avx)
+  when Result::Err(e) then panic("the AVX2 desc must admit a 256-bit vector function: " + e)
+  when Result::Ok(v) then v
+  end
+  var vv = -1
+  var found256 = false
+  for (k, w) in lf.vector_widths do
+    if w == 256 then
+      vv = k
+      found256 = true
+    end
+  end
+  assert(found256, "the AVX v256 row records a 256-bit vector image")
+  match vab_find_bind(lf.clone())
+  when Option::Some(b) then
+    assert(b.0 == vv, "the v256 entry bind defines the parameter image")
+    assert(b.1 == 0, "the v256 entry bind reads file position 0 (ymm0)")
+  when Option::None then panic("the v256 parameter has no entry bind")
+  end
+  match lf.agg_word_slots.get(vv)
+  when Option::Some(base) then
+    assert(base + 4 <= lf.agg_slots, "the 256-bit image reserves four 8-byte slots")
+  when Option::None then panic("the v256 image has no fixed slot base")
+  end
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyX86_64)
+  assert(violations.len() == 0, "the AVX v256 row must verify clean on the x86_64 route; first: " + vab_first(violations))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. The unified mixed float+vector stream and the by-value vector
+#    stack crossing (the stacked-vector slice).
+# ———————————————————————————————————————————————————————————————
+
+# LirFMove statements whose FIXED side names `fixed`: the entry BIND is
+# LirFMove(ordinary, fixed) (as_dst = false) and the pre-call ARG move
+# is LirFMove(fixed, ordinary) (as_dst = true), so the two directions of
+# one crossing are distinguishable by side.
+def vab_fp_fixed_moves(lf: LirFunction, fixed: Int, as_dst: Bool) -> Int
+  var n = 0
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].kind
+      when LirStmtKind::LirFMove(dst, src) then
+        if as_dst then
+          if dst == fixed then n = n + 1 end
+        else
+          if src == fixed then n = n + 1 end
+        end
+      when _ then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  n
+end
+
+def vab_abi_bind_count(lf: LirFunction) -> Int
+  var n = 0
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].vec
+      when Option::Some(vop) then
+        match vop
+        when LirVecOp::LirVecAbiBind(_, _, _) then n = n + 1
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  n
+end
+
+def vab_abi_bind_max(lf: LirFunction) -> Int
+  var m = -1
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].vec
+      when Option::Some(vop) then
+        match vop
+        when LirVecOp::LirVecAbiBind(_, _, idx) then
+          if idx > m then m = idx end
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  m
+end
+
+def vab_abi_arg_count(lf: LirFunction) -> Int
+  var n = 0
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].vec
+      when Option::Some(vop) then
+        match vop
+        when LirVecOp::LirVecAbiArg(_, _, _) then n = n + 1
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  n
+end
+
+def vab_abi_arg_max(lf: LirFunction) -> Int
+  var m = -1
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].vec
+      when Option::Some(vop) then
+        match vop
+        when LirVecOp::LirVecAbiArg(_, _, idx) then
+          if idx > m then m = idx end
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  m
+end
+
+# Every LirLoadFrame (dst, offset) of the function's blocks.
+def vab_load_frames(lf: LirFunction) -> Vec[(Int, Int)]
+  var out: Vec[(Int, Int)] = Vec::new()
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].kind
+      when LirStmtKind::LirLoadFrame(dst, off) then out.push((dst, off))
+      when _ then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+def vab_find_push(lf: LirFunction) -> Option[Int]
+  var found: Option[Int] = Option::None
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].kind
+      when LirStmtKind::LirPushArg(vreg) then found = Option::Some(vreg)
+      when _ then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  found
+end
+
+# Every LirPushArg image of the function, in statement order (the
+# descending caller-slot stream: the highest stack position first).
+def vab_push_vregs(lf: LirFunction) -> Vec[Int]
+  var out: Vec[Int] = Vec::new()
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].kind
+      when LirStmtKind::LirPushArg(vreg) then out.push(vreg)
+      when _ then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+# Every vector vreg bound from the SIMD&FP file by an entry ABI bind
+# marker (the register-class parameters, never the stacked ones).
+def vab_bind_vregs(lf: LirFunction) -> Vec[Int]
+  var out: Vec[Int] = Vec::new()
+  var bi = 0
+  while bi < lf.blocks.len() do
+    var si = 0
+    while si < lf.blocks[bi].stmts.len() do
+      match lf.blocks[bi].stmts[si].vec
+      when Option::Some(vop) then
+        match vop
+        when LirVecOp::LirVecAbiBind(_, dst, _) then out.push(dst)
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+def vab_call_stack_args(lf: LirFunction) -> Int
+  var sa = -1
+  var bi = 0
+  while bi < lf.blocks.len() do
+    match lf.blocks[bi].term.kind
+    when LirTermKind::LirCall(_, _, stack_args, _, _) then sa = stack_args
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  sa
+end
+
+def vab_mixed_locals() -> Vec[MirLocal]
+  Vec::from([
+    vab_local(0, "ret", Type::Unit, false),
+    vab_local(1, "a", Type::F64, false),
+    vab_local(2, "b", vab_vec4_ty(), false),
+    vab_local(3, "c", Type::F32, false)
+  ])
+end
+
+def vab_mixed_params() -> Vec[MirLocal]
+  Vec::from([
+    vab_local(1, "a", Type::F64, false),
+    vab_local(2, "b", vab_vec4_ty(), false),
+    vab_local(3, "c", Type::F32, false)
+  ])
+end
+
+# A function with `n` vector parameters and a Unit return; with_call
+# makes block 0 call `callee` passing every vector parameter.
+def vab_many_vec_fn(name: String, n: Int, with_call: Bool) -> MirFunction
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(vab_local(0, "ret", Type::Unit, false))
+  var params: Vec[MirLocal] = Vec::new()
+  var i = 0
+  while i < n do
+    locals.push(vab_local(i + 1, "v" + i.to_string(), vab_vec4_ty(), false))
+    params.push(vab_local(i + 1, "v" + i.to_string(), vab_vec4_ty(), false))
+    i = i + 1
+  end
+  var blocks: Vec[MirBlock] = Vec::new()
+  if with_call then
+    locals.push(vab_local(n + 1, "dest", Type::Unit, false))
+    var args: Vec[MirCallArg] = Vec::new()
+    var ai = 0
+    while ai < n do
+      args.push(vab_vec_arg(ai + 1))
+      ai = ai + 1
+    end
+    blocks.push(vab_block(0, Vec::new(), vab_call_term(vab_place(n + 1), "callee".to_string(), args, 1)))
+    blocks.push(vab_block(1, Vec::new(), vab_ret_term()))
+  else
+    blocks.push(vab_block(0, Vec::new(), vab_ret_term()))
+  end
+  MirFunction {
+    name: name,
+    params: params,
+    ret_type: Type::Unit,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+@test
+def test_mixed_float_vector_signature_row_aarch64() -> Unit
+  let defs = vab_type_defs()
+  # The mixed signature `f(a: F64, b: v128, c: F32)` is ONE plan-driven
+  # SIMD&FP stream: the authority places a=d0, b=v1, c=d2.
+  let f = MirFunction {
+    name: "mixed_place".to_string(),
+    params: vab_mixed_params(),
+    ret_type: Type::Unit,
+    locals: vab_mixed_locals(),
+    blocks: Vec::from([vab_block(0, Vec::new(), vab_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+  let lf = vab_lower(f, defs)
+  match vab_find_bind(lf.clone())
+  when Option::Some(b) then
+    assert(b.1 == 1, "the vector parameter binds the shared file position after d0 (v1), got " + b.1.to_string())
+  when Option::None then panic("the mixed signature row has no vector entry bind")
+  end
+  assert(vab_fp_fixed_moves(lf.clone(), 8, false) == 1, "the F64 parameter binds from d0 (fixed 8)")
+  assert(vab_fp_fixed_moves(lf.clone(), 10, false) == 1, "the F32 parameter binds from d2 (fixed 10, after the vector's v1)")
+  assert(vab_fp_fixed_moves(lf.clone(), 9, false) == 0, "nothing binds d1 (the vector owns the shared position 1)")
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyA64)
+  assert(violations.len() == 0, "the mixed signature row must verify clean; first: " + vab_first(violations))
+end
+
+@test
+def test_mixed_float_vector_call_row_aarch64() -> Unit
+  let defs = vab_type_defs()
+  var locals = vab_mixed_locals()
+  locals.push(vab_local(4, "dest", Type::Unit, false))
+  # The mixed call passes a (F64), b (v128), c (F32): the argument
+  # moves consume the same shared plan positions as the callee's binds.
+  let f = MirFunction {
+    name: "mixed_call".to_string(),
+    params: vab_mixed_params(),
+    ret_type: Type::Unit,
+    locals: locals,
+    blocks: Vec::from([
+      vab_block(0, Vec::new(), vab_call_term(vab_place(4), "callee".to_string(), Vec::from([vab_vec_arg(1), vab_vec_arg(2), vab_vec_arg(3)]), 1)),
+      vab_block(1, Vec::new(), vab_ret_term())
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+  let lf = vab_lower(f, defs)
+  match vab_find_arg(lf.clone())
+  when Option::Some(a) then
+    assert(a.1 == 1, "the vector argument crosses in the shared file position v1, got " + a.1.to_string())
+  when Option::None then panic("the mixed call row has no vector argument marker")
+  end
+  assert(vab_abi_arg_count(lf.clone()) == 1, "exactly one vector argument marker")
+  assert(vab_fp_fixed_moves(lf.clone(), 8, true) == 1, "the F64 argument moves into d0 (fixed 8)")
+  assert(vab_fp_fixed_moves(lf.clone(), 10, true) == 1, "the F32 argument moves into d2 (fixed 10)")
+  assert(vab_fp_fixed_moves(lf.clone(), 9, true) == 0, "no argument moves into d1 (the vector owns position 1)")
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyA64)
+  assert(violations.len() == 0, "the mixed call row must verify clean; first: " + vab_first(violations))
+end
+
+@test
+def test_stacked_vector_param_row_aarch64() -> Unit
+  let defs = vab_type_defs()
+  let lf = vab_lower(vab_many_vec_fn("ten_vec_params".to_string(), 10, false), defs)
+  # The first eight parameters take the SIMD&FP file positions v0..v7.
+  assert(vab_abi_bind_count(lf.clone()) == 8, "the first eight vector parameters bind the SIMD&FP file")
+  assert(vab_abi_bind_max(lf.clone()) == 7, "the highest register position is v7")
+  # Parameters 9 and 10 cross BY VALUE on the caller stack; the entry
+  # binds them with the vector LirLoadFrame image at 16 and 32.
+  let frames = vab_load_frames(lf.clone())
+  assert(frames.len() == 2, "the two stacked vector parameters bind through LirLoadFrame, got " + frames.len().to_string())
+  var saw16 = false
+  var saw32 = false
+  var vi = 0
+  while vi < frames.len() do
+    assert(lf.vector_widths.contains_key(&frames[vi].0), "a stacked vector bind's destination is a vector-class vreg")
+    if frames[vi].1 == 16 then saw16 = true end
+    if frames[vi].1 == 32 then saw32 = true end
+    vi = vi + 1
+  end
+  assert(saw16, "the 9th vector parameter binds at [FP + 16]")
+  assert(saw32, "the 10th vector parameter binds at [FP + 32]")
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyA64)
+  assert(violations.len() == 0, "the stacked vector parameter row must verify clean; first: " + vab_first(violations))
+end
+
+@test
+def test_stacked_vector_arg_row_aarch64() -> Unit
+  let defs = vab_type_defs()
+  let lf = vab_lower(vab_many_vec_fn("ten_vec_call".to_string(), 10, true), defs)
+  # The first eight arguments cross in v0..v7 (ABI register markers);
+  # arguments 9 and 10 have NO register marker — each rides the caller
+  # stack BY VALUE as a LirPushArg vector image and reserves one 16-byte
+  # slot unit (stack_args == 2).
+  assert(vab_abi_arg_count(lf.clone()) == 8, "the first eight vector arguments cross in the SIMD&FP file")
+  assert(vab_abi_arg_max(lf.clone()) == 7, "the highest argument register position is v7")
+  match vab_find_push(lf.clone())
+  when Option::Some(pv) then
+    assert(lf.vector_widths.contains_key(&pv), "the pushed stack argument is a vector-class vreg")
+  when Option::None then panic("the stacked vector argument has no LirPushArg image")
+  end
+  # The caller stream: exactly two push images, one per stacked argument,
+  # each a distinct vector vreg that has NO SIMD&FP register bind marker
+  # (the pushed images are parameters 9 and 10, not the file-bound eight).
+  let pushes = vab_push_vregs(lf.clone())
+  assert(pushes.len() == 2, "the two stacked vector arguments emit two caller push images, got " + pushes.len().to_string())
+  assert(pushes[0] != pushes[1], "each stacked vector argument pushes its own image")
+  let bound = vab_bind_vregs(lf.clone())
+  assert(!bound.contains(&pushes[0]) && !bound.contains(&pushes[1]), "the pushed images are the stacked arguments, never the file-bound register parameters")
+  assert(vab_call_stack_args(lf.clone()) == 2, "two 16-byte caller slot units for the two stacked vector arguments")
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyA64)
+  assert(violations.len() == 0, "the stacked vector argument row must verify clean; first: " + vab_first(violations))
+end

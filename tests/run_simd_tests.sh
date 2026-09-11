@@ -4,10 +4,14 @@
 # P1.12).
 #
 # Runs the three committed SIMD suites against the given tg compiler
-# binary: the behavior suite (the vector add/shuffle/load-store vs the
+# binary: the behavior suite (the vector add/shuffle/load-store AND the
+# completed explicit surface — andnot / the lane-mask compares / the
+# per-lane shifts / splat / lane extract-insert / pack-unpack — vs the
 # scalar reference), the layout suite (the VECTOR ROW assertions: size =
 # N lanes x lane size, alignment = the vector width), and the ABI probe
-# (the 16-byte vector through the registers vs the 32/64-byte by-address
+# (the 16-byte vector through the registers; the 32-byte form through the
+# ymm file on an x86-64 desc with the avx/avx2 tokens — the plan-level
+# v256 promotion — and by address otherwise; the 64-byte by-address
 # classification).
 #
 # Plus the CLAIMS' HONESTY gate: the std/simd.tg module header and the

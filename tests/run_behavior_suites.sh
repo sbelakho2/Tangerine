@@ -137,6 +137,24 @@ SUITES=(
   # pointer (p.inner.x, p.e downcast) and sub-word F32 fields (4-byte
   # width accesses + GP<->FP bit moves) + the verify_lir gate.
   "tests/lir_aggregate_residual_test.tg"
+  # audit item 34 stage 2: the LIR vector params/returns + ABI crossings
+  # (the shared SIMD&FP file positions from classify_call_plan, the
+  # entry bind / call argument / return markers, the memory-resident
+  # image across a call, the v256 admission gated by the desc's AVX
+  # tokens) + the verify_lir gate.
+  "tests/lir_vector_abi_rows_test.tg"
+  # the explicit-op extension lane: the andnot / compare / shift /
+  # splat / lane / pack-unpack lowering rows (each extension intrinsic
+  # becomes one marked LirVecOp and verify_lir stays clean) + the
+  # semantic-set refusal rows (float gt/ge, the 64-bit ordering
+  # compares, the float lane moves, the non-narrow pack source and the
+  # out-of-range marker data).
+  "tests/lir_vector_ext_op_rows_test.tg"
+  # the whole-vector move/copy slice: the v128 slot-image copy row
+  # (aarch64), the assignment-move (MirMovePlace) row, the v256 copy on
+  # the AVX2 x86-64 desc with the baseline refusal, and the stale-note
+  # gate over lir.tg's live header.
+  "tests/lir_vector_move_rows_test.tg"
   # third-audit item 34: the §40 coverage ingest lane (tg.cov.v1 ids, the
   # tg.cov.trace.v1 ingest, the point indexes, uncovered_paths and the
   # test.affected / coverage.affected ops).

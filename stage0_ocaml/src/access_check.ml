@@ -247,20 +247,25 @@ let effects_of_convention (c : Access_effect.t) : Access_effect.read_effect =
          first sight of a `set`-convention write is the initialization
          itself, so the pass cannot manufacture its own conflict).
 
-         CFG-AUTHORITY ALIGNMENT (the CALL_ARGUMENT_ACCESS_SANITY
-         sweep): a call-argument Consume does NOT transition the
-         caller-local here — a call-argument move copies the value at
-         the call boundary; the caller's local becomes Consumed only at
-         an explicit drop/deinit of the caller's own storage, which the
-         recorded channel (one record per checked call argument) never
-         contains.  The authoritative path-sensitive CFG dataflow
-         (resource_check.ml, over the lowered MIR) models exactly this
-         and reports 0 on the kernel closure; the linear replay (one
-         straight-line sequence per item, no branch/path information:
-         mutually-exclusive arms and loops conflated, impl-block method
-         scopes and declaration-round records merged into one timeline)
-         therefore must not manufacture use-after-consume / double-move
-         findings from call-argument moves.
+         CALL-ARGUMENT MOVES: a Consume (Sink) argument of a non-Copy
+         (owned) value IS a genuine move of the caller-local — the
+         lowerer emits Seed_mir.Move for exactly this shape (the same
+         `copyable_ty ty -> Copy else Move` rule the verifier and the
+         CFG pass consume), and the seed VM's move_slot marks the
+         caller's slot moved, so a second move traps and a later read
+         of the slot is a use-after-consume.  The recorded Consume
+         therefore drives the lattice's move transition (Live ->
+         Consumed, Consumed -> double-move via Resource_check.check_move)
+         — never a read.  A Consume of a Copy-typed value is a copy
+         (check_move's is_copy branch), and Copy-typed roots are not
+         owned/tracked here at all.  HONEST BOUNDARY of this linear
+         replay: it walks one straight-line sequence per item with no
+         branch/path information (mutually-exclusive arms and loops
+         conflated, impl-block method scopes and declaration-round
+         records merged into one timeline), so the authoritative
+         path-sensitive CFG dataflow (resource_check.ml, over the
+         lowered MIR) remains the ownership authority; this replay is
+         the additional diagnostic.
 
    HONEST BOUNDARY: the pass walks the RECORDED typed channels — the
    full CFG-based stage (finalize_plan + edge_cleanup consumed by MIR)
@@ -435,29 +440,20 @@ let run_closure ?(lang_items : Lang_items.t option = None)
                   Resource_check.set_state env p.root Resource_check.Live;
                 (match a.a_effect with
                  | Access_effect.Consume ->
-                     (* CFG-authority alignment (the
-                        CALL_ARGUMENT_ACCESS_SANITY sweep): a
-                        call-argument move is a COPY at the call
-                        boundary — the caller-local becomes Consumed
-                        only at an EXPLICIT drop/deinit of the caller's
-                        own storage, and the recorded channel (one
-                        record per checked call argument) never
-                        contains a drop.  The authoritative CFG
-                        dataflow (resource_check.ml, the path-sensitive
-                        stage over the lowered MIR) models exactly this:
-                        argument moves never transition a local, so the
-                        linear replay must not manufacture
-                        use-after-consume / double-move findings from
-                        call-argument moves (the replay walks one
-                        linear per-item sequence with no branch/path
-                        information: mutually-exclusive arms, loops and
-                        impl-block method scopes conflated into one
-                        timeline, plus declaration-round records — the
-                        CFG pass reports 0 on the same closure).  The
-                        value's copyability needs no consultation here:
-                        a read check is legal for both a move and a
-                        copy of a live value. *)
-                     Resource_check.check_read env p.root a.a_item
+                     (* a sink call argument is a genuine move of a
+                        non-Copy (owned) value: mir_lower emits
+                        Seed_mir.Move for this exact shape and the seed
+                        VM's move_slot marks the caller's slot moved, so
+                        a second move traps and a later read is a
+                        use-after-consume.  The recorded Consume must
+                        therefore drive the lattice's move transition
+                        (Live -> Consumed, Consumed -> double-move) —
+                        routing it through check_read silently erased
+                        the finding the selfcheck pins.  check_move's
+                        is_copy branch keeps a Consume of a Copy-typed
+                        value a copy; Copy-typed roots are not owned and
+                        never enter this lattice. *)
+                     Resource_check.check_move env p.root (is_copy a.a_type) a.a_item
                  | Access_effect.Initialize ->
                      if was_uninitialized then ()
                      else Resource_check.check_initialize env p.root a.a_item

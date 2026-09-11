@@ -16,6 +16,17 @@ use std::core::{Option, Unit, Bool, panic}
 use std::collections::{Vec}
 use std::test::*
 use tg_compiler::types::{SimdLane, SimdIntrinsicKind}
+use tg_compiler::asm::{
+  CodeBuffer, buf_new, A64, A64V,
+  a64_neon_bic, a64_neon_cmeq, a64_neon_cmgt, a64_neon_cmge,
+  a64_neon_fcmeq, a64_neon_fcmgt, a64_neon_fcmge,
+  a64_neon_sshl, a64_neon_ushl, a64_neon_umin, a64_neon_bit, a64_neon_neg,
+  a64_neon_shl_imm, a64_neon_sshr_imm, a64_neon_ushr_imm,
+  a64_neon_dup_b, a64_neon_dup_d,
+  a64_neon_umov_b, a64_neon_umov_s, a64_neon_umov_d,
+  a64_neon_ins_b, a64_neon_ins_d,
+  a64_neon_sqxtn, a64_neon_sqxtn2, a64_neon_sshll, a64_neon_sshll2
+}
 use tg_compiler::lir::{
   LirVectorLane, LirVecBinOp, LirVecOp,
   lir_vector_lane_build,
@@ -34,6 +45,10 @@ use tg_compiler::lir::{
   lir_vector_lane_ok, lir_vector_lane_name, lir_vector_lane_is_float,
   lir_vector_lane_of_simd_lane, lir_simd_lane_of_vector_lane,
   lir_vec_binop_intrinsic_kind, lir_vec_binop_of_intrinsic_kind,
+  lir_vec_binop_is_compare, lir_vec_shift_form_ok, lir_vec_shift_form_name,
+  lir_vector_lane_narrow, lir_vector_lane_widen,
+  LirSimdExtKind, lir_simd_ext_op_of, lir_simd_ext_op_name,
+  lir_simd_ext_binop_of, lir_simd_ext_shift_form_of,
   lir_vec_stmt_occ
 }
 
@@ -203,10 +218,254 @@ def test_vec_binop_bridge_rows() -> Unit
   check_binop_none(SimdIntrinsicKind::SimdLoad)
   check_binop_none(SimdIntrinsicKind::SimdStore)
   check_binop_none(SimdIntrinsicKind::SimdShuffle)
-  # The emitter's reverse table.
-  assert_true(lir_vec_binop_intrinsic_kind(LirVecBinOp::LirVecMul) == SimdIntrinsicKind::SimdMul)
-  assert_true(lir_vec_binop_intrinsic_kind(LirVecBinOp::LirVecAnd) == SimdIntrinsicKind::SimdAnd)
-  assert_true(lir_vec_binop_intrinsic_kind(LirVecBinOp::LirVecXor) == SimdIntrinsicKind::SimdXor)
+  # The emitter's reverse table: the base tokens carry an intrinsic
+  # kind; the explicit-extension tokens do not (they emit through the
+  # asm.tg AdvSIMD encoders in lir.tg's own arm).
+  assert_true(lir_vec_binop_intrinsic_kind(LirVecBinOp::LirVecMul) == Option::Some(SimdIntrinsicKind::SimdMul))
+  assert_true(lir_vec_binop_intrinsic_kind(LirVecBinOp::LirVecAnd) == Option::Some(SimdIntrinsicKind::SimdAnd))
+  assert_true(lir_vec_binop_intrinsic_kind(LirVecBinOp::LirVecXor) == Option::Some(SimdIntrinsicKind::SimdXor))
+  assert_true(lir_vec_binop_intrinsic_kind(LirVecBinOp::LirVecAndNot) == Option::None)
+  assert_true(lir_vec_binop_intrinsic_kind(LirVecBinOp::LirVecEq) == Option::None)
+  assert_true(lir_vec_binop_intrinsic_kind(LirVecBinOp::LirVecLt) == Option::None)
+  assert_true(lir_vec_binop_intrinsic_kind(LirVecBinOp::LirVecGt) == Option::None)
+  assert_true(lir_vec_binop_intrinsic_kind(LirVecBinOp::LirVecLe) == Option::None)
+  assert_true(lir_vec_binop_intrinsic_kind(LirVecBinOp::LirVecGe) == Option::None)
+  # The compare classifier and the shift-form vocabulary.
+  assert_true(lir_vec_binop_is_compare(LirVecBinOp::LirVecEq))
+  assert_true(lir_vec_binop_is_compare(LirVecBinOp::LirVecGe))
+  assert_true(!lir_vec_binop_is_compare(LirVecBinOp::LirVecAdd))
+  assert_true(!lir_vec_binop_is_compare(LirVecBinOp::LirVecAndNot))
+  assert_true(lir_vec_shift_form_ok(0) && lir_vec_shift_form_ok(1) && lir_vec_shift_form_ok(2))
+  assert_true(!lir_vec_shift_form_ok(3) && !lir_vec_shift_form_ok(-1))
+  assert_true(lir_vec_shift_form_name(0) == "shl")
+  assert_true(lir_vec_shift_form_name(1) == "lsr")
+  assert_true(lir_vec_shift_form_name(2) == "asr")
+end
+
+# ———————————————————————————————————————————————————————————————
+# The explicit-extension router rows (lir_simd_ext_op_of)
+# ———————————————————————————————————————————————————————————————
+
+def check_ext_op(name: String, want: LirSimdExtKind) -> Unit
+  match lir_simd_ext_op_of(name)
+  when Option::Some(k) then
+    if k != want then panic("extension router: " + name + " mapped to the wrong kind") end
+  when Option::None then panic("extension router: " + name + " must classify")
+  end
+end
+
+def check_ext_none(name: String) -> Unit
+  match lir_simd_ext_op_of(name)
+  when Option::None then ()
+  when Option::Some(_) then panic("extension router: " + name + " must not classify")
+  end
+end
+
+@test
+def test_simd_ext_router_rows() -> Unit
+  # The prefixed and bare spellings classify identically.
+  check_ext_op("__intrinsic_simd_andnot_i32x4", LirSimdExtKind::LirSimdExtAndNot)
+  check_ext_op("simd_andnot_i32x4", LirSimdExtKind::LirSimdExtAndNot)
+  check_ext_op("__intrinsic_simd_eq_i8x16", LirSimdExtKind::LirSimdExtEq)
+  check_ext_op("__intrinsic_simd_lt_f32x4", LirSimdExtKind::LirSimdExtLt)
+  check_ext_op("__intrinsic_simd_gt_i16x8", LirSimdExtKind::LirSimdExtGt)
+  check_ext_op("__intrinsic_simd_le_f64x2", LirSimdExtKind::LirSimdExtLe)
+  check_ext_op("__intrinsic_simd_ge_i64x2", LirSimdExtKind::LirSimdExtGe)
+  check_ext_op("__intrinsic_simd_shl_imm_i32x4", LirSimdExtKind::LirSimdExtShlImm)
+  check_ext_op("__intrinsic_simd_shr_imm_i16x8", LirSimdExtKind::LirSimdExtShrImm)
+  check_ext_op("__intrinsic_simd_sar_imm_i64x2", LirSimdExtKind::LirSimdExtSarImm)
+  check_ext_op("__intrinsic_simd_shl_i32x4", LirSimdExtKind::LirSimdExtShl)
+  check_ext_op("__intrinsic_simd_shr_i8x16", LirSimdExtKind::LirSimdExtShr)
+  check_ext_op("__intrinsic_simd_sar_i16x8", LirSimdExtKind::LirSimdExtSar)
+  check_ext_op("__intrinsic_simd_splat_i64x2", LirSimdExtKind::LirSimdExtSplat)
+  check_ext_op("__intrinsic_simd_extract_i32x4", LirSimdExtKind::LirSimdExtExtract)
+  check_ext_op("__intrinsic_simd_insert_i8x16", LirSimdExtKind::LirSimdExtInsert)
+  check_ext_op("__intrinsic_simd_pack_i32x4", LirSimdExtKind::LirSimdExtPack)
+  check_ext_op("__intrinsic_simd_unpacklo_i16x8", LirSimdExtKind::LirSimdExtUnpackLo)
+  check_ext_op("__intrinsic_simd_unpackhi_i8x16", LirSimdExtKind::LirSimdExtUnpackHi)
+  # The base router's ops and unknown spellings do not classify here.
+  check_ext_none("__intrinsic_simd_add_i32x4")
+  check_ext_none("__intrinsic_simd_shuffle_i32x4")
+  check_ext_none("__intrinsic_simd_bogus_i32x4")
+  check_ext_none("plain_function")
+  # The kind -> token bridges.
+  assert_true(lir_simd_ext_binop_of(LirSimdExtKind::LirSimdExtAndNot) == Option::Some(LirVecBinOp::LirVecAndNot))
+  assert_true(lir_simd_ext_binop_of(LirSimdExtKind::LirSimdExtEq) == Option::Some(LirVecBinOp::LirVecEq))
+  assert_true(lir_simd_ext_binop_of(LirSimdExtKind::LirSimdExtGe) == Option::Some(LirVecBinOp::LirVecGe))
+  assert_true(lir_simd_ext_binop_of(LirSimdExtKind::LirSimdExtSplat) == Option::None)
+  assert_true(lir_simd_ext_shift_form_of(LirSimdExtKind::LirSimdExtShlImm) == Option::Some((0, true)))
+  assert_true(lir_simd_ext_shift_form_of(LirSimdExtKind::LirSimdExtShrImm) == Option::Some((1, true)))
+  assert_true(lir_simd_ext_shift_form_of(LirSimdExtKind::LirSimdExtSar) == Option::Some((2, false)))
+  assert_true(lir_simd_ext_shift_form_of(LirSimdExtKind::LirSimdExtExtract) == Option::None)
+  # The op names (diagnostics).
+  assert_true(lir_simd_ext_op_name(LirSimdExtKind::LirSimdExtAndNot) == "andnot")
+  assert_true(lir_simd_ext_op_name(LirSimdExtKind::LirSimdExtUnpackHi) == "unpackhi")
+end
+
+# ———————————————————————————————————————————————————————————————
+# The pack/unpack lane-pair derivation rows
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_pack_unpack_lane_pair_rows() -> Unit
+  # The signed narrow targets.
+  match lir_vector_lane_narrow(lir_vector_lane_i32x4())
+  when Option::Some(l) then assert_true(lir_vector_lane_name(l) == "i16x8")
+  when Option::None then panic("i32x4 must narrow to i16x8")
+  end
+  match lir_vector_lane_narrow(lir_vector_lane_i16x8())
+  when Option::Some(l) then assert_true(lir_vector_lane_name(l) == "i8x16")
+  when Option::None then panic("i16x8 must narrow to i8x16")
+  end
+  match lir_vector_lane_narrow(lir_vector_lane_i8x16())
+  when Option::None then ()
+  when Option::Some(_) then panic("i8x16 has no packed narrow target")
+  end
+  match lir_vector_lane_narrow(lir_vector_lane_u32x4())
+  when Option::None then ()
+  when Option::Some(_) then panic("the packed surface is the signed integer lanes only")
+  end
+  match lir_vector_lane_narrow(lir_vector_lane_f32x4())
+  when Option::None then ()
+  when Option::Some(_) then panic("the packed surface is the signed integer lanes only")
+  end
+  # The signed widen targets.
+  match lir_vector_lane_widen(lir_vector_lane_i16x8())
+  when Option::Some(l) then assert_true(lir_vector_lane_name(l) == "i32x4")
+  when Option::None then panic("i16x8 must widen to i32x4")
+  end
+  match lir_vector_lane_widen(lir_vector_lane_i8x16())
+  when Option::Some(l) then assert_true(lir_vector_lane_name(l) == "i16x8")
+  when Option::None then panic("i8x16 must widen to i16x8")
+  end
+  match lir_vector_lane_widen(lir_vector_lane_i32x4())
+  when Option::None then ()
+  when Option::Some(_) then panic("i32x4 has no packed widen target")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The aarch64 AdvSIMD extension encoder word rows (asm.tg)
+# ———————————————————————————————————————————————————————————————
+# Every expected word is the objdump-pinned little-endian instruction
+# word for v0/v1/v2 (or the GP pair the row names) — the offline
+# assembler rows the asm.tg comments record.
+
+def neon_word(b: CodeBuffer, off: Int) -> u32
+  (b.bytes[off] as u32) |
+  ((b.bytes[off + 1] as u32) << 8) |
+  ((b.bytes[off + 2] as u32) << 16) |
+  ((b.bytes[off + 3] as u32) << 24)
+end
+
+def neon_word_check(b: CodeBuffer, off: Int, want: u32, what: String) -> Unit
+  if neon_word(b, off) != want then
+    panic("aarch64 NEON encoder row `" + what + "` mismatches the assembler-pinned word")
+  end
+end
+
+@test
+def test_a64_neon_ext_encoder_rows() -> Unit
+  var b = buf_new()
+  var off = 0
+  a64_neon_bic(b, A64V::V0, A64V::V1, A64V::V2)
+  neon_word_check(b, off, 0x4E621C20, "bic v0.16b,v1.16b,v2.16b")
+  off = off + 4
+  a64_neon_cmeq(b, A64V::V0, A64V::V1, A64V::V2, 32)
+  neon_word_check(b, off, 0x6EA28C20, "cmeq v0.4s,v1.4s,v2.4s")
+  off = off + 4
+  a64_neon_cmeq(b, A64V::V0, A64V::V1, A64V::V2, 64)
+  neon_word_check(b, off, 0x6EE28C20, "cmeq v0.2d,v1.2d,v2.2d")
+  off = off + 4
+  a64_neon_cmgt(b, A64V::V0, A64V::V1, A64V::V2, 32)
+  neon_word_check(b, off, 0x4EA23420, "cmgt v0.4s,v1.4s,v2.4s")
+  off = off + 4
+  a64_neon_cmge(b, A64V::V0, A64V::V1, A64V::V2, 32)
+  neon_word_check(b, off, 0x4EA23C20, "cmge v0.4s,v1.4s,v2.4s")
+  off = off + 4
+  a64_neon_fcmeq(b, A64V::V0, A64V::V1, A64V::V2, 32)
+  neon_word_check(b, off, 0x4E22E420, "fcmeq v0.4s,v1.4s,v2.4s")
+  off = off + 4
+  a64_neon_fcmgt(b, A64V::V0, A64V::V1, A64V::V2, 64)
+  neon_word_check(b, off, 0x6EE2E420, "fcmgt v0.2d,v1.2d,v2.2d")
+  off = off + 4
+  a64_neon_fcmge(b, A64V::V0, A64V::V1, A64V::V2, 32)
+  neon_word_check(b, off, 0x6E22E420, "fcmge v0.4s,v1.4s,v2.4s")
+  off = off + 4
+  a64_neon_sshl(b, A64V::V0, A64V::V1, A64V::V2, 32)
+  neon_word_check(b, off, 0x4EA24420, "sshl v0.4s,v1.4s,v2.4s")
+  off = off + 4
+  a64_neon_ushl(b, A64V::V0, A64V::V1, A64V::V2, 32)
+  neon_word_check(b, off, 0x6EA24420, "ushl v0.4s,v1.4s,v2.4s")
+  off = off + 4
+  # The unsigned-count clamp building blocks: UMIN (8/16/32-bit lanes)
+  # and the 64-bit CMHI + BIT pair (no 64-bit UMIN exists).
+  a64_neon_umin(b, A64V::V0, A64V::V1, A64V::V2, 32)
+  neon_word_check(b, off, 0x6EA26C20, "umin v0.4s,v1.4s,v2.4s")
+  off = off + 4
+  a64_neon_umin(b, A64V::V0, A64V::V1, A64V::V2, 16)
+  neon_word_check(b, off, 0x6E626C20, "umin v0.8h,v1.8h,v2.8h")
+  off = off + 4
+  a64_neon_umin(b, A64V::V0, A64V::V1, A64V::V2, 8)
+  neon_word_check(b, off, 0x6E226C20, "umin v0.16b,v1.16b,v2.16b")
+  off = off + 4
+  a64_neon_cmhi(b, A64V::V0, A64V::V1, A64V::V2, 64)
+  neon_word_check(b, off, 0x6EE23420, "cmhi v0.2d,v1.2d,v2.2d")
+  off = off + 4
+  a64_neon_bit(b, A64V::V0, A64V::V1, A64V::V2)
+  neon_word_check(b, off, 0x6EA21C20, "bit v0.16b,v1.16b,v2.16b")
+  off = off + 4
+  a64_neon_neg(b, A64V::V0, A64V::V1, 8)
+  neon_word_check(b, off, 0x6E20B820, "neg v0.16b,v1.16b")
+  off = off + 4
+  a64_neon_shl_imm(b, A64V::V0, A64V::V1, 3, 8)
+  neon_word_check(b, off, 0x4F0B5420, "shl v0.16b,v1.16b,#3")
+  off = off + 4
+  a64_neon_sshr_imm(b, A64V::V0, A64V::V1, 3, 16)
+  neon_word_check(b, off, 0x4F1D0420, "sshr v0.8h,v1.8h,#3")
+  off = off + 4
+  a64_neon_ushr_imm(b, A64V::V0, A64V::V1, 3, 64)
+  neon_word_check(b, off, 0x6F7D0420, "ushr v0.2d,v1.2d,#3")
+  off = off + 4
+  a64_neon_dup_b(b, A64V::V0, A64::X1)
+  neon_word_check(b, off, 0x4E010C20, "dup v0.16b,w1")
+  off = off + 4
+  a64_neon_dup_d(b, A64V::V0, A64::X1)
+  neon_word_check(b, off, 0x4E080C20, "dup v0.2d,x1")
+  off = off + 4
+  a64_neon_umov_b(b, A64::X0, A64V::V1, 3)
+  neon_word_check(b, off, 0x0E073C20, "umov w0,v1.b[3]")
+  off = off + 4
+  a64_neon_umov_s(b, A64::X0, A64V::V1, 3)
+  neon_word_check(b, off, 0x0E1C3C20, "umov w0,v1.s[3]")
+  off = off + 4
+  a64_neon_umov_d(b, A64::X0, A64V::V1, 1)
+  neon_word_check(b, off, 0x4E183C20, "umov x0,v1.d[1]")
+  off = off + 4
+  a64_neon_ins_b(b, A64V::V0, A64::X1, 3)
+  neon_word_check(b, off, 0x4E071C20, "ins v0.b[3],w1")
+  off = off + 4
+  a64_neon_ins_d(b, A64V::V0, A64::X1, 1)
+  neon_word_check(b, off, 0x4E181C20, "ins v0.d[1],x1")
+  off = off + 4
+  a64_neon_sqxtn(b, A64V::V0, A64V::V1, 32)
+  neon_word_check(b, off, 0x0E614820, "sqxtn v0.4h,v1.4s")
+  off = off + 4
+  a64_neon_sqxtn2(b, A64V::V0, A64V::V1, 32)
+  neon_word_check(b, off, 0x4E614820, "sqxtn2 v0.8h,v1.4s")
+  off = off + 4
+  a64_neon_sqxtn(b, A64V::V0, A64V::V1, 16)
+  neon_word_check(b, off, 0x0E214820, "sqxtn v0.8b,v1.8h")
+  off = off + 4
+  a64_neon_sshll(b, A64V::V0, A64V::V1, 16)
+  neon_word_check(b, off, 0x0F10A420, "sshll v0.4s,v1.4h,#0")
+  off = off + 4
+  a64_neon_sshll2(b, A64V::V0, A64V::V1, 16)
+  neon_word_check(b, off, 0x4F10A420, "sshll2 v0.4s,v1.8h,#0")
+  off = off + 4
+  a64_neon_sshll(b, A64V::V0, A64V::V1, 8)
+  neon_word_check(b, off, 0x0F08A420, "sshll v0.8h,v1.8b,#0")
+  off = off + 4
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -243,6 +502,18 @@ def test_vec_stmt_occ_rows() -> Unit
   check_occ(LirVecOp::LirVecLoad(lane, 30, 31), Vec::from([30]), Vec::from([31]))
   # store: use src, use ptr (no defs).
   check_occ(LirVecOp::LirVecStore(lane, 30, 31), Vec::new(), Vec::from([30, 31]))
+  # move (the whole-image slot copy): use src, def dst.
+  check_occ(LirVecOp::LirVecMove(lane, 30, 31), Vec::from([30]), Vec::from([31]))
   # shuffle: uses a, mask then defs dst.
   check_occ(LirVecOp::LirVecShuffle(lane, 30, 31, 32), Vec::from([30]), Vec::from([31, 32]))
+  # The explicit-extension markers: the def/use rows.
+  check_occ(LirVecOp::LirVecShiftImm(lane, 0, 30, 31, 3), Vec::from([30]), Vec::from([31]))
+  check_occ(LirVecOp::LirVecShiftVec(lane, 1, 30, 31, 32), Vec::from([30]), Vec::from([31, 32]))
+  check_occ(LirVecOp::LirVecSplat(lane, 30, 31), Vec::from([30]), Vec::from([31]))
+  check_occ(LirVecOp::LirVecExtract(lane, 30, 31, 2), Vec::from([30]), Vec::from([31]))
+  check_occ(LirVecOp::LirVecInsert(lane, 30, 31, 32, 2), Vec::from([30]), Vec::from([31, 32]))
+  let i16 = lir_vector_lane_i16x8()
+  let i32 = lir_vector_lane_i32x4()
+  check_occ(LirVecOp::LirVecPack(i32, i16, 30, 31, 32), Vec::from([30]), Vec::from([31, 32]))
+  check_occ(LirVecOp::LirVecUnpack(i16, i32, 1, 30, 31), Vec::from([30]), Vec::from([31]))
 end

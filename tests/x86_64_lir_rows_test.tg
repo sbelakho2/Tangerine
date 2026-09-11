@@ -16,7 +16,7 @@ use std::core::{panic}
 use std::collections::{Vec, Map}
 use std::test::*
 use tg_compiler::asm::X64
-use tg_compiler::lir::{LirAlloc, LirSeg, LirCond, LirDivOp, LirVectorLane, LirVecBinOp}
+use tg_compiler::lir::{LirAlloc, LirSeg, LirCond, LirDivOp, LirVectorLane, LirVecBinOp, LirVecOp, LirFpWidth}
 use tg_compiler::types::{Type}
 use tg_compiler::mir::{
   MirStatic, MirOperand, MirOperandKind,
@@ -48,16 +48,41 @@ use tg_compiler::backend_x86_64::{
   x86_movq_xmm_r64, x86_movq_r64_xmm, x86_movd_xmm_r32, x86_movd_r32_xmm,
   x86_xorps_rr, x86_xorpd_rr,
   x86_pand_rr, x86_por_rr, x86_pxor_rr,
+  x86_pandn_rr,
+  x86_pcmpeqb_rr, x86_pcmpeqw_rr, x86_pcmpeqd_rr, x86_pcmpeqq_rr,
+  x86_pcmpgtb_rr, x86_pcmpgtw_rr, x86_pcmpgtd_rr,
+  x86_pmuludq_rr, x86_pmulld_rr, x86_punpckldq_rr, x86_punpckhdq_rr,
+  x86_punpcklbw_rr, x86_punpcklwd_rr, x86_punpckhbw_rr, x86_punpckhwd_rr,
+  x86_packsswb_rr, x86_packssdw_rr,
+  x86_pextrw_r32_xmm, x86_pinsrw_xmm_r32,
+  x86_pextrb_r32_xmm, x86_pinsrb_xmm_r32, x86_pinsrq_xmm_r64,
   x86_paddb_rr, x86_paddw_rr, x86_paddd_rr, x86_paddq_rr,
   x86_psubb_rr, x86_psubw_rr, x86_psubd_rr, x86_psubq_rr, x86_pmullw_rr,
   x86_addps_rr, x86_addpd_rr, x86_mulps_rr, x86_mulpd_rr,
   x86_subps_rr, x86_subpd_rr,
   x86_movdqu_load, x86_movdqu_store, x86_pshufb_rr,
+  x86_pshufd_rr, x86_pshuflw_rr, x86_pshufhw_rr,
+  x86_psllw_imm, x86_pslld_imm, x86_psllq_imm,
+  x86_psrlw_imm, x86_psrld_imm, x86_psrlq_imm,
+  x86_psraw_imm, x86_psrad_imm,
+  x86_psllw_rr, x86_pslld_rr, x86_psllq_rr,
+  x86_psrlw_rr, x86_psrld_rr, x86_psrlq_rr,
+  x86_psraw_rr, x86_psrad_rr,
+  x86_cmpps_rr, x86_cmppd_rr,
+  x86_sqrtps_rr, x86_sqrtpd_rr, x86_divps_rr, x86_divpd_rr,
+  x86_movmskps_r32_xmm, x86_pextrd_r32_xmm, x86_pinsrd_xmm_r32,
+  x86_cvtps2pd_rr, x86_cvtpd2ps_rr, x86_cvtps2dq_rr,
+  x86_cvtdq2ps_rr, x86_cvtpd2dq_rr, x86_cvttpd2dq_rr,
   x86_movzx_r64_m16, x86_mov_r32_rm,
   x86_mov_m8_r8, x86_mov_m16_r16, x86_mov_m32_r32,
   x86_xchg_rm, x86_lock_xadd, x86_lock_cmpxchg, x86_mfence,
   x86_mov_rm_rip, x86_alu_rmi8, x86_alu_rr_w,
-  x86_vec_binop_opcode, x86_validate_vec_lane, x86_validate_atomic_width,
+  x86_vec_binop_plan, X86VecBinopPlan, x86_emit_vec_stmt,
+  x86_emit_vec_eq_i64_sse2, x86_emit_vec_extract_i32_sse2,
+  x86_vec_cmp_plan, X86VecCmpPlan,
+  x86_vex_andnps_rrr, x86_vex_vpsllvd_rrr, x86_vex_vpsrlvd_rrr,
+  x86_vex_vpsravd_rrr, x86_vex_broadcast, x86_vex_shift_imm,
+  x86_validate_vec_lane, x86_validate_atomic_width,
   x86_emit_new, x86_emit_div_guard, x86_emit_static, x86_collect_datas, x86_elf64_obj
 }
 
@@ -579,37 +604,368 @@ def test_x86_sse_packed_vector_encoding_rows() -> Unit
     Vec::from([0x66, 0x0F, 0x38, 0x00, 0xC1]))
 end
 
+# The SSE2 lane-class plan rows: every lane class gets a single legacy
+# instruction except the 32-bit integer multiply (the PMULUDQ sequence
+# on the baseline; PMULLD only under the described sse41 token), and
+# the byte/qword multiplies refuse with the named ISA rule.
+def x86_row_plan_sse(pl: X86VecBinopPlan) -> (Int, Int)
+  match pl
+  when X86VecBinopPlan::X86VecSse(prefix, opcode) then (prefix, opcode)
+  when _ then panic("expected a single legacy SSE binop plan")
+  end
+end
+
 @test
 def test_x86_vector_opcode_table_rows() -> Unit
-  let add_i8 = x86_vec_binop_opcode(LirVecBinOp::LirVecAdd, "i8")
+  let add_i8 = x86_vec_binop_plan(LirVecBinOp::LirVecAdd, "i8", false)
   assert_true(add_i8.is_ok())
   match add_i8
-  when Result::Ok(pr) then assert_true(pr.0 == 0x66 && pr.1 == 0xFC)
+  when Result::Ok(pl) then
+    let pr = x86_row_plan_sse(pl)
+    assert_true(pr.0 == 0x66 && pr.1 == 0xFC)
   when Result::Err(_) then ()
   end
-  let add_f64 = x86_vec_binop_opcode(LirVecBinOp::LirVecAdd, "f64")
+  let add_f64 = x86_vec_binop_plan(LirVecBinOp::LirVecAdd, "f64", false)
   assert_true(add_f64.is_ok())
   match add_f64
-  when Result::Ok(pr) then assert_true(pr.0 == 0x66 && pr.1 == 0x58)
+  when Result::Ok(pl) then
+    let pr = x86_row_plan_sse(pl)
+    assert_true(pr.0 == 0x66 && pr.1 == 0x58)
   when Result::Err(_) then ()
   end
-  let sub_u32 = x86_vec_binop_opcode(LirVecBinOp::LirVecSub, "u32")
+  let sub_u32 = x86_vec_binop_plan(LirVecBinOp::LirVecSub, "u32", false)
   assert_true(sub_u32.is_ok())
   match sub_u32
-  when Result::Ok(pr) then assert_true(pr.0 == 0x66 && pr.1 == 0xFA)
+  when Result::Ok(pl) then
+    let pr = x86_row_plan_sse(pl)
+    assert_true(pr.0 == 0x66 && pr.1 == 0xFA)
   when Result::Err(_) then ()
   end
-  let mul_i16 = x86_vec_binop_opcode(LirVecBinOp::LirVecMul, "i16")
+  let mul_i16 = x86_vec_binop_plan(LirVecBinOp::LirVecMul, "i16", false)
   assert_true(mul_i16.is_ok())
-  let mul_f32 = x86_vec_binop_opcode(LirVecBinOp::LirVecMul, "f32")
+  match mul_i16
+  when Result::Ok(pl) then
+    let pr = x86_row_plan_sse(pl)
+    assert_true(pr.0 == 0x66 && pr.1 == 0xD5)
+  when Result::Err(_) then ()
+  end
+  let mul_f32 = x86_vec_binop_plan(LirVecBinOp::LirVecMul, "f32", false)
   assert_true(mul_f32.is_ok())
-  assert_true(x86_vec_binop_opcode(LirVecBinOp::LirVecMul, "i8").is_err())
-  assert_true(x86_vec_binop_opcode(LirVecBinOp::LirVecMul, "i32").is_err())
-  assert_true(x86_vec_binop_opcode(LirVecBinOp::LirVecMul, "i64").is_err())
+  match mul_f32
+  when Result::Ok(pl) then
+    let pr = x86_row_plan_sse(pl)
+    assert_true(pr.0 == 0 && pr.1 == 0x59)
+  when Result::Err(_) then ()
+  end
+  # The 32-bit lane multiply: SSE2 sequence on the baseline, PMULLD
+  # only when the desc advertises sse41.
+  let mul_i32 = x86_vec_binop_plan(LirVecBinOp::LirVecMul, "i32", false)
+  assert_true(mul_i32.is_ok())
+  match mul_i32
+  when Result::Ok(pl) then
+    match pl
+    when X86VecBinopPlan::X86VecMul32Sse2 then ()
+    when _ then panic("i32 mul must plan the SSE2 PMULUDQ sequence")
+    end
+  when Result::Err(_) then ()
+  end
+  let mul_u32 = x86_vec_binop_plan(LirVecBinOp::LirVecMul, "u32", true)
+  assert_true(mul_u32.is_ok())
+  match mul_u32
+  when Result::Ok(pl) then
+    match pl
+    when X86VecBinopPlan::X86VecMul32Sse41 then ()
+    when _ then panic("u32 mul with sse41 must plan PMULLD")
+    end
+  when Result::Err(_) then ()
+  end
+  # The truly-missing lane classes refuse with the named ISA rule.
+  let m8 = x86_vec_binop_plan(LirVecBinOp::LirVecMul, "i8", false)
+  assert_true(m8.is_err())
+  match m8
+  when Result::Err(e) then assert_true(e.contains("PMULLB"))
+  when Result::Ok(_) then ()
+  end
+  let m64 = x86_vec_binop_plan(LirVecBinOp::LirVecMul, "i64", false)
+  assert_true(m64.is_err())
+  match m64
+  when Result::Err(e) then assert_true(e.contains("VPMULLQ"))
+  when Result::Ok(_) then ()
+  end
+  let mx = x86_vec_binop_plan(LirVecBinOp::LirVecAdd, "q7", false)
+  assert_true(mx.is_err())
+  match mx
+  when Result::Err(e) then assert_true(e.contains("canonical vector element kind"))
+  when Result::Ok(_) then ()
+  end
   let lane128 = LirVectorLane { elem_kind: "i32".to_string(), lanes: 4, bits: 128 }
   assert_true(x86_validate_vec_lane("f", lane128).is_ok())
   let lane256 = LirVectorLane { elem_kind: "i32".to_string(), lanes: 8, bits: 256 }
   assert_true(x86_validate_vec_lane("f", lane256).is_err())
+end
+
+# The SSE2 lane-class encoder rows (the matrix the plan and the future
+# lane arms are built from; every row is the hand-verified byte string).
+@test
+def test_x86_sse2_lane_class_encoder_rows() -> Unit
+  x86_row_check("pandn xmm0, xmm1", x86_pandn_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0xDF, 0xC1]))
+  x86_row_check("pcmpeqb xmm0, xmm1", x86_pcmpeqb_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x74, 0xC1]))
+  x86_row_check("pcmpeqw xmm0, xmm1", x86_pcmpeqw_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x75, 0xC1]))
+  x86_row_check("pcmpeqd xmm0, xmm1", x86_pcmpeqd_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x76, 0xC1]))
+  x86_row_check("pcmpeqq xmm0, xmm1 (SSE4.1)", x86_pcmpeqq_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x38, 0x29, 0xC1]))
+  x86_row_check("pcmpgtb xmm0, xmm1", x86_pcmpgtb_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x64, 0xC1]))
+  x86_row_check("pcmpgtw xmm0, xmm1", x86_pcmpgtw_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x65, 0xC1]))
+  x86_row_check("pcmpgtd xmm0, xmm1", x86_pcmpgtd_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x66, 0xC1]))
+  x86_row_check("pmuludq xmm2, xmm1", x86_pmuludq_rr(2, 1),
+    Vec::from([0x66, 0x0F, 0xF4, 0xD1]))
+  x86_row_check("pmulld xmm0, xmm1 (SSE4.1)", x86_pmulld_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x38, 0x40, 0xC1]))
+  x86_row_check("punpckldq xmm2, xmm0", x86_punpckldq_rr(2, 0),
+    Vec::from([0x66, 0x0F, 0x62, 0xD0]))
+  x86_row_check("punpckhdq xmm2, xmm0", x86_punpckhdq_rr(2, 0),
+    Vec::from([0x66, 0x0F, 0x6A, 0xD0]))
+  x86_row_check("pshufd xmm0, xmm0, 0xB1", x86_pshufd_rr(0, 0, 0xB1),
+    Vec::from([0x66, 0x0F, 0x70, 0xC0, 0xB1]))
+  x86_row_check("pshuflw xmm0, xmm1, 0x1B", x86_pshuflw_rr(0, 1, 0x1B),
+    Vec::from([0xF2, 0x0F, 0x70, 0xC1, 0x1B]))
+  x86_row_check("pshufhw xmm0, xmm1, 0x1B", x86_pshufhw_rr(0, 1, 0x1B),
+    Vec::from([0xF3, 0x0F, 0x70, 0xC1, 0x1B]))
+  x86_row_check("psllw xmm1, 3", x86_psllw_imm(1, 3),
+    Vec::from([0x66, 0x0F, 0x71, 0xF1, 0x03]))
+  x86_row_check("pslld xmm1, 3", x86_pslld_imm(1, 3),
+    Vec::from([0x66, 0x0F, 0x72, 0xF1, 0x03]))
+  x86_row_check("psllq xmm1, 3", x86_psllq_imm(1, 3),
+    Vec::from([0x66, 0x0F, 0x73, 0xF1, 0x03]))
+  x86_row_check("psrlw xmm1, 3", x86_psrlw_imm(1, 3),
+    Vec::from([0x66, 0x0F, 0x71, 0xD1, 0x03]))
+  x86_row_check("psrld xmm1, 3", x86_psrld_imm(1, 3),
+    Vec::from([0x66, 0x0F, 0x72, 0xD1, 0x03]))
+  x86_row_check("psrlq xmm1, 3", x86_psrlq_imm(1, 3),
+    Vec::from([0x66, 0x0F, 0x73, 0xD1, 0x03]))
+  x86_row_check("psraw xmm1, 3", x86_psraw_imm(1, 3),
+    Vec::from([0x66, 0x0F, 0x71, 0xE1, 0x03]))
+  x86_row_check("psrad xmm1, 3", x86_psrad_imm(1, 3),
+    Vec::from([0x66, 0x0F, 0x72, 0xE1, 0x03]))
+  x86_row_check("psllw xmm0, xmm1", x86_psllw_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0xF1, 0xC1]))
+  x86_row_check("pslld xmm0, xmm1", x86_pslld_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0xF2, 0xC1]))
+  x86_row_check("psllq xmm0, xmm1", x86_psllq_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0xF3, 0xC1]))
+  x86_row_check("psrlw xmm0, xmm1", x86_psrlw_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0xD1, 0xC1]))
+  x86_row_check("psrld xmm0, xmm1", x86_psrld_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0xD2, 0xC1]))
+  x86_row_check("psrlq xmm0, xmm1", x86_psrlq_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0xD3, 0xC1]))
+  x86_row_check("psraw xmm0, xmm1", x86_psraw_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0xE1, 0xC1]))
+  x86_row_check("psrad xmm0, xmm1", x86_psrad_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0xE2, 0xC1]))
+  x86_row_check("cmpeqps xmm0, xmm1", x86_cmpps_rr(0, 1, 0),
+    Vec::from([0x0F, 0xC2, 0xC1, 0x00]))
+  x86_row_check("cmpltps xmm0, xmm1", x86_cmpps_rr(0, 1, 1),
+    Vec::from([0x0F, 0xC2, 0xC1, 0x01]))
+  x86_row_check("cmpeqpd xmm0, xmm1", x86_cmppd_rr(0, 1, 0),
+    Vec::from([0x66, 0x0F, 0xC2, 0xC1, 0x00]))
+  x86_row_check("sqrtps xmm0, xmm1", x86_sqrtps_rr(0, 1),
+    Vec::from([0x0F, 0x51, 0xC1]))
+  x86_row_check("sqrtpd xmm0, xmm1", x86_sqrtpd_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x51, 0xC1]))
+  x86_row_check("divps xmm0, xmm1", x86_divps_rr(0, 1),
+    Vec::from([0x0F, 0x5E, 0xC1]))
+  x86_row_check("divpd xmm0, xmm1", x86_divpd_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x5E, 0xC1]))
+  x86_row_check("movmskps eax, xmm0", x86_movmskps_r32_xmm(X64::RAX, 0),
+    Vec::from([0x0F, 0x50, 0xC0]))
+  x86_row_check("movmskps r10d, xmm15", x86_movmskps_r32_xmm(X64::R10, 15),
+    Vec::from([0x45, 0x0F, 0x50, 0xD7]))
+  x86_row_check("pextrd eax, xmm0, 2 (SSE4.1)", x86_pextrd_r32_xmm(X64::RAX, 0, 2),
+    Vec::from([0x66, 0x0F, 0x3A, 0x16, 0xC0, 0x02]))
+  x86_row_check("pinsrd xmm0, eax, 2 (SSE4.1)", x86_pinsrd_xmm_r32(0, X64::RAX, 2),
+    Vec::from([0x66, 0x0F, 0x3A, 0x22, 0xC0, 0x02]))
+  x86_row_check("cvtps2pd xmm0, xmm1", x86_cvtps2pd_rr(0, 1),
+    Vec::from([0x0F, 0x5A, 0xC1]))
+  x86_row_check("cvtpd2ps xmm0, xmm1", x86_cvtpd2ps_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x5A, 0xC1]))
+  x86_row_check("cvtps2dq xmm0, xmm1", x86_cvtps2dq_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x5B, 0xC1]))
+  x86_row_check("cvtdq2ps xmm0, xmm1", x86_cvtdq2ps_rr(0, 1),
+    Vec::from([0x0F, 0x5B, 0xC1]))
+  x86_row_check("cvtpd2dq xmm0, xmm1", x86_cvtpd2dq_rr(0, 1),
+    Vec::from([0xF2, 0x0F, 0xE6, 0xC1]))
+  x86_row_check("cvttpd2dq xmm0, xmm1", x86_cvttpd2dq_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0xE6, 0xC1]))
+end
+
+# The sequence-pinned lazy lane forms: the SSE2 i64x2 equality and the
+# SSE2 i32 lane extract (the SSE4.1 twins are pcmpeqq/pextrd above).
+@test
+def test_x86_vec_i64_eq_and_extract_sse2_rows() -> Unit
+  var xe = x86_emit_new()
+  x86_emit_vec_eq_i64_sse2(xe, 0, 1)
+  x86_row_check("i64x2 eq (SSE2 sequence)", xe.buf.bytes.clone(),
+    Vec::from([
+      0x66, 0x0F, 0x76, 0xC1,
+      0x66, 0x0F, 0x70, 0xD0, 0xB1,
+      0x66, 0x0F, 0xDB, 0xC2
+    ]))
+  var xr = x86_emit_new()
+  x86_emit_vec_extract_i32_sse2(xr, X64::R10, 3, 2)
+  x86_row_check("i32 lane 2 extract (SSE2 sequence)", xr.buf.bytes.clone(),
+    Vec::from([
+      0x66, 0x0F, 0x70, 0xD3, 0xAA,
+      0x66, 0x41, 0x0F, 0x7E, 0xD2
+    ]))
+end
+
+# The statement-level lane rows: the v128 32-bit multiply emits the
+# SSE2 PMULUDQ sequence on the baseline and PMULLD under the sse41
+# token; the v256 integer multiply emits VPMULLD under avx2 and refuses
+# with the named token rule otherwise.
+def x86_row_slot_seg(vreg: Int, slot: Int) -> LirSeg
+  LirSeg { start: 0, end: 0, vreg: vreg, phys: -1, slot: slot, needs_reload: false }
+end
+
+def x86_row_vec3_alloc() -> LirAlloc
+  var segs: Map[Int, Vec[LirSeg]] = Map::new()
+  segs.insert(16, Vec::from([x86_row_slot_seg(16, 0)]))
+  segs.insert(17, Vec::from([x86_row_slot_seg(17, 1)]))
+  segs.insert(18, Vec::from([x86_row_slot_seg(18, 2)]))
+  x86_row_alloc(3, segs, Vec::new())
+end
+
+@test
+def test_x86_vec_i32_mul_statement_rows() -> Unit
+  let lane = LirVectorLane { elem_kind: "i32".to_string(), lanes: 4, bits: 128 }
+  let alloc = x86_row_vec3_alloc()
+  var xe = x86_emit_new()
+  let r = x86_emit_vec_stmt(xe, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecMul, lane, 18, 16, 17), 0)
+  assert_true(r.is_ok())
+  x86_row_check("i32x4 mul (SSE2 sequence)", xe.buf.bytes.clone(),
+    Vec::from([
+      0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+      0xF3, 0x0F, 0x6F, 0x4D, 0xF0,
+      0xF3, 0x0F, 0x6F, 0x55, 0xF8,
+      0x66, 0x0F, 0xF4, 0xD1,
+      0x66, 0x0F, 0x70, 0xC0, 0xB1,
+      0x66, 0x0F, 0x70, 0xC9, 0xB1,
+      0x66, 0x0F, 0xF4, 0xC1,
+      0x66, 0x0F, 0x70, 0xD2, 0x08,
+      0x66, 0x0F, 0x70, 0xC0, 0x08,
+      0x66, 0x0F, 0x62, 0xD0,
+      0xF3, 0x0F, 0x7F, 0x55, 0xE8
+    ]))
+  var xs = x86_emit_new()
+  xs.sse41_ok = true
+  let rs = x86_emit_vec_stmt(xs, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecMul, lane, 18, 16, 17), 0)
+  assert_true(rs.is_ok())
+  x86_row_check("i32x4 mul (SSE4.1 PMULLD)", xs.buf.bytes.clone(),
+    Vec::from([
+      0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+      0xF3, 0x0F, 0x6F, 0x4D, 0xF0,
+      0x66, 0x0F, 0x38, 0x40, 0xC1,
+      0xF3, 0x0F, 0x7F, 0x45, 0xE8
+    ]))
+  # The v256 form: VPMULLD under avx2; the desc gates name the token.
+  let lane256 = LirVectorLane { elem_kind: "i32".to_string(), lanes: 8, bits: 256 }
+  var xa = x86_emit_new()
+  let ra = x86_emit_vec_stmt(xa, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecMul, lane256, 18, 16, 17), 0)
+  assert_true(ra.is_err())
+  match ra
+  when Result::Err(e) then assert_true(e.contains("AVX 256-bit envelope"))
+  when Result::Ok(_) then ()
+  end
+  var xb = x86_emit_new()
+  xb.avx_ok = true
+  let rb = x86_emit_vec_stmt(xb, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecMul, lane256, 18, 16, 17), 0)
+  assert_true(rb.is_err())
+  match rb
+  when Result::Err(e) then assert_true(e.contains("avx2"))
+  when Result::Ok(_) then ()
+  end
+  var xv = x86_emit_new()
+  xv.avx_ok = true
+  xv.avx2_ok = true
+  let rv = x86_emit_vec_stmt(xv, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecMul, lane256, 18, 16, 17), 0)
+  assert_true(rv.is_ok())
+  x86_row_check("i32x8 mul (AVX2 VPMULLD)", xv.buf.bytes.clone(),
+    Vec::from([
+      0xC4, 0xE1, 0x7E, 0x6F, 0x45, 0xF8,
+      0xC4, 0xE1, 0x7E, 0x6F, 0x4D, 0xF0,
+      0xC4, 0xE2, 0x7D, 0x40, 0xC1,
+      0xC4, 0xE1, 0x7E, 0x7F, 0x45, 0xE8
+    ]))
+  # The other v256 integer lane the AVX2 envelope serves: VPMULLW.
+  let lane16 = LirVectorLane { elem_kind: "i16".to_string(), lanes: 16, bits: 256 }
+  var xw = x86_emit_new()
+  xw.avx_ok = true
+  xw.avx2_ok = true
+  let rw = x86_emit_vec_stmt(xw, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecMul, lane16, 18, 16, 17), 0)
+  assert_true(rw.is_ok())
+  x86_row_check("i16x16 mul (AVX2 VPMULLW)", xw.buf.bytes.clone(),
+    Vec::from([
+      0xC4, 0xE1, 0x7E, 0x6F, 0x45, 0xF8,
+      0xC4, 0xE1, 0x7E, 0x6F, 0x4D, 0xF0,
+      0xC4, 0xE1, 0x7D, 0xD5, 0xC1,
+      0xC4, 0xE1, 0x7E, 0x7F, 0x45, 0xE8
+    ]))
+  # A v256 float lane needs the AVX envelope only (VADDPS ymm).
+  let lane_f32 = LirVectorLane { elem_kind: "f32".to_string(), lanes: 8, bits: 256 }
+  var xf = x86_emit_new()
+  xf.avx_ok = true
+  let rf = x86_emit_vec_stmt(xf, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecAdd, lane_f32, 18, 16, 17), 0)
+  assert_true(rf.is_ok())
+  x86_row_check("f32x8 add (AVX VADDPS)", xf.buf.bytes.clone(),
+    Vec::from([
+      0xC4, 0xE1, 0x7E, 0x6F, 0x45, 0xF8,
+      0xC4, 0xE1, 0x7E, 0x6F, 0x4D, 0xF0,
+      0xC4, 0xE1, 0x7C, 0x58, 0xC1,
+      0xC4, 0xE1, 0x7E, 0x7F, 0x45, 0xE8
+    ]))
+end
+
+@test
+def test_x86_vec_shuffle_gate_rows() -> Unit
+  let lane = LirVectorLane { elem_kind: "i8".to_string(), lanes: 16, bits: 128 }
+  let alloc = x86_row_vec3_alloc()
+  var xe = x86_emit_new()
+  let r = x86_emit_vec_stmt(xe, alloc, LirVecOp::LirVecShuffle(lane, 18, 16, 17), 0)
+  assert_true(r.is_err())
+  match r
+  when Result::Err(e) then assert_true(e.contains("ssse3"))
+  when Result::Ok(_) then ()
+  end
+  # With the ssse3 token the PSHUFB arm emits the byte-mask select.
+  var xs = x86_emit_new()
+  xs.ssse3_ok = true
+  let rs = x86_emit_vec_stmt(xs, alloc, LirVecOp::LirVecShuffle(lane, 18, 16, 17), 0)
+  assert_true(rs.is_ok())
+  x86_row_check("i8x16 shuffle (SSSE3 PSHUFB)", xs.buf.bytes.clone(),
+    Vec::from([
+      0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+      0xF3, 0x0F, 0x6F, 0x4D, 0xF0,
+      0x66, 0x0F, 0x38, 0x00, 0xC1,
+      0xF3, 0x0F, 0x7F, 0x55, 0xE8
+    ]))
+  # v256: VPSHUFB ymm needs the avx2 token even when avx is present.
+  let lane256 = LirVectorLane { elem_kind: "i8".to_string(), lanes: 32, bits: 256 }
+  var xb = x86_emit_new()
+  xb.avx_ok = true
+  let rb = x86_emit_vec_stmt(xb, alloc, LirVecOp::LirVecShuffle(lane256, 18, 16, 17), 0)
+  assert_true(rb.is_err())
+  match rb
+  when Result::Err(e) then assert_true(e.contains("avx2"))
+  when Result::Ok(_) then ()
+  end
 end
 
 @test
@@ -748,4 +1104,412 @@ def test_x86_elf_data_section_rows() -> Unit
   assert_true((obj[62] as Int) + ((obj[63] as Int) << 8) == 1)
   # .data starts at align8(64 + code.len()) = 72; the eight bytes appear.
   assert_true((obj[72] as Int) == 1 && (obj[79] as Int) == 8)
+end
+
+# ———————————————————————————————————————————————————————————————
+# The explicit-op extension rows (compare / shift / splat / lane moves
+# / and-not / pack-unpack): the encoders, the statement sequences and
+# the desc-gated refusals.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_x86_vec_ext_encoder_rows() -> Unit
+  x86_row_check("packsswb xmm0, xmm1", x86_packsswb_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x63, 0xC1]))
+  x86_row_check("packssdw xmm0, xmm1", x86_packssdw_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x6B, 0xC1]))
+  x86_row_check("punpcklbw xmm0, xmm1", x86_punpcklbw_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x60, 0xC1]))
+  x86_row_check("punpcklwd xmm0, xmm1", x86_punpcklwd_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x61, 0xC1]))
+  x86_row_check("punpckhbw xmm0, xmm1", x86_punpckhbw_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x68, 0xC1]))
+  x86_row_check("punpckhwd xmm0, xmm1", x86_punpckhwd_rr(0, 1),
+    Vec::from([0x66, 0x0F, 0x69, 0xC1]))
+  x86_row_check("pextrw eax, xmm1, 3", x86_pextrw_r32_xmm(X64::RAX, 1, 3),
+    Vec::from([0x66, 0x0F, 0xC5, 0xC1, 0x03]))
+  x86_row_check("pinsrw xmm0, eax, 3", x86_pinsrw_xmm_r32(0, X64::RAX, 3),
+    Vec::from([0x66, 0x0F, 0xC4, 0xC0, 0x03]))
+  x86_row_check("pextrb eax, xmm1, 3 (SSE4.1)", x86_pextrb_r32_xmm(X64::RAX, 1, 3),
+    Vec::from([0x66, 0x0F, 0x3A, 0x14, 0xC8, 0x03]))
+  x86_row_check("pinsrb xmm0, eax, 3 (SSE4.1)", x86_pinsrb_xmm_r32(0, X64::RAX, 3),
+    Vec::from([0x66, 0x0F, 0x3A, 0x20, 0xC0, 0x03]))
+  x86_row_check("pinsrq xmm0, rax, 1 (SSE4.1)", x86_pinsrq_xmm_r64(0, X64::RAX, 1),
+    Vec::from([0x66, 0x48, 0x0F, 0x3A, 0x22, 0xC0, 0x01]))
+  x86_row_check("vandnps ymm0, ymm1, ymm2", x86_vex_andnps_rrr(0, 1, 2, true),
+    Vec::from([0xC4, 0xE1, 0x74, 0x55, 0xC2]))
+  x86_row_check("vpsllvd ymm0, ymm1, ymm2", x86_vex_vpsllvd_rrr(0, 1, 2, true),
+    Vec::from([0xC4, 0xE2, 0x75, 0x47, 0xC2]))
+  x86_row_check("vpsrlvd ymm0, ymm1, ymm2", x86_vex_vpsrlvd_rrr(0, 1, 2, true),
+    Vec::from([0xC4, 0xE2, 0x75, 0x45, 0xC2]))
+  x86_row_check("vpsravd ymm0, ymm1, ymm2", x86_vex_vpsravd_rrr(0, 1, 2, true),
+    Vec::from([0xC4, 0xE2, 0x75, 0x46, 0xC2]))
+  x86_row_check("vpsllvd xmm0, xmm0, xmm1", x86_vex_vpsllvd_rrr(0, 0, 1, false),
+    Vec::from([0xC4, 0xE2, 0x79, 0x47, 0xC1]))
+  x86_row_check("vpbroadcastd ymm0, xmm0", x86_vex_broadcast(0, 0, true, 0x58),
+    Vec::from([0xC4, 0xE2, 0x7D, 0x58, 0xC0]))
+  x86_row_check("vpbroadcastq ymm0, xmm0", x86_vex_broadcast(0, 0, true, 0x59),
+    Vec::from([0xC4, 0xE2, 0x7D, 0x59, 0xC0]))
+  x86_row_check("vpslld ymm0, ymm0, 3 (VEX imm)", x86_vex_shift_imm(0, 0, 0x72, 6, true, 3),
+    Vec::from([0xC4, 0xE1, 0x7D, 0x72, 0xF0, 0x03]))
+  x86_row_check("pslld xmm0, 3 (VEX imm)", x86_vex_shift_imm(0, 0, 0x72, 6, false, 3),
+    Vec::from([0xC4, 0xE1, 0x79, 0x72, 0xF0, 0x03]))
+end
+
+# The statement fixture with a scalar word slot (vreg 19 -> slot 3) for
+# the splat/extract/insert rows (the vector vregs use the same slot 0/1/2
+# fixture as the base-statement rows).
+def x86_row_vec_word_alloc() -> LirAlloc
+  var segs: Map[Int, Vec[LirSeg]] = Map::new()
+  segs.insert(16, Vec::from([x86_row_slot_seg(16, 0)]))
+  segs.insert(17, Vec::from([x86_row_slot_seg(17, 1)]))
+  segs.insert(18, Vec::from([x86_row_slot_seg(18, 2)]))
+  segs.insert(19, Vec::from([x86_row_slot_seg(19, 3)]))
+  x86_row_alloc(4, segs, Vec::new())
+end
+
+# The same slot fixture with vreg 19 recorded FP-class (the f32/f64
+# splat source rows: the scalar lane arrives as its FP bit image).
+def x86_row_vec_fp_alloc(w: LirFpWidth) -> LirAlloc
+  var segs: Map[Int, Vec[LirSeg]] = Map::new()
+  segs.insert(16, Vec::from([x86_row_slot_seg(16, 0)]))
+  segs.insert(17, Vec::from([x86_row_slot_seg(17, 1)]))
+  segs.insert(18, Vec::from([x86_row_slot_seg(18, 2)]))
+  segs.insert(19, Vec::from([x86_row_slot_seg(19, 3)]))
+  var fp: Map[Int, LirFpWidth] = Map::new()
+  fp.insert(19, w)
+  LirAlloc {
+    slots: 4,
+    frame_bytes: 16 * 5,
+    segs_of: segs,
+    spills: Vec::new(),
+    reloads: Vec::new(),
+    cc_used: Vec::new(),
+    fp_widths: fp
+  }
+end
+
+@test
+def test_x86_vec_ext_statement_rows() -> Unit
+  let lane = LirVectorLane { elem_kind: "i32".to_string(), lanes: 4, bits: 128 }
+  let lane16 = LirVectorLane { elem_kind: "i16".to_string(), lanes: 8, bits: 128 }
+  let lane8 = LirVectorLane { elem_kind: "i8".to_string(), lanes: 16, bits: 128 }
+  let lane64 = LirVectorLane { elem_kind: "i64".to_string(), lanes: 2, bits: 128 }
+  let lane_f32 = LirVectorLane { elem_kind: "f32".to_string(), lanes: 4, bits: 128 }
+  let lane_f64 = LirVectorLane { elem_kind: "f64".to_string(), lanes: 2, bits: 128 }
+  let alloc = x86_row_vec_word_alloc()
+  # and-not: b staged in xmm0, a in xmm1, PANDN.
+  var x1 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x1, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecAndNot, lane, 18, 16, 17), 0).is_ok())
+  x86_row_check("i32x4 andnot (SSE2 PANDN)", x1.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF0,
+    0xF3, 0x0F, 0x6F, 0x4D, 0xF8,
+    0x66, 0x0F, 0xDF, 0xC1,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  # eq i32: PCMEQD.
+  var x2 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x2, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecEq, lane, 18, 16, 17), 0).is_ok())
+  x86_row_check("i32x4 eq (SSE2)", x2.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0xF3, 0x0F, 0x6F, 0x4D, 0xF0,
+    0x66, 0x0F, 0x76, 0xC1,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  # lt i32: PCMPGTD with the operands swapped (a in xmm1, b in xmm0).
+  var x3 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x3, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecLt, lane, 18, 16, 17), 0).is_ok())
+  x86_row_check("i32x4 lt (SSE2 swap)", x3.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x4D, 0xF8,
+    0xF3, 0x0F, 0x6F, 0x45, 0xF0,
+    0x66, 0x0F, 0x66, 0xC1,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  # le i32: PCMPGTD then the all-ones inversion.
+  var x4 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x4, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecLe, lane, 18, 16, 17), 0).is_ok())
+  x86_row_check("i32x4 le (SSE2 invert)", x4.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0xF3, 0x0F, 0x6F, 0x4D, 0xF0,
+    0x66, 0x0F, 0x66, 0xC1,
+    0x66, 0x0F, 0x76, 0xD2,
+    0x66, 0x0F, 0xEF, 0xC2,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  # eq i64: the SSE2 dword sequence.
+  var x5 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x5, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecEq, lane64, 18, 16, 17), 0).is_ok())
+  x86_row_check("i64x2 eq (SSE2 sequence)", x5.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0xF3, 0x0F, 0x6F, 0x4D, 0xF0,
+    0x66, 0x0F, 0x76, 0xC1,
+    0x66, 0x0F, 0x70, 0xD0, 0xB1,
+    0x66, 0x0F, 0xDB, 0xC2,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  # eq f32 / le f64: the CMPPS/CMPPD predicate rows.
+  var x6 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x6, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecEq, lane_f32, 18, 16, 17), 0).is_ok())
+  x86_row_check("f32x4 eq (CMPPS 0)", x6.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0xF3, 0x0F, 0x6F, 0x4D, 0xF0,
+    0x0F, 0xC2, 0xC1, 0x00,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  var x7 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x7, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecLe, lane_f64, 18, 16, 17), 0).is_ok())
+  x86_row_check("f64x2 le (CMPPD 2)", x7.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0xF3, 0x0F, 0x6F, 0x4D, 0xF0,
+    0x66, 0x0F, 0xC2, 0xC1, 0x02,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  # shift by immediate: PSLLD / PSRAW.
+  var x8 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x8, alloc, LirVecOp::LirVecShiftImm(lane, 0, 18, 16, 3), 0).is_ok())
+  x86_row_check("i32x4 shl #3 (PSLLD imm)", x8.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0x66, 0x0F, 0x72, 0xF0, 0x03,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  var x9 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x9, alloc, LirVecOp::LirVecShiftImm(lane16, 2, 18, 16, 3), 0).is_ok())
+  x86_row_check("i16x8 asr #3 (PSRAW imm)", x9.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0x66, 0x0F, 0x71, 0xE0, 0x03,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  # shift by vector count: the AVX2 VPSLLVD xmm form (per-lane dwords).
+  var x10 = x86_emit_new()
+  x10.avx2_ok = true
+  assert_true(x86_emit_vec_stmt(x10, alloc, LirVecOp::LirVecShiftVec(lane, 0, 18, 16, 17), 0).is_ok())
+  x86_row_check("i32x4 shl by vector counts (AVX2 VPSLLVD)", x10.buf.bytes.clone(), Vec::from([
+    0xC4, 0xE1, 0x7E, 0x6F, 0x45, 0xF8,
+    0xC4, 0xE1, 0x7E, 0x6F, 0x4D, 0xF0,
+    0xC4, 0xE2, 0x79, 0x47, 0xC1,
+    0xC4, 0xE1, 0x7E, 0x7F, 0x45, 0xE8
+  ]))
+  # The other two dword forms: VPSRLVD / VPSRAVD — the SAME unsigned
+  # count rule (a count >= 32 yields zero / sign fill; the aarch64
+  # clamp sequence mirrors this).
+  var x10b = x86_emit_new()
+  x10b.avx2_ok = true
+  assert_true(x86_emit_vec_stmt(x10b, alloc, LirVecOp::LirVecShiftVec(lane, 1, 18, 16, 17), 0).is_ok())
+  x86_row_check("i32x4 shr by vector counts (AVX2 VPSRLVD)", x10b.buf.bytes.clone(), Vec::from([
+    0xC4, 0xE1, 0x7E, 0x6F, 0x45, 0xF8,
+    0xC4, 0xE1, 0x7E, 0x6F, 0x4D, 0xF0,
+    0xC4, 0xE2, 0x79, 0x45, 0xC1,
+    0xC4, 0xE1, 0x7E, 0x7F, 0x45, 0xE8
+  ]))
+  var x10c = x86_emit_new()
+  x10c.avx2_ok = true
+  assert_true(x86_emit_vec_stmt(x10c, alloc, LirVecOp::LirVecShiftVec(lane, 2, 18, 16, 17), 0).is_ok())
+  x86_row_check("i32x4 sar by vector counts (AVX2 VPSRAVD)", x10c.buf.bytes.clone(), Vec::from([
+    0xC4, 0xE1, 0x7E, 0x6F, 0x45, 0xF8,
+    0xC4, 0xE1, 0x7E, 0x6F, 0x4D, 0xF0,
+    0xC4, 0xE2, 0x79, 0x46, 0xC1,
+    0xC4, 0xE1, 0x7E, 0x7F, 0x45, 0xE8
+  ]))
+  # splat: i32 MOVD+PSHUFD; i8 the PUNPCKLBW doubling.
+  var x11 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x11, alloc, LirVecOp::LirVecSplat(lane, 18, 19), 0).is_ok())
+  x86_row_check("i32x4 splat (MOVD+PSHUFD)", x11.buf.bytes.clone(), Vec::from([
+    0x48, 0x8B, 0x45, 0xE0,
+    0x66, 0x0F, 0x6E, 0xC0,
+    0x66, 0x0F, 0x70, 0xC0, 0x00,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  var x12 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x12, alloc, LirVecOp::LirVecSplat(lane8, 18, 19), 0).is_ok())
+  x86_row_check("i8x16 splat (PUNPCKLBW x2 + PSHUFD)", x12.buf.bytes.clone(), Vec::from([
+    0x48, 0x8B, 0x45, 0xE0,
+    0x66, 0x0F, 0x6E, 0xC0,
+    0x66, 0x0F, 0x60, 0xC0,
+    0x66, 0x0F, 0x60, 0xC0,
+    0x66, 0x0F, 0x70, 0xC0, 0x00,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  # float splats: the FP-class scalar's bit image reads into RAX
+  # (MOVSS/MOVSD + MOVD/MOVQ) before the integer broadcast sequence.
+  let fp32_alloc = x86_row_vec_fp_alloc(LirFpWidth::LirF32)
+  var x12f = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x12f, fp32_alloc, LirVecOp::LirVecSplat(lane_f32, 18, 19), 0).is_ok())
+  x86_row_check("f32x4 splat (MOVSS+MOVD+PSHUFD)", x12f.buf.bytes.clone(), Vec::from([
+    0xF3, 0x44, 0x0F, 0x10, 0x7D, 0xE0,
+    0x66, 0x44, 0x0F, 0x7E, 0xF8,
+    0x66, 0x0F, 0x6E, 0xC0,
+    0x66, 0x0F, 0x70, 0xC0, 0x00,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  let fp64_alloc = x86_row_vec_fp_alloc(LirFpWidth::LirF64)
+  var x12d = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x12d, fp64_alloc, LirVecOp::LirVecSplat(lane_f64, 18, 19), 0).is_ok())
+  x86_row_check("f64x2 splat (MOVSD+MOVQ+PSHUFD)", x12d.buf.bytes.clone(), Vec::from([
+    0xF2, 0x44, 0x0F, 0x10, 0x7D, 0xE0,
+    0x66, 0x4C, 0x0F, 0x7E, 0xF8,
+    0x66, 0x48, 0x0F, 0x6E, 0xC0,
+    0x66, 0x0F, 0x70, 0xC0, 0x44,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  # extract: i16 PEXTRW (SSE2), i32 the PSHUFD+MOVD sequence.
+  var x13 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x13, alloc, LirVecOp::LirVecExtract(lane16, 19, 16, 2), 0).is_ok())
+  x86_row_check("i16 lane 2 extract (PEXTRW)", x13.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0x66, 0x0F, 0xC5, 0xC0, 0x02,
+    0x48, 0x89, 0x45, 0xE0
+  ]))
+  var x14 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x14, alloc, LirVecOp::LirVecExtract(lane, 19, 16, 2), 0).is_ok())
+  x86_row_check("i32 lane 2 extract (SSE2 sequence)", x14.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0x66, 0x0F, 0x70, 0xD0, 0xAA,
+    0x66, 0x0F, 0x7E, 0xD0,
+    0x48, 0x89, 0x45, 0xE0
+  ]))
+  # insert: i16 PINSRW.
+  var x15 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x15, alloc, LirVecOp::LirVecInsert(lane16, 18, 16, 19, 3), 0).is_ok())
+  x86_row_check("i16 lane 3 insert (PINSRW)", x15.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0x48, 0x8B, 0x45, 0xE0,
+    0x66, 0x0F, 0xC4, 0xC0, 0x03,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  # pack i32->i16: PACKSSDW; unpack lo i16->i32: PUNPCKLWD + PSRAD 16.
+  var x16 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x16, alloc, LirVecOp::LirVecPack(lane, lane16, 18, 16, 17), 0).is_ok())
+  x86_row_check("i32x4 pack to i16x8 (PACKSSDW)", x16.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0xF3, 0x0F, 0x6F, 0x4D, 0xF0,
+    0x66, 0x0F, 0x6B, 0xC1,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  var x17 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x17, alloc, LirVecOp::LirVecUnpack(lane16, lane, 0, 18, 16), 0).is_ok())
+  x86_row_check("i16x8 unpacklo to i32x4 (PUNPCKLWD+PSRAD)", x17.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0x66, 0x0F, 0x61, 0xC0,
+    0x66, 0x0F, 0x72, 0xE0, 0x10,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  var x18 = x86_emit_new()
+  assert_true(x86_emit_vec_stmt(x18, alloc, LirVecOp::LirVecUnpack(lane8, lane16, 1, 18, 16), 0).is_ok())
+  x86_row_check("i8x16 unpackhi to i16x8 (PUNPCKHBW+PSRAW)", x18.buf.bytes.clone(), Vec::from([
+    0xF3, 0x0F, 0x6F, 0x45, 0xF8,
+    0x66, 0x0F, 0x68, 0xC0,
+    0x66, 0x0F, 0x71, 0xE0, 0x08,
+    0xF3, 0x0F, 0x7F, 0x45, 0xE8
+  ]))
+  # v256 and-not: the AVX1 VANDNPS ymm row.
+  let lane256 = LirVectorLane { elem_kind: "i32".to_string(), lanes: 8, bits: 256 }
+  var x19 = x86_emit_new()
+  x19.avx_ok = true
+  assert_true(x86_emit_vec_stmt(x19, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecAndNot, lane256, 18, 16, 17), 0).is_ok())
+  x86_row_check("i32x8 andnot (AVX VANDNPS)", x19.buf.bytes.clone(), Vec::from([
+    0xC4, 0xE1, 0x7E, 0x6F, 0x45, 0xF0,
+    0xC4, 0xE1, 0x7E, 0x6F, 0x4D, 0xF8,
+    0xC4, 0xE1, 0x7C, 0x55, 0xC1,
+    0xC4, 0xE1, 0x7E, 0x7F, 0x45, 0xE8
+  ]))
+end
+
+@test
+def test_x86_vec_ext_gate_rows() -> Unit
+  let lane = LirVectorLane { elem_kind: "i32".to_string(), lanes: 4, bits: 128 }
+  let lane16 = LirVectorLane { elem_kind: "i16".to_string(), lanes: 8, bits: 128 }
+  let lane8 = LirVectorLane { elem_kind: "i8".to_string(), lanes: 16, bits: 128 }
+  let lane64 = LirVectorLane { elem_kind: "i64".to_string(), lanes: 2, bits: 128 }
+  let alloc = x86_row_vec_word_alloc()
+  # The i8 immediate shift names the missing SSE2 byte-shift rule.
+  var x1 = x86_emit_new()
+  let r1 = x86_emit_vec_stmt(x1, alloc, LirVecOp::LirVecShiftImm(lane8, 0, 18, 16, 3), 0)
+  assert_true(r1.is_err())
+  match r1
+  when Result::Err(e) then assert_true(e.contains("byte-lane shift"))
+  when Result::Ok(_) then ()
+  end
+  # The i64 asr names the AVX-512 qword arithmetic rule.
+  var x2 = x86_emit_new()
+  let r2 = x86_emit_vec_stmt(x2, alloc, LirVecOp::LirVecShiftImm(lane64, 2, 18, 16, 3), 0)
+  assert_true(r2.is_err())
+  match r2
+  when Result::Err(e) then assert_true(e.contains("AVX-512"))
+  when Result::Ok(_) then ()
+  end
+  # The per-lane variable shift needs the avx2 token and the dword lanes.
+  var x3 = x86_emit_new()
+  let r3 = x86_emit_vec_stmt(x3, alloc, LirVecOp::LirVecShiftVec(lane, 0, 18, 16, 17), 0)
+  assert_true(r3.is_err())
+  match r3
+  when Result::Err(e) then assert_true(e.contains("avx2"))
+  when Result::Ok(_) then ()
+  end
+  var x4 = x86_emit_new()
+  x4.avx2_ok = true
+  let r4 = x86_emit_vec_stmt(x4, alloc, LirVecOp::LirVecShiftVec(lane64, 1, 18, 16, 17), 0)
+  assert_true(r4.is_err())
+  match r4
+  when Result::Err(e) then assert_true(e.contains("AVX2 dword forms"))
+  when Result::Ok(_) then ()
+  end
+  # The SSE4.1 lane inserts/extracts name the token when absent.
+  var x5 = x86_emit_new()
+  let r5 = x86_emit_vec_stmt(x5, alloc, LirVecOp::LirVecInsert(lane, 18, 16, 19, 2), 0)
+  assert_true(r5.is_err())
+  match r5
+  when Result::Err(e) then assert_true(e.contains("sse41"))
+  when Result::Ok(_) then ()
+  end
+  var x6 = x86_emit_new()
+  let r6 = x86_emit_vec_stmt(x6, alloc, LirVecOp::LirVecExtract(lane8, 19, 16, 2), 0)
+  assert_true(r6.is_err())
+  match r6
+  when Result::Err(e) then assert_true(e.contains("sse41"))
+  when Result::Ok(_) then ()
+  end
+  # The v256 compare/pack rows name the missing AVX2 VEX envelope.
+  let lane256 = LirVectorLane { elem_kind: "i32".to_string(), lanes: 8, bits: 256 }
+  var x7 = x86_emit_new()
+  x7.avx_ok = true
+  x7.avx2_ok = true
+  let r7 = x86_emit_vec_stmt(x7, alloc, LirVecOp::LirVecBinop(LirVecBinOp::LirVecEq, lane256, 18, 16, 17), 0)
+  assert_true(r7.is_err())
+  match r7
+  when Result::Err(e) then assert_true(e.contains("VPCMPEQ"))
+  when Result::Ok(_) then ()
+  end
+  var x8 = x86_emit_new()
+  x8.avx_ok = true
+  x8.avx2_ok = true
+  let r8 = x86_emit_vec_stmt(x8, alloc, LirVecOp::LirVecPack(lane256, LirVectorLane { elem_kind: "i16".to_string(), lanes: 16, bits: 256 }, 18, 16, 17), 0)
+  assert_true(r8.is_err())
+  match r8
+  when Result::Err(e) then assert_true(e.contains("VPACKSS"))
+  when Result::Ok(_) then ()
+  end
+  # The compare planner rows: i64 is equality only; the float gt/ge are
+  # outside the explicit surface.
+  let p_eq64 = x86_vec_cmp_plan(LirVecBinOp::LirVecEq, "i64")
+  assert_true(p_eq64.is_ok())
+  match p_eq64
+  when Result::Ok(pl) then
+    match pl
+    when X86VecCmpPlan::X86VecCmpEq64Sse2 then ()
+    when _ then panic("i64 eq must plan the SSE2 dword sequence")
+    end
+  when Result::Err(_) then ()
+  end
+  let p_lt64 = x86_vec_cmp_plan(LirVecBinOp::LirVecLt, "i64")
+  assert_true(p_lt64.is_err())
+  match p_lt64
+  when Result::Err(e) then assert_true(e.contains("64-bit signed compare"))
+  when Result::Ok(_) then ()
+  end
+  let p_gt_f32 = x86_vec_cmp_plan(LirVecBinOp::LirVecGt, "f32")
+  assert_true(p_gt_f32.is_err())
+  match p_gt_f32
+  when Result::Err(e) then assert_true(e.contains("eq/lt/le"))
+  when Result::Ok(_) then ()
+  end
 end

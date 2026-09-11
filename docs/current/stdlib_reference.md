@@ -23,7 +23,7 @@ This document provides a comprehensive reference for all modules in the Tangerin
    un-contracted module: **a new `std/*.tg` file fails the gate until it
    receives a contract + proof tests.** The module count is computed
    from the `std/*.tg` glob, never typed (the reviewer's table enumerated
-   133; the current tree enumerates 131 — `std/postgres.tg` was merged
+   133; the current tree enumerates 134 — `std/postgres.tg` was merged
    into `std/db.tg` and `std/hash_tests.tg` was removed in earlier
    waves).
 2. **Bootstrap closure (implemented-unverified):** the 14 std modules in
@@ -33,8 +33,8 @@ This document provides a comprehensive reference for all modules in the Tangerin
    ladder. They have no per-module native test suites.
 3. **E106 migration COMPLETE (parse-clean, CI-verified):** every shipped
    std module (all `std/*.tg` files — the count is computed, currently
-   131: the 14 kernel modules in
-   `bootstrap/compiler_kernel.manifest` plus the 117 non-kernel modules) is
+   134: the 14 kernel modules in
+   `bootstrap/compiler_kernel.manifest` plus the 120 non-kernel modules) is
    free of every forbidden syntax class: zero `-> &T` / `-> &mut T`
    returns, zero nested `&` in generic args (`Option[&T]`, `Vec[&T]`,
    `Option<&T>`), zero `&T`-typed fields/consts/let-annotations, zero
@@ -120,7 +120,7 @@ access model. The conversion classes:
 Remaining reference-typed positions in std: **zero** outside the
 documented `__intrinsic_` extern-ABI exception. The sweep gate
 `tests/run_stdlib_e106_sweep.sh` asserts every shipped module (the
-computed `std/*.tg` count — currently 131) checks clean AND passes the
+computed `std/*.tg` count — currently 134) checks clean AND passes the
 forbidden-syntax grep backstop; the gate is a **required CI job**
 (`stdlib-e106-sweep` in `.github/workflows/ci.yml`).
 

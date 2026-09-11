@@ -1,0 +1,245 @@
+# tests/simd_declaration_router_test.tg — the std/simd DECLARATION <->
+# ROUTER agreement lane (audit item 34 residual).
+#
+# std/simd.tg is the DECLARED explicit surface; the compiler recognizes
+# that surface through TWO name routers:
+#   - the BASE router (types.tg simd_intrinsic_kind_of): add/sub/mul/
+#     and/or/xor/load/store/shuffle names;
+#   - the EXPLICIT-OP router (lir.tg lir_simd_ext_op_of): andnot, the
+#     eq/lt/gt/le/ge lane-mask compares, the immediate and vector-count
+#     shifts, splat, lane extract/insert and the signed pack/unpack
+#     pairs.
+#
+# This test READS std/simd.tg, extracts every declared
+# `extern def __intrinsic_simd_<op>_<lane>` name, and asserts, one row
+# per op family, that every declared name classifies through its router
+# with the expected kind, yields a modeled lane spelling, and is not
+# classified by the other router. It also pins the residual that
+# motivated the lane — every load/store name the SLP pass emits
+# (i32x4/f32x4/i16x8/i8x16, plus the i64x2 sibling that completes the
+# 128-bit family) is DECLARED and base-router classified — and that the
+# routers' whole op vocabulary has at least one declaration (a wave that
+# adds a router op without the std declaration fails here).
+#
+# Rows (each a family name + its mismatch list; empty result = agree):
+#   A1 base arith        add/sub/mul/and/or/xor
+#   A2 base load/store   load/store
+#   A3 base shuffle      shuffle
+#   A4 ext andnot        andnot
+#   A5 ext compares      eq/lt/gt/le/ge
+#   A6 ext shifts        shl/shr/sar + shl_imm/shr_imm/sar_imm
+#   A7 ext splat         splat
+#   A8 ext extract/insert
+#   A9 ext pack/unpack   pack/unpacklo/unpackhi
+#   A10 SLP emitted surface  (the pass's names against the declarations)
+#   A11 router vocabulary    (every router op token has a declaration)
+#
+# Run with the repo root as the working directory:
+#   tg test tests/simd_declaration_router_test.tg
+
+use std::core::{Option, Result, Unit, Bool, panic}
+use std::collections::{Vec, Set}
+use std::test::*
+use std::fs::{read_to_string}
+use tg_compiler::types::{
+  SimdIntrinsicKind, simd_intrinsic_kind_of, simd_intrinsic_lane_of
+}
+use tg_compiler::lir::{
+  LirSimdExtKind, lir_simd_ext_op_of, lir_simd_ext_op_name
+}
+
+# ———————————————————————————————————————————————————————————————
+# The declaration reader: every `extern def __intrinsic_simd_*` name of
+# std/simd.tg (the declaration lines start at column 0; a name ends at
+# the parameter list's "(").
+# ———————————————————————————————————————————————————————————————
+
+def sdra_declared_names(src: String) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  for line in src.split("\n") do
+    let t = line.trim()
+    if t.starts_with("extern def __intrinsic_simd_") then
+      let rest = t.slice("extern def __intrinsic_simd_".len(), t.len())
+      match rest.find("(")
+      when Option::Some(p) then out.push(rest.slice(0, p))
+      when Option::None then ()
+      end
+    end
+  end
+  out
+end
+
+# The (op, lane) split of a __intrinsic_simd_<op>_<lane> name; ("","")
+# for a name that does not carry the shape.
+def sdra_op_lane_of(name: String) -> (String, String)
+  var bare = name.clone()
+  if bare.len() >= 12 && bare.slice(0, 12) == "__intrinsic_" then
+    bare = bare.slice(12, bare.len())
+  end
+  if !bare.starts_with("simd_") then return ("".to_string(), "".to_string()) end
+  let rest = bare.slice(5, bare.len())
+  match rest.rfind("_")
+  when Option::Some(pos) then (rest.slice(0, pos), rest.slice(pos + 1, rest.len()))
+  when Option::None then ("".to_string(), "".to_string())
+  end
+end
+
+def sdra_in(names: Vec[String], name: String) -> Bool
+  var hit = false
+  for n in names do
+    if n == name then hit = true end
+  end
+  hit
+end
+
+# The base router's kind -> op word (the reverse mapping of
+# simd_intrinsic_kind_of's op table, used to pin WHICH kind a declared
+# name classifies as — e.g. that load_i16x8 is SimdLoad, not SimdStore).
+def sdra_base_op_of_kind(kind: SimdIntrinsicKind) -> String
+  match kind
+  when SimdIntrinsicKind::SimdAdd then "add"
+  when SimdIntrinsicKind::SimdSub then "sub"
+  when SimdIntrinsicKind::SimdMul then "mul"
+  when SimdIntrinsicKind::SimdAnd then "and"
+  when SimdIntrinsicKind::SimdOr then "or"
+  when SimdIntrinsicKind::SimdXor then "xor"
+  when SimdIntrinsicKind::SimdLoad then "load"
+  when SimdIntrinsicKind::SimdStore then "store"
+  when SimdIntrinsicKind::SimdShuffle then "shuffle"
+  end
+end
+
+# One op-family row: every declared name whose op is in `ops` must route
+# through the chosen router with the matching kind and a modeled lane
+# spelling, and must NOT be claimed by the other router.
+def sdra_family_check(declared: Vec[String], family: String, ops: Vec[String], base_router: Bool, inout out: Vec[String]) -> Unit
+  var misses: Vec[String] = Vec::new()
+  var checked = 0
+  for name in declared do
+    let parts = sdra_op_lane_of(name.clone())
+    if sdra_in(ops.clone(), parts.0.clone()) then
+      checked = checked + 1
+      match simd_intrinsic_lane_of(&name)
+      when Option::Some(_) then ()
+      when Option::None then misses.push(name.clone() + " (unmodeled lane)")
+      end
+      if base_router then
+        match simd_intrinsic_kind_of(&name)
+        when Option::Some(k) then
+          if sdra_base_op_of_kind(k) != parts.0 then
+            misses.push(name.clone() + " (base kind mismatch)")
+          end
+        when Option::None then misses.push(name.clone() + " (base router miss)")
+        end
+        if lir_simd_ext_op_of(&name) != Option::None then
+          misses.push(name.clone() + " (claimed by the ext router too)")
+        end
+      else
+        match lir_simd_ext_op_of(&name)
+        when Option::Some(k) then
+          if lir_simd_ext_op_name(k) != parts.0 then
+            misses.push(name.clone() + " (ext kind mismatch)")
+          end
+        when Option::None then misses.push(name.clone() + " (ext router miss)")
+        end
+        if simd_intrinsic_kind_of(&name) != Option::None then
+          misses.push(name.clone() + " (claimed by the base router too)")
+        end
+      end
+    end
+  end
+  if checked == 0 then
+    out.push(family.clone() + ": no declared names found")
+  elsif !misses.is_empty() then
+    out.push(family.clone() + ": " + misses.join(", "))
+  end
+end
+
+# A10: every name the SLP pass builds (slp_intrinsic_name / the load and
+# store name forms) is DECLARED and base-router classified. The lane
+# classes are the pass's four (i32x4/f32x4/i16x8/i8x16) plus i64x2, the
+# remaining 128-bit class the emit arms serve.
+def sdra_slp_surface_row(declared: Vec[String]) -> String
+  var misses: Vec[String] = Vec::new()
+  var lanes: Vec[String] = Vec::from(["i32x4", "f32x4", "i16x8", "i8x16", "i64x2"])
+  for lane in lanes do
+    for op in Vec::from(["load", "store"]) do
+      let nm = "__intrinsic_simd_" + op.clone() + "_" + lane.clone()
+      if !sdra_in(declared.clone(), nm.clone()) then misses.push(nm.clone()) end
+      if simd_intrinsic_kind_of(&nm) == Option::None then
+        misses.push(nm.clone() + " (base router miss)")
+      end
+    end
+  end
+  # The arithmetic classes/ops the pass supports (the i8x16 lane class has
+  # no multiply in the declared surface — never emitted by the pass).
+  for lane in Vec::from(["i32x4", "f32x4", "i16x8"]) do
+    for op in Vec::from(["add", "sub", "mul", "and", "or", "xor"]) do
+      let nm = "__intrinsic_simd_" + op.clone() + "_" + lane.clone()
+      if !sdra_in(declared.clone(), nm.clone()) then misses.push(nm.clone()) end
+    end
+  end
+  for op in Vec::from(["add", "sub", "and", "or", "xor"]) do
+    let nm = "__intrinsic_simd_" + op.clone() + "_i8x16"
+    if !sdra_in(declared.clone(), nm.clone()) then misses.push(nm.clone()) end
+  end
+  if misses.is_empty() then "" else "slp-emitted-surface: " + misses.join(", ") end
+end
+
+# A11: every op token either router knows has at least one declared name.
+def sdra_router_vocabulary_row(declared: Vec[String]) -> String
+  var present: Set[String] = Set::new()
+  for name in declared do
+    let parts = sdra_op_lane_of(name.clone())
+    present.insert(parts.0.clone())
+  end
+  var misses: Vec[String] = Vec::new()
+  for op in Vec::from(["add", "sub", "mul", "and", "or", "xor", "load", "store", "shuffle"]) do
+    if !present.contains(&op) then misses.push(op.clone()) end
+  end
+  for op in Vec::from([
+    "andnot", "eq", "lt", "gt", "le", "ge",
+    "shl", "shr", "sar", "shl_imm", "shr_imm", "sar_imm",
+    "splat", "extract", "insert", "pack", "unpacklo", "unpackhi"
+  ]) do
+    if !present.contains(&op) then misses.push(op.clone()) end
+  end
+  if misses.is_empty() then "" else "router-vocabulary: no declaration for " + misses.join(", ") end
+end
+
+# The lane entry: the mismatch rows (empty = the declared surface and the
+# routers agree row for row).
+def sdra_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  let src = match read_to_string("std/simd.tg")
+  when Result::Ok(s) then s
+  when Result::Err(e) then
+    out.push("cannot read std/simd.tg: " + e.to_string())
+    return out
+  end
+  let declared = sdra_declared_names(src.clone())
+  if declared.is_empty() then
+    out.push("std/simd.tg declares no __intrinsic_simd_* names")
+    return out
+  end
+  sdra_family_check(declared.clone(), "base-arith", Vec::from(["add", "sub", "mul", "and", "or", "xor"]), true, &mut out)
+  sdra_family_check(declared.clone(), "base-load-store", Vec::from(["load", "store"]), true, &mut out)
+  sdra_family_check(declared.clone(), "base-shuffle", Vec::from(["shuffle"]), true, &mut out)
+  sdra_family_check(declared.clone(), "ext-andnot", Vec::from(["andnot"]), false, &mut out)
+  sdra_family_check(declared.clone(), "ext-compares", Vec::from(["eq", "lt", "gt", "le", "ge"]), false, &mut out)
+  sdra_family_check(declared.clone(), "ext-shifts", Vec::from(["shl", "shr", "sar", "shl_imm", "shr_imm", "sar_imm"]), false, &mut out)
+  sdra_family_check(declared.clone(), "ext-splat", Vec::from(["splat"]), false, &mut out)
+  sdra_family_check(declared.clone(), "ext-extract-insert", Vec::from(["extract", "insert"]), false, &mut out)
+  sdra_family_check(declared.clone(), "ext-pack-unpack", Vec::from(["pack", "unpacklo", "unpackhi"]), false, &mut out)
+  let slp_row = sdra_slp_surface_row(declared.clone())
+  if slp_row != "" then out.push(slp_row) end
+  let vocab_row = sdra_router_vocabulary_row(declared.clone())
+  if vocab_row != "" then out.push(vocab_row) end
+  out
+end
+
+@test
+def test_simd_declaration_router_agreement() -> Unit
+  let rows = sdra_check()
+  assert(rows.is_empty(), "simd declaration/router mismatches: " + rows.join("; "))
+end
