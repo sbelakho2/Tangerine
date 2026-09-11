@@ -338,6 +338,17 @@ type state = {
      the driver's provenance audit.  Deduped, so fixpoint re-rounds
      never accumulate *)
   mutable dup_decls : (string * (int * int) * (int * int)) list;
+  (* the typed-profile domain (audit P0): the fn-decl span keys
+     (file_id, decl start — see fn_decl_key) of the declarations whose
+     bodies were SUCCESSFULLY type-checked.  Only these declarations
+     ever contribute typed nodes/channels and are ever lowered; a
+     non-canonical duplicate (decl_keys discipline) or a declaration
+     that failed checking carries no typed use at all (it is typecheck
+     debt, never lowered), so the post-typing profile must walk exactly
+     the declarations recorded here.  Written by check_function_body on
+     its Ok path — the single funnel for free functions, methods,
+     trait defaults and tests. *)
+  checked_fn_spans : ((int * int), unit) Hashtbl.t;
   mutable o_handoff_resolved : int;
   (* the const-function registry: zero-arg functions whose body is a
      literal (`def DT_DIR() -> u8 = 4`) — their constant value backs the
@@ -1709,6 +1720,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       failed_items = [];
       decl_keys = Hashtbl.create 8192;
       dup_decls = [];
+      checked_fn_spans = Hashtbl.create 8192;
       o_handoff_resolved = 0;
       nested_functions = [];
       const_fns = Hashtbl.create 64;
@@ -8433,6 +8445,13 @@ let rec check_function_body (env : env)
                     (type_to_string sig_.ts_return)
                     (type_to_string (flow_normal body)) m)))
   in
+  (* the typed-profile domain: a successfully checked declaration is the
+     ONLY place a typed use (and therefore a profile finding) can live —
+     mark the span key so Typed_profile.check walks exactly the checked
+     declarations (the walk itself stays fully recursive inside each) *)
+  (match result with
+   | Ok () -> Hashtbl.replace env.state.checked_fn_spans (fn_decl_key d.fn_span) ()
+   | Error _ -> ());
   env.impls.param_bounds <- saved;
   result
 
@@ -10131,7 +10150,6 @@ and check_bodies (env : env) (program : Ast.program) : (env * string list, strin
         current_mod_global := program.Ast.prog_module_path;
         env.state.current_item_params <- item_param_ids env item;
         reset_oracle env;
-        prerr_endline ("TRACE-I " ^ mod_key ^ " :: " ^ name);
         let secondary = List.mem name env.state.failed_items in
         let tag m = if secondary then "[secondary] " ^ m else m in
         match check_item env item with

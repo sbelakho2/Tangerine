@@ -5,7 +5,14 @@
    typing and walks the FULL typed closure recursively (re-audit
    item 12: every expression child, nested block, branch/loop/match
    body, call argument, impl method and nested function is visited;
-   a missing finding cannot hide inside a nested form).  It validates
+   a missing finding cannot hide inside a nested form).  The DOMAIN is
+   exactly the declarations the typechecker successfully body-checked
+   (state.checked_fn_spans): the canonical-declaration discipline never
+   type-checks the losing copy of a duplicated function/method/test,
+   and a declaration that failed checking is typecheck debt that is
+   never lowered — neither carries a typed use, so profiling them
+   would only report missing records as findings (the scope fix; the
+   walk inside every checked declaration is still complete).  It validates
    the typed uses: the for-loop iterable kinds (the lowering supports
    Range, Fixed_array, Array/Vec and String runtime iteration; the
    Map/Set entries protocol is lowered through the intrinsic channel
@@ -241,13 +248,30 @@ let check (env : Typecheck.env) (items : Ast.item list) : finding list =
     | Ast.FnExpr e -> check_expr e
     | Ast.FnSignatureOnly -> ()
   in
+  (* the profile's DOMAIN (audit P0 scope fix): only the declarations the
+     typechecker actually body-checked AND accepted carry typed uses.
+     The canonical-declaration discipline deliberately never checks the
+     losing copy of a duplicated function/method/test (decl_keys), and a
+     declaration that failed checking is typecheck debt that is never
+     lowered — neither has any typed use to profile, so walking them can
+     only manufacture findings out of missing records (the typed
+     channels are keyed by the same AST node ids and untyped nodes have
+     none).  Inside each checked declaration the walk below remains the
+     full recursive traversal. *)
+  let decl_checked (sp : Span.span) : bool =
+    Hashtbl.mem env.Typecheck.state.checked_fn_spans (Typecheck.fn_decl_key sp)
+  in
   let check_items (items : Ast.item list) =
     List.iter
       (fun i ->
         match i.Ast.kind with
-        | Ast.Function fd -> check_fn_body fd.Ast.fn_body
+        | Ast.Function fd ->
+            if decl_checked fd.Ast.fn_span then check_fn_body fd.Ast.fn_body
         | Ast.ImplBlock d ->
-            List.iter (fun m -> check_fn_body m.Ast.fn_body) d.Ast.i_methods
+            List.iter
+              (fun m ->
+                if decl_checked m.Ast.fn_span then check_fn_body m.Ast.fn_body)
+              d.Ast.i_methods
         | Ast.StaticDecl _ | Ast.ConstDecl _ -> ()
         | _ -> ())
       items

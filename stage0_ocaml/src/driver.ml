@@ -1971,8 +1971,6 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
         let rec body_pass env = function
           | [] -> env
           | node :: rest -> (
-              prerr_endline
-                ("TRACE-M " ^ String.concat "::" node.Module_graph.node_path);
               match Typecheck.check_bodies (with_module env node) node.Module_graph.node_program with
               | Error m ->
                   let key = String.concat "::" node.Module_graph.node_path in
@@ -1985,12 +1983,10 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
                   body_pass env' rest)
         in
         env := body_pass env_after_decls nodes;
-        prerr_endline "TRACE-1 body-pass-done";
         (* final-state report (re-audit P0 #1): the compatibility-fallback
            activation count of the closure's resolution — exactly zero
            means the closure is strict-clean (per-module authority) *)
         let fallback_activations = Resolver.flat_fallback_activations resolved in
-        prerr_endline "TRACE-2 fallback-done";
         Printf.printf "  strict-mode status: %d compatibility-fallback activation(s) — %s\n"
           fallback_activations
           (if fallback_activations = 0 then
@@ -2028,9 +2024,7 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
            pattern bridges, closure_query_sigs, the oracle set, the
            mono-poison debug) read the ALREADY-FINAL channel contents
            and never chase a mutable historical journal again. *)
-        prerr_endline "TRACE-3 pre-finalize";
         (if type_errors = [] then env := Typecheck.finalize_inference !env);
-        prerr_endline "TRACE-4 finalize-done";
         (* ── the TYPED-PROFILE firewall (the audit's P0): the
            syntactic subset gate says the parser sees no categorically
            forbidden AST form — it does NOT prove every TYPED use of
@@ -2039,9 +2033,7 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
         let profile_items =
           List.concat_map (fun node -> node.Module_graph.node_items) (topological_nodes graph)
         in
-        prerr_endline "TRACE-5 pre-profile";
         let profile_findings = Typed_profile.check !env profile_items in
-        prerr_endline "TRACE-6 profile-done";
         Printf.printf "  TYPED_PROFILE = %s (%d findings)\n"
           (if profile_findings = [] then "PASS" else "FAIL")
           (List.length profile_findings);
@@ -4775,7 +4767,6 @@ let cmd_bootstrap_check (args : string list) : int =
        Printf.printf "  RESULT: FAIL\n";
        1
    | Ok ctx ->
-       prerr_endline "TRACE-A pipeline-returned";
        (match opts.diagnostics_jsonl with
         | Some p ->
             write_diagnostics_jsonl ~path:p
@@ -4801,9 +4792,7 @@ let cmd_bootstrap_check (args : string list) : int =
          1
        end
        else begin
-         prerr_endline "TRACE-B lowering-start";
          let prog = lower_closure ctx in
-         prerr_endline "TRACE-C lowering-done";
          (match
             Mir_verify.require_valid_template
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
