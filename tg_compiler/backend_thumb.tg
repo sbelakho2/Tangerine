@@ -38,8 +38,10 @@
 #       model by construction — this backend's prologue pushes
 #       {r4-r10, lr} (32 bytes) and points r7 at the BOTTOM of the
 #       local frame — so the emitter translates each payload to the
-#       machine offset [r7 + frame_bytes + 24 + payload] (derivation in
-#       the LirLoadFrame emitter arm below). Call sites with more than
+#       machine offset [r7 + frame_bytes + 24 + payload] (plus the
+#       64-byte VPUSH {d8-d15} bias when the function carries FP
+#       content: thumb_stack_param_off; derivation in the LirLoadFrame
+#       emitter arm below). Call sites with more than
 #       4 arguments push the overflow words themselves (see the caller
 #       stack-argument push slice below);
 #     - the allocator's fixed precolored vregs 0..3 are r0..r3; its pool
@@ -155,15 +157,26 @@
 #     call, the float STACK-PARAMETER binds (LirLoadFrame at the
 #     width) and the call CROSSING of live float values (the width-
 #     aware pre-call spill stores and post-call reloads) all lower at
-#     the crossings; the cm allocator's width-aware slot geometry
+#     the crossings; the float-ABI RESIDUAL slice adds the caller side
+#     of the stack stream — a float argument beyond d0..d7 rides the
+#     shared 4-byte AAPCS32 word stream and the emitter's LirPushArg
+#     arm stores it at its width (VSTR.F32 one word / VSTR.F64 the
+#     exact 8-byte double at the even base the lowering aligned, the
+#     interspersed alignment pad pushed below the unit) — and the F32
+#     int<->float TRANSMUTES (bm-marked VMOV Sd/Rt crossings, bit
+#     patterns preserved; an F64 pair fails closed at the 32-bit word
+#     model); the cm allocator's width-aware slot geometry
 #     (LirAlloc.slot_words — an F64 image's home is TWO 4-byte words
 #     at an even base, an F32 image one word) makes the 8-byte F64
 #     slot images exact). F32 values are MEMORY-CLASS on this route:
 #     the cm allocator entry (lir_alloc_registers_cm) never places an
-#     F32 vreg in the FP pool (d16..d29 — no single-register alias
-#     above d15 on the cortex-m register model), so every F32
+#     F32 vreg in the FP pool (d8..d13 — the M-profile single aliases
+#     are s0..s31 = d0..d15 only and are not re-derived from the pool
+#     doubles), so every F32
 #     statement lowers load-op-store through the d15/d14 statement
-#     scratches. FLOAT ADMISSION IS DESC-DRIVEN (audit §16): the VFP
+#     scratches. F64 values ride the pool d8..d13 when register-
+#     resident (the FP callee-save block below preserves them).
+#     FLOAT ADMISSION IS DESC-DRIVEN (audit §16): the VFP
 #     emission below is legal ONLY when the route's descriptor has an
 #     FPU and the hard-float ABI (fpu FPv4SP/FPv5D16, float_abi Hard —
 #     the cortex-m4f/cortex-m7 instances; the M4F crossing rules are
@@ -171,21 +184,28 @@
 #     implemented). Against a cortex-m3/cortex-m4 descriptor (fpu
 #     None, float_abi Soft) every function whose allocation carries
 #     float content fails closed at the desc-driven FP gate below —
-#     never a VFP byte for a core without an FPU.
+#     never a VFP byte for a core without an FPU. The FPU VARIANT gate
+#     adds the F64 split: on FPv4-SP/FPv5-SP (target_desc_f64_data_
+#     processing false) the F64 data-processing statements fail closed
+#     and the F64 envelope is the load/store/transfer/copy subset; on
+#     FPv5D16 (cortex-m7) the full F64 data-processing surface lowers.
 #     VARIADIC EXTERN CALLS (audit §16/§26): AAPCS32 says a VARIADIC call
 #     is made with the BASE convention — no VFP CPRC at all, floats
 #     ride general registers/stack as base-type words — while the
 #     shared LIR lowering marshals every call per-class into the VFP
 #     registers whenever the float route is open (it has no variadic
-#     marker). The base-convention caller marshaling is a
-#     lowering-level form this slice cannot express, so a call to a
-#     VARIADIC extern whose marshaling crosses float-class values in
-#     the fixed FP registers fails closed below with that rule — this
-#     includes the §26-promoted F64 image of an F32 extra and every
-#     F32/F64 extra and float fixed-prefix argument of the call. A
-#     GP-only variadic call keeps lowering exactly as before (the §26
-#     narrow-integer extras cross as their promoted int words, which
-#     the base standard's word stream already matches).
+#     marker). This backend RE-DERIVES the whole call's base convention
+#     at emission: a variadic call block's hard-float marshal
+#     statements are skipped and the argument stream is rebuilt as
+#     base-type words — an F64 (or the §26-promoted F64 image of an
+#     F32 extra, a real F32 -> F64 conversion) rides an aligned even-odd
+#     r0..r3 pair via vmov r,r,d, or an 8-byte-aligned caller-stack
+#     unit; the GP words continue the same r0..r3 / 4-byte word stream
+#     (see the AAPCS32 variadic base-convention marshaller section
+#     below). The F32 promotion needs double-precision VFP
+#     (vcvt.f64.f32) and therefore fails closed on the
+#     FPv4-SP/FPv5-SP cortex-m4f instances, whose F64 envelope is the
+#     load/store/transfer subset.
 #     Atomics via the ARMv7-M
 #     LDREX/STREX exclusives ARE implemented on this route (the
 #     ARMv7-M class of every family instance — native_atomic_widths
@@ -331,6 +351,7 @@ use tg_compiler::mir::{MirProgram, MirStatic}
 use tg_compiler::lir::{
   LirFunction, LirAlloc, LirStmt, LirStmtKind, LirTermKind, LirValue,
   LirBinOp, LirUnOp, LirCond, LirFpWidth, LirFpBinOp, LirPtrOp,
+  LirBitMoveOp,
   lir_fixed_fp_base, lir_is_fixed_fp_id,
   lower_mir_fn_to_lir_cm, lir_peephole, lir_alloc_registers_cm,
   lir_first_alloc_vreg, lir_seg_at, lir_reload_at,
@@ -342,6 +363,7 @@ use tg_compiler::lir::{
 use tg_compiler::target_desc::{
   TargetDesc, InterruptAbi, Arch, FloatAbi, Fpu,
   AtomicSupport, atomic_support,
+  target_desc_f64_data_processing,
   thumbv7m_cortex_m3_desc, thumbv7em_cortex_m4_desc,
   thumbv7em_cortex_m4f_desc, thumbv7em_cortex_m7_desc
 }
@@ -463,15 +485,56 @@ def thumb_desc_has_fp(desc: TargetDesc) -> Bool
   desc.fpu != Fpu::None && desc.float_abi == FloatAbi::Hard
 end
 
-# Whether a function's allocation carries float content: the lowering
-# registers exactly the three unconditional FP scratch vregs (the
-# F64/F32 statement scratches of lir_lower_ctx_new — ids
-# lir_first_alloc_vreg() .. +2) in LirAlloc.fp_widths even for a
-# float-free function, so a float-free allocation has EXACTLY three
-# rows; any float local/parameter/return/temporary adds its own row
-# (the map is the class table thumb's float arms resolve through).
+# Whether a function's allocation carries float content: lir.tg's
+# lir_lower_ctx_new registers exactly TWO unconditional FP scratch
+# vregs (the F64 and F32 statement scratches) in LirAlloc.fp_widths
+# even for a float-free function, so a float-free allocation has
+# EXACTLY two rows. Any float local/parameter/return/lowering
+# temporary adds its own row (the map is the class table thumb's
+# float arms resolve through), so a count above the two-scratch
+# baseline means the emitted body can touch the FP register file (an
+# FP operand or the d14/d15 statement scratches): the frame must carry
+# the VPUSH/VPOP {d8-d15} callee-save block and the no-FPU descriptor
+# gate must fire. The comparison is `> 2`, NOT `> 3`: one FP vreg
+# beyond the scratch baseline (e.g. a function whose only float value
+# is its return local, or a single F32 constant) already emits VFP
+# code through the scratches/pool, so the callee-save and the FPU gate
+# must engage.
 def thumb_alloc_has_fp_content(alloc: LirAlloc) -> Bool
-  alloc.fp_widths.len() > 3
+  alloc.fp_widths.len() > 2
+end
+
+# The canonical token of a modeled FPU (diagnostics and the F64 gate
+# text). Kept in lockstep with target_desc.tg's Fpu enum.
+def thumb_fpu_token(f: Fpu) -> String
+  match f
+  when Fpu::None then "none"
+  when Fpu::FPv4SP then "FPv4SP"
+  when Fpu::FPv5D16 then "FPv5D16"
+  when Fpu::FPv5SP then "FPv5SP"
+  when Fpu::AdvSimdA64 then "AdvSimdA64"
+  when Fpu::Sse2 then "Sse2"
+  when Fpu::RVF then "RVF"
+  when Fpu::RVD then "RVD"
+  end
+end
+
+# The fail-closed rule text for an F64 DATA-PROCESSING statement on a
+# descriptor whose FPU has none (target_desc_f64_data_processing false:
+# FPv4-SP on the cortex-m4f instance, FPv5-SP on a single-precision
+# M7). The F64 load/store/transfer envelope stays legal; arithmetic,
+# compares and conversions fail closed HERE with the desc's actual
+# values (the gate reads desc.fpu — never a hard-coded CPU name).
+def thumb_f64_dp_rule(desc: TargetDesc, fn_name: String, what: String) -> String
+  "thumb: " + fn_name + ": " + what + " does not lower against the `" + desc.name + "` description — its FPU (" + thumb_fpu_token(desc.fpu) + ") has NO double-precision data processing (FPv4-SP / FPv5-SP are single-precision units: the double-register support is the load/store/transfer subset only). The F64 load/store envelope (VLDR/VSTR/VPUSH/VPOP, VMOV core<->D, register copies through the stack) stays legal; use the cortex-m7 description (fpu FPv5D16, isa_features \"vfp-dp\") for F64 data processing (fail-closed)"
+end
+
+# The emitter-side mirror of thumb_f64_dp_rule: the statement arms are
+# defense in depth AFTER thumb_validate_fn (which carries the desc), so
+# this variant reports a validation/emission divergence while still
+# never emitting the F64 data-processing byte.
+def thumb_f64_dp_rule_emit(te: ThumbEmit, what: String) -> String
+  "thumb: " + what + " reached the emitter against `" + te.desc_name + "`, whose FPU has no double-precision data processing (target_desc_f64_data_processing false) — validation must have failed it closed; refusing to emit the F64 data-processing form (internal gate divergence; fail-closed)"
 end
 
 # Build the register model from the desc — the desc is the single source
@@ -724,8 +787,11 @@ end
 # executes the desc's exit rule. Entry SP alignment (8) and the MSP
 # handler-stack discipline are the startup/board contract documented
 # in the module header.
-def thumb_emit_interrupt_prologue(inout te: ThumbEmit, frame_bytes: Int) -> Unit
+def thumb_emit_interrupt_prologue(inout te: ThumbEmit, frame_bytes: Int, fp_save: Bool) -> Unit
   t2_push_w(&mut te.buf, thumb_saved_reg_list())
+  if fp_save then
+    t2_vpush_d(&mut te.buf, 8, 8)
+  end
   if frame_bytes > 0 then
     if frame_bytes <= 508 then
       t2_sub_sp_imm7(&mut te.buf, frame_bytes)
@@ -756,6 +822,19 @@ def thumb_frame_bytes(slots: Int) -> Int
   else
     raw
   end
+end
+
+# The machine [r7 + ...] offset of an AAPCS stack-parameter payload at
+# the LIR-canonical `off` (the LirLoadFrame statement's payload; see
+# the emitter arm's derivation): r7 sits below the {r4-r10, lr} push
+# (32 bytes), the local frame (`frame_bytes`) and — for an FP-content
+# function (te.fp_save) — the VPUSH {d8-d15} callee-save block (64
+# bytes), so the payload [fp + off] (fp = incoming SP - 8) translates
+# to off + frame_bytes + 24 + (64 when the FP block is present). The
+# LirLoadFrame arm and the structural rows both read THIS helper —
+# the 64-byte bias can never drift between them.
+def thumb_stack_param_off(off: Int, frame_bytes: Int, fp_save: Bool) -> Int
+  off + frame_bytes + 24 + (if fp_save then 64 else 0 end)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1739,6 +1818,39 @@ def t2_vmov_f32(inout b: CodeBuffer, sd: Int, sm: Int) -> Unit
   t2_word(b, 0xEEB00A40 | (((sd as u32) >> 1) << 12) | (((sm as u32) & 1) << 5) | (((sd as u32) & 1) << 22) | ((sm as u32) >> 1))
 end
 
+# VPUSH {Dfirst, ..., Dfirst+count-1} — the VSTMDB SP! (decrement
+# before, writeback) form with the double register list, word
+# 0xED2D0B00 | (Dfirst&15)<<12 | (Dfirst>>4)<<22 | 2*count: the
+# encoding's low byte counts SINGLE-precision registers (a double
+# occupies two), so a count of `count` doubles encodes 2*count. This is
+# the M-profile FP callee-save push (the FP mirror of PUSH {r4-r10,
+# lr}) AND the 64-bit register-copy primitive for FPv4-SP, whose
+# instruction set has NO VMOV.F64 Dd, Dm (a 64-bit copy rides the
+# stack: vpush the source, vpop the destination). Verified against the
+# fpv4-sp-d16 assembler: vpush {d0} = 0xED2D0B02; vpush {d8} =
+# 0xED2D8B02; vpush {d8-d15} = 0xED2D8B10; vpush {d15} = 0xED2DFB02;
+# vpush {d0-d7} = 0xED2D0B10 (bytes 2d ed 10 0b). FLAGLESS; SP moves by
+# 8*count (always a multiple of 8, so the AAPCS frame alignment holds
+# at every statement boundary and around the prologue save block).
+def t2_vpush_d(inout b: CodeBuffer, first: Int, count: Int) -> Unit
+  if first < 0 || first > 31 then panic("t2_vpush_d: first register must be d0-d31") end
+  if count < 1 || count > 16 || first + count > 32 then panic("t2_vpush_d: register count must be 1..16 and stay in d0-d31") end
+  t2_word(b, 0xED2D0B00 | (((first as u32) & 15) << 12) | ((((first as u32) >> 4) & 1) << 22) | ((2 * count) as u32))
+end
+
+# VPOP {Dfirst, ..., Dfirst+count-1} — the VLDMIA SP! (increment after,
+# writeback) double-list form, word 0xECBD0B00 | (Dfirst&15)<<12 |
+# (Dfirst>>4)<<22 | 2*count (the VLDMIA counterpart of t2_vpush_d; the
+# same single-count low byte). Pops exactly the words a matching
+# t2_vpush_d(first, count) pushed. Verified: vpop {d0} = 0xECBD0B02;
+# vpop {d1} = 0xECBD1B02; vpop {d8} = 0xECBD8B02; vpop {d8-d15} =
+# 0xECBD8B10; vpop {d3-d5} = 0xECBD3B06 (bytes bd ec 06 3b). FLAGLESS.
+def t2_vpop_d(inout b: CodeBuffer, first: Int, count: Int) -> Unit
+  if first < 0 || first > 31 then panic("t2_vpop_d: first register must be d0-d31") end
+  if count < 1 || count > 16 || first + count > 32 then panic("t2_vpop_d: register count must be 1..16 and stay in d0-d31") end
+  t2_word(b, 0xECBD0B00 | (((first as u32) & 15) << 12) | ((((first as u32) >> 4) & 1) << 22) | ((2 * count) as u32))
+end
+
 # VCMP.F64 Dd, Dm — monadic compare, word 0xEEB40B40 | same fields as
 # t2_vneg_f64 (opcode [19:16] = 0100, [7:4] = 0100). Sets the FPSCR
 # comparison flags (they reach APSR only via t2_vmrs_apsr_nzcv).
@@ -2104,20 +2216,31 @@ end
 # the assembler on every boundary and reject probe — #0.125 (E = -3,
 # exp 1020) encodes, #0.0625 (E = -4) is rejected, #16.0 (E = 4, exp
 # 1027) encodes, #32.0 (E = 5) and #0.0/#-0.0 are rejected, and every
-# accepted value's word matches t2_vmov_f64_imm's output. Returns true
-# iff `bits` has an encoding (and emits the VMOV); false otherwise.
-def t2_vmov_f64_const(inout b: CodeBuffer, dd: Int, bits: u64) -> Bool
-  if dd < 0 || dd > 31 then panic("t2_vmov_f64_const: register must be d0-d31") end
+# accepted value's word matches t2_vmov_f64_imm's output. The imm8
+# VALUE is returned by t2_vmov_imm8_of_f64_bits (-1 = not encodable):
+# the F32 modified-immediate form encodes the SAME 256-value set with
+# the SAME imm8, so the F32 constant path reuses this predicate.
+def t2_vmov_imm8_of_f64_bits(bits: u64) -> Int
   let e = bits >> 52
   if e < 1020 || e > 1027 then
-    return false
+    return -1
   end
   let m = (bits << 12) >> 12
   let f = m >> 48
   if (f << 48) != m then
+    return -1
+  end
+  ((((bits >> 63) & 1) << 7) | ((e & 7) << 4) | f) as Int
+end
+
+# Returns true iff `bits` has an encoding (and emits the VMOV.F64 imm);
+# false otherwise.
+def t2_vmov_f64_const(inout b: CodeBuffer, dd: Int, bits: u64) -> Bool
+  if dd < 0 || dd > 31 then panic("t2_vmov_f64_const: register must be d0-d31") end
+  let imm8 = t2_vmov_imm8_of_f64_bits(bits)
+  if imm8 < 0 then
     return false
   end
-  let imm8 = ((((bits >> 63) & 1) << 7) | ((e & 7) << 4) | f) as Int
   t2_vmov_f64_imm(b, dd, imm8)
   true
 end
@@ -2218,12 +2341,21 @@ def thumb_reloc_movt_abs() -> Int = 48
 
 # The whole-program emission state: the text buffer, the deferred branch
 # patches, the extern-call relocations and the symbol records (function
-# symbols + extern undefined symbols, in program order).
+# symbols + extern undefined symbols, in program order). `f64dp` is the
+# current function's scalar F64 data-processing admission
+# (target_desc_f64_data_processing over the route's descriptor — set
+# once per function by thumb_emit_fn); `fp_save` records whether the
+# current function's frame carries the VPUSH/VPOP {d8-d15} FP
+# callee-save block (FP content on an FPU-carrying descriptor — the
+# prologue emits it, the epilogue restores it).
 struct ThumbEmit
   buf: CodeBuffer
   patches: Vec[ThumbPatch]
   relocs: Vec[ThumbReloc]
   syms: Vec[AsmSymbol]
+  f64dp: Bool
+  fp_save: Bool
+  desc_name: String
 end
 
 def thumb_emit_new() -> ThumbEmit
@@ -2231,7 +2363,10 @@ def thumb_emit_new() -> ThumbEmit
     buf: buf_new(),
     patches: Vec::new(),
     relocs: Vec::new(),
-    syms: Vec::new()
+    syms: Vec::new(),
+    f64dp: false,
+    fp_save: false,
+    desc_name: "".to_string()
   }
 end
 
@@ -2480,9 +2615,48 @@ def thumb_validate_fn(f: LirFunction, desc: TargetDesc) -> Result[Unit, String]
             end
           end
         end
-      when LirStmtKind::LirUnop(_, _, src) then
-        if thumb_fixed_bad(src) then
-          return Result::Err("thumb: " + f.name + ": unop operand from fixed vreg " + src.to_string() + " does not lower (fixed vregs 4..7 are aarch64 x4..x7; the cortex-m lowering never emits them — fail-closed)")
+      when LirStmtKind::LirUnop(_, dst, src) then
+        # A bm-marked carrier (LirStmt.bm — the int<->float transmute of
+        # the float slice) validates as the register-class bit move it
+        # is: the FP side must carry a class record (an ordinary FP
+        # vreg — fixed FP ids are ABI edges, never transmute results),
+        # the general side must be an ordinary word, and only the F32
+        # pair exists at the 32-bit word model (an F64 bit image needs
+        # the two-register VMOV pair the single-GP-operand carrier
+        # cannot express; the lowering rejects it before this check —
+        # defense in depth).
+        match stmt.bm
+        when Option::Some(bmop) then
+          match bmop
+          when LirBitMoveOp::LirBitsGpToFp then
+            match f.fp_widths.get(dst)
+            when Option::Some(w) then
+              if w != LirFpWidth::LirF32 then
+                return Result::Err("thumb: " + f.name + ": f64 gp-to-fp bit move into vreg " + dst.to_string() + " does not lower on the cortex-m route (the 32-bit word model has no single general register for a 64-bit image — only F32 <-> the 4-byte integer words lower; fail-closed)")
+              end
+            when Option::None then
+              return Result::Err("thumb: " + f.name + ": gp-to-fp bit move destination vreg " + dst.to_string() + " has no FP class record (a fixed/ABI id or a class-table divergence — fail-closed)")
+            end
+            if thumb_fixed_bad(src) then
+              return Result::Err("thumb: " + f.name + ": gp-to-fp bit move source from fixed vreg " + src.to_string() + " does not lower (fixed vregs 4..7 are aarch64 x4..x7 — fail-closed)")
+            end
+          when LirBitMoveOp::LirBitsFpToGp then
+            match f.fp_widths.get(src)
+            when Option::Some(w) then
+              if w != LirFpWidth::LirF32 then
+                return Result::Err("thumb: " + f.name + ": f64 fp-to-gp bit move from vreg " + src.to_string() + " does not lower on the cortex-m route (the 32-bit word model has no single general register for a 64-bit image — only F32 <-> the 4-byte integer words lower; fail-closed)")
+              end
+            when Option::None then
+              return Result::Err("thumb: " + f.name + ": fp-to-gp bit move source vreg " + src.to_string() + " has no FP class record (a fixed/ABI id or a class-table divergence — fail-closed)")
+            end
+            if thumb_fixed_bad(dst) then
+              return Result::Err("thumb: " + f.name + ": fp-to-gp bit move destination in fixed vreg " + dst.to_string() + " does not lower (fixed vregs 4..7 are aarch64 x4..x7 — fail-closed)")
+            end
+          end
+        when Option::None then
+          if thumb_fixed_bad(src) then
+            return Result::Err("thumb: " + f.name + ": unop operand from fixed vreg " + src.to_string() + " does not lower (fixed vregs 4..7 are aarch64 x4..x7; the cortex-m lowering never emits them — fail-closed)")
+          end
         end
       when LirStmtKind::LirCmp(left, right) then
         match left
@@ -2503,19 +2677,28 @@ def thumb_validate_fn(f: LirFunction, desc: TargetDesc) -> Result[Unit, String]
       when LirStmtKind::LirCset(_, _) then ()
       when LirStmtKind::LirLoadFrame(dst, off) then
         # The cortex-m lowering emits LirLoadFrame only at the top of
-        # the entry block to bind parameter indexes >= 4 from their
-        # AAPCS caller-stack words, with the canonical payload
-        # 8 + 4*(i-4) (lir.tg's lir_stack_arg_offset). A fixed-vreg
-        # destination or a payload outside that geometry (4-aligned,
-        # >= 8) marks a foreign lowering; an aarch64-convention
-        # function is in any case caught by the fixed-vreg 4..7
-        # rejections (its parameter binds always trip one before any
-        # LirLoadFrame is reached).
+        # the entry block to bind stack-class parameters from the shared
+        # AAPCS caller-word stream: a general word (or F32) at the
+        # canonical payload 8 + 4*k, an F64's 8-byte unit at the EVEN
+        # word base 8 + 4*k (the entry walk's width-aware arithmetic —
+        # lir.tg's lir_stack_arg_offset). A fixed-vreg destination or a
+        # payload outside that geometry (4-aligned, >= 8 — and
+        # 8-aligned for an F64 image) marks a foreign lowering; an
+        # aarch64-convention function is in any case caught by the
+        # fixed-vreg 4..7 rejections (its parameter binds always trip
+        # one before any LirLoadFrame is reached).
         if dst < lir_first_alloc_vreg() then
           return Result::Err("thumb: " + f.name + ": stack-parameter load into fixed vreg " + dst.to_string() + " does not lower (the cortex-m lowering loads AAPCS stack parameters into ordinary vregs only — fail-closed)")
         end
         if off < 8 || (off % 4) != 0 then
-          return Result::Err("thumb: " + f.name + ": stack-parameter load at canonical offset " + off.to_string() + " does not lower — the AAPCS stack-parameter payloads of the cortex-m lowering are 8 + 4*(i-4) for parameter index i >= 4 (fail-closed)")
+          return Result::Err("thumb: " + f.name + ": stack-parameter load at canonical offset " + off.to_string() + " does not lower — the AAPCS stack-parameter payloads of the cortex-m lowering are 8 + 4*k (fail-closed)")
+        end
+        match f.fp_widths.get(dst)
+        when Option::Some(w) then
+          if w == LirFpWidth::LirF64 && off % 8 != 0 then
+            return Result::Err("thumb: " + f.name + ": F64 stack-parameter load at the odd-word offset " + off.to_string() + " does not lower — an 8-byte double image needs an 8-byte-aligned even-word base (the AAPCS32 stream's width-aware arithmetic; fail-closed)")
+          end
+        when Option::None then ()
         end
       when LirStmtKind::LirPushArg(vreg) then
         if vreg < lir_first_alloc_vreg() then
@@ -2544,49 +2727,96 @@ def thumb_validate_fn(f: LirFunction, desc: TargetDesc) -> Result[Unit, String]
         # slot loads/stores of memory-resident operands (spill-slot
         # segments and post-call reload records — invariant I2). An F32
         # operand is always memory-resident here — the cm allocator
-        # keeps F32 out of the FP pool (d16..d29 — no single-register
-        # alias above d15; F32 is memory-class on this route) — so the
-        # register-resident F32 forms the resolution helpers still fail
-        # closed on are allocator-invariant checks (unproducible), and
-        # validation passes every float statement whose lowering shape
-        # is cortex-m-native. A fixed
+        # keeps F32 out of the FP pool (d8..d13 — the M-profile single
+        # aliases are s0..s31 = d0..d15 only, and the pool's doubles are
+        # not re-derived as singles; F32 is memory-class on this route)
+        # — so the register-resident F32 forms the resolution helpers
+        # still fail closed on are allocator-invariant checks
+        # (unproducible), and validation passes every float statement
+        # whose lowering shape is cortex-m-native. A fixed
         # ABI FP id (8..15) in either operand is legal only at the
-        # float ABI edges the route does not produce yet — the emission
-        # resolves it to its d-register exactly like an allocated one.
+        # float ABI edges the route produces (parameter binds,
+        # argument marshals, returns, result captures) — the emission
+        # resolves it to its d-register exactly like an allocated one,
+        # and an F64 register-to-register copy on an FPv4-SP FPU lowers
+        # as the VPUSH/VPOP pair (no VMOV.F64 Dd, Dm exists there).
         ()
-      when LirStmtKind::LirFBinop(_, _, _, _, _) then ()
-      when LirStmtKind::LirFNeg(_, _, _) then ()
-      when LirStmtKind::LirFCmp(_, _, _) then ()
-      when LirStmtKind::LirFConst(_, _, _) then ()
-      when LirStmtKind::LirIntToFloat(_, _, src, _) then
+      when LirStmtKind::LirFBinop(_, w, _, _, _) then
+        if w == LirFpWidth::LirF64 && !target_desc_f64_data_processing(desc) then
+          return Result::Err(thumb_f64_dp_rule(desc, f.name, "F64 arithmetic (fadd/fsub/fmul/fdiv)"))
+        end
+      when LirStmtKind::LirFNeg(w, _, _) then
+        if w == LirFpWidth::LirF64 && !target_desc_f64_data_processing(desc) then
+          return Result::Err(thumb_f64_dp_rule(desc, f.name, "F64 negation"))
+        end
+      when LirStmtKind::LirFCmp(w, _, _) then
+        if w == LirFpWidth::LirF64 && !target_desc_f64_data_processing(desc) then
+          return Result::Err(thumb_f64_dp_rule(desc, f.name, "an F64 compare"))
+        end
+      when LirStmtKind::LirFConst(_, _, _) then
+        # F64 constants are ADMITTED on every FPU with D registers,
+        # including the single-precision FPv4-SP/FPv5-SP units: their
+        # materialization is the core<->D TRANSFER path (movw/movt into
+        # a GP pair + VMOV Dd, Rt, Rt2 — legal on fpv4-sp-d16), NOT the
+        # F64 data-processing VMOV.F64 Dd, #imm. The capability gate for
+        # constants is therefore the EMITTER's encoder choice: the
+        # F64 arm consults te.f64dp and uses the immediate form only
+        # when target_desc_f64_data_processing(desc) is true, so no F64
+        # data-processing byte can be emitted against a single-precision
+        # unit. The F32-on-an-SP-FPU partial envelope is likewise
+        # enforced at emission (imm/zero lower through the transfer and
+        # single-immediate forms; the general host-double rounding case
+        # fails closed there with its own rule).
+        ()
+      when LirStmtKind::LirIntToFloat(w, _, src, _) then
         # The integer source rides a general word: a fixed vreg 4..7
         # operand marks an aarch64-convention LIR (the same fingerprint
         # the general statement arms reject).
+        if w == LirFpWidth::LirF64 && !target_desc_f64_data_processing(desc) then
+          return Result::Err(thumb_f64_dp_rule(desc, f.name, "the int -> F64 conversion (vcvt.f64.s32/vcvt.f64.u32)"))
+        end
         if thumb_fixed_bad(src) then
           return Result::Err("thumb: " + f.name + ": int-to-float source from fixed vreg " + src.to_string() + " does not lower (fixed vregs 4..7 are aarch64 x4..x7; the cortex-m lowering never emits them — fail-closed)")
         end
-      when LirStmtKind::LirFloatToInt(_, dst, _) then
+      when LirStmtKind::LirFloatToInt(w, dst, _) then
         # The integer destination rides a general word: a fixed vreg
         # 4..7 destination marks an aarch64-convention LIR.
+        if w == LirFpWidth::LirF64 && !target_desc_f64_data_processing(desc) then
+          return Result::Err(thumb_f64_dp_rule(desc, f.name, "the F64 -> int conversion (vcvt.s32.f64/vcvt.u32.f64)"))
+        end
         if thumb_fixed_bad(dst) then
           return Result::Err("thumb: " + f.name + ": float-to-int into fixed vreg " + dst.to_string() + " does not lower (fixed vregs 4..7 are aarch64 x4..x7; the cortex-m lowering never emits them — fail-closed)")
         end
-      when LirStmtKind::LirFcvt(_, _, _) then ()
+      when LirStmtKind::LirFcvt(src_w, dst, _) then
+        # An F64 side marks the double <-> single conversion class
+        # (VCVT.F32.F64 / VCVT.F64.F32), which an FPv4-SP/FPv5-SP unit
+        # does not implement (clang lowers these via __aeabi_f2d /
+        # __aeabi_d2f on a Cortex-M4F). The destination's class record
+        # is the width authority (the emitter reads the same table).
+        let dw = match f.fp_widths.get(dst)
+        when Option::Some(v) then v
+        when Option::None then panic("thumb: LirFcvt into a vreg with no FP class record (lowering invariant)")
+        end
+        if (src_w == LirFpWidth::LirF64 || dw == LirFpWidth::LirF64) && !target_desc_f64_data_processing(desc) then
+          return Result::Err(thumb_f64_dp_rule(desc, f.name, "the F64 <-> F32 conversion (vcvt.f32.f64/vcvt.f64.f32)"))
+        end
       end
       si = si + 1
     end
     match block.term.kind
     when LirTermKind::LirCall(target, args, stack_args, _, _) then
       # AAPCS caller-word pushes: stack_args counts the 4-byte words the
-      # lowering pushed for argument indexes >= 4, INCLUDING the
-      # alignment padding of lir_lower_call — so it is always EVEN (the
-      # pad rule keeps the caller's SP 8-byte aligned at the BL). An odd
-      # or out-of-range count therefore marks a foreign lowering (a
-      # call lowered with the aarch64 conventions would carry an odd
-      # 16-byte-slot count whenever its slot count is odd — fail-closed;
-      # such functions are in any case caught by the fixed-vreg 4..7
-      # rejections above).
-      if stack_args < 0 || stack_args > 32 || (stack_args % 2) != 0 then
+      # lowering pushed for the stack-class arguments, INCLUDING the
+      # F64 units' two words each and the alignment padding of
+      # lir_lower_call — so it is always EVEN (the pad rule keeps the
+      # caller's SP 8-byte aligned at the BL). An odd or out-of-range
+      # count therefore marks a foreign lowering (a call lowered with
+      # the aarch64 conventions would carry an odd 16-byte-slot count
+      # whenever its slot count is odd — fail-closed; such functions are
+      # in any case caught by the fixed-vreg 4..7 rejections above). The
+      # bound is the 32-argument call cap's worst case: 32 two-word F64
+      # units plus one interspersed pad each plus the top pad = 96 words.
+      if stack_args < 0 || stack_args > 96 || (stack_args % 2) != 0 then
         return Result::Err("thumb: " + f.name + ": call to `" + target + "` carries " + stack_args.to_string() + " caller stack words — the cortex-m lowering pads odd AAPCS word counts to EVEN (lir_lower_call), so an odd or out-of-range count marks a foreign lowering (fail-closed)")
       end
       var ai = 0
@@ -2603,60 +2833,20 @@ def thumb_validate_fn(f: LirFunction, desc: TargetDesc) -> Result[Unit, String]
   Result::Ok(())
 end
 
-# AUDIT §16/§26 — the AAPCS32 VARIADIC base-convention gate: a
-# variadic extern call is made with the BASE convention — NO VFP CPRC:
-# float arguments ride the general registers / caller stack as their
-# base-type words (an F32 as one word, an F64 as its two-word image)
-# — while the shared LIR lowering (lir.tg's lir_lower_call walk) has
-# no variadic marker and marshals every register-class float argument
-# into the fixed FP vregs (d0..d7 — the hard-float crossing) as soon
-# as the float route is open. The audit §26 promotions made F32 and
-# F64 EXTRAS of variadic extern calls legal at the checker (an F32
-# extra promotes to the F64 double image), so this gate now guards the
-# full §26 extra surface: a promoted-double or fixed-prefix float
-# extra would marshal into d0..d7 exactly like any other float-class
-# argument. The base-convention caller marshaling is a lowering-level
-# form this slice cannot express at emission (the GP-position and
-# stack geometry would have to be re-derived — an F64 extra rides an
-# aligned even-odd general-register pair or the 8-byte-aligned caller
-# stack under the base standard), so a
-# function that marshals a float-class value into a fixed FP vreg in
-# the block of a call to a VARIADIC extern fails closed HERE with the
-# rule — never a silently VFP-marshaled call to a base-convention
-# callee. A GP-only variadic extern call (the common printf-family
-# shape — after the §26 promotions: i8/u8/i16/u16/Bool extras ride
-# their int-promoted word images, which the shared word stream already
-# crosses C-exactly on the cortex-m route) contains no fixed-FP
-# marshaling and is unaffected. The set
-# is the program's is_extern_variadic functions (MirProgram
-# functions — the same table codegen.tg's direct emitter reads for
-# its own variadic route).
-def thumb_validate_variadic_calls(f: LirFunction, variadic_externs: Set[String]) -> Result[Unit, String]
-  var bi = 0
-  while bi < f.blocks.len() do
-    let block = f.blocks[bi]
-    match block.term.kind
-    when LirTermKind::LirCall(target, _, _, _, _) then
-      if variadic_externs.contains(&target) then
-        var si = 0
-        while si < block.stmts.len() do
-          let stmt = block.stmts[si]
-          match stmt.kind
-          when LirStmtKind::LirFMove(dst, _) then
-            if lir_is_fixed_fp_id(dst) then
-              return Result::Err("thumb: " + f.name + ": call to the variadic extern `" + target + "` marshals a float-class argument into the VFP register file (a LirFMove into fixed FP vreg " + dst.to_string() + " = d" + (dst - lir_fixed_fp_base()).to_string() + "), which does not lower on the hard-float cortex-m route — AAPCS32 makes VARIADIC calls with the BASE convention only (no VFP CPRC: float arguments ride the general registers/stack as base-type words, an F64 as an aligned even-odd pair), and the §26 promotions (F32 extras -> F64) reach this gate as promoted doubles; the shared LIR lowering's per-class marshaling has no base-convention form this backend can emit (fail-closed; the base-convention caller marshaling — F32/F64 extras through r0-r3 / the 4-byte caller-stack words per the base standard — is a lowering-level later slice)")
-            end
-          when _ then ()
-          end
-          si = si + 1
-        end
-      end
-    when _ then ()
-    end
-    bi = bi + 1
-  end
-  Result::Ok(())
-end
+# AUDIT §16/§26 — the AAPCS32 VARIADIC base-convention marshalling:
+# a variadic extern call is made with the BASE convention — NO VFP
+# CPRC: every argument (fixed prefix and §26-promoted extras alike)
+# rides the general registers / caller stack as its base-type words
+# (an F64 as an aligned even-odd r-pair or an 8-byte-aligned stack
+# unit; an F32 extra is the promoted double). The shared LIR lowering
+# (lir.tg's lir_lower_call walk) has no variadic marker and marshals
+# every register-class float argument into the fixed FP vregs d0..d7,
+# so the emitter RE-DERIVES the whole call's base-convention layout
+# from the call term's argument list and emits the crossings itself
+# (thumb_var_call_plan / thumb_emit_var_call_block below) — the
+# original fixed-vreg/push marshal statements of a variadic call block
+# are skipped at emission. See the planner's doc for the walk and the
+# AAPCS32 rules it implements.
 
 # ———————————————————————————————————————————————————————————————
 # Emission helpers (mirroring lir.tg's allocator-query helpers)
@@ -2961,7 +3151,8 @@ def thumb_emit_bl(inout te: ThumbEmit, label: String, is_extern: Bool) -> Unit
   end
 end
 
-# The epilogue: release the frame and restore the callee-saved
+# The epilogue: release the frame, restore the FP callee-save block
+# (when the prologue emitted one), restore the general callee-saved
 # registers, then return. SP equals the frame pointer's frame top
 # (r7 + frame_bytes) at every Ret — the AAPCS caller-word pushes of a
 # call site are undone by that call's own SP cleanup right after the
@@ -2974,6 +3165,14 @@ end
 # frame and resumes the preempted context. The instruction sequence
 # is identical for ordinary functions — their pushed LR holds the
 # BL-supplied return address.)
+# FP CALLEE-SAVES (the M-profile d8..d15 block): when the prologue
+# emitted VPUSH {d8-d15} (te.fp_save — the function carries FP content
+# on an FPU-carrying descriptor), the VPOP here restores it AFTER the
+# frame release and BEFORE the GP POP, exactly the reverse of the
+# prologue order (GP PUSH; VPUSH; frame build) — so SP is back at the
+# VPUSH base when the 64-byte pop runs and the GP POP then restores
+# the entry SP. The block covers the allocatable pool d8..d13 AND the
+# d14/d15 statement scratches, which are callee-saved under AAPCS32.
 def thumb_emit_epilogue(inout te: ThumbEmit, frame_bytes: Int) -> Unit
   if frame_bytes > 0 then
     if frame_bytes <= 508 then
@@ -2982,6 +3181,9 @@ def thumb_emit_epilogue(inout te: ThumbEmit, frame_bytes: Int) -> Unit
       t2_movw(&mut te.buf, thumb_ip_reg(), (frame_bytes & 0xFFFF) as u16)
       t2_add_sp_w_reg(&mut te.buf, thumb_ip_reg())
     end
+  end
+  if te.fp_save then
+    t2_vpop_d(&mut te.buf, 8, 8)
   end
   t2_pop_w(&mut te.buf, thumb_saved_reg_list())
   t2_bx_lr(&mut te.buf)
@@ -3004,12 +3206,13 @@ end
 # gone):
 #   - a fixed ABI FP id (8..15 — lir_is_fixed_fp_id) IS its d-register
 #     (d-index = id - lir_fixed_fp_base()); an allocated FP vreg's
-#     physical id (116..129 — the allocator's FP-pool namespace,
-#     lir_fp_pool_regs) is d_{phys - 100};
+#     physical id (108..113 — the allocator's cm FP-pool namespace,
+#     lir_fp_pool_regs_cm) is d_{phys - 100};
 #   - the helpers speak the statement width's REGISTER INDEX SPACE: a
 #     d-index under F64, a SINGLE index (s = 2*d — the canonical low
 #     single of the d-index) under F32. An F32 value rides the LOW
-#     single of its d-index. The FP pool (d16..d29) has no
+#     single of its d-index. The FP pool (d8..d13, the encodable
+#     callee-saved M-profile doubles) has no
 #     single-register alias on the cortex-m register model (s0..s31 —
 #     d0..d15 — only), so F32 values are MEMORY-CLASS on this route:
 #     the cm allocator (lir_alloc_registers_cm — f32_pool_ok = false)
@@ -3043,20 +3246,22 @@ end
 # whose LOW single is s30 (s = 2*d, the canonical single, encodable by
 # every single-form VFP encoder) — and d14 — whose LOW single is s28.
 # Both are free at every statement position by construction of the
-# shared register model: the allocator's FP pool is d16..d29 (physical
-# ids 100+16..100+29 — lir_fp_pool_regs) and the fixed ABI FP ids are
-# d0..d7, so d8..d15 are NEVER allocated on any route (the aarch64
-# route's callee-saved d8..d15 are deliberately excluded from
-# lir_fp_pool_regs too — see its doc), which leaves d14/d15 — and
-# their singles s28..s31 — statement-local scratch on this route,
-# exactly like r12/r3 on the general side. The roles mirror the
-# aarch64 route's V30/V31 split (lir.tg's lir_fp_def_temp /
+# register model: the fixed ABI FP ids are d0..d7 and the allocator's
+# M-profile FP pool is lir_fp_pool_regs_cm() — d8..d13 (physical ids
+# 100+8..100+13) — so d14/d15 are deliberately OUTSIDE the pool and
+# stay statement-local scratch on this route, exactly like r12/r3 on
+# the general side. They are callee-saved under AAPCS32 (s28..s31),
+# and the prologue/epilogue of every FP-content function saves and
+# restores the WHOLE d8..d15 block with VPUSH/VPOP {d8-d15}
+# (te.fp_save), so the scratch use is ABI-transparent. The roles
+# mirror the aarch64 route's V30/V31 split (lir.tg's lir_fp_def_temp /
 # lir_fp_use_temp): d15 is the DEF scratch — the def temp of a
 # memory-resident def, the conversion register of the int<->float
-# statements (VCVT writes/reads single registers only) and the
+# statements (VCVT reads/writes single registers only) and the
 # double-materialization target of the F32 constant path (the fcvt
-# s, d rounding source) — and d14 is the SECOND scratch a second
-# memory-resident operand loads into.
+# s, d rounding source where the F64 data processing is available) —
+# and d14 is the SECOND scratch a second memory-resident operand loads
+# into.
 def thumb_fp_scratch_d() -> Int = 15
 def thumb_fp_scratch_s() -> Int = 30
 def thumb_fp_scratch2_d() -> Int = 14
@@ -3071,6 +3276,29 @@ end
 
 def thumb_fp_use_scratch(w: LirFpWidth) -> Int
   if w == LirFpWidth::LirF32 then thumb_fp_scratch2_s() else thumb_fp_scratch2_d() end
+end
+
+# Copy FP register `src` to `dst` (both in the width's register index
+# space: d-indices under F64, s-indices under F32). F32 and the F64
+# data-processing-capable FPUs (FPv5-D16 / the a64 / x86 / RVD
+# routes) use the register-move form VMOV.F32 / VMOV.F64. On an
+# FPv4-SP/FPv5-SP FPU (te.f64dp false) there is NO VMOV.F64 Dd, Dm in
+# the instruction set — LLVM's fpv4-sp-d16 feature model rejects it
+# and clang lowers double copies through the general registers — so an
+# F64 register copy rides the stack with the verified 64-bit
+# VPUSH/VPOP pair (t2_vpush_d src; t2_vpop_d dst), a load/store-only
+# sequence the single-precision FPU does encode. The pair is
+# SP-balanced and 8-byte aligned, so it is safe at every statement
+# position including the AAPCS argument-marshaling moves.
+def thumb_fp_reg_copy(inout te: ThumbEmit, w: LirFpWidth, dst: Int, src: Int) -> Unit
+  if w == LirFpWidth::LirF32 then
+    t2_vmov_f32(&mut te.buf, dst, src)
+  elsif te.f64dp then
+    t2_vmov_f64(&mut te.buf, dst, src)
+  else
+    t2_vpush_d(&mut te.buf, src, 1)
+    t2_vpop_d(&mut te.buf, dst, 1)
+  end
 end
 
 # The load-scratch choice of a statement (mirrors lir.tg's
@@ -3094,6 +3322,25 @@ end
 def thumb_fp_idx_of_fixed(vreg: Int, w: LirFpWidth) -> Int
   let d = vreg - lir_fixed_fp_base()
   if w == LirFpWidth::LirF32 then 2 * d else d end
+end
+
+# The d-register index of an allocated FP pool physical id (the
+# 100+code namespace), VALIDATED against the cm pool: the cortex-m
+# allocator allocates register-resident FP values ONLY from
+# lir_fp_pool_regs_cm() — d8..d13, physical ids 108..113 (the
+# encodable, AAPCS-callee-saved doubles of the M-profile file; d0..d7
+# are the fixed ABI file and d14/d15 the statement scratches). Any
+# other physical id must FAIL CLOSED here — the emitter never encodes
+# an operand outside the pool no matter what the pool seam hands it
+# (the aarch64 d16..d29 namespace the pre-slice cm route wrongly
+# reused is the motivating case).
+def thumb_fp_pool_d(phys: Int, role: String) -> Result[Int, String]
+  let code = phys - 100
+  if code < 8 || code > 13 then
+    Result::Err("thumb: " + role + " is register-resident in physical " + phys.to_string() + ", outside the cm FP pool (d8..d13 — physical ids 108..113; the M-profile encodable allocatable doubles — the pre-slice route reused the aarch64 d16..d29 pool; fail-closed)")
+  else
+    Result::Ok(code)
+  end
 end
 
 # The FP destination target of a def at position `pos` (the float
@@ -3120,9 +3367,13 @@ def thumb_fp_def_target(alloc: LirAlloc, w: LirFpWidth, vreg: Int, pos: Int, rol
     when Option::Some(s) then
       if s.phys >= 0 then
         if w == LirFpWidth::LirF32 then
-          return Result::Err("thumb: F32 " + role + " vreg " + vreg.to_string() + " in an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 marks an allocator-invariant violation (fail-closed)")
+          return Result::Err("thumb: F32 " + role + " vreg " + vreg.to_string() + " in an allocated FP-pool register (d8..d13) does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 marks an allocator-invariant violation (fail-closed)")
         end
-        Result::Ok(ThumbFpDefTarget { reg: s.phys - 100, store_slot: -1 })
+        let dd = match thumb_fp_pool_d(s.phys, "the " + role + " vreg " + vreg.to_string())
+        when Result::Ok(d) then d
+        when Result::Err(e) then return Result::Err(e)
+        end
+        Result::Ok(ThumbFpDefTarget { reg: dd, store_slot: -1 })
       else
         Result::Ok(ThumbFpDefTarget { reg: thumb_fp_def_scratch(w), store_slot: s.slot })
       end
@@ -3143,7 +3394,7 @@ end
 # restores its OWN register from the slot at the width (later reads
 # ride the register — the general-register thumb_emit_use pattern).
 # Fails closed — never emitting a partial load — for an F32 value
-# resident in the FP pool (d16..d29), whose register has no single-
+# resident in the FP pool (d8..d13), whose register has no single-
 # register alias on the cortex-m register model (s0..s31 = d0..d15
 # only); the cm allocator never produces such a segment (F32 is
 # memory-class on this route), so the arm doubles as an
@@ -3158,9 +3409,12 @@ def thumb_fp_use_reg(inout te: ThumbEmit, alloc: LirAlloc, w: LirFpWidth, vreg: 
     when Option::Some(s) then
       if s.phys >= 0 then
         if w == LirFpWidth::LirF32 then
-          return Result::Err("thumb: F32 " + role + " vreg " + vreg.to_string() + " in an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 marks an allocator-invariant violation (fail-closed)")
+          return Result::Err("thumb: F32 " + role + " vreg " + vreg.to_string() + " in an allocated FP-pool register (d8..d13) does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 marks an allocator-invariant violation (fail-closed)")
         end
-        let dd = s.phys - 100
+        let dd = match thumb_fp_pool_d(s.phys, "the " + role + " vreg " + vreg.to_string())
+        when Result::Ok(d) then d
+        when Result::Err(e) then return Result::Err(e)
+        end
         if lir_reload_at(alloc.reloads, pos, vreg) then
           thumb_slot_fp_load(te, w, dd, s.slot)
         end
@@ -3187,8 +3441,10 @@ end
 # t2_vstr_f64), 4 bytes for an F32 canonical single (t2_vldr_f32 /
 # t2_vstr_f32). The address is [r7 + off] with off a 4-aligned
 # non-negative byte offset: a translated AAPCS stack-parameter offset
-# (off + frame_bytes + 24 — the incoming caller area sits above the
-# frame, see the LirLoadFrame arm) or a spill-slot offset (4*slot).
+# (thumb_stack_param_off: off + frame_bytes + 24, plus the 64-byte FP
+# callee-save bias when the function carries FP content — the incoming
+# caller area sits above the frame and the VPUSH, see the LirLoadFrame
+# arm) or a spill-slot offset (4*slot).
 # VLDR/VSTR's immediate range is -1020..1020; beyond it the address is
 # built in r12 (movw; add r12, r7 — the flagless 0x4400 form, the
 # thumb_slot_access address path). A VFP memory operand never collides
@@ -3247,19 +3503,98 @@ def thumb_slot_fp_store(inout te: ThumbEmit, w: LirFpWidth, reg: Int, slot: Int)
   thumb_fp_mem_r7(te, w, reg, thumb_slot_offset(slot), false)
 end
 
+# ———————————————————————————————————————————————————————————————
+# Register-class bit moves (int <-> float transmutes) — cortex-m
+# ———————————————————————————————————————————————————————————————
+# A bm-marked statement (LirStmt.bm — the float slice's int<->float
+# TRANSMUTE carrier, riding the arity-exact LirUnop shape) lowers on the
+# cortex-m route as the VFP core<->FP transfer pair, mirroring the
+# aarch64 FMOV bit semantics EXACTLY (the bit pattern crosses untouched:
+# no conversion, no rounding):
+#   LirBitsGpToFp — VMOV Sd, Rt (t2_vmov_gp_to_s): the general word's
+#     32 bits become the F32 canonical single;
+#   LirBitsFpToGp — VMOV Rt, Sd (t2_vmov_s_to_gp): the single's 32 bits
+#     land in the general word (the word is 32 bits on this route — no
+#     zero-extension question exists, unlike the aarch64 W-form).
+# The width resolves from the FP side's class record (alloc.fp_widths).
+# ONLY F32 pairs exist at this word model: an F64 bit image would need
+# the two-register forms (VMOV Dd, Rt, Rt2 / VMOV Rt, Rt2, Dd — both
+# encoders exist) but the LIR carrier has ONE general operand and the
+# cortex-m machine word is 4 bytes, so a 64-bit pattern has no single
+# general-register home; the lowering rejects those pairs with the
+# word-model rule before any statement is built, and this arm fails
+# closed defensively. The FP def/use rides the ordinary float
+# resolution: a def (always a memory-class F32 on this route) computes
+# into the def scratch and stores its image at the width; a use loads
+# its slot at the width into the second scratch first.
+def thumb_emit_bitmove_stmt(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], stmt: LirStmt, bmop: LirBitMoveOp, pos: Int) -> Result[Unit, String]
+  match stmt.kind
+  when LirStmtKind::LirUnop(_, dst, src) then
+    match bmop
+    when LirBitMoveOp::LirBitsGpToFp then
+      let w = match alloc.fp_widths.get(dst)
+      when Option::Some(v) then v
+      when Option::None then
+        return Result::Err("thumb: gp-to-fp bit move into vreg " + dst.to_string() + " with no FP class record (the class table is the authority — lowering invariant, fail-closed)")
+      end
+      if w != LirFpWidth::LirF32 then
+        return Result::Err("thumb: f64 gp-to-fp bit move does not lower on the cortex-m route — the 32-bit word model has no single general register that can hold an F64 bit image (the two-word VMOV Dd, Rt, Rt2 form has no LIR carrier); only F32 <-> the 4-byte integer words lower (fail-closed)")
+      end
+      let dt = match thumb_fp_def_target(alloc, w, dst, pos, "bit-move destination")
+      when Result::Ok(t) then t
+      when Result::Err(e) then return Result::Err(e)
+      end
+      let sr = thumb_emit_use(te, alloc, mdl_pool, src, pos, thumb_ip_reg())
+      t2_vmov_gp_to_s(&mut te.buf, sr, dt.reg)
+      if dt.store_slot >= 0 then
+        thumb_slot_fp_store(te, w, dt.reg, dt.store_slot)
+      end
+      Result::Ok(())
+    when LirBitMoveOp::LirBitsFpToGp then
+      let w = match alloc.fp_widths.get(src)
+      when Option::Some(v) then v
+      when Option::None then
+        return Result::Err("thumb: fp-to-gp bit move from vreg " + src.to_string() + " with no FP class record (the class table is the authority — lowering invariant, fail-closed)")
+      end
+      if w != LirFpWidth::LirF32 then
+        return Result::Err("thumb: f64 fp-to-gp bit move does not lower on the cortex-m route — the 32-bit word model has no single general register that can hold an F64 bit image (the two-word VMOV Rt, Rt2, Dd form has no LIR carrier); only F32 <-> the 4-byte integer words lower (fail-closed)")
+      end
+      let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
+      let sm = match thumb_fp_use_reg(te, alloc, w, src, pos, thumb_fp_use_scratch(w), "bit-move source")
+      when Result::Ok(r) then r
+      when Result::Err(e) then return Result::Err(e)
+      end
+      t2_vmov_s_to_gp(&mut te.buf, dt.reg, sm)
+      if dt.store_slot >= 0 then
+        thumb_slot_store(te, mdl_pool, dt.reg, dt.store_slot)
+      end
+      Result::Ok(())
+    end
+  when _ then
+    return Result::Err("thumb: bit-move marker on a non-LirUnop carrier (the marker rides the arity-exact LirUnop shape — lowering invariant, fail-closed)")
+  end
+end
+
 # Emit one LIR statement of a cortex-m function. A statement carrying a
 # marked LirPtrOp (LirStmt.ptr — the pointer/atomic statements of the
 # cortex-m atomic surface) emits through the pointer/atomic arms (the
 # ARMv7-M exclusive/barrier/width sequences of thumb_emit_ptr_stmt) —
 # NEVER through its nominal kind's semantics (the nominal kinds are
-# arity-nearest carriers only; see LirStmt.ptr); every other statement
-# emits through the nominal-kind arms of thumb_emit_stmt_kind.
+# arity-nearest carriers only; see LirStmt.ptr); a statement carrying a
+# marked LirBitMoveOp (LirStmt.bm — the int<->float transmute) emits
+# through thumb_emit_bitmove_stmt; every other statement emits through
+# the nominal-kind arms of thumb_emit_stmt_kind.
 def thumb_emit_stmt(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], frame_bytes: Int, fn_name: String, stmt: LirStmt, pos: Int) -> Result[Unit, String]
   match stmt.ptr
   when Option::Some(pop) then
     thumb_emit_ptr_stmt(te, alloc, mdl_pool, fn_name, stmt, pop, pos)
   when Option::None then
-    thumb_emit_stmt_kind(te, alloc, mdl_pool, frame_bytes, stmt.kind, pos)
+    match stmt.bm
+    when Option::Some(bmop) then
+      thumb_emit_bitmove_stmt(te, alloc, mdl_pool, stmt, bmop, pos)
+    when Option::None then
+      thumb_emit_stmt_kind(te, alloc, mdl_pool, frame_bytes, stmt.kind, pos)
+    end
   end
 end
 
@@ -3369,8 +3704,14 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     #   = (incoming-SP + off - 8) - (incoming-SP - 32 - frame_bytes)
     #   = off + frame_bytes + 24
     # (checked against the layout: argument i sits at r7 + 32 +
-    # frame_bytes + 4*(i-4), and off - 8 = 4*(i-4) — identical). The
-    # load is a plain word load through r7 (flagless, invariant I1);
+    # frame_bytes + 4*(i-4), and off - 8 = 4*(i-4) — identical). An
+    # FP-content function (te.fp_save) inserts VPUSH {d8-d15} (64
+    # bytes) between the GP push and the frame, so r7 sits 64 bytes
+    # LOWER for the same incoming SP: the translation adds the same
+    # 64-byte bias (thumb_stack_param_off) — otherwise every stack
+    # parameter of an FP function would read 64 bytes too low (its own
+    # saved scratch/pool registers instead of the caller's argument).
+    # The load is a plain word load through r7 (flagless, invariant I1);
     # only ever emitted at the top of the entry block, where the
     # prologue has already established r7.
     #
@@ -3393,13 +3734,14 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     # never allocated on any route) and stores the image to its slot.
     # The F32 single of a d-index is its low half (s = 2*d) — the same
     # alias rule every F32 arm guards: the cm allocator keeps F32
-    # values OUT of the FP pool (d16..d29 has no single-register alias
-    # above d15 — F32 is memory-class on this route), so an F32
+    # values OUT of the FP pool (d8..d13 has no re-derived
+    # single-register alias — F32 is memory-class on this route), so an
+    # F32
     # register-resident destination below marks an allocator-invariant
     # violation and fails closed.
     match alloc.fp_widths.get(dst)
     when Option::Some(w) then
-      let foff = off + frame_bytes + 24
+      let foff = thumb_stack_param_off(off, frame_bytes, te.fp_save)
       if foff > 65535 then
         return Result::Err("thumb: stack-parameter load at machine offset [r7 + " + foff.to_string() + "] exceeds the 16-bit frame-address model of the cortex-m backend (fail-closed)")
       end
@@ -3410,9 +3752,13 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
           if s.phys >= 0 then
             match w
             when LirFpWidth::LirF32 then
-              return Result::Err("thumb: F32 stack-parameter load into an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 destination marks an allocator-invariant violation (fail-closed)")
+              return Result::Err("thumb: F32 stack-parameter load into an allocated FP-pool register (d8..d13) does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 destination marks an allocator-invariant violation (fail-closed)")
             when LirFpWidth::LirF64 then
-              thumb_fp_mem_r7(te, w, s.phys - 100, foff, true)
+              let dd = match thumb_fp_pool_d(s.phys, "the stack-parameter destination vreg " + dst.to_string())
+              when Result::Ok(d) then d
+              when Result::Err(e) then return Result::Err(e)
+              end
+              thumb_fp_mem_r7(te, w, dd, foff, true)
             end
           else
             # Memory-resident dst: load at the width into the FP
@@ -3441,7 +3787,7 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
       Result::Ok(())
     when Option::None then
       let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
-      let foff = off + frame_bytes + 24
+      let foff = thumb_stack_param_off(off, frame_bytes, te.fp_save)
       if foff > 65535 then
         return Result::Err("thumb: stack-parameter load at machine offset [r7 + " + foff.to_string() + "] exceeds the 16-bit frame-address model of the cortex-m backend (fail-closed)")
       end
@@ -3464,23 +3810,48 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
       Result::Ok(())
     end
   when LirStmtKind::LirPushArg(vreg) then
-    # AAPCS caller-word push: reserve the 4-byte word below SP
-    # (sub sp, #4 — the 16-bit SP-relative form, flagless) and store
+    # AAPCS caller-stack push: reserve the pushed unit below SP and store
     # the value at [SP]. Emission order is the LIR statement order —
     # DESCENDING argument index (lir_lower_call), so the LAST push of a
-    # call site is argument 4 at the LOWEST address, [SP] at the BL.
-    # The lowering pads odd word counts, so the total decrement is
-    # always a multiple of 8 bytes and the caller's SP is 8-byte
+    # call site is the lowest stack position, [SP] at the BL. The
+    # lowering pads the total word count to EVEN, so SP is 8-byte
     # aligned at the BL (AAPCS). Spill-slot reads address through r7,
     # never SP, so the lowered SP disturbs nothing between pushes.
-    let sr = thumb_emit_use(te, alloc, mdl_pool, vreg, pos, thumb_ip_reg())
-    t2_sub_sp_imm7(&mut te.buf, 4)
-    if sr <= 7 then
-      t2_str_sp_imm8(&mut te.buf, sr, 0)
-    else
-      t2_str_w_imm12(&mut te.buf, sr, 13, 0)
+    #
+    # An FP-class vreg (alloc.fp_widths — the float class table) is a
+    # FLOAT stack argument of the AAPCS32 VFP stream: the push reserves
+    # the value's WIDTH and stores its FP image at [SP] — VSTR.F32's
+    # 4-byte single (one AAPCS word) or VSTR.F64's exact 8-byte double
+    # image (a two-word unit at the even base the lowering aligned it
+    # to). The value resolves through the float-use machinery (a
+    # memory-resident source loads through a statement scratch first; a
+    # register-resident F64 keeps its pool register). Every other vreg
+    # is a general word (the 4-byte push below).
+    match alloc.fp_widths.get(vreg)
+    when Option::Some(w) then
+      let sr = match thumb_fp_use_reg(te, alloc, w, vreg, pos, thumb_fp_use_scratch(w), "pushed stack argument")
+      when Result::Ok(r) then r
+      when Result::Err(e) then return Result::Err(e)
+      end
+      match w
+      when LirFpWidth::LirF32 then
+        t2_sub_sp_imm7(&mut te.buf, 4)
+        t2_vstr_f32(&mut te.buf, sr, thumb_sp_reg(), 0)
+      when LirFpWidth::LirF64 then
+        t2_sub_sp_imm7(&mut te.buf, 8)
+        t2_vstr_f64(&mut te.buf, sr, thumb_sp_reg(), 0)
+      end
+      Result::Ok(())
+    when Option::None then
+      let sr = thumb_emit_use(te, alloc, mdl_pool, vreg, pos, thumb_ip_reg())
+      t2_sub_sp_imm7(&mut te.buf, 4)
+      if sr <= 7 then
+        t2_str_sp_imm8(&mut te.buf, sr, 0)
+      else
+        t2_str_w_imm12(&mut te.buf, sr, 13, 0)
+      end
+      Result::Ok(())
     end
-    Result::Ok(())
   when LirStmtKind::LirStaticLoad(dst, sym) then
     # A static-value load (a whole-program static reference — see the
     # statement doc in lir.tg): materialize the static's ABSOLUTE
@@ -3516,15 +3887,19 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     # lir_emit_stmt, over the FULL residency envelope (see the float
     # resolution section): a fixed ABI FP id (8..15 — lir_is_fixed_fp_id)
     # IS its d-register (d-index = id - lir_fixed_fp_base()), and an
-    # allocated FP vreg's physical id (116..129 — the allocator's
-    # FP-pool namespace, lir_fp_pool_regs) is d_{phys - 100}; a
-    # memory-resident source loads its slot into a statement scratch at
-    # the width, and a memory-resident destination computes into the
-    # def scratch (d15 — its low single s30 under F32) and stores the
-    # image to its slot at the width. The width resolves from the
-    # ordinary operand's FP class record (alloc.fp_widths — fixed ids
-    # carry no record, and the lowering pairs a fixed id with an
-    # ordinary one, never two fixed ids). F32 operands are always
+    # allocated FP vreg's physical id (108..113 — the cm pool
+    # namespace, lir_fp_pool_regs_cm) is d_{phys - 100}. A
+    # memory-resident source loads its slot STRAIGHT into the
+    # destination register (or the def scratch for a memory-resident
+    # destination) at the width, and a register source stores STRAIGHT
+    # to a memory-resident destination's slot: no scratch copy and no
+    # VMOV is emitted for either memory side. A register-to-register
+    # copy goes through thumb_fp_reg_copy (VMOV.F64 where the FPU has
+    # F64 data processing; the VPUSH/VPOP pair on FPv4-SP/FPv5-SP,
+    # whose instruction set has no VMOV.F64 Dd, Dm). The width resolves
+    # from the ordinary operand's FP class record (alloc.fp_widths —
+    # fixed ids carry no record, and the lowering pairs a fixed id with
+    # an ordinary one, never two fixed ids). F32 operands are always
     # memory-resident on this route (the cm allocator's memory-class
     # rule — see the float resolution section), so both sides lower
     # through the scratch singles; the register-resident F32 form the
@@ -3543,19 +3918,60 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     when Result::Ok(t) then t
     when Result::Err(e) then return Result::Err(e)
     end
-    let pref = thumb_fp_first_pref(dt.reg, w)
-    let sr = match thumb_fp_use_reg(te, alloc, w, src, pos, pref, "move source")
-    when Result::Ok(r) then r
-    when Result::Err(e) then return Result::Err(e)
-    end
-    if dt.reg != sr then
-      match w
-      when LirFpWidth::LirF32 then t2_vmov_f32(&mut te.buf, dt.reg, sr)
-      when LirFpWidth::LirF64 then t2_vmov_f64(&mut te.buf, dt.reg, sr)
+    # Resolve the source over the full residency envelope, loading a
+    # memory-resident source STRAIGHT into the destination register
+    # (dt.reg — the destination is being defined, so no second scratch
+    # is needed) and storing a register source STRAIGHT to a
+    # memory-resident destination's slot. The old scratch-then-VMOV
+    # shape is gone: on an FPv4-SP FPU VMOV.F64 Dd, Dm does not exist,
+    # and the AAPCS-edge LirMoves (entry parameter binds, argument
+    # marshals, returns) must never borrow a statement scratch that
+    # could hold another fixed ABI value (d0..d7) of the same edge.
+    # Only a REGISTER-to-REGISTER copy reaches thumb_fp_reg_copy (the
+    # VMOV / VPUSH+VPOP primitive). A fixed ABI FP source is its own
+    # d-register; a pool source with a reload record restores its own
+    # register first (invariant I2), exactly like thumb_fp_use_reg.
+    var sr = -1
+    var src_is_memory = false
+    var src_slot = -1
+    if lir_is_fixed_fp_id(src) then
+      sr = thumb_fp_idx_of_fixed(src, w)
+    else
+      match alloc.segs_of.get(src)
+      when Option::Some(segs) then
+        match lir_seg_at(segs, pos)
+        when Option::Some(s) then
+          if s.phys >= 0 then
+            if w == LirFpWidth::LirF32 then
+              return Result::Err("thumb: F32 move source vreg " + src.to_string() + " is resident in an allocated FP-pool register (d8..d13) — its 4-byte image has no single-register alias above d15 on the cortex-m register model; the cm allocator never assigns an F32 a pool register (F32 is memory-class on this route), so a pool-resident F32 marks an allocator-invariant violation (fail-closed)")
+            end
+            sr = match thumb_fp_pool_d(s.phys, "the float move source vreg " + src.to_string())
+            when Result::Ok(d) then d
+            when Result::Err(e) then return Result::Err(e)
+            end
+            if lir_reload_at(alloc.reloads, pos, src) then
+              thumb_slot_fp_load(te, w, sr, s.slot)
+            end
+          else
+            src_is_memory = true
+            src_slot = s.slot
+          end
+        when Option::None then
+          return Result::Err("thumb: float move source vreg " + src.to_string() + " has no segment at position " + pos.to_string() + " (fail-closed)")
+        end
+      when Option::None then
+        return Result::Err("thumb: float move source vreg " + src.to_string() + " has no intervals (fail-closed)")
       end
     end
-    if dt.store_slot >= 0 then
-      thumb_slot_fp_store(te, w, dt.reg, dt.store_slot)
+    if src_is_memory then
+      thumb_slot_fp_load(te, w, dt.reg, src_slot)
+      if dt.store_slot >= 0 then
+        thumb_slot_fp_store(te, w, dt.reg, dt.store_slot)
+      end
+    elsif dt.store_slot >= 0 then
+      thumb_slot_fp_store(te, w, sr, dt.store_slot)
+    elsif dt.reg != sr then
+      thumb_fp_reg_copy(te, w, dt.reg, sr)
     end
     Result::Ok(())
   when LirStmtKind::LirFBinop(fop, w, dst, left, right) then
@@ -3575,6 +3991,9 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     # through the scratch singles and stores its result from the def
     # scratch; the register-resident F32 form the resolution helpers
     # still fail closed on is unproducible (allocator invariant).
+    if w == LirFpWidth::LirF64 && !te.f64dp then
+      return Result::Err(thumb_f64_dp_rule_emit(te, "F64 arithmetic (fadd/fsub/fmul/fdiv)"))
+    end
     let dt = match thumb_fp_def_target(alloc, w, dst, pos, "binop destination")
     when Result::Ok(t) then t
     when Result::Err(e) then return Result::Err(e)
@@ -3623,6 +4042,9 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     # rule), so the arm always loads through the scratch single (the
     # register-resident F32 form the resolution helper fails closed on
     # is unproducible — an allocator-invariant check).
+    if w == LirFpWidth::LirF64 && !te.f64dp then
+      return Result::Err(thumb_f64_dp_rule_emit(te, "F64 negation"))
+    end
     let dt = match thumb_fp_def_target(alloc, w, dst, pos, "negate destination")
     when Result::Ok(t) then t
     when Result::Err(e) then return Result::Err(e)
@@ -3661,7 +4083,9 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     # is unproducible — an allocator-invariant check).
     # F64 emits the verified VCMP.F64 (t2_vcmp_f64 — the quiet
     # compare, mirroring the a64 FCMP); F32 emits the verified
-    # VCMP.F32 (t2_vcmp_f32) over the single-index scratch pair.
+    if w == LirFpWidth::LirF64 && !te.f64dp then
+      return Result::Err(thumb_f64_dp_rule_emit(te, "an F64 compare"))
+    end
     let ld = match thumb_fp_use_reg(te, alloc, w, left, pos, thumb_fp_def_scratch(w), "compare left operand")
     when Result::Ok(r) then r
     when Result::Err(e) then return Result::Err(e)
@@ -3690,14 +4114,18 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     # pattern (MirFloat carries doubles — see the LirFConst statement
     # doc), for F32 destinations exactly as for F64 ones.
     #   F64: when the double's bit pattern is modified-immediate
-    #   encodable, VMOV.F64 Dd, #imm (t2_vmov_f64_const — its verified
+    #   encodable AND the FPU has F64 data processing
+    #   (te.f64dp — VMOV.F64 Dd, #imm is not in the FPv4-SP/FPv5-SP
+    #   set), VMOV.F64 Dd, #imm (t2_vmov_f64_const — its verified
     #   accept test returns false for every non-encodable pattern,
     #   including +0.0/-0.0, which the modified-immediate rule cannot
     #   express: zero always carries a leading 1.mantissa). Otherwise
     #   the GP transit: materialize the pattern's LOW word in r0 and
     #   its HIGH word in r1 with the movw/movt pair
     #   (thumb_emit_imm32 — the backend's 32-bit constant machinery),
-    #   then VMOV Dd, r0, r1 (t2_vmov_gp_pair_to_d). This covers the
+    #   then VMOV Dd, r0, r1 (t2_vmov_gp_pair_to_d — a core<->FP
+    #   transfer the single-precision units DO encode, so this is the
+    #   ONLY F64 constant path on FPv4-SP/FPv5-SP). This covers the
     #   zero patterns exactly (r0 = r1 = 0 for +0.0; r1 = 0x80000000
     #   for -0.0). A register-clearing VSUB Dd, Dd, Dd self-subtract is
     #   NOT used: the constant statement DEFINES dst, whose register may
@@ -3707,7 +4135,8 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     #   statement boundary on this route (fixed-vreg traffic is the
     #   entry binds, the call-argument moves and the return moves, all
     #   adjacent to terminators/entry), so the transit is safe.
-    #   F32: the emission materializes the DOUBLE pattern into the FP
+    #   F32: where the FPU has F64 data processing (M7/FPv5-D16), the
+    #   emission materializes the DOUBLE pattern into the FP
     #   scratch d-register (d15 — the same imm8/GP-transit choice) and
     #   rounds it to the canonical single with VCVT.F32.F64 s{dst},
     #   d15 — the exact twin of the aarch64 arm's fmov d{V31}, x16 +
@@ -3718,9 +4147,18 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     #   scratch s30 — the LOW single of the source d15 itself: VFP
     #   data processing reads its operands before writing its result
     #   (the canonical vcvt.f32.f64 s0, d0 narrowing), so the
-    #   read-after-rounding store sees the exact single image. An F32
+    #   read-after-rounding store sees the exact single image.
+    #   On an FPv4-SP/FPv5-SP unit (te.f64dp false) that conversion
+    #   does not exist, so the branch materializes the single DIRECTLY:
+    #   a modified-immediate value reuses the double pattern's imm8
+    #   (the F32 and F64 forms share the 256-value table and the imm8
+    #   field), and +/-0.0 goes through the GP transit of its f32 bits
+    #   (sign only); any other constant needs the host-side
+    #   double->single rounding this slice does not implement and
+    #   fails closed with the precise rule (no silent illegal VCVT).
+    #   An F32
     #   destination is ALWAYS memory-resident on this route (the cm
-    #   allocator's memory-class rule), so the rounding always writes
+    #   allocator's memory-class rule), so the emission always writes
     #   the def scratch s30 and stores the slot; the register-resident
     #   F32 form thumb_fp_def_target still fails closed on is
     #   unproducible (allocator invariant).
@@ -3730,14 +4168,44 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     end
     match w
     when LirFpWidth::LirF32 then
-      if !t2_vmov_f64_const(&mut te.buf, thumb_fp_scratch_d(), bits as u64) then
-        thumb_emit_imm32(te, 0, bits & 0xFFFFFFFF)
-        thumb_emit_imm32(te, 1, (bits >> 32) & 0xFFFFFFFF)
-        t2_vmov_gp_pair_to_d(&mut te.buf, 0, 1, thumb_fp_scratch_d())
+      if te.f64dp then
+        if !t2_vmov_f64_const(&mut te.buf, thumb_fp_scratch_d(), bits as u64) then
+          thumb_emit_imm32(te, 0, bits & 0xFFFFFFFF)
+          thumb_emit_imm32(te, 1, (bits >> 32) & 0xFFFFFFFF)
+          t2_vmov_gp_pair_to_d(&mut te.buf, 0, 1, thumb_fp_scratch_d())
+        end
+        t2_vcvt_f32_f64(&mut te.buf, dt.reg, thumb_fp_scratch_d())
+      else
+        # No F64->F32 conversion on this FPU (see the LirFcvt gate's
+        # rule): materialize the canonical single WITHOUT touching a
+        # double. A modified-immediate value has the SAME imm8 in the
+        # F32 form (the shared 256-value table), so the double pattern's
+        # imm8 drives VMOV.F32 Sd, #imm; exact +/-0.0 (the only
+        # non-imm value this path can convert exactly without host
+        # rounding) is the GP transit of its f32 bits (sign only);
+        # everything else needs the double->single RNE rounding this
+        # slice does not implement and fails closed.
+        let imm8 = t2_vmov_imm8_of_f64_bits(bits as u64)
+        if imm8 >= 0 then
+          t2_vmov_f32_imm(&mut te.buf, dt.reg, imm8)
+        elsif ((bits as u64) << 1) == 0 then
+          thumb_emit_imm32(te, 0, (bits >> 32) & 0xFFFFFFFF)
+          t2_vmov_gp_to_s(&mut te.buf, 0, dt.reg)
+        else
+          return Result::Err("thumb: F32 constant (host-double pattern " + bits.to_string() + ") does not lower against the `" + te.desc_name + "` description — its FPU is single-precision only and has no F64->F32 conversion (VCVT.F32.F64); the constant is neither a modified-immediate value nor an exact zero, and this slice does not implement the host-side double->single rounding the general case needs (fail-closed; compile for cortex-m7 / Fpu FPv5D16 for arbitrary F32 constants)")
+        end
       end
-      t2_vcvt_f32_f64(&mut te.buf, dt.reg, thumb_fp_scratch_d())
     when LirFpWidth::LirF64 then
-      if !t2_vmov_f64_const(&mut te.buf, dt.reg, bits as u64) then
+      # VMOV.F64 Dd, #imm is not in the FPv4-SP/FPv5-SP instruction set:
+      # on those FPUs the constant always takes the GP pair transit
+      # (VMOV Dd, Rt, Rt2 is a core<->FP transfer the SP unit DOES
+      # encode); on an F64-data-processing FPU the modified-immediate
+      # form is tried first and the GP transit is the fallback.
+      var emitted = false
+      if te.f64dp then
+        emitted = t2_vmov_f64_const(&mut te.buf, dt.reg, bits as u64)
+      end
+      if !emitted then
         thumb_emit_imm32(te, 0, bits & 0xFFFFFFFF)
         thumb_emit_imm32(te, 1, (bits >> 32) & 0xFFFFFFFF)
         t2_vmov_gp_pair_to_d(&mut te.buf, 0, 1, dt.reg)
@@ -3776,6 +4244,9 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     # scratch single it also writes — VFP data processing reads before
     # it writes, and a widening vcvt.f64.s32 d15, s30 is the canonical
     # shape).
+    if w == LirFpWidth::LirF64 && !te.f64dp then
+      return Result::Err(thumb_f64_dp_rule_emit(te, "the int -> F64 conversion (vcvt.f64.s32/vcvt.f64.u32)"))
+    end
     let dt = match thumb_fp_def_target(alloc, w, dst, pos, "int-to-float destination")
     when Result::Ok(t) then t
     when Result::Err(e) then return Result::Err(e)
@@ -3828,6 +4299,9 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     # integer destination — the aarch64 route's FCVTZS-to-X form — has
     # no VFP mirror and cannot reach a validated function (see the
     # LirIntToFloat arm); no rule-naming Err is reachable for it here.
+    if w == LirFpWidth::LirF64 && !te.f64dp then
+      return Result::Err(thumb_f64_dp_rule_emit(te, "the F64 -> int conversion (vcvt.s32.f64/vcvt.u32.f64)"))
+    end
     let dt = thumb_def_target(alloc, mdl_pool, dst, pos)
     let sm = match thumb_fp_use_reg(te, alloc, w, src, pos, thumb_fp_use_scratch(w), "float-to-int source")
     when Result::Ok(r) then r
@@ -3871,6 +4345,9 @@ def thumb_emit_stmt_kind(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int
     when Option::Some(v) then v
     when Option::None then panic("lir: LirFcvt into a vreg with no FP class record (lowering invariant)")
     end
+    if (src_w == LirFpWidth::LirF64 || dw == LirFpWidth::LirF64) && !te.f64dp then
+      return Result::Err(thumb_f64_dp_rule_emit(te, "the F64 <-> F32 conversion (vcvt.f32.f64/vcvt.f64.f32)"))
+    end
     let dt = match thumb_fp_def_target(alloc, dw, dst, pos, "fcvt destination")
     when Result::Ok(t) then t
     when Result::Err(e) then return Result::Err(e)
@@ -3896,8 +4373,10 @@ end
 # Emit the pre-call spill stores (register-resident pre-call segments
 # whose end precedes the call at `pos` — invariant I2; redundant for the
 # callee-saved pool but keeps the allocator target-agnostic). A spill
-# record whose vreg is a FLOAT-class vreg (alloc.fp_widths — the FP
-# pool d16..d29 is caller-saved, so an F64 value live across a call
+# record whose vreg is a FLOAT-class vreg (alloc.fp_widths — the cm FP
+# pool d8..d13 is callee-saved and saved as a whole block by the
+# prologue, but the allocator still treats pool registers as
+# caller-saved, so an F64 value live across a call
 # always takes this path) stores its slot image at the width through
 # the VFP store machinery (thumb_slot_fp_store): an F64's 8-byte image
 # rides the width-sized slot home the cm allocator reserves (two
@@ -3923,9 +4402,13 @@ def thumb_emit_call_spills(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[I
             match alloc.fp_widths.get(vreg)
             when Option::Some(w) then
               if w == LirFpWidth::LirF32 then
-                return Result::Err("thumb: F32 value vreg " + vreg.to_string() + " is live across a call in an allocated FP-pool register (d16..d29) and would need a spill store at its call boundary — its 4-byte image has no single-register alias above d15 on the cortex-m register model; the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 marks an allocator-invariant violation (fail-closed)")
+                return Result::Err("thumb: F32 value vreg " + vreg.to_string() + " is live across a call in an allocated FP-pool register (d8..d13) and would need a spill store at its call boundary — its 4-byte image has no single-register alias above d15 on the cortex-m register model; the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 marks an allocator-invariant violation (fail-closed)")
               end
-              thumb_slot_fp_store(te, w, s.phys - 100, s.slot)
+              let dd = match thumb_fp_pool_d(s.phys, "the spill-crossing FP value vreg " + vreg.to_string())
+              when Result::Ok(d) then d
+              when Result::Err(e) then return Result::Err(e)
+              end
+              thumb_slot_fp_store(te, w, dd, s.slot)
             when Option::None then
               thumb_slot_store(te, mdl_pool, thumb_phys_of(mdl_pool, s.phys), s.slot)
             end
@@ -4446,13 +4929,16 @@ def thumb_emit_term(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn
           match lir_seg_at(segs, pos)
           when Option::Some(s) then
             if s.phys >= 0 && !lir_reload_at(alloc.reloads, pos, vreg) then
-              let dd = s.phys - 100
               match w
               when LirFpWidth::LirF32 then
-                return Result::Err("thumb: F32 return through an allocated FP-pool register (d16..d29) does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 return marks an allocator-invariant violation (fail-closed)")
+                return Result::Err("thumb: F32 return through an allocated FP-pool register (d8..d13) does not lower on the cortex-m route (the pool's doubles have no re-derived single alias in the float arms); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 return marks an allocator-invariant violation (fail-closed)")
               when LirFpWidth::LirF64 then
+                let dd = match thumb_fp_pool_d(s.phys, "the F64 return vreg " + vreg.to_string())
+                when Result::Ok(d) then d
+                when Result::Err(e) then return Result::Err(e)
+                end
                 if dd != 0 then
-                  t2_vmov_f64(&mut te.buf, 0, dd)
+                  thumb_fp_reg_copy(te, w, 0, dd)
                 end
               end
             else
@@ -4536,13 +5022,16 @@ def thumb_emit_term(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn
           match lir_seg_at(segs, pos)
           when Option::Some(s) then
             if s.phys >= 0 then
-              let dd = s.phys - 100
               match w
               when LirFpWidth::LirF32 then
-                return Result::Err("thumb: call to `" + target + "` returns an F32 into an allocated FP-pool register (d16..d29), which does not lower on the cortex-m route (no single-register alias above d15); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 result marks an allocator-invariant violation (fail-closed)")
+                return Result::Err("thumb: call to `" + target + "` returns an F32 into an allocated FP-pool register (d8..d13), which does not lower on the cortex-m route (the pool's doubles have no re-derived single alias in the float arms); the cm allocator never assigns an F32 a pool register — F32 is memory-class on this route — so a pool-resident F32 result marks an allocator-invariant violation (fail-closed)")
               when LirFpWidth::LirF64 then
+                let dd = match thumb_fp_pool_d(s.phys, "the call-result F64 vreg " + dv.to_string())
+                when Result::Ok(d) then d
+                when Result::Err(e) then return Result::Err(e)
+                end
                 if dd != 0 then
-                  t2_vmov_f64(&mut te.buf, dd, 0)
+                  thumb_fp_reg_copy(te, w, dd, 0)
                 end
               end
             else
@@ -4577,10 +5066,11 @@ end
 # 8-aligned); sub sp, #frame (16-bit imm7 for small frames, movw +
 # SUB.W sp, sp, r12 beyond); mov r7, sp. Spill slot i is [r7 + 4*i].
 # The AAPCS stack parameters of a > 4-parameter function sit ABOVE the
-# push block (32 bytes) and the frame, so their machine offset from r7
-# is off + frame_bytes + 24 for the LIR's canonical payload `off` (see
-# the LirLoadFrame arm); frame_bytes threads through the statement
-# emitter for that translation.
+# push block (32 bytes), the frame and — for an FP-content function —
+# the VPUSH {d8-d15} block (64 bytes), so their machine offset from r7
+# is thumb_stack_param_off(off, frame_bytes, fp_save) for the LIR's
+# canonical payload `off` (see the LirLoadFrame arm); frame_bytes
+# threads through the statement emitter for that translation.
 # Epilogue (at every Ret): add sp, #frame; POP {r4-r10, lr}; BX LR.
 # (AUDIT §16 — an @interrupt function, f.attr_interrupt, is emitted
 # through the same geometry with the interrupt validation gate and the
@@ -4588,6 +5078,358 @@ end
 # epilogue is the same instruction sequence at every Ret: the POP
 # restores the EXC_RETURN holder (the pushed LR slot) into LR and BX
 # LR executes the desc's NVIC exit rule.)
+# ———————————————————————————————————————————————————————————————
+# AUDIT §16/§26 — the AAPCS32 variadic base-convention marshaller
+# ———————————————————————————————————————————————————————————————
+# A variadic extern call is made with the BASE convention: every
+# argument — the fixed prefix and the §26 extras alike — is passed as
+# its base-type words in r0..r3 and the caller's 4-byte word stream.
+# An F64 argument (or an F32 extra after the C default promotion to
+# the double image) is a double-word-aligned unit: the walk rounds
+# NCRN up to an even register number and places the low word in the
+# even register and the high word in the odd one, or — when the
+# aligned even-odd pair does not fit r0..r3 — rounds NSAA up to an
+# even word index and lays the unit's two words (little-endian: the
+# low word at the lower address) on the caller stack. The caller's SP
+# is padded to an even word count so it is 8-byte aligned at the BL.
+#
+# The shared LIR lowering has no variadic marker and marshals the call
+# with the hard-float per-class walk (F64/F32 into fixed d0..d7, the
+# stack stream at each argument's own width). This section re-derives
+# the BASE walk from the call term's argument vreg list, maps every
+# argument to the original LIR marshal statement that reads its source
+# (so the allocator's segment/reload records stay authoritative — a
+# source is ALWAYS resolved at its own original position), and emits
+# the base crossings; the block's original marshal statements are
+# skipped. The re-marshalling never invents a vreg: it only reads the
+# call's own argument vregs and writes the fixed ABI registers/r0..r3
+# and the caller stack area, exactly the traffic the allocator already
+# modeled.
+
+struct ThumbVarArgAction
+  kind: Int          # 0 gp word, 1 gp f64 pair, 2 stack word, 3 stack f64
+  vreg: Int
+  src_pos: Int
+  a: Int             # gp register (0/1) or stack word index (2/3)
+  b: Int             # the pair's second gp register (kind 1)
+  w: LirFpWidth
+end
+
+struct ThumbVarArgPlan
+  actions: Vec[ThumbVarArgAction]
+  stack_words: Int
+  skip: Set[Int]
+end
+
+# Plan one variadic call block: re-run the LIR's original per-class
+# cm walk to map every argument to its source-reading marshal statement
+# (register moves in argument order, then the descending push stream
+# with its interleaved F64 alignment pads and the even-word top pad),
+# then re-run the harness's BASE walk and return the action list, the
+# total caller-stack word count and the set of marshal statements the
+# caller must skip. Any divergence between the walk and the statements
+# fails closed (never a partially re-marshalled call).
+def thumb_var_call_plan(f: LirFunction, stmts: Vec[LirStmt], term_pos: Int, args: Vec[Int]) -> Result[ThumbVarArgPlan, String]
+  let block_base = term_pos - stmts.len()
+  var gp_moves: Vec[Int] = Vec::new()
+  var gp_move_pos: Vec[Int] = Vec::new()
+  var fp_moves: Vec[Int] = Vec::new()
+  var fp_move_pos: Vec[Int] = Vec::new()
+  var push_pos: Vec[Int] = Vec::new()
+  var si = 0
+  while si < stmts.len() do
+    let stmt = stmts[si]
+    match stmt.kind
+    when LirStmtKind::LirMove(dst, val) then
+      if dst < lir_first_alloc_vreg() then
+        match val
+        when LirValue::LirReg(src) then
+          gp_moves.push(src)
+          gp_move_pos.push(block_base + si)
+        when _ then
+          return Result::Err("thumb: " + f.name + ": variadic call marshal move into fixed vreg " + dst.to_string() + " is not a register move (lowering/backend divergence — fail-closed)")
+        end
+      end
+    when LirStmtKind::LirFMove(dst, src) then
+      if lir_is_fixed_fp_id(dst) then
+        fp_moves.push(src)
+        fp_move_pos.push(block_base + si)
+      end
+    when LirStmtKind::LirPushArg(_) then
+      push_pos.push(block_base + si)
+    when _ then ()
+    end
+    si = si + 1
+  end
+  # The original per-class cm walk: register-class general arguments
+  # consume the fixed r0..r3 moves in argument order and register-class
+  # floats the fixed d0..d7 moves; the overflow of either class joins
+  # the shared 4-byte stack stream (an F64 a two-word unit at an even
+  # word index with an inserted pad below it).
+  var gp_pos = 0
+  var fp_pos = 0
+  var stk_pos = 0
+  var gp_mi = 0
+  var fp_mi = 0
+  var arg_kind: Vec[Int] = Vec::new()     # 0 gp reg, 1 fp reg, 2 stack
+  var arg_aux: Vec[Int] = Vec::new()      # register position or original stack position
+  var arg_src_pos: Vec[Int] = Vec::new()
+  var pad_words: Set[Int] = Set::new()
+  var ai = 0
+  while ai < args.len() do
+    let vreg = args[ai]
+    match f.fp_widths.get(vreg)
+    when Option::Some(w) then
+      if fp_pos < 8 then
+        arg_kind.push(1)
+        arg_aux.push(fp_pos)
+        if fp_mi >= fp_moves.len() then
+          return Result::Err("thumb: " + f.name + ": variadic call FLOAT argument " + ai.to_string() + " (vreg " + vreg.to_string() + ") has no register marshal statement (lowering/backend divergence — fail-closed)")
+        end
+        if fp_moves[fp_mi] != vreg then
+          return Result::Err("thumb: " + f.name + ": variadic call FLOAT argument " + ai.to_string() + " (vreg " + vreg.to_string() + ") does not match its register marshal statement (vreg " + fp_moves[fp_mi].to_string() + ") — lowering/backend divergence (fail-closed)")
+        end
+        arg_src_pos.push(fp_move_pos[fp_mi])
+        fp_mi = fp_mi + 1
+      else
+        arg_kind.push(2)
+        if w == LirFpWidth::LirF64 then
+          if stk_pos % 2 != 0 then
+            pad_words.insert(stk_pos)
+            stk_pos = stk_pos + 1
+          end
+        end
+        arg_aux.push(stk_pos)
+        arg_src_pos.push(-1)
+        if w == LirFpWidth::LirF64 then
+          stk_pos = stk_pos + 2
+        else
+          stk_pos = stk_pos + 1
+        end
+      end
+      fp_pos = fp_pos + 1
+    when Option::None then
+      if gp_pos < 4 then
+        arg_kind.push(0)
+        arg_aux.push(gp_pos)
+        if gp_mi >= gp_moves.len() then
+          return Result::Err("thumb: " + f.name + ": variadic call INTEGER argument " + ai.to_string() + " (vreg " + vreg.to_string() + ") has no register marshal statement (lowering/backend divergence — fail-closed)")
+        end
+        if gp_moves[gp_mi] != vreg then
+          return Result::Err("thumb: " + f.name + ": variadic call INTEGER argument " + ai.to_string() + " (vreg " + vreg.to_string() + ") does not match its register marshal statement (vreg " + gp_moves[gp_mi].to_string() + ") — lowering/backend divergence (fail-closed)")
+        end
+        arg_src_pos.push(gp_move_pos[gp_mi])
+        gp_mi = gp_mi + 1
+      else
+        arg_kind.push(2)
+        arg_aux.push(stk_pos)
+        arg_src_pos.push(-1)
+        stk_pos = stk_pos + 1
+      end
+      gp_pos = gp_pos + 1
+    end
+    ai = ai + 1
+  end
+  if gp_mi != gp_moves.len() then
+    return Result::Err("thumb: " + f.name + ": variadic call leaves " + (gp_moves.len() - gp_mi).to_string() + " unclaimed INTEGER register marshal statement(s) — lowering/backend divergence (fail-closed)")
+  end
+  if fp_mi != fp_moves.len() then
+    return Result::Err("thumb: " + f.name + ": variadic call leaves " + (fp_moves.len() - fp_mi).to_string() + " unclaimed FLOAT register marshal statement(s) — lowering/backend divergence (fail-closed)")
+  end
+  # Map each stack-class argument's original stack position to its push
+  # statement: the LIR emits the even-word top pad first, then the
+  # descending stack-position walk (one push per stack argument, plus
+  # one pad push immediately after an F64 unit whose base index was
+  # odd).
+  var push_idx = 0
+  if stk_pos % 2 != 0 then
+    push_idx = 1
+  end
+  var pi = args.len()
+  while pi > 0 do
+    pi = pi - 1
+    if arg_kind[pi] == 2 then
+      if push_idx >= push_pos.len() then
+        return Result::Err("thumb: " + f.name + ": variadic call stack argument " + pi.to_string() + " has no push marshal statement (lowering/backend divergence — fail-closed)")
+      end
+      arg_src_pos[pi] = push_pos[push_idx]
+      push_idx = push_idx + 1
+      if pad_words.contains(&(arg_aux[pi] - 1)) then
+        if push_idx >= push_pos.len() then
+          return Result::Err("thumb: " + f.name + ": variadic call F64 alignment pad for stack argument " + pi.to_string() + " has no push marshal statement (lowering/backend divergence — fail-closed)")
+        end
+        push_idx = push_idx + 1
+      end
+    end
+  end
+  if push_idx != push_pos.len() then
+    return Result::Err("thumb: " + f.name + ": variadic call push stream does not match the LIR walk (" + push_idx.to_string() + " vs " + push_pos.len().to_string() + " statements) — lowering/backend divergence (fail-closed)")
+  end
+  # The BASE walk: NCRN/NSAA as documented above (the fixed prefix and
+  # the extras are one stream, exactly the AAPCS32 rule).
+  var actions: Vec[ThumbVarArgAction] = Vec::new()
+  var ncrn = 0
+  var nsaa = 0
+  ai = 0
+  while ai < args.len() do
+    let vreg = args[ai]
+    match f.fp_widths.get(vreg)
+    when Option::Some(w) then
+      if ncrn % 2 != 0 then
+        ncrn = ncrn + 1
+      end
+      if ncrn <= 2 then
+        actions.push(ThumbVarArgAction { kind: 1, vreg: vreg, src_pos: arg_src_pos[ai], a: ncrn, b: ncrn + 1, w: w })
+        ncrn = ncrn + 2
+      else
+        if nsaa % 2 != 0 then
+          nsaa = nsaa + 1
+        end
+        actions.push(ThumbVarArgAction { kind: 3, vreg: vreg, src_pos: arg_src_pos[ai], a: nsaa, b: 0, w: w })
+        nsaa = nsaa + 2
+      end
+    when Option::None then
+      if ncrn < 4 then
+        actions.push(ThumbVarArgAction { kind: 0, vreg: vreg, src_pos: arg_src_pos[ai], a: ncrn, b: 0, w: LirFpWidth::LirF64 })
+        ncrn = ncrn + 1
+      else
+        actions.push(ThumbVarArgAction { kind: 2, vreg: vreg, src_pos: arg_src_pos[ai], a: nsaa, b: 0, w: LirFpWidth::LirF64 })
+        nsaa = nsaa + 1
+      end
+    end
+    ai = ai + 1
+  end
+  var total = nsaa
+  if total % 2 != 0 then
+    total = total + 1
+  end
+  var skip: Set[Int] = Set::new()
+  var mi = 0
+  while mi < gp_move_pos.len() do
+    skip.insert(gp_move_pos[mi])
+    mi = mi + 1
+  end
+  mi = 0
+  while mi < fp_move_pos.len() do
+    skip.insert(fp_move_pos[mi])
+    mi = mi + 1
+  end
+  mi = 0
+  while mi < push_pos.len() do
+    skip.insert(push_pos[mi])
+    mi = mi + 1
+  end
+  Result::Ok(ThumbVarArgPlan { actions: actions, stack_words: total, skip: skip })
+end
+
+# Resolve a variadic float argument to a D-INDEX holding the double
+# image the base convention passes: the F64 source itself, or the §26
+# promoted image of an F32 extra. The F32 -> F64 promotion is a real
+# VCVT (vcvt.f64.f32) and therefore needs the double-precision VFP
+# data-processing unit (cortex-m7 / FPv5-D16); on the FPv4-SP/FPv5-SP
+# cortex-m4f instances the promotion does not lower and fails closed
+# (the F64 load/store/transfer subset cannot convert).
+def thumb_var_f64_use(inout te: ThumbEmit, alloc: LirAlloc, w: LirFpWidth, vreg: Int, pos: Int, role: String) -> Result[Int, String]
+  if w == LirFpWidth::LirF64 then
+    return thumb_fp_use_reg(te, alloc, LirFpWidth::LirF64, vreg, pos, thumb_fp_use_scratch(LirFpWidth::LirF64), role)
+  end
+  if !te.f64dp then
+    return Result::Err("thumb: variadic float argument (vreg " + vreg.to_string() + ") is an F32 extra of a variadic extern call: the C default argument promotion F32 -> F64 needs vcvt.f64.f32 (double-precision VFP), which the `" + te.desc_name + "` descriptor does not provide — the FPv4-SP/FPv5-SP FPUs carry only the F64 load/store/transfer subset; pass an F64 extra explicitly — fail-closed")
+  end
+  let ss = match thumb_fp_use_reg(te, alloc, LirFpWidth::LirF32, vreg, pos, thumb_fp_use_scratch(LirFpWidth::LirF32), role)
+  when Result::Ok(r) then r
+  when Result::Err(e) then return Result::Err(e)
+  end
+  t2_vcvt_f64_f32(&mut te.buf, thumb_fp_scratch_d(), ss)
+  Result::Ok(thumb_fp_scratch_d())
+end
+
+# Store the general word in `sr` at the base convention's caller-stack
+# word `unit` ([sp + 4*unit] — the whole area was reserved once).
+def thumb_var_stack_word(inout te: ThumbEmit, sr: Int, unit: Int) -> Unit
+  if unit == 0 then
+    if sr <= 7 then
+      t2_str_sp_imm8(&mut te.buf, sr, 0)
+    else
+      t2_str_w_imm12(&mut te.buf, sr, thumb_sp_reg(), 0)
+    end
+  else
+    t2_str_w_imm12(&mut te.buf, sr, thumb_sp_reg(), 4 * unit)
+  end
+end
+
+# Emit one variadic call block: non-marshal statements normally, then —
+# with the caller's stack area reserved in one sub — the base-convention
+# crossings re-derived by the plan, then the call itself (spills, BL,
+# cleanup for the base word count, result capture, branch). The source
+# reads resolve at each argument's ORIGINAL statement position, so the
+# allocator's segment/reload records stay exact; only fixed ABI
+# registers and the caller stack area are written.
+def thumb_emit_var_call_block(inout te: ThumbEmit, alloc: LirAlloc, mdl_pool: Vec[Int], f: LirFunction, stmts: Vec[LirStmt], term: LirTerm, frame_bytes: Int, block_pos: Int, externs: Set[String], defined: Set[String]) -> Result[Unit, String]
+  let term_pos = block_pos + stmts.len()
+  match term.kind
+  when LirTermKind::LirCall(target, args, _orig_stack, dest, success) then
+    let plan = match thumb_var_call_plan(f, stmts.clone(), term_pos, args.clone())
+    when Result::Ok(p) then p
+    when Result::Err(e) then return Result::Err(e)
+    end
+    var si = 0
+    while si < stmts.len() do
+      let spos = block_pos + si
+      if !plan.skip.contains(&spos) then
+        match thumb_emit_stmt(te, alloc, mdl_pool, frame_bytes, f.name.clone(), stmts[si].clone(), spos)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      end
+      si = si + 1
+    end
+    if plan.stack_words > 0 then
+      let bytes = 4 * plan.stack_words
+      if bytes <= 508 then
+        t2_sub_sp_imm7(&mut te.buf, bytes)
+      else
+        t2_movw(&mut te.buf, thumb_ip_reg(), (bytes & 0xFFFF) as u16)
+        t2_sub_sp_w_reg(&mut te.buf, thumb_ip_reg())
+      end
+    end
+    var ai = 0
+    while ai < plan.actions.len() do
+      let act = plan.actions[ai]
+      match act.kind
+      when 0 then
+        let sr = thumb_emit_use(te, alloc, mdl_pool, act.vreg, act.src_pos, thumb_ip_reg())
+        if act.a != sr then
+          t2_mov_rr(&mut te.buf, act.a, sr)
+        end
+      when 1 then
+        let fd = match thumb_var_f64_use(te, alloc, act.w, act.vreg, act.src_pos, "variadic F64 pair extra")
+        when Result::Ok(r) then r
+        when Result::Err(e) then return Result::Err(e)
+        end
+        t2_vmov_d_to_gp_pair(&mut te.buf, act.a, act.b, fd)
+      when 2 then
+        let sr = thumb_emit_use(te, alloc, mdl_pool, act.vreg, act.src_pos, thumb_ip_reg())
+        thumb_var_stack_word(te, sr, act.a)
+      when 3 then
+        let fd = match thumb_var_f64_use(te, alloc, act.w, act.vreg, act.src_pos, "variadic F64 stack extra")
+        when Result::Ok(r) then r
+        when Result::Err(e) then return Result::Err(e)
+        end
+        t2_vstr_f64(&mut te.buf, fd, thumb_sp_reg(), 4 * act.a)
+      end
+      ai = ai + 1
+    end
+    match thumb_emit_term(te, alloc, mdl_pool, f.name.clone(), frame_bytes, LirTermKind::LirCall(target.clone(), args.clone(), plan.stack_words, dest, success), term_pos, externs, defined)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    Result::Ok(())
+  when _ then
+    Result::Err("thumb: internal: thumb_emit_var_call_block on a non-call terminator (fail-closed)")
+  end
+end
+
 def thumb_emit_fn(inout te: ThumbEmit, mdl_pool: Vec[Int], desc: TargetDesc, f: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String], variadic_externs: Set[String]) -> Result[Unit, String]
   match thumb_validate_fn(f, desc)
   when Result::Err(e) then return Result::Err(e)
@@ -4596,7 +5438,7 @@ def thumb_emit_fn(inout te: ThumbEmit, mdl_pool: Vec[Int], desc: TargetDesc, f: 
   # AUDIT §16 — the desc-driven FP gate: VFP instructions may be
   # emitted only against an FPU-carrying hard-float descriptor (the
   # cortex-m4f/cortex-m7 instances). A function whose allocation
-  # carries float content (fp_widths beyond the three unconditional
+  # carries float content (fp_widths beyond the TWO unconditional
   # FP statement scratches — see thumb_alloc_has_fp_content) fails
   # closed against a no-FPU descriptor — never a VFP byte for a core
   # without an FPU. (The float shape checks of thumb_validate_fn stay
@@ -4606,15 +5448,13 @@ def thumb_emit_fn(inout te: ThumbEmit, mdl_pool: Vec[Int], desc: TargetDesc, f: 
       return Result::Err("thumb: function " + f.name + " carries float content (VFP registers/images), which does not lower against the `" + desc.name + "` description — fpu None, float_abi Soft: the cortex-m float slice requires an FPU-carrying hard-float descriptor (cortex-m4f or cortex-m7; the M3/M4 cores have no FPU and must not receive VFP instructions — fail-closed)")
     end
   end
-  # AUDIT §16 — the AAPCS32 variadic base-convention gate (see the
-  # validator's doc): a variadic extern call whose marshaling would
-  # cross float values in the VFP registers fails closed per the base
-  # convention — never a silently wrong call to a base-convention
-  # callee.
-  match thumb_validate_variadic_calls(f, variadic_externs)
-  when Result::Err(e) then return Result::Err(e)
-  when Result::Ok(_) then ()
-  end
+  # AUDIT §16/§26 — the variadic call base-convention marshalling is
+  # re-derived at emission (see thumb_emit_var_call_block); no
+  # float-class variadic rejection remains. A function whose allocation
+  # carries FP content still passes the desc-driven FP gate above (a
+  # variadic F64/F32 extra is an FP-class vreg, so an FPU-less/M3/M4
+  # descriptor fails closed there before any byte is emitted).
+  #
   # Frame bound: slot offsets are 4*slot; the frame is 8-aligned and the
   # address path covers offsets up to 0xFFFF (movw) — 16382 slots max
   # (4*16382 = 65528 bytes, the largest 8-aligned frame under 0x10000).
@@ -4650,10 +5490,31 @@ def thumb_emit_fn(inout te: ThumbEmit, mdl_pool: Vec[Int], desc: TargetDesc, f: 
   # LR — EXC_RETURN — lands in the push block's LR slot before any BL
   # can clobber LR; the body may clobber r0-r3/r12, which the NVIC
   # frame already auto-saved).
+  #
+  # FP CALLEE-SAVES (the M-profile d8..d15 block): a function whose
+  # allocation carries FP content emits VPUSH {d8-d15} (64 bytes,
+  # 8-aligned — SP stays AAPCS-aligned) right after the GP push and
+  # BEFORE the frame build, so r7 = SP keeps the frame displacement and
+  # the epilogue's add-sp/POP order is the exact reverse. The block
+  # saves the allocatable F64 pool d8..d13 AND the d14/d15 statement
+  # scratches — all callee-saved under AAPCS32 — so external callers'
+  # s16..s31 values survive the call, and the PUSH {r4-r10, lr} mirror
+  # is complete: the whole allocatable register set this backend can
+  # touch is preserved. (@interrupt handlers take the same block: the
+  # hardware's lazy FP context save already protects the preempted
+  # context's FP registers; the block keeps the handler's own frame
+  # discipline uniform with ordinary functions.)
+  let fp_save = thumb_desc_has_fp(desc) && thumb_alloc_has_fp_content(alloc)
+  te.f64dp = target_desc_f64_data_processing(desc)
+  te.fp_save = fp_save
+  te.desc_name = desc.name.clone()
   if is_interrupt then
-    thumb_emit_interrupt_prologue(te, frame_bytes)
+    thumb_emit_interrupt_prologue(te, frame_bytes, fp_save)
   else
     t2_push_w(&mut te.buf, thumb_saved_reg_list())
+    if fp_save then
+      t2_vpush_d(&mut te.buf, 8, 8)
+    end
     if frame_bytes > 0 then
       if frame_bytes <= 508 then
         t2_sub_sp_imm7(&mut te.buf, frame_bytes)
@@ -4666,24 +5527,44 @@ def thumb_emit_fn(inout te: ThumbEmit, mdl_pool: Vec[Int], desc: TargetDesc, f: 
   end
 
   # Blocks, in order, with the SAME position walk the allocator used
-  # (invariant I3).
+  # (invariant I3). A block whose terminator is a call to a VARIADIC
+  # extern takes the base-convention re-marshalling path
+  # (thumb_emit_var_call_block): the original hard-float marshal
+  # statements are skipped and the whole call's AAPCS32 base crossings
+  # are re-derived, while the position walk (and therefore every
+  # segment/reload query) stays identical.
   var pos = 0
   var bi = 0
   while bi < f.blocks.len() do
     let b = f.blocks[bi]
     def_label(&mut te.buf, lir_block_label(f.name.clone(), b.id))
-    var si = 0
-    while si < b.stmts.len() do
-      match thumb_emit_stmt(te, alloc, mdl_pool, frame_bytes, f.name.clone(), b.stmts[si].clone(), pos)
+    var is_var_call = false
+    match b.term.kind
+    when LirTermKind::LirCall(target, _, _, _, _) then
+      if variadic_externs.contains(&target) then
+        is_var_call = true
+      end
+    when _ then ()
+    end
+    if is_var_call then
+      match thumb_emit_var_call_block(te, alloc, mdl_pool, f, b.stmts.clone(), b.term.clone(), frame_bytes, pos, externs, defined)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
       end
-      pos = pos + 1
-      si = si + 1
-    end
-    match thumb_emit_term(te, alloc, mdl_pool, f.name.clone(), frame_bytes, b.term.kind, pos, externs, defined)
-    when Result::Err(e) then return Result::Err(e)
-    when Result::Ok(_) then ()
+    else
+      var si = 0
+      while si < b.stmts.len() do
+        match thumb_emit_stmt(te, alloc, mdl_pool, frame_bytes, f.name.clone(), b.stmts[si].clone(), pos)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        pos = pos + 1
+        si = si + 1
+      end
+      match thumb_emit_term(te, alloc, mdl_pool, f.name.clone(), frame_bytes, b.term.kind, pos, externs, defined)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
     end
     pos = pos + 1
     bi = bi + 1
@@ -5518,8 +6399,8 @@ def thumb_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u8
   var externs: Set[String] = Set::new()
   var defined: Set[String] = Set::new()
   # The program's VARIADIC extern names (MirFunction.is_extern_variadic
-  # — audit §16: the AAPCS32 base-convention gate below consumes this
-  # set; see thumb_validate_variadic_calls).
+  # — audit §16: thumb_emit_fn routes a call block to the AAPCS32
+  # base-convention marshaller below for these targets).
   var variadic_externs: Set[String] = Set::new()
   var fi = 0
   while fi < program.functions.len() do

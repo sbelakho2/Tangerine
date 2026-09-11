@@ -97,6 +97,46 @@ SUITES=(
   # audit items 28 + 29: the ABI call-plan rows (classify_call_plan over
   # aarch64/x86-64/cortex-m/riscv64, internal + ExternC flavors).
   "tests/abi/abi_call_plan_rows_test.tg"
+  # the cortex-m float-ABI residual slice: the AAPCS32 float stack
+  # arguments (callee [FP + 8 + 4*k] binds and the caller's descending
+  # push stream, the F64 even-word alignment pads and the word-aware
+  # verifier accounting), the F32 int<->float transmute crossings and
+  # the variadic float base-convention marshalling (P0-21).
+  "tests/thumb_float_residual_rows_test.tg"
+  # P0-21 (audit §16/§26): the cortex-m AAPCS32 variadic BASE-convention
+  # lane rows — an F64/F32-promoted extra in an aligned r-pair via
+  # vmov r,r,d or an 8-byte-aligned stack unit, the interleaved
+  # displaced-int row, and the FPv4-SP F32-promotion fail-closed rule.
+  "tests/thumb_variadic_float_rows_test.tg"
+  # the cortex-m FPU-variant model rows (the float-work correctness
+  # fix): the cm pool restricted to the encodable d8..d13, the FPv4-SP
+  # F64-data-processing fail-closed gate vs the FPv5-D16 admission,
+  # and the VPUSH/VPOP {d8-d15} FP callee-save emission.
+  "tests/thumb_fp_fpu_variant_rows_test.tg"
+  # the riscv float slice's row pinning (the F/D encoder bytes, the
+  # psABI stack stream, the F32 F-only li32 + fmv.w.x constant path,
+  # the riscv32 F64 two-unit push and the general-pool phys mapping).
+  "tests/riscv_float_rows_test.tg"
+  # P0-21 (audit §26): the riscv psABI variadic INTEGER-convention lane
+  # rows — the rv64 F64 extra as one a-register bit pattern via
+  # fmv.x.d, the rv32 aligned a-pair via fsd + lw/lw, the stack-extra
+  # stream and the RVF F32-promotion fail-closed rule.
+  "tests/riscv_variadic_float_rows_test.tg"
+  # P0-21 deinit-plan consumer: the MirDeinit plan-tree rows (aggregate
+  # field order, UserFinalizer-then-walk, enum active-variant selection,
+  # the fixed-array counted loop, recursion-by-symbol glue calls, the
+  # String destructor leaf) + the verify_lir gate on every row.
+  "tests/lir_deinit_plan_test.tg"
+  # P0-21 aggregate-layout model: the layout-driven admission/emission
+  # rows (tuples, fixed arrays, nested aggregates, @packed/@align,
+  # sub-word fields, zero-field structs) + the verify_lir gate.
+  "tests/lir_aggregate_layout_test.tg"
+  # the aggregate-residual slice: nested enum fields (value word,
+  # discriminant normalization, heap downcast), heap-handle fields
+  # (String move + plan destructor), nested projection through a
+  # pointer (p.inner.x, p.e downcast) and sub-word F32 fields (4-byte
+  # width accesses + GP<->FP bit moves) + the verify_lir gate.
+  "tests/lir_aggregate_residual_test.tg"
   # third-audit item 34: the §40 coverage ingest lane (tg.cov.v1 ids, the
   # tg.cov.trace.v1 ingest, the point indexes, uncovered_paths and the
   # test.affected / coverage.affected ops).
@@ -151,6 +191,19 @@ if bash tests/run_int_arith_trap_lane.sh "$COMPILER" "$OUTDIR/trap_lane"; then
   echo "behavior suites: PASS  tests/run_int_arith_trap_lane.sh"
 else
   echo "behavior suites: FAIL  tests/run_int_arith_trap_lane.sh" >&2
+  FAILED=1
+fi
+
+# The P0-21 retirement-readiness DIFFERENTIAL PARITY item: the
+# differential-corpus lane (the explicit --codegen=direct fallback
+# against the default LIR route — executed behavior compared where the
+# host can run both, emitted-object AbiCallPlans + symbol sets compared
+# with an explicit SKIP-EXEC status otherwise). The aarch64-none LIR
+# artifact rows ride the same script (structural only).
+if bash tests/run_differential_corpus_tests.sh "$COMPILER" "$OUTDIR/differential_corpus"; then
+  echo "behavior suites: PASS  tests/run_differential_corpus_tests.sh"
+else
+  echo "behavior suites: FAIL  tests/run_differential_corpus_tests.sh" >&2
   FAILED=1
 fi
 

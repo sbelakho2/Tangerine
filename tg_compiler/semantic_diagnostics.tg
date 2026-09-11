@@ -13,40 +13,52 @@
 # TEXT render this module stamps (diagnostic_store_add_stamping) and the
 # round-trip handle diagnostic.get consumes.
 #
-# STABLE DIAGNOSTIC ID (audit item 23). A diagnostic's identity is the
-# semantic tuple (owner, cause, code, obligation):
-#   - owner      — the diagnostic's primary_symbol when it records one,
-#                  else "" (the typed payloads carry no symbol field; the
-#                  primary symbol is the source-level anchor).
-#   - cause      — the typed payload's site/place/node field:
-#                  TypeMismatchData.site, OwnershipDiagnosticData.place,
-#                  EffectViolationData.path[0] (the claimed subject node);
-#                  else the dense span locator "<file>:<start>"; else the
-#                  word "diagnostic". TraitFailureData carries no
-#                  site/place/node — its obligation is the tuple's own
-#                  obligation component and its cause falls to the span.
-#   - code       — the ErrorCode render ("E0201", ...; "" when none).
-#   - obligation — the typed TraitFailureData obligation render ("" for
-#                  every other payload and a payload-less diagnostic).
-# Semantically identical repeats (same tuple, different content — e.g. the
-# same rejection at two loop sites) are distinguished by the store-side
-# collision_ordinal: a per-tuple counter that starts at 0 and increments
-# once per stored occurrence. Re-adding the SAME content under the same
-# tuple is IDEMPOTENT (the existing id is returned, the counter does not
-# move), so re-running a pipeline over an unchanged compile never forks
-# identities. digest_hi/digest_lo are the 128-bit stable digest of the
-# canonical length-prefixed id text (owner, cause, code, obligation,
-# ordinal); Eq/Hash compare the digest words only, like the stable_ids
-# section-3/6 records.
+# STABLE DIAGNOSTIC ID (audit item 23; fourth-audit P1-1). A diagnostic's
+# identity is TYPED and revision-stable: the diagnostic code plus a typed
+# SUBJECT (what the diagnostic is about) plus a typed CAUSE (the
+# obligation or the node/place the rejection was found at), digested over
+# the typed fields ONLY:
+#   - subject — the typed DiagnosticSubject union: Decl (a StableDeclId),
+#               HIRNode (a StableHirNodeId), MIRNode (a StableMirNodeId),
+#               Place (a StablePlaceId), Contract (a StableContractId),
+#               TraitObligation (a TraitObligationId) or ABI (a
+#               StableAbiSurfaceId), else "none". Derived from the typed
+#               DiagnosticSemanticData where present (ownership place ->
+#               Place with the stable place id; a MIR node key site ->
+#               MIRNode; trait failure -> TraitObligation; effect
+#               violation path head -> MIRNode cause + Decl subject), else
+#               from the primary symbol's stable declaration (Decl), never
+#               from the span.
+#   - cause   — the typed DiagnosticCause: the cause subject (the place /
+#               node the rejection was found at) plus the optional typed
+#               obligation identity (TraitObligationId).
+#   - code    — the ErrorCode render ("E0201", ...; "" when none).
+# The SPAN is presentation metadata only: it rides DiagnosticRecord.span
+# and the live Diagnostic.span, NEVER the identity. Duplicate occurrences
+# within ONE snapshot are distinguished by the store-side collision_ordinal
+# — a per-typed-identity counter starting at 0; the ordinal is the ONLY
+# snapshot-scoped component and never encodes a span or text. Re-adding the
+# SAME semantic content (message + the non-locator typed rows) under the
+# same typed identity is IDEMPOTENT (the existing id is returned, the
+# counter does not move): a comment insertion shifts spans and dense site
+# locators only, so it never forks an existing error's identity, and an
+# earlier UNRELATED diagnostic never consumes this identity's ordinal
+# (counters are keyed by the typed identity, not by insertion order). Two
+# DIFFERENT errors (different typed subject/cause) with equal text get
+# different identities and different ids. digest_hi/digest_lo
+# are the 128-bit stable digest of the canonical length-prefixed typed
+# identity text; Eq/Hash compare the digest words only, like the
+# stable_ids section-3/6 records.
 #
-# DIAGNOSTIC RECORD / STORE (audit item 23). DiagnosticRecord is the
-# PERSISTENT store form: id, message, span locator, the typed payload's
-# class word (semantic_kind) and the typed payload's RENDERED rows
-# (related). The RICH typed payload stays on the live Diagnostic
-# (parser.tg's semantic_data) — the record is the serializable projection,
-# and diagnostic.get returns it as canonical rows. DiagnosticStore is
-# append-only: by_id in insertion order + the collision counters map;
-# store_all re-renders the id-ordered view.
+# DIAGNOSTIC RECORD / STORE (audit item 23; fourth-audit P1-1).
+# DiagnosticRecord is the PERSISTENT store form: id, message, span locator
+# (presentation metadata, never identity), the typed payload's class word
+# (semantic_kind) and the typed payload's RENDERED rows (related). The RICH
+# typed payload stays on the live Diagnostic (parser.tg's semantic_data) —
+# the record is the serializable projection, and diagnostic.get returns it
+# as canonical rows. DiagnosticStore is append-only: by_id in insertion
+# order + the typed-identity collision counters map; store_all re-renders
+# the id-ordered view.
 #
 # EXPLAIN NODE (audit item 24 / item 52's typed follow-up). ExplainNode is
 # the typed derivation tree:
@@ -83,89 +95,89 @@ use std::core::{Option, Result}
 use std::collections::{Vec, Map}
 use tg_compiler::token::{Span}
 use tg_compiler::parser::{
-  Diagnostic, DiagnosticSemanticData, DiagLevel, OwnershipDiagnosticData
+  Diagnostic, DiagnosticSemanticData, DiagLevel, OwnershipDiagnosticData,
+  TraitFailureData
 }
-use tg_compiler::stable_ids::{stable_key_digest}
+use tg_compiler::stable_ids::{
+  StableDeclId, StableHirNodeId, StableMirNodeId, StablePlaceId,
+  StableContractId, StableAbiSurfaceId,
+  stable_key_digest, stable_decl_of_key, stable_decl_identity_text_of,
+  stable_place_of_text, stable_place_text_of,
+  stable_hir_node_identity_text, stable_mir_node_key_of, stable_mir_node_of_key,
+  stable_mir_node_id_of_generated
+}
 
 # ———————————————————————————————————————————————————————————————
-# StableDiagnosticId — the revision-stable diagnostic identity
+# The typed DiagnosticSubject / DiagnosticCause union (fourth-audit P1-1)
 # ———————————————————————————————————————————————————————————————
+# ONE typed obligation identity: the failed obligation's
+# "<trait> for <subject>" render plus the RESOLVED trait/subject stable
+# declarations when the text boundary could parse them. digest words cover
+# the typed fields (trait declaration identity words, subject declaration
+# identity words, obligation text) length-prefixed — never a span.
+pub struct TraitObligationId
+  obligation: String = ""
+  trait_decl: Option[StableDeclId] = Option::None
+  subject_decl: Option[StableDeclId] = Option::None
+  digest_hi: UInt = 0
+  digest_lo: UInt = 0
+end
 
+# ONE typed diagnostic subject — the "what is this diagnostic about" union.
+# kind is one of "decl" | "hir-node" | "mir-node" | "place" | "contract" |
+# "trait-obligation" | "abi" | "none"; the matching P0-4/P0-7 stable id
+# record rides its field. id is the typed id's canonical identity text
+# (wire / collision-detection cargo) and id_hi/id_lo are its identity
+# digest words — the subject digest folds kind + the typed id digest words,
+# never a text field and never a span. display is presentation only.
+pub struct DiagnosticSubject
+  kind: String = "none"
+  id: String = ""
+  id_hi: UInt = 0
+  id_lo: UInt = 0
+  decl: Option[StableDeclId] = Option::None
+  hir_node: Option[StableHirNodeId] = Option::None
+  mir_node: Option[StableMirNodeId] = Option::None
+  place: Option[StablePlaceId] = Option::None
+  contract: Option[StableContractId] = Option::None
+  trait_obligation: Option[TraitObligationId] = Option::None
+  abi: Option[StableAbiSurfaceId] = Option::None
+  display: String = ""
+  digest_hi: UInt = 0
+  digest_lo: UInt = 0
+end
+
+# ONE typed diagnostic cause: the cause subject (the place / node the
+# rejection was found at) plus the optional typed obligation identity.
+# kind is "subject" | "obligation" | "none".
+pub struct DiagnosticCause
+  kind: String = "none"
+  subject: DiagnosticSubject = DiagnosticSubject {}
+  obligation: Option[TraitObligationId] = Option::None
+  digest_hi: UInt = 0
+  digest_lo: UInt = 0
+end
+
+# THE persistent diagnostic identity: the code + the typed subject + the
+# typed cause + the within-snapshot collision ordinal. digest_hi/lo are the
+# digest of the canonical typed identity preimage; Eq/Hash compare the
+# digest words only (the pieces are collision cargo).
 pub struct StableDiagnosticId
-  owner: String
-  cause: String
-  code: String
-  obligation: String
+  code: String = ""
+  subject: DiagnosticSubject = DiagnosticSubject {}
+  cause: DiagnosticCause = DiagnosticCause {}
   collision_ordinal: Int = 0
   digest_hi: UInt = 0
   digest_lo: UInt = 0
 end
 
 # The dense span locator of a diagnostic ("<file>:<start>"; "" when the
-# diagnostic carries no span) — the same "<file>:<start>" vocabulary the
-# typed payloads record in their site fields.
+# diagnostic carries no span) — PRESENTATION ONLY (DiagnosticRecord.span).
 def diagnostic_span_locator(d: Diagnostic) -> String
   match d.span
   when Option::Some(sp) then sp.file.clone() + ":" + sp.start.to_string()
   when Option::None then "".to_string()
   end
-end
-
-# The owner anchor: the primary symbol when recorded, else "".
-pub def stable_diagnostic_owner(d: Diagnostic) -> String
-  match d.primary_symbol
-  when Option::Some(p) then p.clone()
-  when Option::None then "".to_string()
-  end
-end
-
-# The cause locator: the typed payload's site/place/node field, else the
-# span locator, else the word "diagnostic".
-pub def stable_diagnostic_cause(d: Diagnostic) -> String
-  let fallback = stable_diagnostic_cause_fallback(&d)
-  match d.semantic_data
-  when Option::Some(sd) then
-    match sd
-    when DiagnosticSemanticData::Ownership(od) then
-      if od.place.len() > 0 then od.place.clone() else fallback.clone() end
-    when DiagnosticSemanticData::TypeMismatch(tm) then
-      if tm.site.len() > 0 then tm.site.clone() else fallback.clone() end
-    when DiagnosticSemanticData::TraitFailure(_) then
-      fallback.clone()
-    when DiagnosticSemanticData::EffectViolation(ev) then
-      if ev.path.len() > 0 then ev.path[0].clone() else fallback.clone() end
-    end
-  when Option::None then
-    fallback.clone()
-  end
-end
-
-def stable_diagnostic_cause_fallback(d: Diagnostic) -> String
-  let span_text = diagnostic_span_locator(d)
-  if span_text.len() > 0 then span_text else "diagnostic".to_string() end
-end
-
-# The code component: the ErrorCode render ("" when none).
-pub def stable_diagnostic_code(d: Diagnostic) -> String
-  match d.code
-  when Option::Some(c) then c.clone()
-  when Option::None then "".to_string()
-  end
-end
-
-# The obligation component: the typed TraitFailureData obligation render
-# ("" for every other payload class and a payload-less diagnostic).
-pub def stable_diagnostic_obligation(d: Diagnostic) -> String
-  var ob = "".to_string()
-  match d.semantic_data
-  when Option::Some(sd) then
-    match sd
-    when DiagnosticSemanticData::TraitFailure(tf) then ob = tf.obligation.clone()
-    when _ then ()
-    end
-  when Option::None then ()
-  end
-  ob
 end
 
 # The length-prefixed identity segment ("<len>:<text>") — the injectivity
@@ -176,26 +188,282 @@ def diagnostic_lenpref(piece: String) -> String
   piece.len().to_string() + ":" + piece
 end
 
-# The semantic tuple key (owner, cause, code, obligation) — the store's
-# counter key and the repeated-cause equivalence.
-pub def stable_diagnostic_tuple_key(
-  owner: String, cause: String, code: String, obligation: String
-) -> String
-  diagnostic_lenpref(&owner) + diagnostic_lenpref(&cause) +
-    diagnostic_lenpref(&code) + diagnostic_lenpref(&obligation)
+# The byte index of `needle` at or after `from` (-1 when absent) — the
+# text-scan idiom of the stable_ids/semantic_delta helpers.
+def diagnostic_index_of(s: String, needle: String, from: Int) -> Int
+  if needle.len() == 0 then
+    return -1
+  end
+  var i = from
+  while i + needle.len() <= s.len() do
+    if s.slice(i, i + needle.len()) == needle then
+      return i
+    end
+    i = i + 1
+  end
+  -1
 end
 
-# The canonical identity preimage: the semantic tuple PLUS the collision
-# ordinal (the ordinal is identity, not cargo — it distinguishes repeated
-# identical causes).
-def stable_diagnostic_id_canonical_text(
-  owner: String, cause: String, code: String, obligation: String, collision_ordinal: Int
+# ———— TraitObligationId ———
+
+# The typed obligation id of its pieces: the digest folds the trait and
+# subject declaration identity words (0/0 when unresolved) plus the
+# obligation render, every piece length-prefixed.
+pub def trait_obligation_id_of(
+  obligation: String,
+  trait_decl: Option[StableDeclId],
+  subject_decl: Option[StableDeclId]
+) -> TraitObligationId
+  var text = diagnostic_lenpref("trait-obligation") + diagnostic_lenpref(&obligation)
+  match trait_decl.clone()
+  when Option::Some(d) then
+    text = text + diagnostic_lenpref("trait") +
+      diagnostic_lenpref(&d.digest_hi.to_string()) + diagnostic_lenpref(&d.digest_lo.to_string())
+  when Option::None then
+    text = text + diagnostic_lenpref("trait") + diagnostic_lenpref("0") + diagnostic_lenpref("0")
+  end
+  match subject_decl.clone()
+  when Option::Some(d) then
+    text = text + diagnostic_lenpref("subject") +
+      diagnostic_lenpref(&d.digest_hi.to_string()) + diagnostic_lenpref(&d.digest_lo.to_string())
+  when Option::None then
+    text = text + diagnostic_lenpref("subject") + diagnostic_lenpref("0") + diagnostic_lenpref("0")
+  end
+  let digest = stable_key_digest(&text)
+  TraitObligationId {
+    obligation: obligation,
+    trait_decl: trait_decl,
+    subject_decl: subject_decl,
+    digest_hi: digest.hi,
+    digest_lo: digest.lo
+  }
+end
+
+# The text-boundary obligation id: when the render carries the
+# "<trait> for <subject>" separator, the resolved declarations are built
+# through the total stable_decl_of_key boundary; otherwise the obligation
+# render alone is the typed preimage.
+pub def trait_obligation_id_of_text(obligation: String) -> TraitObligationId
+  let mark = diagnostic_index_of(&obligation, " for ", 0)
+  if mark > 0 then
+    let trait_text = obligation.slice(0, mark)
+    let subject_text = obligation.slice(mark + 5, obligation.len())
+    if trait_text.len() > 0 && subject_text.len() > 0 then
+      return trait_obligation_id_of(obligation.clone(),
+        Option::Some(stable_decl_of_key(&trait_text)),
+        Option::Some(stable_decl_of_key(&subject_text)))
+    end
+  end
+  trait_obligation_id_of(obligation, Option::None, Option::None)
+end
+
+# The obligation's display render.
+pub def trait_obligation_id_text(ob: TraitObligationId) -> String
+  ob.obligation.clone()
+end
+
+# ———— DiagnosticSubject constructors ———
+
+# The subject identity preimage: kind + the typed id's identity digest
+# words, length-prefixed (the id TEXT is collision-detection cargo and
+# never digested — a declaration rename or a display change leaves the
+# typed digest untouched).
+pub def diagnostic_subject_identity_key(subject: DiagnosticSubject) -> String
+  diagnostic_lenpref("subject") + diagnostic_lenpref(&subject.kind) +
+    diagnostic_lenpref(&subject.id_hi.to_string()) + diagnostic_lenpref(&subject.id_lo.to_string())
+end
+
+def diagnostic_subject_of_parts(
+  kind: String, id: String, id_hi: UInt, id_lo: UInt, display: String
+) -> DiagnosticSubject
+  let text = diagnostic_lenpref("subject") + diagnostic_lenpref(&kind) +
+    diagnostic_lenpref(&id_hi.to_string()) + diagnostic_lenpref(&id_lo.to_string())
+  let digest = stable_key_digest(&text)
+  DiagnosticSubject {
+    kind: kind,
+    id: id,
+    id_hi: id_hi,
+    id_lo: id_lo,
+    display: display,
+    digest_hi: digest.hi,
+    digest_lo: digest.lo
+  }
+end
+
+pub def diagnostic_subject_none() -> DiagnosticSubject
+  diagnostic_subject_of_parts("none".to_string(), "".to_string(), 0, 0, "".to_string())
+end
+
+pub def diagnostic_subject_of_decl(decl: StableDeclId, display: String) -> DiagnosticSubject
+  var subject = diagnostic_subject_of_parts("decl".to_string(),
+    stable_decl_identity_text_of(decl.clone()), decl.digest_hi, decl.digest_lo, display)
+  subject.decl = Option::Some(decl)
+  subject
+end
+
+pub def diagnostic_subject_of_decl_key(key: String) -> DiagnosticSubject
+  diagnostic_subject_of_decl(stable_decl_of_key(&key), key)
+end
+
+pub def diagnostic_subject_of_hir_node(node: StableHirNodeId, display: String) -> DiagnosticSubject
+  var subject = diagnostic_subject_of_parts("hir-node".to_string(),
+    stable_hir_node_identity_text(node.clone()), node.digest_hi, node.digest_lo, display)
+  subject.hir_node = Option::Some(node)
+  subject
+end
+
+pub def diagnostic_subject_of_mir_node(node: StableMirNodeId, display: String) -> DiagnosticSubject
+  var subject = diagnostic_subject_of_parts("mir-node".to_string(),
+    stable_mir_node_key_of(node.clone()), node.digest_hi, node.digest_lo, display)
+  subject.mir_node = Option::Some(node)
+  subject
+end
+
+pub def diagnostic_subject_of_place(place: StablePlaceId, display: String) -> DiagnosticSubject
+  var subject = diagnostic_subject_of_parts("place".to_string(),
+    stable_place_text_of(place.clone()), place.digest_hi, place.digest_lo, display)
+  subject.place = Option::Some(place)
+  subject
+end
+
+# The text-boundary place subject ("r", "self.field"); Option::None
+# subject when the text is not a canonical place (dynamic indexes are not
+# stable places — the caller falls back to the symbol declaration).
+pub def diagnostic_subject_of_place_text(text: String) -> DiagnosticSubject
+  match stable_place_of_text(&text)
+  when Option::Some(place) then diagnostic_subject_of_place(place, text)
+  when Option::None then diagnostic_subject_none()
+  end
+end
+
+pub def diagnostic_subject_of_contract(contract: StableContractId) -> DiagnosticSubject
+  var subject = diagnostic_subject_of_parts("contract".to_string(),
+    contract.stable_key.clone(), contract.digest_hi, contract.digest_lo, contract.stable_key.clone())
+  subject.contract = Option::Some(contract)
+  subject
+end
+
+pub def diagnostic_subject_of_obligation(ob: TraitObligationId, display: String) -> DiagnosticSubject
+  var subject = diagnostic_subject_of_parts("trait-obligation".to_string(),
+    ob.obligation.clone(), ob.digest_hi, ob.digest_lo, display)
+  subject.trait_obligation = Option::Some(ob)
+  subject
+end
+
+pub def diagnostic_subject_of_abi(abi: StableAbiSurfaceId) -> DiagnosticSubject
+  var subject = diagnostic_subject_of_parts("abi".to_string(),
+    abi.stable_key.clone(), abi.digest_hi, abi.digest_lo, abi.stable_key.clone())
+  subject.abi = Option::Some(abi)
+  subject
+end
+
+# ———— DiagnosticCause constructors ———
+
+def diagnostic_cause_of_parts(
+  kind: String, subject: DiagnosticSubject, obligation: Option[TraitObligationId]
+) -> DiagnosticCause
+  var text = diagnostic_lenpref("cause") + diagnostic_lenpref(&kind) +
+    diagnostic_lenpref(&diagnostic_subject_identity_key(subject.clone()))
+  match obligation.clone()
+  when Option::Some(ob) then
+    text = text + diagnostic_lenpref(&ob.digest_hi.to_string()) +
+      diagnostic_lenpref(&ob.digest_lo.to_string()) + diagnostic_lenpref(&ob.obligation)
+  when Option::None then
+    text = text + diagnostic_lenpref("0") + diagnostic_lenpref("0") + diagnostic_lenpref("")
+  end
+  let digest = stable_key_digest(&text)
+  DiagnosticCause {
+    kind: kind,
+    subject: subject,
+    obligation: obligation,
+    digest_hi: digest.hi,
+    digest_lo: digest.lo
+  }
+end
+
+pub def diagnostic_cause_subject(subject: DiagnosticSubject) -> DiagnosticCause
+  diagnostic_cause_of_parts("subject".to_string(), subject, Option::None)
+end
+
+pub def diagnostic_cause_obligation(
+  subject: DiagnosticSubject, obligation: TraitObligationId
+) -> DiagnosticCause
+  diagnostic_cause_of_parts("obligation".to_string(), subject, Option::Some(obligation))
+end
+
+pub def diagnostic_cause_none() -> DiagnosticCause
+  diagnostic_cause_of_parts("none".to_string(), diagnostic_subject_none(), Option::None)
+end
+
+# The cause identity preimage: the cause kind + the cause subject's typed
+# identity + the optional obligation's TYPED DIGEST WORDS (the obligation
+# render text never enters the preimage — the digest words already cover
+# the resolved trait/subject declarations and the obligation render).
+pub def diagnostic_cause_identity_key(cause: DiagnosticCause) -> String
+  var text = diagnostic_lenpref("cause") + diagnostic_lenpref(&cause.kind) +
+    diagnostic_lenpref(&diagnostic_subject_identity_key(cause.subject.clone()))
+  match cause.obligation.clone()
+  when Option::Some(ob) then
+    text = text + diagnostic_lenpref("obligation") +
+      diagnostic_lenpref(&ob.digest_hi.to_string()) + diagnostic_lenpref(&ob.digest_lo.to_string())
+  when Option::None then
+    text = text + diagnostic_lenpref("obligation") + diagnostic_lenpref("0") + diagnostic_lenpref("0")
+  end
+  text
+end
+
+pub def diagnostic_cause_obligation_text(cause: DiagnosticCause) -> String
+  match cause.obligation
+  when Option::Some(ob) then ob.obligation.clone()
+  when Option::None then "".to_string()
+  end
+end
+
+# ———— StableDiagnosticId ———
+
+# The typed identity key WITHOUT the ordinal: the store's counter key and
+# the idempotency comparison.
+pub def diagnostic_identity_key(
+  subject: DiagnosticSubject, cause: DiagnosticCause, code: String
 ) -> String
-  stable_diagnostic_tuple_key(owner, cause, code, obligation) +
+  diagnostic_lenpref("diagnostic") + diagnostic_lenpref(&code) +
+    diagnostic_lenpref(&diagnostic_subject_identity_key(subject.clone())) +
+    diagnostic_lenpref(&diagnostic_cause_identity_key(cause.clone()))
+end
+
+# The canonical identity preimage: the typed identity key PLUS the
+# within-snapshot collision ordinal.
+def stable_diagnostic_id_canonical_text(
+  code: String, subject: DiagnosticSubject, cause: DiagnosticCause, collision_ordinal: Int
+) -> String
+  diagnostic_identity_key(subject, cause, code) +
     diagnostic_lenpref(&collision_ordinal.to_string())
 end
 
-# The typed id constructor: the 128-bit digest of the canonical preimage.
+# The typed id constructor: the 128-bit digest of the typed preimage.
+pub def stable_diagnostic_id_typed(
+  code: String,
+  subject: DiagnosticSubject,
+  cause: DiagnosticCause,
+  collision_ordinal: Int
+) -> StableDiagnosticId
+  let text = stable_diagnostic_id_canonical_text(
+    code.clone(), subject.clone(), cause.clone(), collision_ordinal)
+  let digest = stable_key_digest(&text)
+  StableDiagnosticId {
+    code: code,
+    subject: subject,
+    cause: cause,
+    collision_ordinal: collision_ordinal,
+    digest_hi: digest.hi,
+    digest_lo: digest.lo
+  }
+end
+
+# The legacy TEXT-boundary constructor (API compatibility only): the typed
+# subject/cause are built from the owner/cause text through the stable_ids
+# boundary constructors. The persistent store path NEVER calls this builder
+# — it derives the typed subject from the live Diagnostic.
 pub def stable_diagnostic_id_of(
   owner: String,
   cause: String,
@@ -203,27 +471,39 @@ pub def stable_diagnostic_id_of(
   obligation: String,
   collision_ordinal: Int
 ) -> StableDiagnosticId
-  let text = stable_diagnostic_id_canonical_text(
-    owner.clone(), cause.clone(), code.clone(), obligation.clone(), collision_ordinal)
-  let digest = stable_key_digest(&text)
-  StableDiagnosticId {
-    owner: owner,
-    cause: cause,
-    code: code,
-    obligation: obligation,
-    collision_ordinal: collision_ordinal,
-    digest_hi: digest.hi,
-    digest_lo: digest.lo
-  }
+  let subject = diagnostic_subject_of_text_boundary(owner.clone(), cause.clone())
+  var cs = diagnostic_cause_subject(subject.clone())
+  if obligation.len() > 0 then
+    cs = diagnostic_cause_obligation(subject.clone(), trait_obligation_id_of_text(obligation))
+  end
+  stable_diagnostic_id_typed(code, subject, cs, collision_ordinal)
+end
+
+# The legacy text-boundary subject: the owner def key's stable declaration
+# when one is known, else a parses-as-place cause subject.
+def diagnostic_subject_of_text_boundary(owner: String, cause: String) -> DiagnosticSubject
+  if owner.len() > 0 then
+    return diagnostic_subject_of_decl_key(owner)
+  end
+  if cause.len() > 0 then
+    let subject = diagnostic_subject_of_place_text(cause.clone())
+    if subject.kind != "none" then
+      return subject
+    end
+  end
+  diagnostic_subject_none()
 end
 
 # The canonical id RENDER (diagnostics cargo / Diagnostic.id / the
-# diagnostic.get key): owner, code, cause, the length-prefixed obligation
-# and the ordinal. This is NOT the digest preimage — the digest words are
-# the identity; this text is the wire / round-trip handle.
+# diagnostic.get key): the code, the typed subject kind + identity text +
+# digest words, the typed cause kind + obligation render and the ordinal.
+# This is NOT the digest preimage — the digest words are the identity; this
+# text is the wire / round-trip handle.
 pub def stable_diagnostic_id_text(id: StableDiagnosticId) -> String
-  id.owner.clone() + "|diagnostic|" + id.code.clone() + "|" + id.cause.clone() +
-    "|" + diagnostic_lenpref(&id.obligation) + "|#" + id.collision_ordinal.to_string()
+  "diagnostic|" + id.code.clone() + "|" + id.subject.kind.clone() + "|" + id.subject.id.clone() +
+    "|" + id.subject.id_hi.to_string() + "-" + id.subject.id_lo.to_string() +
+    "|" + id.cause.kind.clone() + "|" + diagnostic_cause_obligation_text(id.cause.clone()) +
+    "|#" + id.collision_ordinal.to_string()
 end
 
 # ———— Eq/Hash (the digest-words fold; the pieces are collision cargo) ————
@@ -241,6 +521,132 @@ impl Hash for StableDiagnosticId
     h = ((h as UInt) * 31 + self.digest_lo) as Int
     h
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The typed derivation of a live Diagnostic's subject / cause
+# ———————————————————————————————————————————————————————————————
+
+# The primary symbol's stable declaration subject (the documented fallback
+# when only a symbol is known).
+pub def diagnostic_subject_of_symbol(d: Diagnostic) -> DiagnosticSubject
+  match d.primary_symbol
+  when Option::Some(s) then
+    if s.len() > 0 then diagnostic_subject_of_decl_key(s.clone()) else diagnostic_subject_none() end
+  when Option::None then diagnostic_subject_none()
+  end
+end
+
+# The typed subject of a diagnostic: the typed DiagnosticSemanticData's
+# stable fact where present, the primary symbol's declaration otherwise.
+# SPANS NEVER PARTICIPATE. Ownership: the place text -> the structured
+# StablePlaceId. Type mismatch: a MIR node key site -> MIRNode (the site
+# payload carries no HIR-node key grammar; HIRNode subjects are constructed
+# by callers holding a StableHirNodeId), else the symbol declaration. Trait
+# failure: the typed TraitObligation subject (the obligation id; the
+# obligation also rides the cause). Effect violation: the symbol
+# declaration (the evidence path head rides the cause as a MIRNode).
+pub def diagnostic_subject_of(d: Diagnostic) -> DiagnosticSubject
+  match d.semantic_data
+  when Option::Some(sd) then
+    match sd
+    when DiagnosticSemanticData::Ownership(od) then
+      if od.place.len() > 0 then
+        let subject = diagnostic_subject_of_place_text(od.place.clone())
+        if subject.kind == "place" then subject else diagnostic_subject_of_symbol(&d) end
+      else
+        diagnostic_subject_of_symbol(&d)
+      end
+    when DiagnosticSemanticData::TypeMismatch(tm) then
+      if tm.site.len() > 0 then
+        match stable_mir_node_of_key(&tm.site)
+        when Option::Some(node) then diagnostic_subject_of_mir_node(node, tm.site.clone())
+        when Option::None then diagnostic_subject_of_symbol(&d)
+        end
+      else
+        diagnostic_subject_of_symbol(&d)
+      end
+    when DiagnosticSemanticData::TraitFailure(tf) then
+      if tf.obligation.len() > 0 then
+        diagnostic_subject_of_obligation(
+          trait_obligation_id_of_text(tf.obligation.clone()), tf.obligation.clone())
+      else
+        diagnostic_subject_of_symbol(&d)
+      end
+    when DiagnosticSemanticData::EffectViolation(_) then
+      diagnostic_subject_of_symbol(&d)
+    end
+  when Option::None then diagnostic_subject_of_symbol(&d)
+  end
+end
+
+# The typed cause: trait failure -> the typed obligation id; effect
+# violation -> the evidence path head as a MIRNode; every other class ->
+# the subject itself (the cause place/node).
+pub def diagnostic_cause_of(d: Diagnostic) -> DiagnosticCause
+  let subject = diagnostic_subject_of(&d)
+  match d.semantic_data
+  when Option::Some(sd) then
+    match sd
+    when DiagnosticSemanticData::TraitFailure(tf) then
+      if tf.obligation.len() > 0 then
+        diagnostic_cause_obligation(subject, trait_obligation_id_of_text(tf.obligation.clone()))
+      else
+        diagnostic_cause_subject(subject)
+      end
+    when DiagnosticSemanticData::EffectViolation(ev) then
+      if ev.path.len() > 0 then
+        let head = ev.path[0].clone()
+        let node = stable_mir_node_id_of_generated(head.clone(), head.clone(),
+          "diagnostic", "effect-evidence-head", 0)
+        diagnostic_cause_subject(diagnostic_subject_of_mir_node(node, head))
+      else
+        diagnostic_cause_subject(subject)
+      end
+    when _ then diagnostic_cause_subject(subject)
+    end
+  when Option::None then diagnostic_cause_subject(subject)
+  end
+end
+
+# The presentation owner anchor: the subject's display render (never
+# identity).
+pub def stable_diagnostic_owner(d: Diagnostic) -> String
+  let subject = diagnostic_subject_of(&d)
+  if subject.display.len() > 0 then subject.display.clone() else subject.id.clone() end
+end
+
+# The presentation cause anchor: the cause subject's display render (never
+# identity).
+pub def stable_diagnostic_cause(d: Diagnostic) -> String
+  let cause = diagnostic_cause_of(&d)
+  if cause.subject.display.len() > 0 then cause.subject.display.clone() else cause.subject.id.clone() end
+end
+
+# The code component: the ErrorCode render ("" when none).
+pub def stable_diagnostic_code(d: Diagnostic) -> String
+  match d.code
+  when Option::Some(c) then c.clone()
+  when Option::None then "".to_string()
+  end
+end
+
+# The obligation component: the typed TraitFailureData obligation render
+# ("" for every other payload class and a payload-less diagnostic).
+pub def stable_diagnostic_obligation(d: Diagnostic) -> String
+  diagnostic_cause_obligation_text(diagnostic_cause_of(&d))
+end
+
+# The legacy text-level tuple key — the API-compatibility boundary only.
+pub def stable_diagnostic_tuple_key(
+  owner: String, cause: String, code: String, obligation: String
+) -> String
+  let subject = diagnostic_subject_of_text_boundary(owner.clone(), cause.clone())
+  var cs = diagnostic_cause_subject(subject.clone())
+  if obligation.len() > 0 then
+    cs = diagnostic_cause_obligation(subject.clone(), trait_obligation_id_of_text(obligation))
+  end
+  diagnostic_identity_key(subject, cs, code)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -314,28 +720,45 @@ pub def diagnostic_semantic_data_rows(d: Diagnostic) -> Vec[String]
 end
 
 def diagnostic_content_key_of_parts(
-  message: String, span: String, kind: String, rows: Vec[String]
+  message: String, kind: String, rows: Vec[String]
 ) -> String
-  var text = diagnostic_lenpref(&message) + diagnostic_lenpref(&span) + diagnostic_lenpref(&kind)
+  var text = diagnostic_lenpref(&message) + diagnostic_lenpref(&kind)
   for r in rows do
     text = text + diagnostic_lenpref(&r)
   end
   text
 end
 
-# The content key of a LIVE diagnostic (message, span, class, typed rows)
-# — the idempotency comparison of diagnostic_store_add.
+# Whether a typed row is a dense SITE locator ("consumed_at:", "rejected_at:",
+# "site:") — presentation metadata that never participates in the
+# idempotency content key (so a comment insertion that shifts a byte offset
+# never forks an existing diagnostic's identity).
+def diagnostic_content_row_is_presentation(row: String) -> Bool
+  row.starts_with("consumed_at:") || row.starts_with("rejected_at:") || row.starts_with("site:")
+end
+
+# The content key of a LIVE diagnostic (message, class, the typed NON-SITE
+# rows) — the idempotency comparison of diagnostic_store_add. The span and
+# the dense site rows are presentation metadata and are deliberately
+# EXCLUDED.
 pub def diagnostic_content_key(d: Diagnostic) -> String
-  diagnostic_content_key_of_parts(
-    d.message.clone(),
-    diagnostic_span_locator(&d),
-    diagnostic_semantic_data_kind(&d),
-    diagnostic_semantic_data_rows(&d))
+  var rows: Vec[String] = Vec::new()
+  for r in diagnostic_semantic_data_rows(&d) do
+    if !diagnostic_content_row_is_presentation(r.clone()) then
+      rows.push(r.clone())
+    end
+  end
+  diagnostic_content_key_of_parts(d.message.clone(), diagnostic_semantic_data_kind(&d), rows)
 end
 
 pub def diagnostic_record_content_key(r: DiagnosticRecord) -> String
-  diagnostic_content_key_of_parts(
-    r.message.clone(), r.span.clone(), r.semantic_kind.clone(), r.related.clone())
+  var rows: Vec[String] = Vec::new()
+  for row in r.related do
+    if !diagnostic_content_row_is_presentation(row.clone()) then
+      rows.push(row.clone())
+    end
+  end
+  diagnostic_content_key_of_parts(r.message.clone(), r.semantic_kind.clone(), rows)
 end
 
 # The persistent projection of a live diagnostic under an assigned id.
@@ -362,40 +785,43 @@ pub def new_diagnostic_store() -> DiagnosticStore
   DiagnosticStore { by_id: Vec::new(), counters: Map::new() }
 end
 
-def diagnostic_record_tuple_matches(
-  r: DiagnosticRecord, owner: String, cause: String, code: String, obligation: String
+# Whether a stored record's TYPED identity equals (code, subject, cause):
+# the typed identity key comparison — no text field, no span, no ordinal.
+def diagnostic_record_identity_matches(
+  r: DiagnosticRecord, subject: DiagnosticSubject, cause: DiagnosticCause, code: String
 ) -> Bool
-  r.id.owner == owner && r.id.cause == cause &&
-    r.id.code == code && r.id.obligation == obligation
+  diagnostic_identity_key(r.id.subject.clone(), r.id.cause.clone(), r.id.code.clone()) ==
+    diagnostic_identity_key(subject, cause, code)
 end
 
 # Add ONE diagnostic: returns the existing id when the SAME content under
-# the same semantic tuple is already stored (idempotent); otherwise
-# assigns the tuple's next collision ordinal and appends the record. The
-# counter is keyed by the semantic tuple text, so genuinely repeated
-# identical causes (same tuple, different content/site) get increasing
-# ordinals while a re-run of an unchanged compile returns the same ids.
+# the same typed identity is already stored (idempotent); otherwise
+# assigns the typed identity's next collision ordinal and appends the
+# record. The counter is keyed by the TYPED identity key (code + subject +
+# cause digest words), so genuinely repeated identical causes (same typed
+# identity, different non-locator content) get increasing ordinals while a
+# re-run of an unchanged compile returns the same ids. The ordinal is the
+# ONLY snapshot-scoped component of the id; it never encodes a span or a
+# text field.
 pub def diagnostic_store_add(inout store: DiagnosticStore, diagnostic: Diagnostic) -> StableDiagnosticId
-  let owner = stable_diagnostic_owner(&diagnostic)
-  let cause = stable_diagnostic_cause(&diagnostic)
+  let subject = diagnostic_subject_of(&diagnostic)
+  let cause = diagnostic_cause_of(&diagnostic)
   let code = stable_diagnostic_code(&diagnostic)
-  let obligation = stable_diagnostic_obligation(&diagnostic)
-  let tuple_key = stable_diagnostic_tuple_key(
-    owner.clone(), cause.clone(), code.clone(), obligation.clone())
+  let identity_key = diagnostic_identity_key(subject.clone(), cause.clone(), code.clone())
   let content = diagnostic_content_key(&diagnostic)
   var i = 0
   while i < store.by_id.len() do
     let r = store.by_id[i].clone()
-    if diagnostic_record_tuple_matches(
-        &r, owner.clone(), cause.clone(), code.clone(), obligation.clone()) &&
+    if diagnostic_record_identity_matches(
+        &r, subject.clone(), cause.clone(), code.clone()) &&
        diagnostic_record_content_key(&r) == content then
       return r.id.clone()
     end
     i = i + 1
   end
-  let ordinal = store.counters.get(tuple_key.clone()).unwrap_or(0)
-  store.counters.insert(tuple_key.clone(), ordinal + 1)
-  let id = stable_diagnostic_id_of(owner, cause, code, obligation, ordinal)
+  let ordinal = store.counters.get(identity_key.clone()).unwrap_or(0)
+  store.counters.insert(identity_key.clone(), ordinal + 1)
+  let id = stable_diagnostic_id_typed(code, subject, cause, ordinal)
   store.by_id.push(diagnostic_record_of(&diagnostic, id.clone()))
   id
 end
@@ -888,7 +1314,7 @@ def diag_lane_span(start: Int) -> Span
   Span { file: "lane.tg", start: start, end_pos: start + 1 }
 end
 
-def diag_lane_ownership(message: String, start: Int) -> Diagnostic
+def diag_lane_ownership_place(message: String, place: String, start: Int) -> Diagnostic
   Diagnostic {
     level: DiagLevel::Error,
     message: message,
@@ -899,7 +1325,7 @@ def diag_lane_ownership(message: String, start: Int) -> Diagnostic
     primary_symbol: Option::Some("m::f#fn()->unit".to_string()),
     semantic_site: Option::Some("ownership analysis".to_string()),
     semantic_data: Option::Some(DiagnosticSemanticData::Ownership(OwnershipDiagnosticData {
-      place: "r".to_string(),
+      place: place,
       state_before: "consumed".to_string(),
       operation: "use".to_string(),
       consume_site: "lane.tg:5".to_string(),
@@ -909,13 +1335,36 @@ def diag_lane_ownership(message: String, start: Int) -> Diagnostic
   }
 end
 
+def diag_lane_ownership(message: String, start: Int) -> Diagnostic
+  diag_lane_ownership_place(message, "r".to_string(), start)
+end
+
+# ONE trait-bound failure: the typed obligation "<trait> for <subject>".
+def diag_lane_trait_failure(obligation: String) -> Diagnostic
+  Diagnostic {
+    level: DiagLevel::Error,
+    message: "trait bound not satisfied: " + obligation.clone(),
+    span: Option::Some(diag_lane_span(30)),
+    notes: Vec::new(),
+    suggestions: Vec::new(),
+    code: Option::Some("E0203".to_string()),
+    primary_symbol: Option::Some("m::f#fn()->unit".to_string()),
+    semantic_site: Option::Some("method call resolution".to_string()),
+    semantic_data: Option::Some(DiagnosticSemanticData::TraitFailure(TraitFailureData {
+      obligation: obligation,
+      rejected_candidates: Vec::from(["impl Display for R".to_string()])
+    }))
+  }
+end
+
 pub def semantic_diagnostics_lane_check() -> Vec[String]
   var out: Vec[String] = Vec::new()
 
-  # ———— D1: derivation + ordinals ————
+  # ———— D1: typed derivation + identity determinism ————
   let d1 = diag_lane_ownership("use of moved value `r`".to_string(), 10)
   let d2 = diag_lane_ownership("use of moved value `r` (second site)".to_string(), 20)
-  diag_lane_text(&mut out, "d1-owner", stable_diagnostic_owner(&d1), "m::f#fn()->unit")
+  diag_lane_text(&mut out, "d1-owner", stable_diagnostic_owner(&d1), "r")
+  diag_lane_text(&mut out, "d1-subject-kind", diagnostic_subject_of(&d1).kind.clone(), "place")
   diag_lane_text(&mut out, "d1-cause-place", stable_diagnostic_cause(&d1), "r")
   diag_lane_text(&mut out, "d1-code", stable_diagnostic_code(&d1), "E0201")
   diag_lane_text(&mut out, "d1-obligation-none", stable_diagnostic_obligation(&d1), "")
@@ -931,6 +1380,25 @@ pub def semantic_diagnostics_lane_check() -> Vec[String]
   diag_lane_bool(&mut out, "d1-ordinal-distinguishes",
     stable_diagnostic_id_text(id1.clone()) !=
       stable_diagnostic_id_text(stable_diagnostic_id_of("m::f#fn()->unit".to_string(), "r".to_string(), "E0201".to_string(), "".to_string(), 1)))
+  # The typed constructor over the DERIVED subject/cause agrees with the
+  # text-boundary constructor for the same owner/cause tuple.
+  let typed_id1 = stable_diagnostic_id_typed(
+    "E0201".to_string(),
+    diagnostic_subject_of_decl_key("m::f#fn()->unit".to_string()),
+    diagnostic_cause_subject(diagnostic_subject_of_decl_key("m::f#fn()->unit".to_string())),
+    0)
+  diag_lane_text(&mut out, "d1-typed-id-agrees",
+    stable_diagnostic_id_text(typed_id1.clone()), stable_diagnostic_id_text(id1.clone()))
+
+  # The trait-failure subject is the typed TraitObligation (the obligation
+  # id), and the obligation identity participates in the cause key.
+  let tf1 = diag_lane_trait_failure("Display for R".to_string())
+  let tf2 = diag_lane_trait_failure("Debug for R".to_string())
+  diag_lane_text(&mut out, "d1-trait-subject-kind", diagnostic_subject_of(&tf1).kind.clone(), "trait-obligation")
+  diag_lane_text(&mut out, "d1-trait-cause-kind", diagnostic_cause_of(&tf1).kind.clone(), "obligation")
+  diag_lane_bool(&mut out, "d1-trait-obligation-distinguishes",
+    diagnostic_identity_key(diagnostic_subject_of(&tf1), diagnostic_cause_of(&tf1), "E0203".to_string()) !=
+      diagnostic_identity_key(diagnostic_subject_of(&tf2), diagnostic_cause_of(&tf2), "E0203".to_string()))
 
   # ———— D2: store idempotency + collision ordinals ————
   var store = new_diagnostic_store()
@@ -941,6 +1409,20 @@ pub def semantic_diagnostics_lane_check() -> Vec[String]
   diag_lane_int(&mut out, "d2-idempotent-len", store_len(store.clone()), 1)
   let s2 = diagnostic_store_add(&mut store, d2.clone())
   diag_lane_int(&mut out, "d2-repeated-ordinal", s2.collision_ordinal, 1)
+  # Duplicates within one snapshot share the typed identity and are
+  # distinguished by the ordinal ONLY (no span/text component).
+  diag_lane_bool(&mut out, "d2-duplicate-identity-equal",
+    diagnostic_identity_key(diagnostic_subject_of(&d1), diagnostic_cause_of(&d1), "E0201".to_string()) ==
+      diagnostic_identity_key(diagnostic_subject_of(&d2), diagnostic_cause_of(&d2), "E0201".to_string()))
+  diag_lane_bool(&mut out, "d2-duplicate-subject-equal",
+    diagnostic_subject_identity_key(diagnostic_subject_of(&d1)) ==
+      diagnostic_subject_identity_key(diagnostic_subject_of(&d2)))
+  diag_lane_bool(&mut out, "d2-duplicate-cause-equal",
+    diagnostic_cause_identity_key(diagnostic_cause_of(&d1)) ==
+      diagnostic_cause_identity_key(diagnostic_cause_of(&d2)))
+  diag_lane_int(&mut out, "d2-first-ordinal", s1.collision_ordinal, 0)
+  diag_lane_bool(&mut out, "d2-duplicate-ids-differ",
+    stable_diagnostic_id_text(s1.clone()) != stable_diagnostic_id_text(s2.clone()))
   diag_lane_int(&mut out, "d2-store-len", store_len(store.clone()), 2)
   let s1_after = diagnostic_store_add(&mut store, d1.clone())
   diag_lane_text(&mut out, "d2-idempotent-after-repeat",
@@ -1045,6 +1527,42 @@ pub def semantic_diagnostics_lane_check() -> Vec[String]
   when Option::None then
     out.push("d6-get: expected Some, got None")
   end
+
+  # ———— D7: presentation insertion stability + equal-text identity ————
+  # (P1-1) A comment/earlier insertion shifts the span and the dense site
+  # locators but NOT the typed identity: the same error under a fresh store
+  # keeps the same id (ordinal 0), and an UNRELATED earlier diagnostic does
+  # not move it (the counter is keyed by the typed identity, so an earlier
+  # different identity never consumes this identity's ordinal).
+  let d_shifted = diag_lane_ownership_place("use of moved value `r`".to_string(), "r".to_string(), 99)
+  var store_plain = new_diagnostic_store()
+  let id_plain = diagnostic_store_add(&mut store_plain, d1.clone())
+  var store_inserted = new_diagnostic_store()
+  let _earlier = diagnostic_store_add(&mut store_inserted,
+    diag_lane_ownership_place("use of moved value `s`".to_string(), "s".to_string(), 4))
+  let id_inserted = diagnostic_store_add(&mut store_inserted, d_shifted.clone())
+  diag_lane_text(&mut out, "d7-insertion-stable",
+    stable_diagnostic_id_text(id_plain.clone()), stable_diagnostic_id_text(id_inserted.clone()))
+  diag_lane_int(&mut out, "d7-insertion-ordinal", id_inserted.collision_ordinal, 0)
+  diag_lane_int(&mut out, "d7-insertion-store-len", store_len(store_inserted.clone()), 2)
+  # The span and the dense site rows never enter the identity preimage.
+  diag_lane_bool(&mut out, "d7-span-not-in-identity",
+    diagnostic_identity_key(diagnostic_subject_of(&d1), diagnostic_cause_of(&d1), "E0201".to_string()) ==
+      diagnostic_identity_key(diagnostic_subject_of(&d_shifted), diagnostic_cause_of(&d_shifted), "E0201".to_string()))
+
+  # Two DIFFERENT errors with the SAME message text get different ids: the
+  # typed subject differs (a different place), so the identity differs.
+  let equal_text_r = diag_lane_ownership_place("use of moved value".to_string(), "r".to_string(), 10)
+  let equal_text_s = diag_lane_ownership_place("use of moved value".to_string(), "s".to_string(), 20)
+  var equal_store = new_diagnostic_store()
+  let id_r = diagnostic_store_add(&mut equal_store, equal_text_r.clone())
+  let id_s = diagnostic_store_add(&mut equal_store, equal_text_s.clone())
+  diag_lane_bool(&mut out, "d7-equal-text-different-ids",
+    stable_diagnostic_id_text(id_r.clone()) != stable_diagnostic_id_text(id_s.clone()))
+  diag_lane_bool(&mut out, "d7-equal-text-identity-differs",
+    diagnostic_identity_key(diagnostic_subject_of(&equal_text_r), diagnostic_cause_of(&equal_text_r), "E0201".to_string()) !=
+      diagnostic_identity_key(diagnostic_subject_of(&equal_text_s), diagnostic_cause_of(&equal_text_s), "E0201".to_string()))
+  diag_lane_int(&mut out, "d7-equal-text-ordinals", id_r.collision_ordinal + id_s.collision_ordinal, 0)
 
   out
 end

@@ -181,8 +181,8 @@ Verifier returns `Vec[String]` of error messages. An empty vector means the MIR 
 | Consumer | What it reads | Source file |
 |----------|--------------|-------------|
 | Optimizer | MirProgram (transforms in place) | mir.tg |
-| Codegen | MirProgram → (default route) instruction selection + register-targeted direct emission (the inline per-function `RegAllocState` — `alloc_reg`/`free_reg`/`alloc_reg_or_spill`; no standalone allocation pass on this route) | codegen.tg |
-| LIR route (env-gated) | MirProgram → LIR → standalone linear-scan register allocation → per-backend emission (`TANGERINE_LIR=1`, default off — driver.tg `compile_lir_route`; lir.tg `lir_linearize` / `lir_alloc_registers_mode` with spill-slot assignment; pending full-corpus parity, fails closed outside its legalization contract) | lir.tg + backend_thumb.tg / backend_rv.tg |
+| Codegen (the DEFAULT host route: LIR) | MirProgram → LIR → standalone linear-scan register allocation (lir.tg `lir_linearize` / `lir_alloc_registers_mode` with spill-slot assignment) → the mandatory post-allocation `verify_lir` gate → per-backend emission (canonical default since fourth-audit P0-21 — driver.tg `compile_lir_route`, `codegen_default()`) | lir.tg + backend_thumb.tg / backend_rv.tg / backend_x86_64.tg |
+| Codegen (`--codegen=direct` fallback) | MirProgram → instruction selection + register-targeted direct emission (the inline per-function `RegAllocState` — `alloc_reg`/`free_reg`/`alloc_reg_or_spill`; no standalone allocation pass on this route) — the EXPLICIT debug/bootstrap fallback retained while the remaining LIR fail-closed shapes close | codegen.tg |
 | Pretty-printer | MirProgram → human-readable text | mir.tg |
 | PGO instrumenter | MirProgram (adds counters) | mir.tg |
 | Async transformer | MirFunction (generates state machine) | mir.tg |
@@ -215,7 +215,7 @@ Verifier returns `Vec[String]` of error messages. An empty vector means the MIR 
 | AST (access/resource-checked) | Non-canonical | Verified at access/resource-check boundary |
 | MIR (lowered from AST) | **CANONICAL** | Verified by MIR verifier |
 | MIR (optimized) | **CANONICAL** | Re-verified post-opt AND immediately before codegen (the verify-everything policy + the final firewall) — the former "(Stage 5 work)" note is resolved |
-| LIR (env-gated LIR route) | Non-canonical (route-internal) | Lowered from the verified MirProgram by the `TANGERINE_LIR=1` route (driver.tg `compile_lir_route`, default off); consumed by the linear-scan allocator and the per-backend emitters (lir.tg / backend_thumb.tg / backend_rv.tg) |
+| LIR (the DEFAULT host route) | Non-canonical (route-internal) | Lowered from the verified MirProgram by the default LIR route (driver.tg `compile_lir_route` — canonical since fourth-audit P0-21); consumed by the linear-scan allocator and the per-backend emitters (lir.tg / backend_thumb.tg / backend_rv.tg / backend_x86_64.tg); the deprecated `TANGERINE_LIR=1` alias selects nothing new |
 | CodeBuffer (from codegen) | Non-canonical | Not independently verified |
 
 All non-canonical IRs are consumed only by the immediately following stage.

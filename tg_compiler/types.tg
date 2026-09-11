@@ -900,17 +900,31 @@ end
 #       runtime-measured (the counter decides — never a static site
 #       rejection: a 2-site if with one allocation per path is legal).
 #   heap_bytes | heap_size | heap
-#       -> "heap_bytes". The heap byte bound from the static
-#       allocation-site analysis (site count × BUDGET_ALLOC_SITE_BYTES,
-#       the documented conservative per-site cap; the MIR carries no
-#       allocation byte payload). Classification static-bound; static-
-#       proof for the zero case (limit 0, no sites, no-allocation proof).
+#       -> "heap_bytes". The heap byte bound from the P1-7 per-site size
+#       classification: every reachable allocation site is classified
+#       Exact(bytes) (a compile-time-constant size), UpperBound(bytes)
+#       (a proven static bound), Unbounded (runtime-sized growth) or
+#       Unknown (unresolved/indirect allocation); the aggregate sums the
+#       Exact/UpperBound sites and is Unbounded/Unknown when any site is.
+#       Classification static-proof ONLY for an Exact aggregate,
+#       static-bound ONLY for an UpperBound aggregate; an Unbounded/
+#       Unknown aggregate has NO finite static bound and fails the
+#       annotation (E0235) — a runtime-sized allocation can never be
+#       certified by "one site × BUDGET_ALLOC_SITE_BYTES". The legacy
+#       site-count cap (BUDGET_ALLOC_SITE_BYTES) remains the documented
+#       fallback ONLY for a derivation context that carries no P1-7
+#       classification (heap_size_class == "").
 #   stack_bytes | stack_size | stack
-#       -> "stack_bytes". The function's stack frame size: the LIR
-#       frame_bytes is EXACT (static-proof) when the LIR route supplies
-#       it; the MIR-derived bound is static-bound. The generated native
-#       frame never exceeds the derivation (the pass fails the annotation
-#       when the derived bound exceeds the declared limit).
+#       -> "stack_bytes". The function's MAX TRANSITIVE STACK (P1-8): its
+#       own frame (the LIR frame_bytes is EXACT when the LIR route
+#       supplies it, else the MIR-derived bound) plus, over every direct
+#       callee, callee max_stack + BUDGET_CALL_OVERHEAD_BYTES; a call
+#       cycle with no proven finite recursion bound makes the answer
+#       Unbounded. Classification static-proof when the whole chain is
+#       exact, static-bound when finite but partly MIR-derived; an
+#       Unbounded max_stack fails the annotation (E0235). The generated
+#       native chain never exceeds the derivation (the pass fails the
+#       annotation when the derived bound exceeds the declared limit).
 #   code_size_bytes | code_size | code_bytes
 #       -> "code_size". The emitted code size: an emitter's exact word
 #       count classifies static-proof; the MIR instruction-count estimate
@@ -1033,13 +1047,388 @@ pub struct BudgetGuarantee
   classification: String
 end
 
-# The documented per-allocation-site byte bound of the static
-# allocation-site analysis: every allocating site the MIR can see (its
-# own or a reachable callee's) is charged this conservative cap, so a
-# function's heap_bytes bound is (site count × the cap). The MIR carries
-# no allocation byte payload — this is the documented conservative site
-# cost, never an invented exact size.
+# The documented per-allocation-site byte bound of the LEGACY site-count
+# fallback (third-audit item 45): a derivation context that supplies no
+# P1-7 per-site size classification (heap_size_class == "") still charges
+# every allocating site this conservative cap, so its heap_bytes bound is
+# (site count × the cap). P1-7 contexts NEVER use this constant: a
+# runtime-sized allocation site is Unbounded/Unknown and can never become
+# a finite static proof.
 pub const BUDGET_ALLOC_SITE_BYTES: Int = 4096
+
+# ———————————————————————————————————————————————————————————————
+# (fourth-audit P1-7) The per-allocation-site HEAP SIZE classification
+# ———————————————————————————————————————————————————————————————
+# Every allocation site the MIR can see gets ONE classified size:
+#   Exact(bytes)       the allocation's byte size is a compile-time
+#                      constant (a constant size argument — MemAlloc(n),
+#                      ArrayWithCapacity(n) over a resolvable element
+#                      stride — or a fixed-size allocation: StringNew,
+#                      ArrayNew, a literal StringFromStatic/concat).
+#   UpperBound(bytes)  no exact size is derivable, but the MIR proves a
+#                      finite static upper bound on the size argument
+#                      (a bounded constant expression: `n & 0xFF`,
+#                      `n % K`, `n * K + c`, ...).
+#   Unbounded          the allocation is runtime-sized: the size is
+#                      driven by runtime values (String/Vec/Map/Set
+#                      growth, non-literal concat/clone/copy, a runtime
+#                      MemAlloc/ArrayWithCapacity argument).
+#   Unknown            the allocation is unresolved/indirect (a bodyless
+#                      extern allocator, an indirect/closure call, an
+#                      algebraic-effect perform) — fail closed.
+#
+# The AGGREGATE over a function's reachable sites follows the document's
+# four-way rule:
+#   - Exact sites SUM exactly; UpperBound sites SUM their bounds (mixing
+#     Exact into an UpperBound sum keeps it an UpperBound).
+#   - ANY Unbounded site makes the aggregate Unbounded (Unbounded
+#     dominates Unknown: a known runtime-sized allocation is a stronger
+#     fact than an unresolved one).
+#   - ANY Unknown site (with no Unbounded site) makes the aggregate
+#     Unknown.
+# The heap_bytes guarantee is reported static-proof ONLY for an Exact
+# aggregate and static-bound ONLY for an UpperBound aggregate; Unbounded/
+# Unknown carries NO finite static bound and fails the annotation.
+pub enum AllocSizeClass
+  Exact(Int)
+  UpperBound(Int)
+  Unbounded
+  Unknown
+end
+
+# The classification WORD of one site/aggregate ("exact" | "upper-bound" |
+# "unbounded" | "unknown").
+pub def alloc_size_class_word(c: AllocSizeClass) -> String
+  match c
+  when AllocSizeClass::Exact(_) then "exact"
+  when AllocSizeClass::UpperBound(_) then "upper-bound"
+  when AllocSizeClass::Unbounded then "unbounded"
+  when AllocSizeClass::Unknown then "unknown"
+  end
+end
+
+# The finite byte value the class carries (0 for Unbounded/Unknown — there
+# is no finite bound to report).
+pub def alloc_size_class_bytes(c: AllocSizeClass) -> Int
+  match c
+  when AllocSizeClass::Exact(n) then n
+  when AllocSizeClass::UpperBound(n) then n
+  when AllocSizeClass::Unbounded then 0
+  when AllocSizeClass::Unknown then 0
+  end
+end
+
+# Whether the class admits a finite static byte value (Exact/UpperBound).
+pub def alloc_size_class_is_finite(c: AllocSizeClass) -> Bool
+  match c
+  when AllocSizeClass::Exact(_) then true
+  when AllocSizeClass::UpperBound(_) then true
+  when AllocSizeClass::Unbounded then false
+  when AllocSizeClass::Unknown then false
+  end
+end
+
+# Structural equality of two size classes (the lane's comparison helper).
+pub def alloc_size_class_eq(a: AllocSizeClass, b: AllocSizeClass) -> Bool
+  match a
+  when AllocSizeClass::Exact(av) then
+    match b
+    when AllocSizeClass::Exact(bv) then av == bv
+    when _ then false
+    end
+  when AllocSizeClass::UpperBound(av) then
+    match b
+    when AllocSizeClass::UpperBound(bv) then av == bv
+    when _ then false
+    end
+  when AllocSizeClass::Unbounded then
+    match b
+    when AllocSizeClass::Unbounded then true
+    when _ then false
+    end
+  when AllocSizeClass::Unknown then
+    match b
+    when AllocSizeClass::Unknown then true
+    when _ then false
+    end
+  end
+end
+
+# The AGGREGATE JOIN of the four-way lattice: Exact sums exactly;
+# UpperBound sums bounds (and absorbs Exact); Unbounded dominates Unknown;
+# Unknown absorbs every finite class.
+pub def alloc_size_class_join(a: AllocSizeClass, b: AllocSizeClass) -> AllocSizeClass
+  match a
+  when AllocSizeClass::Unbounded then
+    AllocSizeClass::Unbounded
+  when AllocSizeClass::Unknown then
+    match b
+    when AllocSizeClass::Unbounded then AllocSizeClass::Unbounded
+    when _ then AllocSizeClass::Unknown
+    end
+  when AllocSizeClass::Exact(av) then
+    match b
+    when AllocSizeClass::Exact(bv) then AllocSizeClass::Exact(av + bv)
+    when AllocSizeClass::UpperBound(bv) then AllocSizeClass::UpperBound(av + bv)
+    when AllocSizeClass::Unbounded then AllocSizeClass::Unbounded
+    when AllocSizeClass::Unknown then AllocSizeClass::Unknown
+    end
+  when AllocSizeClass::UpperBound(av) then
+    match b
+    when AllocSizeClass::Exact(bv) then AllocSizeClass::UpperBound(av + bv)
+    when AllocSizeClass::UpperBound(bv) then AllocSizeClass::UpperBound(av + bv)
+    when AllocSizeClass::Unbounded then AllocSizeClass::Unbounded
+    when AllocSizeClass::Unknown then AllocSizeClass::Unknown
+    end
+  end
+end
+
+# One function's (or a transitive closure's) P1-7 heap aggregate: the
+# allocating-SITE count (the alloc metric's unit, unchanged) and the
+# joined size class.
+pub struct HeapSizeAggregate
+  sites: Int
+  size_class: AllocSizeClass
+end
+
+# The neutral aggregate of the join (zero sites, Exact(0)).
+pub def heap_size_aggregate_empty() -> HeapSizeAggregate
+  HeapSizeAggregate { sites: 0, size_class: AllocSizeClass::Exact(0) }
+end
+
+# ONE allocation site's aggregate (one site carrying the site's class).
+pub def heap_size_aggregate_of_class(c: AllocSizeClass) -> HeapSizeAggregate
+  HeapSizeAggregate { sites: 1, size_class: c }
+end
+
+# The aggregate JOIN: site counts add; the size classes join by the
+# four-way lattice (alloc_size_class_join) — Exact sums exactly,
+# UpperBound sums bounds (absorbing Exact), Unbounded dominates Unknown,
+# Unknown absorbs every finite class.
+pub def heap_size_aggregate_join(a: HeapSizeAggregate, b: HeapSizeAggregate) -> HeapSizeAggregate
+  HeapSizeAggregate {
+    sites: a.sites + b.sites,
+    size_class: alloc_size_class_join(&a.size_class, &b.size_class)
+  }
+end
+
+# The classification word of an aggregate's size class.
+pub def heap_size_aggregate_class_word(a: HeapSizeAggregate) -> String
+  alloc_size_class_word(&a.size_class)
+end
+
+# The finite byte value of an aggregate's size class (0 when Unbounded/
+# Unknown — no finite static bound exists).
+pub def heap_size_aggregate_bound_bytes(a: HeapSizeAggregate) -> Int
+  alloc_size_class_bytes(&a.size_class)
+end
+
+# The P1-7 byte model of an owned String object whose DATA length is known:
+# the {data,len,cap,stride} header plus the NUL-terminated data buffer,
+# 8-byte aligned and never below the initial StringNew buffer.
+pub def budget_string_object_bytes(data_len: Int) -> Int
+  var need = data_len + 1
+  let rem = need % 8
+  if rem != 0 then need = need + (8 - rem) end
+  if need < BUDGET_STRING_INITIAL_DATA_BYTES then need = BUDGET_STRING_INITIAL_DATA_BYTES end
+  BUDGET_STRING_OBJECT_BYTES + need
+end
+
+# The P1-7 size class of an ArrayWithCapacity(cap)/ArrayNew(cap) site over
+# a resolved element stride. `stride_exact` distinguishes a scalar stride
+# (Exact) from an aggregate upper bound (UpperBound):
+#   Exact(n)       -> Exact(header + n×stride) with an exact stride,
+#                     UpperBound(header + n×stride) with an upper-bound
+#                     stride; Exact(header) for n == 0; a negative or
+#                     overflowing capacity is Unknown (fail closed).
+#   UpperBound(k)  -> UpperBound(header + k×stride).
+#   Unbounded      -> Unbounded (the capacity is a runtime value: no
+#                     finite static proof can ever be derived).
+#   Unknown        -> Unknown.
+pub def budget_capacity_site_class(cap: AllocSizeClass, stride: Int, stride_exact: Bool, header_bytes: Int) -> AllocSizeClass
+  match cap
+  when AllocSizeClass::Exact(n) then
+    if n < 0 then
+      AllocSizeClass::Unknown
+    elsif n == 0 then
+      AllocSizeClass::Exact(header_bytes)
+    elsif stride <= 0 then
+      AllocSizeClass::Unknown
+    elsif n > (BUDGET_ALLOC_MAX_BYTES - header_bytes) / stride then
+      AllocSizeClass::Unknown
+    elsif stride_exact then
+      AllocSizeClass::Exact(header_bytes + n * stride)
+    else
+      AllocSizeClass::UpperBound(header_bytes + n * stride)
+    end
+  when AllocSizeClass::UpperBound(k) then
+    if k < 0 || stride <= 0 then
+      AllocSizeClass::Unknown
+    elsif k > (BUDGET_ALLOC_MAX_BYTES - header_bytes) / stride then
+      AllocSizeClass::Unknown
+    else
+      AllocSizeClass::UpperBound(header_bytes + k * stride)
+    end
+  when AllocSizeClass::Unbounded then AllocSizeClass::Unbounded
+  when AllocSizeClass::Unknown then AllocSizeClass::Unknown
+  end
+end
+
+# The documented heap-layout constants of the P1-7 byte model (the
+# 64-bit-target object ABI the runtime materializes — see runtime.tg's
+# String object and Vec header):
+#   BUDGET_STRING_OBJECT_BYTES  the {data,len,cap,stride} String header
+#   BUDGET_STRING_INITIAL_DATA_BYTES the 8-byte NUL buffer StringNew
+#                               allocates alongside the header
+#   BUDGET_VEC_HEADER_BYTES     the {data,len,cap,stride} Vec header
+#   BUDGET_ALLOC_WORD_BYTES     one pointer/scalar-word width of the model
+#   BUDGET_ALLOC_MAX_BYTES      the model's overflow clamp: a product
+#                               beyond it is not bounded (fail closed)
+pub const BUDGET_STRING_OBJECT_BYTES: Int = 32
+pub const BUDGET_STRING_INITIAL_DATA_BYTES: Int = 8
+pub const BUDGET_VEC_HEADER_BYTES: Int = 32
+pub const BUDGET_ALLOC_WORD_BYTES: Int = 8
+pub const BUDGET_ALLOC_MAX_BYTES: Int = 1073741824
+
+# ———————————————————————————————————————————————————————————————
+# (fourth-audit P1-8) The MAX TRANSITIVE STACK derivation constants
+# ———————————————————————————————————————————————————————————————
+# The documented caller-side call overhead the max-stack analysis adds on
+# every call edge: the return address + saved frame pointer + alignment
+# slack the CALLER's frame pushes around a callee activation (the native
+# prologues materialize the same bookkeeping). max_stack(f) = frame(f) +
+# max over direct callees of (max_stack(callee) + BUDGET_CALL_OVERHEAD).
+pub const BUDGET_CALL_OVERHEAD_BYTES: Int = 16
+
+# The recursion-safety depth guard of the max-stack DFS: an acyclic chain
+# deeper than this is refused as Unbounded (fail closed).
+pub const BUDGET_MAX_STACK_DEPTH: Int = 256
+
+# One function's frame fact for the max-stack analysis: the bytes the
+# function's OWN activation reserves. frame_exact marks the post-RA LIR
+# frame_bytes (the allocation's exact frame); the MIR-derived bound (see
+# mir.tg's mir_budget_stack_bound_mir) is a conservative upper bound and
+# leaves it false.
+pub struct StackFrameFact
+  frame_bytes: Int
+  frame_exact: Bool = false
+end
+
+# The frame fact of a post-RA LIR frame_bytes (exact).
+pub def stack_frame_fact_exact(frame_bytes: Int) -> StackFrameFact
+  StackFrameFact { frame_bytes: frame_bytes, frame_exact: true }
+end
+
+# The frame fact of a MIR-derived bound (conservative, never exact).
+pub def stack_frame_fact_bound(frame_bytes: Int) -> StackFrameFact
+  StackFrameFact { frame_bytes: frame_bytes, frame_exact: false }
+end
+
+# One function's max-transitive-stack result:
+#   frame_bytes      the function's own frame
+#   max_stack_bytes  frame + max over direct callees of (callee
+#                    max_stack + BUDGET_CALL_OVERHEAD_BYTES)
+#   exact            the whole chain is post-RA exact (static-proof)
+#   unbounded        NO finite static max-stack exists: a call cycle
+#                    without a proven finite recursion bound, or a callee
+#                    outside the frame table (Unknown — fail closed; the
+#                    budget rules treat Unknown as Unbounded)
+pub struct MaxStackFact
+  frame_bytes: Int
+  max_stack_bytes: Int
+  exact: Bool
+  unbounded: Bool
+end
+
+# Whether a MaxStackFact carries a finite static max-stack.
+pub def max_stack_fact_is_finite(f: MaxStackFact) -> Bool
+  !f.unbounded
+end
+
+# The P1-8 MAX TRANSITIVE STACK of `root` over a program's call graph.
+#
+# ALGORITHM: depth-first over the direct-call edges. The max stack of a
+# function is
+#     frame(f) + max over f's direct callees c of
+#         (max_stack(c) + BUDGET_CALL_OVERHEAD_BYTES)
+# and a function with no callees keeps just its frame. A callee MISSING
+# from `frames` (a bodyless extern / intrinsic runtime helper / indirect
+# call — the consumer names it outside the frame table) is Unknown: the
+# whole branch is Unbounded (fail closed). A memo table keeps the walk
+# polynomial; the current DFS path detects cycles.
+#
+# RECURSION RULE: the compiler proves NO finite recursion bound — the MIR
+# carries no recursion-depth annotation and no constant-bounded recursion
+# fact — so EVERY call cycle is Unbounded: a function revisited ON THE
+# CURRENT PATH marks its branch Unbounded. A future recursion-bound fact
+# could discharge a cycle by charging K × (frame + overhead); no such
+# proof exists in the current surface, so the rule is the fail-closed one.
+pub def budget_max_stack_of(frames: Map[String, StackFrameFact], edges: Map[String, Vec[String]], root: String) -> MaxStackFact
+  var memo: Map[String, MaxStackFact] = Map::new()
+  var path: Set[String] = Set::new()
+  budget_max_stack_visit(&frames, &edges, &root, 0, &mut path, &mut memo)
+end
+
+def budget_max_stack_visit(
+  frames: Map[String, StackFrameFact],
+  edges: Map[String, Vec[String]],
+  name: String,
+  depth: Int,
+  inout path: Set[String],
+  inout memo: Map[String, MaxStackFact]
+) -> MaxStackFact
+  match memo.get(name.clone())
+  when Option::Some(m) then return m.clone()
+  when Option::None then ()
+  end
+  if !frames.contains_key(&name) then
+    # A callee outside the frame table: Unknown max stack (fail closed).
+    let out = MaxStackFact { frame_bytes: 0, max_stack_bytes: 0, exact: false, unbounded: true }
+    memo.insert(name.clone(), out.clone())
+    return out
+  end
+  let fact = match frames.get(name.clone())
+  when Option::Some(f) then f.clone()
+  when Option::None then StackFrameFact { frame_bytes: 0, frame_exact: false }
+  end
+  if path.contains(&name) then
+    # A call cycle with no proven finite recursion bound: Unbounded.
+    return MaxStackFact { frame_bytes: fact.frame_bytes, max_stack_bytes: 0, exact: false, unbounded: true }
+  end
+  if depth > BUDGET_MAX_STACK_DEPTH then
+    return MaxStackFact { frame_bytes: fact.frame_bytes, max_stack_bytes: 0, exact: false, unbounded: true }
+  end
+  path.insert(name.clone())
+  var max_callee = 0
+  var chain_exact = fact.frame_exact
+  var unbounded = false
+  match edges.get(name.clone())
+  when Option::Some(callees) then
+    for c in callees do
+      let sub = budget_max_stack_visit(&frames, &edges, c.clone(), depth + 1, path, memo)
+      if sub.unbounded then
+        unbounded = true
+      else
+        let chain = sub.max_stack_bytes + BUDGET_CALL_OVERHEAD_BYTES
+        if chain > max_callee then max_callee = chain end
+        if !sub.exact then chain_exact = false end
+      end
+    end
+  when Option::None then ()
+  end
+  path.remove(&name)
+  var out = MaxStackFact { frame_bytes: fact.frame_bytes, max_stack_bytes: 0, exact: false, unbounded: true }
+  if !unbounded then
+    out = MaxStackFact {
+      frame_bytes: fact.frame_bytes,
+      max_stack_bytes: fact.frame_bytes + max_callee,
+      exact: chain_exact,
+      unbounded: false
+    }
+  end
+  memo.insert(name.clone(), out.clone())
+  out
+end
 
 # The DERIVATION CONTEXT of one @budget-annotated function: what the MIR
 # (and, when the LIR route supplies it, the LIR allocation) statically
@@ -1052,13 +1441,27 @@ pub struct BudgetDerivations
   alloc_proven_none: Bool = false
   # The allocating-site count over the transitive call graph.
   alloc_sites: Int = 0
-  # The static heap-byte bound: alloc_sites × BUDGET_ALLOC_SITE_BYTES
-  # (0 when alloc_proven_none holds).
+  # (P1-7) The transitive heap-size aggregate word ("exact" | "upper-bound"
+  # | "unbounded" | "unknown"). "" = LEGACY context: the site-count ×
+  # BUDGET_ALLOC_SITE_BYTES fallback below applies.
+  heap_size_class: String = ""
+  # The FINITE heap-byte value: the Exact sum / UpperBound total over the
+  # reachable sites; 0 when the aggregate is Unbounded/Unknown (no finite
+  # static bound exists).
   heap_bound_bytes: Int = 0
-  # The stack bound: the LIR frame_bytes when supplied (stack_exact), else
-  # the MIR-derived bound (see mir_budget_stack_bound_mir).
+  # The function's OWN frame: the LIR frame_bytes when supplied
+  # (stack_exact), else the MIR-derived bound (see
+  # mir_budget_stack_bound_mir).
   stack_bound_bytes: Int = 0
   stack_exact: Bool = false
+  # (P1-8) The transitivity fields: max_stack_computed marks a context
+  # whose max_stack_bytes/max_stack_exact/max_stack_unbounded were derived
+  # by the call-graph analysis (the legacy contexts above leave it false
+  # and the budget rules read stack_bound_bytes as the frame bound).
+  max_stack_computed: Bool = false
+  max_stack_bytes: Int = 0
+  max_stack_exact: Bool = false
+  max_stack_unbounded: Bool = false
   # The emitted code size: an emitter's exact word bytes when supplied
   # (code_exact), else the MIR estimate × 4.
   code_size_bytes: Int = 0
@@ -1137,7 +1540,7 @@ pub def budget_derived_value_of(resource: String, d: BudgetDerivations) -> Int
   elsif res == "heap_bytes" then
     d.heap_bound_bytes
   elsif res == "stack_bytes" then
-    d.stack_bound_bytes
+    if d.max_stack_computed then d.max_stack_bytes else d.stack_bound_bytes end
   elsif res == "code_size" then
     d.code_size_bytes
   elsif res == "instructions" then
@@ -1154,8 +1557,16 @@ end
 # precondition each static classification demands:
 #   alloc        static-proof ONLY when limit == 0 and the no-alloc
 #                summary proves and no sites exist; else runtime-measured
-#   heap_bytes   static-proof for the zero case above; else static-bound
-#   stack_bytes  static-proof with the LIR frame_bytes; else static-bound
+#   heap_bytes   static-proof for the zero case above OR an Exact P1-7
+#                aggregate; static-bound for an UpperBound aggregate (and
+#                the legacy "" context's site-count cap); an Unbounded/
+#                Unknown aggregate is runtime-measured and the violation
+#                row fails the annotation (no finite static bound exists)
+#   stack_bytes  static-proof when the P1-8 max-stack chain is exact (or
+#                the legacy own-frame LIR frame_bytes); static-bound when
+#                finite but partly MIR-derived; an Unbounded max-stack
+#                (an unbounded call cycle) is runtime-measured and the
+#                violation row fails the annotation
 #   code_size    static-proof with an exact emitted word count; else
 #                static-bound
 #   instructions static-bound when the estimate exists; else
@@ -1171,13 +1582,17 @@ pub def budget_guarantee_classification(metric: String, limit: Int, d: BudgetDer
       "runtime-measured"
     end
   elsif res == "heap_bytes" then
-    if limit == 0 && d.alloc_proven_none && d.alloc_sites == 0 then
+    if d.alloc_proven_none && d.alloc_sites == 0 then
       "static-proof"
-    else
+    elsif d.heap_size_class == "exact" then
+      "static-proof"
+    elsif d.heap_size_class == "upper-bound" || d.heap_size_class == "" then
       "static-bound"
+    else
+      "runtime-measured"
     end
   elsif res == "stack_bytes" then
-    if d.stack_exact then "static-proof" else "static-bound" end
+    budget_stack_classification(&d)
   elsif res == "code_size" then
     if d.code_exact then "static-proof" else "static-bound" end
   elsif res == "instructions" then
@@ -1186,6 +1601,27 @@ pub def budget_guarantee_classification(metric: String, limit: Int, d: BudgetDer
     if d.time_bound_ns > 0 then "static-bound" else "runtime-measured" end
   else
     "runtime-measured"
+  end
+end
+
+# The P1-8 stack classification under a derivation: a computed max-stack
+# rules (unbounded -> runtime-measured; exact chain -> static-proof; a
+# finite but partly MIR-derived chain -> static-bound); a legacy context
+# (max_stack_computed == false) keeps the own-frame rule (the LIR
+# frame_bytes is static-proof, the MIR-derived frame is static-bound).
+pub def budget_stack_classification(d: BudgetDerivations) -> String
+  if d.max_stack_computed then
+    if d.max_stack_unbounded then
+      "runtime-measured"
+    elsif d.max_stack_exact then
+      "static-proof"
+    else
+      "static-bound"
+    end
+  elsif d.stack_exact then
+    "static-proof"
+  else
+    "static-bound"
   end
 end
 
@@ -1216,7 +1652,11 @@ end
 # The classification + derived-value text of one resource under a context
 # (the diagnostics' suffix and the lane rows' evidence):
 # "static-bound bound 4096", "static-proof value 0" or
-# "runtime-measured (the generated frame decides)".
+# "runtime-measured (the generated frame decides)". The P1-8 stack rows
+# carry the own frame alongside the derived max stack; an Unbounded/
+# Unknown heap aggregate reports the no-finite-bound rule instead of a
+# misleading "the generated frame decides" (heap_bytes has no runtime
+# byte counter — it fails statically).
 pub def budget_derivation_text(resource: String, d: BudgetDerivations) -> String
   let res = budget_metric_resource(resource)
   let cls = budget_guarantee_classification(&res.clone(), 0, &d)
@@ -1224,7 +1664,13 @@ pub def budget_derivation_text(resource: String, d: BudgetDerivations) -> String
   if cls == "static-proof" then
     "static-proof value " + value.to_string()
   elsif cls == "static-bound" then
-    "static-bound bound " + value.to_string()
+    if res == "stack_bytes" && d.max_stack_computed then
+      "static-bound bound " + value.to_string() + " (frame_bytes " + d.stack_bound_bytes.to_string() + ")"
+    else
+      "static-bound bound " + value.to_string()
+    end
+  elsif res == "heap_bytes" && (d.heap_size_class == "unbounded" || d.heap_size_class == "unknown") then
+    "runtime-measured (" + d.heap_size_class.clone() + " heap size class — no finite static heap-byte bound)"
   else
     "runtime-measured (the generated frame decides)"
   end
@@ -1233,8 +1679,15 @@ end
 # The static violation rows of one typed budget under a derivation: a
 # static-proof/static-bound guarantee whose derived value EXCEEDS the
 # declared limit yields ONE row naming the resource, the classification
-# and the derived (bound/measured) value; a runtime-measured guarantee
-# never yields a static row (the generated frame decides at run time).
+# and the derived (bound/measured) value. (P1-8) a stack_bytes row also
+# reports BOTH the own frame_bytes and the derived max_stack_bytes. A
+# runtime-measured guarantee yields a static row only under the P1-7/P1-8
+# no-finite-proof rules: an Unbounded/Unknown heap aggregate can never be
+# certified against any declared heap_bytes limit, and an Unbounded
+# max-stack chain (a call cycle without a proven finite recursion bound)
+# can never be certified against any declared stack_bytes limit — the
+# annotation FAILS (E0235). Every other runtime-measured guarantee never
+# yields a static row (the generated frame decides at run time).
 # Empty = every static guarantee holds.
 pub def budget_violation_rows(tb: TypedBudget, d: BudgetDerivations) -> Vec[String]
   var out = Vec::new()
@@ -1247,8 +1700,20 @@ pub def budget_violation_rows(tb: TypedBudget, d: BudgetDerivations) -> Vec[Stri
     if g.classification == "static-proof" || g.classification == "static-bound" then
       let derived = budget_derived_value_of(&g.resource, &d)
       if derived > g.limit then
-        out.push("budget:" + g.resource.clone() + " " + g.classification.clone() + " bound " + derived.to_string() + " exceeds limit " + g.limit.to_string())
+        var detail = ""
+        if g.resource == "stack_bytes" then
+          detail = " (frame_bytes " + d.stack_bound_bytes.to_string() + ", max_stack_bytes " + derived.to_string() + ")"
+        end
+        out.push("budget:" + g.resource.clone() + " " + g.classification.clone() + " bound " + derived.to_string() + detail + " exceeds limit " + g.limit.to_string())
       end
+    elsif g.resource == "heap_bytes" && (d.heap_size_class == "unbounded" || d.heap_size_class == "unknown") then
+      # (P1-7) Unbounded/Unknown carries NO finite static bound: the
+      # declared heap_bytes limit can never be certified.
+      out.push("budget:heap_bytes " + d.heap_size_class.clone() + " (no finite static bound: the runtime-sized or unresolved allocation site cannot be certified) fails limit " + g.limit.to_string())
+    elsif g.resource == "stack_bytes" && d.max_stack_computed && d.max_stack_unbounded then
+      # (P1-8) An unbounded max-stack chain (a call cycle without a proven
+      # finite recursion bound) has NO finite static bound.
+      out.push("budget:stack_bytes unbounded (a call cycle without a proven finite recursion bound has no finite static max-stack; frame_bytes " + d.stack_bound_bytes.to_string() + ") fails limit " + g.limit.to_string())
     end
   end
   out
@@ -1350,6 +1815,82 @@ pub def budget_guarantee_lane_check() -> Vec[String]
   budget_lane_expect_int(&mut out, "T8-time-us-suffix-wins", budget_time_limit_ns_of("time_us", "10ms"), 10000000)
   budget_lane_expect_word(&mut out, "T8-derivation-text-bound", budget_derivation_text("stack_bytes", &d_mir), "static-bound bound 512")
   budget_lane_expect_word(&mut out, "T8-derivation-text-runtime", budget_derivation_text("time", &d_mir), "runtime-measured (the generated frame decides)")
+
+  # T9 (fourth-audit P1-7): the four-way heap-size lattice, the aggregate
+  # rules and the soundness rule — a runtime-capacity site is Unbounded
+  # and an Unbounded/Unknown heap aggregate can never become a finite
+  # static proof.
+  budget_lane_expect_bool(&mut out, "T9-exact-sums", alloc_size_class_eq(alloc_size_class_join(AllocSizeClass::Exact(32), AllocSizeClass::Exact(8)), AllocSizeClass::Exact(40)))
+  budget_lane_expect_bool(&mut out, "T9-upper-absorbs-exact", alloc_size_class_eq(alloc_size_class_join(AllocSizeClass::UpperBound(64), AllocSizeClass::Exact(8)), AllocSizeClass::UpperBound(72)))
+  budget_lane_expect_bool(&mut out, "T9-upper-sums", alloc_size_class_eq(alloc_size_class_join(AllocSizeClass::UpperBound(64), AllocSizeClass::UpperBound(8)), AllocSizeClass::UpperBound(72)))
+  budget_lane_expect_bool(&mut out, "T9-unbounded-dominates-unknown", alloc_size_class_eq(alloc_size_class_join(AllocSizeClass::Unknown, AllocSizeClass::Unbounded), AllocSizeClass::Unbounded))
+  budget_lane_expect_bool(&mut out, "T9-unknown-absorbs-finite", alloc_size_class_eq(alloc_size_class_join(AllocSizeClass::Exact(8), AllocSizeClass::Unknown), AllocSizeClass::Unknown))
+  let agg_sites = heap_size_aggregate_join(heap_size_aggregate_of_class(AllocSizeClass::Exact(32)), heap_size_aggregate_of_class(AllocSizeClass::UpperBound(64)))
+  budget_lane_expect_int(&mut out, "T9-aggregate-sites", agg_sites.sites, 2)
+  budget_lane_expect_word(&mut out, "T9-aggregate-word", heap_size_aggregate_class_word(&agg_sites), "upper-bound")
+  budget_lane_expect_int(&mut out, "T9-aggregate-bound", heap_size_aggregate_bound_bytes(&agg_sites), 96)
+  let agg_unbounded = heap_size_aggregate_join(heap_size_aggregate_of_class(AllocSizeClass::Unbounded), heap_size_aggregate_of_class(AllocSizeClass::Exact(32)))
+  budget_lane_expect_word(&mut out, "T9-aggregate-unbounded-dominates", heap_size_aggregate_class_word(&agg_unbounded), "unbounded")
+  budget_lane_expect_int(&mut out, "T9-aggregate-unbounded-bound-zero", heap_size_aggregate_bound_bytes(&agg_unbounded), 0)
+  # Vec::with_capacity(runtime n): the runtime-capacity site classifies
+  # Unbounded at every stride and is never finite.
+  let cap_unbounded = budget_capacity_site_class(AllocSizeClass::Unbounded, 8, true, BUDGET_VEC_HEADER_BYTES)
+  budget_lane_expect_bool(&mut out, "T9-runtime-capacity-unbounded", alloc_size_class_eq(cap_unbounded, AllocSizeClass::Unbounded))
+  budget_lane_expect_bool(&mut out, "T9-runtime-capacity-not-finite", !alloc_size_class_is_finite(cap_unbounded))
+  budget_lane_expect_bool(&mut out, "T9-constant-capacity-exact", alloc_size_class_eq(budget_capacity_site_class(AllocSizeClass::Exact(4), 8, true, BUDGET_VEC_HEADER_BYTES), AllocSizeClass::Exact(64)))
+  budget_lane_expect_bool(&mut out, "T9-bound-capacity-upper", alloc_size_class_eq(budget_capacity_site_class(AllocSizeClass::UpperBound(255), 8, true, BUDGET_VEC_HEADER_BYTES), AllocSizeClass::UpperBound(32 + 255 * 8)))
+  # The derivation rule: an Unbounded/Unknown heap aggregate is never a
+  # finite static proof — the heap_bytes annotation FAILS.
+  let d_heap_unbounded = BudgetDerivations { alloc_sites: 1, heap_size_class: "unbounded", heap_bound_bytes: 0 }
+  let g_heap_unb = budget_guarantee_of("heap_bytes".to_string(), 1024, &d_heap_unbounded)
+  budget_lane_expect_word(&mut out, "T9-unbounded-heap-runtime", g_heap_unb.classification, "runtime-measured")
+  budget_lane_expect_bool(&mut out, "T9-unbounded-heap-fails-annotation", budget_violation_rows(&budget_lane_tb("heap_bytes", "1024"), &d_heap_unbounded).len() == 1)
+  let d_heap_unknown = BudgetDerivations { alloc_sites: 1, heap_size_class: "unknown", heap_bound_bytes: 0 }
+  budget_lane_expect_bool(&mut out, "T9-unknown-heap-fails-annotation", budget_violation_rows(&budget_lane_tb("heap_bytes", "4096"), &d_heap_unknown).len() == 1)
+  let d_heap_exact = BudgetDerivations { heap_size_class: "exact", heap_bound_bytes: 64 }
+  budget_lane_expect_word(&mut out, "T9-exact-heap-static-proof", budget_guarantee_of("heap_bytes".to_string(), 64, &d_heap_exact).classification, "static-proof")
+  let d_heap_upper = BudgetDerivations { heap_size_class: "upper-bound", heap_bound_bytes: 96 }
+  budget_lane_expect_word(&mut out, "T9-upper-heap-static-bound", budget_guarantee_of("heap_bytes".to_string(), 96, &d_heap_upper).classification, "static-bound")
+
+  # T10 (fourth-audit P1-8): the call-graph max-stack analysis with
+  # hand-built frames / call edges. f (frame 64) calls g (frame 256):
+  # max_stack(f) = 64 + (256 + BUDGET_CALL_OVERHEAD_BYTES) — at least
+  # 320 + the call-overhead constant.
+  var ms_frames: Map[String, StackFrameFact] = Map::new()
+  ms_frames.insert("f", stack_frame_fact_exact(64))
+  ms_frames.insert("g", stack_frame_fact_exact(256))
+  var ms_edges: Map[String, Vec[String]] = Map::new()
+  ms_edges.insert("f", Vec::from(["g".to_string()]))
+  let ms_f = budget_max_stack_of(&ms_frames, &ms_edges, "f".to_string())
+  budget_lane_expect_bool(&mut out, "T10-f-max-stack-at-least-320-plus-overhead", ms_f.max_stack_bytes >= 320 + BUDGET_CALL_OVERHEAD_BYTES)
+  budget_lane_expect_int(&mut out, "T10-f-max-stack-exact-value", ms_f.max_stack_bytes, 64 + 256 + BUDGET_CALL_OVERHEAD_BYTES)
+  budget_lane_expect_int(&mut out, "T10-f-frame-bytes", ms_f.frame_bytes, 64)
+  budget_lane_expect_bool(&mut out, "T10-f-exact-chain", ms_f.exact && max_stack_fact_is_finite(ms_f))
+  # A call cycle with no proven finite recursion bound is Unbounded.
+  var ms_cycle: Map[String, Vec[String]] = Map::new()
+  ms_cycle.insert("f", Vec::from(["g".to_string()]))
+  ms_cycle.insert("g", Vec::from(["f".to_string()]))
+  let ms_c = budget_max_stack_of(&ms_frames, &ms_cycle, "f".to_string())
+  budget_lane_expect_bool(&mut out, "T10-cycle-unbounded", ms_c.unbounded)
+  # A callee with no frame fact (a bodyless extern) is Unknown → Unbounded.
+  var ms_extern: Map[String, Vec[String]] = Map::new()
+  ms_extern.insert("f", Vec::from(["extern_helper".to_string()]))
+  let ms_e = budget_max_stack_of(&ms_frames, &ms_extern, "f".to_string())
+  budget_lane_expect_bool(&mut out, "T10-extern-callee-unbounded", ms_e.unbounded && !max_stack_fact_is_finite(ms_e))
+  # The derivation rule: stack_bytes compares max_stack_bytes (not the own
+  # frame): frame 64 ≤ 300 while max_stack 336 > 300 fails, and the row
+  # reports BOTH frame_bytes and max_stack_bytes.
+  let d_stack_max = BudgetDerivations { stack_bound_bytes: 64, max_stack_computed: true, max_stack_bytes: 336, max_stack_exact: true }
+  budget_lane_expect_word(&mut out, "T10-max-stack-static-proof", budget_guarantee_of("stack_bytes".to_string(), 336, &d_stack_max).classification, "static-proof")
+  budget_lane_expect_int(&mut out, "T10-max-stack-derived", budget_derived_value_of("stack_bytes", &d_stack_max), 336)
+  let rows_stack_max = budget_violation_rows(&budget_lane_tb("stack_bytes", "300"), &d_stack_max)
+  budget_lane_expect_int(&mut out, "T10-max-stack-over-limit-row-count", rows_stack_max.len(), 1)
+  budget_lane_expect_bool(&mut out, "T10-max-stack-row-reports-both", rows_stack_max.len() == 1 && rows_stack_max[0].contains("frame_bytes 64") && rows_stack_max[0].contains("max_stack_bytes 336"))
+  let d_stack_mir = BudgetDerivations { stack_bound_bytes: 96, max_stack_computed: true, max_stack_bytes: 96, max_stack_exact: false }
+  budget_lane_expect_word(&mut out, "T10-mir-chain-static-bound", budget_guarantee_of("stack_bytes".to_string(), 96, &d_stack_mir).classification, "static-bound")
+  let d_stack_unbounded = BudgetDerivations { stack_bound_bytes: 64, max_stack_computed: true, max_stack_bytes: 0, max_stack_exact: false, max_stack_unbounded: true }
+  budget_lane_expect_word(&mut out, "T10-unbounded-stack-runtime", budget_guarantee_of("stack_bytes".to_string(), 4096, &d_stack_unbounded).classification, "runtime-measured")
+  budget_lane_expect_bool(&mut out, "T10-unbounded-stack-fails-annotation", budget_violation_rows(&budget_lane_tb("stack_bytes", "4096"), &d_stack_unbounded).len() == 1)
 
   out
 end

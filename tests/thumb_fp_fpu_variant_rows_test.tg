@@ -1,0 +1,643 @@
+# tests/thumb_fp_fpu_variant_rows_test.tg — the cortex-m FPU-VARIANT
+# model rows (the float-work correctness fix):
+#   1. the cm FP pool is the ENCODABLE callee-saved d8..d13 subset of
+#      the M-profile d0..d15 register file (lir_fp_pool_regs_cm) — the
+#      pre-slice cm route reused the aarch64 d16..d29 pool, whose
+#      operands no M-profile FPU can encode;
+#   2. FPv4-SP (cortex-m4f, target_desc_f64_data_processing false)
+#      fails F64 ARITHMETIC closed with the FPU rule naming the desc
+#      and the FPU token — never an F64 data-processing byte;
+#   3. FPv5-D16 (cortex-m7, target_desc_f64_data_processing true)
+#      admits the SAME F64 statement, and every register-resident F64
+#      segment it allocates lies in the encodable pool;
+#   4. the prologue/epilogue emit the VPUSH/VPOP {d8-d15} FP
+#      callee-save block (the FP mirror of PUSH {r4-r10, lr}) for a
+#      function whose allocation carries FP content — the block saves
+#      the pool d8..d13 and the callee-saved d14/d15 statement
+#      scratches together, so the AAPCS32 contract holds for external
+#      callers' s16..s31 values;
+#   5. the single-FP-vreg boundary: one FP vreg beyond the two
+#      unconditional scratch rows (thumb_alloc_has_fp_content > 2)
+#      already forces the FP callee-save block and the no-FPU desc
+#      gate — a `> 3` baseline misses it while the body still writes
+#      the d15 scratch;
+#   6. the F64 constant encoder gate: FPv4-SP materializes F64
+#      constants through the core<->D TRANSFER (movw/movt + VMOV d,
+#      r0, r1 — legal on fpv4-sp-d16) and NEVER emits VMOV.F64 #imm;
+#      FPv5-D16 uses the modified-immediate form;
+#   7. the emitter-side pool wall: an FP segment handed a d16+
+#      physical id (the pre-slice aarch64 namespace) fails closed
+#      before any outside-the-pool operand is encoded; FPv5-SP (the
+#      M7 single-precision option) is gated from its own desc field.
+#
+# Run with: tg test tests/thumb_fp_fpu_variant_rows_test.tg
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::asm::{CodeBuffer, buf_new}
+use tg_compiler::token::span_dummy
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId, MirStatement,
+  MirStatementKind, MirRvalue, MirRvalueKind, MirOperand, MirOperandKind,
+  MirBinOp, MirTerminator, MirTerminatorKind, place_local,
+  constant_float
+}
+use tg_compiler::types::Type
+use tg_compiler::lir::{
+  LirFunction, LirAlloc, LirSeg, LirFpWidth,
+  lower_mir_fn_to_lir_cm, lir_peephole, lir_alloc_registers_cm,
+  lir_fp_pool_regs, lir_fp_pool_regs_cm,
+  verify_lir, LirVerifyRoute
+}
+use tg_compiler::target_desc::{
+  TargetDesc, Fpu, target_desc_f64_data_processing,
+  thumbv7m_cortex_m3_desc,
+  thumbv7em_cortex_m4f_desc, thumbv7em_cortex_m7_desc
+}
+use tg_compiler::backend_thumb::{
+  ThumbEmit, thumb_emit_new, thumb_emit_fn, thumb_mdl_pool,
+  thumb_alloc_has_fp_content, t2_vpush_d, t2_vpop_d,
+  t2_vmov_f64_const, t2_vmov_gp_pair_to_d
+}
+
+# ———————————————————————————————————————————————————————————————
+# Small MIR fixtures (the construction mirrors the float residual rows)
+# ———————————————————————————————————————————————————————————————
+
+def tfp_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal {
+    id: MirLocalId { id: id },
+    name: name,
+    ty: ty,
+    is_mut: is_mut,
+    span: span_dummy()
+  }
+end
+
+def tfp_copy(id: Int) -> MirOperand
+  MirOperand { kind: MirOperandKind::MirCopy(place_local(MirLocalId { id: id })) }
+end
+
+def tfp_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def tfp_assign_local0(rv: MirRvalue) -> MirStatement
+  MirStatement {
+    kind: MirStatementKind::MirAssign(place_local(MirLocalId { id: 0 }), rv),
+    span: span_dummy()
+  }
+end
+
+def tfp_f64_binop_fn(name: String, op: MirBinOp) -> MirFunction
+  # _ret (local 0) = p0 <op> p1 (locals 1/2), all F64; Ret returns
+  # local 0. The lowering's F64 classification makes this an
+  # LirFBinop at width F64 — the statement the FPU-variant gate keys
+  # on.
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(tfp_local(0, "_ret", Type::F64, true))
+  locals.push(tfp_local(1, "p0", Type::F64, false))
+  locals.push(tfp_local(2, "p1", Type::F64, false))
+  MirFunction {
+    name: name,
+    params: Vec::from([locals[1].clone(), locals[2].clone()]),
+    ret_type: Type::F64,
+    locals: locals,
+    blocks: Vec::from([
+      MirBlock {
+        id: MirBlockId { id: 0 },
+        statements: Vec::from([
+          tfp_assign_local0(MirRvalue {
+            kind: MirRvalueKind::MirBinOp(op, tfp_copy(1), tfp_copy(2))
+          })
+        ]),
+        terminator: tfp_ret_term()
+      }
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def tfp_f64_identity_fn() -> MirFunction
+  # _ret (local 0) = p0 (local 1, F64); Ret. An FP-content function
+  # whose F64 crossing is the allowed load/store envelope on every
+  # hard-float M-profile FPU (the callee-save row's fixture).
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(tfp_local(0, "_ret", Type::F64, true))
+  locals.push(tfp_local(1, "p0", Type::F64, false))
+  MirFunction {
+    name: "f64id",
+    params: Vec::from([locals[1].clone()]),
+    ret_type: Type::F64,
+    locals: locals,
+    blocks: Vec::from([
+      MirBlock {
+        id: MirBlockId { id: 0 },
+        statements: Vec::from([
+          tfp_assign_local0(MirRvalue {
+            kind: MirRvalueKind::MirMove(tfp_copy(1))
+          })
+        ]),
+        terminator: tfp_ret_term()
+      }
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def tfp_f32_identity_fn() -> MirFunction
+  # The F32 sibling: F32 is memory-class on the cm route, so its pool
+  # row is the empty set (every segment stays phys = -1, one word).
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(tfp_local(0, "_ret", Type::F32, true))
+  locals.push(tfp_local(1, "p0", Type::F32, false))
+  MirFunction {
+    name: "f32id",
+    params: Vec::from([locals[1].clone()]),
+    ret_type: Type::F32,
+    locals: locals,
+    blocks: Vec::from([
+      MirBlock {
+        id: MirBlockId { id: 0 },
+        statements: Vec::from([
+          tfp_assign_local0(MirRvalue {
+            kind: MirRvalueKind::MirMove(tfp_copy(1))
+          })
+        ]),
+        terminator: tfp_ret_term()
+      }
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def tfp_f32_const_fn() -> MirFunction
+  # _ret (local 0, F32) = 1.0; Ret. The function's ONLY FP vreg beyond
+  # the two unconditional scratch rows is the return local, so the
+  # allocation has EXACTLY three fp_widths rows — the single-row
+  # boundary of thumb_alloc_has_fp_content. The F32 constant emits
+  # through the d15 statement scratch, so the frame MUST carry the FP
+  # callee-save block (and a no-FPU descriptor must reject the body).
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(tfp_local(0, "_ret", Type::F32, true))
+  MirFunction {
+    name: "f32const",
+    params: Vec::new(),
+    ret_type: Type::F32,
+    locals: locals,
+    blocks: Vec::from([
+      MirBlock {
+        id: MirBlockId { id: 0 },
+        statements: Vec::from([
+          tfp_assign_local0(MirRvalue {
+            kind: MirRvalueKind::MirMove(MirOperand {
+              kind: MirOperandKind::MirConstant(constant_float(1.0))
+            })
+          })
+        ]),
+        terminator: tfp_ret_term()
+      }
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def tfp_f64_const_fn() -> MirFunction
+  # The F64 sibling: _ret = 1.0. On FPv4-SP the constant materializes
+  # through the core<->D transfer (movw/movt + VMOV d, r0, r1) — never
+  # the F64-data-processing VMOV.F64 #imm; on FPv5-D16 the immediate
+  # form is available and used.
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(tfp_local(0, "_ret", Type::F64, true))
+  MirFunction {
+    name: "f64const",
+    params: Vec::new(),
+    ret_type: Type::F64,
+    locals: locals,
+    blocks: Vec::from([
+      MirBlock {
+        id: MirBlockId { id: 0 },
+        statements: Vec::from([
+          tfp_assign_local0(MirRvalue {
+            kind: MirRvalueKind::MirMove(MirOperand {
+              kind: MirOperandKind::MirConstant(constant_float(1.0))
+            })
+          })
+        ]),
+        terminator: tfp_ret_term()
+      }
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def tfp_fpv5sp_desc() -> TargetDesc
+  # The Cortex-M7 single-precision option: vfpv5-d16 with SP data
+  # processing only (the same single-precision discipline as FPv4-SP).
+  # target_desc.tg models the variant as Fpu::FPv5SP (no instance
+  # carries it yet); the desc here copies the M7 instance's data and
+  # swaps the FPU field, so the capability gate must answer false from
+  # the FIELD — never from the core name.
+  let m7 = thumbv7em_cortex_m7_desc()
+  TargetDesc {
+    name: "cortex-m7-sp",
+    pointer_width: m7.pointer_width,
+    endianness: m7.endianness,
+    stack_alignment: m7.stack_alignment,
+    arch: m7.arch,
+    cpu: m7.cpu,
+    isa: m7.isa,
+    isa_features: Vec::new(),
+    float_abi: m7.float_abi,
+    fpu: Fpu::FPv5SP,
+    fpu_register_width: m7.fpu_register_width,
+    integer_div: m7.integer_div,
+    native_atomic_widths: m7.native_atomic_widths,
+    emulated_atomic_widths: m7.emulated_atomic_widths,
+    mmio_atomic_widths: m7.mmio_atomic_widths,
+    unaligned_policy: m7.unaligned_policy,
+    cache_line_size: m7.cache_line_size,
+    red_zone: m7.red_zone,
+    tls_model: m7.tls_model,
+    interrupt_abi: m7.interrupt_abi,
+    reg_caller_saved: m7.reg_caller_saved,
+    reg_callee_saved: m7.reg_callee_saved,
+    arg_regs: m7.arg_regs,
+    memory_spaces: m7.memory_spaces
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Read helpers
+# ———————————————————————————————————————————————————————————————
+
+def tfp_lower_ok(f: MirFunction) -> LirFunction
+  match lower_mir_fn_to_lir_cm(f, Map::new())
+  when Result::Ok(lf) then lir_peephole(lf)
+  when Result::Err(e) then panic("thumb FPU variant rows: lowering failed: " + e)
+  end
+end
+
+def tfp_check(lf: LirFunction) -> LirAlloc
+  let alloc = lir_alloc_registers_cm(lf)
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyCm)
+  var first = ""
+  if violations.len() > 0 then first = violations[0] end
+  assert(violations.len() == 0, "a cortex-m FPU-variant fixture must verify clean; first violation: " + first)
+  alloc
+end
+
+def tfp_mdl_pool(desc: TargetDesc) -> Vec[Int]
+  match thumb_mdl_pool(desc)
+  when Result::Ok(p) then p
+  when Result::Err(e) then panic("thumb FPU variant rows: pool failed: " + e)
+  end
+end
+
+def tfp_emit_result(lf: LirFunction, alloc: LirAlloc, desc: TargetDesc) -> Result[Unit, String]
+  var te = thumb_emit_new()
+  thumb_emit_fn(&mut te, tfp_mdl_pool(desc), desc, lf, alloc, Set::new(), Set::new(), Set::new())
+end
+
+def tfp_emit_ok(lf: LirFunction, alloc: LirAlloc, desc: TargetDesc) -> ThumbEmit
+  var te = thumb_emit_new()
+  match thumb_emit_fn(&mut te, tfp_mdl_pool(desc), desc, lf, alloc, Set::new(), Set::new(), Set::new())
+  when Result::Ok(_) then te
+  when Result::Err(e) then panic("thumb FPU variant rows: emission failed: " + e)
+  end
+end
+
+def tfp_word_at(b: CodeBuffer, off: Int) -> Int
+  (b.bytes[off] as Int)
+    | ((b.bytes[off + 1] as Int) << 8)
+    | ((b.bytes[off + 2] as Int) << 16)
+    | ((b.bytes[off + 3] as Int) << 24)
+end
+
+# Does the code buffer contain the 4-byte little-endian word `word`
+# anywhere (the structural scan the callee-save row uses)?
+def tfp_has_word(b: CodeBuffer, word: Int) -> Bool
+  var i = 0
+  while i + 3 < b.bytes.len() do
+    let v = tfp_word_at(b, i)
+    if v == word then
+      return true
+    end
+    i = i + 1
+  end
+  false
+end
+
+def tfp_is_f64(lf: LirFunction, vreg: Int) -> Bool
+  match lf.fp_widths.get(vreg)
+  when Option::Some(w) then w == LirFpWidth::LirF64
+  when Option::None then false
+  end
+end
+
+def tfp_is_f32(lf: LirFunction, vreg: Int) -> Bool
+  match lf.fp_widths.get(vreg)
+  when Option::Some(w) then w == LirFpWidth::LirF32
+  when Option::None then false
+  end
+end
+
+# Force a register-resident F64 segment of `alloc` into physical id
+# `new_phys` (the hardening row hands the emitter the aarch64
+# namespace the pre-slice cm pool wrongly reused).
+def tfp_force_f64_phys(lf: LirFunction, alloc: LirAlloc, new_phys: Int) -> LirAlloc
+  var found = false
+  var new_segs: Map[Int, Vec[LirSeg]] = Map::new()
+  for (v, segs) in alloc.segs_of.entries() do
+    var out: Vec[LirSeg] = Vec::new()
+    for s in segs do
+      if !found && s.phys >= 0 && tfp_is_f64(lf, v) then
+        out.push(LirSeg { start: s.start, end: s.end, vreg: s.vreg, phys: new_phys, slot: s.slot, needs_reload: s.needs_reload })
+        found = true
+      else
+        out.push(LirSeg { start: s.start, end: s.end, vreg: s.vreg, phys: s.phys, slot: s.slot, needs_reload: s.needs_reload })
+      end
+    end
+    new_segs.insert(v, out)
+  end
+  if !found then
+    panic("FP phys row: the fixture must have a register-resident F64 segment")
+  end
+  LirAlloc {
+    slots: alloc.slots,
+    frame_bytes: alloc.frame_bytes,
+    segs_of: new_segs,
+    spills: alloc.spills,
+    reloads: alloc.reloads,
+    fp_widths: alloc.fp_widths,
+    slot_words: alloc.slot_words
+  }
+end
+
+# ———————————————————————————————————————————————————————————————
+# Rows
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_thumb_fpu_variant_capability_and_pool_rows() -> Unit
+  let m4f = thumbv7em_cortex_m4f_desc()
+  let m7 = thumbv7em_cortex_m7_desc()
+  # The desc capability the gate reads: FPv4-SP has no F64 data
+  # processing; FPv5-D16 (cortex-m7) does; the M7 single-precision
+  # option (FPv5-SP) answers false from its own fpu FIELD.
+  assert_true(!target_desc_f64_data_processing(m4f))
+  assert_true(target_desc_f64_data_processing(m7))
+  assert_true(!target_desc_f64_data_processing(tfp_fpv5sp_desc()))
+  # The cm pool rows: entries in the encodable M-profile d0..d15 file
+  # ONLY (108..115 at the widest), and — because d14/d15 are the cm
+  # statement scratches — the allocatable pool stops at d13 (113).
+  let cm_pool = lir_fp_pool_regs_cm()
+  assert(cm_pool.len() == 6, "the cm FP pool must be the six callee-saved doubles d8..d13")
+  var i = 0
+  while i < cm_pool.len() do
+    assert(cm_pool[i] >= 108 && cm_pool[i] <= 115, "a cm FP pool entry must be an encodable M-profile d0..d15 register (d8..d15 range)")
+    assert(cm_pool[i] <= 113, "d14/d15 are the statement scratches and must not be pool entries")
+    i = i + 1
+  end
+  # The aarch64 pool stays the caller-saved d16..d29 (V16..V29).
+  let a64_pool = lir_fp_pool_regs()
+  assert(a64_pool.len() == 14, "the aarch64 FP pool stays the fourteen caller-saved V16..V29")
+  assert(a64_pool[0] == 116 && a64_pool[a64_pool.len() - 1] == 129, "aarch64 pool stays phys 116..129")
+  # F32 on the cm route is MEMORY-CLASS: no F32-class segment may carry
+  # a pool register (the pool's encodable rows are F64 homes).
+  let lf32 = tfp_lower_ok(tfp_f32_identity_fn())
+  let alloc32 = tfp_check(lf32)
+  var saw_f32 = false
+  for (v, segs) in alloc32.segs_of.entries() do
+    if tfp_is_f32(lf32, v) then
+      saw_f32 = true
+      for s in segs do
+        assert(s.phys < 0, "an F32-class cm segment must stay memory-resident (phys -1); got phys " + s.phys.to_string())
+      end
+    end
+  end
+  assert(saw_f32, "the F32 identity fixture must carry an F32-class vreg")
+  # The single-FP-vreg boundary of thumb_alloc_has_fp_content: the two
+  # unconditional scratch rows plus ONE FP vreg (the return local) is
+  # already FP content — a `> 3` baseline would miss it, skipping both
+  # the callee-save block and the no-FPU gate while the emitted body
+  # still writes the d15 scratch.
+  let lf3 = tfp_lower_ok(tfp_f32_const_fn())
+  let alloc3 = tfp_check(lf3)
+  assert(alloc3.fp_widths.len() == 3, "the single-FP-vreg fixture must carry exactly the two scratch rows plus one FP vreg")
+  assert_true(thumb_alloc_has_fp_content(alloc3))
+end
+
+@test
+def test_thumb_fpu_variant_f64_arithmetic_rows() -> Unit
+  let m4f = thumbv7em_cortex_m4f_desc()
+  let m7 = thumbv7em_cortex_m7_desc()
+  let lf = tfp_lower_ok(tfp_f64_binop_fn("f64add", MirBinOp::Add))
+  # M4F: the F64 data-processing statement fails closed with the FPU
+  # rule; the error names the descriptor and the FPU token and never a
+  # silent M4F VADD.F64.
+  match tfp_emit_result(lf, tfp_check(lf), m4f)
+  when Result::Err(e) then
+    assert(e.contains("FPv4SP"), "the M4F gate error must name the FPU token (FPv4SP); got: " + e)
+    assert(e.contains("double-precision data processing"), "the M4F gate error must name the missing capability; got: " + e)
+    assert(e.contains("cortex-m4f"), "the M4F gate error must name the descriptor; got: " + e)
+  when Result::Ok(_) then
+    panic("cortex-m4f (FPv4-SP) must FAIL CLOSED on F64 arithmetic — no F64 data processing exists on the unit")
+  end
+  # The M7 single-precision option gates the SAME statement with the
+  # FPv5SP token: the admission is per-descriptor (fpu field), not
+  # per-core-name.
+  match tfp_emit_result(lf, tfp_check(lf), tfp_fpv5sp_desc())
+  when Result::Err(e) then
+    assert(e.contains("FPv5SP"), "the FPv5-SP gate error must name the FPU token (FPv5SP); got: " + e)
+  when Result::Ok(_) then
+    panic("cortex-m7 (FPv5-SP option) must FAIL CLOSED on F64 arithmetic")
+  end
+  # M7: the SAME statement is admitted (the gate reads the desc's
+  # actual FPU), and every register-resident F64 segment the allocator
+  # produced uses an encodable cm-pool register.
+  let alloc_m7 = tfp_check(lf)
+  let _te = tfp_emit_ok(lf, alloc_m7, m7)
+  for (_v, segs) in alloc_m7.segs_of.entries() do
+    for s in segs do
+      if s.phys >= 0 then
+        assert(s.phys >= 108 && s.phys <= 113, "a register-resident cm FP segment must use the encodable d8..d13 pool; got phys " + s.phys.to_string())
+      end
+    end
+  end
+end
+
+@test
+def test_thumb_fpu_variant_f32_vs_f64_rows() -> Unit
+  # The F32 side of the same function class stays legal on FPv4-SP
+  # (single-precision data processing IS the FPv4-SP surface): a built
+  # F64 statement fails, while an F64 LOAD/STORE/copy statement (the
+  # identity fixture) emits on the same descriptor.
+  let m4f = thumbv7em_cortex_m4f_desc()
+  let lf = tfp_lower_ok(tfp_f64_identity_fn())
+  let alloc = tfp_check(lf)
+  let te = tfp_emit_ok(lf, alloc, m4f)
+  # The F64 crossing lowers through the legal M-profile load/store/copy
+  # envelope (VSTR/VLDR and, for a register-to-register copy, the
+  # VPUSH/VPOP pair) — the row pins that the same descriptor that fails
+  # F64 ARITHMETIC closed still admits the load/store surface.
+  assert_true(te.buf.bytes.len() > 0)
+end
+
+@test
+def test_thumb_fpu_callee_save_rows() -> Unit
+  # Direct encoder rows: VPUSH/VPOP {d8-d15} and the single-register
+  # copy pair (the FPv4-SP F64 register-copy primitive).
+  var b = buf_new()
+  t2_vpush_d(&mut b, 8, 8)
+  assert(tfp_word_at(b, 0) == 0xED2D8B10, "vpush {d8-d15} must encode 0xED2D8B10")
+  var b2 = buf_new()
+  t2_vpop_d(&mut b2, 8, 8)
+  assert(tfp_word_at(b2, 0) == 0xECBD8B10, "vpop {d8-d15} must encode 0xECBD8B10")
+  var b3 = buf_new()
+  t2_vpush_d(&mut b3, 8, 1)
+  assert(tfp_word_at(b3, 0) == 0xED2D8B02, "vpush {d8} must encode 0xED2D8B02 (the low byte counts singles)")
+  # Emitter structural row: an FP-content function's prologue/epilogue
+  # carries the VPUSH/VPOP {d8-d15} callee-save block on both hard-float
+  # M-profile descriptors.
+  let m4f = thumbv7em_cortex_m4f_desc()
+  let m7 = thumbv7em_cortex_m7_desc()
+  let lf = tfp_lower_ok(tfp_f64_identity_fn())
+  let te4 = tfp_emit_ok(lf, tfp_check(lf), m4f)
+  assert(tfp_has_word(&te4.buf, 0xED2D8B10), "an FP-content cortex-m4f function must push the d8..d15 callee-save block")
+  assert(tfp_has_word(&te4.buf, 0xECBD8B10), "an FP-content cortex-m4f function must pop the d8..d15 callee-save block")
+  let te7 = tfp_emit_ok(lf, tfp_check(lf), m7)
+  assert(tfp_has_word(&te7.buf, 0xED2D8B10), "an FP-content cortex-m7 function must push the d8..d15 callee-save block")
+  assert(tfp_has_word(&te7.buf, 0xECBD8B10), "an FP-content cortex-m7 function must pop the d8..d15 callee-save block")
+end
+
+@test
+def test_thumb_fpu_callee_save_single_fp_vreg_rows() -> Unit
+  # The single-FP-vreg boundary (see the capability row): the F32
+  # constant function's allocation has exactly three fp_widths rows
+  # (two scratches + the return local) and its body writes the d15
+  # scratch (VMOV.F32 s30, #1.0 — word 0xEEB7FA00), so the frame must
+  # carry the VPUSH/VPOP {d8-d15} block on both hard-float descriptors.
+  let m4f = thumbv7em_cortex_m4f_desc()
+  let m7 = thumbv7em_cortex_m7_desc()
+  let m3 = thumbv7m_cortex_m3_desc()
+  let lf = tfp_lower_ok(tfp_f32_const_fn())
+  let alloc = tfp_check(lf)
+  assert_true(thumb_alloc_has_fp_content(alloc))
+  let te4 = tfp_emit_ok(lf, alloc, m4f)
+  assert(tfp_has_word(&te4.buf, 0xEEB7FA00), "the F32 constant must materialize into the d15 scratch (vmov.f32 s30, #1.0)")
+  assert(tfp_has_word(&te4.buf, 0xED2D8B10), "a one-FP-vreg cortex-m4f function must push the d8..d15 callee-save block")
+  assert(tfp_has_word(&te4.buf, 0xECBD8B10), "a one-FP-vreg cortex-m4f function must pop the d8..d15 callee-save block")
+  let te7 = tfp_emit_ok(lf, alloc, m7)
+  assert(tfp_has_word(&te7.buf, 0xED2D8B10), "a one-FP-vreg cortex-m7 function must push the d8..d15 callee-save block")
+  assert(tfp_has_word(&te7.buf, 0xECBD8B10), "a one-FP-vreg cortex-m7 function must pop the d8..d15 callee-save block")
+  # ... and a no-FPU descriptor fails the SAME allocation closed: one
+  # FP vreg is enough for the desc gate to fire (never a VFP byte on
+  # the M3/M4 cores).
+  match tfp_emit_result(lf, alloc, m3)
+  when Result::Err(e) then
+    assert(e.contains("float content"), "the no-FPU gate must name the float content; got: " + e)
+    assert(e.contains("fpu None"), "the no-FPU gate must name the descriptor's fpu None; got: " + e)
+  when Result::Ok(_) then
+    panic("cortex-m3 (fpu None) must fail a one-FP-vreg function closed")
+  end
+end
+
+@test
+def test_thumb_fpu_f64_constant_encoder_gate_rows() -> Unit
+  # 1.0 as an IEEE-754 double bit pattern.
+  let one_bits = 4607182418800017408 as u64
+  let m4f = thumbv7em_cortex_m4f_desc()
+  let m7 = thumbv7em_cortex_m7_desc()
+  let lf = tfp_lower_ok(tfp_f64_const_fn())
+  let alloc = tfp_check(lf)
+  # FPv4-SP: NO VMOV.F64 #imm word may appear for any d8..d15 — the
+  # constant rides the core<->D transfer (movw/movt pair + VMOV Dd, r0,
+  # r1), which IS in the FPv4-SP instruction set.
+  let te4 = tfp_emit_ok(lf, alloc, m4f)
+  var di = 8
+  while di <= 15 do
+    var imm_probe = buf_new()
+    if t2_vmov_f64_const(&mut imm_probe, di, one_bits) then
+      assert(!tfp_has_word(&te4.buf, tfp_word_at(imm_probe, 0)), "cortex-m4f (FPv4-SP) must never emit VMOV.F64 #imm (d" + di.to_string() + ")")
+    end
+    di = di + 1
+  end
+  var saw_transfer = false
+  di = 8
+  while di <= 15 do
+    var tr_probe = buf_new()
+    t2_vmov_gp_pair_to_d(&mut tr_probe, 0, 1, di)
+    if tfp_has_word(&te4.buf, tfp_word_at(tr_probe, 0)) then
+      saw_transfer = true
+    end
+    di = di + 1
+  end
+  assert(saw_transfer, "cortex-m4f must materialize the F64 constant through the VMOV Dd, r0, r1 transfer")
+  # FPv5-D16: the F64 data-processing FPU admits the modified-immediate
+  # form (1.0 is encodable) — at least one d8..d15 immediate word.
+  let te7 = tfp_emit_ok(lf, alloc, m7)
+  var saw_imm = false
+  di = 8
+  while di <= 15 do
+    var imm_probe7 = buf_new()
+    if t2_vmov_f64_const(&mut imm_probe7, di, one_bits) then
+      if tfp_has_word(&te7.buf, tfp_word_at(imm_probe7, 0)) then
+        saw_imm = true
+      end
+    end
+    di = di + 1
+  end
+  assert_true(saw_imm)
+end
+
+@test
+def test_thumb_fpu_phys_hardening_row() -> Unit
+  # The emitter-side "never d16+" wall: even if a pool seam hands the
+  # backend an aarch64-namespace physical id (the pre-slice bug's
+  # d16..d29), the FP resolution fails closed before any operand
+  # outside the cm pool is encoded.
+  let m7 = thumbv7em_cortex_m7_desc()
+  let lf = tfp_lower_ok(tfp_f64_binop_fn("f64add_badpool", MirBinOp::Add))
+  let alloc = tfp_check(lf)
+  let bad_alloc = tfp_force_f64_phys(lf, alloc, 116)
+  match tfp_emit_result(lf, bad_alloc, m7)
+  when Result::Err(e) then
+    assert(e.contains("outside the cm FP pool"), "the emitter must fail closed on a d16+ physical id; got: " + e)
+  when Result::Ok(_) then
+    panic("an FP segment in physical 116 (d16) must not encode on the M-profile route")
+  end
+  # Negative control: the unmodified allocation still emits.
+  let _te = tfp_emit_ok(lf, alloc, m7)
+end

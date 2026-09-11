@@ -996,7 +996,7 @@ CURRENT STATE (structural, verified against the tested tree):
   and per-phase fingerprints; --skip-ladder/--skip-determinism options exist
   but a full run is the release gate). The self-host GRAMMAR GATE
   (scripts/run_selfhost_grammar_gate.sh) runs before any stage is built
-  next to the struct-integrity pre-gate: the manifest closure (37 sources)
+  next to the struct-integrity pre-gate: the manifest closure ($KERNEL_CLOSURE_COUNT sources)
   must be free of every forbidden legacy parameter form (mut/&/&mut/move/own
   prefixes, \`x: &T\` / \`x: &mut T\` markers, fn-type conventions, \`&self\` /
   \`&mut self\` receivers), or the harness fails before stage0.

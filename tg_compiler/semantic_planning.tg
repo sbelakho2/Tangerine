@@ -13,15 +13,17 @@
 # value is a pure projection of those records.
 #
 # WHAT IS DERIVABLE, AND FROM WHERE:
-#   SemanticWriteSet   — SemanticDelta.created + SemanticDelta.modified
-#                        (the writer keys) plus the delta's OWNERSHIP row
-#                        targets ("<function.key>|<place>") and EFFECT row
-#                        targets (the effect row key IS the function key).
-#                        The diff core guarantees a changed effect/ownership
-#                        row also marks its entity modified, so the entity
-#                        list and the row-target list agree; the row targets
-#                        are carried because they are the finer write units
-#                        a merge planner keys on.
+#   SemanticWriteSet   — (fourth-audit P1-2) TYPED write entries: every
+#                        created / REMOVED / modified entity, every
+#                        changed effect row, every changed ownership
+#                        place, every changed capability/contract row and
+#                        every changed field/variant member becomes a
+#                        { address: SemanticAddress; kind: SemanticWrite
+#                        Kind } record (Decl / Place / Member / MirNode /
+#                        RowKey). DELETED entities are first-class
+#                        entries (kind Delete), never dropped. The legacy
+#                        canonical key text list rides `keys` as the
+#                        display / graph-query projection ONLY.
 #   SemanticReadSet    — the observer envelope of the delta: the delta's
 #                        already-computed call closure (SemanticDelta
 #                        .affected, produced by semantic_delta_of over the
@@ -37,9 +39,11 @@
 #                        owner; ContractReference owning function). See the
 #                        section doc for why the envelope is a conservative
 #                        over-approximation.
-#   EffectResourceSet  — the delta's typed effect rows (EffectSummaryView
-#                        before/after bits + capability ids) and the typed
-#                        capability rows (Presence before/after).
+#   EffectResourceSet  — (P1-2) TYPED resources: the §11 class BITS newly
+#                        carried by effect rows, the CapabilityId records
+#                        (effect-view ids + presence toggles) and the
+#                        StableDeclId records of the newly-alloc rows. The
+#                        text renders are display-only projections.
 #   RiskVector         — the typed delta row counts + the §36
 #                        budget_verify violation list (the risk word is
 #                        forced critical by ANY violation: exceeding the
@@ -47,34 +51,56 @@
 #   MemoryFact         — third-audit item 38's mir_alias_facts_of_call
 #                        (CallMutationRegion: barrier + per-root
 #                        read/write/exclusive/consume facts), walked over
-#                        every call terminator of a MirProgram.
-#   MergeRisk          — two deltas' write sets (semantic_write_set_of_delta)
-#                        and their affected envelopes.
+#                        every call terminator of a MirProgram. (P1-2) The
+#                        function is a StableDeclId and the root a
+#                        function-scoped StablePlaceId; the canonical text
+#                        render is diagnostics only.
+#   MergeRisk          — (P1-2) two deltas' typed write sets and their
+#                        affected envelopes. The conflict decision is
+#                        EXACT PROJECTION OVERLAP over StablePlaceId
+#                        projection chains (place_projection_overlap: one
+#                        list is a prefix of the other) — NEVER a '|'
+#                        text-split root compare: delete vs anything at
+#                        the same address or a prefix/child = conflict;
+#                        modify vs modify at the SAME address = conflict;
+#                        sibling-field writes (same root, non-overlapping
+#                        field projections) = independent.
 #
 # DETERMINISM. Every list this module returns is sorted by byte order and
-# deduped (planning_sorted_keys), so consumers can compare records field by
-# field; no Map iteration order, insertion order or hash order ever reaches
-# a result.
+# deduped (planning_sorted_keys / planning_write_add), so consumers can
+# compare records field by field; no Map iteration order, insertion order
+# or hash order ever reaches a result.
 #
 # TABLE OF CONTENTS:
-#   1. The typed records (SemanticWriteSet / SemanticReadSet /
+#   1. The typed records (SemanticWriteKind / SemanticAddress /
+#      SemanticWrite / SemanticWriteSet / SemanticReadSet /
 #      EffectResourceSet / RiskVector / MemoryFact / MergeRisk).
-#   2. Collection + text helpers.
+#   2. Collection + text helpers (incl. the typed address predicates).
 #   3. SemanticWriteSet / SemanticReadSet.
 #   4. EffectResourceSet.
 #   5. RiskVector.
 #   6. MemoryFact (semantic_memory_facts_of_mir).
 #   7. MergeRisk (semantic_merge_risk).
-#   8. The executable lane rows (semantic_planning_lane_check and the four
+#   8. The executable lane rows (semantic_planning_lane_check and the five
 #      sub-lanes). No test-file-only fixtures: the rows are exported
 #      functions a behavior lane calls, the semantic_delta.tg /
 #      change_budget.tg sibling style.
 
 use std::collections::{Vec, Map, Set}
 
-use tg_compiler::types::{AccessEffect, Type}
+use tg_compiler::types::{AccessEffect, Type, CapabilityId}
 use tg_compiler::token::{span_dummy}
-use tg_compiler::stable_ids::{StableDeclId, stable_decl_of_key}
+use tg_compiler::stable_ids::{
+  StableDeclId, stable_decl_of_key, stable_decl_eq,
+  StablePlaceId, StableLocalId, StableProjection,
+  MemberLineageId, StableRowKey, StableMirNodeId,
+  stable_place_of_text, stable_place_text_of, stable_place_id_of,
+  stable_local_identity_text, stable_binder_id_of,
+  structural_instance_id_of, stable_synthetic_lineage,
+  stable_row_key_or_text, stable_mir_node_key_of, stable_mir_node_id_eq,
+  stable_mir_node_id_of_generated,
+  stable_member_synthetic_lineage, stable_member_lineage_id_of
+}
 use tg_compiler::semantic_model::{
   SemanticDependencyGraph, TypeUseEdge, TraitImplEdge, TraitSelectionEdge,
   GenericInstantiationEdge, LayoutDependencyEdge, ConstEvalDependencyEdge,
@@ -100,20 +126,56 @@ use tg_compiler::mir::{
 # 1. THE TYPED RECORDS
 # ═══════════════════════════════════════════════════════════════
 
-# The keys one change WRITES. Each key is a canonical stable id text in the
-# §31 key domain:
-#   - a created / modified entity's stable key ("path::name#signature");
-#   - an ownership row target "<function.key>|<place>" (the place-level
-#     write unit — the §31 ownership rows are keyed "fn|place");
-#   - an effect row target, which is the function key itself (the §31
-#     effect row key is the function's declaration key).
-# REMOVED entity keys are NOT write keys in this slice: a deletion removes
-# the key rather than writing a surviving one; the diff core records it in
-# SemanticDelta.removed and the §36 symbol gate owns it (documented scope
-# decision, not an omission). Capability row targets are likewise not write
-# keys — they are resources (EffectResourceSet), and the owning function is
-# already a modified writer when its capability rows changed.
+# (fourth-audit P1-2) The write KIND of one typed write entry. Create and
+# Delete are real kinds — a REMOVED entity is a Delete entry, never a
+# dropped key. Modify covers a row/entity that existed on both sides.
+pub enum SemanticWriteKind
+  Create
+  Modify
+  Delete
+end
+
+# (fourth-audit P1-2) The typed ADDRESS of one write entry — the union of
+# the stable identities a change can write:
+#   Decl(d)   — a declaration (created / removed / modified entity, an
+#               effect row's function, ...).
+#   Place(p)  — a function-scoped ownership place (StablePlaceId: the
+#               stable root local + the persistent projection chain). The
+#               function scope rides the root local's owner instance.
+#   Member(m) — a field / variant member lineage (MemberLineageId) of a
+#               changed member row.
+#   MirNode(n)— a persistent P0-7 MIR node identity (site-level
+#               consumers; the delta rows themselves are decl/place/row
+#               keyed).
+#   RowKey(r) — a stable composite row key (StableRowKey) for the
+#               capability / contract / fallback ownership rows.
+pub enum SemanticAddress
+  Decl(StableDeclId)
+  Place(StablePlaceId)
+  Member(MemberLineageId)
+  MirNode(StableMirNodeId)
+  RowKey(StableRowKey)
+end
+
+# ONE typed write entry: the exact stable address + what the change does
+# to it.
+pub struct SemanticWrite
+  address: SemanticAddress
+  kind: SemanticWriteKind
+end
+
+# (fourth-audit P1-2) The typed write set of one delta.
+#   entries — the deduped { address, kind } records: every created /
+#             REMOVED / modified entity (kind Create / Delete / Modify),
+#             every changed effect row (Decl), every changed ownership
+#             place (Place, lifecycle-derived kind), every changed
+#             capability / contract row (RowKey) and every changed
+#             field/variant member (Member).
+#   keys    — the canonical §31 key TEXT renders (display and typed-graph
+#             query projection ONLY — the merge decision reads `entries`,
+#             never these texts).
 pub struct SemanticWriteSet
+  entries: Vec[SemanticWrite] = Vec::new()
   keys: Vec[String] = Vec::new()
 end
 
@@ -122,27 +184,27 @@ pub struct SemanticReadSet
   keys: Vec[String] = Vec::new()
 end
 
-# The effect / capability / allocation resources one change NEWLY uses,
-# all projected from the typed before/after rows of the delta (never from
-# rendered text):
-#   effects       — the §11 dirty-class words newly carried by an effect
+# (fourth-audit P1-2) The effect / capability / allocation resources one
+# change NEWLY uses, all projected from the typed before/after rows of the
+# delta (never from rendered text). The fields are TYPED:
+#   effects       — the §11 dirty-class BITS newly carried by an effect
 #                   row's after view (after.bits & !before.bits, one entry
-#                   per class): alloc | block | io | spawn | sleep | panic |
-#                   unsafe (the §11 bit order; the "alloc" spelling matches
-#                   change_budget.tg's class-word vocabulary).
-#   capabilities  — the canonical "cap<id>" texts NEWLY present: every
-#                   capability row whose presence toggled Absent -> Present,
-#                   plus every capability-id text an effect row's after
-#                   view newly carries (normalized to "cap<id>" so the two
-#                   sources share one key domain).
-#   allocations   — the function keys of the effect rows whose after view
-#                   newly carries the alloc class (bit 1) — exactly the
-#                   row set §36 check 8 counts (budget_allocation_alloc_row_count).
+#                   per class): bit 1 alloc | 2 block | 4 io | 8 spawn |
+#                   16 sleep | 32 panic | 64 unsafe. The display words come
+#                   from effect_resource_set_effect_words.
+#   capabilities  — the CapabilityId records NEWLY present: every
+#                   capability row whose presence toggled Absent ->
+#                   Present plus every numeric capability id an effect
+#                   row's after view newly carries (the typed member; the
+#                   text fallback parses the view's rendered id run).
+#   allocations   — the StableDeclId records of the effect rows whose
+#                   after view newly carries the alloc class (bit 1) —
+#                   exactly the row set §36 check 8 counts.
 # Lists are sorted and deduped.
 pub struct EffectResourceSet
-  effects: Vec[String] = Vec::new()
-  capabilities: Vec[String] = Vec::new()
-  allocations: Vec[String] = Vec::new()
+  effects: Vec[Int] = Vec::new()
+  capabilities: Vec[CapabilityId] = Vec::new()
+  allocations: Vec[StableDeclId] = Vec::new()
 end
 
 # The risk profile of one change against one §36 ChangeBudget.
@@ -163,6 +225,8 @@ end
 #                       of the row's typed before/after projections) is
 #                       Breaking or Unknown (Unknown fails closed).
 #   affected_count    — SemanticDelta.affected.len() (the call closure).
+# Every count field is a typed Int (no strings); risk_word is the display
+# render of the documented score thresholds.
 # BUDGET VIOLATIONS participate through the score (not through a field):
 # every budget_verify row forces the score to the critical band, because a
 # change outside its declared envelope is never low risk.
@@ -193,11 +257,11 @@ end
 
 # ONE call-site root fact (third-audit item 38's convention model lifted to
 # a report row):
-#   function  — the containing MirFunction's name (presentation identity;
-#               the call site itself is not carried — see the section doc).
-#   root      — the accessed local root's NAME ("local#<id>" when the MIR
-#               local carries no name). The local id is the semantic
-#               identity; the name is the display form this record carries.
+#   function  — (P1-2) the containing MirFunction as a StableDeclId.
+#   root      — (P1-2) the accessed local root as a function-scoped
+#               StablePlaceId (empty projection chain). The stable identity
+#               is the record; planning_memory_fact_text is the display
+#               render.
 #   may_read / may_write / exclusive / consumed — the CallMutationRegion
 #               facts for that root (exclusive = inout's no-alias proof;
 #               consumed = sink's last-read ownership transfer).
@@ -207,8 +271,8 @@ end
 # remains available through mir.tg's call_initializes_root for consumers
 # that need it).
 pub struct MemoryFact
-  function: String
-  root: String
+  function: StableDeclId
+  root: StablePlaceId
   may_read: Bool
   may_write: Bool
   exclusive: Bool
@@ -218,22 +282,25 @@ end
 # The merge-conflict prediction of TWO concurrent deltas (a and b).
 #   overlapping_symbols — the exact intersection of the two affected
 #                         envelopes (a.affected ∩ b.affected), sorted.
-#   write_conflicts     — the write keys of the two deltas that conflict:
-#                         a pair (ka, kb) conflicts when ka == kb OR when
-#                         both keys share the same OWNER ROOT (the text
-#                         before the first '|'; a bare symbol key roots to
-#                         itself, an ownership target "fn|place" roots to
-#                         its owning function). Both keys of every
-#                         conflicting pair are listed, sorted and deduped.
+#   write_conflicts     — the display renders of the conflicting write
+#                         entries (both sides of every conflicting pair,
+#                         sorted and deduped). The DECISION is the typed
+#                         predicate semantic_write_conflicts over the
+#                         SemanticAddress records — never a text split:
+#                         same address => conflict; a Delete against any
+#                         address it contains or that contains it (a
+#                         prefix/child place projection, a member of the
+#                         declaration, ...) => conflict; sibling field
+#                         writes (same root, non-overlapping projections)
+#                         => independent.
 #   verdict             — the documented decision, in precedence order:
 #                         "conflict"    when write_conflicts is non-empty;
 #                         "review"      when write_conflicts is empty but
-#                                       the deltas interact through the
-#                                       dependency envelope —
-#                                       overlapping_symbols non-empty OR a
-#                                       write key of one side appears in
-#                                       the other side's affected set
-#                                       (cross-read);
+#                         the deltas interact through the dependency
+#                         envelope — overlapping_symbols non-empty OR a
+#                         typed write address of one side observes an
+#                         affected declaration of the other side
+#                         (cross-read);
 #                         "independent" otherwise.
 pub struct MergeRisk
   overlapping_symbols: Vec[String] = Vec::new()
@@ -297,9 +364,10 @@ end
 
 # The owner root of a write key: everything before the first '|'. A bare
 # symbol key roots to itself; an ownership target "fn.key|place" roots to
-# its owning function. (Uses the first '|' because the §31 function keys
-# never contain '|' — same assumption change_budget.tg's contract-row
-# helpers document.)
+# its owning function. (P1-2 note: the MERGE decision never uses this text
+# split — semantic_write_conflicts reads the typed SemanticAddress records
+# and place_projection_overlap; this helper remains for
+# semantic_evolution.tg's textual item grouping.)
 def planning_key_root(key: String) -> String
   var i = 0
   while i < key.len() do
@@ -309,6 +377,421 @@ def planning_key_root(key: String) -> String
     i = i + 1
   end
   key.clone()
+end
+
+# ————— (fourth-audit P1-2) the typed address machinery —————
+
+# The display text of a declaration address (the record's advisory display
+# key, else its digest words).
+def planning_decl_text(d: StableDeclId) -> String
+  if d.display_key.len() > 0 then
+    d.display_key.clone()
+  else
+    "decl:" + d.digest_hi.to_string() + "-" + d.digest_lo.to_string()
+  end
+end
+
+# The binder ordinal of a place ROOT text (stable_place_text_root's rule:
+# the "l<digits>" locator ordinal, else the deterministic synthetic
+# sequence of the name).
+def planning_binder_seq(root_text: String) -> Int
+  if root_text.len() > 0 && root_text.slice(0, 1) == "l" then
+    let rest = root_text.slice(1, root_text.len())
+    let parsed = rest.parse_int().unwrap_or(-1)
+    if parsed >= 0 then
+      return parsed
+    end
+  end
+  stable_synthetic_lineage(&root_text)
+end
+
+# The function-scoped root-only place of (function key, root local name):
+# the owner instance binds the function scope into the place identity. The
+# owner's callable is stable_decl_of_key(function key) — the SAME
+# declaration identity the row keys and the affected envelope carry (the
+# callable-key grammar's own parser is a different dialect and would not
+# compare equal).
+def planning_place_root(function_key: String, root_name: String) -> StablePlaceId
+  let owner = structural_instance_id_of(stable_decl_of_key(&function_key), Vec::new())
+  let binder = stable_binder_id_of(owner.callable.clone(), planning_binder_seq(root_name.clone()))
+  let root = StableLocalId { owner: owner, binder: binder, display_name: root_name }
+  let fallback = StablePlaceId { root: root.clone(), projections: Vec::new() }
+  stable_place_id_of(root, Vec::new()).unwrap_or(fallback)
+end
+
+# The function-scoped place of a canonical place text (snapshot_place_key's
+# grammar): parse the text with the no-table parser, then REBIND the root
+# local to the owning function's structural instance so two functions'
+# same-named locals never collide. Option::None for a text the stable
+# grammar rejects (dynamic indexes, derefs) — the caller falls back to a
+# RowKey address.
+def planning_place_id_scoped(function_key: String, place_text: String) -> Option[StablePlaceId]
+  match stable_place_of_text(&place_text)
+  when Option::Some(p) then
+    let owner = structural_instance_id_of(stable_decl_of_key(&function_key), Vec::new())
+    let binder = stable_binder_id_of(owner.callable.clone(), planning_binder_seq(p.root.display_name.clone()))
+    let root = StableLocalId { owner: owner, binder: binder, display_name: p.root.display_name.clone() }
+    stable_place_id_of(root, p.projections)
+  when Option::None then Option::None
+  end
+end
+
+# Whether two places share the same root local identity (the function
+# scope + the local lineage, never the display text).
+pub def planning_place_root_same(a: StablePlaceId, b: StablePlaceId) -> Bool
+  stable_local_identity_text(&a.root) == stable_local_identity_text(&b.root)
+end
+
+# One projection's structural equality (kind + digest words; the names are
+# collision cargo) — the prefix chain's element test.
+def planning_projection_same(prefix_item: StableProjection, whole_item: StableProjection) -> Bool
+  if prefix_item.kind != whole_item.kind then
+    return false
+  end
+  if prefix_item.digest_hi != whole_item.digest_hi then
+    return false
+  end
+  prefix_item.digest_lo == whole_item.digest_lo
+end
+
+# Whether `prefix` is a prefix of `whole` (empty is a prefix of anything).
+def planning_projection_list_prefix(prefix: Vec[StableProjection], whole: Vec[StableProjection]) -> Bool
+  if prefix.len() > whole.len() then
+    return false
+  end
+  var i = 0
+  while i < prefix.len() do
+    if !planning_projection_same(prefix[i].clone(), whole[i].clone()) then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+# (fourth-audit P1-2) The EXACT projection-overlap of two places: the same
+# root and one projection list a prefix of the other (equality included).
+# This replaces the old '|' text-split root compare — sibling fields under
+# one root are NOT overlapping.
+pub def place_projection_overlap(a: StablePlaceId, b: StablePlaceId) -> Bool
+  if !planning_place_root_same(&a, &b) then
+    return false
+  end
+  if planning_projection_list_prefix(a.projections.clone(), b.projections.clone()) then
+    return true
+  end
+  planning_projection_list_prefix(b.projections.clone(), a.projections.clone())
+end
+
+# Whether two places are the SAME address: same root and equal projection
+# chains.
+def planning_place_same(a: StablePlaceId, b: StablePlaceId) -> Bool
+  if !planning_place_root_same(&a, &b) then
+    return false
+  end
+  if a.projections.len() != b.projections.len() then
+    return false
+  end
+  planning_projection_list_prefix(a.projections.clone(), b.projections.clone())
+end
+
+# Whether one place's resolved projection chain carries the member
+# lineage. (Text-parsed projections carry no member lineage — the
+# documented no-table limitation; store-carrying producers stamp them.)
+def planning_place_has_member(p: StablePlaceId, m: MemberLineageId) -> Bool
+  for proj in p.projections do
+    match proj.field
+    when Option::Some(f) then
+      match f.member_lineage
+      when Option::Some(ml) then
+        if stable_decl_eq(&ml.owner, &m.owner) && ml.member_kind == m.member_kind && ml.lineage == m.lineage then
+          return true
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+    match proj.variant
+    when Option::Some(v) then
+      match v.member_lineage
+      when Option::Some(ml2) then
+        if stable_decl_eq(&ml2.owner, &m.owner) && ml2.member_kind == m.member_kind && ml2.lineage == m.lineage then
+          return true
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+  end
+  false
+end
+
+# The display render of a typed address (diagnostics / MergeRisk rows ONLY
+# — never an identity).
+pub def semantic_address_text(addr: SemanticAddress) -> String
+  match addr.clone()
+  when Decl(d) then planning_decl_text(d)
+  when Place(p) then planning_decl_text(p.root.owner.callable) + "|" + stable_place_text_of(p)
+  when Member(m) then planning_decl_text(m.owner) + "|" + m.member_kind.clone() + "#L" + m.lineage.to_string()
+  when MirNode(n) then stable_mir_node_key_of(n)
+  when RowKey(r) then r.text.clone()
+  end
+end
+
+# The deterministic sort key of an address (family + identity digest
+# words).
+def planning_address_sort_key(addr: SemanticAddress) -> String
+  match addr.clone()
+  when Decl(d) then "decl|" + d.digest_hi.to_string() + "-" + d.digest_lo.to_string()
+  when Place(p) then "place|" + p.digest_hi.to_string() + "-" + p.digest_lo.to_string()
+  when Member(m) then "member|" + m.digest_hi.to_string() + "-" + m.digest_lo.to_string()
+  when MirNode(n) then "mir|" + n.digest_hi.to_string() + "-" + n.digest_lo.to_string()
+  when RowKey(r) then "row|" + r.digest_hi.to_string() + "-" + r.digest_lo.to_string()
+  end
+end
+
+# The entry sort key (address identity + kind word).
+def planning_write_sort_key(w: SemanticWrite) -> String
+  planning_address_sort_key(w.address.clone()) + "#" + semantic_write_kind_word(w.kind)
+end
+
+def semantic_write_kind_word(k: SemanticWriteKind) -> String
+  match k
+  when SemanticWriteKind::Create then "create"
+  when SemanticWriteKind::Modify then "modify"
+  when SemanticWriteKind::Delete then "delete"
+  end
+end
+
+def semantic_write_kind_is_delete(k: SemanticWriteKind) -> Bool
+  match k
+  when SemanticWriteKind::Delete then true
+  when _ then false
+  end
+end
+
+# (fourth-audit P1-2) The exact typed address identity (same family and
+# the same stable identity record).
+pub def semantic_address_same(a: SemanticAddress, b: SemanticAddress) -> Bool
+  match a.clone()
+  when Decl(ad) then
+    match b.clone()
+    when Decl(bd) then stable_decl_eq(&ad, &bd)
+    when _ then false
+    end
+  when Place(ap) then
+    match b.clone()
+    when Place(bp) then planning_place_same(&ap, &bp)
+    when _ then false
+    end
+  when Member(am) then
+    match b.clone()
+    when Member(bm) then
+      stable_decl_eq(&am.owner, &bm.owner) && am.member_kind == bm.member_kind && am.lineage == bm.lineage
+    when _ then false
+    end
+  when MirNode(an) then
+    match b.clone()
+    when MirNode(bn) then stable_mir_node_id_eq(an, bn)
+    when _ then false
+    end
+  when RowKey(ar) then
+    match b.clone()
+    when RowKey(br) then ar.digest_hi == br.digest_hi && ar.digest_lo == br.digest_lo
+    when _ then false
+    end
+  end
+end
+
+# (fourth-audit P1-2) Whether two typed addresses are the same OR one
+# CONTAINS the other (a declaration contains its members and place roots;
+# a place root contains its child projections; a row key roots at its
+# subject declaration; a MIR node belongs to its function declaration).
+# Only a Delete consults this containment (semantic_write_conflicts): a
+# delete of a whole root conflicts with a write to any prefix/child.
+pub def semantic_address_overlaps(a: SemanticAddress, b: SemanticAddress) -> Bool
+  if semantic_address_same(a.clone(), b.clone()) then
+    return true
+  end
+  match a.clone()
+  when Decl(d) then
+    match b.clone()
+    when Decl(_) then false
+    when Member(m) then stable_decl_eq(&d, &m.owner)
+    when Place(p) then stable_decl_eq(&d, &p.root.owner.callable)
+    when MirNode(n) then stable_decl_eq(&d, &n.function.callable)
+    when RowKey(r) then stable_decl_eq(&d, &r.decl)
+    end
+  when Member(m) then
+    match b.clone()
+    when Decl(_) then false
+    when Member(_) then false
+    when Place(p) then planning_place_has_member(&p, m.clone())
+    when MirNode(n) then stable_decl_eq(&m.owner, &n.function.callable)
+    when RowKey(r) then stable_decl_eq(&m.owner, &r.decl)
+    end
+  when Place(p) then
+    match b.clone()
+    when Decl(_) then false
+    when Member(m) then planning_place_has_member(&p, m.clone())
+    when Place(p2) then place_projection_overlap(&p, &p2)
+    when MirNode(n) then stable_decl_eq(&p.root.owner.callable, &n.function.callable)
+    when RowKey(r) then stable_decl_eq(&p.root.owner.callable, &r.decl)
+    end
+  when MirNode(n) then
+    match b.clone()
+    when Decl(_) then false
+    when Member(_) then false
+    when Place(p) then stable_decl_eq(&n.function.callable, &p.root.owner.callable)
+    when MirNode(_) then false
+    when RowKey(r) then stable_decl_eq(&n.function.callable, &r.decl)
+    end
+  when RowKey(r) then
+    match b.clone()
+    when Decl(_) then false
+    when Member(_) then false
+    when Place(p) then stable_decl_eq(&r.decl, &p.root.owner.callable)
+    when MirNode(n) then stable_decl_eq(&r.decl, &n.function.callable)
+    when RowKey(_) then false
+    end
+  end
+end
+
+# (fourth-audit P1-2) The merge-conflict predicate of two typed write
+# entries:
+#   - the same address => conflict (Modify+Modify, Create+Modify, ...);
+#   - a Delete against any address it contains, or that contains it =>
+#     conflict;
+#   - everything else (sibling field projections included) => independent.
+pub def semantic_write_conflicts(a: SemanticWrite, b: SemanticWrite) -> Bool
+  if semantic_address_same(a.address.clone(), b.address.clone()) then
+    return true
+  end
+  if semantic_write_kind_is_delete(a.kind) || semantic_write_kind_is_delete(b.kind) then
+    return semantic_address_overlaps(a.address, b.address)
+  end
+  false
+end
+
+# Append a write entry unless an identical (address identity, kind) record
+# is already present (the write-set dedupe boundary).
+def planning_write_add(inout entries: Vec[SemanticWrite], w: SemanticWrite) -> Unit
+  for e in entries do
+    if e.kind == w.kind && semantic_address_same(e.address.clone(), w.address.clone()) then
+      return
+    end
+  end
+  entries.push(w)
+  ()
+end
+
+# Whether a typed write address observes a declaration in `affected` (the
+# typed cross-read test: the address's owning/subject declaration digest
+# equals an affected key's declaration digest).
+def planning_address_in_affected(addr: SemanticAddress, affected: Vec[String]) -> Bool
+  for k in affected do
+    let d = stable_decl_of_key(&k)
+    match addr.clone()
+    when Decl(ad) then
+      if stable_decl_eq(&ad, &d) then return true end
+    when Place(p) then
+      if stable_decl_eq(&p.root.owner.callable, &d) then return true end
+    when Member(m) then
+      if stable_decl_eq(&m.owner, &d) then return true end
+    when MirNode(n) then
+      if stable_decl_eq(&n.function.callable, &d) then return true end
+    when RowKey(r) then
+      if stable_decl_eq(&r.decl, &d) then return true end
+    end
+  end
+  false
+end
+
+# Append an Int if absent.
+def planning_int_add(inout xs: Vec[Int], x: Int) -> Unit
+  for y in xs do
+    if y == x then
+      return
+    end
+  end
+  xs.push(x)
+  ()
+end
+
+# Sort + dedupe an Int list in place.
+def planning_sorted_ints(inout xs: Vec[Int]) -> Unit
+  xs.sort()
+  var out: Vec[Int] = Vec::new()
+  for x in xs do
+    if out.is_empty() then
+      out.push(x)
+    elsif out[out.len() - 1] != x then
+      out.push(x)
+    end
+  end
+  xs = out
+  ()
+end
+
+# The numeric capability id of a raw id text ("3" -> 3, "cap1" -> 1; -1
+# outside the digits grammar after the optional "cap" prefix).
+def planning_capability_id_of_text(id_text: String) -> Int
+  var text = id_text.clone()
+  if text.starts_with("cap") then
+    text = text.slice(3, text.len())
+  end
+  text.parse_int().unwrap_or(-1)
+end
+
+# The TYPED capability ids of an effect view: the typed member list when
+# the view carries one, else the parsed raw texts (the boundary fallback
+# for hand-built views).
+def planning_view_capability_ids(view: EffectSummaryView) -> Vec[Int]
+  if view.capability_ids.len() > 0 then
+    return view.capability_ids.clone()
+  end
+  var ids: Vec[Int] = Vec::new()
+  for id_text in view.capabilities do
+    let id = planning_capability_id_of_text(id_text.clone())
+    if id >= 0 then
+      planning_int_add(&mut ids, id)
+    end
+  end
+  ids
+end
+
+# The typed declaration member of an effect row (the row's typed member
+# when present, else the parse of its function key text).
+def planning_row_function_decl(row: EffectDelta) -> StableDeclId
+  match row.function_decl
+  when Option::Some(d) then d.clone()
+  when Option::None then stable_decl_of_key(&row.function)
+  end
+end
+
+# The typed member lineage of one changed member row (the deterministic
+# name-derived synthetic lineage — the no-store fallback; a store-carrying
+# producer stamps its persistent lineage at the row builder boundary).
+def planning_member_lineage(owner: StableDeclId, member_kind: String, name: String) -> MemberLineageId
+  let lineage = stable_member_synthetic_lineage(owner.clone(), member_kind.clone(), name.clone())
+  stable_member_lineage_id_of(owner.package.clone(), owner, member_kind, lineage)
+end
+
+# The write kind from a row's before/after presence.
+def planning_lifecycle_kind(before_present: Bool, after_present: Bool) -> SemanticWriteKind
+  if !before_present && after_present then
+    SemanticWriteKind::Create
+  elsif before_present && !after_present then
+    SemanticWriteKind::Delete
+  else
+    SemanticWriteKind::Modify
+  end
+end
+
+# Whether an effect view is the EMPTY before/after side of a row lifecycle
+# (bits 0, no capability ids, no rendered capability texts).
+def planning_effect_view_is_empty(view: EffectSummaryView) -> Bool
+  view.bits == 0 && view.capabilities.len() == 0 && view.capability_ids.len() == 0
 end
 
 # The owning def key of an ABI surface id ("fn:<key>" / "type:<key>"; ""
@@ -341,24 +824,92 @@ end
 # 3. SemanticWriteSet / SemanticReadSet
 # ═══════════════════════════════════════════════════════════════
 
-# The write set of ONE delta. See SemanticWriteSet's doc for the exact key
-# derivation and the documented removed/capability exclusions.
-pub def semantic_write_set_of_delta(delta: SemanticDelta) -> SemanticWriteSet
+# (fourth-audit P1-2) The typed write set of ONE delta. `entries` carries
+# the exact SemanticAddress / SemanticWriteKind records (REMOVED entities
+# included as Delete entries); `keys` keeps the canonical §31 write-key
+# TEXT renders (the read-set graph query projection).
+def semantic_write_set_of_delta(delta: SemanticDelta) -> SemanticWriteSet
+  var entries: Vec[SemanticWrite] = Vec::new()
   var keys: Vec[String] = Vec::new()
   for k in delta.created do
     planning_keys_add(&mut keys, k.clone())
+    planning_write_add(&mut entries, SemanticWrite {
+      address: SemanticAddress::Decl(stable_decl_of_key(&k)),
+      kind: SemanticWriteKind::Create
+    })
+  end
+  for k in delta.removed do
+    planning_keys_add(&mut keys, k.clone())
+    planning_write_add(&mut entries, SemanticWrite {
+      address: SemanticAddress::Decl(stable_decl_of_key(&k)),
+      kind: SemanticWriteKind::Delete
+    })
   end
   for e in delta.modified do
     planning_keys_add(&mut keys, e.stable_id.clone())
+    planning_write_add(&mut entries, SemanticWrite {
+      address: SemanticAddress::Decl(stable_decl_of_key(&e.stable_id)),
+      kind: SemanticWriteKind::Modify
+    })
   end
   for row in delta.effect_delta do
     planning_keys_add(&mut keys, row.function.clone())
+    let kind = planning_lifecycle_kind(
+      !planning_effect_view_is_empty(row.before.clone()),
+      !planning_effect_view_is_empty(row.after.clone()))
+    planning_write_add(&mut entries, SemanticWrite {
+      address: SemanticAddress::Decl(planning_row_function_decl(row.clone())),
+      kind: kind
+    })
   end
   for row in delta.ownership_delta do
     planning_keys_add(&mut keys, row.function.clone() + "|" + row.place.clone())
+    var addr = SemanticAddress::RowKey(stable_row_key_or_text("ownership", row.function.clone() + "|" + row.place.clone()))
+    match planning_place_id_scoped(&row.function, &row.place)
+    when Option::Some(p) then addr = SemanticAddress::Place(p)
+    when Option::None then ()
+    end
+    planning_write_add(&mut entries, SemanticWrite {
+      address: addr,
+      kind: planning_lifecycle_kind(row.before.len() > 0, row.after.len() > 0)
+    })
+  end
+  for row in delta.capability_delta do
+    let key_text = row.function.clone() + "|" + row.capability.clone()
+    let before_present = match row.before
+    when Presence::Present then true
+    when Presence::Absent then false
+    end
+    let after_present = match row.after
+    when Presence::Present then true
+    when Presence::Absent then false
+    end
+    planning_write_add(&mut entries, SemanticWrite {
+      address: SemanticAddress::RowKey(stable_row_key_or_text("capability-row", key_text)),
+      kind: planning_lifecycle_kind(before_present, after_present)
+    })
+  end
+  for row in delta.contract_delta do
+    planning_write_add(&mut entries, SemanticWrite {
+      address: SemanticAddress::RowKey(stable_row_key_or_text("contract", row.contract_id.clone())),
+      kind: planning_lifecycle_kind(row.before.is_some(), row.after.is_some())
+    })
+  end
+  for row in delta.field_delta do
+    planning_write_add(&mut entries, SemanticWrite {
+      address: SemanticAddress::Member(planning_member_lineage(row.owner.clone(), "field".to_string(), row.name.clone())),
+      kind: planning_lifecycle_kind(row.before.is_some(), row.after.is_some())
+    })
+  end
+  for row in delta.variant_delta do
+    planning_write_add(&mut entries, SemanticWrite {
+      address: SemanticAddress::Member(planning_member_lineage(row.owner.clone(), "variant".to_string(), row.name.clone())),
+      kind: planning_lifecycle_kind(row.before.is_some(), row.after.is_some())
+    })
   end
   planning_sorted_keys(&mut keys)
-  SemanticWriteSet { keys: keys }
+  entries.sort_by(|x, y| planning_write_sort_key(x) < planning_write_sort_key(y))
+  SemanticWriteSet { entries: entries, keys: keys }
 end
 
 # The typed-graph dependents of one write key, appended to `keys`:
@@ -530,7 +1081,18 @@ def planning_effect_added_class(row: EffectDelta, bit: Int) -> Bool
   planning_word_has_class(row.after.bits, bit) && !planning_word_has_class(row.before.bits, bit)
 end
 
-# after.capabilities - before.capabilities.
+# after.capability_ids - before.capability_ids (the TYPED member test; the
+# text fallback parses a hand-built view's rendered id run).
+def planning_effect_added_cap_id(row: EffectDelta, cap_id: Int) -> Bool
+  if !planning_view_capability_ids(row.before.clone()).contains(&cap_id) then
+    return planning_view_capability_ids(row.after.clone()).contains(&cap_id)
+  end
+  false
+end
+
+# after.capabilities - before.capabilities (the rendered-text view; the
+# TYPED member test is planning_effect_added_cap_id. This text form
+# remains for semantic_evolution.tg's textual capability grouping).
 def planning_effect_added_cap(row: EffectDelta, id_text: String) -> Bool
   if row.before.capabilities.contains(&id_text) then
     return false
@@ -538,8 +1100,8 @@ def planning_effect_added_cap(row: EffectDelta, id_text: String) -> Bool
   row.after.capabilities.contains(&id_text)
 end
 
-# The canonical "cap<id>" text of an effect-view capability entry (the raw
-# id text normalizes to the capability row's own "cap<id>" domain).
+# The canonical "cap<id>" text of a raw capability id text (the display
+# normalizer; the CapabilityId record is the typed form).
 def planning_capability_text(id_text: String) -> String
   if id_text.starts_with("cap") then
     return id_text.clone()
@@ -547,25 +1109,90 @@ def planning_capability_text(id_text: String) -> String
   "cap" + id_text
 end
 
-# Build the resource set of ONE delta (see EffectResourceSet's doc for the
-# exact derivation).
+# The canonical "cap<id>" display text of a numeric capability id.
+def planning_capability_text_of_id(cap_id: Int) -> String
+  "cap" + cap_id.to_string()
+end
+
+# The display render of the resource set's typed capabilities (diagnostics
+# ONLY — the CapabilityId records are the identity).
+pub def effect_resource_set_capability_texts(res: EffectResourceSet) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  for cap in res.capabilities do
+    out.push(planning_capability_text_of_id(cap.id))
+  end
+  out
+end
+
+# The display render of the resource set's typed effect bits.
+pub def effect_resource_set_effect_words(res: EffectResourceSet) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  for bit in res.effects do
+    out.push(planning_class_word(bit))
+  end
+  out
+end
+
+# The display render of the resource set's typed allocation declarations.
+pub def effect_resource_set_allocation_texts(res: EffectResourceSet) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  for d in res.allocations do
+    out.push(planning_decl_text(d.clone()))
+  end
+  out
+end
+
+# Append a declaration if its identity is absent.
+def planning_decl_add(inout xs: Vec[StableDeclId], d: StableDeclId) -> Unit
+  for x in xs do
+    if stable_decl_eq(&x, &d) then
+      return
+    end
+  end
+  xs.push(d)
+  ()
+end
+
+# The deterministic sort key of a declaration record.
+def planning_decl_sort_key(d: StableDeclId) -> String
+  d.digest_hi.to_string() + "-" + d.digest_lo.to_string() + "|" + planning_decl_text(d.clone())
+end
+
+# Sort + dedupe a declaration list in place.
+def planning_sorted_decls(inout xs: Vec[StableDeclId]) -> Unit
+  xs.sort_by(|a, b| planning_decl_sort_key(a.clone()) < planning_decl_sort_key(b.clone()))
+  var out: Vec[StableDeclId] = Vec::new()
+  for d in xs do
+    if out.is_empty() then
+      out.push(d.clone())
+    elsif !stable_decl_eq(&out[out.len() - 1], &d) then
+      out.push(d.clone())
+    end
+  end
+  xs = out
+  ()
+end
+
+# (fourth-audit P1-2) Build the TYPED resource set of ONE delta (see
+# EffectResourceSet's doc for the exact derivation): class bits, CapabilityId
+# records and StableDeclId allocation rows.
 pub def effect_resource_set_of_delta(delta: SemanticDelta) -> EffectResourceSet
-  var effects: Vec[String] = Vec::new()
-  var capabilities: Vec[String] = Vec::new()
-  var allocations: Vec[String] = Vec::new()
+  var effects: Vec[Int] = Vec::new()
+  var capability_ids: Vec[Int] = Vec::new()
+  var allocations: Vec[StableDeclId] = Vec::new()
   for row in delta.effect_delta do
     for bit in planning_class_bits() do
       if planning_effect_added_class(&row, bit) then
-        planning_keys_add(&mut effects, planning_class_word(bit))
+        planning_int_add(&mut effects, bit)
       end
     end
-    for id_text in row.after.capabilities do
-      if planning_effect_added_cap(&row, id_text.clone()) then
-        planning_keys_add(&mut capabilities, planning_capability_text(id_text.clone()))
+    for cap_id in planning_view_capability_ids(row.after.clone()) do
+      if planning_effect_added_cap_id(&row, cap_id) then
+        planning_int_add(&mut capability_ids, cap_id)
       end
     end
     if planning_effect_added_class(&row, 1) then
-      planning_keys_add(&mut allocations, row.function.clone())
+      planning_decl_add(&mut allocations, planning_row_function_decl(row.clone()))
     end
   end
   for row in delta.capability_delta do
@@ -575,13 +1202,23 @@ pub def effect_resource_set_of_delta(delta: SemanticDelta) -> EffectResourceSet
       match row.after
       when Presence::Absent then ()
       when Presence::Present then
-        planning_keys_add(&mut capabilities, row.capability.clone())
+        var cap_id = row.capability_id
+        if cap_id < 0 then
+          cap_id = planning_capability_id_of_text(row.capability.clone())
+        end
+        if cap_id >= 0 then
+          planning_int_add(&mut capability_ids, cap_id)
+        end
       end
     end
   end
-  planning_sorted_keys(&mut effects)
-  planning_sorted_keys(&mut capabilities)
-  planning_sorted_keys(&mut allocations)
+  planning_sorted_ints(&mut effects)
+  planning_sorted_ints(&mut capability_ids)
+  planning_sorted_decls(&mut allocations)
+  var capabilities: Vec[CapabilityId] = Vec::new()
+  for id in capability_ids do
+    capabilities.push(CapabilityId { id: id })
+  end
   EffectResourceSet { effects: effects, capabilities: capabilities, allocations: allocations }
 end
 
@@ -727,9 +1364,11 @@ end
 # 6. MemoryFact — semantic_memory_facts_of_mir
 # ═══════════════════════════════════════════════════════════════
 
-# The display text of one MemoryFact (the lane's comparison carrier).
+# The display text of one MemoryFact (the lane's comparison carrier; the
+# typed StableDeclId / StablePlaceId records are the identity).
 def planning_memory_fact_text(fact: MemoryFact) -> String
-  fact.function + "|" + fact.root + "|read=" + planning_bool_text(fact.may_read) +
+  planning_decl_text(fact.function.clone()) + "|" + stable_place_text_of(fact.root.clone()) +
+    "|read=" + planning_bool_text(fact.may_read) +
     "|write=" + planning_bool_text(fact.may_write) +
     "|exclusive=" + planning_bool_text(fact.exclusive) +
     "|consumed=" + planning_bool_text(fact.consumed)
@@ -798,9 +1437,10 @@ pub def semantic_memory_facts_of_mir(program: Option[MirProgram] = Option::None)
             end
           end
           for lid in lids do
+            let root_name = planning_root_name(&local_names, lid)
             out.push(MemoryFact {
-              function: function_name.clone(),
-              root: planning_root_name(&local_names, lid),
+              function: stable_decl_of_key(&function_name),
+              root: planning_place_root(&function_name, root_name),
               may_read: call_may_read(&region, lid),
               may_write: call_may_write(&region, lid),
               exclusive: call_root_is_exclusive(&region, lid),
@@ -823,8 +1463,9 @@ end
 # 7. MergeRisk — semantic_merge_risk
 # ═══════════════════════════════════════════════════════════════
 
-# Predict the merge risk of two deltas (see MergeRisk's doc for the exact
-# rules). Deterministic: every list is sorted and deduped.
+# (fourth-audit P1-2) Predict the merge risk of two deltas from their TYPED
+# write entries (see MergeRisk's doc for the exact rules). Deterministic:
+# every list is sorted and deduped.
 pub def semantic_merge_risk(a: SemanticDelta, b: SemanticDelta) -> MergeRisk
   let wa = semantic_write_set_of_delta(&a)
   let wb = semantic_write_set_of_delta(&b)
@@ -834,25 +1475,29 @@ pub def semantic_merge_risk(a: SemanticDelta, b: SemanticDelta) -> MergeRisk
       planning_keys_add(&mut overlaps, k.clone())
     end
   end
+  # The typed conflict decision: semantic_write_conflicts over the address
+  # records (exact projection overlap), NOT a '|' text-split root compare.
   var conflicts: Vec[String] = Vec::new()
-  for ka in wa.keys do
-    for kb in wb.keys do
-      if ka == kb || planning_key_root(&ka) == planning_key_root(&kb) then
-        planning_keys_add(&mut conflicts, ka.clone())
-        planning_keys_add(&mut conflicts, kb.clone())
+  for ea in wa.entries do
+    for eb in wb.entries do
+      if semantic_write_conflicts(ea.clone(), eb.clone()) then
+        planning_keys_add(&mut conflicts, semantic_address_text(ea.address.clone()))
+        planning_keys_add(&mut conflicts, semantic_address_text(eb.address.clone()))
       end
     end
   end
   planning_sorted_keys(&mut overlaps)
   planning_sorted_keys(&mut conflicts)
+  # The typed cross-read: a write address of one side observes an affected
+  # declaration of the other.
   var cross_read = false
-  for ka in wa.keys do
-    if b.affected.contains(&ka) then
+  for ea in wa.entries do
+    if planning_address_in_affected(ea.address.clone(), b.affected.clone()) then
       cross_read = true
     end
   end
-  for kb in wb.keys do
-    if a.affected.contains(&kb) then
+  for eb in wb.entries do
+    if planning_address_in_affected(eb.address.clone(), a.affected.clone()) then
       cross_read = true
     end
   end
@@ -891,13 +1536,21 @@ end
 #        difference of one replaced row).
 #   R5 — an abi row replacement: critical from abi_breaks alone (2).
 #   R6 — a Pre strengthening contract row: contract_breaks 1, critical.
-#   E1 — the EffectResourceSet of the W1 delta (classes, capability
-#        normalization, allocation rows).
+#   E1 — the TYPED EffectResourceSet of the W1 delta (class bits,
+#        CapabilityId records, StableDeclId allocation rows; the text
+#        lists are display renders).
 #   M1 — merge of disjoint deltas: independent.
 #   M2 — shared affected key only: review.
-#   M3 — the same write key (every conflicting key under that owner is
-#        listed): conflict.
-#   M4 — different ownership targets under one owner root: conflict.
+#   M3 — the same typed Decl address written twice: conflict.
+#   M4 — different ownership targets under one owner root, shared affected:
+#        review (the old root-text rule's conflict is GONE).
+#   T1 — same-entity deletes conflict (two Delete entries, same Decl).
+#   T2 — same-field modifies conflict (same Place address, Modify+Modify).
+#   T3 — sibling fields independent (same root, disjoint projections).
+#   T4 — whole-root delete vs child modify conflict (projection prefix,
+#        delete present).
+#   T5 — the typed address families: Member / MirNode / RowKey identity and
+#        the place_projection_overlap predicate.
 #   F1 — no MirProgram: empty facts.
 #   F2 — the let/inout/sink call fixture: four facts (read / read+write+
 #        exclusive / read+consumed / destination write).
@@ -1128,18 +1781,19 @@ def planning_lane_write_read_check() -> Vec[String]
     "m::lower#fn()->int".to_string()
   ]))
 
-  # E1 — the resource set: the three added class bits, the normalized
-  # capability texts (capability row cap1 + effect-view id 3 -> cap3), the
-  # allocation functions of the newly-alloc rows.
+  # E1 — the TYPED resource set: the three added class bits, the typed
+  # CapabilityId records (capability row cap1 + effect-view id 3 -> cap3),
+  # the StableDeclId allocation rows. The text lists are the display
+  # renders (effect_resource_set_*).
   let res = effect_resource_set_of_delta(&d)
-  planning_lane_keys(&mut out, "E1-resources-effects", res.effects.clone(), Vec::from([
+  planning_lane_keys(&mut out, "E1-resources-effects", effect_resource_set_effect_words(&res), Vec::from([
     "alloc".to_string(), "block".to_string(), "io".to_string()
   ]))
-  planning_lane_keys(&mut out, "E1-resources-capabilities", res.capabilities.clone(), Vec::from([
+  planning_lane_keys(&mut out, "E1-resources-capabilities", effect_resource_set_capability_texts(&res), Vec::from([
     "cap1".to_string(), "cap3".to_string()
   ]))
-  planning_lane_keys(&mut out, "E1-resources-allocations", res.allocations.clone(), Vec::from([
-    "m::B#fn()->unit".to_string()
+  planning_lane_keys(&mut out, "E1-resources-allocations", effect_resource_set_allocation_texts(&res), Vec::from([
+    "m::B".to_string()
   ]))
   out
 end
@@ -1314,24 +1968,136 @@ def planning_lane_merge_check() -> Vec[String]
   planning_lane_keys(&mut out, "M2-conflicts", m2.write_conflicts.clone(), Vec::new())
   planning_lane_text(&mut out, "M2-verdict", m2.verdict.clone(), "review")
 
-  # M3 — both write m::B: conflict (the same key plus A's m::B|p write,
-  # whose owner root is m::B too).
+  # M3 — both write the m::B declaration (Modify+Modify at the same typed
+  # Decl address): conflict. The place/row-key entries do NOT conflict with
+  # a plain Modify (no Delete present).
   let m3 = semantic_merge_risk(&a, &planning_lane_delta_conflict_exact())
   planning_lane_keys(&mut out, "M3-conflicts", m3.write_conflicts.clone(), Vec::from([
-    "m::B#fn()->unit".to_string(),
-    "m::B#fn()->unit|p".to_string()
+    "m::B".to_string()
   ]))
   planning_lane_text(&mut out, "M3-verdict", m3.verdict.clone(), "conflict")
 
-  # M4 — m::B|q vs the m::B / m::B|p writes: same owner root -> conflict
-  # (the union of the conflicting keys, sorted).
+  # M4 — m::B|q vs the m::B / m::B|p writes under the old root rule: with
+  # exact projection overlap the sibling ownership writes are independent;
+  # the shared affected envelope (m::B) still forces "review" (never a
+  # write conflict).
   let m4 = semantic_merge_risk(&a, &planning_lane_delta_conflict_root())
-  planning_lane_keys(&mut out, "M4-conflicts", m4.write_conflicts.clone(), Vec::from([
-    "m::B#fn()->unit".to_string(),
-    "m::B#fn()->unit|p".to_string(),
-    "m::B#fn()->unit|q".to_string()
+  planning_lane_keys(&mut out, "M4-conflicts", m4.write_conflicts.clone(), Vec::new())
+  planning_lane_text(&mut out, "M4-verdict", m4.verdict.clone(), "review")
+
+  out
+end
+
+# ————— (fourth-audit P1-2) the typed-merge lane fixtures —————
+
+# One ownership row at the given place (before/after drive the write kind).
+def planning_lane_place_delta(place: String, before: String, after: String) -> SemanticDelta
+  var d = semantic_delta_empty()
+  d.ownership_delta = Vec::from([OwnershipDelta {
+    function: "m::B#fn()->unit".to_string(),
+    place: place,
+    before: before,
+    after: after
+  }])
+  d
+end
+
+# A removed entity delta (semantic_delta_empty's removed default is empty;
+# this sets it explicitly on a copy).
+def planning_lane_removed_delta() -> SemanticDelta
+  var d = semantic_delta_empty()
+  d.removed = Vec::from(["m::B#fn()->unit".to_string()])
+  d
+end
+
+# The P1-2 merge tests: same-entity deletes, same-field modifies, sibling
+# fields, whole-root delete vs child modify, and the typed address union.
+def planning_lane_typed_merge_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # T1 — same-entity deletes conflict (both sides kind Delete, same Decl).
+  let t1 = semantic_merge_risk(&planning_lane_removed_delta(), &planning_lane_removed_delta())
+  planning_lane_keys(&mut out, "T1-conflicts", t1.write_conflicts.clone(), Vec::from([
+    "m::B".to_string()
   ]))
-  planning_lane_text(&mut out, "M4-verdict", m4.verdict.clone(), "conflict")
+  planning_lane_text(&mut out, "T1-verdict", t1.verdict.clone(), "conflict")
+
+  # T2 — same-field modifies conflict (same function-scoped Place address).
+  let t2 = semantic_merge_risk(
+    &planning_lane_place_delta("s.f".to_string(), "let".to_string(), "inout".to_string()),
+    &planning_lane_place_delta("s.f".to_string(), "let".to_string(), "sink".to_string()))
+  planning_lane_keys(&mut out, "T2-conflicts", t2.write_conflicts.clone(), Vec::from([
+    "m::B|s.f".to_string()
+  ]))
+  planning_lane_text(&mut out, "T2-verdict", t2.verdict.clone(), "conflict")
+
+  # T3 — sibling fields independent (same root, non-overlapping field
+  # projections, disjoint affected envelopes).
+  let t3 = semantic_merge_risk(
+    &planning_lane_place_delta("s.a".to_string(), "let".to_string(), "inout".to_string()),
+    &planning_lane_place_delta("s.b".to_string(), "let".to_string(), "inout".to_string()))
+  planning_lane_keys(&mut out, "T3-conflicts", t3.write_conflicts.clone(), Vec::new())
+  planning_lane_text(&mut out, "T3-verdict", t3.verdict.clone(), "independent")
+
+  # T4 — whole-root delete vs child modify conflict (empty projection list
+  # is a prefix of every child chain; one side is a Delete).
+  let t4 = semantic_merge_risk(
+    &planning_lane_place_delta("s".to_string(), "let".to_string(), "".to_string()),
+    &planning_lane_place_delta("s.f".to_string(), "let".to_string(), "inout".to_string()))
+  planning_lane_keys(&mut out, "T4-conflicts", t4.write_conflicts.clone(), Vec::from([
+    "m::B|s".to_string(),
+    "m::B|s.f".to_string()
+  ]))
+  planning_lane_text(&mut out, "T4-verdict", t4.verdict.clone(), "conflict")
+
+  # T5 — the typed address families and the projection-overlap predicate.
+  let owner = stable_decl_of_key("m::B#fn()->unit".to_string())
+  let ml_f = planning_member_lineage(owner.clone(), "field".to_string(), "f".to_string())
+  let ml_f2 = planning_member_lineage(owner.clone(), "field".to_string(), "f".to_string())
+  let ml_g = planning_member_lineage(owner.clone(), "field".to_string(), "g".to_string())
+  planning_lane_bool(&mut out, "T5-member-same", semantic_address_same(
+    SemanticAddress::Member(ml_f.clone()), SemanticAddress::Member(ml_f2)))
+  planning_lane_bool(&mut out, "T5-member-diff", !semantic_address_same(
+    SemanticAddress::Member(ml_f), SemanticAddress::Member(ml_g)))
+
+  let mir_a = stable_mir_node_id_of_generated(
+    "m::B#fn()->unit".to_string(), "inline".to_string(), "inl-7".to_string(), "body".to_string(), 3)
+  let mir_b = stable_mir_node_id_of_generated(
+    "m::B#fn()->unit".to_string(), "inline".to_string(), "inl-7".to_string(), "body".to_string(), 3)
+  planning_lane_bool(&mut out, "T5-mirnode-same", semantic_address_same(
+    SemanticAddress::MirNode(mir_a.clone()), SemanticAddress::MirNode(mir_b)))
+
+  let row_a = stable_row_key_or_text("capability-row".to_string(), "m::B#fn()->unit|cap1".to_string())
+  let row_b = stable_row_key_or_text("capability-row".to_string(), "m::B#fn()->unit|cap1".to_string())
+  let row_c = stable_row_key_or_text("capability-row".to_string(), "m::B#fn()->unit|cap2".to_string())
+  planning_lane_bool(&mut out, "T5-rowkey-same", semantic_address_same(
+    SemanticAddress::RowKey(row_a.clone()), SemanticAddress::RowKey(row_b)))
+  planning_lane_bool(&mut out, "T5-rowkey-diff", !semantic_address_same(
+    SemanticAddress::RowKey(row_a), SemanticAddress::RowKey(row_c)))
+
+  match planning_place_id_scoped("m::B#fn()->unit".to_string(), "s".to_string())
+  when Option::Some(p_root) then
+    match planning_place_id_scoped("m::B#fn()->unit".to_string(), "s.f".to_string())
+    when Option::Some(p_child) then
+      planning_lane_bool(&mut out, "T5-prefix-overlap", place_projection_overlap(&p_root, &p_child))
+      planning_lane_bool(&mut out, "T5-delete-vs-child", semantic_write_conflicts(
+        SemanticWrite { address: SemanticAddress::Place(p_root.clone()), kind: SemanticWriteKind::Delete },
+        SemanticWrite { address: SemanticAddress::Place(p_child.clone()), kind: SemanticWriteKind::Modify }))
+      match planning_place_id_scoped("m::B#fn()->unit".to_string(), "s.g".to_string())
+      when Option::Some(p_sibling) then
+        planning_lane_bool(&mut out, "T5-sibling-no-overlap", !place_projection_overlap(&p_child, &p_sibling))
+        planning_lane_bool(&mut out, "T5-sibling-modifies", !semantic_write_conflicts(
+          SemanticWrite { address: SemanticAddress::Place(p_child.clone()), kind: SemanticWriteKind::Modify },
+          SemanticWrite { address: SemanticAddress::Place(p_sibling), kind: SemanticWriteKind::Modify }))
+      when Option::None then
+        out.push("T5-sibling fixture: place parse failed")
+      end
+    when Option::None then
+      out.push("T5-child fixture: place parse failed")
+    end
+  when Option::None then
+    out.push("T5-root fixture: place parse failed")
+  end
 
   out
 end
@@ -1466,6 +2232,9 @@ pub def semantic_planning_lane_check() -> Vec[String]
     out.push(row)
   end
   for row in planning_lane_merge_check() do
+    out.push(row)
+  end
+  for row in planning_lane_typed_merge_check() do
     out.push(row)
   end
   for row in planning_lane_memory_check() do

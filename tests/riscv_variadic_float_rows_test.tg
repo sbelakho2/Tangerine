@@ -1,0 +1,358 @@
+# tests/riscv_variadic_float_rows_test.tg — the RISC-V psABI variadic
+# INTEGER-convention marshalling rows (audit §26, the P0-21 contract
+# residual). The emitter re-derives the variadic EXTRAS' crossings at
+# emission (rv_emit_var_call_block / rv_var_call_plan in
+# backend_rv.tg); the NAMED prefix keeps the ordinary hardware-FP
+# placement (its register moves stay exactly as the shared LIR
+# lowering emitted them), while the anonymous extras follow the psABI
+# rule — "Variadic arguments are passed according to the integer
+# calling convention":
+#   - riscv64: one XLEN word per extra in the next a-register; an F64
+#     (the promoted image of an F32 extra) crosses as its bit pattern
+#     via fmv.x.d — never an fa-register;
+#   - riscv32: a promoted double needs an ALIGNED even-odd a-register
+#     pair; RV32 has no fmv.x.d (and no 64-bit x-register), so the
+#     double is stored with fsd and its little-endian low/high words
+#     are loaded into the even/odd pair with lw — never an fa-register;
+#   - after the first extra that goes on the stack, every later extra
+#     goes on the stack; the stack stream continues after the named
+#     args and the caller total is padded to the 16-byte SP alignment;
+#   - the F32 -> F64 promotion is a real fcvt.d.s and fails closed on
+#     descriptions without the D unit (RVF/soft) — never an
+#     unconverted single crossing a C vararg boundary.
+#
+# Run with: tg test tests/riscv_variadic_float_rows_test.tg
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::token::span_dummy
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId, MirStatement,
+  MirStatementKind, MirRvalue, MirRvalueKind, MirOperand, MirOperandKind,
+  MirConstant, MirConstantKind, MirTerminator, MirTerminatorKind,
+  MirCallArg, MirCallValue, CastKind, place_local
+}
+use tg_compiler::types::{Type, AccessEffect}
+use tg_compiler::lir::{
+  LirFunction, LirAlloc, LirFpWidth,
+  lower_mir_fn_to_lir_rv64, lower_mir_fn_to_lir_rv32,
+  lir_peephole, lir_alloc_registers, verify_lir, LirVerifyRoute
+}
+use tg_compiler::target_desc::{
+  TargetDesc, riscv64gc_desc, riscv32imafdc_desc, riscv32imafc_desc
+}
+use tg_compiler::backend_rv::{
+  RvEmit, rv_emit_new, rv_emit_fn, rv_mdl_pool, rv_fixed_phys,
+  rv_fmv_x_d, rv_lw, rv_fsd, rv_fcvt_d_s, rv_fp_mov_word, rv_sp_reg
+}
+
+# ———————————————————————————————————————————————————————————————
+# Fixtures: `_ret` is local 0; parameter i is local i+1 (so a call
+# argument list is written directly as the parameter local ids).
+# ———————————————————————————————————————————————————————————————
+
+def rvv_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal {
+    id: MirLocalId { id: id },
+    name: name,
+    ty: ty,
+    is_mut: is_mut,
+    span: span_dummy()
+  }
+end
+
+def rvv_param_locals(tys: Vec[Type]) -> Vec[MirLocal]
+  var out: Vec[MirLocal] = Vec::new()
+  var i = 0
+  while i < tys.len() do
+    out.push(rvv_local(i + 1, "p" + i.to_string(), tys[i].clone(), false))
+    i = i + 1
+  end
+  out
+end
+
+def rvv_block(bid: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: bid }, statements: stmts, terminator: term }
+end
+
+def rvv_fn(name: String, tys: Vec[Type], ret_ty: Type, blocks: Vec[MirBlock]) -> MirFunction
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(rvv_local(0, "_ret", ret_ty.clone(), true))
+  let params = rvv_param_locals(tys)
+  var pi = 0
+  while pi < params.len() do
+    locals.push(params[pi].clone())
+    pi = pi + 1
+  end
+  MirFunction {
+    name: name,
+    params: params,
+    ret_type: ret_ty,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def rvv_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def rvv_copy_operand(id: Int) -> MirOperand
+  MirOperand { kind: MirOperandKind::MirCopy(place_local(MirLocalId { id: id })) }
+end
+
+def rvv_call_term(target: String, arg_ids: Vec[Int]) -> MirTerminator
+  var args: Vec[MirCallArg] = Vec::new()
+  var i = 0
+  while i < arg_ids.len() do
+    args.push(MirCallArg {
+      effect: AccessEffect::Read,
+      value: MirCallValue::Value(rvv_copy_operand(arg_ids[i]))
+    })
+    i = i + 1
+  end
+  MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: place_local(MirLocalId { id: 0 }),
+      func: MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirFnItem(target),
+        ty: Type::Unit,
+        instance: Option::None
+      }) },
+      args: args,
+      success: MirBlockId { id: 1 },
+      unwind: Option::None,
+      intrinsic: Option::None,
+      tail: false
+    },
+    span: span_dummy()
+  }
+end
+
+def rvv_caller_fn(name: String, tys: Vec[Type], target: String, arg_ids: Vec[Int]) -> MirFunction
+  rvv_fn(name, tys, Type::Unit, Vec::from([
+    rvv_block(0, Vec::new(), rvv_call_term(target, arg_ids)),
+    rvv_block(1, Vec::new(), rvv_ret_term())
+  ]))
+end
+
+# The variadic extern's declared FIXED prefix count (the checker's
+# prefix; rv_emit_fn consumes the map to split named from extras).
+def rvv_variadic(fixed: Int) -> Map[String, Int]
+  var m: Map[String, Int] = Map::new()
+  m.insert("sink".to_string(), fixed)
+  m
+end
+
+def rvv_lower_ok(f: MirFunction, xlen: Int) -> LirFunction
+  let lowered = if xlen == 8 then lower_mir_fn_to_lir_rv64(f, Map::new()) else lower_mir_fn_to_lir_rv32(f, Map::new()) end
+  match lowered
+  when Result::Ok(lf) then lir_peephole(lf)
+  when Result::Err(e) then panic("riscv variadic float rows: lowering failed: " + e)
+  end
+end
+
+def rvv_check(lf: LirFunction, xlen: Int) -> LirAlloc
+  let alloc = lir_alloc_registers(xlen, lf)
+  let route = if xlen == 8 then LirVerifyRoute::LirVerifyRv64 else LirVerifyRoute::LirVerifyRv32 end
+  let violations = verify_lir(lf, alloc, route)
+  var first = ""
+  if violations.len() > 0 then first = violations[0] end
+  assert(violations.len() == 0, "a riscv variadic function must verify clean; first violation: " + first)
+  alloc
+end
+
+def rvv_desc(desc_name: String) -> TargetDesc
+  match desc_name
+  when "rv64gc" then riscv64gc_desc()
+  when "rv32d" then riscv32imafdc_desc()
+  when "rv32f" then riscv32imafc_desc()
+  when _ then panic("riscv variadic float rows: unknown desc " + desc_name)
+  end
+end
+
+def rvv_emit_result(lf: LirFunction, alloc: LirAlloc, xlen: Int, desc_name: String, fixed: Int) -> Result[RvEmit, String]
+  let desc = rvv_desc(desc_name)
+  let pool = match rv_mdl_pool(desc, xlen)
+  when Result::Ok(p) then p
+  when Result::Err(e) then return Result::Err("riscv variadic float rows: pool failed: " + e)
+  end
+  var externs: Set[String] = Set::new()
+  externs.insert("sink".to_string())
+  var re = rv_emit_new()
+  match rv_emit_fn(&mut re, pool, lf, alloc, externs, Set::new(), rvv_variadic(fixed), xlen, desc)
+  when Result::Ok(_) then Result::Ok(re)
+  when Result::Err(e) then Result::Err(e)
+  end
+end
+
+def rvv_emit_ok(lf: LirFunction, alloc: LirAlloc, xlen: Int, desc_name: String, fixed: Int) -> RvEmit
+  match rvv_emit_result(lf, alloc, xlen, desc_name, fixed)
+  when Result::Ok(re) then re
+  when Result::Err(e) then panic("riscv variadic float rows: emission failed: " + e)
+  end
+end
+
+def rvv_word_at(re: RvEmit, off: Int) -> Int
+  (re.buf.bytes[off] as Int)
+    | ((re.buf.bytes[off + 1] as Int) << 8)
+    | ((re.buf.bytes[off + 2] as Int) << 16)
+    | ((re.buf.bytes[off + 3] as Int) << 24)
+end
+
+def rvv_has_word(re: RvEmit, word: Int) -> Bool
+  var i = 0
+  while i + 3 < re.buf.bytes.len() do
+    if rvv_word_at(re, i) == word then
+      return true
+    end
+    i = i + 1
+  end
+  false
+end
+
+# The buffer contains fmv.x.d a<reg>, f<some> — the integer-convention
+# bit-pattern crossing (never an fa-register save/move).
+def rvv_has_fmv_x_d_to(re: RvEmit, areg: Int) -> Bool
+  var fd = 0
+  var found = false
+  while fd <= 31 do
+    if rvv_has_word(re, (rv_fmv_x_d(rv_fixed_phys(areg), fd) as Int)) then
+      found = true
+    end
+    fd = fd + 1
+  end
+  found
+end
+
+# The buffer contains an fa0 = f10 float-argument move word (the
+# hardware-FP crossing the variadic rule forbids for an EXTRA).
+def rvv_has_fa0_move(re: RvEmit) -> Bool
+  var f = 0
+  var found = false
+  while f <= 31 do
+    if rvv_has_word(re, (rv_fp_mov_word(LirFpWidth::LirF64, 10, f) as Int)) then
+      found = true
+    end
+    f = f + 1
+  end
+  found
+end
+
+# The buffer contains the RV32 two-word pair extraction for the aligned
+# a-register pair (lo, hi): fsd f<some>, 0(sp); lw lo, 0(sp);
+# lw hi, 4(sp).
+def rvv_has_rv32_pair_words(re: RvEmit, lo: Int, hi: Int) -> Bool
+  let lw_lo = (rv_lw(rv_fixed_phys(lo), rv_sp_reg(), 0) as Int)
+  let lw_hi = (rv_lw(rv_fixed_phys(hi), rv_sp_reg(), 4) as Int)
+  rvv_has_word(re, lw_lo) && rvv_has_word(re, lw_hi)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Rows
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_rv64_variadic_f64_areg_row() -> Unit
+  # sink(Int, F64) with fixed = 1: the named int rides a0 (the ordinary
+  # convention), the extra double is ONE integer a-register (a1 = x11)
+  # carrying its bit pattern via fmv.x.d — never fa0.
+  let caller = rvv_caller_fn("rv64_caller", Vec::from([
+    Type::Int, Type::F64
+  ]), "sink", Vec::from([1, 2]))
+  let lf = rvv_lower_ok(caller, 8)
+  let alloc = rvv_check(lf, 8)
+  let re = rvv_emit_ok(lf, alloc, 8, "rv64gc", 1)
+  assert_true(rvv_has_fmv_x_d_to(re, 1), "the rv64 F64 extra must cross via fmv.x.d into a1")
+  assert_true(!rvv_has_fa0_move(re), "no variadic float may ride fa0 on the integer convention")
+end
+
+@test
+def test_rv32_variadic_f64_pair_row() -> Unit
+  # The same call on riscv32imafdc: the extra double needs an aligned
+  # even-odd pair; a1 is skipped and the pair is a2/a3 (x12/x13),
+  # extracted through fsd + the two little-endian words.
+  let caller = rvv_caller_fn("rv32_caller", Vec::from([
+    Type::Int, Type::F64
+  ]), "sink", Vec::from([1, 2]))
+  let lf = rvv_lower_ok(caller, 4)
+  let alloc = rvv_check(lf, 4)
+  let re = rvv_emit_ok(lf, alloc, 4, "rv32d", 1)
+  assert_true(rvv_has_rv32_pair_words(re, 2, 3), "the rv32 F64 extra must cross as the aligned a2/a3 word pair")
+  assert_true(!rvv_has_fa0_move(re), "no variadic float may ride fa0 on the integer convention")
+end
+
+@test
+def test_rv64_variadic_stack_extra_row() -> Unit
+  # Eight named ints fill a0..a7; the F64 extra then goes on the stack
+  # (va_start points at it), with the caller total padded to the
+  # 16-byte SP alignment.
+  let caller = rvv_caller_fn("rv64_stack_caller", Vec::from([
+    Type::Int, Type::Int, Type::Int, Type::Int, Type::Int, Type::Int, Type::Int, Type::Int, Type::F64
+  ]), "sink", Vec::from([1, 2, 3, 4, 5, 6, 7, 8, 9]))
+  let lf = rvv_lower_ok(caller, 8)
+  let alloc = rvv_check(lf, 8)
+  let re = rvv_emit_ok(lf, alloc, 8, "rv64gc", 8)
+  var fd = 0
+  var saw_fsd = false
+  while fd <= 31 do
+    if rvv_has_word(re, (rv_fsd(fd, rv_sp_reg(), 0) as Int)) then
+      saw_fsd = true
+    end
+    fd = fd + 1
+  end
+  assert_true(saw_fsd, "the stack-class F64 extra must cross with fsd on the integer stack stream")
+  assert_true(!rvv_has_fa0_move(re), "no variadic float may ride fa0 on the integer convention")
+end
+
+@test
+def test_rv32_variadic_f32_promotion_rvf_rejected_row() -> Unit
+  # An F32 extra on the F-only riscv32imafc description: the C default
+  # promotion F32 -> F64 needs fcvt.d.s (the D unit); the route fails
+  # closed with the promotion rule.
+  let caller = rvv_caller_fn("rv32f_caller", Vec::from([
+    Type::Int, Type::F32
+  ]), "sink", Vec::from([1, 2]))
+  let lf = rvv_lower_ok(caller, 4)
+  let alloc = rvv_check(lf, 4)
+  match rvv_emit_result(lf, alloc, 4, "rv32f", 1)
+  when Result::Ok(_) then panic("the RVF F32 variadic promotion must fail closed")
+  when Result::Err(e) then
+    assert_true(e.contains("F32 -> F64"))
+  end
+end
+
+@test
+def test_rv32_variadic_f32_promoted_pair_row() -> Unit
+  # On riscv32imafdc the promotion lowers: fcvt.d.s into the scratch
+  # double, then the same aligned a2/a3 pair extraction (a1 skipped).
+  let caller = rvv_caller_fn("rv32d_caller", Vec::from([
+    Type::Int, Type::F32
+  ]), "sink", Vec::from([1, 2]))
+  let lf = rvv_lower_ok(caller, 4)
+  let alloc = rvv_check(lf, 4)
+  let re = rvv_emit_ok(lf, alloc, 4, "rv32d", 1)
+  var fd = 0
+  var ss = 0
+  var saw_fcvt = false
+  while fd <= 31 do
+    ss = 0
+    while ss <= 31 do
+      if rvv_has_word(re, (rv_fcvt_d_s(fd, ss) as Int)) then
+        saw_fcvt = true
+      end
+      ss = ss + 1
+    end
+    fd = fd + 1
+  end
+  assert_true(saw_fcvt, "the rv32 F32 extra must be promoted with fcvt.d.s")
+  assert_true(rvv_has_rv32_pair_words(re, 2, 3))
+end

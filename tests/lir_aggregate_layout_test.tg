@@ -1,0 +1,741 @@
+# tests/lir_aggregate_layout_test.tg — THE P0-21 AGGREGATE-LAYOUT SLICE
+# of the LIR route: tuples, fixed arrays, nested aggregates, @packed /
+# @align structs, sub-word fields and zero-field structs all lower/emit
+# from layout_engine's concrete records (the direct pipeline's offsets,
+# strides and sizes), not from the retired whole-word-per-field gate.
+#
+# What this suite pins:
+#   1. ADMISSION (layout-driven): the admitted shape's size/words/field
+#      offsets/sizes/recursion equal the layout authority's records for
+#      (a) a 2-field tuple, (b) a fixed array [Int; 3], (c) a nested
+#      struct, (d) a @packed 12-byte struct (offsets 0/4/8), (e) an
+#      @align(16) struct (tail-padded size 16), (f) a sub-word struct
+#      (u8/i16/u8), (g) a zero-field struct (size 0, words 0), (h) a
+#      struct with an ENUM field (one canonical value word at the
+#      field's engine offset, enum_nested carrying the variant table);
+#      the unknown-layout boundary (an unregistered named type) stays
+#      fail-closed with its named rule;
+#   2. EMISSION (real offsets): sub-word fields emit width-sized frame
+#      accesses at the layout byte offsets (the store widths 1/2/4 and
+#      the signed i16 read's sign extension), packed fields emit the
+#      unaligned-safe accesses, nested fields emit their sub-image byte
+#      copies, and the zero-sized construction/copy is a no-op word
+#      group (no pointers, no slots);
+#   3. CROSSINGS: the class helpers answer from the actual layout sizes
+#      (<= 8 bytes Scalar-class, > 8 bytes sret with ceil(size/8) words,
+#      size 0 zero-sized) AND the AbiCallPlan cross-check
+#      (lir_check_agg_class_plan) agrees with the single authority for
+#      every admitted shape;
+#   4. the verifier stays clean on every lowered row.
+#
+# Run with: tg test tests/lir_aggregate_layout_test.tg
+
+use std::core::{Option, Result, Int, UInt, Unit, Bool, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::ast::{layout_attrs_plain, LayoutAttrs}
+use tg_compiler::ids::{TypeId, FieldId, ModuleId}
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId, MirStatement,
+  MirStatementKind, MirRvalue, MirRvalueKind, MirOperand, MirOperandKind,
+  MirConstant, MirConstantKind, MirTerminator, MirTerminatorKind,
+  MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef,
+  AggregateKind, Place, Projection, place_local
+}
+use tg_compiler::token::span_dummy
+use tg_compiler::target_desc::aarch64_desc
+use tg_compiler::types::Type
+use tg_compiler::lir::{
+  LirFunction, LirVerifyRoute, LirAggShape, LirAggShapeKind,
+  LirPtrOp,
+  lir_plain_struct_shape, lir_check_agg_class_plan,
+  lir_agg_sret_words, lir_agg_is_scalar_class, lir_agg_is_zero_sized,
+  lower_mir_fn_to_lir_prog, lir_alloc_registers_a64,
+  verify_lir
+}
+
+# ———————————————————————————————————————————————————————————————
+# Fixtures: the struct/tuple/array type universe of the suite.
+# ———————————————————————————————————————————————————————————————
+
+def al_packed_attrs() -> LayoutAttrs
+  LayoutAttrs { is_repr_c: false, is_packed: true, align: Option::None, span: span_dummy() }
+end
+
+def al_aligned_attrs(n: Int) -> LayoutAttrs
+  LayoutAttrs { is_repr_c: false, is_packed: false, align: Option::Some(n), span: span_dummy() }
+end
+
+def al_struct_def(id: Int, name: String, fields: Vec[(String, Type)], layout: LayoutAttrs) -> MirTypeDef
+  var fs: Vec[MirFieldDef] = Vec::new()
+  var i = 0
+  while i < fields.len() do
+    fs.push(MirFieldDef { name: fields[i].0.clone(), ty: fields[i].1.clone() })
+    i = i + 1
+  end
+  MirTypeDef {
+    id: TypeId { id: id },
+    name: name,
+    kind: MirTypeDefKind::Struct(fs),
+    generic_params: Vec::new(),
+    layout: layout
+  }
+end
+
+def al_enum_def(id: Int, name: String, variants: Vec[MirVariantDef]) -> MirTypeDef
+  MirTypeDef {
+    id: TypeId { id: id },
+    name: name,
+    kind: MirTypeDefKind::Enum(variants),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def al_type_defs() -> Map[Int, MirTypeDef]
+  var defs: Map[Int, MirTypeDef] = Map::new()
+  # 200: enum InnerEnum { A, B } — the enum-field fixture (admitted as
+  # one canonical value word by the aggregate-residual slice).
+  defs.insert(200, al_enum_def(200, "InnerEnum", Vec::from([
+    MirVariantDef { name: "A".to_string(), discriminant: 0, fields: Vec::new() },
+    MirVariantDef { name: "B".to_string(), discriminant: 1, fields: Vec::new() }
+  ])))
+  # 201: struct Inner { x: Int, y: Int }
+  defs.insert(201, al_struct_def(201, "Inner", Vec::from([
+    ("x".to_string(), Type::Int),
+    ("y".to_string(), Type::Int)
+  ]), layout_attrs_plain(span_dummy())))
+  # 202: struct Outer { inner: Inner, c: Int } — nested aggregate.
+  defs.insert(202, al_struct_def(202, "Outer", Vec::from([
+    ("inner".to_string(), al_inner_ty()),
+    ("c".to_string(), Type::Int)
+  ]), layout_attrs_plain(span_dummy())))
+  # 203: @packed struct Packed12 { a: U32, b: U32, c: U32 } — offsets 0/4/8.
+  defs.insert(203, al_struct_def(203, "Packed12", Vec::from([
+    ("a".to_string(), Type::U32),
+    ("b".to_string(), Type::U32),
+    ("c".to_string(), Type::U32)
+  ]), al_packed_attrs()))
+  # 204: @align(16) struct Aligned16 { a: Int } — size tail-padded to 16.
+  defs.insert(204, al_struct_def(204, "Aligned16", Vec::from([
+    ("a".to_string(), Type::Int)
+  ]), al_aligned_attrs(16)))
+  # 205: struct SubWord { a: U8, b: I16, c: U8 } — sub-word fields.
+  defs.insert(205, al_struct_def(205, "SubWord", Vec::from([
+    ("a".to_string(), Type::U8),
+    ("b".to_string(), Type::I16),
+    ("c".to_string(), Type::U8)
+  ]), layout_attrs_plain(span_dummy())))
+  # 206: struct Empty {} — zero-field / zero-sized.
+  defs.insert(206, al_struct_def(206, "Empty", Vec::new(), layout_attrs_plain(span_dummy())))
+  # 207: struct HasEnum { e: InnerEnum } — an enum-typed field (one
+  # canonical value word at the field's engine offset; the aggregate-
+  # residual slice).
+  defs.insert(207, al_struct_def(207, "HasEnum", Vec::from([
+    ("e".to_string(), al_inner_enum_ty())
+  ]), layout_attrs_plain(span_dummy())))
+  # 208: struct HasMissing { m: 999 } — an unregistered named type: the
+  # unknown-layout fail-closed fixture.
+  defs.insert(208, al_struct_def(208, "HasMissing", Vec::from([
+    ("m".to_string(), Type::Adt(TypeId { id: 999 }, Vec::new()))
+  ]), layout_attrs_plain(span_dummy())))
+  defs
+end
+
+def al_tuple2_ty() -> Type
+  Type::Tuple(Vec::from([Type::Int, Type::Int]))
+end
+def al_array3_ty() -> Type
+  Type::FixedArray(Type::Int, 3)
+end
+def al_inner_ty() -> Type
+  Type::Adt(TypeId { id: 201 }, Vec::new())
+end
+def al_outer_ty() -> Type
+  Type::Adt(TypeId { id: 202 }, Vec::new())
+end
+def al_packed12_ty() -> Type
+  Type::Adt(TypeId { id: 203 }, Vec::new())
+end
+def al_aligned16_ty() -> Type
+  Type::Adt(TypeId { id: 204 }, Vec::new())
+end
+def al_subword_ty() -> Type
+  Type::Adt(TypeId { id: 205 }, Vec::new())
+end
+def al_empty_ty() -> Type
+  Type::Adt(TypeId { id: 206 }, Vec::new())
+end
+def al_inner_enum_ty() -> Type
+  Type::Adt(TypeId { id: 200 }, Vec::new())
+end
+def al_has_enum_ty() -> Type
+  Type::Adt(TypeId { id: 207 }, Vec::new())
+end
+def al_has_missing_ty() -> Type
+  Type::Adt(TypeId { id: 208 }, Vec::new())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Fixture helpers.
+# ———————————————————————————————————————————————————————————————
+
+def al_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal { id: MirLocalId { id: id }, name: name, ty: ty, is_mut: is_mut, span: span_dummy() }
+end
+
+def al_block(bid: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: bid }, statements: stmts, terminator: term }
+end
+
+def al_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def al_int_operand(v: Int, ty: Type) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirInt(v),
+      ty: ty,
+      instance: Option::None
+    })
+  }
+end
+
+def al_copy_operand(p: Place) -> MirOperand
+  MirOperand { kind: MirOperandKind::MirCopy(p) }
+end
+
+def al_place(id: Int) -> Place
+  place_local(MirLocalId { id: id })
+end
+
+def al_field_place(id: Int, owner: Int, field: Int) -> Place
+  var p = al_place(id)
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: owner }, index: field }))
+  p
+end
+
+def al_assign_stmt(dst: Place, rv: MirRvalue) -> MirStatement
+  MirStatement { kind: MirStatementKind::MirAssign(dst, rv), span: span_dummy() }
+end
+
+def al_move_rvalue(op: MirOperand) -> MirRvalue
+  MirRvalue { kind: MirRvalueKind::MirMove(op), span: span_dummy() }
+end
+
+def al_agg_rvalue(kind: AggregateKind, ops: Vec[MirOperand]) -> MirRvalue
+  MirRvalue { kind: MirRvalueKind::MirAggregate(kind, ops), span: span_dummy() }
+end
+
+def al_fn_ret(name: String, ret_ty: Type, locals: Vec[MirLocal], stmts: Vec[MirStatement]) -> MirFunction
+  MirFunction {
+    name: name,
+    params: Vec::new(),
+    ret_type: ret_ty,
+    locals: locals,
+    blocks: Vec::from([al_block(0, stmts, al_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def al_fn_param(name: String, param_ty: Type, ret_ty: Type, locals: Vec[MirLocal], stmts: Vec[MirStatement]) -> MirFunction
+  MirFunction {
+    name: name,
+    params: Vec::from([al_local(1, "arg", param_ty, false)]),
+    ret_type: ret_ty,
+    locals: locals,
+    blocks: Vec::from([al_block(0, stmts, al_ret_term())]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def al_lower(f: MirFunction, defs: Map[Int, MirTypeDef]) -> LirFunction
+  match lower_mir_fn_to_lir_prog(f, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Err(e) then panic("aggregate-layout test lowering failed for " + f.name + ": " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def al_verify_clean(f: LirFunction, what: String) -> Unit
+  let alloc = lir_alloc_registers_a64(f)
+  let violations = verify_lir(f, alloc, LirVerifyRoute::LirVerifyA64)
+  var first = ""
+  if violations.len() > 0 then first = violations[0] end
+  assert(violations.len() == 0, what + " must verify clean; first violation: " + first)
+end
+
+def al_shape(defs: Map[Int, MirTypeDef], ty: Type, what: String) -> LirAggShape
+  match lir_plain_struct_shape(defs, ty)
+  when Result::Err(e) then panic(what + " shape admission failed: " + e)
+  when Result::Ok(o) then
+    match o
+    when Option::Some(kind) then
+      match kind
+      when LirAggShapeKind::LirAggStruct(s) then s
+      when LirAggShapeKind::LirAggEnum(_) then panic(what + " admitted as an enum shape")
+      end
+    when Option::None then panic(what + " did not admit as an aggregate")
+    end
+  end
+end
+
+def al_ptr_loads(f: LirFunction) -> Vec[(Int, Int, Bool)]
+  var out: Vec[(Int, Int, Bool)] = Vec::new()
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].ptr
+      when Option::Some(pop) then
+        match pop
+        when LirPtrOp::LirPtrLoad(_, _, off, w, sign) then out.push((off, w, sign))
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+def al_ptr_stores(f: LirFunction) -> Vec[(Int, Int)]
+  var out: Vec[(Int, Int)] = Vec::new()
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].ptr
+      when Option::Some(pop) then
+        match pop
+        when LirPtrOp::LirPtrStore(_, off, _, w) then out.push((off, w))
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+def al_has_store(stores: Vec[(Int, Int)], off: Int, w: Int) -> Bool
+  var found = false
+  var i = 0
+  while i < stores.len() do
+    if stores[i].0 == off && stores[i].1 == w then found = true end
+    i = i + 1
+  end
+  found
+end
+
+def al_has_load(loads: Vec[(Int, Int, Bool)], off: Int, w: Int, sign: Bool) -> Bool
+  var found = false
+  var i = 0
+  while i < loads.len() do
+    if loads[i].0 == off && loads[i].1 == w && loads[i].2 == sign then found = true end
+    i = i + 1
+  end
+  found
+end
+
+def al_count_stores(stores: Vec[(Int, Int)]) -> Int
+  stores.len()
+end
+
+# Build a one-local function whose return aggregate is constructed from
+# the operands (the construction row's driver).
+def al_construct_fn(name: String, ret_ty: Type, kind: AggregateKind, ops: Vec[MirOperand]) -> MirFunction
+  al_fn_ret(name, ret_ty, Vec::from([al_local(0, "_ret", ret_ty, true)]),
+    Vec::from([al_assign_stmt(al_place(0), al_agg_rvalue(kind, ops))]))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. A 2-field tuple: layout size 16, two 8-byte fields at 0/8, sret
+#    class (the pair image), word-mode stores through the two image
+#    word vregs.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def tuple_layout_admits_and_lowers() -> Unit
+  let defs = al_type_defs()
+  let ty = al_tuple2_ty()
+  let shape = al_shape(defs, ty, "tuple (Int, Int)")
+  assert(shape.size == 16, "a 2-field Int tuple must be 16 bytes (layout authority), got " + shape.size.to_string())
+  assert(shape.words == 2, "a 16-byte tuple must span 2 word slots, got " + shape.words.to_string())
+  assert(shape.fields.len() == 2, "tuple fields")
+  assert(shape.fields[0].byte_off == 0 && shape.fields[0].size == 8, "tuple field 0 at 0/8")
+  assert(shape.fields[1].byte_off == 8 && shape.fields[1].size == 8, "tuple field 1 at 8/8")
+  match lir_check_agg_class_plan(aarch64_desc(), shape, ty, defs, "tuple")
+  when Result::Err(e) then panic("tuple class plan diverged: " + e)
+  when Result::Ok(_) then ()
+  end
+  assert(lir_agg_sret_words(shape) == 2, "a 16-byte tuple crosses through sret with 2 words")
+  assert(!lir_agg_is_scalar_class(shape), "a 16-byte tuple is not Scalar-class")
+  let f = al_lower(al_construct_fn("tuple_ret", ty, AggregateKind::Tuple, Vec::from([
+    al_int_operand(11, Type::Int),
+    al_int_operand(22, Type::Int)
+  ])), defs)
+  al_verify_clean(f, "the tuple-return function")
+  assert(f.agg_slots == 2, "the tuple return local occupies 2 slots")
+  assert(f.sret_words == 2, "the tuple return is an sret image of 2 words")
+  assert(f.sret_bytes == 16, "the tuple return image is exactly 16 bytes")
+  assert(al_count_stores(al_ptr_stores(f)) == 0, "word-mode tuple fields store through their word vregs, not frame pointers")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. A fixed array [Int; 3]: stride 8, offsets 0/8/16, size 24, 3 words.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def fixed_array_layout_admits_and_lowers() -> Unit
+  let defs = al_type_defs()
+  let ty = al_array3_ty()
+  let shape = al_shape(defs, ty, "[Int; 3]")
+  assert(shape.size == 24, "[Int; 3] must be 24 bytes, got " + shape.size.to_string())
+  assert(shape.words == 3, "[Int; 3] must span 3 word slots, got " + shape.words.to_string())
+  assert(shape.fields.len() == 3, "array elements")
+  assert(shape.fields[0].byte_off == 0, "element 0 at 0")
+  assert(shape.fields[1].byte_off == 8, "element 1 at the 8-byte element stride")
+  assert(shape.fields[2].byte_off == 16, "element 2 at 16")
+  assert(lir_agg_sret_words(shape) == 3, "a 24-byte array crosses through sret with 3 words")
+  let f = al_lower(al_construct_fn("array_ret", ty, AggregateKind::MirArray(ty), Vec::from([
+    al_int_operand(1, Type::Int),
+    al_int_operand(2, Type::Int),
+    al_int_operand(3, Type::Int)
+  ])), defs)
+  al_verify_clean(f, "the array-return function")
+  assert(f.agg_slots == 3, "the array return local occupies 3 slots")
+  assert(f.sret_words == 3, "the array return is an sret image of 3 words")
+  assert(f.sret_bytes == 24, "the array return image is exactly 24 bytes")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. A nested struct Outer { inner: Inner, c: Int }: recursive admission
+#    (inner is a 16-byte sub-image at 0, c at 16), construction by a
+#    whole sub-image copy plus a word store, and a deep scalar read
+#    through the projection chain.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def nested_struct_layout_admits_and_lowers() -> Unit
+  let defs = al_type_defs()
+  let outer_ty = al_outer_ty()
+  let shape = al_shape(defs, outer_ty, "Outer")
+  assert(shape.size == 24, "Outer must be 24 bytes, got " + shape.size.to_string())
+  assert(shape.words == 3, "Outer must span 3 word slots")
+  assert(shape.fields[0].byte_off == 0 && shape.fields[0].size == 16, "inner at 0/16")
+  assert(shape.fields[1].byte_off == 16 && shape.fields[1].size == 8, "c at 16/8")
+  match shape.fields[0].nested
+  when Option::Some(inner) then
+    assert(inner.size == 16 && inner.words == 2, "the nested Inner shape is the 16-byte two-word image")
+    assert(inner.fields.len() == 2 && inner.fields[1].byte_off == 8, "the nested fields keep their own offsets")
+  when Option::None then panic("the nested field must carry its recursive shape")
+  end
+  match lir_check_agg_class_plan(shape, outer_ty, defs, "Outer")
+  when Result::Err(e) then panic("nested struct class plan diverged: " + e)
+  when Result::Ok(_) then ()
+  end
+  # Construction: the inner temp is built first and byte-copied into the
+  # outer image; the outer's own field stores at its word slot.
+  let f = al_lower(al_nested_construct_fn(), defs)
+  al_verify_clean(f, "the nested-struct construction function")
+  let stores = al_ptr_stores(f)
+  assert(al_has_store(stores, 0, 8), "the nested inner sub-image copies its first word at byte 0")
+  assert(al_has_store(stores, 8, 8), "the nested inner sub-image copies its second word at byte 8")
+  assert(f.sret_words == 3 && f.sret_bytes == 24, "Outer returns through a 3-word/24-byte sret")
+  # Deep scalar read: o.inner.y resolves to the word at byte 16 (the
+  # accumulated layout offset) — no frame pointer access, a word vreg.
+  let g = al_lower(al_deep_read_fn(), defs)
+  al_verify_clean(g, "the deep nested-field read function")
+  assert(al_ptr_loads(g).len() == 0, "a deep word-mode field read uses the image word vreg, not a frame load")
+end
+
+def al_nested_construct_fn() -> MirFunction
+  let outer_ty = al_outer_ty()
+  let inner_ty = al_inner_ty()
+  al_fn_ret("nested_ret", outer_ty, Vec::from([
+    al_local(0, "_ret", outer_ty, true),
+    al_local(1, "tmp", inner_ty, true)
+  ]), Vec::from([
+    al_assign_stmt(al_place(1), al_agg_rvalue(
+      AggregateKind::Struct(TypeId { id: 201 }, Vec::from(["x".to_string(), "y".to_string()])),
+      Vec::from([al_int_operand(1, Type::Int), al_int_operand(2, Type::Int)]))),
+    al_assign_stmt(al_place(0), al_agg_rvalue(
+      AggregateKind::Struct(TypeId { id: 202 }, Vec::from(["inner".to_string(), "c".to_string()])),
+      Vec::from([al_copy_operand(al_place(1)), al_int_operand(3, Type::Int)])))
+  ]))
+end
+
+def al_deep_read_fn() -> MirFunction
+  let outer_ty = al_outer_ty()
+  al_fn_param("deep_read", outer_ty, Type::Int, Vec::from([
+    al_local(0, "_ret", Type::Int, true),
+    al_local(1, "arg", outer_ty, false),
+    al_local(2, "tmp", Type::Int, true)
+  ]), Vec::from([
+    al_assign_stmt(al_place(2), al_move_rvalue(al_copy_operand(al_deep_place(1)))),
+    al_assign_stmt(al_place(0), al_move_rvalue(al_copy_operand(al_place(2))))
+  ]))
+end
+
+def al_deep_place(id: Int) -> Place
+  var p = al_place(id)
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: 202 }, index: 0 }))
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: 201 }, index: 1 }))
+  p
+end
+
+# A whole nested sub-image copy: `_ret = arg.inner` byte-copies the
+# nested image at its accumulated layout offset (no scalar read).
+@test
+def nested_whole_image_copy_emits_byte_copies() -> Unit
+  let defs = al_type_defs()
+  let g = al_lower(al_nested_copy_fn(), defs)
+  al_verify_clean(g, "the nested whole-image copy function")
+  let loads = al_ptr_loads(g)
+  let stores = al_ptr_stores(g)
+  assert(al_has_load(loads, 0, 8, false) && al_has_load(loads, 8, 8, false), "the nested sub-image loads both 8-byte words")
+  assert(al_has_store(stores, 0, 8) && al_has_store(stores, 8, 8), "the destination receives both 8-byte words at 0/8")
+end
+
+def al_nested_copy_fn() -> MirFunction
+  let outer_ty = al_outer_ty()
+  let inner_ty = al_inner_ty()
+  al_fn_param("nested_copy", outer_ty, inner_ty, Vec::from([
+    al_local(0, "_ret", inner_ty, true),
+    al_local(1, "arg", outer_ty, false)
+  ]), Vec::from([
+    al_assign_stmt(al_place(0), al_move_rvalue(al_copy_operand(al_field_place(1, 202, 0))))
+  ]))
+end
+
+# A fixed-array element read: `_ret = arg[2]` resolves through the
+# array shape to the element at byte 16 (2 * the 8-byte stride) and
+# reads it as a word-mode field (no frame pointer access).
+@test
+def fixed_array_element_read_uses_layout_stride() -> Unit
+  let defs = al_type_defs()
+  let g = al_lower(al_array_elem_read_fn(), defs)
+  al_verify_clean(g, "the fixed-array element read function")
+  assert(al_ptr_loads(g).len() == 0, "a word-mode array element read uses the image word vreg, not a frame load")
+  assert(g.agg_slots == 3, "the [Int; 3] parameter image occupies 3 slots")
+end
+
+def al_array_elem_read_fn() -> MirFunction
+  let aty = al_array3_ty()
+  al_fn_param("array_elem_read", aty, Type::Int, Vec::from([
+    al_local(0, "_ret", Type::Int, true),
+    al_local(1, "arg", aty, false),
+    al_local(2, "tmp", Type::Int, true)
+  ]), Vec::from([
+    al_assign_stmt(al_place(2), al_move_rvalue(al_copy_operand(al_array_elem_place(1, 2)))),
+    al_assign_stmt(al_place(0), al_move_rvalue(al_copy_operand(al_place(2))))
+  ]))
+end
+
+def al_array_elem_place(id: Int, elem: Int) -> Place
+  var p = al_place(id)
+  p.projections.push(Projection::ProjConstantIndex(elem))
+  p
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. The @packed 12-byte struct { u32, u32, u32 }: offsets 0/4/8 (the
+#    layout authority's packed placement), sub-word width stores, and
+#    the C-ABI pair crossing (2 sret words, 12 exact bytes).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def packed_struct_layout_emits_packed_offsets() -> Unit
+  let defs = al_type_defs()
+  let ty = al_packed12_ty()
+  let shape = al_shape(defs, ty, "Packed12")
+  assert(shape.size == 12, "the packed struct must be 12 bytes, got " + shape.size.to_string())
+  assert(shape.words == 2, "a 12-byte image spans 2 word slots")
+  assert(shape.fields[0].byte_off == 0, "packed field a at 0")
+  assert(shape.fields[1].byte_off == 4, "packed field b at 4 (no padding)")
+  assert(shape.fields[2].byte_off == 8, "packed field c at 8")
+  match lir_check_agg_class_plan(aarch64_desc(), shape, ty, defs, "Packed12")
+  when Result::Err(e) then panic("packed struct class plan diverged: " + e)
+  when Result::Ok(_) then ()
+  end
+  assert(lir_agg_sret_words(shape) == 2, "the 12-byte C-ABI pair crosses through 2 sret words")
+  assert(!lir_agg_is_scalar_class(shape), "a 12-byte image is not Scalar-class")
+  let f = al_lower(al_construct_fn("packed_ret", ty,
+    AggregateKind::Struct(TypeId { id: 203 }, Vec::from(["a".to_string(), "b".to_string(), "c".to_string()])),
+    Vec::from([
+      al_int_operand(1, Type::U32),
+      al_int_operand(2, Type::U32),
+      al_int_operand(3, Type::U32)
+    ])), defs)
+  al_verify_clean(f, "the packed-struct construction function")
+  let stores = al_ptr_stores(f)
+  assert(al_has_store(stores, 0, 4), "packed u32 a stores width 4 at byte 0")
+  assert(al_has_store(stores, 4, 4), "packed u32 b stores width 4 at byte 4")
+  assert(al_has_store(stores, 8, 4), "packed u32 c stores width 4 at byte 8")
+  assert(f.sret_words == 2 && f.sret_bytes == 12, "the packed image crosses with 2 sret words and exactly 12 bytes")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 5. The @align(16) struct { a: Int }: the declared alignment pads the
+#    size to 16 (the tail padding is part of the layout image).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def aligned_struct_layout_pads_to_declared_alignment() -> Unit
+  let defs = al_type_defs()
+  let ty = al_aligned16_ty()
+  let shape = al_shape(defs, ty, "Aligned16")
+  assert(shape.size == 16, "the @align(16) struct size is tail-padded to 16, got " + shape.size.to_string())
+  assert(shape.words == 2, "the tail-padded image spans 2 word slots")
+  assert(shape.fields.len() == 1 && shape.fields[0].byte_off == 0 && shape.fields[0].size == 8, "field a at 0/8")
+  match lir_check_agg_class_plan(aarch64_desc(), shape, ty, defs, "Aligned16")
+  when Result::Err(e) then panic("aligned struct class plan diverged: " + e)
+  when Result::Ok(_) then ()
+  end
+  assert(lir_agg_sret_words(shape) == 2, "the padded 16-byte image crosses through 2 sret words")
+  let f = al_lower(al_construct_fn("aligned_ret", ty,
+    AggregateKind::Struct(TypeId { id: 204 }, Vec::from(["a".to_string()])),
+    Vec::from([al_int_operand(7, Type::Int)])), defs)
+  al_verify_clean(f, "the aligned-struct construction function")
+  assert(f.sret_words == 2 && f.sret_bytes == 16, "the aligned return is a 2-word/16-byte sret image")
+  assert(f.agg_slots == 2, "the aligned local occupies the padded 2 slots")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 6. The sub-word struct { u8, i16, u8 }: natural offsets 0/2/4, size 6;
+#    construction stores widths 1/2/1 at those offsets and the i16 read
+#    is a signed (sign-extending) width-2 load; the 6-byte image is
+#    Scalar-class (one word in x0).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def subword_struct_layout_emits_width_accesses() -> Unit
+  let defs = al_type_defs()
+  let ty = al_subword_ty()
+  let shape = al_shape(defs, ty, "SubWord")
+  assert(shape.size == 6, "SubWord must be 6 bytes, got " + shape.size.to_string())
+  assert(shape.words == 1, "a 6-byte image spans 1 word slot")
+  assert(shape.fields[0].byte_off == 0 && shape.fields[0].size == 1, "u8 a at 0/1")
+  assert(shape.fields[1].byte_off == 2 && shape.fields[1].size == 2, "i16 b at 2/2")
+  assert(shape.fields[2].byte_off == 4 && shape.fields[2].size == 1, "u8 c at 4/1")
+  assert(lir_agg_sret_words(shape) == 0, "a 6-byte image is not an sret image")
+  assert(lir_agg_is_scalar_class(shape), "a 6-byte image crosses as ONE Scalar-class word")
+  match lir_check_agg_class_plan(aarch64_desc(), shape, ty, defs, "SubWord")
+  when Result::Err(e) then panic("sub-word struct class plan diverged: " + e)
+  when Result::Ok(_) then ()
+  end
+  let f = al_lower(al_construct_fn("subword_ret", ty,
+    AggregateKind::Struct(TypeId { id: 205 }, Vec::from(["a".to_string(), "b".to_string(), "c".to_string()])),
+    Vec::from([
+      al_int_operand(1, Type::U8),
+      al_int_operand(-2, Type::I16),
+      al_int_operand(3, Type::U8)
+    ])), defs)
+  al_verify_clean(f, "the sub-word construction function")
+  let stores = al_ptr_stores(f)
+  assert(al_has_store(stores, 0, 1), "u8 a stores width 1 at byte 0")
+  assert(al_has_store(stores, 2, 2), "i16 b stores width 2 at byte 2")
+  assert(al_has_store(stores, 4, 1), "u8 c stores width 1 at byte 4")
+  let g = al_lower(al_subword_read_fn(), defs)
+  al_verify_clean(g, "the sub-word read function")
+  let loads = al_ptr_loads(g)
+  assert(al_has_load(loads, 2, 2, true), "the i16 read is a signed width-2 load at byte 2")
+end
+
+def al_subword_read_fn() -> MirFunction
+  let sub_ty = al_subword_ty()
+  al_fn_param("subword_read", sub_ty, Type::Int, Vec::from([
+    al_local(0, "_ret", Type::Int, true),
+    al_local(1, "arg", sub_ty, false),
+    al_local(2, "tmp", Type::Int, true)
+  ]), Vec::from([
+    al_assign_stmt(al_place(2), al_move_rvalue(al_copy_operand(al_field_place(1, 205, 1)))),
+    al_assign_stmt(al_place(0), al_move_rvalue(al_copy_operand(al_place(2))))
+  ]))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 7. The zero-field struct Empty {}: size 0, no words, no slots; the
+#    construction and the whole copy lower to no machine statements
+#    (the no-op word group) and verify clean.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def zero_field_struct_is_a_noop_word_group() -> Unit
+  let defs = al_type_defs()
+  let ty = al_empty_ty()
+  let shape = al_shape(defs, ty, "Empty")
+  assert(shape.size == 0, "an empty struct has no payload, got size " + shape.size.to_string())
+  assert(shape.words == 0, "an empty struct spans no word slots")
+  assert(shape.fields.len() == 0, "an empty struct has no fields")
+  assert(lir_agg_is_zero_sized(shape), "the shape helper answers the zero-sized class")
+  assert(lir_agg_sret_words(shape) == 0 && !lir_agg_is_scalar_class(shape), "a zero-sized image crosses nothing")
+  match lir_check_agg_class_plan(aarch64_desc(), shape, ty, defs, "Empty")
+  when Result::Err(e) then panic("zero-sized class plan diverged: " + e)
+  when Result::Ok(_) then ()
+  end
+  let f = al_lower(al_construct_fn("empty_ret", ty,
+    AggregateKind::Struct(TypeId { id: 206 }, Vec::new()), Vec::new()), defs)
+  al_verify_clean(f, "the empty-struct construction function")
+  assert(f.agg_slots == 0, "the empty local consumes no aggregate slots")
+  assert(f.sret_words == 0 && f.sret_bytes == 0, "the empty return crosses nothing")
+  assert(f.blocks[0].stmts.len() == 0, "the empty construction emits no statements")
+  let g = al_lower(al_empty_copy_fn(), defs)
+  al_verify_clean(g, "the empty-struct whole copy function")
+  assert(g.blocks[0].stmts.len() == 0, "the empty whole copy emits no statements")
+end
+
+def al_empty_copy_fn() -> MirFunction
+  let ty = al_empty_ty()
+  al_fn_ret("empty_copy", ty, Vec::from([
+    al_local(0, "_ret", ty, true),
+    al_local(1, "e", ty, false)
+  ]), Vec::from([
+    al_assign_stmt(al_place(0), al_move_rvalue(al_copy_operand(al_place(1))))
+  ]))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 8. The aggregate-residual boundary: an enum-typed field is ADMITTED
+#    as one canonical value word (enum_nested carries the variant
+#    table) at the field's engine offset; an UNKNOWN layout (an
+#    unregistered named type) still fails closed with its named rule.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def nested_enum_field_admits_and_unknown_layout_stays_fail_closed() -> Unit
+  let defs = al_type_defs()
+  let shape = al_shape(defs, al_has_enum_ty(), "HasEnum")
+  assert(shape.size == 8, "HasEnum (one payload-less enum field) is 8 bytes, got " + shape.size.to_string())
+  assert(shape.words == 1, "the enum field image is one word")
+  assert(shape.fields.len() == 1 && shape.fields[0].byte_off == 0 && shape.fields[0].size == 8, "the enum field sits at 0/8")
+  match shape.fields[0].enum_nested
+  when Option::Some(es) then
+    assert(es.variants.len() == 2, "the admitted enum field carries its two variants")
+    assert(es.variants[0].discriminant == 0 && es.variants[1].discriminant == 1, "the field's variant discriminants survive")
+  when Option::None then panic("the enum-typed field must carry its admitted enum shape")
+  end
+  # The unknown-layout boundary: a field whose named type has no def.
+  match lir_plain_struct_shape(defs, al_has_missing_ty())
+  when Result::Ok(_) then panic("a struct with an unregistered field type must not admit")
+  when Result::Err(e) then
+    assert(e.contains("no registered definition"), "the unknown-layout refusal must name the rule, got: " + e)
+  end
+end

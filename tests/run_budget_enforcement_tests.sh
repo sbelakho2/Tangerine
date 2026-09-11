@@ -27,15 +27,30 @@
 #      the E0235 row naming the classification and the derived bound.
 #   G) (item 45) the heap_allocations = 0 / heap_bytes = 0 static proof:
 #      a non-allocating function passes statically and exits 0.
-#   H) (item 45) the heap_bytes static-bound failure: `@budget(heap_bytes
-#      = 0)` on an allocating function FAILS the compilation with the
-#      measured/bound value row.
+#   H) (item 45 / P1-7) the heap_bytes NO-FINITE-BOUND failure:
+#      `@budget(heap_bytes = 0)` on a function whose reachable sites
+#      include a RUNTIME-SIZED allocation (Vec::new + push) FAILS the
+#      compilation with the Unbounded row (the P1-7 rule: a runtime-sized
+#      site can never be certified against a finite heap_bytes limit).
 #   I) (item 45) the INSTRUCTIONS runtime counter: a loop whose dynamic
 #      statement count exceeds the declared limit but whose STATIC
 #      estimate is under it compiles and TRAPS at runtime.
 #   J) (item 45) the time_us runtime-measured row: a generous
 #      `@budget(time_us = 1000000)` compiles and exits 0 (the runtime
 #      frame clock decides — no static row).
+#   K) (P1-7) the runtime-capacity soundness case: a GENEROUS
+#      `@budget(heap_bytes = "1073741824")` on a function that calls
+#      `Vec::with_capacity(n)` with a RUNTIME n must still FAIL — the
+#      with_capacity site is Unbounded, and "one site × 4096" can never
+#      become a finite static proof.
+#   L) (P1-8) the max TRANSITIVE stack: a caller whose own frame fits a
+#      small `@budget(stack_bytes = "200")` but whose callee chain does
+#      not FAILS with a row reporting BOTH frame_bytes and max_stack_bytes;
+#      the generous-limit companion compiles and exits 0.
+#   M) (P1-8) the recursion rule: a self-recursive function with a
+#      generous `@budget(stack_bytes)` FAILS as Unbounded (a call cycle
+#      with no proven finite recursion bound has no finite static
+#      max-stack).
 #
 # Usage: tests/run_budget_enforcement_tests.sh [compiler-binary] [scratch-dir]
 #   compiler-binary defaults to build/tg_stage2
@@ -175,9 +190,10 @@ def main() -> Int
 end
 EOF
 
-# H) (item 45) The heap_bytes static-bound failure: an allocating function
-#    against heap_bytes = 0 must NOT compile (the row carries the derived
-#    site bound).
+# H) (item 45 / P1-7) The heap_bytes no-finite-bound failure: a function
+#    whose reachable sites include a RUNTIME-SIZED allocation (Vec::new +
+#    push) against heap_bytes = 0 must NOT compile — the P1-7 Unbounded
+#    aggregate carries no finite static bound to compare.
 cat > "$SCRATCH/budget_heap_over.tg" <<'EOF'
 def leaky() -> Int @budget(heap_bytes = 0)
   let v = Vec[Int]::new()
@@ -225,6 +241,140 @@ def main() -> Int
 end
 EOF
 
+# K) (P1-7) The runtime-capacity soundness case: Vec::with_capacity(n)
+#    with a RUNTIME n is Unbounded — even a 1 GiB heap_bytes limit must
+#    FAIL (a runtime-sized site can never satisfy a finite static proof).
+cat > "$SCRATCH/budget_heap_runtime_capacity.tg" <<'EOF'
+def sized(n: Int) -> Int @budget(heap_bytes = "1073741824")
+  let v = Vec[Int]::with_capacity(n)
+  v.len() as Int
+end
+
+def main() -> Int
+  sized(4)
+end
+EOF
+
+# L) (P1-8) The max TRANSITIVE stack failure: `shallow`'s own MIR frame
+#    fits stack_bytes = 200, but its callee `heavy` has a wide frame; the
+#    derived max_stack = frame(shallow) + frame(heavy) + the documented
+#    call overhead must FAIL and the row must report BOTH frame_bytes and
+#    max_stack_bytes. `heavy` keeps its ~30 locals live through the sum.
+cat > "$SCRATCH/budget_stack_transitive.tg" <<'EOF'
+def heavy() -> Int
+  let a0 = 1
+  let a1 = 2
+  let a2 = 3
+  let a3 = 4
+  let a4 = 5
+  let a5 = 6
+  let a6 = 7
+  let a7 = 8
+  let a8 = 9
+  let a9 = 10
+  let a10 = 11
+  let a11 = 12
+  let a12 = 13
+  let a13 = 14
+  let a14 = 15
+  let a15 = 16
+  let a16 = 17
+  let a17 = 18
+  let a18 = 19
+  let a19 = 20
+  let a20 = 21
+  let a21 = 22
+  let a22 = 23
+  let a23 = 24
+  let a24 = 25
+  let a25 = 26
+  let a26 = 27
+  let a27 = 28
+  let a28 = 29
+  let a29 = 30
+  let s0 = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9
+  let s1 = a10 + a11 + a12 + a13 + a14 + a15 + a16 + a17 + a18 + a19
+  let s2 = a20 + a21 + a22 + a23 + a24 + a25 + a26 + a27 + a28 + a29
+  s0 + s1 + s2
+end
+
+def shallow() -> Int @budget(stack_bytes = "200")
+  let x = heavy()
+  x
+end
+
+def main() -> Int
+  shallow()
+end
+EOF
+
+# L2) The generous-limit companion: the SAME chain under a limit above the
+#     computed max-stack must compile and exit 0.
+cat > "$SCRATCH/budget_stack_transitive_within.tg" <<'EOF'
+def heavy() -> Int
+  let a0 = 1
+  let a1 = 2
+  let a2 = 3
+  let a3 = 4
+  let a4 = 5
+  let a5 = 6
+  let a6 = 7
+  let a7 = 8
+  let a8 = 9
+  let a9 = 10
+  let a10 = 11
+  let a11 = 12
+  let a12 = 13
+  let a13 = 14
+  let a14 = 15
+  let a15 = 16
+  let a16 = 17
+  let a17 = 18
+  let a18 = 19
+  let a19 = 20
+  let a20 = 21
+  let a21 = 22
+  let a22 = 23
+  let a23 = 24
+  let a24 = 25
+  let a25 = 26
+  let a26 = 27
+  let a27 = 28
+  let a28 = 29
+  let a29 = 30
+  let s0 = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9
+  let s1 = a10 + a11 + a12 + a13 + a14 + a15 + a16 + a17 + a18 + a19
+  let s2 = a20 + a21 + a22 + a23 + a24 + a25 + a26 + a27 + a28 + a29
+  s0 + s1 + s2
+end
+
+def shallow() -> Int @budget(stack_bytes = "8192")
+  let x = heavy()
+  x
+end
+
+def main() -> Int
+  shallow()
+end
+EOF
+
+# M) (P1-8) The recursion rule: a self-recursive function has a call cycle
+#    with NO proven finite recursion bound — the max-stack analysis reports
+#    Unbounded and the generous annotation FAILS.
+cat > "$SCRATCH/budget_stack_recursive.tg" <<'EOF'
+def rec(n: Int) -> Int @budget(stack_bytes = "1048576")
+  if n <= 0 then
+    0
+  else
+    rec(n - 1) + 1
+  end
+end
+
+def main() -> Int
+  rec(3)
+end
+EOF
+
 failures=0
 
 # Case A: compile + run the over-limit program; the runtime trap must
@@ -242,8 +392,8 @@ else
   fi
 fi
 
-# Cases B/C/D/E/G/J: within-limit programs must compile and exit 0.
-for case_name in budget_branch_within budget_two_calls budget_nested budget_static_within budget_static_proof budget_time_us; do
+# Cases B/C/D/E/G/J/L2: within-limit programs must compile and exit 0.
+for case_name in budget_branch_within budget_two_calls budget_nested budget_static_within budget_static_proof budget_time_us budget_stack_transitive_within; do
   if ! "$COMPILER" "$SCRATCH/$case_name.tg" -o "$SCRATCH/$case_name" >"$SCRATCH/${case_name}_build.log" 2>&1; then
     bh_err "budget Case $case_name FAILED: within-limit program did not compile"
     bh_err "  $(head -n3 "$SCRATCH/${case_name}_build.log" | tr '\n' ' ')"
@@ -288,17 +438,65 @@ else
   fi
 fi
 
-# Case H: the heap_bytes static violation must FAIL the compile with the
-# static-bound row carrying the derived site bound.
+# Case H: the heap_bytes P1-7 rule — a reachable runtime-sized allocation
+# can never be certified, so the compile must FAIL with the Unbounded row.
 if "$COMPILER" "$SCRATCH/budget_heap_over.tg" -o "$SCRATCH/heap_over" >"$SCRATCH/h_build.log" 2>&1; then
-  bh_err "budget Case H FAILED: heap_bytes = 0 compiled despite an allocating site"
+  bh_err "budget Case H FAILED: heap_bytes = 0 compiled despite a runtime-sized allocating site"
   failures=$((failures + 1))
 else
-  if grep -q "budget:heap_bytes static-bound bound" "$SCRATCH/h_build.log"; then
-    bh_log "budget Case H ok: heap_bytes static-bound violation failed with the derived value row"
+  if grep -Eq "budget:heap_bytes (unbounded|unknown)" "$SCRATCH/h_build.log" && grep -q "no finite static bound" "$SCRATCH/h_build.log"; then
+    bh_log "budget Case H ok: heap_bytes Unbounded/Unknown violation failed the annotation"
   else
-    bh_err "budget Case H FAILED: the compile failed but the heap_bytes static-bound row is missing"
+    bh_err "budget Case H FAILED: the compile failed but the no-finite-bound heap_bytes row is missing"
     bh_err "  $(head -n5 "$SCRATCH/h_build.log" | tr '\n' ' ')"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Case K: the runtime-capacity soundness case. Vec::with_capacity(n) over
+# a runtime n is Unbounded — a finite heap_bytes limit (even 1 GiB) can
+# never be certified and the compile must FAIL with the P1-7 row.
+if "$COMPILER" "$SCRATCH/budget_heap_runtime_capacity.tg" -o "$SCRATCH/heap_runtime_capacity" >"$SCRATCH/k_build.log" 2>&1; then
+  bh_err "budget Case K FAILED: Vec::with_capacity(runtime n) satisfied a finite heap_bytes proof"
+  failures=$((failures + 1))
+else
+  if grep -Eq "budget:heap_bytes (unbounded|unknown)" "$SCRATCH/k_build.log" && grep -q "no finite static bound" "$SCRATCH/k_build.log"; then
+    bh_log "budget Case K ok: the runtime-capacity site can never satisfy a finite heap_bytes proof"
+  else
+    bh_err "budget Case K FAILED: the compile failed but the runtime-capacity heap row is missing"
+    bh_err "  $(head -n5 "$SCRATCH/k_build.log" | tr '\n' ' ')"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Case L: the max TRANSITIVE stack — the caller's own frame fits the limit
+# while frame + callee frame + call overhead does not. The row must report
+# BOTH frame_bytes and max_stack_bytes.
+if "$COMPILER" "$SCRATCH/budget_stack_transitive.tg" -o "$SCRATCH/stack_transitive" >"$SCRATCH/l_build.log" 2>&1; then
+  bh_err "budget Case L FAILED: the transitive max-stack overrun compiled"
+  failures=$((failures + 1))
+else
+  if grep -q "budget:stack_bytes static-bound bound" "$SCRATCH/l_build.log" && grep -q "exceeds limit 200" "$SCRATCH/l_build.log" && grep -q "frame_bytes" "$SCRATCH/l_build.log" && grep -q "max_stack_bytes" "$SCRATCH/l_build.log"; then
+    bh_log "budget Case L ok: the transitive max-stack violation reports frame_bytes + max_stack_bytes"
+  else
+    bh_err "budget Case L FAILED: the max-stack row is missing"
+    bh_err "  $(head -n5 "$SCRATCH/l_build.log" | tr '\n' ' ')"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Case M: the recursion rule — a self-recursive function has no proven
+# finite recursion bound, so the max-stack is Unbounded and the generous
+# stack_bytes annotation FAILS.
+if "$COMPILER" "$SCRATCH/budget_stack_recursive.tg" -o "$SCRATCH/stack_recursive" >"$SCRATCH/m_build.log" 2>&1; then
+  bh_err "budget Case M FAILED: a recursive call cycle satisfied a finite stack_bytes proof"
+  failures=$((failures + 1))
+else
+  if grep -q "budget:stack_bytes unbounded" "$SCRATCH/m_build.log" && grep -q "recursion bound" "$SCRATCH/m_build.log"; then
+    bh_log "budget Case M ok: the recursive call cycle failed as Unbounded"
+  else
+    bh_err "budget Case M FAILED: the compile failed but the unbounded recursion row is missing"
+    bh_err "  $(head -n5 "$SCRATCH/m_build.log" | tr '\n' ' ')"
     failures=$((failures + 1))
   fi
 fi
@@ -307,5 +505,5 @@ if [ "$failures" -ne 0 ]; then
   bh_err "budget enforcement tests FAILED: $failures problem(s)"
   exit 1
 fi
-bh_log "budget enforcement tests OK: runtime traps (alloc/instructions/time), static guarantees (stack/heap/instructions vocabulary) and the E0235 static-bound diagnostics all behave"
+bh_log "budget enforcement tests OK: runtime traps (alloc/instructions/time), static guarantees (stack/heap/instructions vocabulary), the P1-7 runtime-size/with_capacity no-finite-bound rule, the P1-8 transitive max-stack rows and the recursion rule all behave"
 exit 0

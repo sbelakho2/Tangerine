@@ -147,7 +147,7 @@ use tg_compiler::lir::{
   LirFunction, LirAlloc, LirStmt, LirStmtKind, LirTermKind, LirValue,
   LirCond, LirBinOp, LirUnOp, LirDivOp,
   LirFpWidth, LirFpBinOp, LirPtrOp, LirVecOp, LirVecBinOp, LirVectorLane,
-  LirBitMoveOp, LirAggCallArg,
+  LirBitMoveOp, LirAggCallArg, LirSysOp,
   lower_mir_fn_to_lir_prog_x86, lir_peephole, lir_alloc_registers_mode,
   lir_validate_callees, lir_first_alloc_vreg, lir_check_extern_enum_calls,
   lir_check_fn_enum_abi_export,
@@ -1130,6 +1130,16 @@ end
 
 def x86_ud2() -> Vec[u8]
   Vec::from([0x0F, 0x0B])
+end
+
+# SYSCALL (the LIR syscall marker's x86-64 kernel entry): the classic
+# two-byte form 0F 05 (no REX prefix needed). The Linux SysV kernel ABI
+# the LIR route's ELF64 object contract names: the number in RAX and
+# the arguments in RDI, RSI, RDX, R10, R8, R9; the result comes back in
+# RAX with the negative-errno convention (no carry normalization, unlike
+# Darwin). verified-by-hand: syscall = 0F 05.
+def x86_syscall() -> Vec[u8]
+  Vec::from([0x0F, 0x05])
 end
 
 # JMP rel32 = E9 id; Jcc rel32 = 0F 80+cc id; CALL rel32 = E8 id. The
@@ -3617,6 +3627,43 @@ def x86_emit_call_spills(inout xe: X86Emit, alloc: LirAlloc, pos: Int) -> Unit
   end
 end
 
+# The INLINED syscall sequence of a marked terminator (LirTerm.sys —
+# the __intrinsic_syscall1..6 family). The pre-call argument moves
+# landed the intrinsic's words in the fixed ABI vregs (0 = number,
+# 1..5 = user args = rdi/rsi/rdx/rcx/r8/r9), and the Linux SysV kernel
+# ABI reads the number in RAX and the args in RDI, RSI, RDX, R10, R8,
+# R9. `nargs` is the direct emitter's nargs: the intrinsic's USER
+# argument count (the family index — __intrinsic_syscall3 declares the
+# number plus THREE user args, so its call passes nargs = 3; the
+# number is separate). The shuffle mirrors codegen.tg's x86-64 Linux
+# arm for the 1..3 user-argument forms (rax = rdi; rdi = rsi;
+# rsi = rdx; rdx = rcx) and completes the 4-user-argument form the
+# direct arm leaves untranslated: user arg 4 (SysV r8) moves to the
+# kernel's r10; user arg 5 already sits in r9. (__intrinsic_syscall6's
+# seven words exceed the route's six fixed argument registers and fail
+# closed at the lowering, so nargs = 6 never reaches here.) `syscall`
+# returns in RAX under the negative-errno convention (Linux — no carry
+# normalization, unlike Darwin). This route's object contract is the
+# ELF64 Linux SysV object, so the Linux convention is the route's.
+# verified-by-hand: mov rax,rdi = 48 89 F8; mov rdi,rsi = 48 89 F7;
+# mov rsi,rdx = 48 89 D6; mov rdx,rcx = 48 89 CA; mov r10,r8 = 4D 89 C2;
+# syscall = 0F 05.
+def x86_emit_syscall_lir(inout xe: X86Emit, nargs: Int) -> Unit
+  x86_emit(&mut xe.buf, x86_mov_rr(X64::RAX, X64::RDI))
+  x86_emit(&mut xe.buf, x86_mov_rr(X64::RDI, X64::RSI))
+  if nargs >= 2 then
+    x86_emit(&mut xe.buf, x86_mov_rr(X64::RSI, X64::RDX))
+  end
+  if nargs >= 3 then
+    x86_emit(&mut xe.buf, x86_mov_rr(X64::RDX, X64::RCX))
+  end
+  if nargs >= 4 then
+    x86_emit(&mut xe.buf, x86_mov_rr(X64::R10, X64::R8))
+  end
+  # nargs >= 5: the last user arg already sits in R9 (fixed vreg 5).
+  x86_emit(&mut xe.buf, x86_syscall())
+end
+
 # One terminator. `sret_base` is the caller-side sret destination's
 # fixed slot when this LirCall returns an aggregate (the
 # sret_call_slots record): the SysV hidden pointer is formed in rdi
@@ -3625,7 +3672,11 @@ end
 # caller-side aggregate-argument records (addresses formed in their ABI
 # slots). `gp_arg_count` is the block's general-class argument count
 # (fixed-move destinations and aggregate slots) — the shift width.
-def x86_emit_term(inout xe: X86Emit, alloc: LirAlloc, fn_name: String, kind: LirTermKind, pos: Int, externs: Set[String], defined: Set[String], sret_base: Option[Int], agg_args: Vec[LirAggCallArg], gp_arg_count: Int, sret_words: Int, sret_base_slot: Int, tail: Bool) -> Result[Unit, String]
+# `sys` is the terminator's syscall marker (LirTerm.sys): a marked
+# LirCall emits the inlined kernel-call sequence above instead of the
+# branch (still under the ordinary call machinery — the pre-call
+# spills, the RAX capture and the success jump).
+def x86_emit_term(inout xe: X86Emit, alloc: LirAlloc, fn_name: String, kind: LirTermKind, sys: Option[LirSysOp], pos: Int, externs: Set[String], defined: Set[String], sret_base: Option[Int], agg_args: Vec[LirAggCallArg], gp_arg_count: Int, sret_words: Int, sret_base_slot: Int, tail: Bool) -> Result[Unit, String]
   if xe.pending_cmp then
     panic("x86_64: terminator reached with a LirCmp still pending (invariant I1)")
   end
@@ -3713,72 +3764,91 @@ def x86_emit_term(inout xe: X86Emit, alloc: LirAlloc, fn_name: String, kind: Lir
       return Result::Err("x86_64: call to `" + target + "` carries caller stack slots — the SysV stack-argument stream is fail-closed")
     end
     x86_emit_call_spills(xe, alloc, pos)
-    # The caller-side sret destination slot (-1 = an ordinary call): the
-    # hidden pointer consumes rdi, so every general argument shifts up by
-    # one register and the aggregate argument slots land at slot+1.
-    var sret_k = -1
-    match sret_base
-    when Option::Some(base) then sret_k = base
+    # The syscall marker (__intrinsic_syscall1..6 — see LirSysOp): the
+    # pre-call argument moves already placed the args in the fixed ABI
+    # vregs, and the marked terminator emits the inlined Linux SysV
+    # kernel-call sequence instead of a branch. No sret/aggregate
+    # machinery exists for it (lowering records none; the verifier
+    # enforces their absence).
+    var sys_nargs = -1
+    match sys
+    when Option::Some(sop) then
+      match sop
+      when LirSysOp::LirSyscall(n) then sys_nargs = n
+      end
     when Option::None then ()
     end
-    if sret_k >= 0 then
-      match dest
-      when Option::Some(_) then
-        return Result::Err("x86_64: an sret call carries a scalar destination (the copy-out goes to the caller's frame — lowering invariant; fail-closed)")
+    if sys_nargs >= 0 then
+      x86_emit_syscall_lir(xe, sys_nargs)
+    else
+      # The caller-side sret destination slot (-1 = an ordinary call): the
+      # hidden pointer consumes rdi, so every general argument shifts up by
+      # one register and the aggregate argument slots land at slot+1.
+      var sret_k = -1
+      match sret_base
+      when Option::Some(base) then sret_k = base
       when Option::None then ()
       end
-      if gp_arg_count > 5 then
-        return Result::Err("x86_64: an sret call carries " + gp_arg_count.to_string() + " general-class arguments — the hidden rdi pointer leaves only rsi/rdx/rcx/r8/r9 (five) for real arguments; the stack-argument stream is fail-closed")
+      if sret_k >= 0 then
+        match dest
+        when Option::Some(_) then
+          return Result::Err("x86_64: an sret call carries a scalar destination (the copy-out goes to the caller's frame — lowering invariant; fail-closed)")
+        when Option::None then ()
+        end
+        if gp_arg_count > 5 then
+          return Result::Err("x86_64: an sret call carries " + gp_arg_count.to_string() + " general-class arguments — the hidden rdi pointer leaves only rsi/rdx/rcx/r8/r9 (five) for real arguments; the stack-argument stream is fail-closed")
+        end
+        # Shift the general arguments up by one register (descending order
+        # so no source is overwritten before it is read): arg k's value
+        # moves from fixed k to fixed k+1.
+        var gk = gp_arg_count - 1
+        while gk >= 0 do
+          x86_emit(&mut xe.buf, x86_mov_rr(x86_fixed_phys(gk + 1), x86_fixed_phys(gk)))
+          gk = gk - 1
+        end
       end
-      # Shift the general arguments up by one register (descending order
-      # so no source is overwritten before it is read): arg k's value
-      # moves from fixed k to fixed k+1.
-      var gk = gp_arg_count - 1
-      while gk >= 0 do
-        x86_emit(&mut xe.buf, x86_mov_rr(x86_fixed_phys(gk + 1), x86_fixed_phys(gk)))
-        gk = gk - 1
+      # The caller-side aggregate argument addresses: the image's fixed
+      # frame address formed in the argument's ABI slot (after the shift,
+      # so an sret call's aggregate slots land at slot+1).
+      var agi = 0
+      while agi < agg_args.len() do
+        let aa = agg_args[agi]
+        let slot = if sret_k >= 0 then aa.slot + 1 else aa.slot end
+        if slot >= 6 then
+          return Result::Err("x86_64: aggregate argument " + agi.to_string() + " of the call to `" + target + "` lands in general slot " + slot.to_string() + " (only 0..5 are SysV registers; the stack-argument stream is fail-closed)")
+        end
+        x86_emit(&mut xe.buf, x86_lea(x86_fixed_phys(slot), X64::RBP, lir_slot_offset(aa.base_slot)))
+        agi = agi + 1
       end
-    end
-    # The caller-side aggregate argument addresses: the image's fixed
-    # frame address formed in the argument's ABI slot (after the shift,
-    # so an sret call's aggregate slots land at slot+1).
-    var agi = 0
-    while agi < agg_args.len() do
-      let aa = agg_args[agi]
-      let slot = if sret_k >= 0 then aa.slot + 1 else aa.slot end
-      if slot >= 6 then
-        return Result::Err("x86_64: aggregate argument " + agi.to_string() + " of the call to `" + target + "` lands in general slot " + slot.to_string() + " (only 0..5 are SysV registers; the stack-argument stream is fail-closed)")
+      # The hidden sret pointer goes last, into rdi (the register the
+      # callee's prologue saves before shifting its arguments down).
+      if sret_k >= 0 then
+        x86_emit(&mut xe.buf, x86_lea(X64::RDI, X64::RBP, lir_slot_offset(sret_k)))
       end
-      x86_emit(&mut xe.buf, x86_lea(x86_fixed_phys(slot), X64::RBP, lir_slot_offset(aa.base_slot)))
-      agi = agi + 1
-    end
-    # The hidden sret pointer goes last, into rdi (the register the
-    # callee's prologue saves before shifting its arguments down).
-    if sret_k >= 0 then
-      x86_emit(&mut xe.buf, x86_lea(X64::RDI, X64::RBP, lir_slot_offset(sret_k)))
-    end
-    # The lowering's register argument moves are ordinary statements
-    # into the fixed vregs 0..5 (rdi/rsi/rdx/rcx/r8/r9), so `args`
-    # needs no read here. A target that is a defined program function
-    # (self-recursion included) defers a rel32 patch; an extern (or a
-    # target that is neither defined nor declared extern — the
-    # defensive rule backend_rv.tg also keeps) emits a PLT32 relocation.
-    if externs.contains(&target) || !defined.contains(&target) then
-      x86_emit_call_remote(xe, target)
-    else
-      # (third-audit item 37) Tail-jump emission — ADVISORY marker; this
-      # route re-checks its frame conditions: a locally defined callee
-      # (never an extern/PLT), no caller stack slots (stack_args == 0 —
-      # `leave` discards them) and no caller-side sret (sret_k < 0 — the
-      # copy-out is an epilogue action a tail jump skips). The callee's
-      # RAX/rdx result IS the caller's return value; the capture, stack
-      # cleanup and success jump are skipped.
-      if tail && stack_args == 0 && sret_k < 0 then
-        x86_emit_tail_leave(xe, alloc)
-        x86_emit_jmp_label(xe, target.clone())
-        return Result::Ok(())
+      # The lowering's register argument moves are ordinary statements
+      # into the fixed vregs 0..5 (rdi/rsi/rdx/rcx/r8/r9), so `args`
+      # needs no read here. A target that is a defined program function
+      # (self-recursion included) defers a rel32 patch; an extern (or a
+      # target that is neither defined nor declared extern — the
+      # defensive rule backend_rv.tg also keeps) emits a PLT32 relocation.
+      if externs.contains(&target) || !defined.contains(&target) then
+        x86_emit_call_remote(xe, target)
+      else
+        # (third-audit item 37) Tail-jump emission — ADVISORY marker; this
+        # route re-checks its frame conditions: a locally defined callee
+        # (never an extern/PLT), no caller stack slots (stack_args == 0 —
+        # `leave` discards them) and no caller-side sret (sret_k < 0 — the
+        # copy-out is an epilogue action a tail jump skips). The callee's
+        # RAX/rdx result IS the caller's return value; the capture, stack
+        # cleanup and success jump are skipped. A syscall terminator takes
+        # the `if` arm above (no callee branch exists to jump to).
+        if tail && stack_args == 0 && sret_k < 0 then
+          x86_emit_tail_leave(xe, alloc)
+          x86_emit_jmp_label(xe, target.clone())
+          return Result::Ok(())
+        end
+        x86_emit_call_label(xe, target)
       end
-      x86_emit_call_label(xe, target)
     end
     match dest
     when Option::Some(dv) then
@@ -3960,7 +4030,7 @@ def x86_emit_fn(inout xe: X86Emit, lir_fn: LirFunction, alloc: LirAlloc, externs
       pos = pos + 1
       si = si + 1
     end
-    match x86_emit_term(xe, alloc, lir_fn.name.clone(), b.term.kind, pos, externs, defined, sret_base, agg_args, gp_arg_count, lir_fn.sret_words, lir_fn.sret_base_slot, lir_fn.tail_call_blocks.contains(&b.id))
+    match x86_emit_term(xe, alloc, lir_fn.name.clone(), b.term.kind, b.term.sys, pos, externs, defined, sret_base, agg_args, gp_arg_count, lir_fn.sret_words, lir_fn.sret_base_slot, lir_fn.tail_call_blocks.contains(&b.id))
     when Result::Err(e) then return Result::Err(e)
     when Result::Ok(_) then ()
     end

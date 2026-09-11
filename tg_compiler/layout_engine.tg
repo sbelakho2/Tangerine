@@ -4020,7 +4020,16 @@ end
 #   PairInt(a, b)  the two-eightbyte aggregate image (the internal
 #                  by-reference crossing; the C two-GP-register
 #                  composite — placement is the flavor's rule)
-#   Vector(w)      a SIMD vector slot (the 16-byte register row)
+#   Vector(w)      a SIMD vector slot, w = the vector width in BYTES
+#                  (16 = v128, 32 = v256).  The crossing is the target's
+#                  SIMD&FP register file at the SHARED file position
+#                  (v0..v7 on AAPCS64, xmm0..xmm7 on SysV x86-64, their
+#                  ymm aliases for 256-bit), or BY VALUE on the caller
+#                  stack once the file is exhausted.  The width is legal
+#                  only where vector_crossing_legal admits it (the
+#                  vector_support authority + the x86-64-only ymm file);
+#                  every other width/target pair fails closed naming the
+#                  descriptor.
 #   ByAddress(sz)  the address-carried image (the internal aggregate
 #                  convention; the C by-value stacked composite)
 #   TaggedPtr(w)   the canonical ONE-word registered-enum value (audit
@@ -4034,9 +4043,12 @@ end
 #                  lands them)
 #
 # AbiLocation — WHERE it crosses: a typed kind (None / Register /
-# RegisterPairGpr / RegisterPairFp / StackOffset) plus the target's own
-# register NAME strings (data, not a vocabulary — "x0"/"rdi"/"d0"/"fa0")
-# and the stack byte offset.  The audit sketch also lists an "Indirect"
+# RegisterPairGpr / RegisterPairFp / RegisterVector / StackOffset) plus
+# the target's own register NAME strings (data, not a vocabulary —
+# "x0"/"rdi"/"d0"/"v0"/"xmm0"/"ymm0"/"fa0") and the stack byte offset.
+# A RegisterVector location carries the SIMD&FP-file index in `offset`
+# (abi_location_vector / abi_location_vector_index) so no consumer ever
+# parses a name.  The audit sketch also lists an "Indirect"
 # kind; indirectness deliberately stays the typed AbiParam.indirect Bool
 # instead: the location must still name the register that carries the
 # address, so folding it into the kind would lose the register.
@@ -4062,6 +4074,7 @@ pub enum AbiLocationKind
   Register
   RegisterPairGpr
   RegisterPairFp
+  RegisterVector
   StackOffset
 end
 
@@ -4180,6 +4193,26 @@ pub def abi_location_stack(offset: Int) -> AbiLocation
   AbiLocation { kind: AbiLocationKind::StackOffset, reg_a: "".to_string(), reg_b: "".to_string(), offset: offset }
 end
 
+# The SIMD&FP-file register location (audit item 34 stage 2): the kind is
+# its own (a vector register is neither a general register nor the FP
+# PAIR form), the name is the target's vector register name
+# (abi_vector_name), and the position that produced it rides `offset` —
+# the ONE typed place the LIR vector ABI walk reads the file index from.
+pub def abi_location_vector(name: String, index: Int) -> AbiLocation
+  AbiLocation { kind: AbiLocationKind::RegisterVector, reg_a: name, reg_b: "".to_string(), offset: index }
+end
+
+# The SIMD&FP-file position of a plan location (vector registers carry it
+# in `offset`), -1 for every other kind.  Consumers of the vector ABI
+# read the position ONLY through this helper (the plan remains the one
+# place the position is derived).
+pub def abi_location_vector_index(loc: AbiLocation) -> Int
+  match loc.kind
+  when AbiLocationKind::RegisterVector then loc.offset
+  when _ then -1
+  end
+end
+
 # The canonical location text: "none", the register name, the
 # comma-joined pair ("x0,x1") or "stack+<offset>" — byte-identical to
 # the old string vocabulary.
@@ -4189,6 +4222,7 @@ pub def abi_location_text(loc: AbiLocation) -> String
   when AbiLocationKind::Register then loc.reg_a.clone()
   when AbiLocationKind::RegisterPairGpr then loc.reg_a.clone() + "," + loc.reg_b.clone()
   when AbiLocationKind::RegisterPairFp then loc.reg_a.clone() + "," + loc.reg_b.clone()
+  when AbiLocationKind::RegisterVector then loc.reg_a.clone()
   when AbiLocationKind::StackOffset then "stack+" + loc.offset.to_string()
   end
 end
@@ -4283,6 +4317,76 @@ def abi_fpr_name(desc: TargetDesc, index: Int) -> String
   when Arch::RiscV32 then "fa" + index.to_string()
   when Arch::RiscV64 then "fa" + index.to_string()
   end
+end
+
+# The target's VECTOR ABI register name at SIMD&FP-file position `index`
+# (audit item 34 stage 2).  The float file and the vector file are ONE
+# positional register file on both platform ABIs — AAPCS64's v0..v7
+# short-vector registers alias d0..d7, and the SysV xmm0..xmm7 SSE
+# argument registers are the same registers — so the position is the same
+# shared `fp_pos` stream abi_place_value consumes.  A 256-bit vector on
+# x86-64 uses the ymm alias of the same register.  This is the ONE
+# vector-register NAME authority; the width's legality is
+# vector_crossing_legal.
+pub def abi_vector_name(desc: TargetDesc, index: Int, bits: Int) -> String
+  match desc.arch
+  when Arch::AArch64 then "v" + index.to_string()
+  when Arch::X86_64 then
+    if bits >= 256 then "ymm" + index.to_string() else "xmm" + index.to_string() end
+  when _ then "v" + index.to_string()
+  end
+end
+
+# The VECTOR return register of the target (v0 / xmm0 / ymm0): the first
+# SIMD&FP-file register, fixed by both platform ABIs for every vector
+# return independent of the argument walk.
+pub def abi_vector_return_name(desc: TargetDesc, bits: Int) -> String
+  abi_vector_name(desc, 0, bits)
+end
+
+# THE vector-crossing legality gate (audit item 34 stage 2): a vector
+# register crossing exists exactly where target_desc.vector_support
+# models the width's facility, and the 256-bit class additionally
+# requires the x86-64 SysV ymm file (the AArch64 AdvSIMD file has no
+# 256-bit register and SVE/SME are not modeled).  Fail-closed: every
+# other (desc, width) pair answers false and the consumer names the
+# descriptor through vector_crossing_reason.
+pub def vector_crossing_legal(desc: TargetDesc, bits: Int) -> Bool
+  match vector_support(desc, bits)
+  when VectorSupport::V128 then true
+  when VectorSupport::V256 then desc.arch == Arch::X86_64
+  when VectorSupport::Unsupported then false
+  end
+end
+
+# The fail-closed reason text for a rejected vector crossing: it names
+# the DESCRIPTOR (never a bare arch rule) and the authority that
+# answered.  Empty when the crossing is legal.
+pub def vector_crossing_reason(desc: TargetDesc, bits: Int) -> String
+  if vector_crossing_legal(desc, bits) then
+    ""
+  else
+    "the `" + desc.name + "` target description does not model the " + bits.to_string() + "-bit SIMD vector ABI: target_desc.vector_support(" + desc.name + ", " + bits.to_string() + ") answers Unsupported (128-bit crossings need the AdvSimdA64/Sse2 vector facility; 256-bit crossings need the x86-64 ymm file plus the desc's avx/avx2 tokens) — fail-closed"
+  end
+end
+
+# The caller-stack slot of a vector argument that overflows the SIMD&FP
+# file: the payload crosses BY VALUE (the vector image itself is the slot
+# contents), so the slot is at least the vector width rounded up to the
+# platform stack unit (16 bytes on aarch64 and x86-64, the machine word
+# on the embedded routes), never smaller than the ordinary slot rule.
+def abi_vector_stack_slot(desc: TargetDesc, internal_convention: Bool, size: Int) -> Int
+  let unit = match desc.arch
+  when Arch::AArch64 then 16
+  when Arch::X86_64 then 16
+  when Arch::Armv6M then 4
+  when Arch::Armv7M then 4
+  when Arch::RiscV32 then 4
+  when Arch::RiscV64 then 8
+  end
+  let base = abi_stack_slot_size(desc, internal_convention, size)
+  let rounded = if size <= 0 then unit else ((size + unit - 1) / unit) * unit end
+  if base > rounded then base else rounded end
 end
 
 # The byte size of ONE caller-stack slot for a stacked value.  The
@@ -4690,20 +4794,28 @@ def abi_place_value(desc: TargetDesc, flavor: AbiFlavor, class: AbiValueClass, s
       AbiParam { value_class: AbiValueClass::ByAddress(sz), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
     end
   when AbiValueClass::Vector(w) then
-    if !internal_convention && fp_pos < fpr_count then
-      let loc = abi_location_register(abi_fpr_name(desc, fp_pos))
+    # (audit item 34 stage 2) The SIMD&FP register-file crossing.  The
+    # register file position is SHARED with the scalar floats (AAPCS64's
+    # v0..v7 short-vector file aliases d0..d7; the SysV xmm0..xmm7 SSE
+    # file is one positional stream), so a vector consumes the next
+    # `fp_pos`.  The width's legality was pre-gated by classify_call_plan
+    # (vector_crossing_legal); reaching this arm with an illegal width is
+    # a classifier divergence, not a target gap.
+    let bits = w * 8
+    if !vector_crossing_legal(desc, bits) then
+      panic("abi_place_value: the " + bits.to_string() + "-bit vector crossing of the `" + desc.name + "` descriptor is not legal (vector_crossing_legal answered false) — classify_call_plan pre-gates every vector parameter, so this is a classifier divergence (fail-closed)")
+    end
+    if fp_pos < fpr_count then
+      let loc = abi_location_vector(abi_vector_name(desc, fp_pos, bits), fp_pos)
       fp_pos = fp_pos + 1
       AbiParam { value_class: AbiValueClass::Vector(w), location: loc, indirect: false, extension: AbiExtension::None, alignment: align, size: size }
-    elsif gp_pos < gpr_count then
-      # The internal vector row and the FPU-less C target both carry the
-      # address in a general slot.
-      let loc = abi_location_register(abi_gpr_name(desc, gp_pos))
-      gp_pos = gp_pos + 1
-      AbiParam { value_class: AbiValueClass::Vector(w), location: loc, indirect: true, extension: AbiExtension::None, alignment: align, size: size }
     else
+      # The file is exhausted: the vector image crosses BY VALUE on the
+      # caller stack (indirect = false — the location IS the payload,
+      # exactly like the C stacked composite).
       let off = stack_bytes
-      stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
-      AbiParam { value_class: AbiValueClass::Vector(w), location: abi_location_stack(off), indirect: true, extension: AbiExtension::None, alignment: align, size: size }
+      stack_bytes = stack_bytes + abi_vector_stack_slot(desc, internal_convention, size)
+      AbiParam { value_class: AbiValueClass::Vector(w), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
     end
   end
 end
@@ -4762,8 +4874,22 @@ def abi_classify_return(inout engine: LayoutEngine, desc: TargetDesc, flavor: Ab
     when ValueCategory::ByAddress(sz) then
       Result::Ok(AbiReturn::SRetT(AbiValueClass::ByAddress(sz)))
     when ValueCategory::Vector(w) then
-      let cls = AbiValueClass::Vector(w)
-      if abi_fpr_available(desc) then Result::Ok(AbiReturn::FprPairT(cls)) else Result::Ok(AbiReturn::GprT(cls)) end
+      # (audit item 34 stage 2) A vector return crosses in the fixed
+      # vector return register (v0 / xmm0 / ymm0 — abi_vector_return_name),
+      # legal exactly where the descriptor models the width.  The
+      # FprT carrier is the single-register return class (the FprPairT
+      # form is the two-FP-register aggregate pair, not a vector).
+      if !vector_crossing_legal(desc, w * 8) then
+        return Result::Err(LayoutError {
+          class: LayoutFailureClass::UNSUPPORTED_TYPE,
+          message: "A " + (w * 8).to_string() + "-bit SIMD vector return has no crossing on the `" + desc.name + "` target: " + vector_crossing_reason(desc, w * 8),
+          type_name: mir_type_identity_key(ret_ty),
+          expected: 0,
+          actual: 0,
+          context: "abi_classify_return"
+        })
+      end
+      Result::Ok(AbiReturn::FprT(AbiValueClass::Vector(w)))
     end
   end
 end
@@ -4875,6 +5001,24 @@ pub def classify_call_plan(inout engine: LayoutEngine, desc: TargetDesc, flavor:
     when Result::Ok(i) then i
     when Result::Err(e) then return Result::Err(e)
     end
+    # (audit item 34 stage 2) The vector-width gate: a vector parameter
+    # crosses only where the descriptor models the width (v128) or the
+    # x86-64 ymm file (v256); every other pair fails closed NAMING the
+    # descriptor, before any placement consumes a position.
+    match img.0
+    when AbiValueClass::Vector(w) then
+      if !vector_crossing_legal(desc, w * 8) then
+        return Result::Err(LayoutError {
+          class: LayoutFailureClass::UNSUPPORTED_TYPE,
+          message: "A " + (w * 8).to_string() + "-bit SIMD vector parameter has no crossing on the `" + desc.name + "` target: " + vector_crossing_reason(desc, w * 8),
+          type_name: mir_type_identity_key(ty),
+          expected: 0,
+          actual: 0,
+          context: "classify_call_plan"
+        })
+      end
+    when _ then ()
+    end
     let ext = abi_extension_of(ty)
     let p = abi_place_value(desc, flavor, img.0, img.1, img.2, ext, &mut gp_pos, &mut fp_pos, &mut stack_bytes)
     args.push(p)
@@ -4890,4 +5034,46 @@ pub def classify_call_plan(inout engine: LayoutEngine, desc: TargetDesc, flavor:
     variadic: variadic,
     stack_arg_bytes: stack_bytes
   })
+end
+
+# The number of VECTOR-class arguments in a plan: the count of
+# AbiValueClass::Vector parameters, independent of their placement (the
+# register class is read off the class, so a file overflow's stacked
+# vector still counts).  This is the "vector args" half of the x86-64
+# SysV variadic AL rule.
+pub def abi_vector_arg_count(plan: AbiCallPlan) -> Int
+  var n = 0
+  for p in plan.args do
+    match p.value_class
+    when AbiValueClass::Vector(_) then n = n + 1
+    when _ then ()
+    end
+  end
+  n
+end
+
+# THE x86-64 SysV variadic AL value (the vector-register count rule): a
+# call to a variadic function sets AL to the number of vector registers
+# used by the arguments — the SSE/AVX register file positions, which
+# scalar floats SHARE with vectors (the same shared `fp_pos` stream
+# abi_place_value consumes).  Counts every argument whose location is the
+# register file at a file position (RegisterVector, or Register carrying
+# ScalarFloat), saturating at the file's 8 positions.  A variadic call
+# with more file positions than 8 passes the rest on the stack and AL
+# stays 8 (the psABI's cap); non-x86 targets ignore the value (it is the
+# x86-64 psABI's rule; the LIR x86-64 variadic emission consumes it).
+pub def abi_vector_reg_count(plan: AbiCallPlan) -> Int
+  var n = 0
+  for p in plan.args do
+    match p.location.kind
+    when AbiLocationKind::RegisterVector then n = n + 1
+    when AbiLocationKind::Register then
+      match p.value_class
+      when AbiValueClass::ScalarFloat(_) then n = n + 1
+      when _ then ()
+      end
+    when _ then ()
+    end
+  end
+  if n > 8 then 8 else n end
 end

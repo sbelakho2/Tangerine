@@ -1,0 +1,404 @@
+# tests/thumb_variadic_float_rows_test.tg — the cortex-m AAPCS32
+# variadic base-convention marshalling rows (audit §16/§26, the P0-21
+# contract residual). The emitter re-derives the whole variadic call's
+# BASE layout at emission (thumb_emit_var_call_block /
+# thumb_var_call_plan in backend_thumb.tg): the shared LIR lowering has
+# no variadic marker and marshals every register-class float into the
+# fixed FP vregs d0..d7, so the variadic call block's hard-float marshal
+# statements are skipped and the argument stream is rebuilt as
+# base-type words:
+#   - an F64 extra (or the §26-promoted double image of an F32 extra)
+#     takes the next aligned even-odd r0..r3 pair via VMOV Rt, Rt2, Dd
+#     (low word in the even register) when it fits, else an
+#     8-byte-aligned two-word unit on the caller stack (VSTR.F64);
+#   - the following general words continue the same r0..r3 / 4-byte
+#     word stream (a displaced int moves to the caller stack);
+#   - the caller's SP is padded to an even word count (8-byte aligned
+#     at the BL);
+#   - no variadic float rides a fixed FP argument register (d0..d7):
+#     the pair transfer reads the F64 from its ALLOCATED home (the
+#     callee-saved d8..d13 pool or a spill slot) into general
+#     registers, exactly the base standard.
+# The F32 -> F64 promotion is a real VCVT (vcvt.f64.f32) and needs the
+# double-precision VFP data-processing unit (cortex-m7 / FPv5-D16); on
+# the FPv4-SP/FPv5-SP cortex-m4f instances the promotion fails closed
+# with the named rule (the F64 subset there is load/store/transfer).
+#
+# Run with: tg test tests/thumb_variadic_float_rows_test.tg
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::asm::{CodeBuffer, buf_new}
+use tg_compiler::token::span_dummy
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId, MirStatement,
+  MirStatementKind, MirRvalue, MirRvalueKind, MirOperand, MirOperandKind,
+  MirConstant, MirConstantKind, MirTerminator, MirTerminatorKind,
+  MirCallArg, MirCallValue, CastKind, place_local
+}
+use tg_compiler::types::{Type, AccessEffect}
+use tg_compiler::lir::{
+  LirFunction, LirAlloc, LirStmtKind, LirTermKind, LirFpWidth,
+  lower_mir_fn_to_lir_cm, lir_peephole, lir_alloc_registers_cm,
+  verify_lir, LirVerifyRoute
+}
+use tg_compiler::target_desc::{
+  thumbv7em_cortex_m4f_desc, thumbv7em_cortex_m7_desc
+}
+use tg_compiler::backend_thumb::{
+  ThumbEmit, thumb_emit_new, thumb_emit_fn, thumb_mdl_pool,
+  t2_vmov_d_to_gp_pair, t2_vmov_f64, t2_vstr_f64, t2_vcvt_f64_f32,
+  t2_str_sp_imm8, t2_str_w_imm12
+}
+
+# ———————————————————————————————————————————————————————————————
+# Fixtures: `_ret` is local 0; parameter i is local i+1 (so a call
+# argument list is written directly as the parameter local ids).
+# ———————————————————————————————————————————————————————————————
+
+def tvf_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal {
+    id: MirLocalId { id: id },
+    name: name,
+    ty: ty,
+    is_mut: is_mut,
+    span: span_dummy()
+  }
+end
+
+def tvf_param_locals(tys: Vec[Type]) -> Vec[MirLocal]
+  var out: Vec[MirLocal] = Vec::new()
+  var i = 0
+  while i < tys.len() do
+    out.push(tvf_local(i + 1, "p" + i.to_string(), tys[i].clone(), false))
+    i = i + 1
+  end
+  out
+end
+
+def tvf_block(bid: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: bid }, statements: stmts, terminator: term }
+end
+
+def tvf_fn(name: String, tys: Vec[Type], ret_ty: Type, blocks: Vec[MirBlock]) -> MirFunction
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(tvf_local(0, "_ret", ret_ty.clone(), true))
+  let params = tvf_param_locals(tys)
+  var pi = 0
+  while pi < params.len() do
+    locals.push(params[pi].clone())
+    pi = pi + 1
+  end
+  MirFunction {
+    name: name,
+    params: params,
+    ret_type: ret_ty,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def tvf_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def tvf_copy_operand(id: Int) -> MirOperand
+  MirOperand { kind: MirOperandKind::MirCopy(place_local(MirLocalId { id: id })) }
+end
+
+def tvf_call_term(target: String, arg_ids: Vec[Int]) -> MirTerminator
+  var args: Vec[MirCallArg] = Vec::new()
+  var i = 0
+  while i < arg_ids.len() do
+    args.push(MirCallArg {
+      effect: AccessEffect::Read,
+      value: MirCallValue::Value(tvf_copy_operand(arg_ids[i]))
+    })
+    i = i + 1
+  end
+  MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: place_local(MirLocalId { id: 0 }),
+      func: MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirFnItem(target),
+        ty: Type::Unit,
+        instance: Option::None
+      }) },
+      args: args,
+      success: MirBlockId { id: 1 },
+      unwind: Option::None,
+      intrinsic: Option::None,
+      tail: false
+    },
+    span: span_dummy()
+  }
+end
+
+# A caller whose block 0 calls `target` with the parameter locals in
+# `arg_ids` order (parameter i = local i+1) and block 1 returns.
+def tvf_caller_fn(name: String, tys: Vec[Type], target: String, arg_ids: Vec[Int]) -> MirFunction
+  tvf_fn(name, tys, Type::Unit, Vec::from([
+    tvf_block(0, Vec::new(), tvf_call_term(target, arg_ids)),
+    tvf_block(1, Vec::new(), tvf_ret_term())
+  ]))
+end
+
+def tvf_variadic() -> Set[String]
+  var s: Set[String] = Set::new()
+  s.insert("sink".to_string())
+  s
+end
+
+def tvf_lower_ok(f: MirFunction) -> LirFunction
+  match lower_mir_fn_to_lir_cm(f, Map::new())
+  when Result::Ok(lf) then lir_peephole(lf)
+  when Result::Err(e) then panic("thumb variadic float rows: lowering failed: " + e)
+  end
+end
+
+def tvf_check(lf: LirFunction) -> LirAlloc
+  let alloc = lir_alloc_registers_cm(lf)
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyCm)
+  var first = ""
+  if violations.len() > 0 then first = violations[0] end
+  assert(violations.len() == 0, "a cortex-m variadic function must verify clean; first violation: " + first)
+  alloc
+end
+
+def tvf_emit_result(lf: LirFunction, alloc: LirAlloc, desc_name: String) -> Result[ThumbEmit, String]
+  let desc = if desc_name == "m7" then thumbv7em_cortex_m7_desc() else thumbv7em_cortex_m4f_desc() end
+  let pool = match thumb_mdl_pool(desc)
+  when Result::Ok(p) then p
+  when Result::Err(e) then return Result::Err("thumb variadic float rows: pool failed: " + e)
+  end
+  var te = thumb_emit_new()
+  match thumb_emit_fn(&mut te, pool, desc, lf, alloc, Set::new(), Set::new(), tvf_variadic())
+  when Result::Ok(_) then Result::Ok(te)
+  when Result::Err(e) then Result::Err(e)
+  end
+end
+
+def tvf_emit_ok(lf: LirFunction, alloc: LirAlloc, desc_name: String) -> ThumbEmit
+  match tvf_emit_result(lf, alloc, desc_name)
+  when Result::Ok(te) then te
+  when Result::Err(e) then panic("thumb variadic float rows: emission failed: " + e)
+  end
+end
+
+def tvf_word_at(b: CodeBuffer, off: Int) -> Int
+  (b.bytes[off] as Int)
+    | ((b.bytes[off + 1] as Int) << 8)
+    | ((b.bytes[off + 2] as Int) << 16)
+    | ((b.bytes[off + 3] as Int) << 24)
+end
+
+def tvf_has_word(b: CodeBuffer, word: Int) -> Bool
+  var i = 0
+  while i + 3 < b.bytes.len() do
+    if tvf_word_at(b, i) == word then
+      return true
+    end
+    i = i + 1
+  end
+  false
+end
+
+# The buffer contains VMOV Rt, Rt2, Dd for this exact general pair and
+# SOME allocated double register source (the resolver picks the pool/
+# spill home, so the probe scans d0..d15).
+def tvf_has_gp_pair(b: CodeBuffer, lo: Int, hi: Int) -> Bool
+  var dd = 0
+  var found = false
+  while dd <= 15 do
+    var probe = buf_new()
+    t2_vmov_d_to_gp_pair(&mut probe, lo, hi, dd)
+    if tvf_has_word(b, tvf_word_at(probe, 0)) then
+      found = true
+    end
+    dd = dd + 1
+  end
+  found
+end
+
+# The buffer contains VSTR.F64 Dd, [sp, #off] for SOME double register
+# (the base convention's 8-byte-aligned caller-stack unit).
+def tvf_has_vstr_f64_sp(b: CodeBuffer, off: Int) -> Bool
+  var dd = 0
+  var found = false
+  while dd <= 15 do
+    var probe = buf_new()
+    t2_vstr_f64(&mut probe, dd, 13, off)
+    if tvf_has_word(b, tvf_word_at(probe, 0)) then
+      found = true
+    end
+    dd = dd + 1
+  end
+  found
+end
+
+# The buffer contains a caller-stack word store at [sp, #off] (the
+# 16-bit STR with sp base, or the 32-bit STR.W form).
+def tvf_has_str_sp(b: CodeBuffer, off: Int) -> Bool
+  var found = false
+  if off == 0 then
+    var r0 = 0
+    while r0 <= 7 do
+      var probe = buf_new()
+      t2_str_sp_imm8(&mut probe, r0, 0)
+      if tvf_has_word(b, tvf_word_at(probe, 0)) then
+        found = true
+      end
+      r0 = r0 + 1
+    end
+  end
+  var r12 = 0
+  while r12 <= 12 do
+    var probe = buf_new()
+    t2_str_w_imm12(&mut probe, r12, 13, off)
+    if tvf_has_word(b, tvf_word_at(probe, 0)) then
+      found = true
+    end
+    r12 = r12 + 1
+  end
+  found
+end
+
+# No fixed FP argument register d0..d7 receives the extra through a
+# VMOV.F64 Dd, Dm copy: the base marshalling reads the source's own
+# allocated home (the callee-saved d8..d13 pool or a scratch) and
+# crosses via the general-register pair — a LirFMove into a fixed FP
+# vreg would have produced this copy word with a d0..d7 destination on
+# the f64dp variant.
+def tvf_has_vmov_f64_into_fixed(b: CodeBuffer) -> Bool
+  var dd = 0
+  var found = false
+  while dd <= 7 do
+    var dm = 0
+    while dm <= 15 do
+      if dd != dm then
+        var probe = buf_new()
+        t2_vmov_f64(&mut probe, dd, dm)
+        if tvf_has_word(b, tvf_word_at(probe, 0)) then
+          found = true
+        end
+      end
+      dm = dm + 1
+    end
+    dd = dd + 1
+  end
+  found
+end
+
+# ———————————————————————————————————————————————————————————————
+# Rows
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_thumb_variadic_f64_gp_pair_row() -> Unit
+  # sink(Int, Int, F64): base r0 = i0, r1 = i1, the double's two words
+  # in the aligned r2/r3 pair (low word r2) — NOT d0.
+  let caller = tvf_caller_fn("caller_pair", Vec::from([
+    Type::Int, Type::Int, Type::F64
+  ]), "sink", Vec::from([1, 2, 3]))
+  let lf = tvf_lower_ok(caller)
+  let alloc = tvf_check(lf)
+  let te = tvf_emit_ok(lf, alloc, "m4f")
+  assert_true(tvf_has_gp_pair(te.buf, 2, 3))
+end
+
+@test
+def test_thumb_variadic_f64_stack_row() -> Unit
+  # sink(Int x5, F64): i0..i3 in r0..r3, i4 on the stack word 0; the
+  # double does not fit the aligned pair (NCRN rounds 4 -> 4), so it is
+  # the 8-byte-aligned stack unit at word 2 (word 1 is the alignment
+  # pad); the total is 4 words (even).
+  let caller = tvf_caller_fn("caller_stack", Vec::from([
+    Type::Int, Type::Int, Type::Int, Type::Int, Type::Int, Type::F64
+  ]), "sink", Vec::from([1, 2, 3, 4, 5, 6]))
+  let lf = tvf_lower_ok(caller)
+  let alloc = tvf_check(lf)
+  let te = tvf_emit_ok(lf, alloc, "m4f")
+  assert_true(tvf_has_str_sp(te.buf, 0))
+  assert_true(tvf_has_vstr_f64_sp(te.buf, 8))
+end
+
+@test
+def test_thumb_variadic_interleaved_shift_row() -> Unit
+  # sink(Int, F64, Int): i0 -> r0, the double -> the aligned r2/r3 pair
+  # (NCRN rounds 1 -> 2), and the SECOND int is displaced to the caller
+  # stack word 0 (NCRN 4) — the base convention's left-to-right walk,
+  # not a per-class append.
+  let caller = tvf_caller_fn("caller_shift", Vec::from([
+    Type::Int, Type::F64, Type::Int
+  ]), "sink", Vec::from([1, 2, 3]))
+  let lf = tvf_lower_ok(caller)
+  let alloc = tvf_check(lf)
+  let te = tvf_emit_ok(lf, alloc, "m4f")
+  assert_true(tvf_has_gp_pair(te.buf, 2, 3))
+  assert_true(tvf_has_str_sp(te.buf, 0))
+end
+
+@test
+def test_thumb_variadic_gp_only_row() -> Unit
+  # A GP-only variadic call still emits (and now goes through the same
+  # base re-marshalling): i0..i3 r0..r3, i4/i5 stack words 0/1.
+  let caller = tvf_caller_fn("caller_gp", Vec::from([
+    Type::Int, Type::Int, Type::Int, Type::Int, Type::Int, Type::Int
+  ]), "sink", Vec::from([1, 2, 3, 4, 5, 6]))
+  let lf = tvf_lower_ok(caller)
+  let alloc = tvf_check(lf)
+  let te = tvf_emit_ok(lf, alloc, "m4f")
+  assert_true(te.buf.bytes.len() > 0)
+end
+
+@test
+def test_thumb_variadic_f32_promotion_m4f_rejected_row() -> Unit
+  # An F32 extra reaches the marshaller as its own width: the C default
+  # promotion F32 -> F64 is a real vcvt.f64.f32, which FPv4-SP does not
+  # provide (the F64 subset there is load/store/transfer). The route
+  # fails closed with the promotion rule — never an unconverted single.
+  let caller = tvf_caller_fn("caller_f32", Vec::from([
+    Type::Int, Type::F32
+  ]), "sink", Vec::from([1, 2]))
+  let lf = tvf_lower_ok(caller)
+  let alloc = tvf_check(lf)
+  match tvf_emit_result(lf, alloc, "m4f")
+  when Result::Ok(_) then panic("the FPv4-SP F32 variadic promotion must fail closed")
+  when Result::Err(e) then
+    assert_true(e.contains("F32 -> F64"))
+  end
+end
+
+@test
+def test_thumb_variadic_f32_promoted_pair_m7_row() -> Unit
+  # On the FPv5-D16 cortex-m7 the promotion lowers: vcvt.f64.f32 into
+  # the scratch double, then the same aligned r2/r3 pair (i0 in r0; the
+  # promoted double rounds NCRN 1 -> 2).
+  let caller = tvf_caller_fn("caller_f32_m7", Vec::from([
+    Type::Int, Type::F32
+  ]), "sink", Vec::from([1, 2]))
+  let lf = tvf_lower_ok(caller)
+  let alloc = tvf_check(lf)
+  let te = tvf_emit_ok(lf, alloc, "m7")
+  var saw_vcvt = false
+  var ss = 0
+  while ss <= 31 do
+    var probe = buf_new()
+    t2_vcvt_f64_f32(&mut probe, 15, ss)
+    if tvf_has_word(te.buf, tvf_word_at(probe, 0)) then
+      saw_vcvt = true
+    end
+    ss = ss + 1
+  end
+  assert_true(saw_vcvt, "the m7 F32 extra must be promoted with vcvt.f64.f32")
+  assert_true(tvf_has_gp_pair(te.buf, 2, 3))
+  assert_true(!tvf_has_vmov_f64_into_fixed(te.buf), "no variadic float may cross in a fixed FP argument register")
+end

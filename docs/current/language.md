@@ -801,20 +801,26 @@ The recognized metric spellings and their CURRENT classification
 | Metric spellings | Resource | Classification | Derivation / enforcement |
 |------------------|----------|----------------|--------------------------|
 | `heap_allocations`, `alloc`, `allocation(s)`, `heap_allocs` | `alloc` | `runtime-measured` — the per-invocation allocation counter traps; `static-proof` only for limit `0` with the MIR-proven transitive no-allocation summary | allocation count at run time |
-| `heap_bytes`, `heap_size`, `heap` | `heap_bytes` | `static-bound` — allocation-site count × the documented 4096-byte conservative per-site cap; `static-proof` for the zero case above | static site count |
-| `stack_bytes`, `stack_size`, `stack` | `stack_bytes` | `static-proof` when the LIR route supplies the exact per-function `frame_bytes`, else `static-bound` from the MIR derivation | frame size |
+| `heap_bytes`, `heap_size`, `heap` | `heap_bytes` | per-site size classification (P1-7): every allocating site carries one `Exact` / `UpperBound` / `Unbounded` / `Unknown` class and the reachable sites join under the four-way lattice — `static-proof` for an all-Exact aggregate (or the zero case above), `static-bound` for a finite UpperBound aggregate, and `Unbounded` / `Unknown` (a runtime-sized or unresolved site) carries NO finite static bound and FAILS the annotation (E0235) | per-site size classes joined over the transitive call graph |
+| `stack_bytes`, `stack_size`, `stack` | `stack_bytes` | max transitive stack (P1-8): `max_stack_bytes = frame_bytes + max over direct callees of (callee max_stack_bytes + 16-byte call overhead)` — `static-proof` when the whole chain is post-RA exact, `static-bound` when finite but partly MIR-derived, and a call cycle without a proven finite recursion bound (or a callee outside the frame table) is Unbounded and FAILS the annotation (E0235) | max-transitive analysis over the call graph; diagnostics report both `frame_bytes` and `max_stack_bytes` |
 | `code_size_bytes`, `code_size`, `code_bytes` | `code_size` | `static-bound` from the MIR instruction estimate × 4; `static-proof` only with an emitter's exact word count | instruction estimate |
 | `time`, `time_us`, `time_ms`, `time_ns` | `time` | `runtime-measured` — the frame stamps the entry clock and every return compares the elapsed time (native + wasm frame slots); a `time_us` bare number is microseconds | frame clock |
 | `instructions`, `instruction_count`, `instrs` | `instructions` | `runtime-measured` at run time — the per-statement frame counter (native + wasm) checks at every return; the MIR estimate (2 × statements + 3 × terminators) additionally classifies `static-bound` when derivable | statement count |
 
 Every other metric identifier parses, rides the typed record and is
 classified `runtime-measured` (fail closed — the compiler never claims a
-static guarantee it cannot derive). Two refinements are explicitly NOT
-claimed by the current implementation: the heap derivations stay at the
-conservative site-count/cap model (the exact per-site heap proof is
-pending, tracked as P1-7) and `stack_bytes` is the function's OWN frame
-(the caller-chain max-transitive distinction is pending, tracked as
-P1-8). The declarations below illustrate the surface:
+static guarantee it cannot derive). The heap and stack refinements are
+implemented: the heap derivation joins the per-site
+`Exact`/`UpperBound`/`Unbounded`/`Unknown` classes under the four-way
+lattice, so a runtime-sized allocation site makes the aggregate
+Unbounded/Unknown and can never satisfy a finite static proof (the legacy
+site-count × `BUDGET_ALLOC_SITE_BYTES` cap survives only for a context
+that carries no per-site classification); the stack derivation is the
+caller-chain `max_stack_bytes` (the function's own frame plus, over every
+direct callee, the callee max stack plus the 16-byte call overhead), a
+call cycle with no proven finite recursion bound is Unbounded, and the
+diagnostic reports both `frame_bytes` and `max_stack_bytes`. The
+declarations below illustrate the surface:
 
 ```tangerine
 # The enforced spelling is the @budget attribute (after the return type;
@@ -2192,7 +2198,9 @@ per-backend emission) for the host targets (`aarch64-apple-darwin` /
 `x86_64-unknown-linux-gnu`); `--codegen=direct` selects the DIRECT
 emitter (codegen.tg) — the debug/bootstrap fallback retained until the
 remaining fail-closed LIR shapes close and the differential corpus
-passes. The wasm32 route keeps its own code generator. The LIR pipeline
+lane's execution results hold green (the lane exists:
+`tests/run_differential_corpus_tests.sh`). The wasm32 route keeps its own
+code generator. The LIR pipeline
 is also the code generator for the embedded Thumb/RISC-V triples
 **selected by `--target`**: a `--target thumbv7m-none-eabi` /
 `thumbv7em-none-eabi[f]` / `riscv32imac|imafc|imafdc-unknown-none-elf` /

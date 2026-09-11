@@ -1,0 +1,665 @@
+# tests/lir_deinit_plan_test.tg — THE P0-21 DEINIT-PLAN CONSUMER of the
+# LIR route: MirDeinit's non-trivial concrete DeinitPlan trees lower by
+# CONSUMING the plan in its normative order instead of failing closed
+# (lir.tg's lir_lower_deinit / lir_lower_deinit_plan).
+#
+# What this suite pins (one lane row per plan shape):
+#   1. Aggregate: a struct's field plans run in DECLARATION ORDER and a
+#      registered finalizer Call lowers as the direct finalizer call
+#      (the emitted callee identities and their execution order);
+#   2. UserFinalizer: the user finalizer runs FIRST, then the structural
+#      field walk (the exactly-once order — the shape the old slice
+#      refused for a non-empty walk);
+#   3. Enum: ONE discriminant switch, and only the ACTIVE variant's
+#      payload plan is on each arm's chain (variant A's arm calls only
+#      the A finalizer, variant B's only the B finalizer);
+#   4. Array (the fixed-array element walk): a COUNTED LOOP is emitted
+#      (index 0, bound n, increment, a real back edge) whose per-iteration
+#      element destruction is the element type's per-type glue call —
+#      the plan's element count comes from Type::FixedArray;
+#   5. RecursionBySymbol: a Call identity that is not a registered
+#      finalizer lowers as the per-type GLUE CALL (mir_drop_glue_name —
+#      the exact emission name mir_glue_instance_for_type registers);
+#   6. String: the DeinitPlan::String leaf lowers as the runtime
+#      destructor call (_tg_string_drop) with the field's address;
+#   7. every row verifies clean through the mandatory post-allocation
+#      verify_lir gate.
+#
+# The previously fail-closed rows this opens: the old MirDeinit slice
+# refused every plan shape except Trivial and the empty-structural-walk
+# UserFinalizer/Call (raising "the MirDeinit slice implements the
+# plan-less/trivial drops ... structural cleanup ... is not implemented").
+# There are no stale fail-closed rows to remove: the lane is new.
+#
+# Run with: tg test tests/lir_deinit_plan_test.tg
+
+use std::core::{Option, Result, Int, UInt, Unit, Bool, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::ast::layout_attrs_plain
+use tg_compiler::ids::{TypeId, VariantId, ModuleId, DefId, CallableId, InstanceId, def_id_numeric}
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId, MirStatement,
+  MirStatementKind, MirRvalue, MirRvalueKind, MirOperand, MirOperandKind,
+  MirTerminator, MirTerminatorKind,
+  MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef,
+  Place, Projection, place_local, mir_type_identity_key, mir_drop_glue_name
+}
+use tg_compiler::token::span_dummy
+use tg_compiler::types::{Type, DeinitPlan}
+use tg_compiler::lir::{
+  LirFunction, LirVerifyRoute, LirTermKind, LirValue, LirStmtKind,
+  lower_mir_fn_to_lir_prog, lir_alloc_registers_a64,
+  verify_lir
+}
+
+# ———————————————————————————————————————————————————————————————
+# Fixture: the resource type universe. Every type is admitted by the
+# layout-driven aggregate gate (one-word Int fields / scalar payloads),
+# so the deinit plans are the ONLY new input.
+# ———————————————————————————————————————————————————————————————
+#   300 DropA { x: Int }   — plan Call(finalizer A)
+#   301 DropB { y: Int }   — plan Call(finalizer B)
+#   302 Two   { a: DropA, b: DropB } — plan Aggregate([A, B])
+#   303 E     { A(Int), B(Int) }     — plan Enum({0: A, 1: B})
+#   304 HasSym{ child: DropA }       — plan Aggregate([Call(glue)])
+#   305 HasStr{ s: DropA }           — plan Aggregate([String])
+#   306 Fin   { a: DropA }           — plan UserFinalizer(F0, [A])
+
+def ld_struct_def(id: Int, name: String, fields: Vec[(String, Type)]) -> MirTypeDef
+  var fs: Vec[MirFieldDef] = Vec::new()
+  var i = 0
+  while i < fields.len() do
+    fs.push(MirFieldDef { name: fields[i].0.clone(), ty: fields[i].1.clone() })
+    i = i + 1
+  end
+  MirTypeDef {
+    id: TypeId { id: id },
+    name: name,
+    kind: MirTypeDefKind::Struct(fs),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def ld_enum_def(id: Int, name: String, variants: Vec[MirVariantDef]) -> MirTypeDef
+  MirTypeDef {
+    id: TypeId { id: id },
+    name: name,
+    kind: MirTypeDefKind::Enum(variants),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def ld_type_defs() -> Map[Int, MirTypeDef]
+  var defs: Map[Int, MirTypeDef] = Map::new()
+  defs.insert(300, ld_struct_def(300, "DropA", Vec::from([
+    ("x".to_string(), Type::Int)
+  ])))
+  defs.insert(301, ld_struct_def(301, "DropB", Vec::from([
+    ("y".to_string(), Type::Int)
+  ])))
+  defs.insert(302, ld_struct_def(302, "Two", Vec::from([
+    ("a".to_string(), ld_drop_a_ty()),
+    ("b".to_string(), ld_drop_b_ty())
+  ])))
+  defs.insert(303, ld_enum_def(303, "E", Vec::from([
+    MirVariantDef { name: "A".to_string(), discriminant: 0, fields: Vec::from([Type::Int]) },
+    MirVariantDef { name: "B".to_string(), discriminant: 1, fields: Vec::from([Type::Int]) }
+  ])))
+  defs.insert(304, ld_struct_def(304, "HasSym", Vec::from([
+    ("child".to_string(), ld_drop_a_ty())
+  ])))
+  defs.insert(305, ld_struct_def(305, "HasStr", Vec::from([
+    ("s".to_string(), ld_drop_a_ty())
+  ])))
+  defs.insert(306, ld_struct_def(306, "Fin", Vec::from([
+    ("a".to_string(), ld_drop_a_ty())
+  ])))
+  defs
+end
+
+def ld_drop_a_ty() -> Type
+  Type::Adt(TypeId { id: 300 }, Vec::new())
+end
+
+def ld_drop_b_ty() -> Type
+  Type::Adt(TypeId { id: 301 }, Vec::new())
+end
+
+def ld_two_ty() -> Type
+  Type::Adt(TypeId { id: 302 }, Vec::new())
+end
+
+def ld_e_ty() -> Type
+  Type::Adt(TypeId { id: 303 }, Vec::new())
+end
+
+def ld_has_sym_ty() -> Type
+  Type::Adt(TypeId { id: 304 }, Vec::new())
+end
+
+def ld_has_str_ty() -> Type
+  Type::Adt(TypeId { id: 305 }, Vec::new())
+end
+
+def ld_fin_ty() -> Type
+  Type::Adt(TypeId { id: 306 }, Vec::new())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Fixture: finalizer identities (synthetic DefIds in module 42). The
+# instance indexes 1/2/3 are REGISTERED finalizers; 9 is the
+# recursion-by-symbol glue identity (deliberately NOT registered).
+# ———————————————————————————————————————————————————————————————
+
+def ld_def(index: Int) -> DefId
+  DefId { module: ModuleId { id: 42 }, index: index as UInt }
+end
+
+def ld_inst(index: Int) -> InstanceId
+  InstanceId { def: CallableId { def: ld_def(index) }, substs: Vec::new() }
+end
+
+def ld_finalizer_names() -> Map[Int, String]
+  var m: Map[Int, String] = Map::new()
+  m.insert(def_id_numeric(ld_def(1)), "drop_a".to_string())
+  m.insert(def_id_numeric(ld_def(2)), "drop_b".to_string())
+  m.insert(def_id_numeric(ld_def(3)), "fin_zero".to_string())
+  m
+end
+
+def ld_plan_for(ty: Type, plan: DeinitPlan) -> Map[String, DeinitPlan]
+  var m: Map[String, DeinitPlan] = Map::new()
+  m.insert(mir_type_identity_key(ty), plan)
+  m
+end
+
+# ———————————————————————————————————————————————————————————————
+# Fixture: a function whose only action is the MirDeinit of local 1.
+# ———————————————————————————————————————————————————————————————
+
+def ld_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal { id: MirLocalId { id: id }, name: name, ty: ty, is_mut: is_mut, span: span_dummy() }
+end
+
+def ld_block(bid: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: bid }, statements: stmts, terminator: term }
+end
+
+def ld_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def ld_deinit_term(place: Place, deinit_fn: InstanceId, target: Int) -> MirTerminator
+  MirTerminator {
+    kind: MirTerminatorKind::MirDeinit {
+      place: place,
+      # In a USER function the payload glue identity is replaced by the
+      # plan consumer (the destroyed place's concrete plan is the
+      # authority); a synthetic glue-shaped identity keeps the
+      # terminator well-formed.
+      deinit_fn: deinit_fn,
+      target: MirBlockId { id: target },
+      unwind: Option::None
+    },
+    span: span_dummy()
+  }
+end
+
+def ld_place(id: Int) -> Place
+  place_local(MirLocalId { id: id })
+end
+
+def ld_assign_move(dst: Place, op: MirOperand) -> MirStatement
+  MirStatement {
+    kind: MirStatementKind::MirAssign(dst, MirRvalue {
+      kind: MirRvalueKind::MirMove(op),
+      span: span_dummy()
+    }),
+    span: span_dummy()
+  }
+end
+
+def ld_deref_operand(local_id: Int) -> MirOperand
+  var p = ld_place(local_id)
+  p.projections.push(Projection::ProjDeref)
+  MirOperand { kind: MirOperandKind::MirCopy(p) }
+end
+
+def ld_deinit_fn(name: String, ty: Type) -> MirFunction
+  MirFunction {
+    name: name,
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: Vec::from([
+      ld_local(0, "_ret", Type::Unit, true),
+      ld_local(1, "v", ty, true)
+    ]),
+    blocks: Vec::from([
+      ld_block(0, Vec::new(), ld_deinit_term(ld_place(1), ld_inst(9), 1)),
+      ld_block(1, Vec::new(), ld_ret_term())
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def ld_lower(f: MirFunction, defs: Map[Int, MirTypeDef], plans: Map[String, DeinitPlan]) -> LirFunction
+  match lower_mir_fn_to_lir_prog(f, defs, plans, ld_finalizer_names(), Set::new(), Map::new(), Map::new())
+  when Result::Err(e) then panic("deinit-plan test lowering failed for " + f.name + ": " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def ld_verify_clean(f: LirFunction, what: String) -> Unit
+  let alloc = lir_alloc_registers_a64(f)
+  let violations = verify_lir(f, alloc, LirVerifyRoute::LirVerifyA64)
+  var first = ""
+  if violations.len() > 0 then first = violations[0] end
+  assert(violations.len() == 0, what + " must verify clean; first violation: " + first)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Inspection helpers over the lowered LIR.
+# ———————————————————————————————————————————————————————————————
+
+def ld_block_pos(f: LirFunction, bid: Int) -> Int
+  var i = 0
+  var found = -1
+  while i < f.blocks.len() do
+    if f.blocks[i].id == bid then found = i end
+    i = i + 1
+  end
+  found
+end
+
+def ld_calls(f: LirFunction) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  var bi = 0
+  while bi < f.blocks.len() do
+    match f.blocks[bi].term.kind
+    when LirTermKind::LirCall(target, _, _, _, _) then out.push(target.clone())
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+# Follow the block chain from `start`: call terminators append their
+# target and continue at the success block; jumps continue; anything
+# else stops. This is the plan consumer's EXECUTION order (creation
+# order is backward because the chains are built backward).
+def ld_follow_call_order(f: LirFunction, start: Int) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  var cur = start
+  var guard = 0
+  var done = false
+  while guard < 64 && !done do
+    guard = guard + 1
+    let pos = ld_block_pos(f, cur)
+    if pos < 0 then
+      done = true
+    else
+      match f.blocks[pos].term.kind
+      when LirTermKind::LirCall(target, _, _, _, success) then
+        out.push(target.clone())
+        cur = success
+      when LirTermKind::LirJump(t) then
+        cur = t
+      when _ then done = true
+      end
+    end
+  end
+  out
+end
+
+# The first call target reachable from the entry block's jump (the
+# one-call rows: recursion-by-symbol, String, array).
+def ld_first_call(f: LirFunction) -> String
+  let order = ld_follow_call_order(f, ld_entry_jump_target(f))
+  var first = ""
+  if order.len() > 0 then first = order[0].clone() end
+  first
+end
+
+# The block the entry block (MIR block 0) jumps to: the plan consumer's
+# entry.
+def ld_entry_jump_target(f: LirFunction) -> Int
+  var target = -1
+  var bi = 0
+  while bi < f.blocks.len() do
+    if f.blocks[bi].id == 0 then
+      match f.blocks[bi].term.kind
+      when LirTermKind::LirJump(t) then target = t
+      when _ then ()
+      end
+    end
+    bi = bi + 1
+  end
+  target
+end
+
+# Find the discriminant switch of an Enum/Option/Result plan: the first
+# switch terminator carrying BOTH arm values 0 and 1 (the tagged
+# normalization's own flag switch carries only value 1).
+def ld_find_disc_switch(f: LirFunction) -> (Int, Int)
+  var arm0 = -1
+  var arm1 = -1
+  var bi = 0
+  while bi < f.blocks.len() do
+    match f.blocks[bi].term.kind
+    when LirTermKind::LirSwitch(_, arms, _) then
+      var a0 = -1
+      var a1 = -1
+      var ai = 0
+      while ai < arms.len() do
+        if arms[ai].value == 0 then a0 = arms[ai].target end
+        if arms[ai].value == 1 then a1 = arms[ai].target end
+        ai = ai + 1
+      end
+      if a0 >= 0 && a1 >= 0 && arm0 < 0 then
+        arm0 = a0
+        arm1 = a1
+      end
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  (arm0, arm1)
+end
+
+# A real loop back edge: an extra block (negative id) jumped to from a
+# block at or after it in the linear order. The plan consumer's counted
+# loop's increment block jumps back to the header.
+def ld_has_loop(f: LirFunction) -> Bool
+  var found = false
+  var bi = 0
+  while bi < f.blocks.len() do
+    match f.blocks[bi].term.kind
+    when LirTermKind::LirJump(t) then
+      if t < 0 && ld_block_pos(f, t) <= bi then found = true end
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  found
+end
+
+def ld_has_imm(f: LirFunction, v: Int) -> Bool
+  var found = false
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].kind
+      when LirStmtKind::LirMove(_, val) then
+        match val
+        when LirValue::LirImm(x) then if x == v then found = true end
+        when LirValue::LirReg(_) then ()
+        end
+      when LirStmtKind::LirBinop(_, _, _, rhs) then
+        match rhs
+        when LirValue::LirImm(x) then if x == v then found = true end
+        when LirValue::LirReg(_) then ()
+        end
+      when LirStmtKind::LirCmp(lhs, rhs) then
+        match rhs
+        when LirValue::LirImm(x) then if x == v then found = true end
+        when LirValue::LirReg(_) then ()
+        end
+        match lhs
+        when LirValue::LirImm(x) then if x == v then found = true end
+        when LirValue::LirReg(_) then ()
+        end
+      when _ then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  found
+end
+
+def ld_has_call(f: LirFunction, target: String) -> Bool
+  var found = false
+  let cs = ld_calls(f)
+  var i = 0
+  while i < cs.len() do
+    if cs[i] == target then found = true end
+    i = i + 1
+  end
+  found
+end
+
+# ———————————————————————————————————————————————————————————————
+# The plans under test.
+# ———————————————————————————————————————————————————————————————
+
+def ld_plan_two() -> DeinitPlan
+  DeinitPlan::Aggregate(Vec::from([
+    DeinitPlan::Call(ld_inst(1)),
+    DeinitPlan::Call(ld_inst(2))
+  ]))
+end
+
+def ld_plan_user_finalizer_walk() -> DeinitPlan
+  DeinitPlan::UserFinalizer(ld_inst(3), DeinitPlan::Aggregate(Vec::from([
+    DeinitPlan::Call(ld_inst(1))
+  ])))
+end
+
+def ld_plan_enum() -> DeinitPlan
+  var m: Map[Int, (VariantId, Vec[DeinitPlan])] = Map::new()
+  m.insert(0, (VariantId { owner: TypeId { id: 303 }, index: 0 }, Vec::from([
+    DeinitPlan::Call(ld_inst(1))
+  ])))
+  m.insert(1, (VariantId { owner: TypeId { id: 303 }, index: 1 }, Vec::from([
+    DeinitPlan::Call(ld_inst(2))
+  ])))
+  DeinitPlan::Enum(m)
+end
+
+def ld_plan_array() -> DeinitPlan
+  DeinitPlan::Array(DeinitPlan::Call(ld_inst(1)))
+end
+
+def ld_plan_recursion() -> DeinitPlan
+  # The Call payload is index 9 — deliberately NOT a registered
+  # finalizer, so it classifies as the recursion-by-symbol edge.
+  DeinitPlan::Aggregate(Vec::from([
+    DeinitPlan::Call(ld_inst(9))
+  ]))
+end
+
+def ld_plan_string() -> DeinitPlan
+  DeinitPlan::Aggregate(Vec::from([DeinitPlan::String]))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. Aggregate field order: the child finalizers run in DECLARATION
+#    order (a first, then b) — the plan consumer builds the chain
+#    backward, so the block array order alone would not prove this.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def aggregate_fields_drop_in_plan_order() -> Unit
+  let defs = ld_type_defs()
+  let f = ld_lower(ld_deinit_fn("two_drop", ld_two_ty()), defs, ld_plan_for(ld_two_ty(), ld_plan_two()))
+  ld_verify_clean(f, "the Two aggregate deinit")
+  let order = ld_follow_call_order(f, ld_entry_jump_target(f))
+  assert(order.len() == 2, "the Two plan must emit exactly 2 finalizer calls, got " + order.len().to_string())
+  assert(order[0] == "drop_a", "field 0's finalizer must run first, got " + order[0])
+  assert(order[1] == "drop_b", "field 1's finalizer must run second, got " + order[1])
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. UserFinalizer + structural walk: the user finalizer FIRST, then
+#    the field walk (the exactly-once order the old slice refused for a
+#    non-empty walk).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def user_finalizer_precedes_structural_walk() -> Unit
+  let defs = ld_type_defs()
+  let f = ld_lower(ld_deinit_fn("fin_drop", ld_fin_ty()), defs, ld_plan_for(ld_fin_ty(), ld_plan_user_finalizer_walk()))
+  ld_verify_clean(f, "the Fin user-finalizer deinit")
+  let order = ld_follow_call_order(f, ld_entry_jump_target(f))
+  assert(order.len() == 2, "the Fin plan emits the finalizer + one field call, got " + order.len().to_string())
+  assert(order[0] == "fin_zero", "the user finalizer must run first, got " + order[0])
+  assert(order[1] == "drop_a", "the structural field walk must run after the finalizer, got " + order[1])
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. Enum variant deinit: one switch on the discriminant; each arm
+#    carries ONLY its own variant's payload plan.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def enum_deinits_only_the_active_variant() -> Unit
+  let defs = ld_type_defs()
+  let f = ld_lower(ld_deinit_fn("enum_drop", ld_e_ty()), defs, ld_plan_for(ld_e_ty(), ld_plan_enum()))
+  ld_verify_clean(f, "the enum variant deinit")
+  let (arm0, arm1) = ld_find_disc_switch(f)
+  assert(arm0 >= 0 && arm1 >= 0, "the enum plan must emit a discriminant switch with both variant arms")
+  let chain_a = ld_follow_call_order(f, arm0)
+  let chain_b = ld_follow_call_order(f, arm1)
+  assert(chain_a.len() == 1 && chain_a[0] == "drop_a", "variant A's arm must call only drop_a")
+  assert(chain_b.len() == 1 && chain_b[0] == "drop_b", "variant B's arm must call only drop_b")
+  assert(ld_calls(f).len() == 2, "the enum plan must emit exactly the two payload calls")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. Fixed-array element walk: a counted loop (index 0, bound n,
+#    increment, back edge) whose per-iteration element destruction is
+#    the element type's per-type glue call.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def fixed_array_drop_is_a_counted_loop() -> Unit
+  let defs = ld_type_defs()
+  let aty = Type::FixedArray(ld_drop_a_ty(), 3)
+  let f = ld_lower(ld_deinit_fn("array_drop", aty.clone()), defs, ld_plan_for(aty, ld_plan_array()))
+  ld_verify_clean(f, "the fixed-array element deinit")
+  assert(ld_has_loop(f), "the fixed-array plan must emit a loop back edge")
+  assert(ld_has_imm(f, 0), "the loop index starts at 0")
+  assert(ld_has_imm(f, 1), "the loop increments by 1")
+  assert(ld_has_imm(f, 3), "the loop bound is the plan element count 3 (Type::FixedArray n)")
+  let calls = ld_calls(f)
+  assert(calls.len() == 1, "one per-type element glue call is emitted in the loop body")
+  assert(calls[0] == mir_drop_glue_name(ld_drop_a_ty()), "the element destruction is the element type's per-type glue call")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 5. RecursionBySymbol: a Call payload that is NOT a registered
+#    finalizer lowers as the per-type glue call under the exact
+#    mir_drop_glue_name emission name.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def recursion_by_symbol_calls_the_per_type_glue() -> Unit
+  let defs = ld_type_defs()
+  let f = ld_lower(ld_deinit_fn("sym_drop", ld_has_sym_ty()), defs, ld_plan_for(ld_has_sym_ty(), ld_plan_recursion()))
+  ld_verify_clean(f, "the recursion-by-symbol deinit")
+  assert(ld_calls(f).len() == 1, "the recursion plan emits exactly one glue call")
+  assert(ld_first_call(f) == mir_drop_glue_name(ld_drop_a_ty()), "the recursion edge calls the place type's registered glue name, got " + ld_first_call(f))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 6. String leaf: DeinitPlan::String lowers as the runtime destructor
+#    call (_tg_string_drop) with the field's address.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def string_field_drop_calls_the_runtime_destructor() -> Unit
+  let defs = ld_type_defs()
+  let f = ld_lower(ld_deinit_fn("str_drop", ld_has_str_ty()), defs, ld_plan_for(ld_has_str_ty(), ld_plan_string()))
+  ld_verify_clean(f, "the String field deinit")
+  assert(ld_calls(f).len() == 1, "the String plan emits exactly one destructor call")
+  assert(ld_first_call(f) == "_tg_string_drop", "the String leaf calls the runtime destructor, got " + ld_first_call(f))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 7. Trivial: the plan-less no-op still lowers as the jump to the
+#    MirDeinit target (no calls, no extra plan blocks).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def trivial_plan_is_a_noop() -> Unit
+  let defs = ld_type_defs()
+  let f = ld_lower(ld_deinit_fn("trivial_drop", ld_drop_a_ty()), defs, ld_plan_for(ld_drop_a_ty(), DeinitPlan::Trivial))
+  ld_verify_clean(f, "the trivial deinit")
+  assert(ld_calls(f).len() == 0, "a Trivial plan emits no calls")
+  assert(ld_entry_jump_target(f) == 1, "a Trivial plan jumps straight to the MirDeinit target block")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 8. A generated GLUE BODY lowers its MirDeinit leaves from the
+#    PAYLOAD identity (def_id_numeric -> ctx.drop_glue_fns): the
+#    payload is the leaf action the direct route's codegen emits, and
+#    the glue body's own MIR emits the structural walk separately right
+#    after it. The fixture's place plan is a UserFinalizer with a
+#    non-empty walk (drop_a + drop_b) while the payload leaf is
+#    fin_zero: exactly ONE call must appear (consuming the plan would
+#    emit drop_a + drop_b and destroy the fields twice).
+# ———————————————————————————————————————————————————————————————
+
+def ld_glue_body_fn(glue_name: String) -> MirFunction
+  let value_ty = ld_fin_ty()
+  let ptr_ty = Type::Ptr(value_ty.clone())
+  MirFunction {
+    name: glue_name,
+    params: Vec::from([
+      ld_local(1, "ptr", ptr_ty.clone(), false),
+      ld_local(2, "mask", Type::Int, false)
+    ]),
+    ret_type: Type::Unit,
+    locals: Vec::from([
+      ld_local(0, "_ret", Type::Unit, true),
+      ld_local(1, "ptr", ptr_ty, false),
+      ld_local(2, "mask", Type::Int, false),
+      ld_local(3, "value", value_ty, true)
+    ]),
+    blocks: Vec::from([
+      ld_block(0, Vec::from([
+        ld_assign_move(ld_place(3), ld_deref_operand(1))
+      ]), ld_deinit_term(ld_place(3), ld_inst(3), 1)),
+      ld_block(1, Vec::new(), ld_ret_term())
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+@test
+def glue_body_leaf_lowers_from_the_payload() -> Unit
+  let defs = ld_type_defs()
+  let glue_name = "__tg_drop_glue$test$fin".to_string()
+  var glue_names: Set[String] = Set::new()
+  glue_names.insert(glue_name.clone())
+  var glue_fns: Map[Int, String] = Map::new()
+  glue_fns.insert(def_id_numeric(ld_def(3)), glue_name.clone())
+  let plans = ld_plan_for(ld_fin_ty(), DeinitPlan::UserFinalizer(ld_inst(1), DeinitPlan::Aggregate(Vec::from([
+    DeinitPlan::Call(ld_inst(2))
+  ]))))
+  let f = match lower_mir_fn_to_lir_prog(ld_glue_body_fn(glue_name), defs, plans, ld_finalizer_names(), glue_names, Map::new(), glue_fns)
+  when Result::Err(e) then panic("glue-body lowering failed: " + e)
+  when Result::Ok(lf) then lf
+  end
+  ld_verify_clean(f, "the synthetic glue body")
+  let calls = ld_calls(f)
+  assert(calls.len() == 1, "the glue body leaf emits exactly the payload finalizer call, got " + calls.len().to_string())
+  assert(calls[0] == "fin_zero", "the glue body leaf calls the payload identity (fin_zero), got " + calls[0])
+end

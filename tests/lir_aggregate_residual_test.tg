@@ -1,0 +1,880 @@
+# tests/lir_aggregate_residual_test.tg — THE AGGREGATE-RESIDUAL SLICE of
+# the LIR route: the aggregate-layout model (P0-21) plus the enum
+# value-word model and the deinit-plan consumer (P0-21) admit the four
+# shapes the earlier slices kept fail-closed:
+#   1. NESTED ENUM FIELDS (structs/tuples/arrays): the field is ONE
+#      canonical value word (raw discriminant / heap pointer / niched
+#      payload) at the engine's field offset; construction copies the
+#      source enum's value word, a discriminant read normalizes that
+#      word exactly like a whole enum local's (the tagged threshold
+#      switch / the niched compare), and a downcast payload access goes
+#      through the field's word (LirPlaceEnumHeapField with the field's
+#      base word);
+#   2. HEAP-HANDLE FIELDS (String/Vec/Box/... pointer words): admitted
+#      as one opaque word — storage/move are whole-word operations and
+#      destruction is the plan's leaf (the String runtime destructor on
+#      the field address here), never a deref through the field type;
+#   3. NESTED-AGGREGATE PROJECTIONS THROUGH A POINTER: p.inner.x and
+#      p.e.Variant(v).Field(pf) resolve through the pointed-to image's
+#      admitted shapes to the accumulated layout offset (LirPtrLoad at
+#      that offset, with the enum's value word loaded first for a
+#      payload);
+#   4. SUB-WORD FLOAT FIELDS: an F32 at a 4-byte offset is admitted and
+#      read/written by the width-sized (4-byte) field access with the
+#      marked GP<->FP bit move — a mixed 8-byte image stays a general
+#      word;
+#   plus the unknown-layout boundary (an unregistered named type still
+#   fails closed) and verify_lir on every admitted row.
+#
+# Run with: tg test tests/lir_aggregate_residual_test.tg
+
+use std::core::{Option, Result, Int, UInt, Unit, Bool, Float, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::ast::layout_attrs_plain
+use tg_compiler::ids::{
+  TypeId, VariantId, FieldId, ModuleId, DefId, CallableId, InstanceId,
+  def_id_numeric
+}
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId, MirStatement,
+  MirStatementKind, MirRvalue, MirRvalueKind, MirOperand, MirOperandKind,
+  MirConstant, MirConstantKind, MirTerminator, MirTerminatorKind,
+  MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef,
+  AggregateKind, Place, Projection, place_local, mir_type_identity_key
+}
+use tg_compiler::token::span_dummy
+use tg_compiler::target_desc::aarch64_desc
+use tg_compiler::types::{Type, DeinitPlan}
+use tg_compiler::lir::{
+  LirFunction, LirVerifyRoute, LirTermKind, LirAggShape, LirAggShapeKind,
+  LirPtrOp, LirBitMoveOp,
+  lir_plain_struct_shape, lir_check_agg_class_plan,
+  lower_mir_fn_to_lir_prog, lir_alloc_registers_a64,
+  verify_lir
+}
+
+# ———————————————————————————————————————————————————————————————
+# Fixture: the residual type universe.
+#   400 enum E { A(Int), B(Int) }   tagged + payloaded (image 16 bytes)
+#   401 enum P { A, B }             tagged, payload-less (one tag word)
+#   402 struct HasE { e: E }
+#   403 struct HasP { p: P, y: Int }
+#   404 struct HasStr { s: String, x: Int }
+#   405 struct HasF32 { a: U32, f: F32 }
+#   406 struct Outer2 { inner: Inner2, c: Int }
+#   407 struct Inner2 { x: Int, y: Int }
+#   408 struct HasE2 { c: Int, e: E }
+#   409 struct HasMissing { m: 999 } — the unknown-layout boundary.
+# ———————————————————————————————————————————————————————————————
+
+def ar_struct_def(id: Int, name: String, fields: Vec[(String, Type)]) -> MirTypeDef
+  var fs: Vec[MirFieldDef] = Vec::new()
+  var i = 0
+  while i < fields.len() do
+    fs.push(MirFieldDef { name: fields[i].0.clone(), ty: fields[i].1.clone() })
+    i = i + 1
+  end
+  MirTypeDef {
+    id: TypeId { id: id },
+    name: name,
+    kind: MirTypeDefKind::Struct(fs),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def ar_enum_def(id: Int, name: String, variants: Vec[MirVariantDef]) -> MirTypeDef
+  MirTypeDef {
+    id: TypeId { id: id },
+    name: name,
+    kind: MirTypeDefKind::Enum(variants),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def ar_type_defs() -> Map[Int, MirTypeDef]
+  var defs: Map[Int, MirTypeDef] = Map::new()
+  defs.insert(400, ar_enum_def(400, "E", Vec::from([
+    MirVariantDef { name: "A".to_string(), discriminant: 0, fields: Vec::from([Type::Int]) },
+    MirVariantDef { name: "B".to_string(), discriminant: 1, fields: Vec::from([Type::Int]) }
+  ])))
+  defs.insert(401, ar_enum_def(401, "P", Vec::from([
+    MirVariantDef { name: "A".to_string(), discriminant: 0, fields: Vec::new() },
+    MirVariantDef { name: "B".to_string(), discriminant: 1, fields: Vec::new() }
+  ])))
+  defs.insert(402, ar_struct_def(402, "HasE", Vec::from([
+    ("e".to_string(), ar_e_ty())
+  ])))
+  defs.insert(403, ar_struct_def(403, "HasP", Vec::from([
+    ("p".to_string(), ar_p_ty()),
+    ("y".to_string(), Type::Int)
+  ])))
+  defs.insert(404, ar_struct_def(404, "HasStr", Vec::from([
+    ("s".to_string(), Type::String),
+    ("x".to_string(), Type::Int)
+  ])))
+  defs.insert(405, ar_struct_def(405, "HasF32", Vec::from([
+    ("a".to_string(), Type::U32),
+    ("f".to_string(), Type::F32)
+  ])))
+  defs.insert(406, ar_struct_def(406, "Outer2", Vec::from([
+    ("inner".to_string(), ar_inner2_ty()),
+    ("c".to_string(), Type::Int)
+  ])))
+  defs.insert(407, ar_struct_def(407, "Inner2", Vec::from([
+    ("x".to_string(), Type::Int),
+    ("y".to_string(), Type::Int)
+  ])))
+  defs.insert(408, ar_struct_def(408, "HasE2", Vec::from([
+    ("c".to_string(), Type::Int),
+    ("e".to_string(), ar_e_ty())
+  ])))
+  defs.insert(409, ar_struct_def(409, "HasMissing", Vec::from([
+    ("m".to_string(), Type::Adt(TypeId { id: 999 }, Vec::new()))
+  ])))
+  defs
+end
+
+def ar_e_ty() -> Type
+  Type::Adt(TypeId { id: 400 }, Vec::new())
+end
+def ar_p_ty() -> Type
+  Type::Adt(TypeId { id: 401 }, Vec::new())
+end
+def ar_has_e_ty() -> Type
+  Type::Adt(TypeId { id: 402 }, Vec::new())
+end
+def ar_has_p_ty() -> Type
+  Type::Adt(TypeId { id: 403 }, Vec::new())
+end
+def ar_has_str_ty() -> Type
+  Type::Adt(TypeId { id: 404 }, Vec::new())
+end
+def ar_has_f32_ty() -> Type
+  Type::Adt(TypeId { id: 405 }, Vec::new())
+end
+def ar_outer2_ty() -> Type
+  Type::Adt(TypeId { id: 406 }, Vec::new())
+end
+def ar_inner2_ty() -> Type
+  Type::Adt(TypeId { id: 407 }, Vec::new())
+end
+def ar_has_e2_ty() -> Type
+  Type::Adt(TypeId { id: 408 }, Vec::new())
+end
+def ar_has_missing_ty() -> Type
+  Type::Adt(TypeId { id: 409 }, Vec::new())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Fixture helpers.
+# ———————————————————————————————————————————————————————————————
+
+def ar_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal { id: MirLocalId { id: id }, name: name, ty: ty, is_mut: is_mut, span: span_dummy() }
+end
+
+def ar_block(bid: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: bid }, statements: stmts, terminator: term }
+end
+
+def ar_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def ar_int_operand(v: Int, ty: Type) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirInt(v),
+      ty: ty,
+      instance: Option::None
+    })
+  }
+end
+
+def ar_float_operand(v: Float, ty: Type) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFloat(v),
+      ty: ty,
+      instance: Option::None
+    })
+  }
+end
+
+def ar_copy_operand(p: Place) -> MirOperand
+  MirOperand { kind: MirOperandKind::MirCopy(p) }
+end
+
+def ar_place(id: Int) -> Place
+  place_local(MirLocalId { id: id })
+end
+
+def ar_field_place(id: Int, owner: Int, field: Int) -> Place
+  var p = ar_place(id)
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: owner }, index: field }))
+  p
+end
+
+def ar_deref_place(id: Int) -> Place
+  var p = ar_place(id)
+  p.projections.push(Projection::ProjDeref)
+  p
+end
+
+def ar_assign_stmt(dst: Place, rv: MirRvalue) -> MirStatement
+  MirStatement { kind: MirStatementKind::MirAssign(dst, rv), span: span_dummy() }
+end
+
+def ar_move_rvalue(op: MirOperand) -> MirRvalue
+  MirRvalue { kind: MirRvalueKind::MirMove(op), span: span_dummy() }
+end
+
+def ar_agg_rvalue(kind: AggregateKind, ops: Vec[MirOperand]) -> MirRvalue
+  MirRvalue { kind: MirRvalueKind::MirAggregate(kind, ops), span: span_dummy() }
+end
+
+def ar_disc_rvalue(p: Place) -> MirRvalue
+  MirRvalue { kind: MirRvalueKind::MirDiscriminant(p), span: span_dummy() }
+end
+
+def ar_mk_fn(name: String, params: Vec[MirLocal], ret_ty: Type, locals: Vec[MirLocal], blocks: Vec[MirBlock]) -> MirFunction
+  MirFunction {
+    name: name,
+    params: params,
+    ret_type: ret_ty,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def ar_ret_fn(name: String, ret_ty: Type, locals: Vec[MirLocal], stmts: Vec[MirStatement]) -> MirFunction
+  ar_mk_fn(name, Vec::new(), ret_ty, locals, Vec::from([
+    ar_block(0, stmts, ar_ret_term())
+  ]))
+end
+
+def ar_lower(f: MirFunction, defs: Map[Int, MirTypeDef]) -> LirFunction
+  match lower_mir_fn_to_lir_prog(f, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Err(e) then panic("aggregate-residual test lowering failed for " + f.name + ": " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def ar_lower_with_plans(f: MirFunction, defs: Map[Int, MirTypeDef], plans: Map[String, DeinitPlan]) -> LirFunction
+  match lower_mir_fn_to_lir_prog(f, defs, plans, Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Err(e) then panic("aggregate-residual deinit lowering failed for " + f.name + ": " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def ar_lower_with_deinit(f: MirFunction, defs: Map[Int, MirTypeDef], plans: Map[String, DeinitPlan], finals: Map[Int, String]) -> LirFunction
+  match lower_mir_fn_to_lir_prog(f, defs, plans, finals, Set::new(), Map::new(), Map::new())
+  when Result::Err(e) then panic("aggregate-residual enum-field deinit lowering failed for " + f.name + ": " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def ar_finalizer_names() -> Map[Int, String]
+  var m: Map[Int, String] = Map::new()
+  m.insert(def_id_numeric(ar_def(1)), "drop_a".to_string())
+  m.insert(def_id_numeric(ar_def(2)), "drop_b".to_string())
+  m
+end
+
+# The block the entry block (MIR block 0) jumps to.
+def ar_entry_jump_target(f: LirFunction) -> Int
+  var target = -1
+  var bi = 0
+  while bi < f.blocks.len() do
+    if f.blocks[bi].id == 0 then
+      match f.blocks[bi].term.kind
+      when LirTermKind::LirJump(t) then target = t
+      when _ then ()
+      end
+    end
+    bi = bi + 1
+  end
+  target
+end
+
+def ar_block_pos(f: LirFunction, bid: Int) -> Int
+  var i = 0
+  var found = -1
+  while i < f.blocks.len() do
+    if f.blocks[i].id == bid then found = i end
+    i = i + 1
+  end
+  found
+end
+
+def ar_follow_call_order(f: LirFunction, start: Int) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  var cur = start
+  var guard = 0
+  var done = false
+  while guard < 64 && !done do
+    guard = guard + 1
+    let pos = ar_block_pos(f, cur)
+    if pos < 0 then
+      done = true
+    else
+      match f.blocks[pos].term.kind
+      when LirTermKind::LirCall(target, _, _, _, success) then
+        out.push(target.clone())
+        cur = success
+      when LirTermKind::LirJump(t) then
+        cur = t
+      when _ then done = true
+      end
+    end
+  end
+  out
+end
+
+def ar_find_disc_switch(f: LirFunction) -> (Int, Int)
+  var arm0 = -1
+  var arm1 = -1
+  var bi = 0
+  while bi < f.blocks.len() do
+    match f.blocks[bi].term.kind
+    when LirTermKind::LirSwitch(_, arms, _) then
+      var a0 = -1
+      var a1 = -1
+      var ai = 0
+      while ai < arms.len() do
+        if arms[ai].value == 0 then a0 = arms[ai].target end
+        if arms[ai].value == 1 then a1 = arms[ai].target end
+        ai = ai + 1
+      end
+      if a0 >= 0 && a1 >= 0 && arm0 < 0 then
+        arm0 = a0
+        arm1 = a1
+      end
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  (arm0, arm1)
+end
+
+def ar_verify_clean(f: LirFunction, what: String) -> Unit
+  let alloc = lir_alloc_registers_a64(f)
+  let violations = verify_lir(f, alloc, LirVerifyRoute::LirVerifyA64)
+  var first = ""
+  if violations.len() > 0 then first = violations[0] end
+  assert(violations.len() == 0, what + " must verify clean; first violation: " + first)
+end
+
+def ar_shape(defs: Map[Int, MirTypeDef], ty: Type, what: String) -> LirAggShape
+  match lir_plain_struct_shape(defs, ty)
+  when Result::Err(e) then panic(what + " shape admission failed: " + e)
+  when Result::Ok(o) then
+    match o
+    when Option::Some(kind) then
+      match kind
+      when LirAggShapeKind::LirAggStruct(s) then s
+      when LirAggShapeKind::LirAggEnum(_) then panic(what + " admitted as an enum shape")
+      end
+    when Option::None then panic(what + " did not admit as an aggregate")
+    end
+  end
+end
+
+def ar_ptr_loads(f: LirFunction) -> Vec[(Int, Int, Bool)]
+  var out: Vec[(Int, Int, Bool)] = Vec::new()
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].ptr
+      when Option::Some(pop) then
+        match pop
+        when LirPtrOp::LirPtrLoad(_, _, off, w, sign) then out.push((off, w, sign))
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+def ar_ptr_stores(f: LirFunction) -> Vec[(Int, Int)]
+  var out: Vec[(Int, Int)] = Vec::new()
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].ptr
+      when Option::Some(pop) then
+        match pop
+        when LirPtrOp::LirPtrStore(_, off, _, w) then out.push((off, w))
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+def ar_has_load(loads: Vec[(Int, Int, Bool)], off: Int, w: Int, sign: Bool) -> Bool
+  var found = false
+  var i = 0
+  while i < loads.len() do
+    if loads[i].0 == off && loads[i].1 == w && loads[i].2 == sign then found = true end
+    i = i + 1
+  end
+  found
+end
+
+def ar_has_store(stores: Vec[(Int, Int)], off: Int, w: Int) -> Bool
+  var found = false
+  var i = 0
+  while i < stores.len() do
+    if stores[i].0 == off && stores[i].1 == w then found = true end
+    i = i + 1
+  end
+  found
+end
+
+def ar_has_bitmove(f: LirFunction, op: LirBitMoveOp) -> Bool
+  var found = false
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].bm
+      when Option::Some(b) then
+        match b
+        when LirBitMoveOp::LirBitsGpToFp then
+          match op
+          when LirBitMoveOp::LirBitsGpToFp then found = true
+          when LirBitMoveOp::LirBitsFpToGp then ()
+          end
+        when LirBitMoveOp::LirBitsFpToGp then
+          match op
+          when LirBitMoveOp::LirBitsFpToGp then found = true
+          when LirBitMoveOp::LirBitsGpToFp then ()
+          end
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  found
+end
+
+def ar_calls(f: LirFunction) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  var bi = 0
+  while bi < f.blocks.len() do
+    match f.blocks[bi].term.kind
+    when LirTermKind::LirCall(target, _, _, _, _) then out.push(target.clone())
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+def ar_has_call(f: LirFunction, target: String) -> Bool
+  var found = false
+  let cs = ar_calls(f)
+  var i = 0
+  while i < cs.len() do
+    if cs[i] == target then found = true end
+    i = i + 1
+  end
+  found
+end
+
+# ———————————————————————————————————————————————————————————————
+# The deinit fixture (the String-field drop row): a function whose only
+# action is the MirDeinit of local 1.
+# ———————————————————————————————————————————————————————————————
+
+def ar_def(index: Int) -> DefId
+  DefId { module: ModuleId { id: 42 }, index: index as UInt }
+end
+
+def ar_inst(index: Int) -> InstanceId
+  InstanceId { def: CallableId { def: ar_def(index) }, substs: Vec::new() }
+end
+
+def ar_deinit_term(place: Place, deinit_fn: InstanceId, target: Int) -> MirTerminator
+  MirTerminator {
+    kind: MirTerminatorKind::MirDeinit {
+      place: place,
+      deinit_fn: deinit_fn,
+      target: MirBlockId { id: target },
+      unwind: Option::None
+    },
+    span: span_dummy()
+  }
+end
+
+def ar_deinit_fn(name: String, ty: Type) -> MirFunction
+  ar_mk_fn(name, Vec::new(), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "v", ty, true)
+  ]), Vec::from([
+    ar_block(0, Vec::new(), ar_deinit_term(ar_place(1), ar_inst(9), 1)),
+    ar_block(1, Vec::new(), ar_ret_term())
+  ]))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. NESTED ENUM FIELD admission geometry + construction +
+#    discriminant read (the tagged heap normalization) + the downcast
+#    payload read through the field's value word.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def enum_field_admission_and_value_word_geometry() -> Unit
+  let defs = ar_type_defs()
+  let shape = ar_shape(defs, ar_has_e_ty(), "HasE")
+  assert(shape.size == 16, "HasE (one payloaded enum field) is 16 bytes, got " + shape.size.to_string())
+  assert(shape.words == 2, "the enum field image spans 2 word slots")
+  assert(shape.fields.len() == 1 && shape.fields[0].byte_off == 0 && shape.fields[0].size == 16, "the enum field sits at 0/16 (its engine image)")
+  match shape.fields[0].enum_nested
+  when Option::Some(es) then
+    assert(es.variants.len() == 2, "the field carries its two variants")
+    assert(es.variants[0].fields.len() == 1 && es.variants[0].fields[0].byte_off == 8, "a payloaded tagged variant's payload is at image byte 8")
+  when Option::None then panic("the enum-typed field must carry its admitted enum shape")
+  end
+  match lir_check_agg_class_plan(aarch64_desc(), shape, ar_has_e_ty(), defs, "HasE")
+  when Result::Err(e) then panic("the enum-field class plan diverged: " + e)
+  when Result::Ok(_) then ()
+  end
+end
+
+@test
+def enum_field_construction_and_discriminant_lower() -> Unit
+  let defs = ar_type_defs()
+  let f = ar_lower(ar_enum_field_disc_fn(), defs)
+  ar_verify_clean(f, "the enum-field construction + discriminant function")
+  # The payloaded field's discriminant read normalizes the field's value
+  # word: the heap arm loads the image tag at [word + 0], width 8.
+  let loads = ar_ptr_loads(f)
+  assert(ar_has_load(loads, 0, 8, false), "the payloaded enum field's discriminant normalization loads the heap tag word")
+end
+
+def ar_enum_field_disc_fn() -> MirFunction
+  let ety = ar_e_ty()
+  let hty = ar_has_e_ty()
+  ar_ret_fn("enum_field_disc", Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "e", ety, true),
+    ar_local(2, "h", hty, true),
+    ar_local(3, "d", Type::Int, true)
+  ]), Vec::from([
+    ar_assign_stmt(ar_place(1), ar_agg_rvalue(
+      AggregateKind::Struct(TypeId { id: 400 }, Vec::from(["A".to_string(), "B".to_string()])),
+      Vec::from([ar_int_operand(0, Type::Int), ar_int_operand(7, Type::Int)]))),
+    ar_assign_stmt(ar_place(2), ar_agg_rvalue(
+      AggregateKind::Struct(TypeId { id: 402 }, Vec::from(["e".to_string()])),
+      Vec::from([ar_copy_operand(ar_place(1))]))),
+    ar_assign_stmt(ar_place(3), ar_disc_rvalue(ar_field_place(2, 402, 0))),
+    ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(3))))
+  ]))
+end
+
+@test
+def enum_field_downcast_reads_the_heap_payload() -> Unit
+  let defs = ar_type_defs()
+  let f = ar_lower(ar_enum_field_downcast_fn(), defs)
+  ar_verify_clean(f, "the enum-field downcast read function")
+  # The downcast place is LirPlaceEnumHeapField with the field's base
+  # word (slot 1) and the payload's engine offset 8: ONE load at the
+  # payload byte offset through the field's value word.
+  let loads = ar_ptr_loads(f)
+  assert(ar_has_load(loads, 8, 8, false), "the heap payload load sits at the engine payload offset")
+end
+
+def ar_enum_field_downcast_fn() -> MirFunction
+  let hty = ar_has_e2_ty()
+  var p = ar_field_place(1, 408, 1)
+  p.projections.push(Projection::Variant(VariantId { owner: TypeId { id: 400 }, index: 0 }))
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: 400 }, index: 0 }))
+  ar_mk_fn("enum_field_downcast", Vec::from([ar_local(1, "h", hty, false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "h", hty, false),
+    ar_local(2, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(p))),
+      ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. A payload-less enum field's discriminant read is the plain value
+#    word (no heap normalization, no pointer load).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def payloadless_enum_field_discriminant_is_a_word_move() -> Unit
+  let defs = ar_type_defs()
+  let shape = ar_shape(defs, ar_has_p_ty(), "HasP")
+  assert(shape.size == 16, "HasP { p: P, y: Int } is 16 bytes, got " + shape.size.to_string())
+  assert(shape.fields[0].byte_off == 0 && shape.fields[1].byte_off == 8, "p at 0, y at 8")
+  match shape.fields[0].enum_nested
+  when Option::Some(es) then assert(es.variants.len() == 2, "the payload-less enum field carries its variants")
+  when Option::None then panic("the payload-less enum field must carry its admitted shape")
+  end
+  let f = ar_lower(ar_payloadless_enum_disc_fn(), defs)
+  ar_verify_clean(f, "the payload-less enum-field discriminant function")
+  assert(ar_ptr_loads(f).len() == 0, "a payload-less enum field's discriminant is the raw word move (no heap load)")
+end
+
+def ar_payloadless_enum_disc_fn() -> MirFunction
+  let hty = ar_has_p_ty()
+  ar_mk_fn("payloadless_disc", Vec::from([ar_local(1, "h", hty, false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "h", hty, false),
+    ar_local(2, "d", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_disc_rvalue(ar_field_place(1, 403, 0))),
+      ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. A String-handle field: admitted as ONE opaque word at its engine
+#    offset; a field-to-field move is a whole-word copy; and the
+#    DeinitPlan's String leaf consumes the field (the runtime
+#    destructor on the field address).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def string_field_admits_and_drop_calls_the_runtime_destructor() -> Unit
+  let defs = ar_type_defs()
+  let shape = ar_shape(defs, ar_has_str_ty(), "HasStr")
+  assert(shape.size == 16, "HasStr { s: String, x: Int } is 16 bytes, got " + shape.size.to_string())
+  assert(shape.fields[0].byte_off == 0 && shape.fields[0].size == 8, "the String handle is one 8-byte word at 0")
+  match shape.fields[0].enum_nested
+  when Option::Some(_) then panic("a String field must carry no enum shape")
+  when Option::None then ()
+  end
+  # The field-to-field move lowers as a whole-word move (no deref).
+  let mv = ar_lower(ar_string_field_move_fn(), defs)
+  ar_verify_clean(mv, "the String-field move function")
+  assert(ar_ptr_loads(mv).len() == 0 && ar_ptr_stores(mv).len() == 0, "a String handle move is a word move, never a deref")
+  # The plan consumer: Aggregate([String, Trivial]) drops field 0's
+  # handle through _tg_string_drop at the field address.
+  var plans: Map[String, DeinitPlan] = Map::new()
+  plans.insert(mir_type_identity_key(ar_has_str_ty()), DeinitPlan::Aggregate(Vec::from([
+    DeinitPlan::String,
+    DeinitPlan::Trivial
+  ])))
+  let f = ar_lower_with_plans(ar_deinit_fn("str_field_drop", ar_has_str_ty()), defs, plans)
+  ar_verify_clean(f, "the String-field deinit function")
+  assert(ar_calls(f).len() == 1, "the String field plan emits exactly one destructor call")
+  assert(ar_has_call(f, "_tg_string_drop"), "the String field's plan calls the runtime destructor")
+end
+
+def ar_string_field_move_fn() -> MirFunction
+  let hty = ar_has_str_ty()
+  ar_mk_fn("string_field_move", Vec::from([
+    ar_local(1, "a", hty, true),
+    ar_local(2, "b", hty, false)
+  ]), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "a", hty, true),
+    ar_local(2, "b", hty, false)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_field_place(1, 404, 0), ar_move_rvalue(ar_copy_operand(ar_field_place(2, 404, 0))))
+    ]), ar_ret_term())
+  ]))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3b. A nested enum field's DEINIT PLAN: the struct plan's Enum child
+#     switches on the field's value word, and each variant arm carries
+#     only that variant's payload plan (the heap payload read through
+#     the field's word).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def nested_enum_field_deinit_plan_consumes_the_field_word() -> Unit
+  let defs = ar_type_defs()
+  var plans: Map[String, DeinitPlan] = Map::new()
+  var vmap: Map[Int, (VariantId, Vec[DeinitPlan])] = Map::new()
+  vmap.insert(0, (VariantId { owner: TypeId { id: 400 }, index: 0 }, Vec::from([
+    DeinitPlan::Call(ar_inst(1))
+  ])))
+  vmap.insert(1, (VariantId { owner: TypeId { id: 400 }, index: 1 }, Vec::from([
+    DeinitPlan::Call(ar_inst(2))
+  ])))
+  plans.insert(mir_type_identity_key(ar_has_e2_ty()), DeinitPlan::Aggregate(Vec::from([
+    DeinitPlan::Trivial,
+    DeinitPlan::Enum(vmap)
+  ])))
+  let f = ar_lower_with_deinit(ar_deinit_fn("enum_field_drop", ar_has_e2_ty()), defs, plans, ar_finalizer_names())
+  ar_verify_clean(f, "the nested enum field deinit function")
+  let (arm0, arm1) = ar_find_disc_switch(f)
+  assert(arm0 >= 0 && arm1 >= 0, "the nested enum field's plan must emit a discriminant switch on the field's value word")
+  let chain_a = ar_follow_call_order(f, arm0)
+  let chain_b = ar_follow_call_order(f, arm1)
+  assert(chain_a.len() == 1 && chain_a[0] == "drop_a", "variant A's arm must carry only drop_a, got " + chain_a.len().to_string())
+  assert(chain_b.len() == 1 && chain_b[0] == "drop_b", "variant B's arm must carry only drop_b, got " + chain_b.len().to_string())
+  assert(ar_calls(f).len() == 2, "the nested enum field plan must emit exactly the two payload calls")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. NESTED-AGGREGATE PROJECTIONS THROUGH A POINTER: p.inner.y
+#    resolves through the pointed-to Outer2 image to the accumulated
+#    byte offset 8 (one width-8 load).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def pointer_to_struct_nested_projection_lowers() -> Unit
+  let defs = ar_type_defs()
+  let f = ar_lower(ar_ptr_nested_fn(), defs)
+  ar_verify_clean(f, "the pointer-to-nested-struct projection function")
+  assert(ar_has_load(ar_ptr_loads(f), 8, 8, false), "p.inner.y loads at the accumulated byte offset 8 through the pointer")
+end
+
+def ar_ptr_nested_fn() -> MirFunction
+  let pty = Type::Ptr(ar_outer2_ty())
+  var p = ar_deref_place(1)
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: 406 }, index: 0 }))
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: 407 }, index: 1 }))
+  ar_mk_fn("ptr_nested", Vec::from([ar_local(1, "p", pty, false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "p", pty, false),
+    ar_local(2, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(p))),
+      ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 5. A nested enum field's downcast THROUGH A POINTER: (*p).e.A.0
+#    loads the field's value word at [base + 8] and the payload at
+#    [word + 8] (two width-8 loads).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def pointer_to_enum_field_downcast_lowers() -> Unit
+  let defs = ar_type_defs()
+  let f = ar_lower(ar_ptr_enum_downcast_fn(), defs)
+  ar_verify_clean(f, "the pointer-to-enum-field downcast function")
+  let loads = ar_ptr_loads(f)
+  assert(loads.len() == 2, "the nested enum downcast emits the value-word load and the payload load, got " + loads.len().to_string())
+  assert(ar_has_load(loads, 8, 8, false), "both the value word and the payload load sit at their byte offsets")
+end
+
+def ar_ptr_enum_downcast_fn() -> MirFunction
+  let pty = Type::Ptr(ar_has_e2_ty())
+  var p = ar_deref_place(1)
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: 408 }, index: 1 }))
+  p.projections.push(Projection::Variant(VariantId { owner: TypeId { id: 400 }, index: 0 }))
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: 400 }, index: 0 }))
+  ar_mk_fn("ptr_enum_downcast", Vec::from([ar_local(1, "p", pty, false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "p", pty, false),
+    ar_local(2, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(p))),
+      ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 6. SUB-WORD FLOAT FIELDS: HasF32 { a: U32, f: F32 } places f at byte
+#    4; construction stores the field's 4 bytes at 4 through the
+#    FP->GP bit move, and the read loads 4 bytes at 4 through the
+#    GP->FP bit move (a mixed 8-byte image stays a general word).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def f32_byte_offset_field_access_lowers() -> Unit
+  let defs = ar_type_defs()
+  let shape = ar_shape(defs, ar_has_f32_ty(), "HasF32")
+  assert(shape.size == 8, "HasF32 is 8 bytes, got " + shape.size.to_string())
+  assert(shape.fields[0].byte_off == 0 && shape.fields[0].size == 4, "u32 a at 0/4")
+  assert(shape.fields[1].byte_off == 4 && shape.fields[1].size == 4, "f32 f at 4/4 (the sub-word placement)")
+  match shape.fields[1].enum_nested
+  when Option::Some(_) then panic("an F32 field must carry no enum shape")
+  when Option::None then ()
+  end
+  match lir_check_agg_class_plan(aarch64_desc(), shape, ar_has_f32_ty(), defs, "HasF32")
+  when Result::Err(e) then panic("the F32-field class plan diverged: " + e)
+  when Result::Ok(_) then ()
+  end
+  let f = ar_lower(ar_f32_construct_fn(), defs)
+  ar_verify_clean(f, "the F32-field construction function")
+  let stores = ar_ptr_stores(f)
+  assert(ar_has_store(stores, 0, 4), "u32 a stores width 4 at 0")
+  assert(ar_has_store(stores, 4, 4), "f32 f stores width 4 at byte 4 (not an 8-byte word store)")
+  assert(ar_has_bitmove(f, LirBitMoveOp::LirBitsFpToGp), "the F32 field store crosses FP->GP with the marked bit move")
+  let g = ar_lower(ar_f32_read_fn(), defs)
+  ar_verify_clean(g, "the F32-field read function")
+  assert(ar_has_load(ar_ptr_loads(g), 4, 4, false), "the F32 field read loads width 4 at byte 4")
+  assert(ar_has_bitmove(g, LirBitMoveOp::LirBitsGpToFp), "the F32 field read crosses GP->FP with the marked bit move")
+end
+
+def ar_f32_construct_fn() -> MirFunction
+  let ty = ar_has_f32_ty()
+  ar_ret_fn("f32_ret", ty, Vec::from([ar_local(0, "_ret", ty, true)]), Vec::from([
+    ar_assign_stmt(ar_place(0), ar_agg_rvalue(
+      AggregateKind::Struct(TypeId { id: 405 }, Vec::from(["a".to_string(), "f".to_string()])),
+      Vec::from([ar_int_operand(3, Type::U32), ar_float_operand(1.5, Type::F32)])))
+  ]))
+end
+
+def ar_f32_read_fn() -> MirFunction
+  let ty = ar_has_f32_ty()
+  ar_mk_fn("f32_read", Vec::from([ar_local(1, "arg", ty, false)]), Type::F32, Vec::from([
+    ar_local(0, "_ret", Type::F32, true),
+    ar_local(1, "arg", ty, false),
+    ar_local(2, "t", Type::F32, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(ar_field_place(1, 405, 1)))),
+      ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 7. The unknown-layout boundary: a field whose named type has no
+#    registered def still fails closed with its named rule.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def unknown_field_layout_stays_fail_closed() -> Unit
+  let defs = ar_type_defs()
+  match lir_plain_struct_shape(defs, ar_has_missing_ty())
+  when Result::Ok(_) then panic("a struct with an unregistered field type must not admit")
+  when Result::Err(e) then
+    assert(e.contains("no registered definition"), "the unknown-layout refusal must name the rule, got: " + e)
+  end
+end

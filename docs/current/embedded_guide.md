@@ -50,14 +50,14 @@ embedded route (`compile_to_embedded_route`).
 
 | Target Triple / route name | Architecture | Status |
 |---------------------------|-------------|----------|
-| `aarch64-unknown-none` (embedded route) | ARM64 (bare) | Supported — the real codegen of the `--target` embedded route (the aarch64 backend): the spec JSON + the linker script + the startup/vector artifacts + the bare-metal ELF image |
+| `aarch64-unknown-none` (embedded route) | ARM64 (bare) | Supported — the real codegen of the `--target` embedded route: the spec JSON + the linker script + the startup/vector artifacts + the bare-metal ELF image (the DEFAULT/direct aarch64 startup backend). An explicit `--codegen=lir` routes the same build through the aarch64 LIR artifact arm (ELF64 relocatable object for `--emit=obj` / linked bare ELF image for `--emit=exe`, the same artifacts beside it; `--coverage` fails closed there) |
 | `thumbv7em-none-eabihf` (`--target`) | ARM Cortex-M4F | ROUTED to the LIR cortex-m4f backend (ELF32 ARM object; `fpu: FPv4SP`, hard-float ABI; `--emit=obj`, linking fails closed). The legacy `TANGERINE_LIR_TARGET=cortex-m4f` alias selects the same descriptor |
 | `thumbv7em-none-eabi` (`--target`) | ARM Cortex-M4 (no FPU) | ROUTED to the LIR cortex-m4 backend (`fpu: None`, `float_abi: Soft` — float content fails closed) |
 | `thumbv7m-none-eabi` (`--target`) | ARM Cortex-M3 | ROUTED to the LIR cortex-m3 backend (ELF32 ARM object; `fpu: None`) |
 | `thumbv6m-none-eabi` (embedded route) | ARM Cortex-M0/M0+ | REJECTED by the embedded route; ARMv6-M has no `TargetDesc` instance this slice (fail-closed — no backend consumes it) |
 | `thumbv8m.main-none-eabihf` (embedded route) | ARM Cortex-M33 | REJECTED by the embedded route; no `TargetDesc` instance this slice |
 | `riscv32imac-unknown-none-elf` (`--target`) | RISC-V RV32 | ROUTED to the LIR riscv32imac backend (ELF32 RISC-V object; native atomics [4], emulated [1, 2]) |
-| `riscv32imafc-unknown-none-elf` (`--target`) | RISC-V RV32 | ROUTED to the LIR riscv32imafc backend (`fpu: RVF`/FLEN 32; float emission is the stage-2 slice — fail-closed) |
+| `riscv32imafc-unknown-none-elf` (`--target`) | RISC-V RV32 | ROUTED to the LIR riscv32imafc backend (`fpu: RVF`/FLEN 32; the rv float slice is implemented — S statements/ABI + the psABI stack stream) |
 | `riscv32imafdc-unknown-none-elf` (`--target`) | RISC-V RV32 | ROUTED to the LIR riscv32imafdc backend (`fpu: RVD`/FLEN 64) |
 | `riscv32imc-unknown-none-elf` (embedded route) | RISC-V RV32IMC | REJECTED by the embedded route; no LIR-route instance for the IMC profile (the imac descriptors require the A extension) |
 | `riscv64imac-unknown-none-elf` (`--target`) | RISC-V RV64 | ROUTED to the LIR riscv64imac backend (ELF64 RISC-V object; native atomics [4, 8]) |
@@ -101,7 +101,18 @@ additionally links executables.
   `float_abi: Hard` (AAPCS32 VFP crossings: s0..s15/d0..d7). The
   implemented surface: the register-resident F64 float slice (F32 is
   memory-class on this route — the cm register model has no
-  single-register F32 alias above d15), the atomic slice at the
+  single-register F32 alias above d15), the float stack crossings (the
+  callee binds AND the width-aware AAPCS32 caller pushes — an F64 unit
+  two words at an even base with its alignment pad), the F32<->4-byte-
+  integer transmutes (the marked VMOV Sd/Rt bit moves), the desc-driven
+  FPU gate, the float-class variadic extern CALL marshalling
+  (`thumb_var_call_plan` / `thumb_emit_var_call_block` re-derive the
+  AAPCS32 base convention over the whole call — an F64 extra rides an
+  aligned r-pair via `vmov r,r,d` or an 8-byte-aligned stack unit; an
+  F32 extra promotes through `vcvt.f64.f32` where the descriptor has
+  the double-precision VFP (cortex-m7) and fails closed on the
+  FPv4-SP/FPv5-SP instances via `thumb_var_f64_use`; pinned by
+  `tests/thumb_variadic_float_rows_test.tg`), the atomic slice at the
   [1,2,4]-byte widths (LDREX/STREX loops with the per-ordering DMB
   discipline; `_u64` fails closed), the scalar-constant static subset
   (`.data` + MOVW/MOVT-address loads), and the **NVIC handler slice**:
@@ -112,12 +123,10 @@ additionally links executables.
   32-bit word model cannot hold, aarch64-convention LIR forms (fixed
   vregs 4..7), div/mod (the lowering gate stays closed this slice),
   static writes and non-scalar static images, aggregate returns/
-  parameters, float-class variadic extern calls (GP-only variadic
-  calls keep lowering — the base convention's word stream), and
-  bare-metal image/startup linking (`thumb_compile_executable` fails
-  closed — the route's objects are for an arm-none-eabi linker; the
-  embedded-route cortex-m linker script + startup artifacts are the
-  image contract).
+  parameters, and bare-metal image/startup linking
+  (`thumb_compile_executable` fails closed — the route's objects are
+  for an arm-none-eabi linker; the embedded-route cortex-m linker
+  script + startup artifacts are the image contract).
 - **RISC-V (backend_rv.tg, ELF32/ELF64 EM_RISCV objects):** the
   descriptors carry the atomic width classes as DATA:
   `native_atomic_widths` [4] on riscv32 and [4, 8] on riscv64 (the A
@@ -133,13 +142,25 @@ additionally links executables.
   `fpu: None`; `riscv32imafc` carries `fpu: RVF` (FLEN 32) and
   `riscv32imafdc`/`riscv64gc` `fpu: RVD` (FLEN 64), all with
   `float_abi: Hard` (the psABI fa0..fa7 float argument file modeled as
-  data) — but the rv emitter's float arms are the
-  stage-2 slice, so float statements stay fail-closed. Fail-closed:
+  data). The rv float slice is implemented: the F/D statement emitter
+  arms, the float ABI crossings (return in fa0, the per-class walk), the
+  psABI stack stream beyond the eight fa0..fa7 registers on both
+  xlens (`lir_riscv_stack_mode`; RV32 stores an F64 as its even-based
+  two-unit pair), with the FLEN=64 NaN-boxing convention maintained, and
+  the float-class variadic extern CALL marshalling (`rv_var_call_plan` /
+  `rv_emit_var_call_block` re-derive the psABI integer convention over
+  the extras — `fmv.x.d` into one a-register on rv64, an aligned
+  two-word a-register pair via `fsd`/`lw`/`lw` on rv32, or the stack
+  stream; an F32 extra promotes through `fcvt.d.s` where the descriptor
+  has the D unit and fails closed on RVF/soft instances via
+  `rv_var_f64_use`; pinned by `tests/riscv_variadic_float_rows_test.tg`);
+  a soft-float (`fpu: None`) instance fails float content closed at the
+  descriptor gate, and a callee-side va_list read protocol does not
+  exist in the dialect (no variadic function definitions). Fail-closed:
   aggregate returns/parameters, sub-word (emulated-class) atomics,
   RV32 64-bit atomics and 64-bit-int conversion forms, statics beyond
-  the scalar subset and static writes, div/rem encoders (the modeled
-  M extension names the target capability, not this slice's), and
-  float stack arguments beyond the eight fa0..fa7 registers.
+  the scalar subset and static writes, and div/rem encoders (the
+  modeled M extension names the target capability, not this slice's).
 - The route accepts the standard object/executable emit modes only;
   the thumb/rv arms fail closed on executable emission (objects only
   — link externally), while the aarch64 LIR arm links executables. Neither backend ever

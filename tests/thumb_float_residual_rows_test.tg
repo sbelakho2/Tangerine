@@ -1,0 +1,806 @@
+# tests/thumb_float_residual_rows_test.tg — the cortex-m float-ABI
+# RESIDUAL slice: the AAPCS32 VFP caller-side completion, the float
+# stack-push emitter arm, and the F32 int<->float transmute crossing.
+#
+# The slice closes the documented gaps of backend_thumb.tg (+ the
+# shared lir.tg seam):
+#   - FLOAT STACK ARGUMENTS (a float beyond d0..d7): the shared 4-byte
+#     AAPCS32 word stream at the value's width — an F32 one word, an
+#     F64 an 8-byte unit at an even word index with an inserted
+#     alignment pad word. The lowering arithmetic is the exact caller
+#     mirror of the callee entry walk (the same stk_pos arithmetic),
+#     so these rows pin BOTH ends: the callee LirLoadFrame offsets
+#     ([FP + 8 + 4*k], F64 at even k) and the caller LirPushArg
+#     sequence (descending position order; each F64 unit followed by
+#     its pad where the unit was misaligned; the top pad for odd word
+#     counts).
+#   - the emitter's FP push at width (VSTR.F32 4 bytes / VSTR.F64 the
+#     exact 8-byte double) and the verifier's word-aware push
+#     accounting (one LirPushArg statement per F64 unit, two words).
+#   - TRANSMUTE F32 <-> the 4-byte integer words through the marked
+#     bm register-class bit move (VMOV Sd, Rt / VMOV Rt, Sd — bit
+#     patterns preserved, no conversion) and the F64 pairs'
+#     fail-closed word-model rule (a 32-bit general register has no
+#     room for a 64-bit image).
+#   - the VARIADIC float-class base-convention marshalling (P0-21): the
+#     emitter re-derives the whole call's AAPCS32 BASE walk and
+#     crosses an F64/F32-promoted extra in an aligned r-pair or an
+#     8-byte-aligned stack unit — never a fixed FP argument register
+#     (the full lane rows live in tests/thumb_variadic_float_rows_test.tg).
+#   - the FP callee-save STACK-PARAMETER BIAS: an FP-content function
+#     inserts VPUSH {d8-d15} (64 bytes) between the GP push and the
+#     frame, so the incoming stack arguments sit 64 bytes higher above
+#     r7 — the LirLoadFrame translation (thumb_stack_param_off) carries
+#     the bias and the emitted VLDR.F64 rows pin it (the pre-fix
+#     emitter read every FP stack parameter 64 bytes too low).
+#
+# Run with: tg test tests/thumb_float_residual_rows_test.tg
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::asm::{CodeBuffer, buf_new}
+use tg_compiler::token::span_dummy
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId, MirStatement,
+  MirStatementKind, MirRvalue, MirRvalueKind, MirOperand, MirOperandKind,
+  MirConstant, MirConstantKind, MirTerminator, MirTerminatorKind,
+  MirCallArg, MirCallValue, CastKind, place_local
+}
+use tg_compiler::types::{Type, AccessEffect}
+use tg_compiler::lir::{
+  LirFunction, LirAlloc, LirStmtKind, LirTermKind, LirFpWidth,
+  LirBitMoveOp,
+  lower_mir_fn_to_lir_cm, lir_peephole, lir_alloc_registers_cm,
+  verify_lir, LirVerifyRoute
+}
+use tg_compiler::target_desc::thumbv7em_cortex_m4f_desc
+use tg_compiler::backend_thumb::{
+  ThumbEmit, thumb_emit_new, thumb_emit_fn, thumb_mdl_pool,
+  thumb_stack_param_off,
+  t2_vmov_gp_to_s, t2_vmov_s_to_gp,
+  t2_vmov_gp_pair_to_d, t2_vmov_d_to_gp_pair,
+  t2_vldr_f32, t2_vstr_f32, t2_vldr_f64, t2_vstr_f64, t2_sub_sp_imm7,
+  t2_ldr_imm5, t2_ldr_w_imm12
+}
+
+# ———————————————————————————————————————————————————————————————
+# Small fixtures (the MIR construction mirrors lir_enum_value_word_test)
+# ———————————————————————————————————————————————————————————————
+
+def tfr_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal {
+    id: MirLocalId { id: id },
+    name: name,
+    ty: ty,
+    is_mut: is_mut,
+    span: span_dummy()
+  }
+end
+
+def tfr_param_locals(tys: Vec[Type]) -> Vec[MirLocal]
+  var out: Vec[MirLocal] = Vec::new()
+  var i = 0
+  while i < tys.len() do
+    out.push(tfr_local(i + 1, "p" + i.to_string(), tys[i].clone(), false))
+    i = i + 1
+  end
+  out
+end
+
+def tfr_block(bid: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: bid }, statements: stmts, terminator: term }
+end
+
+def tfr_fn(name: String, tys: Vec[Type], ret_ty: Type, blocks: Vec[MirBlock]) -> MirFunction
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(tfr_local(0, "_ret", ret_ty.clone(), true))
+  let params = tfr_param_locals(tys)
+  var pi = 0
+  while pi < params.len() do
+    locals.push(params[pi].clone())
+    pi = pi + 1
+  end
+  MirFunction {
+    name: name,
+    params: params,
+    ret_type: ret_ty,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def tfr_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def tfr_copy_operand(id: Int) -> MirOperand
+  MirOperand { kind: MirOperandKind::MirCopy(place_local(MirLocalId { id: id })) }
+end
+
+def tfr_call_term(target: String, arg_ids: Vec[Int]) -> MirTerminator
+  var args: Vec[MirCallArg] = Vec::new()
+  var i = 0
+  while i < arg_ids.len() do
+    args.push(MirCallArg {
+      effect: AccessEffect::Read,
+      value: MirCallValue::Value(tfr_copy_operand(arg_ids[i]))
+    })
+    i = i + 1
+  end
+  MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: place_local(MirLocalId { id: 0 }),
+      func: MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirFnItem(target),
+        ty: Type::Unit,
+        instance: Option::None
+      }) },
+      args: args,
+      success: MirBlockId { id: 1 },
+      unwind: Option::None,
+      intrinsic: Option::None,
+      tail: false
+    },
+    span: span_dummy()
+  }
+end
+
+def tfr_cast_stmt(dst_id: Int, target_ty: Type, src_id: Int) -> MirStatement
+  MirStatement {
+    kind: MirStatementKind::MirAssign(
+      place_local(MirLocalId { id: dst_id }),
+      MirRvalue {
+        kind: MirRvalueKind::MirCast(
+          CastKind::Transmute,
+          tfr_copy_operand(src_id),
+          target_ty
+        )
+      }
+    ),
+    span: span_dummy()
+  }
+end
+
+# One-argument-list signature fixture: `tys` and the returned params are
+# positional (params[i] is the vreg of the i-th declared parameter).
+def tfr_sig_fn(name: String, tys: Vec[Type], ret_ty: Type) -> MirFunction
+  tfr_fn(name, tys, ret_ty, Vec::from([tfr_block(0, Vec::new(), tfr_ret_term())]))
+end
+
+# A caller: block 0 calls `target(target_params...)` and block 1 returns.
+def tfr_caller_fn(name: String, tys: Vec[Type], target: String, arg_ids: Vec[Int]) -> MirFunction
+  tfr_fn(name, tys, Type::Unit, Vec::from([
+    tfr_block(0, Vec::new(), tfr_call_term(target, arg_ids)),
+    tfr_block(1, Vec::new(), tfr_ret_term())
+  ]))
+end
+
+# A function whose whole body is the transmute chain.
+def tfr_transmute_fn(name: String, src_ty: Type, dst_ty: Type) -> MirFunction
+  var tys: Vec[Type] = Vec::new()
+  tys.push(src_ty.clone())
+  tfr_fn(name, tys, dst_ty.clone(), Vec::from([
+    tfr_block(0, Vec::from([tfr_cast_stmt(0, dst_ty.clone(), 1)]), tfr_ret_term())
+  ]))
+end
+
+# ———————————————————————————————————————————————————————————————
+# Read helpers
+# ———————————————————————————————————————————————————————————————
+
+# Lower + peephole on the cortex-m route (the backend's own order).
+def tfr_lower_ok(f: MirFunction) -> LirFunction
+  match lower_mir_fn_to_lir_cm(f, Map::new())
+  when Result::Ok(lf) then lir_peephole(lf)
+  when Result::Err(e) then panic("thumb float residual rows: lowering failed: " + e)
+  end
+end
+
+# Allocate + verify clean (the backend's own order; `lf` is already
+# peepholed by tfr_lower_ok).
+def tfr_check(lf: LirFunction) -> LirAlloc
+  let alloc = lir_alloc_registers_cm(lf)
+  let violations = verify_lir(lf, alloc, LirVerifyRoute::LirVerifyCm)
+  var first = ""
+  if violations.len() > 0 then first = violations[0] end
+  assert(violations.len() == 0, "a cortex-m float function must verify clean; first violation: " + first)
+  alloc
+end
+
+# Emit through the thumb emitter (desc gate + variant/float arms).
+def tfr_emit_ok(lf: LirFunction, alloc: LirAlloc, variadic: Set[String]) -> Unit
+  let desc = thumbv7em_cortex_m4f_desc()
+  let pool = match thumb_mdl_pool(desc)
+  when Result::Ok(p) then p
+  when Result::Err(e) then panic("thumb float residual rows: pool failed: " + e)
+  end
+  var te = thumb_emit_new()
+  match thumb_emit_fn(&mut te, pool, desc, lf, alloc, Set::new(), Set::new(), variadic)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then panic("thumb float residual rows: emission failed: " + e)
+  end
+end
+
+def tfr_word_at(b: CodeBuffer, off: Int) -> Int
+  (b.bytes[off] as Int)
+    | ((b.bytes[off + 1] as Int) << 8)
+    | ((b.bytes[off + 2] as Int) << 16)
+    | ((b.bytes[off + 3] as Int) << 24)
+end
+
+def tfr_has_word(b: CodeBuffer, word: Int) -> Bool
+  var i = 0
+  while i + 3 < b.bytes.len() do
+    if tfr_word_at(b, i) == word then
+      return true
+    end
+    i = i + 1
+  end
+  false
+end
+
+# Does the buffer contain a VLDR.F64 d0..d15, [r7, #off] with exactly
+# this machine offset? The structural probe for the stack-parameter
+# rows (the destination register varies with the allocation).
+def tfr_has_vldr_f64(b: CodeBuffer, off: Int) -> Bool
+  var dd = 0
+  var found = false
+  while dd <= 15 do
+    var probe = buf_new()
+    t2_vldr_f64(&mut probe, dd, 7, off)
+    if tfr_has_word(b, tfr_word_at(probe, 0)) then
+      found = true
+    end
+    dd = dd + 1
+  end
+  found
+end
+
+# Does the buffer contain a general LDR r0..r12, [r7, #off] (the 16-bit
+# imm5 form where it fits, the 32-bit imm12 form otherwise)? The
+# structural probe for the general stack-parameter rows.
+def tfr_has_ldr_at(b: CodeBuffer, off: Int) -> Bool
+  var found = false
+  if off <= 124 && (off % 4) == 0 then
+    var r5 = 0
+    while r5 <= 7 do
+      var probe5 = buf_new()
+      t2_ldr_imm5(&mut probe5, r5, 7, off)
+      if tfr_has_word(b, tfr_word_at(probe5, 0)) then
+        found = true
+      end
+      r5 = r5 + 1
+    end
+  end
+  if off <= 4095 then
+    var r12 = 0
+    while r12 <= 12 do
+      var probe12 = buf_new()
+      t2_ldr_w_imm12(&mut probe12, r12, 7, off)
+      if tfr_has_word(b, tfr_word_at(probe12, 0)) then
+        found = true
+      end
+      r12 = r12 + 1
+    end
+  end
+  found
+end
+
+def tfr_emit_capture(lf: LirFunction, alloc: LirAlloc) -> ThumbEmit
+  let desc = thumbv7em_cortex_m4f_desc()
+  let pool = match thumb_mdl_pool(desc)
+  when Result::Ok(p) then p
+  when Result::Err(e) then panic("thumb float residual rows: pool failed: " + e)
+  end
+  var te = thumb_emit_new()
+  match thumb_emit_fn(&mut te, pool, desc, lf, alloc, Set::new(), Set::new(), Set::new())
+  when Result::Ok(_) then te
+  when Result::Err(e) then panic("thumb float residual rows: emission failed: " + e)
+  end
+end
+
+# The bind statement of parameter vreg: Some(the fixed float vreg id) for
+# an LirFMove bind, Some(-1) for an LirLoadFrame bind, None otherwise
+# (the fixed 0..3 general binds and the general stack binds are checked
+# by their own finders below).
+def tfr_bind_fmove_src(lf: LirFunction, vreg: Int) -> Option[Int]
+  for b in lf.blocks do
+    for s in b.statements do
+      match s.kind
+      when LirStmtKind::LirFMove(dst, src) then
+        if dst == vreg then
+          return Option::Some(src)
+        end
+      when _ then ()
+      end
+    end
+  end
+  Option::None
+end
+
+def tfr_bind_loadframe_off(lf: LirFunction, vreg: Int) -> Option[Int]
+  for b in lf.blocks do
+    for s in b.statements do
+      match s.kind
+      when LirStmtKind::LirLoadFrame(dst, off) then
+        if dst == vreg then
+          return Option::Some(off)
+        end
+      when _ then ()
+      end
+    end
+  end
+  Option::None
+end
+
+def tfr_push_vregs(lf: LirFunction) -> Vec[Int]
+  var out: Vec[Int] = Vec::new()
+  for b in lf.blocks do
+    for s in b.statements do
+      match s.kind
+      when LirStmtKind::LirPushArg(vreg) then out.push(vreg)
+      when _ then ()
+      end
+    end
+  end
+  out
+end
+
+def tfr_call_stack_args(lf: LirFunction) -> Int
+  for b in lf.blocks do
+    match b.terminator.kind
+    when LirTermKind::LirCall(_, _, sa, _, _) then
+      return sa
+    when _ then ()
+    end
+  end
+  -1
+end
+
+# The FP width of `vreg` per the function's class table (None = the
+# general word class).
+def tfr_fp_width(lf: LirFunction, vreg: Int) -> Option[LirFpWidth]
+  lf.fp_widths.get(vreg)
+end
+
+def tfr_is_f64(lf: LirFunction, vreg: Int) -> Bool
+  match tfr_fp_width(lf, vreg)
+  when Option::Some(w) then w == LirFpWidth::LirF64
+  when Option::None then false
+  end
+end
+
+def tfr_is_f32(lf: LirFunction, vreg: Int) -> Bool
+  match tfr_fp_width(lf, vreg)
+  when Option::Some(w) then w == LirFpWidth::LirF32
+  when Option::None then false
+  end
+end
+
+def tfr_bm_count(lf: LirFunction, want: LirBitMoveOp) -> Int
+  var n = 0
+  for b in lf.blocks do
+    for s in b.statements do
+      match s.bm
+      when Option::Some(op) then
+        if op == want then
+          n = n + 1
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  n
+end
+
+# The FP-class dst/src of the single bm-marked statement of op `want`
+# (the fixture functions have exactly one).
+def tfr_bm_fp_side(lf: LirFunction, want: LirBitMoveOp) -> Int
+  for b in lf.blocks do
+    for s in b.statements do
+      match s.bm
+      when Option::Some(op) then
+        if op == want then
+          match s.kind
+          when LirStmtKind::LirUnop(_, dst, src) then
+            if want == LirBitMoveOp::LirBitsGpToFp then
+              return dst
+            else
+              return src
+            end
+          when _ then return -1
+          end
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  -1
+end
+
+# ———————————————————————————————————————————————————————————————
+# Encoder rows: the exact words the residual emitters place
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_thumb_float_residual_encoder_rows() -> Unit
+  # VMOV Sd, Rt / VMOV Rt, Sd — the F32 transmute crossings.
+  var b = buf_new()
+  t2_vmov_gp_to_s(&mut b, 3, 17)
+  assert_true(tfr_word_at(b, 0) == 0xEE083A90)
+  var b2 = buf_new()
+  t2_vmov_s_to_gp(&mut b2, 3, 17)
+  assert_true(tfr_word_at(b2, 0) == 0xEE183A90)
+
+  # The F64 pair crossings (encoders exist; the 32-bit word model has no
+  # single-GP carrier for them — the lowering rejects those pairs).
+  var b3 = buf_new()
+  t2_vmov_gp_pair_to_d(&mut b3, 0, 1, 0)
+  assert_true(tfr_word_at(b3, 0) == 0xEC410B10)
+  var b4 = buf_new()
+  t2_vmov_d_to_gp_pair(&mut b4, 0, 1, 0)
+  assert_true(tfr_word_at(b4, 0) == 0xEC510B10)
+
+  # The push/store forms the FP stack-argument arm emits: VSTR.F32 s30,
+  # [sp] (4-byte single) and VSTR.F64 d14, [sp] (exact 8-byte image).
+  var b5 = buf_new()
+  t2_vstr_f32(&mut b5, 30, 13, 0)
+  assert_true(tfr_word_at(b5, 0) == 0xED8DFA00)
+  var b6 = buf_new()
+  t2_vstr_f64(&mut b6, 14, 13, 0)
+  assert_true(tfr_word_at(b6, 0) == 0xED8DEB00)
+
+  # ... and the matching loads at the same width (the callee side).
+  var b7 = buf_new()
+  t2_vldr_f32(&mut b7, 28, 13, 0)
+  assert_true(tfr_word_at(b7, 0) == 0xED9DEA00)
+  var b8 = buf_new()
+  t2_vldr_f64(&mut b8, 14, 13, 0)
+  assert_true(tfr_word_at(b8, 0) == 0xED9DEB00)
+
+  # The push reservations: SUB SP, #4 (one word) and SUB SP, #8 (the
+  # F64 unit).
+  var b9 = buf_new()
+  t2_sub_sp_imm7(&mut b9, 4)
+  assert_true((b9.bytes[0] as Int) == 0x81 && (b9.bytes[1] as Int) == 0xB0)
+  var b10 = buf_new()
+  t2_sub_sp_imm7(&mut b10, 8)
+  assert_true((b10.bytes[0] as Int) == 0x82 && (b10.bytes[1] as Int) == 0xB0)
+end
+
+# ———————————————————————————————————————————————————————————————
+# Callee rows: float stack parameters load at [FP + 8 + 4*k]
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_thumb_float_stack_callee_rows() -> Unit
+  # 5 Int + 10 F64: i4 is the general stack word 0; f0..f7 bind the
+  # fixed d0..d7; f8 (the 9th float) takes the 8-byte unit at word 2
+  # (the odd word 1 takes the alignment pad) and f9 the unit at word 4.
+  var tys: Vec[Type] = Vec::new()
+  var i = 0
+  while i < 5 do
+    tys.push(Type::Int)
+    i = i + 1
+  end
+  i = 0
+  while i < 10 do
+    tys.push(Type::F64)
+    i = i + 1
+  end
+  let lf = tfr_lower_ok(tfr_sig_fn("callee_mixed", tys, Type::Unit))
+  let alloc = tfr_check(lf)
+  assert_true(lf.params.len() == 15)
+  # f0..f7: the fixed float vregs 8..15 by FP position.
+  var fp = 0
+  while fp < 8 do
+    match tfr_bind_fmove_src(lf, lf.params[5 + fp])
+    when Option::Some(src) then assert_true(src == 8 + fp)
+    when Option::None then panic("callee_mixed: float register parameter " + fp.to_string() + " is not an LirFMove bind")
+    end
+    fp = fp + 1
+  end
+  # i4: the general stack word at [FP + 8 + 4*0].
+  match tfr_bind_loadframe_off(lf, lf.params[4])
+  when Option::Some(off) then assert_true(off == 8)
+  when Option::None then panic("callee_mixed: i4 is not a stack bind")
+  end
+  # f8: the F64 unit at the even word 2 — [FP + 8 + 4*2] = 16.
+  match tfr_bind_loadframe_off(lf, lf.params[13])
+  when Option::Some(off) then assert_true(off == 16)
+  when Option::None then panic("callee_mixed: f8 is not a stack bind")
+  end
+  # f9: the unit at word 4 — [FP + 8 + 4*4] = 24.
+  match tfr_bind_loadframe_off(lf, lf.params[14])
+  when Option::Some(off) then assert_true(off == 24)
+  when Option::None then panic("callee_mixed: f9 is not a stack bind")
+  end
+  assert_true(tfr_is_f64(lf, lf.params[13]))
+  assert_true(tfr_is_f64(lf, lf.params[14]))
+  tfr_emit_ok(lf, alloc, Set::new())
+
+  # 8 F32 + one F32 + one F64: the first stack F32 takes word 0 and the
+  # F64 the 8-byte unit at word 2 (its odd predecessor is the pad).
+  var tys2: Vec[Type] = Vec::new()
+  var j = 0
+  while j < 9 do
+    tys2.push(Type::F32)
+    j = j + 1
+  end
+  tys2.push(Type::F64)
+  let lf2 = tfr_lower_ok(tfr_sig_fn("callee_f32pad", tys2, Type::Unit))
+  let alloc2 = tfr_check(lf2)
+  # x (the 9th F32) at word 0.
+  match tfr_bind_loadframe_off(lf2, lf2.params[8])
+  when Option::Some(off) then assert_true(off == 8)
+  when Option::None then panic("callee_f32pad: the 9th F32 is not a stack bind")
+  end
+  # g (the 10th float, an F64) at the even word 2 — pad at word 1.
+  match tfr_bind_loadframe_off(lf2, lf2.params[9])
+  when Option::Some(off) then assert_true(off == 16)
+  when Option::None then panic("callee_f32pad: the F64 is not a stack bind")
+  end
+  assert_true(tfr_is_f32(lf2, lf2.params[8]))
+  assert_true(tfr_is_f64(lf2, lf2.params[9]))
+  tfr_emit_ok(lf2, alloc2, Set::new())
+end
+
+@test
+def test_thumb_float_stack_param_fp_save_bias_row() -> Unit
+  # The VPUSH {d8-d15} block (64 bytes) sits between the GP push and the
+  # frame in every FP-content function, so r7 is 64 bytes lower and the
+  # stack-parameter translation carries the matching bias. These rows
+  # pin the formula the LirLoadFrame emitter arm reads:
+  #   off + frame_bytes + 24 + (64 when fp_save)
+  assert_true(thumb_stack_param_off(8, 0, false) == 32)
+  assert_true(thumb_stack_param_off(8, 0, true) == 96)
+  assert_true(thumb_stack_param_off(8, 8, false) == 40)
+  assert_true(thumb_stack_param_off(8, 8, true) == 104)
+  assert_true(thumb_stack_param_off(24, 16, true) == 128)
+  # End-to-end: callee_mixed binds f8/f9 — F64 stack parameters at the
+  # canonical payloads 16/24 — and its FP content forces the VPUSH, so
+  # the emitted VLDR.F64 must address the BIASED offsets; the un-biased
+  # pre-fix offsets must not appear.
+  var tys: Vec[Type] = Vec::new()
+  var i = 0
+  while i < 5 do
+    tys.push(Type::Int)
+    i = i + 1
+  end
+  i = 0
+  while i < 10 do
+    tys.push(Type::F64)
+    i = i + 1
+  end
+  let lf = tfr_lower_ok(tfr_sig_fn("callee_bias", tys, Type::Unit))
+  let alloc = tfr_check(lf)
+  let te = tfr_emit_capture(lf, alloc)
+  # i4 (the general stack word 0, canonical payload 8): the biased
+  # LDR must address [r7 + k0]; the un-biased offset must not appear.
+  let k0 = thumb_stack_param_off(8, alloc.frame_bytes, true)
+  assert(tfr_has_ldr_at(&te.buf, k0), "the i4 general stack bind must load [r7 + " + k0.to_string() + "] (flushed by the 64-byte VPUSH)")
+  assert(!tfr_has_ldr_at(&te.buf, 8 + alloc.frame_bytes + 24), "the un-biased i4 offset (pre-fix bug) must not appear")
+  # f8/f9 (F64 stack parameters at the canonical payloads 16/24): the
+  # emitted VLDR.F64 must address the BIASED offsets too.
+  let k8 = thumb_stack_param_off(16, alloc.frame_bytes, true)
+  let k9 = thumb_stack_param_off(24, alloc.frame_bytes, true)
+  assert(tfr_has_vldr_f64(&te.buf, k8), "the f8 stack bind must load [r7 + " + k8.to_string() + "] (flushed by the 64-byte VPUSH)")
+  assert(tfr_has_vldr_f64(&te.buf, k9), "the f9 stack bind must load [r7 + " + k9.to_string() + "] (flushed by the 64-byte VPUSH)")
+  assert(!tfr_has_vldr_f64(&te.buf, 16 + alloc.frame_bytes + 24), "the un-biased f8 offset (pre-fix bug) must not appear")
+  assert(!tfr_has_vldr_f64(&te.buf, 24 + alloc.frame_bytes + 24), "the un-biased f9 offset (pre-fix bug) must not appear")
+end
+
+# ———————————————————————————————————————————————————————————————
+# Caller rows: the descending push stream (mixed overflow + pads)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_thumb_float_stack_caller_rows() -> Unit
+  # 6 Int + 10 F64. The call passes, in argument order:
+  #   i0 f0 i1 f1 i2 f2 i3 f3 i4 f4 f5 f6 f7 f8 f9 i5
+  # GP positions: i0..i3 = r0..r3, i4 and i5 stack; FP positions:
+  # f0..f7 = d0..d7, f8 and f9 stack. The stack stream: i4 word 0,
+  # pad word 1, f8 unit 2..3, f9 unit 4..5, i5 word 6 — 7 words, so the
+  # TOP pad lands at word 7 (the highest address, pushed first).
+  var tys: Vec[Type] = Vec::new()
+  var i = 0
+  while i < 6 do
+    tys.push(Type::Int)
+    i = i + 1
+  end
+  i = 0
+  while i < 10 do
+    tys.push(Type::F64)
+    i = i + 1
+  end
+  var order: Vec[Int] = Vec::new()
+  order.push(0)
+  order.push(6)
+  order.push(1)
+  order.push(7)
+  order.push(2)
+  order.push(8)
+  order.push(3)
+  order.push(9)
+  order.push(4)
+  order.push(10)
+  order.push(11)
+  order.push(12)
+  order.push(13)
+  order.push(14)
+  order.push(15)
+  order.push(5)
+  let lf = tfr_lower_ok(tfr_caller_fn("caller_mixed", tys, "sink", order))
+  let alloc = tfr_check(lf)
+  # 8 words: i4, pad, f8 (2), f9 (2), i5, top pad.
+  assert_true(tfr_call_stack_args(lf) == 8)
+  let pushes = tfr_push_vregs(lf)
+  assert_true(pushes.len() == 6)
+  # Top pad (first push, the first general stack argument's own word),
+  # i5, f9, f8, f8's alignment pad, i4 last (the lowest address).
+  assert_true(pushes[0] == lf.params[4])
+  assert_true(pushes[1] == lf.params[5])
+  assert_true(pushes[2] == lf.params[15])
+  assert_true(pushes[3] == lf.params[14])
+  assert_true(pushes[4] == lf.params[4])
+  assert_true(pushes[5] == lf.params[4])
+  assert_true(!tfr_is_f64(lf, pushes[0]))
+  assert_true(!tfr_is_f64(lf, pushes[1]))
+  assert_true(tfr_is_f64(lf, pushes[2]))
+  assert_true(tfr_is_f64(lf, pushes[3]))
+  assert_true(!tfr_is_f64(lf, pushes[4]))
+  assert_true(!tfr_is_f64(lf, pushes[5]))
+  tfr_emit_ok(lf, alloc, Set::new())
+
+  # Pool-pressure caller: 15 F64 args — f0..f7 in d0..d7, the seven
+  # remaining F64s stack at the even words 0..12 (no pad: every unit
+  # starts even) and the FP pool (d8..d13 — the encodable callee-saved
+  # M-profile doubles) cannot hold all fifteen, so at least one stack
+  # push reads a memory-resident F64 through the statement scratch —
+  # the emission still succeeds and the verifier's word accounting
+  # still balances (7 pushes x 2 words = 14).
+  var tys2: Vec[Type] = Vec::new()
+  var k = 0
+  while k < 15 do
+    tys2.push(Type::F64)
+    k = k + 1
+  end
+  var order2: Vec[Int] = Vec::new()
+  k = 0
+  while k < 15 do
+    order2.push(k)
+    k = k + 1
+  end
+  let lf2 = tfr_lower_ok(tfr_caller_fn("caller_pressure", tys2, "sink", order2))
+  let alloc2 = tfr_check(lf2)
+  assert_true(tfr_call_stack_args(lf2) == 14)
+  let pushes2 = tfr_push_vregs(lf2)
+  assert_true(pushes2.len() == 7)
+  var p = 0
+  while p < pushes2.len() do
+    assert_true(tfr_is_f64(lf2, pushes2[p]))
+    p = p + 1
+  end
+  # f14..f8 is the descending order.
+  assert_true(pushes2[0] == lf2.params[14])
+  assert_true(pushes2[6] == lf2.params[8])
+  tfr_emit_ok(lf2, alloc2, Set::new())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Transmute rows: the bm VMOV crossings and the word-model rejection
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_thumb_transmute_rows() -> Unit
+  # U32 -> F32: one GpToFp marker whose FP dst carries the F32 width.
+  let lf = tfr_lower_ok(tfr_transmute_fn("tr_u32_f32", Type::U32, Type::F32))
+  let alloc = tfr_check(lf)
+  assert_true(tfr_bm_count(lf, LirBitMoveOp::LirBitsGpToFp) == 1)
+  assert_true(tfr_bm_count(lf, LirBitMoveOp::LirBitsFpToGp) == 0)
+  let f32_v = tfr_bm_fp_side(lf, LirBitMoveOp::LirBitsGpToFp)
+  assert_true(tfr_is_f32(lf, f32_v))
+  tfr_emit_ok(lf, alloc, Set::new())
+
+  # F32 -> U32: one FpToGp marker reading the F32-class source.
+  let lf2 = tfr_lower_ok(tfr_transmute_fn("tr_f32_u32", Type::F32, Type::U32))
+  let alloc2 = tfr_check(lf2)
+  assert_true(tfr_bm_count(lf2, LirBitMoveOp::LirBitsFpToGp) == 1)
+  let f32_src = tfr_bm_fp_side(lf2, LirBitMoveOp::LirBitsFpToGp)
+  assert_true(tfr_is_f32(lf2, f32_src))
+  tfr_emit_ok(lf2, alloc2, Set::new())
+
+  # Int -> F32: the 64-bit KIND is a 4-byte machine image on this route,
+  # so the pair lowers (the machine-word width rule).
+  let lf3 = tfr_lower_ok(tfr_transmute_fn("tr_int_f32", Type::Int, Type::F32))
+  let alloc3 = tfr_check(lf3)
+  assert_true(tfr_bm_count(lf3, LirBitMoveOp::LirBitsGpToFp) == 1)
+  tfr_emit_ok(lf3, alloc3, Set::new())
+
+  # F64 <-> integer: no single general register holds the 64-bit image —
+  # the lowering fails closed with the word-model rule (both directions).
+  match lower_mir_fn_to_lir_cm(tfr_transmute_fn("tr_f64_int", Type::F64, Type::Int), Map::new())
+  when Result::Ok(_) then panic("tr_f64_int: the F64 bit image must not lower on the 32-bit word model")
+  when Result::Err(e) then assert_true(e.contains("32-bit word model"))
+  end
+  match lower_mir_fn_to_lir_cm(tfr_transmute_fn("tr_int_f64", Type::Int, Type::F64), Map::new())
+  when Result::Ok(_) then panic("tr_int_f64: the F64 bit image must not lower on the 32-bit word model")
+  when Result::Err(e) then assert_true(e.contains("32-bit word model"))
+  end
+
+  # Cross-width float pairs are not bit moves either.
+  match lower_mir_fn_to_lir_cm(tfr_transmute_fn("tr_f32_f64", Type::F32, Type::F64), Map::new())
+  when Result::Ok(_) then panic("tr_f32_f64: a cross-width float transmute must not lower")
+  when Result::Err(e) then assert_true(e.contains("transmute"))
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Variadic float-class calls: the AAPCS32 base convention (P0-21)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_thumb_variadic_float_base_convention_row() -> Unit
+  # sink(Int, Int, F64): the base convention crosses the double's two
+  # words in the aligned r2/r3 pair (low word r2) via VMOV Rt, Rt2, Dd
+  # — never d0. The whole-call base re-marshalling is implemented at
+  # emission (thumb_emit_var_call_block); the full lane rows live in
+  # tests/thumb_variadic_float_rows_test.tg.
+  var tys: Vec[Type] = Vec::new()
+  tys.push(Type::Int)
+  tys.push(Type::Int)
+  tys.push(Type::F64)
+  # Parameter i is local i+1: args i0, i1, f0 in declaration order.
+  let lf = tfr_lower_ok(tfr_caller_fn("variadic_float", tys, "sink", Vec::from([1, 2, 3])))
+  let alloc = tfr_check(lf)
+  var variadic: Set[String] = Set::new()
+  variadic.insert("sink".to_string())
+  let desc = thumbv7em_cortex_m4f_desc()
+  let pool = match thumb_mdl_pool(desc)
+  when Result::Ok(p) then p
+  when Result::Err(e) then panic("variadic row: pool failed: " + e)
+  end
+  var te = thumb_emit_new()
+  match thumb_emit_fn(&mut te, pool, desc, lf, alloc, Set::new(), Set::new(), variadic)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then panic("variadic_float: emission failed: " + e)
+  end
+  var saw_pair = false
+  var dd = 0
+  while dd <= 15 do
+    var probe = buf_new()
+    t2_vmov_d_to_gp_pair(&mut probe, 2, 3, dd)
+    if tfr_has_word(te.buf, tfr_word_at(probe, 0)) then
+      saw_pair = true
+    end
+    dd = dd + 1
+  end
+  assert_true(saw_pair, "the F64 variadic extra must cross in the aligned r2/r3 pair")
+
+  # A GP-only variadic call stays on the base convention and emits.
+  var tys2: Vec[Type] = Vec::new()
+  var i = 0
+  while i < 6 do
+    tys2.push(Type::Int)
+    i = i + 1
+  end
+  var order2: Vec[Int] = Vec::new()
+  i = 0
+  while i < 6 do
+    order2.push(i + 1)
+    i = i + 1
+  end
+  let lf2 = tfr_lower_ok(tfr_caller_fn("variadic_gp", tys2, "sink", order2))
+  let alloc2 = tfr_check(lf2)
+  var variadic2: Set[String] = Set::new()
+  variadic2.insert("sink".to_string())
+  tfr_emit_ok(lf2, alloc2, variadic2)
+end

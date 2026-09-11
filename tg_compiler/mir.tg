@@ -29,6 +29,14 @@ use tg_compiler::types::{
   budget_metric_resource, budget_metric_enforced, budget_bound_value,
   budget_time_limit_ns, budget_time_limit_ns_of, typed_budget_limit, intrinsic_allocates,
   BudgetGuarantee, BudgetDerivations, BUDGET_ALLOC_SITE_BYTES,
+  # (fourth-audit P1-7/P1-8) the heap-size classification vocabulary and
+  # the max-transitive-stack records/analysis.
+  AllocSizeClass, HeapSizeAggregate,
+  heap_size_aggregate_empty, heap_size_aggregate_of_class, heap_size_aggregate_join,
+  heap_size_aggregate_class_word, heap_size_aggregate_bound_bytes,
+  budget_capacity_site_class, budget_string_object_bytes,
+  StackFrameFact, stack_frame_fact_exact, stack_frame_fact_bound,
+  budget_max_stack_of, BUDGET_VEC_HEADER_BYTES, BUDGET_ALLOC_MAX_BYTES,
   budget_classification_of, budget_guarantee_classification, budget_derived_value_of,
   budget_guarantees_of, budget_violation_rows, budget_derivation_text,
   TypeError, EffectSummary, EffectClass, EffectAnnotation, EffectClassClaim,
@@ -36,7 +44,7 @@ use tg_compiler::types::{
   fn_effect_def_key, intrinsic_id_of_call,
   effect_summary_merge, effect_summary_unknown, effect_summary_of_intrinsic,
   effect_summary_of_extern_name, effect_summary_has_class,
-  capability_id_name,
+  capability_id_name, capability_id_arena,
   effect_class_word, effect_class_phrase, effect_class_slot_index,
   effect_class_forbidden_classes, effect_class_claim_spelling,
   ConstExprT,
@@ -16915,7 +16923,7 @@ end
 # region-driven since third-audit item 38 (mir_alias_facts_of_call:
 # let/inout/sink/set per call root, barrier for pointer/indirect calls);
 # it still records only the reject rows — a successful forwarding writes
-# no row. The vectorizer is absent entirely (vectorization_eligible is a
+# no row. The vectorizer is absent entirely (vectorization_eligibility is a
 # perf-report counter only), so no vectorization rows exist. The
 # non-owning-scalar deinit elision and the IV counter canonicalization
 # have no reject rows (their rejected shapes are not decisions with
@@ -16927,9 +16935,13 @@ end
 # (behavior identical). The row text is deterministic: `pass` mirrors the
 # verifier checkpoint names ("inline", "bounds-check elimination"),
 # `symbol` is the function key of the function CONTAINING the site,
-# `site` is the terminator's span locator ("file:start-end"; "bbN" for
-# synthesized code whose span is the dummy span), `decision` is the fixed
-# decision word and `reason` is the evidence text read from the site.
+# `decision` is the fixed decision word and `reason` is the evidence text
+# read from the site. (fourth-audit P1-6) `site` is the site node's P0-7
+# SEMANTIC identity — stable_mir_node_key_of(origin), the revision-stable
+# "<fn key>#N@<hi>-<lo>" key; the "file:start-end"/"bbN" span locator
+# survives ONLY as the documented fallback for hand-built IR whose nodes
+# carry no origin (opt_dec_node_site / opt_dec_block_site /
+# opt_dec_alloc_site are the one capture path).
 
 struct OptimizationDecision
   pass: String = ""
@@ -16959,6 +16971,57 @@ def opt_dec_span_locator(span: Span, block_id: Int) -> String
   else
     "bb" + block_id.to_string()
   end
+end
+
+# (fourth-audit P1-6) The decision-site identity of a MIR node: the P0-7
+# SEMANTIC node id the node carries (stable_mir_node_key_of — the
+# revision-stable "<fn key>#N@<hi>-<lo>" key), falling back to the span /
+# block locator only for hand-built IR whose nodes carry no origin. Every
+# journal row captured at a node site goes through this helper, so the
+# site is never a locator ordinal when the node has a stable identity.
+def opt_dec_node_site(origin: Option[StableMirNodeId], span: Span, block_id: Int) -> String
+  match origin
+  when Option::Some(node) then stable_mir_node_key_of(node)
+  when Option::None then opt_dec_span_locator(&span, block_id)
+  end
+end
+
+# The decision-site identity of a BLOCK (a pass whose site is the block
+# carrying the store, not one terminator): the block's P0-7 control-origin
+# stable key, else the "bbN" locator fallback.
+def opt_dec_block_site(f: MirFunction, block_id: Int) -> String
+  var i = 0
+  while i < f.blocks.len() do
+    if f.blocks[i].id.id == block_id then
+      match f.blocks[i].origin
+      when Option::Some(b) then return b.stable_key.clone()
+      when Option::None then return "bb" + block_id.to_string()
+      end
+    end
+    i = i + 1
+  end
+  "bb" + block_id.to_string()
+end
+
+# The decision-site identity of an escape-analysis allocation site (the
+# allocating call whose destination is the promoted local): the call
+# terminator's P0-7 node key, else the documented "heap-alloc" label for a
+# site no MIR node carries.
+def opt_dec_alloc_site(f: MirFunction, lid: Int) -> String
+  for block in f.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic, tail } then
+      if dest.local.id == lid && dest.projections.is_empty() then
+        match mir_escape_alloc_callee_name(func.clone())
+        when Option::Some(_) then
+          return opt_dec_node_site(block.terminator.origin.clone(), &block.terminator.span, block.id.id)
+        when Option::None then ()
+        end
+      end
+    when _ then ()
+    end
+  end
+  "heap-alloc"
 end
 
 def opt_dec_effect_name(e: AccessEffect) -> String
@@ -17727,7 +17790,7 @@ def inline_calls_in_function(inout caller: MirFunction, func_map: Map[String, Mi
           # ACTIVE (profile-selected) thresholds that admitted it — the
           # success-side mirror of the item-58 "inline-rejected" evidence.
           if capture then
-            let applied_site = opt_dec_span_locator(&block.terminator.span, block.id.id)
+            let applied_site = opt_dec_node_site(block.terminator.origin.clone(), &block.terminator.span, block.id.id)
             var body_stmts = 0
             for cblock in callee.blocks do
               body_stmts = body_stmts + cblock.statements.len()
@@ -17746,7 +17809,7 @@ def inline_calls_in_function(inout caller: MirFunction, func_map: Map[String, Mi
           # passed by a non-Read effect) or should_inline's callee guards
           # blocked the inline. Row capture only — the block is unchanged.
           if capture then
-            let site = opt_dec_span_locator(&block.terminator.span, block.id.id)
+            let site = opt_dec_node_site(block.terminator.origin.clone(), &block.terminator.span, block.id.id)
             if call_has_non_read_place_arg(args) then
               rows.push(opt_dec_row("inline", caller.name.clone(), site, "inline-rejected", opt_dec_guard_reason(args)))
             else
@@ -18121,7 +18184,7 @@ def mir_devirt_rewrite_function(inout f: MirFunction, targets: Map[Int, (MirCons
                 tail: tail
               }
               if capture then
-                let site = opt_dec_span_locator(&block.terminator.span, block.id.id)
+                let site = opt_dec_node_site(block.terminator.origin.clone(), &block.terminator.span, block.id.id)
                 rows.push(opt_dec_row("devirtualization", f.name.clone(), site, "devirt",
                   "indirect call through local '" + opt_dec_local_name(f, lid) + "' (single MirFnItem store in bb" + def_block.to_string() + ", holder never reassigned, address-taken or projected) rewritten to a direct call to '" + callee_name.clone() + "'"))
               end
@@ -21189,7 +21252,7 @@ def sccp_propagate_impl(inout f: MirFunction, capture: Bool, inout rows: Vec[Opt
             rows.push(opt_dec_row(
               "SCCP",
               f.name.clone(),
-              opt_dec_span_locator(&block.terminator.span, block.id.id),
+              opt_dec_node_site(block.terminator.origin.clone(), &block.terminator.span, block.id.id),
               "sccp-branch-retained",
               "the switch condition is the constant " + cv.to_string() + " but the matching arm value appears " + match_count.to_string() + " times (an ambiguous target); the branch is retained"
             ))
@@ -21765,7 +21828,7 @@ def mir_promote_select(f: MirFunction, scan: MirPromoteScan, dom: DomInfo, type_
             rows.push(opt_dec_row(
               "mem2reg",
               f.name.clone(),
-              "bb" + store_bid.to_string(),
+              opt_dec_block_site(f, store_bid),
               "promotion-rejected",
               "the single store of local '" + l.name.clone() + "' does not dominate every read (this pass inserts no phi nodes)"
             ))
@@ -21784,7 +21847,7 @@ def mir_promote_select(f: MirFunction, scan: MirPromoteScan, dom: DomInfo, type_
                 rows.push(opt_dec_row(
                   "mem2reg",
                   f.name.clone(),
-                  "bb" + store_bid.to_string(),
+                  opt_dec_block_site(f, store_bid),
                   "promotion-rejected",
                   "the single store of local '" + l.name.clone() + "' reads the local itself; renaming the slot would not preserve that self-reference"
                 ))
@@ -23857,7 +23920,7 @@ def mir_forward_record_rejects(f: MirFunction, term: MirTerminator, bid: Int, st
           rows.push(opt_dec_row(
             "access-fact forwarding",
             f.name.clone(),
-            opt_dec_span_locator(&term.span, bid),
+            opt_dec_node_site(term.origin.clone(), &term.span, bid),
             "load-forwarding-rejected",
             "local '" + opt_dec_local_name(f, root) + "' is passed by value to '" + callee.clone() + "' but is address-taken elsewhere in the function, so the by-value let carries no no-alias proof"
           ))
@@ -23865,7 +23928,7 @@ def mir_forward_record_rejects(f: MirFunction, term: MirTerminator, bid: Int, st
           rows.push(opt_dec_row(
             "access-fact forwarding",
             f.name.clone(),
-            opt_dec_span_locator(&term.span, bid),
+            opt_dec_node_site(term.origin.clone(), &term.span, bid),
             "load-forwarding-rejected",
             "local '" + opt_dec_local_name(f, root) + "' is an argument of '" + callee.clone() + "', a barrier call (indirect callee / intrinsic / pointer-shaped argument): no per-root alias proof exists, so the fact dies"
           ))
@@ -23873,7 +23936,7 @@ def mir_forward_record_rejects(f: MirFunction, term: MirTerminator, bid: Int, st
           rows.push(opt_dec_row(
             "access-fact forwarding",
             f.name.clone(),
-            opt_dec_span_locator(&term.span, bid),
+            opt_dec_node_site(term.origin.clone(), &term.span, bid),
             "load-forwarding-rejected",
             "local '" + opt_dec_local_name(f, root) + "' is passed by " + opt_dec_effect_name(arg.effect) + " to '" + callee.clone() + "' (the call's region writes/consumes the root)"
           ))
@@ -25210,7 +25273,7 @@ def eliminate_bounds_checks_impl(inout f: MirFunction, capture: Bool, inout rows
             rows.push(opt_dec_row(
               "bounds-check elimination",
               f.name.clone(),
-              opt_dec_span_locator(&block.terminator.span, block.id.id),
+              opt_dec_node_site(block.terminator.origin.clone(), &block.terminator.span, block.id.id),
               "bounds-check-retained",
               opt_dec_bounds_retain_reason(f, st, index_op, len_op, block.id.id, lo_ok)
             ))
@@ -27313,7 +27376,7 @@ def escape_analysis_program_impl(inout program: MirProgram, capture: Bool, inout
         if mir_escape_dest_is_alloc_call(f, lid) && mir_escape_local_value_closed(f, lid) then
           promote.insert(lid)
           if capture then
-            rows.push(opt_dec_row("escape analysis", f.name.clone(), "heap-alloc", "escape-promoted",
+            rows.push(opt_dec_row("escape analysis", f.name.clone(), opt_dec_alloc_site(f, lid), "escape-promoted",
               "allocation destination local '" + opt_dec_local_name(f, lid) + "' is interprocedurally NoEscape and value-flow closed — promoted to stack storage"))
           end
         end
@@ -27573,7 +27636,7 @@ def mark_tail_calls_in_function(inout f: MirFunction, func_map: Map[StructuralIn
                   tail: true
                 }
                 if capture then
-                  let site = opt_dec_span_locator(&block.terminator.span, block.id.id)
+                  let site = opt_dec_node_site(block.terminator.origin.clone(), &block.terminator.span, block.id.id)
                   rows.push(opt_dec_row("tail-call recognition", f.name.clone(), site, "tail-marked",
                     "direct callee '" + callee_name.clone() + "' (structural id); dest is the return place; success block bb" + success.id.to_string() + " is a bare return; AbiCallPlan-compatible (or the documented structural fallback); no unwind — tail jump eligible"))
                 end
@@ -33538,6 +33601,211 @@ def mir_effect_classify_deinit(mir: MirProgram, fn_index: Map[String, Int], dein
   }
 end
 
+# ———————————————————————————————————————————————————————————————
+# (fourth-audit P1-6) THE ONE TYPED CALL-OPERATION CLASSIFICATION
+# ———————————————————————————————————————————————————————————————
+# The §11 classifier above answers the EFFECT question (the full
+# EffectSummary + evidence). This section is the SHARED typed projection
+# the effect scan, perf_report and the @budget allocation analysis all
+# consume, so the allocating / arena-capability / derived-Clone decision
+# exists exactly ONCE in the compiler:
+#
+#   summary           — the §11 EffectSummary of the SITE (the
+#                       mir_effect_classify_call/_deinit record; an
+#                       in-program bodied callee carries the empty site
+#                       summary — its effects land on the callee's own
+#                       record through the transitive edge).
+#   allocate          — the summary's Alloc class (may_allocate). The
+#                       fail-closed unknown/indirect sites are true.
+#   arena_allocation  — the summary carries capability_id_arena (the typed
+#                       capability predicate; NO callee-name substring).
+#   clone             — the derived/Clone semantic OPERATION: the stamped
+#                       IntrinsicId::Clone, or — for an unstamped named
+#                       callee — the intrinsic-name router classifying it
+#                       as Clone (intrinsic_id_of_call). The resolved
+#                       concrete clone implementation is dispatch data and
+#                       is never re-spelled from a name.
+#   retain_release    — RESERVED false: no Arc/Rc retain/release operation
+#                       id exists in the MIR vocabulary (the documented
+#                       no-semantic-op rule); a future typed op id turns
+#                       this on for every consumer at once.
+#   class             — the small precedence word (ArenaAllocate > Clone >
+#                       Allocate > None) for consumers that want ONE class;
+#                       the exact flags above are authoritative when a
+#                       site belongs to several families (a Clone call
+#                       allocates its backing, so allocate is true too).
+#   callee / evidence — the transitive edge name and the per-class
+#                       evidence phrases of mir_effect_classify_call (the
+#                       effect scan folds them verbatim).
+pub enum MirOperationClass
+  None
+  Clone
+  Allocate
+  ArenaAllocate
+end
+
+pub struct MirCallOperation
+  class: MirOperationClass
+  summary: EffectSummary
+  allocate: Bool
+  arena_allocation: Bool
+  clone: Bool
+  retain_release: Bool
+  callee: String
+  evidence: Vec[String]
+end
+
+# The emission name of a call target (Option::None for an indirect
+# closure/pointer target) — the one callee-name extractor.
+def mir_operation_callee_name_of(func: MirOperand) -> Option[String]
+  match func.kind
+  when MirOperandKind::MirConstant(c) then
+    match c.kind
+    when MirConstantKind::MirFnItem(name) then Option::Some(name.clone())
+    when _ then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+# Whether an effect summary carries the §11 arena capability
+# (capability_id_arena, types.tg) — the typed predicate replacing the
+# old callee-name "arena"/"bump" substring heuristic.
+pub def mir_operation_summary_arena(summary: EffectSummary) -> Bool
+  let arena = capability_id_arena()
+  summary.capabilities.contains(&arena)
+end
+
+# Whether a call site is the derived/Clone semantic OPERATION: the stamped
+# IntrinsicId::Clone, or the router classification of an unstamped named
+# callee (a name merely containing "clone" is never the operation).
+def mir_operation_call_is_clone(f: MirFunction, type_index: Map[Int, String], func: MirOperand, args: Vec[MirCallArg], intrinsic: Option[IntrinsicId]) -> Bool
+  match intrinsic
+  when Option::Some(iid) then
+    iid == IntrinsicId::Clone
+  when Option::None then
+    match mir_operation_callee_name_of(func)
+    when Option::Some(name) then
+      let facts = mir_effect_router_facts(f, &type_index, &args)
+      match intrinsic_id_of_call(&name, &facts.0, &facts.1, &facts.2, &facts.3, "", facts.4, facts.5)
+      when Option::Some(iid) then iid == IntrinsicId::Clone
+      when Option::None then false
+      end
+    when Option::None then false
+    end
+  end
+end
+
+# The emission-name index of a program (emission name -> function index) —
+# the shared builder of the fn_index every §11 consumer needs.
+pub def mir_function_index_of(mir: MirProgram) -> Map[String, Int]
+  var fn_index: Map[String, Int] = Map::new()
+  var i = 0
+  while i < mir.functions.len() do
+    let name = mir.functions[i].name.clone()
+    if !fn_index.contains_key(&name) then
+      fn_index.insert(name, i)
+    end
+    i = i + 1
+  end
+  fn_index
+end
+
+# The ONE typed classification of a MirCall terminator (see the section
+# doc). Consumed by the §11 effect scan (its summary/callee/evidence), by
+# perf_report (allocate / arena_allocation / clone) and by the @budget
+# allocation analysis (allocate).
+pub def operation_class_of_call(
+  mir: MirProgram,
+  f: MirFunction,
+  type_index: Map[Int, String],
+  fn_index: Map[String, Int],
+  func: MirOperand,
+  args: Vec[MirCallArg],
+  intrinsic: Option[IntrinsicId]
+) -> MirCallOperation
+  let cc = mir_effect_classify_call(mir, f, &type_index, &fn_index, &func, &args, intrinsic.clone())
+  let allocate = effect_summary_has_class(&cc.summary, &EffectClass::Alloc)
+  let arena_allocation = mir_operation_summary_arena(cc.summary.clone())
+  let clone = mir_operation_call_is_clone(f, &type_index, &func, &args, intrinsic)
+  var class = MirOperationClass::None
+  if arena_allocation then
+    class = MirOperationClass::ArenaAllocate
+  elsif clone then
+    class = MirOperationClass::Clone
+  elsif allocate then
+    class = MirOperationClass::Allocate
+  end
+  MirCallOperation {
+    class: class,
+    summary: cc.summary,
+    allocate: allocate,
+    arena_allocation: arena_allocation,
+    clone: clone,
+    retain_release: false,
+    callee: cc.callee,
+    evidence: cc.evidence
+  }
+end
+
+# The ONE typed classification of a MirDeinit terminator (the implicit
+# destruction call): the same record shape, with clone/retain_release
+# false and the deinit summary folded by mir_effect_classify_deinit.
+pub def operation_class_of_deinit(mir: MirProgram, fn_index: Map[String, Int], deinit_fn: InstanceId) -> MirCallOperation
+  let cc = mir_effect_classify_deinit(mir, &fn_index, deinit_fn)
+  let allocate = effect_summary_has_class(&cc.summary, &EffectClass::Alloc)
+  let arena_allocation = mir_operation_summary_arena(cc.summary.clone())
+  var class = MirOperationClass::None
+  if arena_allocation then
+    class = MirOperationClass::ArenaAllocate
+  elsif allocate then
+    class = MirOperationClass::Allocate
+  end
+  MirCallOperation {
+    class: class,
+    summary: cc.summary,
+    allocate: allocate,
+    arena_allocation: arena_allocation,
+    clone: false,
+    retain_release: false,
+    callee: cc.callee,
+    evidence: cc.evidence
+  }
+end
+
+# The typed classification of one MirCall terminator of a function, looked
+# up by block id — the convenience entry external consumers and behavior
+# lanes use (the index maps come from mir_function_index_of / the type
+# table). A block that is not a MirCall yields the empty None record.
+pub def operation_class_of_call_at(
+  mir: MirProgram,
+  f: MirFunction,
+  block_id: Int,
+  type_index: Map[Int, String],
+  fn_index: Map[String, Int]
+) -> MirCallOperation
+  var out = MirCallOperation {
+    class: MirOperationClass::None,
+    summary: EffectSummary {},
+    allocate: false,
+    arena_allocation: false,
+    clone: false,
+    retain_release: false,
+    callee: "",
+    evidence: Vec::new()
+  }
+  for block in f.blocks do
+    if block.id.id == block_id then
+      match block.terminator.kind
+      when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+        out = operation_class_of_call(mir.clone(), f.clone(), &type_index, &fn_index, &func, &args, intrinsic)
+      when _ then ()
+      end
+    end
+  end
+  out
+end
+
 # The DIRECT summary of one function: every statement/terminator
 # operation record plus the in-program callee edges.
 def mir_effect_scan_function(mir: MirProgram, inout state: MirEffectState, type_index: Map[Int, String], fn_index: Map[String, Int], f: MirFunction) -> Unit
@@ -33584,11 +33852,22 @@ def mir_effect_scan_function(mir: MirProgram, inout state: MirEffectState, type_
     end
     match block.terminator.kind
     when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
-      let cc = mir_effect_classify_call(mir, f, &type_index, &fn_index, &func, &args, intrinsic)
-      summary = mir_effect_fold_call(state, summary, f.name.clone(), cc)
+      # (fourth-audit P1-6) the ONE typed call-operation classification:
+      # the scan folds its summary/callee/evidence (the classify-call
+      # record verbatim) so effects, perf and budget share the decision.
+      let op = operation_class_of_call(mir, f, &type_index, &fn_index, &func, &args, intrinsic)
+      summary = mir_effect_fold_call(state, summary, f.name.clone(), MirEffectCallClass {
+        summary: op.summary,
+        callee: op.callee,
+        evidence: op.evidence
+      })
     when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
-      let cc2 = mir_effect_classify_deinit(mir, &fn_index, &deinit_fn)
-      summary = mir_effect_fold_call(state, summary, f.name.clone(), cc2)
+      let op2 = operation_class_of_deinit(mir, &fn_index, &deinit_fn)
+      summary = mir_effect_fold_call(state, summary, f.name.clone(), MirEffectCallClass {
+        summary: op2.summary,
+        callee: op2.callee,
+        evidence: op2.evidence
+      })
     when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
       let panic_sum2 = EffectSummary { may_panic: true }
       summary = effect_summary_merge(&summary, &panic_sum2)
@@ -34674,7 +34953,10 @@ end
 # (stamped intrinsics + unknown/indirect bodyless fail-closed sites) +
 # the string-concat sites + the algebraic-effect perform sites. In-program
 # callees contribute their own sites through the transitive closure walk.
-def mir_budget_alloc_sites_of(mir: MirProgram, f: MirFunction, type_index: Map[Int, String], fn_index: Map[String, Int]) -> Int
+# (fourth-audit P1-6) The call/deinit arms consume the ONE shared typed
+# operation classification (operation_class_of_call/_deinit) — the
+# allocate flag IS the §11 Alloc class, never a re-spelled predicate.
+pub def mir_budget_alloc_sites_of(mir: MirProgram, f: MirFunction, type_index: Map[Int, String], fn_index: Map[String, Int]) -> Int
   var count = 0
   for block in f.blocks do
     for st in block.statements do
@@ -34700,28 +34982,589 @@ def mir_budget_alloc_sites_of(mir: MirProgram, f: MirFunction, type_index: Map[I
     end
     match block.terminator.kind
     when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
-      let cc = mir_effect_classify_call(mir, f, &type_index, &fn_index, &func, &args, intrinsic)
-      if effect_summary_has_class(&cc.summary, &EffectClass::Alloc) then count = count + 1 end
+      let op = operation_class_of_call(mir, f, &type_index, &fn_index, &func, &args, intrinsic)
+      if op.allocate then count = count + 1 end
     when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
-      let cc2 = mir_effect_classify_deinit(&fn_index, &deinit_fn)
-      if effect_summary_has_class(&cc2.summary, &EffectClass::Alloc) then count = count + 1 end
+      let op2 = operation_class_of_deinit(mir, &fn_index, &deinit_fn)
+      if op2.allocate then count = count + 1 end
     when _ then ()
     end
   end
   count
 end
 
+# ———————————————————————————————————————————————————————————————
+# (fourth-audit P1-7) the per-site HEAP SIZE classification
+# ———————————————————————————————————————————————————————————————
+# Every allocating site the MIR can see gets ONE AllocSizeClass:
+#   Exact(bytes)       the size is a compile-time constant — resolved with
+#                      the EXISTING constant-folding evaluator
+#                      (extract_int_constant / try_fold_binop over the
+#                      single-definition locals): MemAlloc(n), an
+#                      ArrayWithCapacity/ArrayNew with constant n over an
+#                      exactly-resolved scalar element stride, StringNew,
+#                      a literal StringFromStatic, a concat of literal
+#                      Strings, ArrayNew (the 32-byte header).
+#   UpperBound(bytes)  no exact value, but a finite static bound: a
+#                      bounded constant expression (`n & M`, `n % D`), a
+#                      constant capacity over an aggregate stride UPPER
+#                      bound, ArrayWithCapacity over an upper-bound
+#                      element.
+#   Unbounded          runtime-sized: a non-constant size argument, the
+#                      container growth ops (push/insert/extend/resize/
+#                      clone/from_list/slice), non-literal concat, the
+#                      String transforms (push/reserve/split/...).
+#   Unknown            unresolved/indirect: a bodyless extern allocator,
+#                      an indirect/closure call, an algebraic-effect
+#                      perform, MapNew/SetNew (the bucket arena needs the
+#                      K/V layout, not resolvable here), a raw syscall,
+#                      an unresolvable element stride.
+#
+# The aggregate over a function's reachable sites follows the four-way
+# lattice (types.tg): Exact sums exactly, UpperBound sums bounds,
+# Unbounded dominates Unknown, Unknown absorbs every finite class. The
+# heap_bytes guarantee is static-proof ONLY for an Exact aggregate and
+# static-bound ONLY for an UpperBound aggregate; an Unbounded/Unknown
+# aggregate has NO finite static bound and fails the annotation (E0235).
+
+# The single syntactic definition of a local, or Option::None when the
+# local is a parameter / has several stores / is address-taken / is
+# passed by a writing effect (the conservative constant-propagation read
+# of the size argument). The one store is re-read with the existing
+# folding evaluator below; a write through an inout call or a MirRef
+# disqualifies the local (its value is not the folded constant).
+def mir_budget_local_single_def(f: MirFunction, local_id: Int) -> Option[MirRvalue]
+  var found: Option[MirRvalue] = Option::None
+  var count = 0
+  for block in f.blocks do
+    for st in block.statements do
+      match st.kind
+      when MirStatementKind::MirAssign(dest, rvalue) then
+        if dest.local.id == local_id then
+          count = count + 1
+          if count == 1 then found = Option::Some(rvalue.clone()) end
+          match rvalue.kind
+          when MirRvalueKind::MirRef(place) then
+            if place.local.id == local_id then count = count + 2 end
+          when _ then ()
+          end
+        end
+      when _ then ()
+      end
+    end
+    match block.terminator.kind
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+      if dest.local.id == local_id then count = count + 1 end
+      for arg in args do
+        if mir_budget_arg_is_write(arg.effect) && mir_budget_arg_mentions_local(&arg, local_id) then
+          count = count + 2
+        end
+      end
+    when _ then ()
+    end
+  end
+  if count == 1 then found else Option::None end
+end
+
+# Whether a call argument's effect can write the argument's place.
+def mir_budget_arg_is_write(eff: AccessEffect) -> Bool
+  eff == AccessEffect::Modify || eff == AccessEffect::Initialize
+end
+
+# Whether a call argument mentions a local (in any operand/place form).
+def mir_budget_arg_mentions_local(arg: MirCallArg, local_id: Int) -> Bool
+  var p: Option[Place] = Option::None
+  match arg.value
+  when MirCallValue::Place(pp) then p = Option::Some(pp)
+  when MirCallValue::Value(op) then
+    match op.kind
+    when MirOperandKind::MirCopy(pp) then p = Option::Some(pp)
+    when MirOperandKind::MirMovePlace(pp) then p = Option::Some(pp)
+    when MirOperandKind::MirRead(pp) then p = Option::Some(pp)
+    when MirOperandKind::MirConsume(pp) then p = Option::Some(pp)
+    when _ then ()
+    end
+  end
+  match p
+  when Option::Some(pp) then pp.local.id == local_id
+  when Option::None then false
+  end
+end
+
+# The compile-time integer value of an operand through the EXISTING
+# constant-folding evaluator, extended over single-definition locals (a
+# nested constant expression lowers through temps — `(2 + 3) * 4` needs
+# the temp of `2 + 3` resolved before try_fold_binop can fold the `*`).
+def mir_budget_fold_int_operand(f: MirFunction, op: MirOperand, depth: Int) -> Option[Int]
+  if depth > 8 then return Option::None end
+  match op.kind
+  when MirOperandKind::MirConstant(c) then
+    match c.kind
+    when MirConstantKind::MirInt(n) then Option::Some(n)
+    when _ then Option::None
+    end
+  when MirOperandKind::MirCopy(p) then mir_budget_fold_int_local(f, p, depth)
+  when MirOperandKind::MirMovePlace(p) then mir_budget_fold_int_local(f, p, depth)
+  when MirOperandKind::MirRead(p) then mir_budget_fold_int_local(f, p, depth)
+  when MirOperandKind::MirConsume(p) then mir_budget_fold_int_local(f, p, depth)
+  when _ then Option::None
+  end
+end
+
+def mir_budget_fold_int_local(f: MirFunction, p: Place, depth: Int) -> Option[Int]
+  if p.projections.len() > 0 then return Option::None end
+  match mir_budget_local_single_def(f, p.local.id)
+  when Option::Some(rv) then mir_budget_fold_int_rvalue(f, rv, depth + 1)
+  when Option::None then Option::None
+  end
+end
+
+def mir_budget_fold_int_rvalue(f: MirFunction, rv: MirRvalue, depth: Int) -> Option[Int]
+  if depth > 8 then return Option::None end
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then mir_budget_fold_int_operand(f, op, depth + 1)
+  when MirRvalueKind::MirCast(CastKind::IntToInt, op, _) then mir_budget_fold_int_operand(f, op, depth + 1)
+  when MirRvalueKind::MirBinOp(op, lhs, rhs) then
+    match mir_budget_fold_int_operand(f, lhs, depth + 1)
+    when Option::Some(lv) then
+      match mir_budget_fold_int_operand(f, rhs, depth + 1)
+      when Option::Some(rvn) then
+        # The existing folding evaluator does the arithmetic.
+        match try_fold_binop(op.clone(), operand_int(lv), operand_int(rvn))
+        when Option::Some(folded) then
+          match folded.kind
+          when MirRvalueKind::MirMove(fop) then extract_int_constant(fop)
+          when _ then Option::None
+          end
+        when Option::None then Option::None
+        end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when MirRvalueKind::MirUnOp(op, operand) then
+    match mir_budget_fold_int_operand(f, operand, depth + 1)
+    when Option::Some(v) then
+      match try_fold_unop(op.clone(), operand_int(v))
+      when Option::Some(folded) then
+        match folded.kind
+        when MirRvalueKind::MirMove(fop) then extract_int_constant(fop)
+        when _ then Option::None
+        end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+# The P1-7 size class of a size-argument operand: EXACT when it folds to a
+# compile-time constant; UPPERBOUND when a bounded constant expression
+# proves a finite bound (`x & M`, `x % D`); UNBOUNDED for every other
+# runtime-driven value; UNKNOWN for an unresolved/indirect form.
+def mir_budget_size_class_of_operand(f: MirFunction, op: MirOperand, depth: Int) -> AllocSizeClass
+  if depth > 8 then return AllocSizeClass::Unknown end
+  match op.kind
+  when MirOperandKind::MirConstant(c) then
+    match c.kind
+    when MirConstantKind::MirInt(n) then
+      if n >= 0 && n <= BUDGET_ALLOC_MAX_BYTES then AllocSizeClass::Exact(n) else AllocSizeClass::Unknown end
+    when _ then AllocSizeClass::Unknown
+    end
+  when MirOperandKind::MirCopy(p) then mir_budget_size_class_of_local(f, p, depth)
+  when MirOperandKind::MirMovePlace(p) then mir_budget_size_class_of_local(f, p, depth)
+  when MirOperandKind::MirRead(p) then mir_budget_size_class_of_local(f, p, depth)
+  when MirOperandKind::MirConsume(p) then mir_budget_size_class_of_local(f, p, depth)
+  when _ then AllocSizeClass::Unknown
+  end
+end
+
+def mir_budget_size_class_of_local(f: MirFunction, p: Place, depth: Int) -> AllocSizeClass
+  if p.projections.len() > 0 then return AllocSizeClass::Unbounded end
+  match mir_budget_local_single_def(f, p.local.id)
+  when Option::Some(rv) then mir_budget_size_class_of_rvalue(f, rv, depth + 1)
+  when Option::None then AllocSizeClass::Unbounded
+  end
+end
+
+def mir_budget_size_class_of_rvalue(f: MirFunction, rv: MirRvalue, depth: Int) -> AllocSizeClass
+  if depth > 8 then return AllocSizeClass::Unknown end
+  # 1) EXACT: the whole value folds through the existing evaluator.
+  match mir_budget_fold_int_rvalue(f, rv.clone(), depth)
+  when Option::Some(n) then
+    if n >= 0 && n <= BUDGET_ALLOC_MAX_BYTES then
+      return AllocSizeClass::Exact(n)
+    else
+      return AllocSizeClass::Unknown
+    end
+  when Option::None then ()
+  end
+  # 2) UPPERBOUND: the bounded constant-expression forms.
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then mir_budget_size_class_of_operand(f, op, depth + 1)
+  when MirRvalueKind::MirCast(_, op, _) then mir_budget_size_class_of_operand(f, op, depth + 1)
+  when MirRvalueKind::MirBinOp(op, lhs, rhs) then
+    match op
+    when MirBinOp::BitAnd then
+      match extract_int_constant(&rhs)
+      when Option::Some(m) then
+        if m >= 0 && m <= BUDGET_ALLOC_MAX_BYTES then AllocSizeClass::UpperBound(m) else AllocSizeClass::Unknown end
+      when Option::None then
+        match extract_int_constant(&lhs)
+        when Option::Some(m2) then
+          if m2 >= 0 && m2 <= BUDGET_ALLOC_MAX_BYTES then AllocSizeClass::UpperBound(m2) else AllocSizeClass::Unknown end
+        when Option::None then AllocSizeClass::Unbounded
+        end
+      end
+    when MirBinOp::Mod then
+      match extract_int_constant(&rhs)
+      when Option::Some(d) then
+        if d > 0 && d - 1 <= BUDGET_ALLOC_MAX_BYTES then AllocSizeClass::UpperBound(d - 1) else AllocSizeClass::Unbounded end
+      when Option::None then AllocSizeClass::Unbounded
+      end
+    when _ then AllocSizeClass::Unbounded
+    end
+  when _ then AllocSizeClass::Unbounded
+  end
+end
+
+# The length of a compile-time string constant operand.
+def mir_budget_string_constant_len(op: MirOperand) -> Option[Int]
+  match op.kind
+  when MirOperandKind::MirConstant(c) then
+    match c.kind
+    when MirConstantKind::MirString(s) then Option::Some(s.len())
+    when _ then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+# The size class of a call-argument operand (value or place form).
+def mir_budget_arg_size_class(f: MirFunction, arg: MirCallArg, depth: Int) -> AllocSizeClass
+  match arg.value
+  when MirCallValue::Value(op) then mir_budget_size_class_of_operand(f, op, depth)
+  when MirCallValue::Place(p) then mir_budget_size_class_of_local(f, p, depth)
+  end
+end
+
+# The string length of a call-argument form (a literal StaticStrPtr /
+# owned String constant only).
+def mir_budget_arg_string_len(arg: MirCallArg) -> Option[Int]
+  match arg.value
+  when MirCallValue::Value(op) then mir_budget_string_constant_len(op)
+  when MirCallValue::Place(_) then Option::None
+  end
+end
+
+# The P1-7 element stride of a Vec/Array destination: an EXACT scalar
+# stride, an UPPER-BOUND aggregate stride, or (-1, false) when the
+# element type is not resolvable (fail closed).
+def mir_budget_scalar_size(ty: Type) -> Int
+  match ty
+  when Type::Unit then 0
+  when Type::Never then 0
+  when Type::Bool then 1
+  when Type::I8 | Type::U8 then 1
+  when Type::I16 | Type::U16 then 2
+  when Type::Char | Type::I32 | Type::U32 | Type::F32 then 4
+  when Type::Int | Type::UInt | Type::I64 | Type::U64 | Type::ISize | Type::USize | Type::Float | Type::F64 then 8
+  when Type::I128 | Type::U128 then 16
+  when Type::String | Type::StaticStrPtr then 8
+  when Type::Ptr(_) | Type::PtrMut(_) then 8
+  when Type::RefInternal(_, _) then 8
+  when Type::FnPtr(_, _, _) then 8
+  when Type::IntLiteral(_) then 8
+  when _ then -1
+  end
+end
+
+# The bare registered name of an Adt TypeId ("" when unregistered).
+def mir_budget_adt_bare_name(type_index: Map[Int, String], tid: TypeId) -> String
+  match type_index.get(tid.id)
+  when Option::Some(n) then mir_effect_bare_type_name(&n)
+  when Option::None then ""
+  end
+end
+
+# The inline byte size of a builtin Adt whose concrete layout is fixed by
+# the ABI (-1 = not a builtin-fixed form: walk the program's type table).
+# The heap-container handles (Array/Vec/Map/Set/Box/Rc) and the public
+# 8-byte StrView handle are ONE pointer; the raw Slice/UnsafeSlice views
+# are the two-word {ptr,len} inline layout (16 bytes).
+def mir_budget_adt_inline_size(name: String) -> Int
+  if name == "Slice" || name == "UnsafeSlice" then
+    16
+  elsif name == "Array" || name == "Vec" || name == "Map" || name == "Set" ||
+        name == "Box" || name == "Rc" || name == "StrView" then
+    8
+  else
+    -1
+  end
+end
+
+# The conservative inline-size UPPER bound of a type under the program's
+# type table (-1 = unknown — fail closed). Scalars resolve exactly; an
+# aggregate sums its resolved field bounds plus a 16-byte alignment
+# allowance per field (covers @align(16)/@repr(C) padding); an enum is its
+# tag plus the widest payload.
+def mir_budget_type_upper_bytes(ty: Type, type_index: Map[Int, String], type_defs: Map[Int, MirTypeDef], depth: Int) -> Int
+  if depth > 8 then return -1 end
+  let scalar = mir_budget_scalar_size(&ty)
+  if scalar >= 0 then return scalar end
+  match ty
+  when Type::Tuple(fields) then
+    var total = 16
+    for ft in fields do
+      let fu = mir_budget_type_upper_bytes(&ft, &type_index, &type_defs, depth + 1)
+      if fu < 0 then return -1 end
+      total = total + fu + 16
+      if total > BUDGET_ALLOC_MAX_BYTES then return BUDGET_ALLOC_MAX_BYTES end
+    end
+    total
+  when Type::FixedArray(elem, n) then
+    let eu = mir_budget_type_upper_bytes(&elem, &type_index, &type_defs, depth + 1)
+    if eu < 0 || n < 0 then return -1 end
+    if n > 0 && eu > BUDGET_ALLOC_MAX_BYTES / n then return BUDGET_ALLOC_MAX_BYTES end
+    eu * n + 16
+  when Type::Adt(tid, _) then
+    let bare = mir_budget_adt_bare_name(&type_index, &tid)
+    let fixed_inline = mir_budget_adt_inline_size(&bare)
+    if fixed_inline >= 0 then
+      fixed_inline
+    else
+      match type_defs.get(tid.id)
+      when Option::Some(td) then
+        match td.kind
+        when MirTypeDefKind::Struct(fields) then
+          var total = 16
+          for fd in fields do
+            let fu = mir_budget_type_upper_bytes(&fd.ty, &type_index, &type_defs, depth + 1)
+            if fu < 0 then return -1 end
+            total = total + fu + 16
+            if total > BUDGET_ALLOC_MAX_BYTES then return BUDGET_ALLOC_MAX_BYTES end
+          end
+          total
+        when MirTypeDefKind::Enum(variants) then
+          var best = 0
+          for v in variants do
+            var vt = 16
+            for ft in v.fields do
+              let fu = mir_budget_type_upper_bytes(&ft, &type_index, &type_defs, depth + 1)
+              if fu < 0 then return -1 end
+              vt = vt + fu + 16
+            end
+            if vt > best then best = vt end
+          end
+          if best + 32 > BUDGET_ALLOC_MAX_BYTES then BUDGET_ALLOC_MAX_BYTES else best + 32 end
+        end
+      when Option::None then -1
+      end
+    end
+  when _ then -1
+  end
+end
+
+# The concrete Vec/Array element type of a destination (resolved=false
+# when the destination is not a resolvable collection handle).
+def mir_budget_vec_elem_type(dest_ty: Type, type_index: Map[Int, String]) -> (Type, Bool)
+  let t = mir_effect_strip_ref(dest_ty)
+  match t
+  when Type::FixedArray(elem, _) then (elem.clone(), true)
+  when Type::String then (Type::Char, true)
+  when Type::Adt(tid, args) then
+    let bare = mir_budget_adt_bare_name(&type_index, &tid)
+    if bare == "Array" || bare == "Vec" || bare == "Slice" || bare == "UnsafeSlice" then
+      if args.is_empty() then (Type::Unit, false) else (args[0].clone(), true) end
+    else
+      (Type::Unit, false)
+    end
+  when _ then (Type::Unit, false)
+  end
+end
+
+def mir_budget_elem_stride(dest_ty: Type, type_index: Map[Int, String], type_defs: Map[Int, MirTypeDef]) -> (Int, Bool)
+  let (elem, resolved) = mir_budget_vec_elem_type(&dest_ty, &type_index)
+  if !resolved then return (-1, false) end
+  let exact = mir_budget_scalar_size(&elem)
+  if exact >= 0 then return (exact, true) end
+  let upper = mir_budget_type_upper_bytes(&elem, &type_index, &type_defs, 0)
+  if upper < 0 then (-1, false) else (upper, false) end
+end
+
+# The size class of an ArrayNew/ArrayWithCapacity site: the capacity
+# argument's class over the destination element stride.
+def mir_budget_capacity_site_class(f: MirFunction, dest: Place, args: Vec[MirCallArg], type_index: Map[Int, String], type_defs: Map[Int, MirTypeDef]) -> AllocSizeClass
+  if args.is_empty() then return AllocSizeClass::Exact(BUDGET_VEC_HEADER_BYTES) end
+  let cap = mir_budget_arg_size_class(f, args[0].clone(), 0)
+  let dest_ty = mir_effect_place_type(f, &dest)
+  let (stride, stride_exact) = mir_budget_elem_stride(dest_ty, type_index, type_defs)
+  budget_capacity_site_class(cap, stride, stride_exact, BUDGET_VEC_HEADER_BYTES)
+end
+
+# The size class of one ALLOCATING intrinsic site. The unlisted allocating
+# intrinsics (the growth/clone/transform family) are runtime-sized:
+# Unbounded; the unresolved runtime surfaces (Map/Set construction, raw
+# syscalls) are Unknown (fail closed).
+def mir_budget_intrinsic_site_class(f: MirFunction, dest: Place, args: Vec[MirCallArg], iid: IntrinsicId, type_index: Map[Int, String], type_defs: Map[Int, MirTypeDef]) -> AllocSizeClass
+  match iid
+  when IntrinsicId::ArrayNew then
+    mir_budget_capacity_site_class(f, dest, args, type_index, type_defs)
+  when IntrinsicId::ArrayWithCapacity then
+    mir_budget_capacity_site_class(f, dest, args, type_index, type_defs)
+  when IntrinsicId::MemAlloc then
+    if args.is_empty() then
+      AllocSizeClass::Unknown
+    else
+      match mir_budget_arg_size_class(f, args[0].clone(), 0)
+      when AllocSizeClass::Exact(n) then
+        if n >= 0 && n <= BUDGET_ALLOC_MAX_BYTES then AllocSizeClass::Exact(n) else AllocSizeClass::Unknown end
+      when AllocSizeClass::UpperBound(k) then AllocSizeClass::UpperBound(k)
+      when AllocSizeClass::Unbounded then AllocSizeClass::Unbounded
+      when AllocSizeClass::Unknown then AllocSizeClass::Unknown
+      end
+    end
+  when IntrinsicId::StringNew then
+    AllocSizeClass::Exact(budget_string_object_bytes(0))
+  when IntrinsicId::StringFromStatic then
+    if args.is_empty() then
+      AllocSizeClass::Unbounded
+    else
+      match mir_budget_arg_string_len(args[0].clone())
+      when Option::Some(n) then AllocSizeClass::Exact(budget_string_object_bytes(n))
+      when Option::None then AllocSizeClass::Unbounded
+      end
+    end
+  when IntrinsicId::StrToString then
+    if args.is_empty() then
+      AllocSizeClass::Unbounded
+    else
+      match mir_budget_arg_string_len(args[0].clone())
+      when Option::Some(n) then AllocSizeClass::Exact(budget_string_object_bytes(n))
+      when Option::None then AllocSizeClass::Unbounded
+      end
+    end
+  when IntrinsicId::StrConcat then
+    if args.len() >= 2 then
+      match mir_budget_arg_string_len(args[0].clone())
+      when Option::Some(a) then
+        match mir_budget_arg_string_len(args[1].clone())
+        when Option::Some(b) then AllocSizeClass::Exact(budget_string_object_bytes(a + b))
+        when Option::None then AllocSizeClass::Unbounded
+        end
+      when Option::None then AllocSizeClass::Unbounded
+      end
+    else
+      AllocSizeClass::Unbounded
+    end
+  when IntrinsicId::MapNew | IntrinsicId::SetNew then
+    AllocSizeClass::Unknown
+  when IntrinsicId::Syscall1 | IntrinsicId::Syscall2 | IntrinsicId::Syscall3 | IntrinsicId::Syscall4 | IntrinsicId::Syscall5 | IntrinsicId::Syscall6 then
+    AllocSizeClass::Unknown
+  when _ then AllocSizeClass::Unbounded
+  end
+end
+
+# The size class of a StrConcat / `+` concatenation site: Exact over two
+# literal String constants, Unbounded otherwise (the runtime lengths).
+def mir_budget_concat_site_class(lhs: MirOperand, rhs: MirOperand) -> AllocSizeClass
+  match mir_budget_string_constant_len(lhs)
+  when Option::Some(a) then
+    match mir_budget_string_constant_len(rhs)
+    when Option::Some(b) then AllocSizeClass::Exact(budget_string_object_bytes(a + b))
+    when Option::None then AllocSizeClass::Unbounded
+    end
+  when Option::None then AllocSizeClass::Unbounded
+  end
+end
+
+# The DIRECT P1-7 heap aggregate of one function: the joined size class +
+# site count of its own allocating sites (in-program callee calls carry no
+# direct site — the transitive walk joins the callee's aggregate). The
+# call/deinit arms consume the ONE shared typed operation classification
+# (operation_class_of_call/_deinit), exactly like mir_budget_alloc_sites_of.
+def mir_budget_alloc_aggregate_of(mir: MirProgram, f: MirFunction, type_index: Map[Int, String], fn_index: Map[String, Int], type_defs: Map[Int, MirTypeDef]) -> HeapSizeAggregate
+  var agg = heap_size_aggregate_empty()
+  for block in f.blocks do
+    var si = 0
+    while si < block.statements.len() do
+      let st = block.statements[si]
+      match st.kind
+      when MirStatementKind::MirAssign(dest, rvalue) then
+        match rvalue.kind
+        when MirRvalueKind::MirBinOp(MirBinOp::Add, lhs, rhs) then
+          let dest_str = mir_effect_type_is_string_like(&mir_effect_place_type(f, &dest))
+          let lhs_str = mir_effect_operand_is_string(f, &lhs)
+          let rhs_str = mir_effect_operand_is_string(f, &rhs)
+          if dest_str || lhs_str || rhs_str then
+            agg = heap_size_aggregate_join(agg.clone(), heap_size_aggregate_of_class(mir_budget_concat_site_class(lhs.clone(), rhs.clone())))
+          end
+        when _ then ()
+        end
+      when MirStatementKind::MirEffectPerform(_, _, _, _, _) then
+        # An algebraic-effects perform's handler is not statically bounded
+        # — fail closed (the effect scan's rule): Unknown.
+        agg = heap_size_aggregate_join(agg.clone(), heap_size_aggregate_of_class(AllocSizeClass::Unknown))
+      when _ then ()
+      end
+      si = si + 1
+    end
+    match block.terminator.kind
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+      let op = operation_class_of_call(mir, f, &type_index, &fn_index, &func, &args, intrinsic.clone())
+      if op.allocate && op.callee.len() == 0 then
+        var cls = AllocSizeClass::Unknown
+        match intrinsic
+        when Option::Some(iid) then
+          cls = mir_budget_intrinsic_site_class(f, dest.clone(), args.clone(), iid, &type_index, &type_defs)
+        when Option::None then
+          match func.kind
+          when MirOperandKind::MirConstant(c) then
+            match c.kind
+            when MirConstantKind::MirFnItem(name) then
+              # The bodyless intrinsic-name route (the synthesized
+              # str_*/string_*/array_* emission names): classifies by the
+              # router's intrinsic id; every other bodyless/seeded extern
+              # allocator stays Unknown (fail closed).
+              let facts = mir_effect_router_facts(f, &type_index, &args)
+              match intrinsic_id_of_call(&name, &facts.0, &facts.1, &facts.2, &facts.3, "", facts.4, facts.5)
+              when Option::Some(iid2) then
+                cls = mir_budget_intrinsic_site_class(f, dest.clone(), args.clone(), iid2, &type_index, &type_defs)
+              when Option::None then ()
+              end
+            when _ then ()
+            end
+          when _ then ()
+          end
+        end
+        agg = heap_size_aggregate_join(agg.clone(), heap_size_aggregate_of_class(cls))
+      end
+    when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+      let op2 = operation_class_of_deinit(mir, &fn_index, &deinit_fn)
+      if op2.allocate && op2.callee.len() == 0 then
+        # A drop glue outside this compilation (deferred generic drop):
+        # Unknown (fail closed). An in-program glue contributes through
+        # the transitive edge.
+        agg = heap_size_aggregate_join(agg.clone(), heap_size_aggregate_of_class(AllocSizeClass::Unknown))
+      end
+    when _ then ()
+    end
+  end
+  agg
+end
+
 # The transitive allocation facts of one function: the merged may_allocate
-# flag over its reachable call graph and the total allocating-site count
+# flag over its reachable call graph and the joined P1-7 heap aggregate
 # over the same graph (the static allocation-site analysis ± the §11
 # effect scan's edges — the SAME graph the effect pass's closure walks).
-def mir_budget_alloc_facts(state: MirEffectState, direct_sites: Map[String, Int], root: String) -> (Bool, Int)
+def mir_budget_alloc_aggregate_facts(state: MirEffectState, direct_aggs: Map[String, HeapSizeAggregate], root: String) -> (Bool, HeapSizeAggregate)
   var summary = EffectSummary {}
   match state.direct.get(root.clone())
   when Option::Some(s) then summary = s.clone()
   when Option::None then ()
   end
-  var sites = 0
+  var agg = heap_size_aggregate_empty()
   var visited: Set[String] = Set::new()
   visited.insert(root.clone())
   var todo = Vec::new()
@@ -34729,8 +35572,8 @@ def mir_budget_alloc_facts(state: MirEffectState, direct_sites: Map[String, Int]
   var ti = 0
   while ti < todo.len() do
     let cur = todo[ti].clone()
-    match direct_sites.get(cur.clone())
-    when Option::Some(n) then sites = sites + n
+    match direct_aggs.get(cur.clone())
+    when Option::Some(a) then agg = heap_size_aggregate_join(agg.clone(), a.clone())
     when Option::None then ()
     end
     match state.edges.get(cur.clone())
@@ -34749,7 +35592,7 @@ def mir_budget_alloc_facts(state: MirEffectState, direct_sites: Map[String, Int]
     end
     ti = ti + 1
   end
-  (effect_summary_has_class(&summary, &EffectClass::Alloc), sites)
+  (effect_summary_has_class(&summary, &EffectClass::Alloc), agg)
 end
 
 # The MIR-derived stack-byte bound of one function (used when the LIR
@@ -34776,34 +35619,92 @@ pub def mir_budget_instruction_estimate(f: MirFunction) -> Int
 end
 
 # The derivation context of one budgeted function under the scan state,
-# the direct allocation-site table and the optional LIR frame-size map
-# (function emission name -> LirAlloc.frame_bytes).
-pub def mir_budget_derivations_of(state: MirEffectState, direct_sites: Map[String, Int], f: MirFunction, lir_frame_bytes: Map[String, Int]) -> BudgetDerivations
-  let (proven_none, sites) = mir_budget_alloc_facts(&state, &direct_sites, f.name.clone())
-  var heap_bound = 0
-  if !(proven_none && sites == 0) then
-    heap_bound = sites * BUDGET_ALLOC_SITE_BYTES
-  end
+# the direct heap aggregate table, the frame facts and the max-stack call
+# graph (function emission name -> direct-callee names). The P1-7 heap
+# aggregate and the P1-8 max-transitive-stack are both derived here.
+pub def mir_budget_derivations_of(state: MirEffectState, direct_aggs: Map[String, HeapSizeAggregate], f: MirFunction, frames: Map[String, StackFrameFact], stack_edges: Map[String, Vec[String]]) -> BudgetDerivations
+  let (proven_none, heap_agg) = mir_budget_alloc_aggregate_facts(&state, &direct_aggs, f.name.clone())
   let instructions = mir_budget_instruction_estimate(&f)
-  var stack_bound = mir_budget_stack_bound_mir(&f)
-  var stack_exact = false
-  match lir_frame_bytes.get(f.name.clone())
-  when Option::Some(fb) then
-    stack_bound = *fb
-    stack_exact = true
-  when Option::None then ()
+  let own_frame = match frames.get(f.name.clone())
+  when Option::Some(ff) then ff.clone()
+  when Option::None then stack_frame_fact_bound(mir_budget_stack_bound_mir(&f))
   end
+  let max_stack = budget_max_stack_of(&frames, &stack_edges, f.name.clone())
   BudgetDerivations {
     alloc_proven_none: proven_none,
-    alloc_sites: sites,
-    heap_bound_bytes: heap_bound,
-    stack_bound_bytes: stack_bound,
-    stack_exact: stack_exact,
+    alloc_sites: heap_agg.sites,
+    heap_size_class: heap_size_aggregate_class_word(&heap_agg),
+    heap_bound_bytes: heap_size_aggregate_bound_bytes(&heap_agg),
+    stack_bound_bytes: own_frame.frame_bytes,
+    stack_exact: own_frame.frame_exact,
+    max_stack_computed: true,
+    max_stack_bytes: max_stack.max_stack_bytes,
+    max_stack_exact: max_stack.exact,
+    max_stack_unbounded: max_stack.unbounded,
     code_size_bytes: instructions * 4,
     code_exact: false,
     instruction_bound: instructions,
     time_bound_ns: 0
   }
+end
+
+# The emission name of a call target (the caller-side frame-table key);
+# an indirect closure/pointer target has no name — the documented
+# "<indirect>" Unknown marker (a callee with no frame fact).
+def mir_budget_callee_name(func: MirOperand) -> String
+  match func.kind
+  when MirOperandKind::MirConstant(c) then
+    match c.kind
+    when MirConstantKind::MirFnItem(name) then name.clone()
+    when _ then "<indirect>".to_string()
+    end
+  when _ then "<indirect>".to_string()
+  end
+end
+
+# The P1-8 max-stack CALL GRAPH of one function: its in-program callee
+# edges (the §11 scan's edges — the SAME graph the transitive effect and
+# allocation walks use) plus one Unknown marker per callee OUTSIDE the
+# frame table (a bodyless extern / intrinsic runtime helper / indirect
+# call, and a bodyless deinit glue). The max-stack analysis treats a
+# missing frame fact as Unknown (Unbounded) — fail closed.
+def mir_budget_stack_edges_of(mir: MirProgram, state: MirEffectState, f: MirFunction, type_index: Map[Int, String], fn_index: Map[String, Int]) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  var seen: Set[String] = Set::new()
+  match state.edges.get(f.name.clone())
+  when Option::Some(es) then
+    for e in es do
+      if !seen.contains(&e) then
+        seen.insert(e.clone())
+        out.push(e.clone())
+      end
+    end
+  when Option::None then ()
+  end
+  for block in f.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic } then
+      let op = operation_class_of_call(mir, f, &type_index, &fn_index, &func, &args, intrinsic)
+      if op.callee.len() == 0 then
+        let uname = mir_budget_callee_name(func.clone())
+        if !seen.contains(&uname) then
+          seen.insert(uname.clone())
+          out.push(uname.clone())
+        end
+      end
+    when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
+      let op2 = operation_class_of_deinit(mir, &fn_index, &deinit_fn)
+      if op2.callee.len() == 0 then
+        let uname = "<deinit>".to_string()
+        if !seen.contains(&uname) then
+          seen.insert(uname.clone())
+          out.push(uname.clone())
+        end
+      end
+    when _ then ()
+    end
+  end
+  out
 end
 
 # The MIR @budget guarantee pass (the pipeline entry — no LIR frames).
@@ -34851,14 +35752,44 @@ pub def check_budget_annotations_mir_with_frames(mir: MirProgram, env: TypeEnv, 
   for td in mir.types do
     type_index.insert(td.id.id, td.name.clone())
   end
+  # The MirTypeDef table (TypeId.id -> def) the P1-7 element-stride model
+  # walks for aggregate element upper bounds.
+  var type_defs: Map[Int, MirTypeDef] = Map::new()
+  for td in mir.types do
+    type_defs.insert(td.id.id, td.clone())
+  end
 
   # The direct summaries/edges of every function (the SAME scan the
-  # effect-class pass consumes) plus the direct allocating-site table.
+  # effect-class pass consumes) plus the direct P1-7 heap aggregate table.
   var state = MirEffectState {}
-  var direct_sites: Map[String, Int] = Map::new()
+  var direct_aggs: Map[String, HeapSizeAggregate] = Map::new()
   for f in mir.functions do
     mir_effect_scan_function(&mir, &mut state, &type_index, &fn_index, &f)
-    direct_sites.insert(f.name.clone(), mir_budget_alloc_sites_of(&mir, f.clone(), &type_index, &fn_index))
+    direct_aggs.insert(f.name.clone(), mir_budget_alloc_aggregate_of(&mir, f.clone(), &type_index, &fn_index, &type_defs))
+  end
+
+  # (fourth-audit P1-8) the frame facts of every body-bearing function:
+  # the LIR route's post-RA frame_bytes when supplied (exact), else the
+  # MIR-derived bound. A bodyless extern gets NO fact — a call to it is
+  # Unknown and makes the caller's max-stack Unbounded (fail closed).
+  var frames: Map[String, StackFrameFact] = Map::new()
+  for f in mir.functions do
+    if !f.is_extern && f.blocks.len() > 0 then
+      match lir_frame_bytes.get(f.name.clone())
+      when Option::Some(fb) then
+        frames.insert(f.name.clone(), stack_frame_fact_exact(*fb))
+      when Option::None then
+        frames.insert(f.name.clone(), stack_frame_fact_bound(mir_budget_stack_bound_mir(&f)))
+      end
+    end
+  end
+  # The max-stack call graph (the in-program edges + the Unknown bodyless
+  # callees the frame table cannot cover).
+  var stack_edges: Map[String, Vec[String]] = Map::new()
+  for f in mir.functions do
+    if !f.is_extern && f.blocks.len() > 0 then
+      stack_edges.insert(f.name.clone(), mir_budget_stack_edges_of(&mir, &state, f.clone(), &type_index, &fn_index))
+    end
   end
 
   # Per-function classification + enforcement.
@@ -34869,7 +35800,7 @@ pub def check_budget_annotations_mir_with_frames(mir: MirProgram, env: TypeEnv, 
         # Clone the typed record so every helper receives a plain
         # owned/reference value (the match binding may be a reference).
         let tb = tb_ref.clone()
-        let d = mir_budget_derivations_of(&state, &direct_sites, &f, &lir_frame_bytes)
+        let d = mir_budget_derivations_of(&state, &direct_aggs, &f, &frames, &stack_edges)
         let rows = budget_violation_rows(&tb, &d)
         if rows.len() > 0 then
           # The derivational trace: ONE row per classified guarantee (the

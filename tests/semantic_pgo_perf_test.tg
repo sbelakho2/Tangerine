@@ -3,31 +3,37 @@
 # stable-keyed semantic PGO profile) and 40 (perf fact provenance +
 # semantic operation classification) behavior lanes.
 #
-# Item 39: the PGO rows are keyed by the stable semantic identities
-# (StructuralInstanceId for "fn" hotness, StableMirBlockId for "blk"
-# counts, StableMirEdgeId for "edge" probabilities, StableCallId for
-# "call" frequencies, StableAllocationSiteId for "alloc" frequencies).
-# This file drives:
-#   test_pgo_profile_stable_roundtrip — build a v2 profile, serialize
+# Item 39 (re-keyed by fourth-audit P0-8): the PGO rows are keyed by the
+# semantic MIR identities (StructuralInstanceId for "fn" hotness,
+# StableMirBlockId control-origin keys for "blk" counts,
+# StableMirEdgeId-composed semantic edge keys for "edge" probabilities,
+# structural call-site keys for "call" frequencies, StableMirNodeId keys
+# for "alloc" frequencies). This file drives:
+#   test_pgo_profile_stable_roundtrip — build a v3 profile, serialize
 #     (deterministic (kind, key) ordering: reversed insertion gives the
 #     identical text), parse it back, look every domain up through
 #     pgo_function_hotness / pgo_block_count / pgo_edge_probability /
 #     pgo_call_frequency / pgo_allocation_frequency, round-trip the file
 #     API (save_pgo_profile / load_pgo_profile / read_pgo_profile) and
-#     check the stable-id parsers; a malformed row fails closed.
+#     check the semantic-id parsers; a malformed row fails closed, and a
+#     v2 locator row with no build to map through fails closed too.
 #   test_pgo_legacy_format_conversion — a legacy v1 tab-separated file
-#     is detected and converted (the emission name IS the instance key;
-#     the dense block ordinal is carried in the canonical block key; NO
-#     fn hotness row is synthesized).
-# Item 40: test_perf_fact_provenance_labels pins the per-metric labels
-# (StaticExact for the exact walks, StaticUpperBound for the
-# conservative heap/escape walks, StaticEstimate for the derived
-# instruction estimate) and the ABSENT RetainRelease row;
-# test_perf_clone_and_retain_release_classification pins the semantic
-# operation classification: an IntrinsicId::Clone call (stamped or
-# router-classified) counts as a clone, while a callee merely named
-# "release" is never a retain/release count (no Arc/Rc operation id
-# exists in the MIR vocabulary).
+#     (and a v2 locator row) converts through the CURRENT build's mapping
+#     to the semantic keys, fails closed without a build or when a locator
+#     cannot be mapped, and NO fn hotness row is synthesized.
+# Item 40 (fourth-audit P1-6): test_perf_fact_provenance_labels pins the
+# per-metric labels (StaticExact for the exact walks, StaticUpperBound for
+# the conservative heap/escape walks, StaticEstimate for the derived
+# instruction estimate); test_perf_clone_and_retain_release_classification
+# pins the semantic operation classification: an IntrinsicId::Clone call
+# (stamped or router-classified) counts as a clone, while a callee merely
+# named "release" is never a retain/release count (no Arc/Rc operation id
+# exists in the MIR vocabulary); test_perf_metric_zero_vs_none pins the
+# typed PerfMetric semantics (Some(0) and None are DISTINCT rows,
+# provenance/bound_kind per metric); test_perf_operation_classification_
+# parity pins the ONE shared classifier: the mir.tg operation_class_of_call
+# flags, the perf_report metrics and the @budget allocation-site count
+# agree on one fixture.
 #
 # Run with the repo root as the working directory:
 #   tg test tests/semantic_pgo_perf_test.tg
@@ -45,13 +51,16 @@ use tg_compiler::mir::{
   MirProgram, MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId,
   MirStatement, MirStatementKind, MirRvalue, MirRvalueKind, MirBinOp,
   MirOperand, MirOperandKind, MirConstant, MirConstantKind, MirTerminator,
-  MirTerminatorKind, place_local, operand_copy, operand_constant
+  MirTerminatorKind, place_local, operand_copy, operand_constant,
+  MirOperationClass, operation_class_of_call_at, mir_function_index_of,
+  mir_budget_alloc_sites_of
 }
 use tg_compiler::perf_report::{
   PerfField, PerfFactSource, PerfFact, perf_report_of_mir_function,
   perf_facts_of_mir_function
 }
 use tg_compiler::stable_ids::{
+  StableMirNodeId,
   stable_mir_block_key, stable_mir_block_of_key,
   stable_decl_of_key, stable_hir_node_id_of,
   stable_mir_node_id_of_source, stable_mir_node_key_of, stable_mir_node_of_key,
@@ -77,7 +86,53 @@ end
 # Whether a labeled fact row for `field` carries provenance `source`.
 def perf_fact_source_is(facts: Vec[PerfFact], field: PerfField, source: PerfFactSource) -> Bool
   for fact in facts do
-    if fact.field == field && fact.source == source then
+    if fact.field == field && fact.metric.provenance == source then
+      return true
+    end
+  end
+  false
+end
+
+# Whether the row for `field` has the recorded value `value` (Some(value)).
+def perf_fact_value_is(facts: Vec[PerfFact], field: PerfField, value: Int) -> Bool
+  for fact in facts do
+    if fact.field == field then
+      match fact.metric.value
+      when Option::Some(v) then
+        if v == value then
+          return true
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  false
+end
+
+# Whether the row for `field` is the NOT-RECORDED shape (value None).
+def perf_fact_value_none(facts: Vec[PerfFact], field: PerfField) -> Bool
+  for fact in facts do
+    if fact.field == field && fact.metric.value.is_none() then
+      return true
+    end
+  end
+  false
+end
+
+# Whether the row for `field` carries the claim word `bound`.
+def perf_fact_bound_is(facts: Vec[PerfFact], field: PerfField, bound: String) -> Bool
+  for fact in facts do
+    if fact.field == field && fact.metric.bound_kind == bound then
+      return true
+    end
+  end
+  false
+end
+
+# Whether the row for `field` lists the stable P0-7 site id.
+def perf_fact_sites_has(facts: Vec[PerfFact], field: PerfField, site: String) -> Bool
+  for fact in facts do
+    if fact.field == field && fact.metric.sites.contains(&site) then
       return true
     end
   end
@@ -338,8 +393,13 @@ def perf_test_simple_function(name: String) -> MirFunction
 end
 
 # A two-block function whose terminator is a call to `callee_name` with
-# the optional stamped intrinsic payload.
-def perf_test_call_function(name: String, callee_name: String, intrinsic: Option[IntrinsicId]) -> MirFunction
+# the optional stamped intrinsic payload and P0-7 origin.
+def perf_test_call_function(
+  name: String,
+  callee_name: String,
+  intrinsic: Option[IntrinsicId],
+  origin: Option[StableMirNodeId] = Option::None
+) -> MirFunction
   let callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem(callee_name),
@@ -357,7 +417,8 @@ def perf_test_call_function(name: String, callee_name: String, intrinsic: Option
       intrinsic: intrinsic,
       tail: false
     },
-    span: span_dummy()
+    span: span_dummy(),
+    origin: origin
   }
   let block0 = MirBlock { id: MirBlockId { id: 0 }, statements: Vec::new(), terminator: call }
   let block1 = MirBlock {
@@ -402,13 +463,17 @@ def test_perf_fact_provenance_labels() -> Unit
   assert(perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::Escapes, PerfFactSource::StaticUpperBound), "escapes is the documented conservative approximation")
 
   # StaticEstimate: the derived instruction estimate.
-  assert(perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::EstInstructionCount, PerfFactSource::StaticEstimate), "the instruction count is a derived estimate")
+  assert(perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::InstructionCount, PerfFactSource::StaticEstimate), "the instruction count is a derived estimate")
 
   # ProfileMeasured is never produced by the static views.
   assert(!perf_fact_source_is(perf_facts_of_mir_function(&program, &f), PerfField::BranchCount, PerfFactSource::ProfileMeasured), "no ProfileMeasured row is produced here")
 
-  # NO RetainRelease row: no Arc/Rc semantic operation exists in the MIR.
-  assert(!perf_fact_row_present(perf_facts_of_mir_function(&program, &f), PerfField::RetainRelease), "no RetainRelease row without an Arc/Rc operation id")
+  # RetainRelease is a REAL row with the None/unknown shape: no Arc/Rc
+  # semantic operation exists in the MIR vocabulary, so no value is
+  # recorded — and the row says so instead of fabricating a zero.
+  assert(perf_fact_row_present(perf_facts_of_mir_function(&program, &f), PerfField::RetainRelease), "the RetainRelease row exists (None/unknown)")
+  assert(perf_fact_value_none(perf_facts_of_mir_function(&program, &f), PerfField::RetainRelease), "retain/release records no value (no MIR construct)")
+  assert(perf_fact_bound_is(perf_facts_of_mir_function(&program, &f), PerfField::RetainRelease, "unknown"), "the no-construct bound word is unknown")
 end
 
 @test
@@ -418,15 +483,16 @@ def test_perf_clone_and_retain_release_classification() -> Unit
   let clone_fn = perf_test_call_function("m::clone_probe".to_string(), "clone".to_string(), Option::None)
   let clone_program = perf_test_program(clone_fn.clone())
   let clone_report = perf_report_of_mir_function(&clone_program, &clone_fn)
-  assert(clone_report.clones == 1, "a router-classified clone call counts as the Clone operation, got " + clone_report.clones.to_string())
-  assert(clone_report.retain_release == 0, "a clone is never a retain/release count")
+  assert(clone_report.clones.value.unwrap_or(-1) == 1, "a router-classified clone call counts as the Clone operation, got " + clone_report.clones.value.unwrap_or(-1).to_string())
+  assert(clone_report.clones.bound_kind == "exact", "the clone walk is exact")
+  assert(clone_report.retain_release.value.is_none(), "a clone is never a retain/release count")
 
   # The stamped intrinsic path: any callee name with the stamped
   # IntrinsicId::Clone counts.
   let stamped_fn = perf_test_call_function("m::stamped_clone_probe".to_string(), "some_callee".to_string(), Option::Some(IntrinsicId::Clone))
   let stamped_program = perf_test_program(stamped_fn.clone())
   let stamped_report = perf_report_of_mir_function(&stamped_program, &stamped_fn)
-  assert(stamped_report.clones == 1, "a STAMPED IntrinsicId::Clone call counts, got " + stamped_report.clones.to_string())
+  assert(stamped_report.clones.value.unwrap_or(-1) == 1, "a STAMPED IntrinsicId::Clone call counts, got " + stamped_report.clones.value.unwrap_or(-1).to_string())
 
   # A callee named "release" is NOT a retain/release operation: no Arc/Rc
   # operation id exists in the MIR vocabulary, so nothing is counted and
@@ -434,9 +500,9 @@ def test_perf_clone_and_retain_release_classification() -> Unit
   let release_fn = perf_test_call_function("m::release_probe".to_string(), "release".to_string(), Option::None)
   let release_program = perf_test_program(release_fn.clone())
   let release_report = perf_report_of_mir_function(&release_program, &release_fn)
-  assert(release_report.retain_release == 0, "the old callee-name heuristic is gone — no retain/release count")
-  assert(release_report.clones == 0, "a callee merely named release is not the Clone operation")
-  assert(!perf_fact_row_present(perf_facts_of_mir_function(&release_program, &release_fn), PerfField::RetainRelease), "no RetainRelease row is emitted")
+  assert(release_report.retain_release.value.is_none(), "the old callee-name heuristic is gone — no retain/release value")
+  assert(release_report.clones.value.unwrap_or(-1) == 0, "a callee merely named release is not the Clone operation")
+  assert(perf_fact_value_none(perf_facts_of_mir_function(&release_program, &release_fn), PerfField::RetainRelease), "the RetainRelease row is None")
 
   # A callee whose name merely CONTAINS "clone" is never counted (the
   # name-substring heuristic is removed; only the semantic router /
@@ -444,5 +510,97 @@ def test_perf_clone_and_retain_release_classification() -> Unit
   let not_clone_fn = perf_test_call_function("m::not_clone_probe".to_string(), "declone_helpers".to_string(), Option::None)
   let not_clone_program = perf_test_program(not_clone_fn.clone())
   let not_clone_report = perf_report_of_mir_function(&not_clone_program, &not_clone_fn)
-  assert(not_clone_report.clones == 0, "a name containing clone is not the Clone operation")
+  assert(not_clone_report.clones.value.unwrap_or(-1) == 0, "a name containing clone is not the Clone operation")
+end
+
+@test
+def test_perf_metric_zero_vs_none() -> Unit
+  # (fourth-audit P1-6) A recorded zero (Some(0)) and an unrecorded surface
+  # (None) are DISTINCT row shapes, and every row carries its provenance
+  # and claim word.
+  let f = perf_test_simple_function("m::metric_probe".to_string())
+  let program = perf_test_program(f.clone())
+  let facts = perf_facts_of_mir_function(&program, &f)
+
+  # arena_allocations is the typed exact walk: a recorded ZERO (Some(0)),
+  # bound_kind "exact", StaticExact provenance.
+  assert(perf_fact_value_is(facts, PerfField::ArenaAllocations, 0), "arena_allocations is a recorded Some(0)")
+  assert(perf_fact_source_is(facts, PerfField::ArenaAllocations, PerfFactSource::StaticExact), "arena_allocations is a StaticExact walk")
+  assert(perf_fact_bound_is(facts, PerfField::ArenaAllocations, "exact"), "arena_allocations is exact")
+
+  # heap_allocations/escapes are the conservative walks: recorded zeros with
+  # bound_kind "upper-bound" (never None, because the walk runs).
+  assert(perf_fact_value_is(facts, PerfField::HeapAllocations, 0), "no allocation site: Some(0)")
+  assert(perf_fact_bound_is(facts, PerfField::HeapAllocations, "upper-bound"), "heap_allocations is an upper bound")
+  assert(perf_fact_bound_is(facts, PerfField::Escapes, "upper-bound"), "escapes is an upper bound")
+
+  # instruction_count is the derived estimate: a recorded value (not None)
+  # with bound_kind "estimate".
+  assert(perf_fact_bound_is(facts, PerfField::InstructionCount, "estimate"), "instruction_count is an estimate")
+  assert(!perf_fact_value_none(facts, PerfField::InstructionCount), "the instruction estimate is recorded, not None")
+
+  # hotness / spills / retain_release are NOT recorded: None with
+  # bound_kind "unknown" (the row exists; the value does not).
+  assert(perf_fact_value_none(facts, PerfField::Hotness), "hotness is None (no profile)")
+  assert(perf_fact_bound_is(facts, PerfField::Hotness, "unknown"), "hotness is unknown")
+  assert(perf_fact_value_none(facts, PerfField::Spills), "spills are None at the MIR level")
+  assert(perf_fact_value_none(facts, PerfField::RetainRelease), "retain/release is None (no MIR construct)")
+
+  # The aggregate metric mirrors the row shape exactly.
+  let report = perf_report_of_mir_function(&program, &f)
+  assert(report.arena_allocations.value.unwrap_or(-1) == 0, "the aggregate arena metric is Some(0)")
+  assert(report.retain_release.value.is_none(), "the aggregate retain/release metric is None")
+  assert(report.retain_release.bound_kind == "unknown", "the aggregate retain/release bound word is unknown")
+end
+
+@test
+def test_perf_operation_classification_parity() -> Unit
+  # (fourth-audit P1-6) ONE typed classification, three consumers: the
+  # shared mir.tg operation_class_of_call flags, the perf_report metrics
+  # and the @budget direct allocation-site count must agree on the same
+  # fixture.
+  var type_index: Map[Int, String] = Map::new()
+
+  # A stamped MemAlloc: allocates, not a clone, not arena.
+  let alloc_fn = perf_test_call_function("m::parity_alloc".to_string(), "some_callee".to_string(), Option::Some(IntrinsicId::MemAlloc))
+  let alloc_program = perf_test_program(alloc_fn.clone())
+  let alloc_index = mir_function_index_of(&alloc_program)
+  let alloc_op = operation_class_of_call_at(alloc_program.clone(), alloc_fn.clone(), 0, &type_index, &alloc_index)
+  assert(alloc_op.allocate, "the shared classifier marks MemAlloc allocating")
+  assert(!alloc_op.clone, "MemAlloc is not a clone operation")
+  assert(!alloc_op.arena_allocation, "MemAlloc carries no arena capability")
+  assert(alloc_op.class == MirOperationClass::Allocate, "the shared class word is Allocate")
+  let alloc_report = perf_report_of_mir_function(&alloc_program, &alloc_fn)
+  assert(alloc_report.heap_allocations.value.unwrap_or(-1) == 1, "perf counts the same allocating site")
+  assert(alloc_report.clones.value.unwrap_or(-1) == 0, "perf counts no clone")
+  assert(alloc_report.arena_allocations.value.unwrap_or(-1) == 0, "perf counts no arena allocation")
+  assert(mir_budget_alloc_sites_of(alloc_program.clone(), alloc_fn.clone(), &type_index, &alloc_index) == 1, "the budget analysis counts the same allocating site")
+
+  # A stamped Clone: the clone flag AND the allocate flag (the clone
+  # allocates its backing) — all three consumers agree.
+  let clone_fn = perf_test_call_function("m::parity_clone".to_string(), "some_callee".to_string(), Option::Some(IntrinsicId::Clone))
+  let clone_program = perf_test_program(clone_fn.clone())
+  let clone_index = mir_function_index_of(&clone_program)
+  let clone_op = operation_class_of_call_at(clone_program.clone(), clone_fn.clone(), 0, &type_index, &clone_index)
+  assert(clone_op.clone, "the shared classifier marks the stamped Clone operation")
+  assert(clone_op.allocate, "a clone call allocates")
+  assert(clone_op.class == MirOperationClass::Clone, "the shared class word is Clone (the more specific family)")
+  let clone_report = perf_report_of_mir_function(&clone_program, &clone_fn)
+  assert(clone_report.clones.value.unwrap_or(-1) == 1, "perf counts the clone")
+  assert(clone_report.heap_allocations.value.unwrap_or(-1) == 1, "perf counts the clone's allocation")
+  assert(mir_budget_alloc_sites_of(clone_program.clone(), clone_fn.clone(), &type_index, &clone_index) == 1, "the budget analysis counts the clone's allocating site")
+
+  # The site list is the stable P0-7 node id when the node carries one
+  # (the locator fallback is documented for hand-built IR only).
+  let origin = stable_mir_node_id_of_source(
+    "m::parity_site".to_string(),
+    stable_hir_node_id_of(stable_decl_of_key("m::parity_site"), 11),
+    "call".to_string())
+  let site_key = stable_mir_node_key_of(origin.clone())
+  let site_fn = perf_test_call_function(
+    "m::parity_site".to_string(), "some_callee".to_string(),
+    Option::Some(IntrinsicId::MemAlloc), Option::Some(origin))
+  let site_program = perf_test_program(site_fn.clone())
+  let site_facts = perf_facts_of_mir_function(&site_program, &site_fn)
+  assert(perf_fact_sites_has(site_facts, PerfField::HeapAllocations, site_key), "the allocating metric carries the stable P0-7 node site id")
 end

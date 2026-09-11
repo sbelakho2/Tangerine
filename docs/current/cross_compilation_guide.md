@@ -35,14 +35,14 @@ Tangerine supports cross-compilation to multiple platforms and architectures fro
 |---|---|---|---|
 | `riscv64gc-unknown-linux-gnu` | Linux | RISC-V 64 | Emerging architecture |
 | `riscv32imac-unknown-none-elf` | Bare metal | RISC-V 32 | The embedded route's desc'd LIR triple: `--target` routes to the riscv32imac LIR backend (ELF32 RISC-V object; `TANGERINE_LIR_TARGET=riscv32imac` is the legacy alias of the same descriptor) |
-| `riscv32imafc-unknown-none-elf` | Bare metal | RISC-V 32 | `--target` routes to the riscv32imafc LIR backend (ELF32 object; `fpu: RVF`/FLEN 32 modeled, float emission is the stage-2 slice — fail-closed) |
+| `riscv32imafc-unknown-none-elf` | Bare metal | RISC-V 32 | `--target` routes to the riscv32imafc LIR backend (ELF32 object; `fpu: RVF`/FLEN 32 — the rv float slice is implemented: the S statement/ABI arms and the psABI stack stream lower; an `fpu: None`/soft-float instance fails float content closed) |
 | `riscv32imafdc-unknown-none-elf` | Bare metal | RISC-V 32 | `--target` routes to the riscv32imafdc LIR backend (ELF32 object; `fpu: RVD`/FLEN 64 modeled) |
 | `riscv32imc-unknown-none-elf` | Bare metal | RISC-V 32 | REJECTED by the embedded route; no LIR-route instance for the IMC profile (the imac descriptors require the A extension) |
 | `riscv64imac-unknown-none-elf` | Bare metal | RISC-V 64 | `--target` routes to the riscv64imac LIR backend (ELF64 object; `fpu: None`) |
 | `riscv64gc-unknown-none-elf` | Bare metal | RISC-V 64 | `--target` routes to the riscv64gc LIR backend (ELF64 object; `fpu: RVD`) |
 | `aarch64-linux-android` | Android | ARM64 | Android NDK required |
 | `x86_64-unknown-freebsd` | FreeBSD | x86-64 | Server deployments |
-| `aarch64-unknown-none` | Bare metal | ARM64 | AArch64 baremetal — the embedded route's REAL target (the aarch64 backend) |
+| `aarch64-unknown-none` | Bare metal | ARM64 | AArch64 baremetal — the embedded route's REAL target (the aarch64 backend; an explicit `--codegen=lir` routes the build through the aarch64 LIR artifact arm — ELF64 object / bare ELF image, `--coverage` fails closed) |
 
 ## Basic Cross-Compilation
 
@@ -193,8 +193,11 @@ DESCRIPTORS, not one generic core:
   extension's LR/SC), the sub-word widths 1/2 emulated-class on every
   instance (no Zabha instance is modeled), and mmio equal to native.
   The imac instances have no FPU; the F/D instances (imafc/imafdc/gc)
-  model the psABI hard-float registers, while float emission on the rv
-  backend is the stage-2 slice (fail-closed). Emission: ELF32/ELF64
+  model the psABI hard-float registers and the rv float slice is
+  implemented (backend_rv.tg's F/D statement arms, the float ABI
+  crossings and the psABI stack stream beyond fa0..fa7 on both xlens);
+  a soft-float (`fpu: None`) instance still fails float content closed
+  at the descriptor gate. Emission: ELF32/ELF64
   RISC-V relocatable objects (backend_rv.tg) with the LR/SC atomic
   slice at the native widths and the scalar-constant static subset.
 

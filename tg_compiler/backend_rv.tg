@@ -138,12 +138,44 @@
 #     have no LIR form here — and RV32 has no 8-byte atomic
 #     width at all (a _u64 intrinsic fails closed at lowering with
 #     the riscv32 reason and, defensively, in rv_validate_fn).
-#   - floats (RV32F/RV64F, RV32D/RV64D): not implemented — no LIR
-#     float statement exists in the slice, so none reaches this
-#     backend (fail-closed by absence); the descriptions model the
-#     FPU split as DATA (float_abi/fpu/fpu_register_width — the
-#     afc/afdc/gc instances carry F/D, FLEN 32/64) for the exact
-#     target naming and the future float slice.
+#   - floats (RV32F/RV64F, RV32D/RV64D): IMPLEMENTED (the stage-2 rv
+#     float slice — see the float encoder set and the float emitter
+#     sections below). The LIR float statements (LirFMove/LirFBinop/
+#     LirFNeg/LirFCmp/LirFConst/LirIntToFloat/LirFloatToInt/LirFcvt)
+#     lower on BOTH xlens over the psABI float ABI: fa0..fa7 = f10..f17
+#     (fixed float vregs 8..15, the independent per-class positional
+#     walk) with fa0 the scalar return register, float stack arguments
+#     in the psABI flattening after eight float positions (one 8-byte
+#     slot on riscv64 with the F32 single in its low 4 bytes, one
+#     4-byte slot on riscv32 — an F64 stack argument on riscv32
+#     reserves its even-based TWO 4-byte units and stores with fsd,
+#     see the LirPushArg arm; only an F64 statement/value on an RVF
+#     description still fails closed with its named rule), and the
+#     FLEN=64 NaN-boxing convention maintained at every boundary (all
+#     S-form/FLW writes box by hardware; the fsgnj.s move is the
+#     explicit boxing copy — see the float section's NaN-BOXING note).
+#     F32 CONSTANTS are formed on every float-capable description —
+#     RVF included — by compile-time RNE rounding of the host-double
+#     payload (rv_f64_bits_to_f32_bits, integer bit arithmetic) plus
+#     li32 + fmv.w.x, never by fcvt.s.d (the F-only residue; see the
+#     LirFConst arm). The selected description's
+#     fpu/float_abi gate the surface: Fpu::None (riscv32imac /
+#     riscv64imac — float_abi Soft) fails closed with the psABI
+#     integer-convention seam rule, Fpu::RVF (riscv32imafc) admits the
+#     S surface only, Fpu::RVD (riscv32imafdc / riscv64gc, FLEN 64)
+#     admits S+D. The F/D encoders are the pure 3a set (fsqrt stays
+#     unused: no LIR sqrt statement exists); the float-statement
+#     emitter arms are rv_emit_stmt_kind.
+#   - psABI stack arguments beyond the register files: IMPLEMENTED on
+#     both riscv xlens (general and float classes — see the
+#     LirLoadFrame/LirPushArg arms and the lir.tg riscv stack stream
+#     of lir_riscv_stack_mode: 8-byte slots on riscv64, 4-byte slots
+#     per word on riscv32, padded to a 16-byte SP). An F64 stack
+#     argument on riscv32 is the two-unit even-based psABI pair: the
+#     caller reserves two 4-byte units (fsd stores the one 8-byte
+#     image), the lowering emits the pair's odd-unit alignment pad as
+#     its own 4-byte push (the marked lir.tg seam), and the callee's
+#     LirLoadFrame fld reads the even base.
 #   - div/rem: the RV64M/32M div/divu/rem/remu encoders are not
 #     implemented (every modeled instance carries the M extension —
 #     integer_div Hardware on the descs — but that names the TARGET's
@@ -179,7 +211,7 @@ use tg_compiler::mir::{MirProgram, MirStatic, MirFunction}
 use tg_compiler::lir::{
   LirFunction, LirAlloc, LirStmt, LirPtrOp, LirBinOp, LirCond,
   LirStmtKind, LirTermKind,
-  LirUnOp, LirValue,
+  LirUnOp, LirValue, LirFpWidth, LirFpBinOp,
   lower_mir_fn_to_lir_rv32, lower_mir_fn_to_lir_rv64,
   lir_peephole, lir_alloc_registers,
   lir_first_alloc_vreg, lir_seg_at, lir_reload_at, lir_block_label,
@@ -195,6 +227,7 @@ use tg_compiler::asm::{
 }
 use tg_compiler::target_desc::{
   TargetDesc, Arch, AtomicSupport, atomic_support,
+  FloatAbi, Fpu,
   riscv32imac_desc, riscv32imafc_desc, riscv32imafdc_desc,
   riscv64imac_desc, riscv64gc_desc
 }
@@ -758,12 +791,25 @@ end
 
 # ———————————————————————————————————————————————————————————————
 # RV32F/RV64F + RV32D/RV64D — the F/D-extension encoder set (pure
-# words only: no emitter or route wiring, so the floats rule of the
-# header stays closed — there is no LIR float statement yet; the
-# descriptions model the FPU split as data (float_abi/fpu/
-# fpu_register_width — the afc/afdc/gc instances), and these defs are
-# the machine-verified word-level building blocks a future float
-# slice would emit or validate against).
+# words: the machine-verified building blocks the stage-2 float
+# slice's emitter and validator below emit against). The descriptions
+# model the FPU split as data (float_abi/fpu/fpu_register_width — the
+# afc/afdc/gc instances carry F/D, FLEN 32/64) and
+# rv_float_desc_reject turns that data into the per-function emission
+# gate (Soft fails closed, RVF admits S only, RVD admits S+D).
+#
+# NaN BOXING (FLEN 64 — the RVD descriptions): the RISC-V F/D spec
+# NaN-boxes every narrower value in an f-register (upper FLEN-32 bits
+# all ones). FLW, every S-form arithmetic result, fsgnj.s, fcvt.s.d
+# and fcvt.{s,d}.{w,wu} all write boxed results; a non-boxed F32
+# consumed by a widening conversion would yield the canonical NaN.
+# This backend maintains the invariant "an F32 value in an f-register
+# is NaN-boxed at all times": spill loads are FLW (boxed by
+# hardware), register copies are fsgnj.s (an S-form write — the
+# boxing copy, there is no fmov.s), and the only F32 values that are
+# not the direct result of an S-form write arrive through those two
+# paths. F32 STORES (fsw / a spill store) write only the low 32 bits;
+# the slot image is the canonical 4-byte single.
 # Layout model (every OP-FP word below): opcode 0x53 (0b1010011),
 # R-type: [31:25] funct7 | [24:20] rs2 | [19:15] rs1 | [14:12]
 # funct3 | [11:7] rd | [6:0] 0x53. On the arithmetic/fsqrt/
@@ -804,8 +850,10 @@ end
 # ———————————————————————————————————————————————————————————————
 
 # flw rd, imm(rs1) — LOAD-FP single word: I-type, opcode 0x07,
-# funct3 = 2 (0b010). Loads the float bits as-is (no extension);
-# imm = the signed 12-bit byte offset.
+# funct3 = 2 (0b010). On FLEN 64 the loaded single is NaN-BOXED (the
+# upper 32 bits are set to all ones — the spec's narrower-value
+# convention; this is what makes a reloaded F32 safe to consume by
+# fcvt.d.s); imm = the signed 12-bit byte offset.
 # verified: flw f1, 100(x2) = 0x06412087; flw f1, -4(x2) = 0xFFC12087.
 def rv_flw(rd: Int, rs1: Int, imm: Int) -> u32
   if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_flw: rd is a float register (f0..f31) and rs1 an integer register (x0..x31)") end
@@ -1172,9 +1220,11 @@ end
 # 1111000/1111001 (fmv.w.x / fmv.d.x, the integer source in rs1, the
 # float result in rd) — NOT the 1110000 + rs2 = 1 form (the 0x08
 # funct7 difference is part of the x -> f encodings). fmv.x.w and
-# fmv.w.x move the 32-bit single bits and exist at both xlens (the
-# word is zero-extended/truncated per xlen); fmv.x.d / fmv.d.x move
-# the full 64-bit double bits and are RV64-ONLY.
+# fmv.w.x move the 32-bit single bits and exist at both xlens (on
+# RV64 fmv.x.w fills the destination's upper 32 bits with copies of
+# the single's SIGN BIT — it is not a plain zero/truncating move —
+# and fmv.w.x NaN-boxes its FP result on FLEN 64); fmv.x.d / fmv.d.x
+# move the full 64-bit double bits and are RV64-ONLY.
 # ———————————————————————————————————————————————————————————————
 
 # fmv.x.w rd, rs1 — single bits, fpr -> x (integer result in rd):
@@ -1208,6 +1258,142 @@ end
 def rv_fmv_d_x(rd: Int, rs1: Int) -> u32
   if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fmv_d_x: rd is a float register (f0..f31) and rs1 an integer register (x0..x31)") end
   ((0x79 as u32) << 25) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# ———————————————————————————————————————————————————————————————
+# Round-toward-zero float -> integer conversions (the language
+# FloatToInt rule; stage-2 addition). Every fcvt word above fixes
+# funct3 = 000 (rm = RNE — the default rounding for the arithmetic and
+# the int -> float conversions). The LANGUAGE FloatToInt cast truncates
+# toward zero (types.tg §25), so the float -> int forms carry funct3 =
+# 001 (rm = RTZ): the same funct7/rs2 fields as their RNE twins with
+# the rounding bit set. The machine result for an out-of-range source
+# is the destination format's largest/smallest integer (the language
+# clamp), and for a NaN the largest positive integer — so the emitter
+# appends the explicit NaN -> 0 fixup (rv_emit_ftoi_nan_fixup below);
+# a quiet FEQ self-compare is the NaN test.
+# verified (hand-derived from the RNE twins by setting the funct3
+# field): fcvt.w.s x1, f2, rtz = 0xC00110D3; fcvt.wu.s x1, f2, rtz =
+# 0xC01110D3; fcvt.l.s x1, f2, rtz = 0xC02110D3; fcvt.lu.s x1, f2,
+# rtz = 0xC03110D3; the D-source forms are the same words with funct7
+# 0x61: fcvt.w.d rtz = 0xC20110D3; fcvt.wu.d rtz = 0xC21110D3;
+# fcvt.l.d rtz = 0xC22110D3; fcvt.lu.d rtz = 0xC23110D3.
+# ———————————————————————————————————————————————————————————————
+
+# fcvt.w.s rd, rs1 (rtz) — single to signed word, truncating.
+def rv_fcvt_w_s_rtz(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_w_s_rtz: rd is an integer register (x0..x31) and rs1 a float register (f0..f31)") end
+  ((0x60 as u32) << 25) | ((1 as u32) << 12) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.wu.s rd, rs1 (rtz) — single to unsigned word, truncating.
+def rv_fcvt_wu_s_rtz(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_wu_s_rtz: rd is an integer register (x0..x31) and rs1 a float register (f0..f31)") end
+  ((0x60 as u32) << 25) | ((1 as u32) << 20) | ((1 as u32) << 12) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.l.s rd, rs1 (rtz) — single to signed long, truncating. RV64-ONLY.
+def rv_fcvt_l_s_rtz(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_l_s_rtz: rd is an integer register (x0..x31) and rs1 a float register (f0..f31)") end
+  ((0x60 as u32) << 25) | ((2 as u32) << 20) | ((1 as u32) << 12) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.lu.s rd, rs1 (rtz) — single to unsigned long, truncating. RV64-ONLY.
+def rv_fcvt_lu_s_rtz(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_lu_s_rtz: rd is an integer register (x0..x31) and rs1 a float register (f0..f31)") end
+  ((0x60 as u32) << 25) | ((3 as u32) << 20) | ((1 as u32) << 12) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.w.d rd, rs1 (rtz) — double to signed word, truncating.
+def rv_fcvt_w_d_rtz(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_w_d_rtz: rd is an integer register (x0..x31) and rs1 a float register (f0..f31)") end
+  ((0x61 as u32) << 25) | ((1 as u32) << 12) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.wu.d rd, rs1 (rtz) — double to unsigned word, truncating.
+def rv_fcvt_wu_d_rtz(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_wu_d_rtz: rd is an integer register (x0..x31) and rs1 a float register (f0..f31)") end
+  ((0x61 as u32) << 25) | ((1 as u32) << 20) | ((1 as u32) << 12) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.l.d rd, rs1 (rtz) — double to signed long, truncating. RV64-ONLY.
+def rv_fcvt_l_d_rtz(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_l_d_rtz: rd is an integer register (x0..x31) and rs1 a float register (f0..f31)") end
+  ((0x61 as u32) << 25) | ((2 as u32) << 20) | ((1 as u32) << 12) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.lu.d rd, rs1 (rtz) — double to unsigned long, truncating. RV64-ONLY.
+def rv_fcvt_lu_d_rtz(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_lu_d_rtz: rd is an integer register (x0..x31) and rs1 a float register (f0..f31)") end
+  ((0x61 as u32) << 25) | ((3 as u32) << 20) | ((1 as u32) << 12) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# ———————————————————————————————————————————————————————————————
+# Integer -> float conversions (the IntToFloat statement; stage-2
+# addition): funct7 1101000 (0x68) converts FROM a single-precision
+# register and 1101001 (0x69) FROM a double — NO, the SOURCE of an
+# int -> float conversion is the integer register; the funct7 bit 0
+# is the DESTINATION format exactly as on the float -> int family
+# (F extension spec: fcvt.s.w = funct7 1101000 with rs2 = the integer
+# source-format selector, fcvt.d.w = 1101001). rs2 selects the 32-bit
+# (w/wu) or 64-bit (l/lu) INTEGER source: 0 = w, 1 = wu, 2 = l,
+# 3 = lu. funct3 = 000 (RNE — the conversion rounds to nearest even,
+# the language's one int -> float rounding). The l/lu forms are
+# RV64-only (a 64-bit integer source needs 64-bit registers; the
+# riscv32 emitter picks the w/wu forms for its 32-bit word model).
+# verified: fcvt.s.w f1, x2 = 0xD00100D3; fcvt.s.wu f1, x2 =
+# 0xD01100D3; fcvt.s.l f1, x2 = 0xD02100D3; fcvt.s.lu f1, x2 =
+# 0xD03100D3; fcvt.d.w f1, x2 = 0xD20100D3; fcvt.d.wu f1, x2 =
+# 0xD21100D3; fcvt.d.l f1, x2 = 0xD22100D3; fcvt.d.lu f1, x2 =
+# 0xD23100D3.
+# ———————————————————————————————————————————————————————————————
+
+# fcvt.s.w rd, rs1 — signed word to single. rd float, rs1 integer.
+def rv_fcvt_s_w(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_s_w: rd is a float register (f0..f31) and rs1 an integer register (x0..x31)") end
+  ((0x68 as u32) << 25) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.s.wu rd, rs1 — unsigned word to single.
+def rv_fcvt_s_wu(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_s_wu: rd is a float register (f0..f31) and rs1 an integer register (x0..x31)") end
+  ((0x68 as u32) << 25) | ((1 as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.s.l rd, rs1 — signed long to single. RV64-ONLY.
+def rv_fcvt_s_l(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_s_l: rd is a float register (f0..f31) and rs1 an integer register (x0..x31)") end
+  ((0x68 as u32) << 25) | ((2 as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.s.lu rd, rs1 — unsigned long to single. RV64-ONLY.
+def rv_fcvt_s_lu(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_s_lu: rd is a float register (f0..f31) and rs1 an integer register (x0..x31)") end
+  ((0x68 as u32) << 25) | ((3 as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.d.w rd, rs1 — signed word to double.
+def rv_fcvt_d_w(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_d_w: rd is a float register (f0..f31) and rs1 an integer register (x0..x31)") end
+  ((0x69 as u32) << 25) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.d.wu rd, rs1 — unsigned word to double.
+def rv_fcvt_d_wu(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_d_wu: rd is a float register (f0..f31) and rs1 an integer register (x0..x31)") end
+  ((0x69 as u32) << 25) | ((1 as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.d.l rd, rs1 — signed long to double. RV64-ONLY.
+def rv_fcvt_d_l(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_d_l: rd is a float register (f0..f31) and rs1 an integer register (x0..x31)") end
+  ((0x69 as u32) << 25) | ((2 as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
+end
+
+# fcvt.d.lu rd, rs1 — unsigned long to double. RV64-ONLY.
+def rv_fcvt_d_lu(rd: Int, rs1: Int) -> u32
+  if rd < 0 || rd > 31 || rs1 < 0 || rs1 > 31 then panic("rv_fcvt_d_lu: rd is a float register (f0..f31) and rs1 an integer register (x0..x31)") end
+  ((0x69 as u32) << 25) | ((3 as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7) | 0x53
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1249,6 +1435,242 @@ end
 # x28..x31): a call may clobber them. gp/tp/sp (x3/x4/x2) are in no list.
 def rv_caller_saved_regs() -> Vec[Int]
   Vec::from([1, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 28, 29, 30, 31])
+end
+
+# ———————————————————————————————————————————————————————————————
+# The float register model + the descriptor FP gate (the stage-2 rv
+# float slice)
+# ———————————————————————————————————————————————————————————————
+# Fixed float ABI vregs 8..15 (lir_fixed_fp_base()): id 8+k is the
+# psABI argument register fa_k = f(10+k) — the per-class positional
+# walk of lir.tg (independent of the integer stream), and the return
+# register is id 8 = fa0 = f10. Allocated FP pool phys ids are the
+# 100+code namespace of lir_fp_pool_regs_rv (f0..f7 = ft0..ft7 and
+# f28/f29 = ft8/ft9) — phys - 100 IS the f-register number. f30/f31
+# (phys 130/131) are the reserved FP statement temps (never allocated;
+# the f30/f31 contrast with the aarch64 route's V30/V31 is only the
+# file letter). F32 and F64 share the f-register number (s and d are
+# the same register), unlike the thumb route's split aliases.
+def rv_fixed_fp_phys(vreg: Int) -> Int
+  if !lir_is_fixed_fp_id(vreg) then
+    panic("rv_fixed_fp_phys: " + vreg.to_string() + " is not a fixed float ABI vreg id (8..15)")
+  end
+  10 + (vreg - lir_fixed_fp_base())
+end
+
+# The f-register of an allocated FP pool physical id (100 + code).
+def rv_fp_phys_of(phys: Int) -> Int
+  phys - 100
+end
+
+# The reserved FP statement temps: f30 = the def scratch (a
+# memory-resident def computes here), f31 = the spill-load/constant
+# scratch — the aarch64 V30/V31 pattern.
+def rv_fp_def_scratch() -> Int = 30
+def rv_fp_use_scratch() -> Int = 31
+
+# Is the FP value of width `w` subject to the psABI NaN-boxing
+# requirement on this description? True exactly when the register file
+# is wider than the value: FLEN 64 (the RVD descriptions,
+# fpu_register_width 64) holding an F32. On FLEN 32 (RVF) an F32 fills
+# the whole register and there is nothing to box; on a Soft/None
+# description no f-register exists at all (the description gate below
+# fails closed first).
+def rv_nan_box_required(desc: TargetDesc, w: LirFpWidth) -> Bool
+  if w == LirFpWidth::LirF32 then
+    desc.fpu_register_width == 64
+  else
+    false
+  end
+end
+
+# The descriptor FP decision of the stage-2 rv float slice, asked
+# once per function before any emission (and mirrored by
+# rv_validate_float_surface): the selected description's fpu/
+# float_abi decide which float surface this backend can emit.
+#   - Fpu::RVD (riscv32imafdc / riscv64gc, float_abi Hard, FLEN 64):
+#     the full S+D surface. F32 values in f-registers are NaN-boxed
+#     (rv_nan_box_required) and every S-form/FLW write maintains the
+#     boxing by hardware.
+#   - Fpu::RVF (riscv32imafc, float_abi Hard, FLEN 32): the S surface
+#     only. An F64-class value (a F64 local/parameter/return or any
+#     D-width statement) has no register and no encoder — fail closed
+#     with the rvf reason.
+#   - Fpu::None (riscv32imac / riscv64imac, float_abi Soft): the psABI
+#     soft-float convention crosses a float as its INTEGER BIT PATTERN
+#     in the a-register stream (a0..a7 and the integer stack words) —
+#     but the shared LIR lowering binds float parameters and marshals
+#     float arguments through the fixed FP vregs 8..15 without ever
+#     consulting desc.float_abi (the per-class positional walk of
+#     lir.tg), so the integer-convention form cannot be expressed by
+#     this backend for ordinary (named) float arguments; fail closed
+#     with the precise soft-float rule. (The §26 variadic EXTRAS are
+#     the exception: rv_emit_var_call_block re-derives their
+#     integer-convention crossings at emission, so a variadic extra
+#     never needs the ordinary fixed-FP placement — but the float
+#     values an extra is computed from still carry an FP-class width,
+#     which this gate rejects on soft-float descriptions.)
+# The answer is the fail-closed reason, Option::None when the surface
+# is emittable.
+def rv_float_desc_reject(desc: TargetDesc, has_f64: Bool) -> Option[String]
+  match desc.fpu
+  when Fpu::RVD then Option::None
+  when Fpu::RVF then
+    if has_f64 then
+      Option::Some("the `" + desc.name + "` description models RVF (fpu RVF, FLEN " + desc.fpu_register_width.to_string() + ") — an F64 value has no D encoders and no 64-bit f-register on this description (the F/D instances riscv32imafdc/riscv64gc carry the D extension; fail-closed)")
+    else
+      Option::None
+    end
+  when Fpu::None then
+    if desc.float_abi != FloatAbi::Soft then
+      Option::Some("the `" + desc.name + "` description carries no scalar FPU (fpu None) but a non-Soft float_abi — an inconsistent descriptor the stage-2 rv float slice cannot emit (fail-closed)")
+    else
+      Option::Some("the `" + desc.name + "` description models soft-float (float_abi Soft, fpu None): the RISC-V psABI passes floats as their INTEGER BIT PATTERNS in the a-register stream (a0..a7 and the integer stack words), but the shared LIR lowering binds float parameters and marshals float arguments through the fixed FP vregs 8..15 without consulting desc.float_abi — the integer-convention crossing has no LIR form this backend can emit (fail-closed; the descriptor set expresses soft-float as data, the lowering seam is what blocks it)")
+    end
+  else
+    Option::Some("the `" + desc.name + "` description's fpu field is not a scalar F/D unit this backend models (fail-closed)")
+  end
+end
+
+# Does the function's FP class table hold any F64 value? The desc gate
+# (rv_float_desc_reject) needs this: an RVF description cannot emit a
+# single D-width statement. The class table is the authority — every
+# ordinary FP vreg (float parameter/local/temp) is recorded there, and
+# the statement width payloads agree with it (the LIR verifier's rule
+# 3).
+def rv_fn_has_f64(f: LirFunction) -> Bool
+  var found = false
+  for entry in f.fp_widths do
+    if entry.1 == LirFpWidth::LirF64 then
+      found = true
+    end
+  end
+  found
+end
+
+# Does the function carry an F64 LirFConst? (xlen 4 only: those
+# constants materialize through the frame's reserved GP -> FPR transit
+# slot — see rv_emit_fn and the LirFConst arm. F32 constants never
+# need it: since the F32 F-only path they materialize with li32 +
+# fmv.w.x on every xlen.)
+def rv_fn_needs_fp_transit(f: LirFunction, xlen: Int) -> Bool
+  if xlen != 4 then
+    return false
+  end
+  var found = false
+  var bi = 0
+  while bi < f.blocks.len() do
+    let b = f.blocks[bi]
+    var si = 0
+    while si < b.stmts.len() do
+      match b.stmts[si].kind
+      when LirStmtKind::LirFConst(LirFpWidth::LirF64, _, _) then found = true
+      when _ then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  found
+end
+
+# The F32 NaN-boxing move: fmv has no S form, so the canonical
+# f-register copy is fsgnj.s rd, rs, rs (copy the sign of rs onto the
+# magnitude of rs — an exact bit copy of the low 32 bits). On FLEN 64
+# every S-form write NaN-boxes its result, so this copy both moves
+# AND boxes an F32 value read from anywhere; on FLEN 32 it is a plain
+# copy. Used at every F32 register-crossing move (LirFMove, the float
+# return, the call-result capture).
+def rv_fp_mov_word(w: LirFpWidth, dst: Int, src: Int) -> u32
+  if w == LirFpWidth::LirF32 then
+    rv_fsgnj_s(dst, src, src)
+  else
+    rv_fsgnj_d(dst, src, src)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The F32-constant compile-time rounding (the RVF F-only path)
+# ———————————————————————————————————————————————————————————————
+# A LirFConst payload is ALWAYS the constant's 64-bit HOST-DOUBLE bit
+# pattern (MirFloat carries doubles — see the LirFConst statement doc),
+# for F32 destinations exactly as for F64 ones. On the F/D descriptions
+# the single could be produced at runtime by fcvt.s.d, but an F-only
+# description (RVF, riscv32imafc, FLEN 32) has no D unit: there is no
+# instruction that narrows the double. The one F-only path is the
+# canonical single's 32-bit pattern materialized in a GP register and
+# moved into the f-file with fmv.w.x (F includes fmv.w.x at both
+# xlens) — so the ROUNDING is performed HERE, at compile time, on the
+# double's bit pattern, with integer bit arithmetic only (the
+# documented "the compiler performs no host-side float math" rule: no
+# host float operation is used, only shifts/masks/compares on the
+# pattern).
+#
+# This is the IEEE-754 round-to-nearest, ties-to-even double -> single
+# narrowing every F32 value receives (the same rounding fcvt.s.d/FCVT/
+# CVTSD2SS apply), including the subnormal-single results and the
+# overflow-to-infinity edge (a checker-accepted F32 literal is within
+# the f32 maximum, so the edge is defensive only — token.tg's
+# parsed_float_f32_overflow rejects the out-of-range literals).
+def rv_f64_bits_to_f32_bits(bits: Int) -> Int
+  let sign = (bits >> 63) & 1
+  let exp = (bits >> 52) & 0x7FF
+  let frac = bits & 0xFFFFFFFFFFFFF
+  if exp == 0x7FF then
+    # Inf/NaN (defensive — checker-accepted literals are finite): an
+    # infinity maps to an infinity, a NaN to the canonical quiet NaN.
+    if frac == 0 then
+      return (sign << 31) | 0x7F800000
+    end
+    return (sign << 31) | 0x7FC00000
+  end
+  if exp == 0 then
+    # A double subnormal (|v| < 2^-1022) is far below the single
+    # subnormal range — every one underflows to a signed zero.
+    return sign << 31
+  end
+  let e = exp - 1023
+  if e > 127 then
+    return (sign << 31) | 0x7F800000
+  end
+  # The 53-bit significand S = 1.frac (implicit bit included).
+  let sig = 0x10000000000000 | frac
+  if e >= -126 then
+    # A normal single: round S to 24 bits (drop 29 bits, RNE).
+    var q = sig >> 29
+    let rem = sig & 0x1FFFFFFF
+    if rem > 0x10000000 || (rem == 0x10000000 && (q & 1) != 0) then
+      q = q + 1
+    end
+    var ef = e + 127
+    if q >= 0x1000000 then
+      # The rounding carried out of the significand: renormalize.
+      q = q >> 1
+      ef = ef + 1
+    end
+    if ef >= 255 then
+      return (sign << 31) | 0x7F800000
+    end
+    return (sign << 31) | (ef << 23) | (q & 0x7FFFFF)
+  else
+    # A subnormal single (or zero): the value is S*2^(e-52), so its
+    # count of 2^-149 units is S*2^(e+97) — round the right shift.
+    # shift = -97-e is 30 at e = -127; beyond 53 the value is below
+    # half of the smallest subnormal and rounds to zero.
+    let shift = -97 - e
+    if shift > 53 then
+      return sign << 31
+    end
+    var q = sig >> shift
+    let rem = sig - (q << shift)
+    let half = 1 << (shift - 1)
+    if rem > half || (rem == half && (q & 1) != 0) then
+      q = q + 1
+    end
+    # q may carry to 0x800000 — the encoding's exponent field 1 with
+    # fraction 0, i.e. exactly the smallest normal single.
+    return (sign << 31) | q
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1588,58 +2010,25 @@ def rv_validate_ptr_stmt(fn_name: String, pop: LirPtrOp, xlen: Int, desc: Target
   end
 end
 
-# AUDIT §26 — the RISC-V psABI VARIADIC integer-convention gate: the
-# psABI makes a VARIADIC extern call with the INTEGER calling
-# convention even under a hard-FP ABI — no fa0..fa7 argument register
-# is used for any of the call's arguments; an F64 extra (the §26
-# promoted image of an F32 extra) or a float fixed-prefix argument of
-# a variadic extern call would ride the integer stream (one 64-bit
-# GP slot on rv64, a pair of 32-bit GP words on rv32), while the
-# shared LIR lowering (lir.tg's lir_lower_call walk) has no variadic
-# marker and marshals every register-class float argument into the
-# fixed float vregs 8..15 (fa0..fa7 = f10..f17) as soon as the riscv
-# float route opens. The riscv route of THIS slice rejects float
-# statements entirely (rv_validate_fn below — the float slice is not
-# implemented), so this gate is the forward guard with the exact rule
-# (it fires the moment the future float slice makes the fp-vreg moves
-# reach this backend) and the precise diagnostic for a variadic
-# extern call today. A GP-only variadic extern call (the common
-# printf-family shape — after the §26 promotions the i8/u8/i16/u16/
-# Bool extras ride their int-promoted word images, which the integer
-# stream crosses unchanged) contains no fixed-fp marshaling and is
-# unaffected. The set is the program's is_extern_variadic functions
-# (the same table codegen.tg's direct emitter reads for its own
-# variadic route).
-def rv_validate_variadic_calls(f: LirFunction, variadic_externs: Set[String]) -> Result[Unit, String]
-  var bi = 0
-  while bi < f.blocks.len() do
-    let block = f.blocks[bi]
-    match block.term.kind
-    when LirTermKind::LirCall(target, _, _, _, _) then
-      if variadic_externs.contains(&target) then
-        var si = 0
-        while si < block.stmts.len() do
-          let stmt = block.stmts[si]
-          match stmt.kind
-          when LirStmtKind::LirFMove(dst, _) then
-            if lir_is_fixed_fp_id(dst) then
-              return Result::Err("rv: " + f.name + ": call to the variadic extern `" + target + "` marshals a float-class argument into the FP argument register file (a LirFMove into fixed FP vreg " + dst.to_string() + " = f" + (10 + (dst - lir_fixed_fp_base())).to_string() + " = fa" + (dst - lir_fixed_fp_base()).to_string() + "), which does not lower on the riscv route — the RISC-V psABI makes VARIADIC calls with the INTEGER calling convention even under a hard-FP ABI (float arguments — including the §26-promoted F64 image of an F32 extra — ride the GP registers/caller stack as integer words: one 64-bit slot per double on rv64, a pair of 32-bit words on rv32), and the shared LIR lowering's per-class marshaling has no integer-convention form this backend can emit (fail-closed; the integer-convention caller marshaling is a lowering-level later slice)")
-            end
-          when _ then ()
-          end
-          si = si + 1
-        end
-      end
-    when _ then ()
-    end
-    bi = bi + 1
-  end
-  Result::Ok(())
-end
+# AUDIT §26 — the psABI VARIADIC integer-convention marshalling: the
+# RISC-V psABI passes a variadic call's NAMED prefix under the ordinary
+# hardware-FP convention and its ANONYMOUS extras under the INTEGER
+# convention ("The remainder of this section applies only to named
+# arguments. Variadic arguments are passed according to the integer
+# calling convention."). The shared LIR lowering (lir.tg's
+# lir_lower_call walk) has no variadic marker and marshals every
+# register-class float argument into the fixed float vregs (fa0..fa7 =
+# f10..f17), so this backend re-derives the EXTRAS' crossings at
+# emission (rv_var_call_plan / rv_emit_var_call_block below — an F64
+# extra as one a-register bit pattern via fmv.x.d on rv64, an aligned
+# two-word a-register pair via fsd/lw/lw on rv32, or the psABI stack
+# stream) and skips their hard-float marshal statements; the named
+# prefix's register moves stay exactly as emitted. See the marshaller
+# section below.
 
 def rv_validate_fn(f: LirFunction, xlen: Int, desc: TargetDesc) -> Result[Unit, String]
-  if f.params.len() > 8 then
-    return Result::Err("rv: stack args beyond a0-a7 not implemented")
+  if xlen != 8 && xlen != 4 then
+    return Result::Err("rv: rv_validate_fn needs xlen 4 or 8 bytes (got " + xlen.to_string() + ")")
   end
   var bi = 0
   while bi < f.blocks.len() do
@@ -1745,26 +2134,56 @@ def rv_validate_fn(f: LirFunction, xlen: Int, desc: TargetDesc) -> Result[Unit, 
         if sym.len() == 0 then
           return Result::Err("rv: " + f.name + ": static-value load carries an empty symbol name (the shared lowering resolves static references to emission names — a lowering divergence; fail-closed)")
         end
-      when LirStmtKind::LirLoadFrame(_, off) then
-        return Result::Err("rv: " + f.name + ": stack-parameter loads (LirLoadFrame at [FP+" + off.to_string() + "]) do not lower — stack args beyond a0-a7 are not implemented")
-      when LirStmtKind::LirPushArg(_) then
-        return Result::Err("rv: " + f.name + ": caller stack-argument pushes (LirPushArg) do not lower — stack args beyond a0-a7 are not implemented")
-      when LirStmtKind::LirFMove(_, _) then
-        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirFBinop(_, _, _, _, _) then
-        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirFNeg(_, _, _) then
-        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirFCmp(_, _, _) then
-        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirFConst(_, _, _) then
-        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirIntToFloat(_, _, _, _) then
-        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirFloatToInt(_, _, _) then
-        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
-      when LirStmtKind::LirFcvt(_, _, _) then
-        return Result::Err("rv: " + f.name + ": float statements do not lower on the riscv route (its shape gate keeps the word-only accept set; the float slice is an aarch64-route rule — fail-closed)")
+      when LirStmtKind::LirLoadFrame(dst, off) then
+        # A riscv psABI stack-parameter bind: the payload is the
+        # incoming-SP-relative byte offset the lowering's riscv walk
+        # produced (8*k on riscv64, 4*k on riscv32 — lir_riscv_stack_mode),
+        # so it is non-negative and machine-unit aligned; an F64 image
+        # on riscv32 additionally needs an 8-byte-aligned even-word
+        # base. The destination is an ordinary parameter vreg (never a
+        # fixed ABI register). The machine offset the emitter computes
+        # is frame_total + off (incoming_sp == s0 + frame_total).
+        if dst < lir_first_alloc_vreg() then
+          return Result::Err("rv: " + f.name + ": stack-parameter load into fixed vreg " + dst.to_string() + " does not lower (parameter binds target ordinary vregs — fail-closed)")
+        end
+        let unit = if xlen == 8 then 8 else 4 end
+        if off < 0 || off % unit != 0 then
+          return Result::Err("rv: " + f.name + ": stack-parameter load from the non-canonical psABI offset " + off.to_string() + " does not lower (riscv" + (if xlen == 8 then "64" else "32" end) + " stack slots sit at " + unit.to_string() + "*k bytes from the incoming SP — fail-closed)")
+        end
+        match f.fp_widths.get(dst)
+        when Option::Some(w) then
+          match w
+          when LirFpWidth::LirF64 then
+            if off % 8 != 0 then
+              return Result::Err("rv: " + f.name + ": F64 stack-parameter load from the odd-word riscv32 offset " + off.to_string() + " does not lower (an 8-byte double image needs an 8-byte-aligned even-word base — psABI — fail-closed)")
+            end
+          when LirFpWidth::LirF32 then ()
+          end
+        when Option::None then ()
+        end
+      when LirStmtKind::LirPushArg(vreg) then
+        # A riscv psABI caller push: the source is an ordinary vreg
+        # (never a fixed ABI register); a FLOAT-class push stores at
+        # the value's width. An F64 push on riscv32 reserves the two
+        # 4-byte units of its even-based psABI pair (the lir.tg stream
+        # emits the odd-unit alignment pad as its own 4-byte push — the
+        # seam recorded in lir.tg's riscv F64 walk) and stores the
+        # 8-byte image with fsd (the D unit is present exactly when an
+        # F64 value exists — riscv32imafdc; the emitter's precise
+        # rule). The width/desc surface is already the authority's:
+        # rv_float_desc_reject rejects any F64 value on a non-RVD
+        # description before emission.
+        if vreg < lir_first_alloc_vreg() then
+          return Result::Err("rv: " + f.name + ": caller stack-argument push of fixed vreg " + vreg.to_string() + " does not lower (stack arguments are ordinary values — fail-closed)")
+        end
+      when LirStmtKind::LirFMove(_, _) then ()
+      when LirStmtKind::LirFBinop(_, _, _, _, _) then ()
+      when LirStmtKind::LirFNeg(_, _, _) then ()
+      when LirStmtKind::LirFCmp(_, _, _) then ()
+      when LirStmtKind::LirFConst(_, _, _) then ()
+      when LirStmtKind::LirIntToFloat(_, _, _, _) then ()
+      when LirStmtKind::LirFloatToInt(_, _, _) then ()
+      when LirStmtKind::LirFcvt(_, _, _) then ()
       end
       si = si + 1
     end
@@ -1780,11 +2199,14 @@ def rv_validate_fn(f: LirFunction, xlen: Int, desc: TargetDesc) -> Result[Unit, 
         ai = ai + 1
       end
     when LirTermKind::LirCall(target, args, stack_args, _, _) then
-      if args.len() > 8 then
-        return Result::Err("rv: stack args beyond a0-a7 not implemented")
-      end
-      if stack_args != 0 then
-        return Result::Err("rv: " + f.name + ": call to `" + target + "` pushes caller stack slots — stack args beyond a0-a7 are not implemented")
+      # The riscv caller stack stream (the psABI flattening): one xlen
+      # slot per unit, padded by the lowering to a 16-byte total (2
+      # units on riscv64, 4 on riscv32) so SP is 16-byte aligned at the
+      # call. The emitter adds stack_args*xlen bytes back after the
+      # call.
+      let per16 = if xlen == 8 then 2 else 4 end
+      if stack_args < 0 || stack_args % per16 != 0 then
+        return Result::Err("rv: " + f.name + ": call to `" + target + "` carries " + stack_args.to_string() + " caller stack units — the psABI caller SP must stay 16-byte aligned, so the count must be a multiple of " + per16.to_string() + " (the lowering pads it — fail-closed)")
       end
     when _ then ()
     end
@@ -1888,8 +2310,27 @@ struct RvEmit
   buf: CodeBuffer
   # The x-numbers of the resolved operand registers of the most recent
   # LirCmp, both -1 when no compare is pending (see the Cmp/Cset arms).
+  # A FLOAT LirFCmp records its two f-register numbers here too and sets
+  # cmp_fp; the adjacent LirCset then emits the F/D comparison sequence
+  # (RISC-V has no NZCV — see the FCmp/Cset arms).
   cmp_left: Int
   cmp_right: Int
+  # The pending compare is a float compare (LirFCmp): cmp_left/cmp_right
+  # are f-register numbers and cmp_fp_w carries the width (0 = F32,
+  # 1 = F64 — a plain Int field so the whole emitter state stays
+  # scalar).
+  cmp_fp: Bool
+  cmp_fp_w: Int
+  # The function-wide frame total (frame_bytes + the saved block) of the
+  # function being emitted: incoming_sp == s0 + frame_total, so the
+  # riscv stack-argument machine offset of a LirLoadFrame payload `off`
+  # (the psABI incoming-SP-relative byte offset) is frame_total + off.
+  frame_total: Int
+  # The RV32 float-constant GP -> FPR transit slot ([s0 + fp_transit]),
+  # -1 when the function needs none (RV64 uses fmv.d.x; an RV32
+  # function with no LirFConst needs no transit). Set by rv_emit_fn per
+  # function.
+  fp_transit: Int
   # Deferred jal sites (forward/unknown branch targets, program-function
   # calls and self-calls), resolved by rv_resolve_patches once the whole
   # program is emitted (every block and function label is defined then).
@@ -1907,6 +2348,10 @@ def rv_emit_new() -> RvEmit
     buf: buf_new(),
     cmp_left: -1,
     cmp_right: -1,
+    cmp_fp: false,
+    cmp_fp_w: 0,
+    frame_total: 0,
+    fp_transit: -1,
     patches: Vec::new(),
     relocs: Vec::new(),
     syms: Vec::new()
@@ -1949,6 +2394,50 @@ def rv_emit_li(inout re: RvEmit, rd: Int, imm: Int) -> Unit
   end
 end
 
+# Materialize an arbitrary 32-bit BIT PATTERN into `rd` (the low 32 bits
+# of `v`; used by the float-constant machinery, whose payloads are bit
+# patterns, not language integers, and may exceed rv_li's signed range).
+# The canonical lui + addi split: hi20 = ((u + 0x800) >> 12) & 0xFFFFF,
+# lo12 = the signed 12-bit remainder — the sum decodes to the exact
+# pattern on both xlens (on RV64 the LUI result's sign extension is
+# irrelevant for a 32-bit pattern write; the F64 path shifts it out).
+def rv_emit_li32(inout re: RvEmit, rd: Int, v: Int) -> Unit
+  let u = v & 0xFFFFFFFF
+  var hi20 = ((u + 0x800) >> 12) & 0xFFFFF
+  # rv_lui takes the SIGNED 20-bit field value (the field's bit 19 is
+  # the encoded sign): a masked hi20 with bit 19 set (0x80000..0xFFFFF)
+  # is the negative field value hi20 - 2^20. Without this, every
+  # pattern whose high field lands in that range — -0.0f32 =
+  # 0x80000000, the high word 0x80000000 of -0.0 / many doubles — would
+  # panic in rv_lui; the zero/negative-sign patterns are exactly the
+  # ones the F32 F-only path must materialize.
+  if hi20 >= 0x80000 then
+    hi20 = hi20 - 0x100000
+  end
+  var lo12 = u & 0xFFF
+  if lo12 >= 0x800 then
+    lo12 = lo12 - 0x1000
+  end
+  rv_emit_word(re, rv_lui(rd, hi20))
+  if lo12 != 0 then
+    rv_emit_word(re, rv_addi(rd, rd, lo12))
+  end
+end
+
+# Materialize a full 64-bit bit pattern into `rd` on RV64: the high
+# word (a 32-bit pattern) shifted into place, plus the sign-extended
+# low word. `rd` must not be t1 (the internal low-word scratch). Exact
+# for every bit pattern (the high part is a multiple of 2^32 and the
+# low part is in [-2^31, 2^31)).
+def rv_emit_bits64(inout re: RvEmit, rd: Int, bits: Int) -> Unit
+  let hi = (bits >> 32) & 0xFFFFFFFF
+  let lo = bits & 0xFFFFFFFF
+  rv_emit_li32(re, rd, hi)
+  rv_emit_word(re, rv_slli(rd, rd, 32))
+  rv_emit_li32(re, rv_t1_reg(), lo)
+  rv_emit_word(re, rv_add(rd, rd, rv_t1_reg()))
+end
+
 # The temp to prefer for a second resolved operand given the register
 # the first landed in: avoid the t0/t1 temp collision (the RV emitter's
 # two statement-local temps — the thumb_alt_pref r12/r3 discipline).
@@ -1956,21 +2445,28 @@ def rv_alt_pref(used: Int) -> Int
   if used == rv_t0_reg() then rv_t1_reg() else rv_t0_reg() end
 end
 
-# The x-number of the machine register holding LIR register id
-# `lir_reg`: fixed (precolored) vregs 0..7 are a0..a7 = x10..x17
-# (rv_fixed_phys — a LIR argument vreg IS its ABI register); allocator
-# pool ids 9..14 index `mdl_pool` (the desc-driven callee-saved vector
-# the function driver builds, thumb style). Panics for anything else —
-# an internal error after rv_validate_fn.
-def rv_phys_of(mdl_pool: Vec[Int], lir_reg: Int) -> Int
-  if lir_reg < lir_first_alloc_vreg() then
-    return rv_fixed_phys(lir_reg)
-  end
-  let idx = lir_reg - lir_first_alloc_vreg()
+# The general-register pool base: the allocator's general pool ids
+# (lir_pool_regs) are 9..14; on this route they INDEX mdl_pool (the
+# desc-driven callee-saved vector rv_mdl_pool builds) — never the fixed
+# vreg namespace. Fixed (precolored) vregs 0..7 are resolved directly by
+# rv_def_target/rv_emit_use through rv_fixed_phys (a LIR argument vreg
+# IS its ABI register a0..a7 = x10..x17), so they never reach this map.
+def rv_general_pool_base() -> Int = 9
+
+# The x-number of the machine register holding the allocator general
+# physical id `phys` (9..14): mdl_pool[phys - 9] — the callee-saved
+# registers the prologue/epilogue save (rv_saved_regs(mdl_pool) is
+# exactly mdl_pool), so every allocated register is preserved across
+# calls. Panics for an id outside the pool — an internal error after
+# rv_validate_fn. (The earlier fixed-vreg fall-through mapped id 9 to
+# x19 = s3 and ids 12..14 to x22..x24 = s6..s8, which the saved block
+# does not cover — the audit residue this fixes.)
+def rv_phys_of(mdl_pool: Vec[Int], phys: Int) -> Int
+  let idx = phys - rv_general_pool_base()
   if idx >= 0 && idx < mdl_pool.len() then
     mdl_pool[idx]
   else
-    panic("rv: no RISC-V register for lir register " + lir_reg.to_string())
+    panic("rv: no RISC-V register for allocator general pool id " + phys.to_string() + " (the pool ids are 9..14 — lir_pool_regs — indexed into mdl_pool)")
   end
 end
 
@@ -2077,6 +2573,186 @@ def rv_slot_access(inout re: RvEmit, reg: Int, slot: Int, xlen: Int, is_load: Bo
       end
     end
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Float operand resolution (mirrors thumb_fp_def_target /
+# thumb_fp_use_reg over the riscv f-register file)
+# ———————————————————————————————————————————————————————————————
+# The FP destination target of a def at position `pos`: a fixed ABI FP
+# id (8..15) IS fa_{id-8} = f(10+id-8); a register-resident ordinary
+# segment is its pool f-register (phys - 100); a memory-resident
+# segment computes into the def scratch f30 with a pending width store
+# to its slot. An ordinary FP vreg with no intervals (the
+# never-occurring unused-parameter bind) still yields a legal scratch
+# target — the bind's def is dead.
+struct RvFpDefTarget
+  reg: Int          # f-register number
+  store_slot: Int   # >= 0: store reg to this slot at the statement width
+end
+
+def rv_fp_def_target(alloc: LirAlloc, vreg: Int, pos: Int, role: String) -> Result[RvFpDefTarget, String]
+  if lir_is_fixed_fp_id(vreg) then
+    return Result::Ok(RvFpDefTarget { reg: rv_fixed_fp_phys(vreg), store_slot: -1 })
+  end
+  match alloc.segs_of.get(vreg)
+  when Option::Some(segs) then
+    match lir_seg_at(segs, pos)
+    when Option::Some(s) then
+      if s.phys >= 0 then
+        Result::Ok(RvFpDefTarget { reg: rv_fp_phys_of(s.phys), store_slot: -1 })
+      else
+        Result::Ok(RvFpDefTarget { reg: rv_fp_def_scratch(), store_slot: s.slot })
+      end
+    when Option::None then
+      Result::Err("rv: float " + role + " vreg " + vreg.to_string() + " has no segment at position " + pos.to_string() + " (fail-closed)")
+    end
+  when Option::None then
+    Result::Ok(RvFpDefTarget { reg: rv_fp_def_scratch(), store_slot: -1 })
+  end
+end
+
+# The width-dispatched float memory access at [s0 + off] (the frame
+# pointer): flw/fsw (F32) or fld/fsd (F64). Beyond the signed 12-bit
+# offset the address is built in t0 (a GP temp; an f-register can never
+# collide with it) and the access runs at [t0 + 0]. The GPR address
+# path uses rv_li/add, both flagless (invariant I1 is vacuous for the
+# F/D forms too). The offset is a byte offset: the spill-slot forms
+# pass rv_slot_offset(slot, xlen) (xlen*slot: the uniform 8-byte unit
+# on rv64, the 4-byte word on rv32 — an F64 image's base word is even
+# by the cm-geometry allocation, so the address is 8-byte aligned), the
+# stack-parameter/argument forms pass the psABI machine offset
+# (frame_total + the LirLoadFrame payload).
+def rv_fp_mem_s0(inout re: RvEmit, w: LirFpWidth, reg: Int, off: Int, is_load: Bool) -> Unit
+  let fp = rv_fp_reg()
+  if off >= -2048 && off <= 2047 then
+    if w == LirFpWidth::LirF32 then
+      if is_load then rv_emit_word(re, rv_flw(reg, fp, off)) else rv_emit_word(re, rv_fsw(reg, fp, off)) end
+    else
+      if is_load then rv_emit_word(re, rv_fld(reg, fp, off)) else rv_emit_word(re, rv_fsd(reg, fp, off)) end
+    end
+  else
+    rv_emit_li(re, rv_t0_reg(), off)
+    rv_emit_word(re, rv_add(rv_t0_reg(), fp, rv_t0_reg()))
+    if w == LirFpWidth::LirF32 then
+      if is_load then rv_emit_word(re, rv_flw(reg, rv_t0_reg(), 0)) else rv_emit_word(re, rv_fsw(reg, rv_t0_reg(), 0)) end
+    else
+      if is_load then rv_emit_word(re, rv_fld(reg, rv_t0_reg(), 0)) else rv_emit_word(re, rv_fsd(reg, rv_t0_reg(), 0)) end
+    end
+  end
+end
+
+# The spill-slot access (see rv_fp_mem_s0).
+def rv_fp_slot_access(inout re: RvEmit, w: LirFpWidth, reg: Int, slot: Int, xlen: Int, is_load: Bool) -> Unit
+  rv_fp_mem_s0(re, w, reg, rv_slot_offset(slot, xlen), is_load)
+end
+
+# Load the spill slot of `slot` into the f-register `reg` at width `w`.
+# An F32 load is a NaN-boxing write on FLEN 64 (FLW sets the upper 32
+# bits to ones — the psABI requires it), so a reloaded F32 is boxed by
+# construction.
+def rv_fp_slot_load(inout re: RvEmit, w: LirFpWidth, reg: Int, slot: Int, xlen: Int) -> Unit
+  rv_fp_slot_access(re, w, reg, slot, xlen, true)
+end
+
+def rv_fp_slot_store(inout re: RvEmit, w: LirFpWidth, reg: Int, slot: Int, xlen: Int) -> Unit
+  rv_fp_slot_access(re, w, reg, slot, xlen, false)
+end
+
+# A general xlen-word LOAD at [s0 + off] (the riscv stack-parameter
+# word form): ld on xlen 8, lw on xlen 4; beyond the signed 12-bit
+# offset the address is built in t0 first (the final load reads the
+# address before writing the same register, so a t0 destination is
+# safe — the rv_slot_access load-path rule). Stores never use this
+# helper (a t0 value register would collide with the address scratch);
+# caller pushes are SP-relative instead.
+def rv_gp_mem_s0_load(inout re: RvEmit, reg: Int, off: Int, xlen: Int) -> Unit
+  let fp = rv_fp_reg()
+  if off >= -2048 && off <= 2047 then
+    if xlen == 8 then
+      rv_emit_word(re, rv_ld(reg, fp, off))
+    else
+      rv_emit_word(re, rv_lw(reg, fp, off))
+    end
+  else
+    rv_emit_li(re, rv_t0_reg(), off)
+    rv_emit_word(re, rv_add(rv_t0_reg(), fp, rv_t0_reg()))
+    if xlen == 8 then
+      rv_emit_word(re, rv_ld(reg, rv_t0_reg(), 0))
+    else
+      rv_emit_word(re, rv_lw(reg, rv_t0_reg(), 0))
+    end
+  end
+end
+
+# Resolve an FP vreg use at `pos` into an f-register number, emitting
+# the width load a memory-resident value needs: a fixed ABI id is its
+# f-register; a register-resident segment whose first post-call read
+# carries a reload record (invariant I2) restores its OWN register from
+# the slot at the width; a memory-resident segment loads into `pref`
+# (the caller-chosen statement scratch). This is the riscv mirror of
+# thumb_fp_use_reg / lir_fp_emit_use (no pool-vs-width guard is needed:
+# every f-register has both an S and a D view, so an F32 in the pool is
+# a legal s-view use).
+def rv_fp_use_reg(inout re: RvEmit, alloc: LirAlloc, w: LirFpWidth, vreg: Int, pos: Int, pref: Int, role: String, xlen: Int) -> Result[Int, String]
+  if lir_is_fixed_fp_id(vreg) then
+    return Result::Ok(rv_fixed_fp_phys(vreg))
+  end
+  match alloc.segs_of.get(vreg)
+  when Option::Some(segs) then
+    match lir_seg_at(segs, pos)
+    when Option::Some(s) then
+      if s.phys >= 0 then
+        let dd = rv_fp_phys_of(s.phys)
+        if lir_reload_at(alloc.reloads, pos, vreg) then
+          rv_fp_slot_load(re, w, dd, s.slot, xlen)
+        end
+        Result::Ok(dd)
+      else
+        rv_fp_slot_load(re, w, pref, s.slot, xlen)
+        Result::Ok(pref)
+      end
+    when Option::None then
+      Result::Err("rv: float " + role + " vreg " + vreg.to_string() + " has no segment at position " + pos.to_string() + " (fail-closed)")
+    end
+  when Option::None then
+    Result::Err("rv: float " + role + " vreg " + vreg.to_string() + " has no intervals (fail-closed)")
+  end
+end
+
+# The load-scratch choice of a statement (mirrors lir_fp_first_pref):
+# a statement's FIRST memory-resident operand loads into f30 when the
+# def target does not occupy it and into f31 otherwise; a SECOND
+# memory-resident operand loads into the other scratch. Reads always
+# precede the def write within the single op, so a load may reuse the
+# def scratch.
+def rv_fp_first_pref(dt_reg: Int) -> Int
+  if dt_reg == rv_fp_def_scratch() then rv_fp_use_scratch() else rv_fp_def_scratch() end
+end
+
+def rv_fp_second_pref(first: Int) -> Int
+  if first == rv_fp_def_scratch() then rv_fp_use_scratch() else rv_fp_def_scratch() end
+end
+
+# The NaN -> 0 fixup of the FloatToInt language rule (types.tg §25):
+# the native RTZ conversion returns the destination format's LARGEST
+# integer for a NaN, so the emitter must zero the result for a NaN.
+# `fs` is the source f-register, `dst` the converted GP word; the
+# quiet FEQ self-compare yields 0 exactly for a NaN (and for nothing
+# else), sub turns it into an all-ones mask, and the AND clears the
+# result. The mask scratch avoids `dst` (a memory-resident def's
+# target is t0). The out-of-range clamp needs no fixup: the native
+# FCVT result for an out-of-range source IS the language clamp (the
+# largest/smallest representable integer).
+def rv_emit_ftoi_nan_fixup(inout re: RvEmit, dst: Int, fs: Int, w: LirFpWidth) -> Unit
+  let t = if dst == rv_t0_reg() then rv_t1_reg() else rv_t0_reg() end
+  if w == LirFpWidth::LirF32 then
+    rv_emit_word(re, rv_feq_s(t, fs, fs))
+  else
+    rv_emit_word(re, rv_feq_d(t, fs, fs))
+  end
+  rv_emit_word(re, rv_sub(t, 0, t))
+  rv_emit_word(re, rv_and(dst, dst, t))
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -2254,7 +2930,7 @@ def rv_emit_stmt(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name:
   when Option::Some(pop) then
     rv_emit_ptr_stmt(re, alloc, mdl_pool, fn_name, pop, pos, xlen, desc)
   when Option::None then
-    rv_emit_stmt_kind(re, alloc, mdl_pool, stmt.kind, pos, xlen)
+    rv_emit_stmt_kind(re, alloc, mdl_pool, stmt.kind, pos, xlen, desc)
   end
 end
 
@@ -2289,7 +2965,7 @@ end
 # The emitter is otherwise stateless per statement; positions walk
 # EXACTLY like lir_linearize (invariant I3), as in thumb_emit_fn.
 
-def rv_emit_stmt_kind(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], kind: LirStmtKind, pos: Int, xlen: Int) -> Result[Unit, String]
+def rv_emit_stmt_kind(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], kind: LirStmtKind, pos: Int, xlen: Int, desc: TargetDesc) -> Result[Unit, String]
   match kind
   when LirStmtKind::LirMove(dst, val) then
     let dt = rv_def_target(alloc, mdl_pool, dst, pos)
@@ -2378,48 +3054,97 @@ def rv_emit_stmt_kind(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], kin
     let right_reg = rv_emit_use(re, alloc, mdl_pool, right, pos, rv_alt_pref(left_reg), xlen)
     re.cmp_left = left_reg
     re.cmp_right = right_reg
+    re.cmp_fp = false
     Result::Ok(())
   when LirStmtKind::LirCset(cond, dst) then
     # Consume the pending LirCmp operands and materialize the 0/1
     # comparison result into the destination. Sequences per LirCond are
     # listed in the section note; each writes ONLY d (plus x0 reads), so
     # d aliasing an operand register or the t0 def temp is always safe.
+    # A pending FLOAT compare (re.cmp_fp — the LirFCmp arm below) emits
+    # the F/D compare sequences of the note on the FCmp arm's two
+    # f-register operands; the destination is still a GP 0/1 word.
     if re.cmp_left < 0 then
       panic("rv: LirCset with no preceding LirCmp in program order (lowering invariant I1)")
     end
     let l = re.cmp_left
     let r = re.cmp_right
+    let is_fp_cmp = re.cmp_fp
+    let fp_cmp_w = re.cmp_fp_w
     re.cmp_left = -1
     re.cmp_right = -1
+    re.cmp_fp = false
     let dt = rv_def_target(alloc, mdl_pool, dst, pos)
     let d = dt.reg
-    match cond
-    when LirCond::LirEq then
-      rv_emit_word(re, rv_xor(d, l, r))
-      rv_emit_word(re, rv_sltiu(d, d, 1))
-    when LirCond::LirNe then
-      rv_emit_word(re, rv_xor(d, l, r))
-      rv_emit_word(re, rv_sltu(d, 0, d))
-    when LirCond::LirLt then
-      rv_emit_word(re, rv_slt(d, l, r))
-    when LirCond::LirLe then
-      rv_emit_word(re, rv_slt(d, r, l))
-      rv_emit_word(re, rv_xori(d, d, 1))
-    when LirCond::LirGt then
-      rv_emit_word(re, rv_slt(d, r, l))
-    when LirCond::LirGe then
-      rv_emit_word(re, rv_slt(d, l, r))
-      rv_emit_word(re, rv_xori(d, d, 1))
-    when LirCond::LirUlt then
-      rv_emit_word(re, rv_sltu(d, l, r))
-    when LirCond::LirUle then
-      rv_emit_word(re, rv_sltu(d, r, l))
-      rv_emit_word(re, rv_xori(d, d, 1))
-    when LirCond::LirUgt then
-      rv_emit_word(re, rv_sltu(d, r, l))
-    when LirCond::LirUge then
-      rv_emit_word(re, rv_sltu(d, l, r))
-      rv_emit_word(re, rv_xori(d, d, 1))
+    if is_fp_cmp then
+      # The IEEE-754 comparison sequences (all six conditions, the
+      # aarch64 FCMP condition-table semantics — every sequence is
+      # false for an unordered (NaN) operand pair except NE, which is
+      # true):
+      #   Eq:  feq.s/d d, l, r
+      #   Ne:  feq.s/d d, l, r;  xori d, d, 1    # not-equal INCLUDING unordered
+      #   Lt:  flt.s/d d, l, r
+      #   Le:  fle.s/d d, l, r
+      #   Gt:  flt.s/d d, r, l
+      #   Ge:  fle.s/d d, r, l
+      # FEQ is the quiet compare (a NaN operand raises no exception and
+      # yields 0); FLT/FLE are the signaling compares. The unsigned
+      # conditions never arise from a float compare (the lowering emits
+      # the six IEEE ops only) — a U cond here is a lowering-invariant
+      # break and panics rather than emitting a wrong signedness.
+      let w = if fp_cmp_w == 1 then LirFpWidth::LirF64 else LirFpWidth::LirF32 end
+      match cond
+      when LirCond::LirEq then
+        if w == LirFpWidth::LirF32 then rv_emit_word(re, rv_feq_s(d, l, r)) else rv_emit_word(re, rv_feq_d(d, l, r)) end
+      when LirCond::LirNe then
+        if w == LirFpWidth::LirF32 then rv_emit_word(re, rv_feq_s(d, l, r)) else rv_emit_word(re, rv_feq_d(d, l, r)) end
+        rv_emit_word(re, rv_xori(d, d, 1))
+      when LirCond::LirLt then
+        if w == LirFpWidth::LirF32 then rv_emit_word(re, rv_flt_s(d, l, r)) else rv_emit_word(re, rv_flt_d(d, l, r)) end
+      when LirCond::LirLe then
+        if w == LirFpWidth::LirF32 then rv_emit_word(re, rv_fle_s(d, l, r)) else rv_emit_word(re, rv_fle_d(d, l, r)) end
+      when LirCond::LirGt then
+        if w == LirFpWidth::LirF32 then rv_emit_word(re, rv_flt_s(d, r, l)) else rv_emit_word(re, rv_flt_d(d, r, l)) end
+      when LirCond::LirGe then
+        if w == LirFpWidth::LirF32 then rv_emit_word(re, rv_fle_s(d, r, l)) else rv_emit_word(re, rv_fle_d(d, r, l)) end
+      when LirCond::LirUlt then
+        panic("rv: unsigned condition after a float compare (lowering invariant: a LirFCmp lowers the six IEEE conditions only)")
+      when LirCond::LirUle then
+        panic("rv: unsigned condition after a float compare (lowering invariant: a LirFCmp lowers the six IEEE conditions only)")
+      when LirCond::LirUgt then
+        panic("rv: unsigned condition after a float compare (lowering invariant: a LirFCmp lowers the six IEEE conditions only)")
+      when LirCond::LirUge then
+        panic("rv: unsigned condition after a float compare (lowering invariant: a LirFCmp lowers the six IEEE conditions only)")
+      end
+    else
+      match cond
+      when LirCond::LirEq then
+        rv_emit_word(re, rv_xor(d, l, r))
+        rv_emit_word(re, rv_sltiu(d, d, 1))
+      when LirCond::LirNe then
+        rv_emit_word(re, rv_xor(d, l, r))
+        rv_emit_word(re, rv_sltu(d, 0, d))
+      when LirCond::LirLt then
+        rv_emit_word(re, rv_slt(d, l, r))
+      when LirCond::LirLe then
+        rv_emit_word(re, rv_slt(d, r, l))
+        rv_emit_word(re, rv_xori(d, d, 1))
+      when LirCond::LirGt then
+        rv_emit_word(re, rv_slt(d, r, l))
+      when LirCond::LirGe then
+        rv_emit_word(re, rv_slt(d, l, r))
+        rv_emit_word(re, rv_xori(d, d, 1))
+      when LirCond::LirUlt then
+        rv_emit_word(re, rv_sltu(d, l, r))
+      when LirCond::LirUle then
+        rv_emit_word(re, rv_sltu(d, r, l))
+        rv_emit_word(re, rv_xori(d, d, 1))
+      when LirCond::LirUgt then
+        rv_emit_word(re, rv_sltu(d, r, l))
+      when LirCond::LirUge then
+        rv_emit_word(re, rv_sltu(d, l, r))
+        rv_emit_word(re, rv_xori(d, d, 1))
+      end
     end
     if dt.store_slot >= 0 then
       rv_slot_store(re, dt.reg, dt.store_slot, xlen)
@@ -2456,26 +3181,374 @@ def rv_emit_stmt_kind(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], kin
       rv_slot_store(re, dt.reg, dt.store_slot, xlen)
     end
     Result::Ok(())
-  when LirStmtKind::LirLoadFrame(_, _) then
-    Result::Err("rv: LirLoadFrame does not lower in this slice — stack-parameter loads (arguments beyond a0-a7) have no RISC-V rule yet; rv_validate_fn rejects them (fail-closed)")
-  when LirStmtKind::LirPushArg(_) then
-    Result::Err("rv: LirPushArg does not lower in this slice — caller stack-argument pushes have no RISC-V rule yet; rv_validate_fn rejects them (fail-closed)")
-  when LirStmtKind::LirFMove(_, _) then
-    Result::Err("rv: float move statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
-  when LirStmtKind::LirFBinop(_, _, _, _, _) then
-    Result::Err("rv: float arithmetic statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
-  when LirStmtKind::LirFNeg(_, _, _) then
-    Result::Err("rv: float negate statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
-  when LirStmtKind::LirFCmp(_, _, _) then
-    Result::Err("rv: float compare statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
-  when LirStmtKind::LirFConst(_, _, _) then
-    Result::Err("rv: float constant statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
-  when LirStmtKind::LirIntToFloat(_, _, _, _) then
-    Result::Err("rv: float conversion statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
-  when LirStmtKind::LirFloatToInt(_, _, _) then
-    Result::Err("rv: float conversion statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
-  when LirStmtKind::LirFcvt(_, _, _) then
-    Result::Err("rv: float conversion statements do not lower on the riscv route (float types are aarch64-route-only — fail-closed)")
+  when LirStmtKind::LirLoadFrame(dst, off) then
+    # The riscv psABI stack-parameter bind: the machine offset of the
+    # psABI incoming-SP-relative payload `off` is frame_total + off
+    # (incoming_sp == s0 + frame_total; rv_emit_fn sets frame_total
+    # before the body). An FP-class dst loads at its width (flw/fld —
+    # an F32 FLW is a NaN-boxing write on FLEN 64); a general dst loads
+    # the xlen word (ld/lw). The load runs at the top of the entry
+    # block, where the prologue has established s0, and defines the
+    # parameter's ordinary vreg exactly like any def (a memory-resident
+    # dst takes the def target's pending slot store).
+    let moff = re.frame_total + off
+    match alloc.fp_widths.get(dst)
+    when Option::Some(w) then
+      let fdt = match rv_fp_def_target(alloc, dst, pos, "stack-parameter destination")
+      when Result::Ok(t) then t
+      when Result::Err(e) then return Result::Err(e)
+      end
+      rv_fp_mem_s0(re, w, fdt.reg, moff, true)
+      if fdt.store_slot >= 0 then
+        rv_fp_slot_store(re, w, fdt.reg, fdt.store_slot, xlen)
+      end
+      Result::Ok(())
+    when Option::None then
+      let dt = rv_def_target(alloc, mdl_pool, dst, pos)
+      rv_gp_mem_s0_load(re, dt.reg, moff, xlen)
+      if dt.store_slot >= 0 then
+        rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+      end
+      Result::Ok(())
+    end
+  when LirStmtKind::LirPushArg(vreg) then
+    # A riscv psABI caller push: reserve the value's stack units below
+    # SP and store the value at its width at [sp + 0]. The LIR
+    # descending statement order makes stack position 0 the LAST push,
+    # so it sits at [SP] at the call — the callee's frame_total + off
+    # load reads it back.
+    #   F32: one xlen unit (4 bytes on riscv32, 8 on riscv64 with the
+    #   canonical single in the slot's low 4 bytes) — fsw.
+    #   F64: eight bytes on both xlens. On riscv64 that IS the xlen
+    #   slot (sub 8; fsd). On riscv32 the psABI pair occupies TWO
+    #   4-byte units at an even base: sub sp, sp, 8; fsd — the units
+    #   are 4-byte, but the STORE is the one 8-byte double transfer,
+    #   because a RISC-V D f-register is a single 64-bit register (the
+    #   S forms read only its low 32 bits — unlike ARM VFP there is no
+    #   s(2k)/s(2k+1) pair to store in two fsw halves), and fsd is
+    #   available exactly where an F64 can reach this arm (the D unit
+    #   of riscv32imafdc; rv_float_desc_reject keeps F64 values off
+    #   the F-only and soft descriptions). The lowering emits the
+    #   pair's odd-unit alignment pad as its own 4-byte push statement
+    #   (the lir.tg riscv walk's pad seam), so the emitted unit count
+    #   matches the terminator's stack_args exactly.
+    match alloc.fp_widths.get(vreg)
+    when Option::Some(w) then
+      let sr = match rv_fp_use_reg(re, alloc, w, vreg, pos, rv_fp_use_scratch(), "stack-argument source", xlen)
+      when Result::Ok(r) then r
+      when Result::Err(e) then return Result::Err(e)
+      end
+      if w == LirFpWidth::LirF32 then
+        rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), -xlen))
+        rv_emit_word(re, rv_fsw(sr, rv_sp_reg(), 0))
+      else
+        rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), -8))
+        rv_emit_word(re, rv_fsd(sr, rv_sp_reg(), 0))
+      end
+      Result::Ok(())
+    when Option::None then
+      let sr = rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(vreg), pos, rv_t0_reg(), xlen)
+      rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), -xlen))
+      if xlen == 8 then
+        rv_emit_word(re, rv_sd(sr, rv_sp_reg(), 0))
+      else
+        rv_emit_word(re, rv_sw(sr, rv_sp_reg(), 0))
+      end
+      Result::Ok(())
+    end
+  when LirStmtKind::LirFMove(dst, src) then
+    # FP register move dst <- src (same width on both sides). The width
+    # resolves from the ordinary operand's FP class record: the fixed
+    # ABI ids (8..15) carry no record, so a move whose dst is fixed (a
+    # float call-argument move) reads the width of src and a move whose
+    # src is fixed (a float parameter bind) reads the width of dst —
+    # never two fixed ids (lowering invariant). F32 moves use fsgnj.s
+    # (the exact bit copy; on FLEN 64 the S form NaN-boxes the result
+    # by hardware), F64 moves fsgnj.d.
+    let w = match alloc.fp_widths.get(dst)
+    when Option::Some(dw) then dw
+    when Option::None then
+      match alloc.fp_widths.get(src)
+      when Option::Some(sw) then sw
+      when Option::None then
+        panic("rv: LirFMove between two fixed FP vregs (lowering invariant)")
+      end
+    end
+    let dt = match rv_fp_def_target(alloc, dst, pos, "move destination")
+    when Result::Ok(t) then t
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let pref = rv_fp_first_pref(dt.reg)
+    let sr = match rv_fp_use_reg(re, alloc, w, src, pos, pref, "move source", xlen)
+    when Result::Ok(r) then r
+    when Result::Err(e) then return Result::Err(e)
+    end
+    if dt.reg != sr then
+      rv_emit_word(re, rv_fp_mov_word(w, dt.reg, sr))
+    end
+    if dt.store_slot >= 0 then
+      rv_fp_slot_store(re, w, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirFBinop(fop, w, dst, left, right) then
+    # FP arithmetic dst = left op right (fadd/fsub/fmul/fdiv .s/.d,
+    # both operands resolved through the FP operand machinery — a
+    # memory-resident operand loads into its statement scratch at the
+    # width first, and a memory-resident destination computes into the
+    # def scratch f30 and stores to its slot). The S forms round once
+    # under the default rm = RNE and NaN-box their results on FLEN 64;
+    # the D forms need the description's D unit (the rv_emit_fn desc
+    # gate).
+    let dt = match rv_fp_def_target(alloc, dst, pos, "binop destination")
+    when Result::Ok(t) then t
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let left_pref = rv_fp_first_pref(dt.reg)
+    let ln = match rv_fp_use_reg(re, alloc, w, left, pos, left_pref, "binop left operand", xlen)
+    when Result::Ok(r) then r
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let right_pref = rv_fp_second_pref(ln)
+    let rm = match rv_fp_use_reg(re, alloc, w, right, pos, right_pref, "binop right operand", xlen)
+    when Result::Ok(r) then r
+    when Result::Err(e) then return Result::Err(e)
+    end
+    match w
+    when LirFpWidth::LirF32 then
+      match fop
+      when LirFpBinOp::LirFAdd then rv_emit_word(re, rv_fadd_s(dt.reg, ln, rm))
+      when LirFpBinOp::LirFSub then rv_emit_word(re, rv_fsub_s(dt.reg, ln, rm))
+      when LirFpBinOp::LirFMul then rv_emit_word(re, rv_fmul_s(dt.reg, ln, rm))
+      when LirFpBinOp::LirFDiv then rv_emit_word(re, rv_fdiv_s(dt.reg, ln, rm))
+      end
+    when LirFpWidth::LirF64 then
+      match fop
+      when LirFpBinOp::LirFAdd then rv_emit_word(re, rv_fadd_d(dt.reg, ln, rm))
+      when LirFpBinOp::LirFSub then rv_emit_word(re, rv_fsub_d(dt.reg, ln, rm))
+      when LirFpBinOp::LirFMul then rv_emit_word(re, rv_fmul_d(dt.reg, ln, rm))
+      when LirFpBinOp::LirFDiv then rv_emit_word(re, rv_fdiv_d(dt.reg, ln, rm))
+      end
+    end
+    if dt.store_slot >= 0 then
+      rv_fp_slot_store(re, w, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirFNeg(w, dst, src) then
+    # dst = -src (fsgnjn.s/d rd, rs, rs — the sign-injection negation;
+    # NaN payloads and signed zeros are preserved exactly, and the S
+    # form NaN-boxes on FLEN 64).
+    let dt = match rv_fp_def_target(alloc, dst, pos, "negate destination")
+    when Result::Ok(t) then t
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let pref = rv_fp_first_pref(dt.reg)
+    let sm = match rv_fp_use_reg(re, alloc, w, src, pos, pref, "negate source", xlen)
+    when Result::Ok(r) then r
+    when Result::Err(e) then return Result::Err(e)
+    end
+    if w == LirFpWidth::LirF32 then
+      rv_emit_word(re, rv_fneg_s(dt.reg, sm))
+    else
+      rv_emit_word(re, rv_fneg_d(dt.reg, sm))
+    end
+    if dt.store_slot >= 0 then
+      rv_fp_slot_store(re, w, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirFCmp(w, left, right) then
+    # Compare two float registers. RISC-V has no flags: the operands
+    # are resolved into f-registers AT THIS POSITION (position-keyed
+    # reload decisions — I2/I3) and recorded in the emitter state; the
+    # ADJACENT LirCset emits the actual feq/flt/fle comparison (the
+    # Cset arm above). A compare has no def to preserve, so the first
+    # operand's spill load uses the use scratch f31 (the def scratch
+    # f30 stays free for the second operand — and for the destination
+    # word the Cset computes).
+    if re.cmp_left >= 0 then
+      panic("rv: LirFCmp with a previous compare still pending (lowering invariant I1: each LirFCmp is consumed by the next LirCset)")
+    end
+    let ln = match rv_fp_use_reg(re, alloc, w, left, pos, rv_fp_use_scratch(), "compare left operand", xlen)
+    when Result::Ok(r) then r
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let right_pref = rv_fp_second_pref(ln)
+    let rm = match rv_fp_use_reg(re, alloc, w, right, pos, right_pref, "compare right operand", xlen)
+    when Result::Ok(r) then r
+    when Result::Err(e) then return Result::Err(e)
+    end
+    re.cmp_left = ln
+    re.cmp_right = rm
+    re.cmp_fp = true
+    re.cmp_fp_w = if w == LirFpWidth::LirF64 then 1 else 0 end
+    Result::Ok(())
+  when LirStmtKind::LirFConst(w, dst, bits) then
+    # Materialize the constant into dst. The statement payload is
+    # ALWAYS the constant's 64-bit HOST-DOUBLE bit pattern (MirFloat
+    # carries doubles — see the LirFConst statement doc), for F32
+    # destinations exactly as for F64 ones.
+    #   F32 on ANY F/RVD description (RVF included — the F-only
+    #   residue): the canonical single's 32-bit pattern is computed at
+    #   COMPILE time by rv_f64_bits_to_f32_bits (the IEEE RNE narrowing,
+    #   integer bit arithmetic only — no host-side float math), built in
+    #   t0 with rv_emit_li32 and moved into the f-file by fmv.w.x (F
+    #   includes fmv.w.x at both xlens; on FLEN 64 it NaN-boxes the
+    #   result, maintaining the boxing invariant). No D unit and no
+    #   transit slot are involved, so this path replaces the old
+    #   fcvt.s.d / transit forms on every float-capable description.
+    #   F64 on RVD (the only descriptions an F64 value can reach —
+    #   rv_float_desc_reject): RV64 materializes the pattern into t0
+    #   (rv_emit_bits64) and carries it by fmv.d.x; RV32 (no fmv.d.x)
+    #   builds the two pattern words in t0/t1, stores them to the
+    #   function's reserved transit slot and loads with fld (an RV32D
+    #   instruction — 8 bytes from the 8-byte-aligned transit).
+    #   rv_emit_fn reserves the transit word for every RV32 function
+    #   carrying an F64 LirFConst (see re.fp_transit) out of the
+    #   function's frame, so no scratch slot is shared with live values.
+    if w == LirFpWidth::LirF32 then
+      if desc.fpu != Fpu::RVF && desc.fpu != Fpu::RVD then
+        return Result::Err("rv: F32 constant materialization on the `" + desc.name + "` description does not lower — the description has no scalar F unit to hold an F32 value (the F-only RVF and F/D RVD instances do; a soft-float description has no f-register file — the psABI integer-convention seam; fail-closed)")
+      end
+      let dt = match rv_fp_def_target(alloc, dst, pos, "constant destination")
+      when Result::Ok(t) then t
+      when Result::Err(e) then return Result::Err(e)
+      end
+      rv_emit_li32(re, rv_t0_reg(), rv_f64_bits_to_f32_bits(bits))
+      rv_emit_word(re, rv_fmv_w_x(dt.reg, rv_t0_reg()))
+      if dt.store_slot >= 0 then
+        rv_fp_slot_store(re, w, dt.reg, dt.store_slot, xlen)
+      end
+      return Result::Ok(())
+    end
+    if desc.fpu != Fpu::RVD then
+      return Result::Err("rv: F64 constant materialization on the `" + desc.name + "` description does not lower — the description's fpu is not RVD (the F/D instances riscv32imafdc/riscv64gc carry the double encoders; fail-closed)")
+    end
+    let dt = match rv_fp_def_target(alloc, dst, pos, "constant destination")
+    when Result::Ok(t) then t
+    when Result::Err(e) then return Result::Err(e)
+    end
+    if xlen == 8 then
+      rv_emit_bits64(re, rv_t0_reg(), bits)
+      rv_emit_word(re, rv_fmv_d_x(dt.reg, rv_t0_reg()))
+    else
+      if re.fp_transit < 0 then
+        return Result::Err("rv: internal: RV32 F64 constant reached emission without a reserved transit slot (rv_emit_fn must reserve one for every RV32 function carrying an F64 LirFConst — fail-closed)")
+      end
+      # The transit access: the signed 12-bit fields cover a small
+      # frame directly; a larger (rv_li-range) transit offset builds
+      # the [s0 + off] address in t0 first (the frame bound of
+      # rv_emit_fn keeps off inside the rv_li range, and t0/t1 are the
+      # statement's free temps).
+      if re.fp_transit >= -2048 && re.fp_transit <= 2043 then
+        rv_emit_li32(re, rv_t0_reg(), bits & 0xFFFFFFFF)
+        rv_emit_li32(re, rv_t1_reg(), (bits >> 32) & 0xFFFFFFFF)
+        rv_emit_word(re, rv_sw(rv_t0_reg(), rv_fp_reg(), re.fp_transit))
+        rv_emit_word(re, rv_sw(rv_t1_reg(), rv_fp_reg(), re.fp_transit + 4))
+        rv_emit_word(re, rv_fld(dt.reg, rv_fp_reg(), re.fp_transit))
+      else
+        rv_emit_li(re, rv_t0_reg(), re.fp_transit)
+        rv_emit_word(re, rv_add(rv_t0_reg(), rv_fp_reg(), rv_t0_reg()))
+        rv_emit_li32(re, rv_t1_reg(), bits & 0xFFFFFFFF)
+        rv_emit_word(re, rv_sw(rv_t1_reg(), rv_t0_reg(), 0))
+        rv_emit_li32(re, rv_t1_reg(), (bits >> 32) & 0xFFFFFFFF)
+        rv_emit_word(re, rv_sw(rv_t1_reg(), rv_t0_reg(), 4))
+        rv_emit_word(re, rv_fld(dt.reg, rv_t0_reg(), 0))
+      end
+    end
+    if dt.store_slot >= 0 then
+      rv_fp_slot_store(re, w, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirIntToFloat(w, dst, src, unsigned) then
+    # Integer word -> float (fcvt.s.w/wu/l/lu or fcvt.d.w/wu/l/lu,
+    # rm = RNE). The source is the GP word in sr; on RV64 the source
+    # is a 64-bit integer (the l/lu forms), on RV32 the machine word
+    # is 32 bits so the w/wu forms are the width-correct mapping (the
+    # same 32-bit-word rule the cortex-m route documents; the l forms
+    # are RV64-only instructions).
+    let dt = match rv_fp_def_target(alloc, dst, pos, "int-to-float destination")
+    when Result::Ok(t) then t
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let sr = rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(src), pos, rv_t0_reg(), xlen)
+    match w
+    when LirFpWidth::LirF32 then
+      if xlen == 8 then
+        if unsigned then rv_emit_word(re, rv_fcvt_s_lu(dt.reg, sr)) else rv_emit_word(re, rv_fcvt_s_l(dt.reg, sr)) end
+      else
+        if unsigned then rv_emit_word(re, rv_fcvt_s_wu(dt.reg, sr)) else rv_emit_word(re, rv_fcvt_s_w(dt.reg, sr)) end
+      end
+    when LirFpWidth::LirF64 then
+      if xlen == 8 then
+        if unsigned then rv_emit_word(re, rv_fcvt_d_lu(dt.reg, sr)) else rv_emit_word(re, rv_fcvt_d_l(dt.reg, sr)) end
+      else
+        if unsigned then rv_emit_word(re, rv_fcvt_d_wu(dt.reg, sr)) else rv_emit_word(re, rv_fcvt_d_w(dt.reg, sr)) end
+      end
+    end
+    if dt.store_slot >= 0 then
+      rv_fp_slot_store(re, w, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirFloatToInt(w, dst, src) then
+    # Float -> signed integer word under the §25 language rule (NaN ->
+    # 0, out-of-range clamps to the destination format's bound, else
+    # truncation toward zero). The truncating RTZ conversion (funct3 =
+    # 001) gives the clamp (the native largest/smallest result for an
+    # out-of-range source) and the truncation; its NaN result is the
+    # largest integer, so rv_emit_ftoi_nan_fixup follows with the
+    # quiet-FEQ NaN test and the masking clear. On RV64 the destination
+    # is the 64-bit word (fcvt.l.*, RV64-only); on RV32 the machine
+    # word is 32 bits and fcvt.w.* is the width-correct form (the
+    # clamp is then the 32-bit bound, exactly the cortex-m route's
+    # VCVT.S32 model).
+    let dt = rv_def_target(alloc, mdl_pool, dst, pos)
+    let sm = match rv_fp_use_reg(re, alloc, w, src, pos, rv_fp_use_scratch(), "float-to-int source", xlen)
+    when Result::Ok(r) then r
+    when Result::Err(e) then return Result::Err(e)
+    end
+    match w
+    when LirFpWidth::LirF32 then
+      if xlen == 8 then rv_emit_word(re, rv_fcvt_l_s_rtz(dt.reg, sm)) else rv_emit_word(re, rv_fcvt_w_s_rtz(dt.reg, sm)) end
+    when LirFpWidth::LirF64 then
+      if xlen == 8 then rv_emit_word(re, rv_fcvt_l_d_rtz(dt.reg, sm)) else rv_emit_word(re, rv_fcvt_w_d_rtz(dt.reg, sm)) end
+    end
+    rv_emit_ftoi_nan_fixup(re, dt.reg, sm, w)
+    if dt.store_slot >= 0 then
+      rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
+  when LirStmtKind::LirFcvt(src_w, dst, src) then
+    # Float <-> float width cast: src_w = the source's width; the dst
+    # vreg's class record is the target width (a mismatch with the
+    # record is a lowering divergence — the two cross-width directions
+    # only). fcvt.d.s is exact widening and requires the input's
+    # NaN-boxing on FLEN 64 (our F32 convention: all S-form writes
+    # box, so it always holds); fcvt.s.d is the exactly-once RNE
+    # rounding (and NaN-boxes its result). Both need the D unit (desc
+    # gate).
+    let dw = match alloc.fp_widths.get(dst)
+    when Option::Some(v) then v
+    when Option::None then panic("rv: LirFcvt into a vreg with no FP class record (lowering invariant)")
+    end
+    let dt = match rv_fp_def_target(alloc, dst, pos, "fcvt destination")
+    when Result::Ok(t) then t
+    when Result::Err(e) then return Result::Err(e)
+    end
+    let pref = rv_fp_first_pref(dt.reg)
+    let sm = match rv_fp_use_reg(re, alloc, src_w, src, pos, pref, "fcvt source", xlen)
+    when Result::Ok(r) then r
+    when Result::Err(e) then return Result::Err(e)
+    end
+    if dw == LirFpWidth::LirF32 && src_w == LirFpWidth::LirF64 then
+      rv_emit_word(re, rv_fcvt_s_d(dt.reg, sm))
+    elsif dw == LirFpWidth::LirF64 && src_w == LirFpWidth::LirF32 then
+      rv_emit_word(re, rv_fcvt_d_s(dt.reg, sm))
+    else
+      panic("rv: LirFcvt between identical widths (lowering invariant; same-width casts lower as moves)")
+    end
+    if dt.store_slot >= 0 then
+      rv_fp_slot_store(re, dw, dt.reg, dt.store_slot, xlen)
+    end
+    Result::Ok(())
   end
 end
 
@@ -3562,8 +4635,10 @@ end
 # [s0 + xlen*i] (positive, the rv_slot_access convention); the saved
 # block sits ABOVE the slot area at [sp + frame_bytes + k*xlen] — the
 # thumb PUSH-above-frame layout. The epilogue reloads that block from
-# the same offsets (the body never moves sp — LirPushArg is rejected),
-# deallocates and rv_ret's; the return value travels in a0 = x10
+# the same offsets (a call block's LirPushArg pushes descend below sp,
+# and the call terminator adds the stack_args units back, so at every
+# Ret sp is the prologue's sp again), deallocates and rv_ret's; the
+# return value travels in a0 = x10
 # (rv_fixed_phys(0) — the LIR fixed vreg 0).
 #
 # Call model: pre-call I2 spill stores (redundant for the callee-saved
@@ -3683,6 +4758,28 @@ def rv_frame_bytes(slots: Int, xlen: Int) -> Int
     panic("rv_frame_bytes: xlen must be 4 or 8 bytes (got " + xlen.to_string() + ")")
   end
   let raw = slots * xlen
+  let rem = raw % 16
+  if rem != 0 then
+    raw + (16 - rem)
+  else
+    raw
+  end
+end
+
+# The function's TOTAL dynamic frame (the prologue's whole SP
+# deduction): the slot/transit region + the saved block, rounded UP to
+# the psABI's 16-byte stack alignment. The saved block ([ra, s0] + the
+# 11 s1..s11 pool registers = 13 registers) is a multiple of 8/4 bytes
+# but not of 16, so without this round the SP at a call would be only
+# 8-aligned on riscv64 (4-aligned on riscv32) — violating the psABI
+# ("the stack pointer must be 16-byte aligned at the point of a
+# function call") and voiding the float/stack stream's 16-byte tail
+# padding. The pad sits ABOVE the saved block (between it and the
+# incoming-argument area), so no slot/save/argument offset moves;
+# incoming_sp == s0 + rv_total_frame(...) still holds exactly, which is
+# what re.frame_total and the LirLoadFrame translation consume.
+def rv_total_frame(frame_bytes: Int, saved_len: Int, xlen: Int) -> Int
+  let raw = frame_bytes + saved_len * xlen
   let rem = raw % 16
   if rem != 0 then
     raw + (16 - rem)
@@ -3880,11 +4977,15 @@ end
 # The pre-call spill stores (mirrors thumb_emit_call_spills)
 # ———————————————————————————————————————————————————————————————
 # Register-resident pre-call segments whose end precedes the call at
-# `pos` store to their slots (invariant I2 — redundant for the
-# callee-saved pool but keeps the allocator target-agnostic, thumb's
-# note). The matching post-call reloads happen at each value's first
-# read after the call (rv_emit_use's alloc.reloads lookup) — nothing
-# further lives in the Call arm.
+# `pos` store to their slots (invariant I2 — the allocator pool is
+# caller-saved, so a value live across a call takes this path). A
+# FLOAT-class vreg (alloc.fp_widths) stores its slot image at the
+# statement width through the F/D slot machinery (an F32's 4-byte
+# image, an F64's 8-byte image at the even-based pair home); a general
+# vreg keeps the word store. The matching post-call reloads happen at
+# each value's first read after the call — the GP side through
+# rv_emit_use's alloc.reloads lookup, the FP side through
+# rv_fp_use_reg's, so nothing further lives in the Call arm.
 def rv_emit_call_spills(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], pos: Int, xlen: Int) -> Unit
   var i = 0
   while i < alloc.spills.len() do
@@ -3895,7 +4996,12 @@ def rv_emit_call_spills(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], p
         match lir_seg_at(segs, pos - 1)
         when Option::Some(s) then
           if s.phys >= 0 && s.slot >= 0 then
-            rv_slot_store(re, rv_phys_of(mdl_pool, s.phys), s.slot, xlen)
+            match alloc.fp_widths.get(vreg)
+            when Option::Some(w) then
+              rv_fp_slot_store(re, w, rv_fp_phys_of(s.phys), s.slot, xlen)
+            when Option::None then
+              rv_slot_store(re, rv_phys_of(mdl_pool, s.phys), s.slot, xlen)
+            end
           end
         when Option::None then ()
         end
@@ -3916,8 +5022,9 @@ end
 # sp + frame_bytes is built in t0 (a caller-saved temp — saved regs are
 # ra/s0/s1..s6, never t0) and the access uses [t0 + idx*xlen], whose
 # max of 7*xlen bytes always fits. The prologue runs the stores and the
-# epilogue the loads at the SAME offsets: the body never moves sp
-# (LirPushArg is rejected by rv_validate_fn), so sp still equals the
+# epilogue the loads at the SAME offsets: a call block's LirPushArg
+# pushes descend below sp, but the call terminator adds the
+# stack_args units back before the block exits, so sp equals the
 # prologue's sp at every Ret.
 
 def rv_saved_access(inout re: RvEmit, reg: Int, frame_bytes: Int, idx: Int, xlen: Int, is_load: Bool) -> Unit
@@ -3967,7 +5074,7 @@ end
 # emission, so every li here is in range (fail-closed).
 def rv_emit_prologue(inout re: RvEmit, mdl_pool: Vec[Int], frame_bytes: Int, xlen: Int) -> Unit
   let saved = rv_saved_regs(mdl_pool)
-  let total = frame_bytes + saved.len() * xlen
+  let total = rv_total_frame(frame_bytes, saved.len(), xlen)
   if total <= 2047 then
     rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), -total))
   else
@@ -3988,7 +5095,7 @@ end
 # registers is a0, so the return value survives the restores.
 def rv_emit_epilogue(inout re: RvEmit, mdl_pool: Vec[Int], frame_bytes: Int, xlen: Int) -> Unit
   let saved = rv_saved_regs(mdl_pool)
-  let total = frame_bytes + saved.len() * xlen
+  let total = rv_total_frame(frame_bytes, saved.len(), xlen)
   var k = 0
   while k < saved.len() do
     rv_saved_access(re, saved[k], frame_bytes, k, xlen, true)
@@ -4051,9 +5158,25 @@ def rv_emit_term(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name:
   when LirTermKind::LirRet(rv) then
     match rv
     when Option::Some(vreg) then
-      let sr = rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(vreg), pos, rv_t0_reg(), xlen)
-      if sr != rv_fixed_phys(0) then
-        rv_emit_word(re, rv_mv(rv_fixed_phys(0), sr))
+      # A FLOAT return crosses in the fixed float vreg 8 = fa0 = f10
+      # at its width (the psABI return register; the same register id
+      # the LIR float ABI uses), moved with the fsgnj boxing copy; a
+      # general return crosses in a0 = x10 as before.
+      match alloc.fp_widths.get(vreg)
+      when Option::Some(w) then
+        let sm = match rv_fp_use_reg(re, alloc, w, vreg, pos, rv_fp_use_scratch(), "return value", xlen)
+        when Result::Ok(r) then r
+        when Result::Err(e) then return Result::Err(e)
+        end
+        let fa0 = rv_fixed_fp_phys(lir_fixed_fp_base())
+        if sm != fa0 then
+          rv_emit_word(re, rv_fp_mov_word(w, fa0, sm))
+        end
+      when Option::None then
+        let sr = rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(vreg), pos, rv_t0_reg(), xlen)
+        if sr != rv_fixed_phys(0) then
+          rv_emit_word(re, rv_mv(rv_fixed_phys(0), sr))
+        end
       end
     when Option::None then ()
     end
@@ -4065,14 +5188,11 @@ def rv_emit_term(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name:
   when LirTermKind::LirCall(target, args, stack_args, dest, success) then
     # Pre-call spill stores (register-resident values crossing the call).
     rv_emit_call_spills(re, alloc, mdl_pool, pos, xlen)
-    # stack_args must be 0 here (rv_validate_fn rejects pushes).
-    if stack_args != 0 then
-      return Result::Err("rv: call to `" + target + "` carries caller stack slots — the a0-a7 register path has no stack-argument rule (rv_validate_fn rejects them; fail-closed)")
-    end
-    # args is carried for the allocator's benefit: its <= 8 fixed moves
-    # are ordinary statements (fixed LIR vreg i IS a_i = x(10+i) —
-    # rv_fixed_phys), so nothing reads args here. rv_validate_fn rejects
-    # args beyond a0-a7.
+    # args is carried for the allocator's benefit: its register-class
+    # moves are ordinary statements (fixed LIR vreg i IS a_i = x(10+i)
+    # for a general argument, fixed float vreg 8+p IS fa_p = f(10+p)
+    # for a float one — rv_fixed_phys / rv_fixed_fp_phys), so nothing
+    # reads args here beyond the stack-argument accounting.
     # The target model mirrors thumb_emit_bl exactly: a call to a DEFINED
     # program function — itself included — is `jal ra, <label>` as a
     # deferred patch (the label is a function label of the shared program
@@ -4087,15 +5207,48 @@ def rv_emit_term(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], fn_name:
     else
       rv_emit_call(re, target)
     end
-    # Result capture: a0 -> dest (a fixed or ordinary vreg def at pos).
+    # Release the caller stack stream: stack_args counts machine units
+    # (one xlen slot each — 8 bytes on riscv64, 4 on riscv32; the
+    # lowering pads the count to a 16-byte total), so add back
+    # stack_args * xlen bytes. The add is flagless and never touches
+    # a0/fa0, so the result capture below reads the return register
+    # unharmed.
+    if stack_args != 0 then
+      let total = stack_args * xlen
+      if total <= 2047 then
+        rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), total))
+      else
+        rv_emit_li(re, rv_t0_reg(), total)
+        rv_emit_word(re, rv_add(rv_sp_reg(), rv_sp_reg(), rv_t0_reg()))
+      end
+    end
+    # Result capture: a0 -> dest for a general result, fa0 = f10 ->
+    # dest at its width for a float result (the fixed float ABI return
+    # register; the fsgnj boxing copy keeps the F32 NaN-boxing on
+    # FLEN 64).
     match dest
     when Option::Some(dv) then
-      let dt = rv_def_target(alloc, mdl_pool, dv, pos)
-      if dt.reg != rv_fixed_phys(0) then
-        rv_emit_word(re, rv_mv(dt.reg, rv_fixed_phys(0)))
-      end
-      if dt.store_slot >= 0 then
-        rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+      match alloc.fp_widths.get(dv)
+      when Option::Some(w) then
+        let fdt = match rv_fp_def_target(alloc, dv, pos, "call-result destination")
+        when Result::Ok(t) then t
+        when Result::Err(e) then return Result::Err(e)
+        end
+        let fa0 = rv_fixed_fp_phys(lir_fixed_fp_base())
+        if fdt.reg != fa0 then
+          rv_emit_word(re, rv_fp_mov_word(w, fdt.reg, fa0))
+        end
+        if fdt.store_slot >= 0 then
+          rv_fp_slot_store(re, w, fdt.reg, fdt.store_slot, xlen)
+        end
+      when Option::None then
+        let dt = rv_def_target(alloc, mdl_pool, dv, pos)
+        if dt.reg != rv_fixed_phys(0) then
+          rv_emit_word(re, rv_mv(dt.reg, rv_fixed_phys(0)))
+        end
+        if dt.store_slot >= 0 then
+          rv_slot_store(re, dt.reg, dt.store_slot, xlen)
+        end
       end
     when Option::None then ()
     end
@@ -4120,38 +5273,623 @@ end
 # buffer — every block label and function label is defined by then
 # (mirrors thumb_emit_fn + thumb_resolve_patches exactly).
 
-def rv_emit_fn(inout re: RvEmit, mdl_pool: Vec[Int], lir_fn: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String], variadic_externs: Set[String], xlen: Int, desc: TargetDesc) -> Result[Unit, String]
+# ———————————————————————————————————————————————————————————————
+# AUDIT §26 — the psABI variadic INTEGER-convention marshaller
+# ———————————————————————————————————————————————————————————————
+# The psABI: "The remainder of this section applies only to named
+# arguments. Variadic arguments are passed according to the integer
+# calling convention." The NAMED prefix of a variadic extern call keeps
+# the ordinary hardware-FP convention (integer args in a0.., floats in
+# fa0..fa7 — the shared LIR lowering's placement, kept as emitted), and
+# the §26 EXTRAS are marshalled by this section with the integer
+# convention:
+#   - one XLEN word per extra in the next integer a-registers on
+#     riscv64 (an F64 — the promoted image of an F32 extra — is one
+#     XLEN-wide value: fmv.x.d carries its bit pattern into the
+#     a-register);
+#   - on riscv32 a double-word-aligned 2×XLEN extra (the promoted
+#     double) needs an EVEN-numbered a-register pair (fmv.x.d does not
+#     exist on RV32 and RV32D has no 64-bit x-register: the pair's two
+#     32-bit words are extracted by storing the double with fsd and
+#     loading the two words with lw — the low word in the even
+#     register, the high word in the odd one); if no aligned pair is
+#     available the last a-register may be left unused and the extra
+#     goes on the stack;
+#   - after the first extra that goes on the stack, EVERY later extra
+#     goes on the stack (the psABI's variadic rule);
+#   - stack extras follow the named stack stream in argument order
+#     (an F64 on riscv32 at an even 4-byte unit, fsd; all other extras
+#     one xlen slot), and the caller total is padded to the 16-byte
+#     psABI SP alignment.
+# The F32 -> F64 promotion is a real fcvt.d.s and therefore needs the
+# D unit: an F32 extra on an RVF (or soft-float) description fails
+# closed — never an unconverted single crossing a C vararg boundary.
+# The shared LIR lowering has no variadic marker and marshals the
+# extras per-class into the fixed fa0..fa7 vregs, so this section
+# re-derives the extras' layout from the call term's argument list,
+# maps every argument to the original LIR marshal statement that reads
+# its source (segment/reload records stay authoritative — a source is
+# ALWAYS resolved at its own original position) and skips the extras'
+# hard-float marshal statements; the named prefix's register moves stay
+# as emitted, while the caller-stack stream (named + extras) is
+# re-emitted here in one base/psABI pass.
+
+struct RvVarRegAction
+  kind: Int          # 0 gp word, 1 f64 one a-reg (rv64), 2 f64 pair (rv32)
+  vreg: Int
+  src_pos: Int
+  a: Int
+  b: Int             # the pair's second a-register (kind 2)
+  w: LirFpWidth
+end
+
+struct RvVarPushItem
+  kind: Int          # 0 gp word, 1 f32, 2 f64, 3 pad
+  vreg: Int
+  src_pos: Int
+  unit: Int          # unit offset in the caller stack stream
+  units: Int
+  w: LirFpWidth
+end
+
+struct RvVarArgPlan
+  reg_actions: Vec[RvVarRegAction]
+  pushes: Vec[RvVarPushItem]
+  top_pad_units: Int
+  stack_units: Int   # named + extra + top pad, a whole 16-byte multiple
+  skip: Set[Int]
+  action_pos: Int
+end
+
+def rv_var_args_rv64(xlen: Int) -> Bool
+  xlen == 8
+end
+
+# Plan one variadic call block: re-run the LIR's original per-class rv
+# walk to map every argument to its source-reading marshal statement,
+# then re-run the integer-convention walk over the extras. `fixed` is
+# the callee's declared fixed-parameter count (the checker's prefix).
+# Any divergence between the walk and the statements fails closed.
+def rv_var_call_plan(f: LirFunction, stmts: Vec[LirStmt], term_pos: Int, args: Vec[Int], fixed: Int, xlen: Int) -> Result[RvVarArgPlan, String]
+  let block_base = term_pos - stmts.len()
+  let rv64 = rv_var_args_rv64(xlen)
+  let per16 = if rv64 then 2 else 4 end
+  var gp_moves: Vec[Int] = Vec::new()
+  var gp_move_pos: Vec[Int] = Vec::new()
+  var fp_moves: Vec[Int] = Vec::new()
+  var fp_move_pos: Vec[Int] = Vec::new()
+  var push_pos: Vec[Int] = Vec::new()
+  var si = 0
+  while si < stmts.len() do
+    let stmt = stmts[si]
+    match stmt.kind
+    when LirStmtKind::LirMove(dst, val) then
+      if dst < lir_first_alloc_vreg() then
+        match val
+        when LirValue::LirReg(src) then
+          gp_moves.push(src)
+          gp_move_pos.push(block_base + si)
+        when _ then
+          return Result::Err("rv: " + f.name + ": variadic call marshal move into fixed vreg " + dst.to_string() + " is not a register move (lowering/backend divergence — fail-closed)")
+        end
+      end
+    when LirStmtKind::LirFMove(dst, src) then
+      if lir_is_fixed_fp_id(dst) then
+        fp_moves.push(src)
+        fp_move_pos.push(block_base + si)
+      end
+    when LirStmtKind::LirPushArg(_) then
+      push_pos.push(block_base + si)
+    when _ then ()
+    end
+    si = si + 1
+  end
+  # The original per-class rv walk (lir_lower_call): a0..a7 and fa0..fa7
+  # with independent positional numbering; the overflow of either class
+  # joins the psABI stack stream (on riscv32 an F64's two 4-byte units
+  # at an even base with an inserted pad).
+  var gp_pos = 0
+  var fp_pos = 0
+  var stk_pos = 0
+  var gp_mi = 0
+  var fp_mi = 0
+  var arg_kind: Vec[Int] = Vec::new()     # 0 gp reg, 1 fp reg, 2 stack
+  var arg_aux: Vec[Int] = Vec::new()      # original register or stack-position
+  var arg_src_pos: Vec[Int] = Vec::new()
+  var pad_words: Set[Int] = Set::new()
+  var ai = 0
+  while ai < args.len() do
+    let vreg = args[ai]
+    match f.fp_widths.get(vreg)
+    when Option::Some(w) then
+      if fp_pos < 8 then
+        arg_kind.push(1)
+        arg_aux.push(fp_pos)
+        if fp_mi >= fp_moves.len() then
+          return Result::Err("rv: " + f.name + ": variadic call FLOAT argument " + ai.to_string() + " (vreg " + vreg.to_string() + ") has no register marshal statement (lowering/backend divergence — fail-closed)")
+        end
+        if fp_moves[fp_mi] != vreg then
+          return Result::Err("rv: " + f.name + ": variadic call FLOAT argument " + ai.to_string() + " (vreg " + vreg.to_string() + ") does not match its register marshal statement (vreg " + fp_moves[fp_mi].to_string() + ") — lowering/backend divergence (fail-closed)")
+        end
+        arg_src_pos.push(fp_move_pos[fp_mi])
+        fp_mi = fp_mi + 1
+      else
+        arg_kind.push(2)
+        if !rv64 && w == LirFpWidth::LirF64 then
+          if stk_pos % 2 != 0 then
+            pad_words.insert(stk_pos)
+            stk_pos = stk_pos + 1
+          end
+        end
+        arg_aux.push(stk_pos)
+        arg_src_pos.push(-1)
+        if !rv64 && w == LirFpWidth::LirF64 then
+          stk_pos = stk_pos + 2
+        else
+          stk_pos = stk_pos + 1
+        end
+      end
+      fp_pos = fp_pos + 1
+    when Option::None then
+      if gp_pos < 8 then
+        arg_kind.push(0)
+        arg_aux.push(gp_pos)
+        if gp_mi >= gp_moves.len() then
+          return Result::Err("rv: " + f.name + ": variadic call INTEGER argument " + ai.to_string() + " (vreg " + vreg.to_string() + ") has no register marshal statement (lowering/backend divergence — fail-closed)")
+        end
+        if gp_moves[gp_mi] != vreg then
+          return Result::Err("rv: " + f.name + ": variadic call INTEGER argument " + ai.to_string() + " (vreg " + vreg.to_string() + ") does not match its register marshal statement (vreg " + gp_moves[gp_mi].to_string() + ") — lowering/backend divergence (fail-closed)")
+        end
+        arg_src_pos.push(gp_move_pos[gp_mi])
+        gp_mi = gp_mi + 1
+      else
+        arg_kind.push(2)
+        arg_aux.push(stk_pos)
+        arg_src_pos.push(-1)
+        stk_pos = stk_pos + 1
+      end
+      gp_pos = gp_pos + 1
+    end
+    ai = ai + 1
+  end
+  if gp_mi != gp_moves.len() then
+    return Result::Err("rv: " + f.name + ": variadic call leaves " + (gp_moves.len() - gp_mi).to_string() + " unclaimed INTEGER register marshal statement(s) — lowering/backend divergence (fail-closed)")
+  end
+  if fp_mi != fp_moves.len() then
+    return Result::Err("rv: " + f.name + ": variadic call leaves " + (fp_moves.len() - fp_mi).to_string() + " unclaimed FLOAT register marshal statement(s) — lowering/backend divergence (fail-closed)")
+  end
+  # Map each stack-class argument's original stack position to its push
+  # statement (the LIR pads the total to a 16-byte multiple FIRST — the
+  # top pad units sit at the highest addresses — then walks descending).
+  var pad_target = stk_pos
+  while pad_target % per16 != 0 do
+    pad_target = pad_target + 1
+  end
+  var push_idx = pad_target - stk_pos
+  var pi = args.len()
+  while pi > 0 do
+    pi = pi - 1
+    if arg_kind[pi] == 2 then
+      if push_idx >= push_pos.len() then
+        return Result::Err("rv: " + f.name + ": variadic call stack argument " + pi.to_string() + " has no push marshal statement (lowering/backend divergence — fail-closed)")
+      end
+      arg_src_pos[pi] = push_pos[push_idx]
+      push_idx = push_idx + 1
+      if pad_words.contains(&(arg_aux[pi] - 1)) then
+        if push_idx >= push_pos.len() then
+          return Result::Err("rv: " + f.name + ": variadic call F64 alignment pad for stack argument " + pi.to_string() + " has no push marshal statement (lowering/backend divergence — fail-closed)")
+        end
+        push_idx = push_idx + 1
+      end
+    end
+  end
+  if push_idx != push_pos.len() then
+    return Result::Err("rv: " + f.name + ": variadic call push stream does not match the LIR walk (" + push_idx.to_string() + " vs " + push_pos.len().to_string() + " statements) — lowering/backend divergence (fail-closed)")
+  end
+  let named_end = if fixed < args.len() then fixed else args.len() end
+  # The named prefix keeps its LIR placement; its stack arguments are
+  # re-emitted here so the extras can continue the stream exactly.
+  var pushes: Vec[RvVarPushItem] = Vec::new()
+  ai = 0
+  while ai < named_end do
+    if arg_kind[ai] == 2 then
+      let w = match f.fp_widths.get(args[ai])
+      when Option::Some(v) then v
+      when Option::None then LirFpWidth::LirF64
+      end
+      let is_fp = match f.fp_widths.get(args[ai])
+      when Option::Some(_) then true
+      when Option::None then false
+      end
+      if is_fp && w == LirFpWidth::LirF64 && !rv64 && arg_aux[ai] % 2 != 0 then
+        return Result::Err("rv: " + f.name + ": variadic call name " + ai.to_string() + " is an F64 at the odd riscv32 stack unit " + arg_aux[ai].to_string() + " (lowering/backend divergence — fail-closed)")
+      end
+      if is_fp then
+        if w == LirFpWidth::LirF64 then
+          # The alignment pad (when the unit base is odd) is pushed
+          # AFTER the unit in memory, i.e. it has the lower unit
+          # offset and must precede the unit in the ascending vector
+          # (the emitter walks the vector in reverse).
+          if !rv64 && pad_words.contains(&(arg_aux[ai] - 1)) then
+            pushes.push(RvVarPushItem { kind: 3, vreg: 0, src_pos: -1, unit: arg_aux[ai] - 1, units: 1, w: LirFpWidth::LirF64 })
+          end
+          pushes.push(RvVarPushItem { kind: 2, vreg: args[ai], src_pos: arg_src_pos[ai], unit: arg_aux[ai], units: if rv64 then 1 else 2 end, w: w })
+        else
+          pushes.push(RvVarPushItem { kind: 1, vreg: args[ai], src_pos: arg_src_pos[ai], unit: arg_aux[ai], units: 1, w: w })
+        end
+      else
+        pushes.push(RvVarPushItem { kind: 0, vreg: args[ai], src_pos: arg_src_pos[ai], unit: arg_aux[ai], units: 1, w: LirFpWidth::LirF64 })
+      end
+    end
+    ai = ai + 1
+  end
+  # The named prefix's unit count: recompute exactly (the all-args walk
+  # above already advanced through the extras).
+  var named_units = 0
+  ai = 0
+  while ai < named_end do
+    if arg_kind[ai] == 2 then
+      let is_fp = match f.fp_widths.get(args[ai])
+      when Option::Some(_) then true
+      when Option::None then false
+      end
+      let w = match f.fp_widths.get(args[ai])
+      when Option::Some(v) then v
+      when Option::None then LirFpWidth::LirF64
+      end
+      if is_fp && w == LirFpWidth::LirF64 && !rv64 then
+        if named_units % 2 != 0 then
+          named_units = named_units + 1
+        end
+        named_units = named_units + 2
+      else
+        named_units = named_units + 1
+      end
+    end
+    ai = ai + 1
+  end
+  # The integer a-register counter after the NAMED prefix: the extras
+  # continue the same a0..a7 stream the named integer arguments used
+  # (named floats ride fa0..fa7 and never advance it).
+  var named_gp = 0
+  ai = 0
+  while ai < named_end do
+    match f.fp_widths.get(args[ai])
+    when Option::Some(_) then ()
+    when Option::None then
+      if named_gp < 8 then
+        named_gp = named_gp + 1
+      end
+    end
+    ai = ai + 1
+  end
+  # Every named push item must fit inside the named unit span the
+  # extras start after (a lower/backend divergence fails closed).
+  var ni = 0
+  while ni < pushes.len() do
+    if pushes[ni].unit + pushes[ni].units > named_units then
+      return Result::Err("rv: " + f.name + ": variadic call named stack item at unit " + pushes[ni].unit.to_string() + " (+" + pushes[ni].units.to_string() + ") overflows the named span " + named_units.to_string() + " (lowering/backend divergence — fail-closed)")
+    end
+    ni = ni + 1
+  end
+  # The extras' integer-convention walk.
+  var reg_actions: Vec[RvVarRegAction] = Vec::new()
+  var r = named_gp
+  var stack_mode = false
+  var running = named_units
+  ai = named_end
+  while ai < args.len() do
+    let vreg = args[ai]
+    let is_fp = match f.fp_widths.get(vreg)
+    when Option::Some(_) then true
+    when Option::None then false
+    end
+    let w = match f.fp_widths.get(vreg)
+    when Option::Some(v) then v
+    when Option::None then LirFpWidth::LirF64
+    end
+    var placed = false
+    if !stack_mode && r < 8 then
+      if is_fp then
+        if rv64 then
+          reg_actions.push(RvVarRegAction { kind: 1, vreg: vreg, src_pos: arg_src_pos[ai], a: r, b: 0, w: w })
+          r = r + 1
+          placed = true
+        else
+          if r % 2 != 0 then
+            r = r + 1
+          end
+          if r + 1 < 8 then
+            reg_actions.push(RvVarRegAction { kind: 2, vreg: vreg, src_pos: arg_src_pos[ai], a: r, b: r + 1, w: w })
+            r = r + 2
+            placed = true
+          else
+            stack_mode = true
+          end
+        end
+      else
+        reg_actions.push(RvVarRegAction { kind: 0, vreg: vreg, src_pos: arg_src_pos[ai], a: r, b: 0, w: w })
+        r = r + 1
+        placed = true
+      end
+    else
+      stack_mode = true
+    end
+    if !placed then
+      if is_fp && !rv64 then
+        if running % 2 != 0 then
+          pushes.push(RvVarPushItem { kind: 3, vreg: 0, src_pos: -1, unit: running, units: 1, w: LirFpWidth::LirF64 })
+          running = running + 1
+        end
+        pushes.push(RvVarPushItem { kind: 2, vreg: vreg, src_pos: arg_src_pos[ai], unit: running, units: 2, w: w })
+        running = running + 2
+      elsif is_fp then
+        pushes.push(RvVarPushItem { kind: 2, vreg: vreg, src_pos: arg_src_pos[ai], unit: running, units: 1, w: w })
+        running = running + 1
+      else
+        pushes.push(RvVarPushItem { kind: 0, vreg: vreg, src_pos: arg_src_pos[ai], unit: running, units: 1, w: LirFpWidth::LirF64 })
+        running = running + 1
+      end
+    end
+    ai = ai + 1
+  end
+  var stack_units = running
+  while stack_units % per16 != 0 do
+    stack_units = stack_units + 1
+  end
+  let top_pad_units = stack_units - running
+  # The statement positions to skip: every push statement (the stream is
+  # re-emitted) and the extras' register marshal statements (the extras
+  # are re-marshalled); the NAMED prefix's register moves stay as
+  # emitted.
+  var skip: Set[Int] = Set::new()
+  var mi = 0
+  while mi < push_pos.len() do
+    skip.insert(push_pos[mi])
+    mi = mi + 1
+  end
+  ai = named_end
+  while ai < args.len() do
+    if arg_kind[ai] < 2 then
+      skip.insert(arg_src_pos[ai])
+    end
+    ai = ai + 1
+  end
+  # The action block goes at the first marshal statement of the block
+  # (the first register move or push; the terminator when the call has
+  # no marshal statements at all).
+  var action_pos = term_pos
+  mi = 0
+  while mi < gp_move_pos.len() do
+    if gp_move_pos[mi] < action_pos then
+      action_pos = gp_move_pos[mi]
+    end
+    mi = mi + 1
+  end
+  mi = 0
+  while mi < fp_move_pos.len() do
+    if fp_move_pos[mi] < action_pos then
+      action_pos = fp_move_pos[mi]
+    end
+    mi = mi + 1
+  end
+  mi = 0
+  while mi < push_pos.len() do
+    if push_pos[mi] < action_pos then
+      action_pos = push_pos[mi]
+    end
+    mi = mi + 1
+  end
+  Result::Ok(RvVarArgPlan { reg_actions: reg_actions, pushes: pushes, top_pad_units: top_pad_units, stack_units: stack_units, skip: skip, action_pos: action_pos })
+end
+
+# Resolve a variadic FLOAT source to an f-register holding the double
+# image the integer convention passes: the F64 source itself, or the
+# promoted image of an F32 extra (fcvt.d.s — the D unit; fails closed
+# on RVF/soft descriptions where no double exists).
+def rv_var_f64_use(inout re: RvEmit, alloc: LirAlloc, desc: TargetDesc, w: LirFpWidth, vreg: Int, pos: Int, role: String, xlen: Int) -> Result[Int, String]
+  if w == LirFpWidth::LirF64 then
+    return rv_fp_use_reg(re, alloc, LirFpWidth::LirF64, vreg, pos, rv_fp_use_scratch(), role, xlen)
+  end
+  match desc.fpu
+  when Fpu::RVD then ()
+  when _ then
+    return Result::Err("rv: variadic float argument (vreg " + vreg.to_string() + ") is an F32 extra of a variadic extern call: the C default argument promotion F32 -> F64 needs fcvt.d.s (the D unit), which the `" + desc.name + "` description does not provide — pass an F64 extra explicitly — fail-closed")
+  end
+  let ss = match rv_fp_use_reg(re, alloc, LirFpWidth::LirF32, vreg, pos, rv_fp_use_scratch(), role, xlen)
+  when Result::Ok(s) then s
+  when Result::Err(e) then return Result::Err(e)
+  end
+  rv_emit_word(re, rv_fcvt_d_s(rv_fp_def_scratch(), ss))
+  Result::Ok(rv_fp_def_scratch())
+end
+
+# Emit the register-class extras (integer convention): a0..a7 words,
+# fmv.x.d on riscv64, the fsd/lw/lw two-word extraction on riscv32.
+def rv_emit_var_reg_actions(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], desc: TargetDesc, plan: RvVarArgPlan, xlen: Int) -> Result[Unit, String]
+  var ai = 0
+  while ai < plan.reg_actions.len() do
+    let act = plan.reg_actions[ai]
+    if act.kind == 0 then
+      let sr = rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(act.vreg), act.src_pos, rv_t0_reg(), xlen)
+      if sr != rv_fixed_phys(act.a) then
+        rv_emit_word(re, rv_mv(rv_fixed_phys(act.a), sr))
+      end
+    elsif act.kind == 1 then
+      let fd = match rv_var_f64_use(re, alloc, desc, act.w, act.vreg, act.src_pos, "variadic F64 extra", xlen)
+      when Result::Ok(f) then f
+      when Result::Err(e) then return Result::Err(e)
+      end
+      rv_emit_word(re, rv_fmv_x_d(rv_fixed_phys(act.a), fd))
+    else
+      let fd = match rv_var_f64_use(re, alloc, desc, act.w, act.vreg, act.src_pos, "variadic F64 extra", xlen)
+      when Result::Ok(f) then f
+      when Result::Err(e) then return Result::Err(e)
+      end
+      # RV32 has no fmv.x.d and no 64-bit x-register: store the double
+      # and load its little-endian low/high words into the aligned pair.
+      rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), -8))
+      rv_emit_word(re, rv_fsd(fd, rv_sp_reg(), 0))
+      rv_emit_word(re, rv_lw(rv_fixed_phys(act.a), rv_sp_reg(), 0))
+      rv_emit_word(re, rv_lw(rv_fixed_phys(act.b), rv_sp_reg(), 4))
+      rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), 8))
+    end
+    ai = ai + 1
+  end
+  Result::Ok(())
+end
+
+# Emit the caller-stack stream: the top 16-byte-alignment pad first (the
+# highest addresses), then the named + extra units in DESCENDING order,
+# so every item lands at its planned [sp + xlen*unit] offset.
+def rv_emit_var_stack_stream(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], desc: TargetDesc, plan: RvVarArgPlan, xlen: Int) -> Result[Unit, String]
+  if plan.top_pad_units > 0 then
+    rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), -(plan.top_pad_units * xlen)))
+  end
+  var pi = plan.pushes.len()
+  while pi > 0 do
+    pi = pi - 1
+    let item = plan.pushes[pi]
+    match item.kind
+    when 3 then
+      rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), -xlen))
+    when 0 then
+      let sr = rv_emit_use(re, alloc, mdl_pool, LirValue::LirReg(item.vreg), item.src_pos, rv_t0_reg(), xlen)
+      rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), -xlen))
+      if xlen == 8 then
+        rv_emit_word(re, rv_sd(sr, rv_sp_reg(), 0))
+      else
+        rv_emit_word(re, rv_sw(sr, rv_sp_reg(), 0))
+      end
+    when 1 then
+      let fs = match rv_fp_use_reg(re, alloc, LirFpWidth::LirF32, item.vreg, item.src_pos, rv_fp_use_scratch(), "variadic stack F32 argument", xlen)
+      when Result::Ok(f) then f
+      when Result::Err(e) then return Result::Err(e)
+      end
+      rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), -xlen))
+      rv_emit_word(re, rv_fsw(fs, rv_sp_reg(), 0))
+    when 2 then
+      let fd = match rv_var_f64_use(re, alloc, desc, item.w, item.vreg, item.src_pos, "variadic stack F64 argument", xlen)
+      when Result::Ok(f) then f
+      when Result::Err(e) then return Result::Err(e)
+      end
+      rv_emit_word(re, rv_addi(rv_sp_reg(), rv_sp_reg(), -8))
+      rv_emit_word(re, rv_fsd(fd, rv_sp_reg(), 0))
+    end
+  end
+  Result::Ok(())
+end
+
+# Emit one variadic call block: non-marshal statements normally, the
+# named prefix's register moves as emitted, then — at the first marshal
+# statement — the extras' register actions and the whole named+extra
+# caller-stack stream, then the call itself with the adjusted stack
+# unit count.
+def rv_emit_var_call_block(inout re: RvEmit, alloc: LirAlloc, mdl_pool: Vec[Int], lir_fn: LirFunction, stmts: Vec[LirStmt], term: LirTerm, fixed: Int, block_pos: Int, frame_bytes: Int, xlen: Int, desc: TargetDesc, externs: Set[String], defined: Set[String]) -> Result[Unit, String]
+  let term_pos = block_pos + stmts.len()
+  match term.kind
+  when LirTermKind::LirCall(target, args, _orig_stack, dest, success) then
+    let plan = match rv_var_call_plan(lir_fn, stmts.clone(), term_pos, args.clone(), fixed, xlen)
+    when Result::Ok(p) then p
+    when Result::Err(e) then return Result::Err(e)
+    end
+    var si = 0
+    while si < stmts.len() do
+      let spos = block_pos + si
+      if spos == plan.action_pos then
+        match rv_emit_var_reg_actions(re, alloc, mdl_pool, desc, plan, xlen)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        match rv_emit_var_stack_stream(re, alloc, mdl_pool, desc, plan, xlen)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      end
+      if !plan.skip.contains(&spos) then
+        match rv_emit_stmt(re, alloc, mdl_pool, lir_fn.name.clone(), stmts[si].clone(), spos, xlen, desc)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+      end
+      si = si + 1
+    end
+    if plan.action_pos == term_pos then
+      match rv_emit_var_reg_actions(re, alloc, mdl_pool, desc, plan, xlen)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      match rv_emit_var_stack_stream(re, alloc, mdl_pool, desc, plan, xlen)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+    end
+    match rv_emit_term(re, alloc, mdl_pool, lir_fn.name.clone(), frame_bytes, LirTermKind::LirCall(target.clone(), args.clone(), plan.stack_units, dest, success), term_pos, xlen, externs, defined)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    Result::Ok(())
+  when _ then
+    Result::Err("rv: internal: rv_emit_var_call_block on a non-call terminator (fail-closed)")
+  end
+end
+
+def rv_emit_fn(inout re: RvEmit, mdl_pool: Vec[Int], lir_fn: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String], variadic_fixed: Map[String, Int], xlen: Int, desc: TargetDesc) -> Result[Unit, String]
   if xlen != 8 && xlen != 4 then
     return Result::Err("rv: rv_emit_fn needs xlen 4 or 8 bytes (got " + xlen.to_string() + ")")
   end
-  # (audit §26 — the psABI variadic integer-convention gate): the
-  # RISC-V psABI makes a VARIADIC call with the INTEGER calling
-  # convention even under a hard-FP ABI (no fa0..fa7 argument
-  # registers for any of the call's arguments); the riscv route of
-  # this slice rejects float statements entirely (rv_validate_fn — the
-  # float slice is not implemented), so this gate is the forward guard
-  # with the exact rule, and the precise diagnostic for a variadic
-  # extern call whose §26-promoted F64 extra (or float fixed-prefix
-  # argument) would marshal into the FP argument registers.
-  match rv_validate_variadic_calls(lir_fn, variadic_externs)
-  when Result::Err(e) then return Result::Err(e)
-  when Result::Ok(_) then ()
-  end
+  # AUDIT §26 — the psABI variadic integer-convention marshalling is
+  # re-derived at emission (see rv_emit_var_call_block): a variadic
+  # call's NAMED prefix keeps the ordinary hardware-FP placement and
+  # its §26 extras are marshalled through the integer a-register/stack
+  # stream. No float-class variadic rejection remains; an F32 extra
+  # that needs the F32 -> F64 promotion fails closed at the emitter on
+  # descriptions without the D unit (rv_var_f64_use).
   match rv_validate_fn(lir_fn, xlen, desc)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(_) then ()
   end
+  # The float surface's DESCRIPTION gate (the stage-2 rv float slice):
+  # the selected description's fpu/float_abi must admit every width the
+  # function's FP class table carries. Soft-float descriptions (fpu
+  # None) fail closed with the integer-convention seam rule and RVF
+  # descriptions fail closed on any F64 value — see
+  # rv_float_desc_reject. Functions without float values pass on every
+  # description.
+  if lir_fn.fp_widths.len() > 0 then
+    match rv_float_desc_reject(desc, rv_fn_has_f64(lir_fn))
+    when Option::Some(reason) then
+      return Result::Err("rv: function " + lir_fn.name + " carries floating-point values: " + reason)
+    when Option::None then ()
+    end
+  end
   # Frame bound (fail-closed, before any emission — the thumb slots bound
-  # mirror): frame_bytes + the 8-register saved block must stay inside the
-  # rv_li materialization range the frame/address path uses (slot offsets
+  # mirror): frame_bytes + the saved block must stay inside the rv_li
+  # materialization range the frame/address path uses (slot offsets
   # beyond the 12-bit field are built with rv_emit_li; a too-large frame
-  # would panic there — never a silently truncated address).
-  let frame_bytes = rv_frame_bytes(alloc.slots, xlen)
+  # would panic there — never a silently truncated address). The total
+  # is rounded to the psABI's 16-byte SP alignment (rv_total_frame),
+  # which is also the frame_total the LirLoadFrame translation consumes
+  # (incoming_sp == s0 + total).
+  # The RV32 F64-constant transit (re.fp_transit): an RV32 function
+  # with an F64 LirFConst reserves one 16-byte word ABOVE the
+  # spill-slot area (the constant's two pattern words are stored there
+  # and loaded with fld — RV32 has no fmv.d.x), extending frame_bytes
+  # by 16 so nothing live is ever clobbered. F32 constants need no
+  # transit (li32 + fmv.w.x on every xlen). The saved block then sits
+  # above the extended frame exactly as before.
+  let base_frame = rv_frame_bytes(alloc.slots, xlen)
+  let transit = if rv_fn_needs_fp_transit(lir_fn, xlen) then base_frame else -1 end
+  let frame_bytes = if transit >= 0 then base_frame + 16 else base_frame end
   let saved = rv_saved_regs(mdl_pool)
-  let total = frame_bytes + saved.len() * xlen
+  let total = rv_total_frame(frame_bytes, saved.len(), xlen)
   if !rv_imm_li_ok(total) then
     return Result::Err("rv: function " + lir_fn.name + " needs a " + total.to_string() + "-byte frame (" + alloc.slots.to_string() + " spill slots) — larger than the rv_li address-materialization range [-2^31, 2^31 - 2049]; full 64-bit frame materialization is a later slice (fail-closed)")
   end
+  # The per-function emitter state: the stack-argument translation
+  # anchor (incoming_sp == s0 + total) and the transit slot offset.
+  re.frame_total = total
+  re.fp_transit = transit
 
   # Symbol + entry label, then the prologue. (P1-18 @cold): the
   # declared hint rides the LIR record (LirFunction.attr_cold — stamped
@@ -4162,30 +5900,49 @@ def rv_emit_fn(inout re: RvEmit, mdl_pool: Vec[Int], lir_fn: LirFunction, alloc:
   rv_emit_prologue(re, mdl_pool, frame_bytes, xlen)
 
   # Blocks, in order, with the SAME position walk the allocator used
-  # (invariant I3).
+  # (invariant I3). A block whose terminator is a call to a VARIADIC
+  # extern takes the psABI integer-convention path (the named prefix's
+  # register moves stay as emitted, the extras and the caller-stack
+  # stream are re-derived; rv_emit_var_call_block).
   var pos = 0
   var bi = 0
   while bi < lir_fn.blocks.len() do
     let b = lir_fn.blocks[bi]
     # Pending-compare reset at the block boundary (lowering never leaves
-    # one pending — a LirCmp's Cset is adjacent in the same block).
+    # one pending — a LirCmp's Cset is adjacent in the same block; the
+    # float-compare flag resets with the pair).
     re.cmp_left = -1
     re.cmp_right = -1
+    re.cmp_fp = false
     def_label(&mut re.buf, lir_block_label(lir_fn.name.clone(), b.id))
-    var si = 0
-    while si < b.stmts.len() do
-      # A statement carrying a marked LirPtrOp dispatches through
-      # rv_emit_stmt to the pointer/atomic arms (see rv_emit_stmt).
-      match rv_emit_stmt(re, alloc, mdl_pool, lir_fn.name.clone(), b.stmts[si], pos, xlen, desc)
+    var var_fixed: Option[Int] = Option::None
+    match b.term.kind
+    when LirTermKind::LirCall(target, _, _, _, _) then
+      var_fixed = variadic_fixed.get(&target)
+    when _ then ()
+    end
+    match var_fixed
+    when Option::Some(fixed) then
+      match rv_emit_var_call_block(re, alloc, mdl_pool, lir_fn, b.stmts.clone(), b.term.clone(), fixed, pos, frame_bytes, xlen, desc, externs, defined)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
       end
-      pos = pos + 1
-      si = si + 1
-    end
-    match rv_emit_term(re, alloc, mdl_pool, lir_fn.name.clone(), frame_bytes, b.term.kind, pos, xlen, externs, defined)
-    when Result::Err(e) then return Result::Err(e)
-    when Result::Ok(_) then ()
+    when Option::None then
+      var si = 0
+      while si < b.stmts.len() do
+        # A statement carrying a marked LirPtrOp dispatches through
+        # rv_emit_stmt to the pointer/atomic arms (see rv_emit_stmt).
+        match rv_emit_stmt(re, alloc, mdl_pool, lir_fn.name.clone(), b.stmts[si], pos, xlen, desc)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        pos = pos + 1
+        si = si + 1
+      end
+      match rv_emit_term(re, alloc, mdl_pool, lir_fn.name.clone(), frame_bytes, b.term.kind, pos, xlen, externs, defined)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
     end
     pos = pos + 1
     bi = bi + 1
@@ -4947,17 +6704,18 @@ def rv_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u8], 
   end
   var externs: Set[String] = Set::new()
   var defined: Set[String] = Set::new()
-  # The program's VARIADIC extern names (MirFunction.is_extern_variadic
-  # — audit §26: the psABI integer-convention gate below consumes this
-  # set; see rv_validate_variadic_calls).
-  var variadic_externs: Set[String] = Set::new()
+  # The program's VARIADIC extern names with their declared FIXED
+  # parameter counts (MirFunction.is_extern_variadic / params — audit
+  # §26: rv_emit_fn uses the count to split the named prefix from the
+  # integer-convention extras in rv_var_call_plan).
+  var variadic_fixed: Map[String, Int] = Map::new()
   var fi = 0
   while fi < program.functions.len() do
     let f = program.functions[fi]
     if f.is_extern then
       externs.insert(f.name.clone())
       if f.is_extern_variadic then
-        variadic_externs.insert(f.name.clone())
+        variadic_fixed.insert(f.name.clone(), f.params.len())
       end
     else
       defined.insert(f.name.clone())
@@ -5019,7 +6777,7 @@ def rv_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u8], 
       if lir_violations.len() > 0 then
         return Result::Err(lir_verify_fail_err(peeped.name.clone(), lir_violations))
       end
-      match rv_emit_fn(&mut re, mdl_pool, peeped, alloc, externs, defined, variadic_externs, xlen, desc)
+      match rv_emit_fn(&mut re, mdl_pool, peeped, alloc, externs, defined, variadic_fixed, xlen, desc)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
       end
@@ -5069,7 +6827,7 @@ def rv_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u8], 
         if lir_violations.len() > 0 then
           return Result::Err(lir_verify_fail_err(peeped.name.clone(), lir_violations))
         end
-        match rv_emit_fn(&mut re, mdl_pool, peeped, alloc, externs, defined, variadic_externs, xlen, desc)
+        match rv_emit_fn(&mut re, mdl_pool, peeped, alloc, externs, defined, variadic_fixed, xlen, desc)
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(_) then ()
         end

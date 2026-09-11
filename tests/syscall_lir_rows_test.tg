@@ -1,0 +1,472 @@
+# tests/syscall_lir_rows_test.tg — the LIR syscall-intrinsic parity rows
+#
+# The __intrinsic_syscall1..6 family (std::core's extern declarations)
+# has NO symbol: the direct emitter inlines the raw kernel-call
+# sequence (codegen.tg's codegen_syscall, dispatched from the
+# IntrinsicId::Syscall1..6 arms). The LIR route recognizes the same
+# names in lir_lower_call, records the LirSysOp marker on the call
+# terminator, and emits the same sequence in place of the branch — so
+# the route no longer emits an undefined `bl __intrinsic_syscallN`.
+#
+# This suite pins the recognition/arity rows (lir_syscall_nargs_of),
+# the target-surface rows (target_desc_syscall_abi / the fail-closed
+# rule), the aarch64 lowering rows for syscall1..6 — the number and
+# user-argument moves into the fixed ABI vregs x0..xn and the
+# destination capture into the return local's vreg — the verifier's
+# clean pass on each, and the aarch64/x86-64 emission rows (SVC #0 /
+# SVC #0x80 presence, no relocation to the intrinsic name, the Linux
+# SysV x86 shuffle bytes).
+#
+# Run with: tg test tests/syscall_lir_rows_test.tg
+
+use std::core::{Option, Result, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::asm::{Arch, OsAbi, asm_target}
+use tg_compiler::ids::{MirLocalId, MirBlockId}
+use tg_compiler::mir::{
+  MirFunction, MirBlock, MirLocal, MirCallArg, MirCallValue, MirConstant,
+  MirConstantKind, MirOperand, MirOperandKind, MirTerminator,
+  MirTerminatorKind, place_local
+}
+use tg_compiler::token::span_dummy
+use tg_compiler::types::{Type, AccessEffect}
+use tg_compiler::codegen::codegen_new
+use tg_compiler::lir::{
+  LirStmtKind, LirTermKind, LirSysOp, LirValue,
+  lir_syscall_nargs_of, lir_syscall_abi_supported,
+  lir_collect_callees,
+  lower_mir_fn_to_lir_prog, lower_mir_fn_to_lir_prog_x86,
+  lower_mir_fn_to_lir_cm, lower_mir_fn_to_lir_rv64,
+  lir_peephole, lir_alloc_registers_a64, verify_lir, lir_emit_fn,
+  LirVerifyRoute
+}
+use tg_compiler::target_desc::{
+  SyscallAbi, target_desc_syscall_abi,
+  aarch64_desc, x86_64_desc, thumbv7em_cortex_m4f_desc, riscv64imac_desc
+}
+use tg_compiler::backend_x86_64::{x86_emit_new, x86_emit_syscall_lir}
+
+# ———————————————————————————————————————————————————————————————
+# Fixture helpers
+# ———————————————————————————————————————————————————————————————
+
+def sys_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal {
+    id: MirLocalId { id: id },
+    name: name,
+    ty: ty,
+    is_mut: is_mut,
+    span: span_dummy()
+  }
+end
+
+def sys_call_arg(p: Place) -> MirCallArg
+  MirCallArg {
+    effect: AccessEffect::Read,
+    value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(p) })
+  }
+end
+
+# def fixture(a1: Int, ..., aN: Int) -> Int { callee(a1..aN) } —
+# locals[0] is the Int return place, locals[1..n] the parameters; the
+# call's args are MirCopy operands over the parameter locals (the
+# ordinary scalar-argument form), and the success block returns local 0.
+# A syscall fixture passes n = family index + 1 (the number plus the
+# user args — __intrinsic_syscall3 carries FOUR words).
+def sys_fixture(callee: String, n: Int) -> MirFunction
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(sys_local(0, "_ret", Type::Int, true))
+  var params: Vec[MirLocal] = Vec::new()
+  var i = 1
+  while i <= n do
+    let l = sys_local(i, "a" + i.to_string(), Type::Int, false)
+    locals.push(l)
+    params.push(l)
+    i = i + 1
+  end
+  var args: Vec[MirCallArg] = Vec::new()
+  var ai = 1
+  while ai <= n do
+    args.push(sys_call_arg(place_local(MirLocalId { id: ai })))
+    ai = ai + 1
+  end
+  let call_term = MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: place_local(MirLocalId { id: 0 }),
+      func: MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirFnItem(callee.clone()),
+        ty: Type::Int,
+        instance: Option::None
+      }) },
+      args: args,
+      success: MirBlockId { id: 1 },
+      unwind: Option::None,
+      intrinsic: Option::None,
+      tail: false
+    },
+    span: span_dummy()
+  }
+  let ret_term = MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+  MirFunction {
+    name: "sys_fixture_" + n.to_string(),
+    params: params,
+    ret_type: Type::Int,
+    locals: locals,
+    blocks: Vec::from([
+      MirBlock {
+        id: MirBlockId { id: 0 },
+        statements: Vec::new(),
+        terminator: call_term
+      },
+      MirBlock {
+        id: MirBlockId { id: 1 },
+        statements: Vec::new(),
+        terminator: ret_term
+      }
+    ]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def sys_lower_a64(f: MirFunction) -> LirFunction
+  match lower_mir_fn_to_lir_prog(f, Map::new(), Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Err(e) then panic("syscall a64 lowering failed: " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+# The source vreg of the (unique) LirMove whose fixed destination is
+# `dst` (the pre-call argument-move rows).
+def sys_fixed_move_src(f: LirFunction, dst: Int) -> Option[Int]
+  var out: Option[Int] = Option::None
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].kind
+      when LirStmtKind::LirMove(d, v) then
+        if d == dst then
+          match v
+          when LirValue::LirReg(src) then out = Option::Some(src)
+          when LirValue::LirImm(_) then ()
+          end
+        end
+      when _ then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+# The (single) syscall-marked terminator's kind.
+def sys_marked_kind(f: LirFunction) -> Option[LirTermKind]
+  var out: Option[LirTermKind] = Option::None
+  var bi = 0
+  while bi < f.blocks.len() do
+    match f.blocks[bi].term.sys
+    when Option::Some(_) then out = Option::Some(f.blocks[bi].term.kind)
+    when Option::None then ()
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+# Does any relocation of the emitted buffer reference the given symbol?
+def sys_has_reloc_to(bytes_relocs: Vec[(String, Int)], sym: String) -> Bool
+  var hit = false
+  var i = 0
+  while i < bytes_relocs.len() do
+    if bytes_relocs[i].0 == sym then hit = true end
+    i = i + 1
+  end
+  hit
+end
+
+# Is `needle` a contiguous byte subsequence of `hay`?
+def sys_has_bytes(hay: Vec[u8], needle: Vec[u8]) -> Bool
+  if needle.len() == 0 || hay.len() < needle.len() then return false end
+  var i = 0
+  while i + needle.len() <= hay.len() do
+    var j = 0
+    var ok = true
+    while j < needle.len() do
+      if hay[i + j] != needle[j] then ok = false end
+      j = j + 1
+    end
+    if ok then return true end
+    i = i + 1
+  end
+  false
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. the recognition / arity rows
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_lir_syscall_recognition_rows() -> Unit
+  var n = 1
+  while n <= 6 do
+    let prefixed = "__intrinsic_syscall" + n.to_string()
+    match lir_syscall_nargs_of(prefixed)
+    when Option::Some(v) then assert(v == n, "the " + prefixed + " row must carry arity " + n.to_string())
+    when Option::None then panic("the " + prefixed + " row must be recognized as a syscall intrinsic")
+    end
+    # The bare router spelling (syscall1..6) classifies on the direct
+    # route too (bare_intrinsic_name leaves it and the router's bare
+    # rows match), so the LIR recognition accepts it as well.
+    let bare = "syscall" + n.to_string()
+    match lir_syscall_nargs_of(bare)
+    when Option::Some(v) then assert(v == n, "the bare " + bare + " row must carry arity " + n.to_string())
+    when Option::None then panic("the bare " + bare + " row must be recognized as a syscall intrinsic")
+    end
+    n = n + 1
+  end
+
+  # The direct normalization's dot strip applies (MIR method spellings).
+  assert(lir_syscall_nargs_of(".syscall3") == Option::Some(3), "the leading-dot method spelling must be recognized like bare_intrinsic_name")
+  assert(lir_syscall_nargs_of(".__intrinsic_syscall3") == Option::Some(3), "the leading-dot prefixed spelling must be recognized")
+  # The generic-suffix strip is Pattern 1's (prefixed) only: the bare
+  # router spelling keeps it and does not classify.
+  assert(lir_syscall_nargs_of("__intrinsic_syscall3<T>") == Option::Some(3), "the generic suffix must be stripped like bare_intrinsic_name does")
+  assert(lir_syscall_nargs_of("syscall6<T>") == Option::None, "the bare spelling with a generic suffix is not a router row")
+  assert(lir_syscall_nargs_of("__syscall3") == Option::None, "a double-underscore non-intrinsic prefix is not a router row")
+
+  # The arity domain is the classified syscall1..6 family: no 0- or
+  # 7-argument form, no bare family prefix.
+  assert(lir_syscall_nargs_of("__intrinsic_syscall0") == Option::None, "syscall0 is not in the family's 1..6 domain")
+  assert(lir_syscall_nargs_of("__intrinsic_syscall7") == Option::None, "syscall7 is not in the family's 1..6 domain")
+  assert(lir_syscall_nargs_of("syscall0") == Option::None, "the bare syscall0 is not in the family's 1..6 domain")
+  assert(lir_syscall_nargs_of("__intrinsic_syscall") == Option::None, "the bare family prefix is not an intrinsic")
+  assert(lir_syscall_nargs_of("__intrinsic_syscallx") == Option::None, "a non-numeric suffix is not an intrinsic")
+  assert(lir_syscall_nargs_of("_syscall3") == Option::None, "a single-underscore name is not the direct route's spelling")
+  assert(lir_syscall_nargs_of("") == Option::None, "an empty name is not an intrinsic")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. the target-surface rows (the ONE syscall authority)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_lir_syscall_desc_rows() -> Unit
+  # The host families carry the modeled forms.
+  assert(target_desc_syscall_abi(aarch64_desc()) == SyscallAbi::SyscallA64, "aarch64 must answer SyscallA64")
+  assert(target_desc_syscall_abi(x86_64_desc()) == SyscallAbi::SyscallX86_64, "x86_64 must answer SyscallX86_64")
+  assert(lir_syscall_abi_supported(aarch64_desc()), "the aarch64 desc must admit the syscall lowering")
+  assert(lir_syscall_abi_supported(x86_64_desc()), "the x86-64 desc must admit the syscall lowering")
+  # The embedded descs fail closed (no modeled kernel-call surface).
+  assert(target_desc_syscall_abi(thumbv7em_cortex_m4f_desc()) == SyscallAbi::SyscallNone, "cortex-m4f must answer SyscallNone")
+  assert(target_desc_syscall_abi(riscv64imac_desc()) == SyscallAbi::SyscallNone, "riscv64imac must answer SyscallNone")
+  assert(!lir_syscall_abi_supported(thumbv7em_cortex_m4f_desc()), "the cortex-m4f desc must fail the syscall lowering closed")
+  assert(!lir_syscall_abi_supported(riscv64imac_desc()), "the riscv64imac desc must fail the syscall lowering closed")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. the aarch64 lowering rows: syscall1..6 register setup + capture
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_lir_syscall_lowering_rows() -> Unit
+  var n = 1
+  while n <= 6 do
+    let callee = "__intrinsic_syscall" + n.to_string()
+    # n+1 words: the syscall number plus n user arguments.
+    let lf = sys_lower_a64(sys_fixture(callee.clone(), n + 1))
+    var marked = false
+    var bi = 0
+    while bi < lf.blocks.len() do
+      match lf.blocks[bi].term.sys
+      when Option::Some(sop) then
+        marked = true
+        match sop
+        when LirSysOp::LirSyscall(arity) then
+          assert(arity == n, "the marker must carry the direct emitter's nargs (the user-argument count " + n.to_string() + ")")
+        end
+        match lf.blocks[bi].term.kind
+        when LirTermKind::LirCall(target, args, sa, dest, _) then
+          assert(target == callee, "the marked call must keep its emission name")
+          assert(args.len() == n + 1, "the marked call must carry the number plus one vreg per user argument")
+          assert(sa == 0, "the syscall marker must carry no caller stack slots")
+          match dest
+          when Option::Some(_) then ()
+          when Option::None then panic("the syscall result must be captured into the destination vreg")
+          end
+          # The register-setup rows: the number word and each user
+          # argument move into the fixed ABI vregs x0..xn (k = 0 is the
+          # number), and no move targets the next fixed register.
+          var k = 0
+          while k <= n do
+            match sys_fixed_move_src(lf, k)
+            when Option::Some(src) then
+              assert(src == args[k], "syscall" + n.to_string() + " word " + k.to_string() + " must move into x" + k.to_string())
+            when Option::None then
+              panic("syscall" + n.to_string() + " is missing the x" + k.to_string() + " argument move")
+            end
+            k = k + 1
+          end
+          assert(sys_fixed_move_src(lf, n + 1) == Option::None, "syscall" + n.to_string() + " must not define x" + (n + 1).to_string())
+        when _ then panic("the syscall marker must ride a LirCall terminator")
+        end
+      when Option::None then ()
+      end
+      bi = bi + 1
+    end
+    assert(marked, "the " + callee + " call must carry the syscall marker")
+    # The marker must pass mandatory verify_lir (defs/uses/clobbers over
+    # the marked terminator — the call boundary's spills included).
+    let peeped = lir_peephole(lf)
+    let alloc = lir_alloc_registers_a64(peeped)
+    let violations = verify_lir(peeped, alloc, LirVerifyRoute::LirVerifyA64)
+    var first = ""
+    if violations.len() > 0 then first = violations[0] end
+    assert(violations.len() == 0, "syscall" + n.to_string() + " must verify clean; first violation: " + first)
+    # The marked terminator demands no callee symbol (the direct route
+    # inlines the sequence; an unresolved `bl` was the LIR-GAP).
+    assert(lir_collect_callees(lf).len() == 0, "a syscall terminator must not be collected as a callee symbol")
+    n = n + 1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. the x86-64 rows (lowering marker + Linux SysV shuffle bytes)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_lir_syscall_x86_rows() -> Unit
+  # The x86-64 route lowers the same marker (the desc gate admits it).
+  # syscall3's declaration is the number plus three user args (four
+  # words), so the fixture carries four parameters.
+  let lf = match lower_mir_fn_to_lir_prog_x86(sys_fixture("__intrinsic_syscall3".to_string(), 4), Map::new(), Map::new())
+  when Result::Err(e) then panic("x86-64 syscall lowering failed: " + e)
+  when Result::Ok(v) then v
+  end
+  match sys_marked_kind(lf)
+  when Option::Some(kind) then
+    match kind
+    when LirTermKind::LirCall(target, args, sa, _, _) then
+      assert(target == "__intrinsic_syscall3", "the x86-64 marked call must keep its emission name")
+      assert(args.len() == 4, "the x86-64 syscall3 call must carry the number plus three user-argument vregs")
+      assert(sa == 0, "the x86-64 syscall marker must carry no caller stack slots")
+    when _ then panic("the x86-64 syscall marker must ride a LirCall terminator")
+    end
+  when Option::None then panic("the x86-64 syscall3 call must carry the syscall marker")
+  end
+  # __intrinsic_syscall6 carries seven words (number + six user args)
+  # and exceeds the route's six fixed SysV argument registers: it must
+  # fail closed at the lowering rather than reach the emitter.
+  match lower_mir_fn_to_lir_prog_x86(sys_fixture("__intrinsic_syscall6".to_string(), 7), Map::new(), Map::new())
+  when Result::Err(e) then
+    assert(e.contains("at most 6 fixed ABI argument registers"), "the x86-64 syscall6 refusal must name the fixed-register bound; got: " + e)
+  when Result::Ok(_) then panic("a seven-word x86-64 syscall must fail closed")
+  end
+
+  # The emission shuffle rows (Linux SysV: rax = number, rdi/rsi/rdx =
+  # args 1..3; syscall = 0F 05). nargs is the user-argument count (3
+  # for __intrinsic_syscall3), exactly the direct emitter's value.
+  var xe = x86_emit_new()
+  x86_emit_syscall_lir(xe, 3)
+  var expect3: Vec[u8] = Vec::from([
+    0x48, 0x89, 0xF8,   # mov rax, rdi (number)
+    0x48, 0x89, 0xF7,   # mov rdi, rsi (arg 1)
+    0x48, 0x89, 0xD6,   # mov rsi, rdx (arg 2)
+    0x48, 0x89, 0xCA,   # mov rdx, rcx (arg 3)
+    0x0F, 0x05          # syscall
+  ])
+  let got3 = xe.buf.bytes.clone()
+  assert(got3.len() == expect3.len(), "the syscall3 x86-64 shuffle must carry exactly the direct route's bytes")
+  assert(sys_has_bytes(got3, expect3), "the syscall3 x86-64 shuffle must mirror the direct route's rdi/rsi/rdx setup + syscall")
+
+  var xe4 = x86_emit_new()
+  x86_emit_syscall_lir(xe4, 4)
+  var expect4: Vec[u8] = Vec::from([
+    0x48, 0x89, 0xF8,   # mov rax, rdi
+    0x48, 0x89, 0xF7,   # mov rdi, rsi
+    0x48, 0x89, 0xD6,   # mov rsi, rdx
+    0x48, 0x89, 0xCA,   # mov rdx, rcx
+    0x4D, 0x89, 0xC2,   # mov r10, r8 (arg 4)
+    0x0F, 0x05
+  ])
+  let got4 = xe4.buf.bytes.clone()
+  assert(got4.len() == expect4.len(), "the syscall4 x86-64 shuffle must carry exactly the direct route's bytes plus the arg-4 move")
+  assert(sys_has_bytes(got4, expect4), "the syscall4 x86-64 shuffle must route arg 4 through the kernel's r10")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 5. the aarch64 emission rows (the direct route's SVC sequences)
+# ———————————————————————————————————————————————————————————————
+
+def sys_emit_a64(f: LirFunction, os: OsAbi) -> (Vec[u8], Vec[(String, Int)])
+  let peeped = lir_peephole(f)
+  let alloc = lir_alloc_registers_a64(peeped)
+  var ctx = codegen_new(asm_target(Arch::AArch64, os))
+  lir_emit_fn(&mut ctx, peeped, alloc, Set::new(), Set::new(), Option::None)
+  var relocs: Vec[(String, Int)] = Vec::new()
+  var ri = 0
+  while ri < ctx.text.relocations.len() do
+    relocs.push((ctx.text.relocations[ri].symbol.clone(), ctx.text.relocations[ri].offset))
+    ri = ri + 1
+  end
+  (ctx.text.bytes, relocs)
+end
+
+@test
+def test_lir_syscall_a64_emission_rows() -> Unit
+  # syscall1 = the number plus one user arg (two words).
+  let lf = sys_lower_a64(sys_fixture("__intrinsic_syscall1".to_string(), 2))
+
+  # Linux: x8 = number + SVC #0 (0xD4000001 -> 01 00 00 D4 LE).
+  let (linux_bytes, linux_relocs) = sys_emit_a64(lf, OsAbi::Linux)
+  assert(sys_has_bytes(linux_bytes, Vec::from([0x01, 0x00, 0x00, 0xD4])), "the Linux aarch64 syscall emission must carry `svc #0`")
+  assert(!sys_has_reloc_to(linux_relocs, "__intrinsic_syscall1"), "the syscall terminator must not leave a relocation to the intrinsic name")
+
+  # macOS: x16 = number + 3 + SVC #0x80 (0xD4001001 -> 01 10 00 D4 LE).
+  let (mac_bytes, mac_relocs) = sys_emit_a64(lf, OsAbi::MacOS)
+  assert(sys_has_bytes(mac_bytes, Vec::from([0x01, 0x10, 0x00, 0xD4])), "the macOS aarch64 syscall emission must carry `svc #0x80`")
+  assert(!sys_has_reloc_to(mac_relocs, "__intrinsic_syscall1"), "the macOS syscall terminator must not leave a relocation to the intrinsic name")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 6. the fail-closed rows (targets without syscalls, wrong arity)
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_lir_syscall_fail_closed_rows() -> Unit
+  # syscall1 = the number plus one user argument (two words).
+  let f1 = sys_fixture("__intrinsic_syscall1".to_string(), 2)
+
+  # cortex-m: the desc carries no syscall ABI — the lowering refuses
+  # the call with the target name (never a silent extern `bl`).
+  match lower_mir_fn_to_lir_cm(f1, Map::new())
+  when Result::Err(e) then
+    assert(e.contains("no syscall ABI"), "the cortex-m refusal must name the missing syscall ABI; got: " + e)
+    assert(e.contains("cortex-m4f"), "the cortex-m refusal must name the target description; got: " + e)
+  when Result::Ok(_) then panic("a syscall intrinsic must fail closed on the cortex-m route")
+  end
+
+  # riscv64: same fail-closed rule.
+  match lower_mir_fn_to_lir_rv64(f1, Map::new())
+  when Result::Err(e) then
+    assert(e.contains("no syscall ABI"), "the riscv refusal must name the missing syscall ABI; got: " + e)
+    assert(e.contains("riscv64imac"), "the riscv refusal must name the target description; got: " + e)
+  when Result::Ok(_) then panic("a syscall intrinsic must fail closed on the riscv route")
+  end
+
+  # A name in the family with the wrong argument count fails the arity
+  # domain (the std::core declaration) before any argument traffic:
+  # __intrinsic_syscall2 declares three words (number + two user args).
+  match lower_mir_fn_to_lir_prog(sys_fixture("__intrinsic_syscall2".to_string(), 2), Map::new(), Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Err(e) then
+    assert(e.contains("expects 3 argument"), "the wrong-arity refusal must name the expected count; got: " + e)
+  when Result::Ok(_) then panic("a syscall intrinsic with the wrong argument count must fail closed")
+  end
+end
