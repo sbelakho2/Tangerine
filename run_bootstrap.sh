@@ -3,29 +3,59 @@
 # run_bootstrap.sh — Deterministic Tangerine bootstrap validation harness
 #
 # Builds and validates the compiler through its self-hosting ladder:
-#     stage0 (Swift) -> stage1 -> stage2 -> stage3
+#     stage0 (OCaml seed) -> stage1 -> stage2 -> stage3
 # and asserts that stage2 and stage3 are byte-identical (reproducible build).
+#
+# Stage 0 is the OCaml seed (stage0_ocaml/): `dune build` produces
+# stage0_ocaml/_build/default/bin/tg_stage0.exe, which compiles the kernel
+# manifest closure (tg_compiler/bootstrap_main.tg) into stage1. The retired
+# Swift stage0 (stage0_swift/) no longer exists; there is no Swift build
+# step, no Swift binary path, and no fallback seed.
 #
 # Stages are produced into build/tg_stage{1,2,3}, with logs under
 # build/bootstrap/. CI uploads these artifacts and logs (see ci.yml).
 #
-# Determinism guarantees:
+# DELEGATION: the stage0 -> stage1 -> stage2 -> stage3 closure is driven by
+# scripts/check_ocaml_bootstrap_complete.sh (the OCaml seed's completeness
+# gate: pinned toolchain -> `cd stage0_ocaml && dune build` -> the seed's
+# `tg_bootstrap_gate` closure through every stage). This script does NOT
+# duplicate that flow; it resolves stage0 through
+# scripts/bootstrap_helpers.sh (bh_ocaml_seed_build) and then delegates.
+# The ladder can only complete once the seed's typecheck debt is zero
+# (check_ocaml_bootstrap_complete.sh prints exactly what remains).
+#
+# Flag mapping (the pre-rewire flags keep their meaning at the delegation
+# points that exist once the ladder is live):
+#   --skip-ladder       skip scripts/run_stage2_diag_ladder.sh (the live
+#                       stage2 diagnostic ladder, run from the delegated
+#                       build/tg_stage2 after the closure gate passes)
+#   --skip-determinism  skip the two-root reproducibility check, i.e.
+#                       scripts/run_two_root_repro.sh — the OCaml-flow
+#                       successor of check_two_clean_dirs (structural
+#                       mode until a live stage binary exists, ladder mode
+#                       from the seed-built stages)
+#   --skip-native-tests skip the native canary / ARM64 lanes
+#   --trace             per-phase fingerprints (applied to the ladder once
+#                       the OCaml-built stages exist)
+#
+# Determinism guarantees (once the ladder is live):
 #   - Fixed, repo-relative output paths (no mktemp randomness).
 #   - Sorted, stable argument ordering.
 #   - No reliance on wall-clock output; only content hashes are compared.
 #   - The two-root reproducibility check builds the identical manifest
 #     closure from two pristine trees (common seed + common host) and
-#     asserts byte-identical binaries.
+#     asserts byte-identical binaries (scripts/run_two_root_repro.sh).
 #   - Canary suite manifests are validated for parity in both directions
 #     (manifest == discovered-set) with recorded counts, before the ladder.
 #
 # Phase fingerprints:
 #   Per-phase sha256 fingerprints are emitted for every stage (link-image,
 #   text, sections, symbols, relocs and — under trace — the probed tokens,
-#   ast/hir, mir, mir-mono front-end dumps). The stage2 == stage3
-#   reproducibility gate compares EVERY fingerprinted phase, not just the
-#   final link image, and in the trace (release) configuration treats any
-#   UNAVAILABLE phase fingerprint as a hard failure.
+#   ast/hir, mir, mir-mono front-end dumps) by the shared helpers. The
+#   stage2 == stage3 reproducibility gate compares EVERY fingerprinted
+#   phase, not just the final link image, and in the trace (release)
+#   configuration treats any UNAVAILABLE phase fingerprint as a hard
+#   failure.
 #
 # Usage:
 #   ./run_bootstrap.sh [--trace|--trace-phases] [--skip-determinism] [--skip-ladder]
@@ -33,7 +63,8 @@
 #
 # Exit codes:
 #   0  all stages built and validated
-#   1  any stage failed to build or validate
+#   1  any stage failed to build or validate (including the seed's own
+#      completeness gate while its typecheck debt is nonzero)
 #   2  stage2 != stage3 (per-phase reproducibility gate) or two-root check failed
 #   3  stage2 diagnostic ladder failed
 
@@ -119,11 +150,21 @@ for arg in "$@"; do
 run_bootstrap.sh — deterministic Tangerine bootstrap validation harness
 
 Options:
-  --trace | --trace-phases   emit per-phase sha256 fingerprints (link/text/sections/symbols/relocs + probed front-end dumps)
+  --trace | --trace-phases   emit per-phase sha256 fingerprints (link/text/sections/symbols/relocs + probed front-end dumps) once the OCaml-built stages exist
   --skip-ladder              skip the stage2 diagnostic ladder
-  --skip-determinism         skip the two-root reproducibility check
+  --skip-determinism         skip the two-root reproducibility check (scripts/run_two_root_repro.sh)
   --skip-native-tests        skip compiling+running native canaries / arch tests
   -h | --help                show this help
+
+Stage 0 (the OCaml seed):
+  Stage 0 is built from stage0_ocaml/ with `cd stage0_ocaml && dune build`;
+  the stage-0 binary is stage0_ocaml/_build/default/bin/tg_stage0.exe.
+  Stage1 is the seed compiling the manifest closure
+  (tg_compiler/bootstrap_main.tg). The stage0 -> stage1 -> stage2 -> stage3
+  closure is delegated to scripts/check_ocaml_bootstrap_complete.sh (the
+  OCaml-seed completeness gate), which drives the same closure through
+  tg_bootstrap_gate. While the seed's typecheck debt is nonzero the
+  delegation exits nonzero and prints exactly what remains.
 
 Release gate:
   With trace active (the CI configuration) the phase-equality gate is the
@@ -156,11 +197,6 @@ bh_log "root:      $ROOT_DIR"
 bh_log "target:    $TARGET_TRIPLE"
 bh_log "trace:     ${BOOTSTRAP_TRACE_ACTIVE}"
 bh_log "log dir:   $BOOT_LOG_DIR"
-
-if ! command -v swift >/dev/null 2>&1; then
-  bh_err "swift toolchain not found; stage0 cannot be built"
-  exit 1
-fi
 
 # Portable tee helper for capturing a subcommand's log while streaming it.
 run_logged() {
@@ -196,32 +232,98 @@ if ! bh_require_canary_suites; then
 fi
 
 # ———————————————————————————————————————————————————————————————
-# Step 1 — build stage0 (Swift interpreter)
+# Step 1 — stage0: build the OCaml seed
 # ———————————————————————————————————————————————————————————————
 
-bh_log "== Stage 0: Swift bootstrap compiler =="
-run_logged stage0_build_swift \
-  swift build --package-path "$ROOT_DIR/stage0_swift" -c release
+# The ONE stage-0 authority (scripts/bootstrap_helpers.sh): the OCaml seed
+# at stage0_ocaml/. The pinned OCaml/Dune toolchain is verified first; the
+# seed is then built with `cd stage0_ocaml && dune build`, and the stage-0
+# binary is stage0_ocaml/_build/default/bin/tg_stage0.exe. The Swift stage0
+# (stage0_swift/) no longer exists and there is no fallback seed.
+if ! scripts/check_ocaml_toolchain.sh; then
+  bh_err "pinned OCaml/Dune toolchain check failed (bootstrap/ocaml-toolchain.lock)"
+  exit 1
+fi
 
-STAGE0_BIN="$ROOT_DIR/stage0_swift/.build/release/tg_stage0"
+bh_log "== Stage 0: OCaml bootstrap seed =="
+if ! STAGE0_BIN="$(bh_ocaml_seed_build)"; then
+  bh_err "stage0 (OCaml seed) build failed"
+  exit 1
+fi
 if [ ! -x "$STAGE0_BIN" ]; then
   bh_err "stage0 binary not produced: $STAGE0_BIN"
   exit 1
 fi
-bh_log "stage0 ready: $STAGE0_BIN"
+bh_log "stage0 ready: $STAGE0_BIN (OCaml seed)"
 
 # ———————————————————————————————————————————————————————————————
-# Step 2 — stage1 (native, via interpreted stage0)
+# Step 2 — the seed's bootstrap closure (stage1 -> stage2 -> stage3)
 # ———————————————————————————————————————————————————————————————
 
-bh_log "== Stage 1: native compiler via stage0 interpreter =="
+# DELEGATION: scripts/check_ocaml_bootstrap_complete.sh is the OCaml-seed
+# completeness gate and the canon of the stage0 -> stage1 -> stage2 ->
+# stage3 closure: it resolves the SAME stage0 binary, loads the manifest
+# closure, and drives it through the seed's tg_bootstrap_gate (cfg
+# elimination, resolver, typechecker, access/resource, lowering, MIR
+# verify, mono, second MIR verify, reachable-host closure, VM run and
+# artifact production). This script does not duplicate that pipeline; it
+# delegates the closure gate and then materializes the three ladder
+# artifacts from the SAME seed via bh_ocaml_seed_compile (stage1), then
+# stage1 -> stage2 and stage2 -> stage3.
 STAGE1="$BUILD_DIR/tg_stage1"
-run_logged stage1_compile \
-  "$STAGE0_BIN" compile --strict-resolution "$DRIVER_SRC" -o "$STAGE1" --target "$TARGET_TRIPLE"
+STAGE2="$BUILD_DIR/tg_stage2"
+STAGE3="$BUILD_DIR/tg_stage3"
 
+bh_log "== OCaml seed bootstrap completeness gate (delegated) =="
+bh_log "delegate: scripts/check_ocaml_bootstrap_complete.sh (stage0 -> stage1 -> stage2 -> stage3 closure)"
+set +e
+scripts/check_ocaml_bootstrap_complete.sh 2>&1 | tee "$BOOT_LOG_DIR/ocaml_bootstrap_complete.log"
+OCAML_GATE_RC="${PIPESTATUS[0]}"
+set -e
+if [ "$OCAML_GATE_RC" -ne 0 ]; then
+  bh_err "OCaml seed bootstrap gate FAILED (exit $OCAML_GATE_RC) — see $BOOT_LOG_DIR/ocaml_bootstrap_complete.log"
+  bh_err "the seed's typecheck debt must reach zero before the full self-hosting ladder can complete;"
+  bh_err "run scripts/check_ocaml_seed_health.sh for the pinned-debt development-health gate."
+  exit 1
+fi
+
+# ── stage1: the seed compiles the manifest closure (the stage1 production
+# step the OCaml harness intends; see bh_ocaml_seed_compile).
+bh_log "== Stage 1: kernel via the OCaml seed (manifest closure) =="
+if ! run_logged stage1_compile \
+     bh_ocaml_seed_compile "$STAGE0_BIN" "$ROOT_DIR" "$TARGET_TRIPLE" "$STAGE1"; then
+  bh_err "stage1 failed to build from the OCaml seed"
+  exit 1
+fi
 chmod +x "$STAGE1"
 if ! validate_stage tg_stage1 "$STAGE1"; then
   bh_err "stage1 failed validation"
+  exit 1
+fi
+
+# ── stage2: stage1 compiles itself (self-host).
+bh_log "== Stage 2: self-host via stage1 =="
+if ! run_logged stage2_compile \
+     "$STAGE1" compile --strict-resolution "$DRIVER_SRC" -o "$STAGE2" --target "$TARGET_TRIPLE"; then
+  bh_err "stage2 failed to build"
+  exit 1
+fi
+chmod +x "$STAGE2"
+if ! validate_stage tg_stage2 "$STAGE2"; then
+  bh_err "stage2 failed validation"
+  exit 1
+fi
+
+# ── stage3: stage2 compiles itself (the fixed-point cycle).
+bh_log "== Stage 3: self-host via stage2 =="
+if ! run_logged stage3_compile \
+     "$STAGE2" compile --strict-resolution "$DRIVER_SRC" -o "$STAGE3" --target "$TARGET_TRIPLE"; then
+  bh_err "stage3 failed to build"
+  exit 1
+fi
+chmod +x "$STAGE3"
+if ! validate_stage tg_stage3 "$STAGE3"; then
+  bh_err "stage3 failed validation"
   exit 1
 fi
 
@@ -241,36 +343,7 @@ if [ "$RUN_NATIVE_TESTS" = "1" ]; then
 fi
 
 # ———————————————————————————————————————————————————————————————
-# Step 3 — stage2 (self-host: stage1 compiles itself)
-# ———————————————————————————————————————————————————————————————
-
-bh_log "== Stage 2: self-host via stage1 =="
-STAGE2="$BUILD_DIR/tg_stage2"
-run_logged stage2_compile \
-  "$STAGE1" compile --strict-resolution "$DRIVER_SRC" -o "$STAGE2" --target "$TARGET_TRIPLE"
-
-chmod +x "$STAGE2"
-if ! validate_stage tg_stage2 "$STAGE2"; then
-  bh_err "stage2 failed validation"
-  exit 1
-fi
-
-# Critical canaries under stage2 before the full stage3 cycle.
-if [ "$RUN_NATIVE_TESTS" = "1" ]; then
-  bh_log "== Critical canaries (via stage2) =="
-  if ! run_critical_canaries "$STAGE2" "$BUILD_DIR/.native_stage2"; then
-    bh_err "stage2 critical canaries failed"
-    exit 1
-  fi
-  bh_log "== Semantic canary negatives (via stage2) =="
-  if ! run_semantic_canary_negatives "$STAGE2"; then
-    bh_err "stage2 semantic canary negatives failed"
-    exit 1
-  fi
-fi
-
-# ———————————————————————————————————————————————————————————————
-# Step 4 — stage2 diagnostic ladder
+# Step 3 — stage2 diagnostic ladder
 # ———————————————————————————————————————————————————————————————
 
 if [ "$RUN_LADDER" = "1" ]; then
@@ -282,22 +355,7 @@ if [ "$RUN_LADDER" = "1" ]; then
 fi
 
 # ———————————————————————————————————————————————————————————————
-# Step 5 — stage3 (self-host: stage2 compiles itself)
-# ———————————————————————————————————————————————————————————————
-
-bh_log "== Stage 3: self-host via stage2 =="
-STAGE3="$BUILD_DIR/tg_stage3"
-run_logged stage3_compile \
-  "$STAGE2" compile --strict-resolution "$DRIVER_SRC" -o "$STAGE3" --target "$TARGET_TRIPLE"
-
-chmod +x "$STAGE3"
-if ! validate_stage tg_stage3 "$STAGE3"; then
-  bh_err "stage3 failed validation"
-  exit 1
-fi
-
-# ———————————————————————————————————————————————————————————————
-# Step 5.5 — native canaries + ARM64 encoder/ABI tests
+# Step 4 — native canaries + ARM64 encoder/ABI tests
 # ———————————————————————————————————————————————————————————————
 
 if [ "$RUN_NATIVE_TESTS" = "1" ]; then
@@ -309,7 +367,7 @@ if [ "$RUN_NATIVE_TESTS" = "1" ]; then
 fi
 
 # ———————————————————————————————————————————————————————————————
-# Step 6 — stage2 == stage3 reproducibility gate (every phase)
+# Step 5 — stage2 == stage3 reproducibility gate (every phase)
 # ———————————————————————————————————————————————————————————————
 
 bh_log "== Reproducibility: stage2 vs stage3 =="
@@ -343,12 +401,18 @@ if ! bh_phase_equality tg_stage2 tg_stage3 "$BUILD_DIR" $phase_gate_args; then
 fi
 
 # ———————————————————————————————————————————————————————————————
-# Step 7 — two-root reproducibility check
+# Step 6 — two-root reproducibility check
 # ———————————————————————————————————————————————————————————————
 
+# The OCaml-flow two-root authority: scripts/run_two_root_repro.sh. It
+# re-runs the seed -> stage1 -> stage2 -> stage3 ladder in two fresh roots
+# (ladder mode) and asserts A.stage3 == B.stage3, with the structural
+# comparisons (manifest identity, deterministic generations) in both modes.
+# This replaces the pre-rewire Swift-seeded check_two_clean_dirs call.
 if [ "$RUN_DETERMINISM" = "1" ]; then
-  bh_log "== Two-root reproducibility check (common seed + common host) =="
-  if ! check_two_clean_dirs tg_det "$STAGE2" "$BUILD_DIR" "$ROOT_DIR"; then
+  bh_log "== Two-root reproducibility check (scripts/run_two_root_repro.sh) =="
+  if ! run_logged two_root_repro \
+       bash scripts/run_two_root_repro.sh --with-binary "$STAGE3" --out "$BOOT_LOG_DIR/two_root_repro.txt"; then
     bh_err "two-root reproducibility check failed"
     exit 2
   fi
@@ -359,7 +423,7 @@ fi
 # ———————————————————————————————————————————————————————————————
 
 bh_log "== Bootstrap complete =="
-bh_log "stage0:  $STAGE0_BIN"
+bh_log "stage0:  $STAGE0_BIN (OCaml seed)"
 bh_log "stage1:  $STAGE1"
 bh_log "stage2:  $STAGE2"
 bh_log "stage3:  $STAGE3"

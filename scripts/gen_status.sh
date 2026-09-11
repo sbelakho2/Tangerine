@@ -991,10 +991,20 @@ $STAGE_HASHES_TEXT
   snapshot that lacks them has no run evidence.
 
 CURRENT STATE (structural, verified against the tested tree):
-- Stage0 (Swift interpreter) exists; the ladder is run via ./run_bootstrap.sh
-  (stage0 -> stage1 -> stage2 -> stage3 with stage2 == stage3 byte-identical
-  and per-phase fingerprints; --skip-ladder/--skip-determinism options exist
-  but a full run is the release gate). The self-host GRAMMAR GATE
+- Stage0 (OCaml seed) is THE bootstrap seed; the ladder is run via
+  ./run_bootstrap.sh (stage0 -> stage1 -> stage2 -> stage3 with
+  stage2 == stage3 byte-identical and per-phase fingerprints;
+  --skip-ladder/--skip-determinism options exist but a full run is the
+  release gate). Stage0 is built from stage0_ocaml/ with
+  \`cd stage0_ocaml && dune build\`; the stage0 binary is
+  stage0_ocaml/_build/default/bin/tg_stage0.exe. The Swift stage0
+  (stage0_swift/) is RETIRED — removed from the tree; there is no Swift
+  build step and no fallback seed. The stage0 -> stage1 -> stage2 ->
+  stage3 closure is delegated to
+  scripts/check_ocaml_bootstrap_complete.sh (the OCaml-seed completeness
+  gate), which drives the same closure through the seed's
+  tg_bootstrap_gate; stage1 is the seed compiling the manifest closure
+  (tg_compiler/bootstrap_main.tg). The self-host GRAMMAR GATE
   (scripts/run_selfhost_grammar_gate.sh) runs before any stage is built
   next to the struct-integrity pre-gate: the manifest closure ($KERNEL_CLOSURE_COUNT sources)
   must be free of every forbidden legacy parameter form (mut/&/&mut/move/own

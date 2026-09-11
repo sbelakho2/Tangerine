@@ -238,6 +238,81 @@ type oracle = {
   mutable o_access_seq : int;
 }
 
+(* ── P1 performance: semantics-exact registry lookup caches ──────────
+   The env registries (types / type_ids / type_names / nominals /
+   functions / methods) are SOURCE-NAME association lists (audit P1-23
+   keeps them the name-resolution domain) and every registration
+   REPLACES the list by allocation (remove_assoc + prepend), so each
+   list object is an immutable snapshot.  The checker's hottest
+   recursions (tc_is_copy -> nominal_of_tid, registered_clone_method's
+   owner candidates, Lang_items.of_types, display_type_name, the
+   TypeId->name render paths, method/function dispatch) walk those
+   lists once per lookup — O(N) per lookup, O(N*M) for the nominal
+   sweep on the 7k-item closure.
+
+   Each cache below mirrors the corresponding list walk EXACTLY (the
+   FIRST occurrence wins — the value List.assoc_opt / find_map
+   returns), and records the PHYSICAL list snapshot it was built from.
+   `src != env.<field>` is therefore an exact "the registry changed"
+   test: a declaration-fixpoint re-registration allocates a new list,
+   and the next lookup rebuilds that one cache once; an unchanged env
+   stays O(1) per lookup.  The caches live on the shared mutable
+   per-compilation state, so every `{ env with ... }` copy sees the
+   same tables and no separate invalidation protocol exists.  These
+   caches change NO answer, only the cost of obtaining it. *)
+type lookup_cache = {
+  mutable lc_type_ids_src : (string * Ids.Type_id.t) list;
+  lc_type_id_by_name : (string, Ids.Type_id.t) Hashtbl.t;
+  mutable lc_type_names_src : (Ids.Type_id.t * string) list;
+  lc_name_by_tid : (Ids.Type_id.t, string) Hashtbl.t;
+  mutable lc_nominals_src : (string * nominal) list;
+  lc_nominal_by_name : (string, nominal) Hashtbl.t;
+  mutable lc_nom_by_tid_nominals_src : (string * nominal) list;
+  mutable lc_nom_by_tid_type_ids_src : (string * Ids.Type_id.t) list;
+  lc_nominal_by_tid : (Ids.Type_id.t, string * nominal) Hashtbl.t;
+  mutable lc_types_src : (string * Type_repr.t) list;
+  lc_type_by_name : (string, Type_repr.t) Hashtbl.t;
+  mutable lc_names_by_tid_types_src : (string * Type_repr.t) list;
+  lc_names_by_tid : (Ids.Type_id.t, string list) Hashtbl.t;
+  mutable lc_methods_src : ((string * string) * typed_signature) list;
+  lc_method_by_key : ((string * string), typed_signature) Hashtbl.t;
+  mutable lc_functions_src : (string * typed_signature) list;
+  lc_function_by_name : (string, typed_signature) Hashtbl.t;
+  mutable lc_constructors_src : (string * typed_signature) list;
+  lc_constructor_by_name : (string, typed_signature) Hashtbl.t;
+  mutable lc_consts_src : (string * Type_repr.t) list;
+  lc_const_by_name : (string, Type_repr.t) Hashtbl.t;
+  mutable lc_statics_src : (string * Type_repr.t) list;
+  lc_static_by_name : (string, Type_repr.t) Hashtbl.t;
+}
+
+let fresh_lookup_cache () : lookup_cache =
+  {
+    lc_type_ids_src = [];
+    lc_type_id_by_name = Hashtbl.create 1024;
+    lc_type_names_src = [];
+    lc_name_by_tid = Hashtbl.create 1024;
+    lc_nominals_src = [];
+    lc_nominal_by_name = Hashtbl.create 1024;
+    lc_nom_by_tid_nominals_src = [];
+    lc_nom_by_tid_type_ids_src = [];
+    lc_nominal_by_tid = Hashtbl.create 1024;
+    lc_types_src = [];
+    lc_type_by_name = Hashtbl.create 1024;
+    lc_names_by_tid_types_src = [];
+    lc_names_by_tid = Hashtbl.create 1024;
+    lc_methods_src = [];
+    lc_method_by_key = Hashtbl.create 1024;
+    lc_functions_src = [];
+    lc_function_by_name = Hashtbl.create 1024;
+    lc_constructors_src = [];
+    lc_constructor_by_name = Hashtbl.create 1024;
+    lc_consts_src = [];
+    lc_const_by_name = Hashtbl.create 256;
+    lc_statics_src = [];
+    lc_static_by_name = Hashtbl.create 256;
+  }
+
 (* Mutable check state (per check_program run). *)
 type state = {
   mutable next_type_id : int;
@@ -324,6 +399,9 @@ type state = {
      directly from the checker's own data, never re-parsed from rendered
      text.  Reversed (append order); consumers reverse. *)
   mutable structured_diags : structured_diag list;
+  (* semantics-exact O(1) registry lookup caches (see lookup_cache) —
+     rebuilt lazily from the physical env list snapshots *)
+  lookup : lookup_cache;
 }
 
 (* The audit's structured diagnostic record: the exact fields the
@@ -449,6 +527,191 @@ let assoc_local (name : string) (locals : (string * Type_repr.t * bool) list) :
   match List.find_opt (fun (n, _, _) -> n = name) locals with
   | Some (_, t, m) -> Some (t, m)
   | None -> None
+
+(* ── P1 performance: cached registry lookups (see lookup_cache) ──────
+   Every helper below returns EXACTLY the value of its list walk, with
+   the FIRST occurrence winning (the value List.assoc_opt / find_map /
+   mem_assoc returns).  Rebuild is lazy and keyed on the physical env
+   list snapshot, so a fixpoint re-registration invalidates exactly the
+   changed table, once, on the next lookup. *)
+let type_id_by_name (env : env) (name : string) : Ids.Type_id.t option =
+  let c = env.state.lookup in
+  if c.lc_type_ids_src != env.type_ids then begin
+    Hashtbl.reset c.lc_type_id_by_name;
+    List.iter
+      (fun (n, tid) ->
+        if not (Hashtbl.mem c.lc_type_id_by_name n) then
+          Hashtbl.replace c.lc_type_id_by_name n tid)
+      env.type_ids;
+    c.lc_type_ids_src <- env.type_ids
+  end;
+  Hashtbl.find_opt c.lc_type_id_by_name name
+
+let name_by_tid (env : env) (tid : Ids.Type_id.t) : string option =
+  let c = env.state.lookup in
+  if c.lc_type_names_src != env.type_names then begin
+    Hashtbl.reset c.lc_name_by_tid;
+    List.iter
+      (fun (t, n) ->
+        if not (Hashtbl.mem c.lc_name_by_tid t) then
+          Hashtbl.replace c.lc_name_by_tid t n)
+      env.type_names;
+    c.lc_type_names_src <- env.type_names
+  end;
+  Hashtbl.find_opt c.lc_name_by_tid tid
+
+let nominal_by_name (env : env) (name : string) : nominal option =
+  let c = env.state.lookup in
+  if c.lc_nominals_src != env.nominals then begin
+    Hashtbl.reset c.lc_nominal_by_name;
+    List.iter
+      (fun (n, nom) ->
+        if not (Hashtbl.mem c.lc_nominal_by_name n) then
+          Hashtbl.replace c.lc_nominal_by_name n nom)
+      env.nominals;
+    c.lc_nominals_src <- env.nominals
+  end;
+  Hashtbl.find_opt c.lc_nominal_by_name name
+
+(* The (name, nominal) pair nominal_of_tid returns: the FIRST nominal in
+   env.nominals whose name maps to tid through the FIRST type_ids entry
+   for that name.  Both list walks are mirrored exactly. *)
+let nominal_entry_of_tid (env : env) (tid : Ids.Type_id.t) :
+    (string * nominal) option =
+  let c = env.state.lookup in
+  if
+    c.lc_nom_by_tid_nominals_src != env.nominals
+    || c.lc_nom_by_tid_type_ids_src != env.type_ids
+  then begin
+    Hashtbl.reset c.lc_nominal_by_tid;
+    let tid_of_name = Hashtbl.create (List.length env.type_ids + 1) in
+    List.iter
+      (fun (n, t) ->
+        if not (Hashtbl.mem tid_of_name n) then Hashtbl.add tid_of_name n t)
+      env.type_ids;
+    List.iter
+      (fun (name, nom) ->
+        match Hashtbl.find_opt tid_of_name name with
+        | Some t ->
+            if not (Hashtbl.mem c.lc_nominal_by_tid t) then
+              Hashtbl.replace c.lc_nominal_by_tid t (name, nom)
+        | None -> ())
+      env.nominals;
+    c.lc_nom_by_tid_nominals_src <- env.nominals;
+    c.lc_nom_by_tid_type_ids_src <- env.type_ids
+  end;
+  Hashtbl.find_opt c.lc_nominal_by_tid tid
+
+let type_by_name (env : env) (name : string) : Type_repr.t option =
+  let c = env.state.lookup in
+  if c.lc_types_src != env.types then begin
+    Hashtbl.reset c.lc_type_by_name;
+    List.iter
+      (fun (n, ty) ->
+        if not (Hashtbl.mem c.lc_type_by_name n) then
+          Hashtbl.replace c.lc_type_by_name n ty)
+      env.types;
+    c.lc_types_src <- env.types
+  end;
+  Hashtbl.find_opt c.lc_type_by_name name
+
+(* Every name whose env.types entry is Named(tid, _), in env.types order
+   (exactly List.filter_map's result — duplicates included). *)
+let names_of_tid (env : env) (tid : Ids.Type_id.t) : string list =
+  let c = env.state.lookup in
+  if c.lc_names_by_tid_types_src != env.types then begin
+    Hashtbl.reset c.lc_names_by_tid;
+    List.iter
+      (fun (name, ty) ->
+        match ty with
+        | Type_repr.Named (t, _) ->
+            let prev =
+              match Hashtbl.find_opt c.lc_names_by_tid t with
+              | Some l -> l
+              | None -> []
+            in
+            Hashtbl.replace c.lc_names_by_tid t (name :: prev)
+        | _ -> ())
+      env.types;
+    c.lc_names_by_tid_types_src <- env.types
+  end;
+  match Hashtbl.find_opt c.lc_names_by_tid tid with
+  | Some names -> List.rev names
+  | None -> []
+
+let first_name_of_tid (env : env) (tid : Ids.Type_id.t) : string option =
+  match names_of_tid env tid with [] -> None | n :: _ -> Some n
+
+let method_of_key (env : env) (owner : string) (mname : string) :
+    typed_signature option =
+  let c = env.state.lookup in
+  if c.lc_methods_src != env.methods then begin
+    Hashtbl.reset c.lc_method_by_key;
+    List.iter
+      (fun (k, ts) ->
+        if not (Hashtbl.mem c.lc_method_by_key k) then
+          Hashtbl.replace c.lc_method_by_key k ts)
+      env.methods;
+    c.lc_methods_src <- env.methods
+  end;
+  Hashtbl.find_opt c.lc_method_by_key (owner, mname)
+
+let function_of_name (env : env) (name : string) : typed_signature option =
+  let c = env.state.lookup in
+  if c.lc_functions_src != env.functions then begin
+    Hashtbl.reset c.lc_function_by_name;
+    List.iter
+      (fun (n, ts) ->
+        if not (Hashtbl.mem c.lc_function_by_name n) then
+          Hashtbl.replace c.lc_function_by_name n ts)
+      env.functions;
+    c.lc_functions_src <- env.functions
+  end;
+  Hashtbl.find_opt c.lc_function_by_name name
+
+let constructor_of_name (env : env) (name : string) : typed_signature option =
+  let c = env.state.lookup in
+  if c.lc_constructors_src != env.constructors then begin
+    Hashtbl.reset c.lc_constructor_by_name;
+    List.iter
+      (fun (n, ts) ->
+        if not (Hashtbl.mem c.lc_constructor_by_name n) then
+          Hashtbl.replace c.lc_constructor_by_name n ts)
+      env.constructors;
+    c.lc_constructors_src <- env.constructors
+  end;
+  Hashtbl.find_opt c.lc_constructor_by_name name
+
+let const_of_name (env : env) (name : string) : Type_repr.t option =
+  let c = env.state.lookup in
+  if c.lc_consts_src != env.consts then begin
+    Hashtbl.reset c.lc_const_by_name;
+    List.iter
+      (fun (n, ty) ->
+        if not (Hashtbl.mem c.lc_const_by_name n) then
+          Hashtbl.replace c.lc_const_by_name n ty)
+      env.consts;
+    c.lc_consts_src <- env.consts
+  end;
+  Hashtbl.find_opt c.lc_const_by_name name
+
+let static_of_name (env : env) (name : string) : Type_repr.t option =
+  let c = env.state.lookup in
+  if c.lc_statics_src != env.statics then begin
+    Hashtbl.reset c.lc_static_by_name;
+    List.iter
+      (fun (n, ty) ->
+        if not (Hashtbl.mem c.lc_static_by_name n) then
+          Hashtbl.replace c.lc_static_by_name n ty)
+      env.statics;
+    c.lc_statics_src <- env.statics
+  end;
+  Hashtbl.find_opt c.lc_static_by_name name
+
+(* The LangItems record of this env, built through the cached name table
+   — exactly Lang_items.of_types env.types, without the 14 list scans. *)
+let lang_items_of_env (env : env) : Lang_items.t =
+  Lang_items.of_lookup (type_by_name env)
 
 (* error-monad bind *)
 let ( let* ) (r : ('a, string) result) (f : 'a -> ('b, string) result) : ('b, string) result =
@@ -1483,6 +1746,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
       debt_last_printed =
         Debt_report.empty |> Debt_report.to_lines |> String.concat "\n";
       structured_diags = [];
+      lookup = fresh_lookup_cache ();
     }
   in
   (* callable-domain separation (identity-handoff fix): the resolver's
@@ -2519,12 +2783,12 @@ and resolve_named (env : env) (scope : scope) (span : Span.span) (name : string)
                         in
                         if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
                           Printf.eprintf "DEBUG-QUAL name=%s head=%s last=%s found=%b\n" name head
-                            last (List.mem_assoc last env.types);
-                        match List.assoc_opt last env.types with
+                            last ((type_by_name env last <> None));
+                        match type_by_name env last with
                         | Some entry -> Ok entry
                         | None -> Error (err span ("unknown type `" ^ name ^ "`")))))
           | None -> (
-              match List.assoc_opt name env.types with
+              match type_by_name env name with
               | None -> Error (err span ("unknown type `" ^ name ^ "`"))
               | Some entry -> (
                   let resolved_args =
@@ -2762,7 +3026,7 @@ let access_item_key (env : env) : string =
    given Type_id (nom_field_ids is the resolver's identity list,
    parallel to nom_fields). *)
 let field_id_of (env : env) (owner_name : string) (fname : string) : Ids.Field_id.t option =
-  match List.assoc_opt owner_name env.nominals with
+  match nominal_by_name env owner_name with
   | None -> None
   | Some nom -> (
       let rec index_of i = function
@@ -2800,9 +3064,9 @@ let rec static_type_of (env : env) (scope : scope) (e : Ast.expr) : Type_repr.t 
           in
           match bt with
           | Type_repr.Named (tid, _args) -> (
-              match List.assoc_opt tid env.type_names with
+              match name_by_tid env tid with
               | Some owner -> (
-                  match List.assoc_opt owner env.nominals with
+                  match nominal_by_name env owner with
                   | Some nom when nom.nom_kind = `Struct -> (
                       match List.assoc_opt fname nom.nom_fields with
                       | Some ft -> Some ft
@@ -2843,7 +3107,7 @@ let rec place_of_expr (env : env) (scope : scope) (e : Ast.expr) : Access_check.
           let fid =
             match static_type_of env scope base with
             | Some (Type_repr.Named (tid, _)) -> (
-                match List.assoc_opt tid env.type_names with
+                match name_by_tid env tid with
                 | Some oname -> field_id_of env oname fname
                 | None -> None)
             | _ -> None
@@ -2999,9 +3263,9 @@ let nullary_variant_of_subject (env : env) (subject : Type_repr.t) (name : strin
     Ids.Variant_id.t option =
   match subject with
   | Type_repr.Named (tid, _) -> (
-      match List.assoc_opt tid env.type_names with
+      match name_by_tid env tid with
       | Some ename -> (
-          match List.assoc_opt ename env.nominals with
+          match nominal_by_name env ename with
           | Some nom when nom.nom_kind = `Enum -> (
               let rec find i = function
                 | [] -> None
@@ -3055,16 +3319,12 @@ let nullary_variant_of_subject (env : env) (subject : Type_repr.t) (name : strin
        synthesized body re-validates on the final concrete types). *)
 
 (* The nominal (def) of a TypeId through the checker's name tables —
-   the mirror of mir_derive.nominal_of_tid (no module may import the
-   other's private walker; both resolve the same tables). *)
+    the mirror of mir_derive.nominal_of_tid (no module may import the
+    other's private walker; both resolve the same tables).  The walk is
+    served by the O(1) nominal_entry_of_tid cache, whose rebuild
+    mirrors this list scan exactly. *)
 let nominal_of_tid (env : env) (tid : Ids.Type_id.t) : nominal option =
-  List.find_map
-    (fun (name, nom) ->
-      match List.assoc_opt name env.type_ids with
-      | Some t when Ids.Type_id.compare t tid = 0 -> Some nom
-      | Some _ -> None
-      | None -> None)
-    env.nominals
+  Option.map snd (nominal_entry_of_tid env tid)
 
 (* The instance-substituted Copy decision for a value type: the P0-2
    property engine over the nominal defs, with the instance's type
@@ -3072,8 +3332,16 @@ let nominal_of_tid (env : env) (tid : Ids.Type_id.t) : nominal option =
    recursion (so a template def never answers conservatively for a
    concrete instance).  Owning LangItems and raw pointers answer by
    their direct properties; Option/Result/structs/enums answer through
-   their defs. *)
-let rec tc_is_copy (env : env) (li : Lang_items.t) (ty : Type_repr.t) : bool =
+   their defs.
+
+   `seen` is the P0-2 cycle rule (type_properties.of_type's seen list):
+   a TypeId already on the current expansion path answers
+   conservatively owned (false), so a self-referential nominal
+   (`struct Node { next: Option[Node] }`) terminates instead of
+   recursing without bound — exactly the answer the ONE property
+   authority gives for the same shape. *)
+let rec tc_is_copy_seen (env : env) (li : Lang_items.t)
+    (seen : Ids.Type_id.t list) (ty : Type_repr.t) : bool =
   match ty with
   | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _ | Type_repr.Float _
   | Type_repr.Never | Type_repr.Ref_internal _ | Type_repr.Raw_ptr _ ->
@@ -3081,17 +3349,18 @@ let rec tc_is_copy (env : env) (li : Lang_items.t) (ty : Type_repr.t) : bool =
   | Type_repr.String | Type_repr.Type_param _ | Type_repr.Infer_var _
   | Type_repr.Int_literal _ | Type_repr.Error ->
       false
-  | Type_repr.Tuple elems -> Array.for_all (tc_is_copy env li) elems
-  | Type_repr.Fixed_array (e, _) -> tc_is_copy env li e
+  | Type_repr.Tuple elems -> Array.for_all (tc_is_copy_seen env li seen) elems
+  | Type_repr.Fixed_array (e, _) -> tc_is_copy_seen env li seen e
   | Type_repr.Function (ps, ret) -> (
       match ret with
       | Type_repr.Never ->
           (* the def_repr'd ENUM encoding (payloads, Never) *)
-          Array.for_all (fun p -> tc_is_copy env li p.Type_repr.pt_type) ps
+          Array.for_all (fun p -> tc_is_copy_seen env li seen p.Type_repr.pt_type) ps
       | _ -> (* a genuine function pointer is an immediate value *) true)
   | Type_repr.Named (tid, args) ->
       if Lang_items.is_raw_pointer li tid then true
       else if Lang_items.is_owning_handle li tid then false
+      else if List.mem tid seen then false (* the P0-2 cycle answer *)
       else (
         match nominal_of_tid env tid with
         | None -> false (* a def-less nominal: conservative owned *)
@@ -3104,18 +3373,24 @@ let rec tc_is_copy (env : env) (li : Lang_items.t) (ty : Type_repr.t) : bool =
                   ps (Array.to_list args)
               else []
             in
+            let seen = tid :: seen in
             (match nom.nom_kind with
              | `Struct ->
                  List.for_all
-                   (fun (_, fty) -> tc_is_copy env li (Type_repr.substitute subst fty))
+                   (fun (_, fty) ->
+                     tc_is_copy_seen env li seen (Type_repr.substitute subst fty))
                    nom.nom_fields
              | `Enum ->
                  List.for_all
                    (fun (_, pty) ->
                      Array.for_all
-                       (fun p -> tc_is_copy env li (Type_repr.substitute subst p))
+                       (fun p ->
+                         tc_is_copy_seen env li seen (Type_repr.substitute subst p))
                        pty)
                    nom.nom_variants))
+
+let tc_is_copy (env : env) (li : Lang_items.t) (ty : Type_repr.t) : bool =
+  tc_is_copy_seen env li [] ty
 
 (* The owner-name alias convention of the method dispatch (the same
    candidate owners check_method_call's try_owners uses), so the clone
@@ -3139,13 +3414,7 @@ let type_owner_candidates (env : env) (ty : Type_repr.t) : string list =
   let base =
     match ty with
     | Type_repr.String -> [ "String" ]
-    | Type_repr.Named (tid, _) ->
-        List.filter_map
-          (fun (n, t) ->
-            match t with
-            | Type_repr.Named (t2, _) when Ids.Type_id.compare t2 tid = 0 -> Some n
-            | _ -> None)
-          env.types
+    | Type_repr.Named (tid, _) -> names_of_tid env tid
     | _ -> []
   in
   let rec expand acc = function
@@ -3171,7 +3440,7 @@ let registered_clone_method (env : env) (ty : Type_repr.t) :
   let rec go = function
     | [] -> None
     | o :: rest -> (
-        match List.assoc_opt (o, "clone") env.methods with
+        match method_of_key env o "clone" with
         | Some ts when Array.length ts.ts_params >= 1 -> (
             match
               Trait_solver.unify_target []
@@ -3196,14 +3465,7 @@ let clone_bound_of (env : env) (pid : Ids.Generic_param_id.t) : bool =
 let rec display_type_name (env : env) (ty : Type_repr.t) : string =
   match ty with
   | Type_repr.Named (tid, args) ->
-      let name_of () =
-        List.find_map
-          (fun (n, t) ->
-            match t with
-            | Type_repr.Named (t2, _) when Ids.Type_id.compare t2 tid = 0 -> Some n
-            | _ -> None)
-          env.types
-      in
+      let name_of () = first_name_of_tid env tid in
       let name = match name_of () with Some n -> n | None -> type_to_string ty in
       if Array.length args = 0 then name
       else
@@ -3359,7 +3621,7 @@ let clone_receiver_obligation (env : env) (li : Lang_items.t)
    receiver's name (anchored by the caller at the method-call span). *)
 let derived_clone_obligations (env : env) (ty : Type_repr.t) :
     ((Type_repr.t * (string * Type_repr.t array) list) list, string) result =
-  let li = Lang_items.of_types env.types in
+  let li = lang_items_of_env env in
   let needed = ref [] in
   match clone_receiver_obligation env li needed ty with
   | Error m ->
@@ -3630,9 +3892,9 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
   if seg1 = "" then begin
     match subject with
     | Type_repr.Named (tid, args) -> (
-        match List.assoc_opt tid env.type_names with
+        match name_by_tid env tid with
         | Some name -> (
-            match List.assoc_opt name env.nominals with
+            match nominal_by_name env name with
             | Some nom when nom.nom_kind = `Enum -> (
                 match List.assoc_opt seg2 nom.nom_variants with
                 | Some field_tys ->
@@ -3664,7 +3926,7 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
               match subject with
               | Type_repr.Named (sid, sargs) when Ids.Type_id.compare sid tid = 0 -> sargs
               | Type_repr.Named (sid, sargs) -> (
-                  match List.assoc_opt sid env.type_names with
+                  match name_by_tid env sid with
                   | Some n1 -> if n1 = seg1 then sargs else args
                   | None -> args)
               | _ -> args
@@ -3684,9 +3946,9 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
 
 and resolve_nominal (env : env) (span : Span.span) (name : string) :
     (nominal * Ids.Type_id.t * Type_repr.t array, string) result =
-  match List.assoc_opt name env.nominals with
+  match nominal_by_name env name with
   | Some nom -> (
-      match List.assoc_opt name env.types with
+      match type_by_name env name with
       | Some (Type_repr.Named (tid, args)) -> Ok (nom, tid, args)
       | _ -> Error (err span (Printf.sprintf "`%s` is not a nominal type" name)))
   | None -> (
@@ -3705,17 +3967,17 @@ and resolve_nominal (env : env) (span : Span.span) (name : string) :
       | Some i when i + 1 < len -> (
           let qualifier = String.sub name 0 (i - 1) in
           let member = String.sub name (i + 1) (len - i - 1) in
-          match List.assoc_opt qualifier env.nominals with
+          match nominal_by_name env qualifier with
           | Some nom -> (
-              match List.assoc_opt qualifier env.types with
+              match type_by_name env qualifier with
               | Some (Type_repr.Named (tid, args)) -> Ok (nom, tid, args)
               | _ -> Error (err span (Printf.sprintf "`%s` is not a nominal type" qualifier)))
           | None -> (
               (* the qualifier is a module path: resolve the last segment
                  flat (the module-qualified struct form) *)
-              match List.assoc_opt member env.nominals with
+              match nominal_by_name env member with
               | Some nom -> (
-                  match List.assoc_opt member env.types with
+                  match type_by_name env member with
                   | Some (Type_repr.Named (tid, args)) -> Ok (nom, tid, args)
                   | _ -> Error (err span (Printf.sprintf "`%s` is not a nominal type" member)))
               | None ->
@@ -3766,8 +4028,8 @@ and unify_expected (env : env) (actual : Type_repr.t) (expected : Type_repr.t)
     match a, b with
     | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
       when Ids.Type_id.compare id1 id2 <> 0 -> (
-        let n1 = List.assoc_opt id1 env.type_names in
-        let n2 = List.assoc_opt id2 env.type_names in
+        let n1 = name_by_tid env id1 in
+        let n2 = name_by_tid env id2 in
         let alias_pair =
           match n1, n2 with
           | Some n, Some m ->
@@ -3811,7 +4073,7 @@ and unify_expected (env : env) (actual : Type_repr.t) (expected : Type_repr.t)
       | Some () -> Ok !s
       | None ->
           (if context <> "transactional probe" then (
-             let name_of_id i = match List.assoc_opt i env.type_names with
+             let name_of_id i = match name_by_tid env i with
                | Some n -> n | None -> "?"
              in
              let rec ids_of ty acc = match ty with
@@ -4124,7 +4386,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                        raises the closure debt to 259; kept with its
                        reachability reported until the kernel's literals
                        pass explicit type arguments *)
-                    match List.assoc_opt name env.types with
+                    match type_by_name env name with
                     | Some (Type_repr.Named (_, a)) ->
                         Ok
                           (Array.of_list
@@ -4355,7 +4617,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                   Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span; te_flow = normal_flow (t) }
               | Type_repr.Named (id, [| t |]) -> (
                   (* the kernel's Array/Vec containers are indexable *)
-                  match List.assoc_opt id env.type_names with
+                  match name_by_tid env id with
                   | Some ("Array" | "Vec") ->
                       Ok { te_type = t; te_effects = Array.append te.te_effects [| Access_effect.Read |]; te_span = span; te_flow = normal_flow (t) }
                   | _ ->
@@ -4454,7 +4716,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
             when Array.length args > 0
                  && (Ids.Type_id.compare id b_option = 0
                     || Ids.Type_id.compare id b_result = 0
-                    || (match List.assoc_opt id env.type_names with
+                    || (match name_by_tid env id with
                         | Some ("Option" | "Result") -> true
                         | _ -> false)) ->
               (* `?` unwraps the Ok/Some payload: the first type argument
@@ -4922,11 +5184,11 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                   if Sys.getenv_opt "TANGERINE_DEBUG_ITER" <> None then
                     Printf.eprintf "DBG-ITER tid=%d name=%s args=%d\n"
                       (Ids.Type_id.to_int id)
-                      (match List.assoc_opt id env.type_names with
+                      (match name_by_tid env id with
                        | Some n -> n | None -> "?")
                       (Array.length args)
                 in
-                match List.assoc_opt id env.type_names with
+                match name_by_tid env id with
                 | Some ("Array" | "Vec" | "Set") when Array.length args = 1 ->
                     Some args.(0)
                 | Some "Map" when Array.length args = 2 ->
@@ -4967,7 +5229,7 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                         | Type_repr.String -> IterString
                         | Type_repr.Tuple _ -> IterTuple
                         | Type_repr.Named (id, _) -> (
-                            match List.assoc_opt id env.type_names with
+                            match name_by_tid env id with
                             | Some "Map" -> IterMap
                             | Some "Set" -> IterSet
                             | _ -> IterOther)
@@ -6129,12 +6391,12 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
             let qualified =
               match env.module_path with
               | [] -> None
-              | mp -> List.assoc_opt (String.concat "::" (mp @ [ n ])) env.statics
+              | mp -> static_of_name env (String.concat "::" (mp @ [ n ]))
             in
             match qualified with
             | Some t -> Some t
             | None -> (
-                match List.assoc_opt n env.statics with
+                match static_of_name env n with
                 | Some t -> Some t
                 | None -> (
                     let suffix = "::" ^ n in
@@ -6188,7 +6450,7 @@ and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool
                   Ok (t, bmut)
               | Type_repr.Named (id, [| t |]) -> (
                   (* the kernel's Array/Vec containers are indexable *)
-                  match List.assoc_opt id env.type_names with
+                  match name_by_tid env id with
                   | Some ("Array" | "Vec") -> Ok (t, bmut)
                   | _ ->
                       Error
@@ -6257,7 +6519,7 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
           (* a field on a Box derefs the boxed value (`expr.kind` on a
              Box[Expr]) UNLESS the Box declares the field itself
              (`self.ptr` inside impl Box) *)
-          match List.assoc_opt "Box" env.nominals with
+          match nominal_by_name env "Box" with
           | Some nom when List.mem_assoc fname nom.nom_fields -> (
               match List.assoc_opt fname nom.nom_fields with
               | Some ft ->
@@ -6275,7 +6537,7 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
           (* the source Ptr struct's own fields first (`self.address`
              inside impl Ptr), then the pointee deref (`self.ptr.as_mut()
              .refcount`) *)
-          match List.assoc_opt "Ptr" env.nominals with
+          match nominal_by_name env "Ptr" with
           | Some nom when List.mem_assoc fname nom.nom_fields -> (
               match List.assoc_opt fname nom.nom_fields with
               | Some ft ->
@@ -6283,9 +6545,9 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
               | None -> check_field env _scope span { base with te_type = inner } fname)
           | _ -> check_field env _scope span { base with te_type = inner } fname)
       | Type_repr.Named (tid, args) -> (
-          match List.assoc_opt tid env.type_names with
+          match name_by_tid env tid with
           | Some owner -> (
-              match List.assoc_opt owner env.nominals with
+              match nominal_by_name env owner with
               | Some nom when nom.nom_kind = `Struct -> (
                   match List.assoc_opt fname nom.nom_fields with
                   | Some ft ->
@@ -6331,12 +6593,12 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
       let qualified =
         match env.module_path with
         | [] -> None
-        | mp -> List.assoc_opt (String.concat "::" (mp @ [ n ])) env.statics
+        | mp -> static_of_name env (String.concat "::" (mp @ [ n ]))
       in
       match qualified with
       | Some t -> Some t
       | None -> (
-          match List.assoc_opt n env.statics with
+          match static_of_name env n with
           | Some t -> Some t
           | None -> (
               let suffix = "::" ^ n in
@@ -6417,7 +6679,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
            match
              match env.module_path with
              | [] -> None
-             | mp -> List.assoc_opt (String.concat "::" (mp @ [ n ])) env.consts
+             | mp -> const_of_name env (String.concat "::" (mp @ [ n ]))
            with
            | Some t ->
                let subst = ref [] in
@@ -6447,7 +6709,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                   its unique closure-wide declaration (EFFECT_IO,
                   VERSION, SYNTHETIC_MODULE_* — the flat-name rule) *)
                (match
-                  match List.assoc_opt n env.consts with
+                  match const_of_name env n with
                   | Some t -> Some t
                   | None -> (
                       match
@@ -6474,12 +6736,12 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                         te_flow = normal_flow (substitute_fixpoint !subst t);
                       }
                 | None ->
-                    (match List.assoc_opt n env.constructors with
+                    (match constructor_of_name env n with
                      | Some cs ->
                          check_call_sig env scope expected node_id cs [] [] span
                            ~hint:CCH_constructor
                      | None -> (
-                         match List.assoc_opt n env.functions with
+                         match function_of_name env n with
                          | Some fs ->
                              let fn_ty = Type_repr.Function (fs.ts_params, fs.ts_return) in
                              (match expected with
@@ -6513,7 +6775,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                          | None -> (
                              (* a type name used as a value: the static method
                                 dispatch's synthetic receiver (`Type::method`) *)
-                             match List.assoc_opt n env.types with
+                             match type_by_name env n with
                              | Some ty ->
                                  Ok
                                    {
@@ -6612,7 +6874,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
       | Some (t, _) ->
           Error (err span (Printf.sprintf "cannot call a value of type %s" (type_to_string t)))
       | None -> (
-          match List.assoc_opt n env.constructors with
+          match constructor_of_name env n with
           | Some cs ->
               check_call_sig env scope expected node_id cs targs args span ~hint:CCH_constructor
           | None -> (
@@ -6629,7 +6891,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                       else
                         let owner = String.sub n 0 i in
                         let mname = String.sub n (i + 2) (String.length n - i - 2) in
-                        match List.assoc_opt (owner, mname) env.methods with
+                        match method_of_key env owner mname with
                         | Some sig_ ->
                             (* prepend the synthetic receiver only when the
                                method actually declares one (`self` as its
@@ -6654,7 +6916,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                  argument) must not receive a synthetic
                                  receiver. *)
                               let self_is_owner =
-                                match List.assoc_opt owner env.types with
+                                match type_by_name env owner with
                                 | Some (Type_repr.Named (tid1, _)) -> (
                                     match sig_.ts_params.(0).Type_repr.pt_type with
                                     | Type_repr.Named (tid2, _) ->
@@ -6679,7 +6941,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                several names; try each *)
                             let owner_nom_names =
                               let base =
-                                match List.assoc_opt owner env.types with
+                                match type_by_name env owner with
                                 | Some (Type_repr.Named (tid, _)) ->
                                     List.filter_map
                                       (fun (t, n) ->
@@ -6717,7 +6979,7 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                       Error
                                         (err span (Printf.sprintf "unknown function `%s`" n)))
                               | alias_owner :: rest -> (
-                                  match List.assoc_opt (alias_owner, mname) env.methods with
+                                  match method_of_key env alias_owner mname with
                                   | Some sig_ ->
                                       let has_self2 =
                                         Array.length sig_.ts_params > 0
@@ -6763,9 +7025,9 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
            in
            match bt with
            | Type_repr.Named (tid, _) -> (
-               match List.assoc_opt tid env.type_names with
+               match name_by_tid env tid with
                | Some oname -> (
-                   match List.assoc_opt oname env.nominals with
+                   match nominal_by_name env oname with
                    | Some nom when nom.nom_kind = `Struct -> (
                        match List.assoc_opt mname nom.nom_fields with
                        | Some (Type_repr.Function _ as ft) ->
@@ -6998,7 +7260,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                         match pt, ate.te_type with
                         | Type_repr.Named (id1, a1), Type_repr.Named (id2, a2)
                           when Ids.Type_id.compare id1 id2 <> 0 -> (
-                            match List.assoc_opt id1 env.type_names, List.assoc_opt id2 env.type_names with
+                            match name_by_tid env id1, name_by_tid env id2 with
                             | Some n, Some m2 when n = m2 ->
                                 if Array.length a1 <> Array.length a2 then None
                                 else begin
@@ -7040,7 +7302,7 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
                       let ref_to_raw_ptr () =
                         match pt, ate.te_type with
                         | Type_repr.Named (pid, [| inner |]), Type_repr.Ref_internal (_, ref_inner) -> (
-                            match List.assoc_opt pid env.type_names with
+                            match name_by_tid env pid with
                             | Some ("Ptr" | "PtrMut") -> (
                                 let s5 = ref [] in
                                 match unify env.state.box_tid s5 inner ref_inner with
@@ -7252,7 +7514,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   let owner_name =
     match owner_ty with
     | Type_repr.Named (tid, _) -> (
-        match List.assoc_opt tid env.type_names with
+        match name_by_tid env tid with
         | Some n -> Some n
         | None -> primitive_name owner_ty)
     | Type_repr.Fixed_array _ -> Some "Array"
@@ -7310,7 +7572,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   let rec try_owners = function
     | [] -> None
     | o :: rest -> (
-        match List.assoc_opt (o, mname) env.methods with
+        match method_of_key env o mname with
         | Some sig_ -> Some (o, sig_)
         | None -> try_owners rest)
   in
@@ -7638,8 +7900,8 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
                              (* the method key's owner name is the authority:
                                 the builtin Vec nominal is named "Array", so
                                 (Vec, len) matches a receiver named "Vec" *)
-                             let n1 = List.assoc_opt id1 env.type_names in
-                             let n2 = List.assoc_opt id2 env.type_names in
+                             let n1 = name_by_tid env id1 in
+                             let n2 = name_by_tid env id2 in
                              let names_agree =
                               match n1, n2 with
                               | Some n, Some m -> n = m || n = oname || m = oname
@@ -8180,7 +8442,7 @@ and check_methods (env : env) (owner : string)
   let rec go = function
     | [] -> Ok ()
     | (m : Ast.function_decl) :: rest -> (
-        match List.assoc_opt (owner, m.fn_sig.sig_name) env.methods with
+        match method_of_key env owner m.fn_sig.sig_name with
         | None ->
             if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then begin
               let matching =
@@ -8213,7 +8475,7 @@ and check_methods (env : env) (owner : string)
 and check_function_item (env : env) (mp : string list) (d : Ast.function_decl) :
     (unit, string) result =
   let qname = qualified_name mp d.fn_sig.sig_name in
-  match List.assoc_opt qname env.functions with
+  match function_of_name env qname with
   | None ->
       Error (err d.fn_span (Printf.sprintf "internal: function `%s` was not registered" qname))
   | Some sig_ ->
@@ -8240,7 +8502,7 @@ and check_function_item (env : env) (mp : string list) (d : Ast.function_decl) :
         check_function_body env [] sig_ d)
 
 and check_struct (env : env) (d : Ast.struct_decl) : (unit, string) result =
-  match List.assoc_opt d.s_name env.nominals, List.assoc_opt d.s_name env.types with
+  match nominal_by_name env d.s_name, type_by_name env d.s_name with
   | Some nom, Some (Type_repr.Named (tid, args)) -> (
       let self_ty = Type_repr.Named (tid, args) in
       let tp_bounds =
@@ -8274,7 +8536,7 @@ and check_struct (env : env) (d : Ast.struct_decl) : (unit, string) result =
   | _ -> Error (err d.s_span (Printf.sprintf "internal: struct `%s` was not registered" d.s_name))
 
 and check_enum (env : env) (d : Ast.enum_decl) : (unit, string) result =
-  match List.assoc_opt d.e_name env.nominals with
+  match nominal_by_name env d.e_name with
   | None -> Error (err d.e_span (Printf.sprintf "internal: enum `%s` was not registered" d.e_name))
   | Some nom -> (
       let tp_bounds =
@@ -8307,7 +8569,7 @@ and check_trait (env : env) (d : Ast.trait_decl) : (unit, string) result =
           match m.fn_body with
           | Ast.FnSignatureOnly -> go rest
           | _ -> (
-              match List.assoc_opt (d.t_name, m.fn_sig.sig_name) env'.methods with
+              match method_of_key env' d.t_name m.fn_sig.sig_name with
               | None -> Error (err m.fn_span "internal: trait method was not registered")
               | Some sig_ -> (
                   (* audit P0-6: default bodies of non-canonical duplicate
@@ -8378,7 +8640,7 @@ and check_impl (env : env) (d : Ast.impl_decl) : (unit, string) result =
   result
 
 and check_const (env : env) (mp : string list) (d : Ast.const_decl) : (unit, string) result =
-  match List.assoc_opt (qualified_name mp d.c_name) env.consts with
+  match const_of_name env (qualified_name mp d.c_name) with
   | None -> Error (err d.c_span "internal: const was not registered")
   | Some ty -> (
       match check_expr env empty_scope (Some ty) d.c_value with
@@ -8386,7 +8648,7 @@ and check_const (env : env) (mp : string list) (d : Ast.const_decl) : (unit, str
       | Error m -> Error m)
 
 and check_static (env : env) (mp : string list) (d : Ast.static_decl) : (unit, string) result =
-  match List.assoc_opt (qualified_name mp d.st_name) env.statics with
+  match static_of_name env (qualified_name mp d.st_name) with
   | None -> Error (err d.st_span "internal: static was not registered")
   | Some ty -> (
       match check_expr env empty_scope (Some ty) d.st_value with
@@ -8424,7 +8686,7 @@ and check_item (env : env) (item : Ast.item) : (unit, string) result =
   | Ast.Function d -> check_function_item env item.module_path d
   | Ast.TestDecl d -> (
       let qname = qualified_name item.module_path d.test_name in
-      match List.assoc_opt qname env.functions with
+      match function_of_name env qname with
       | None -> Error (err item.span "internal: test was not registered")
       | Some sig_ ->
           (* audit P0-6: only the canonical declaration of a duplicated
@@ -8767,7 +9029,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
   | Ast.Function d ->
       let qname = qualified_name item.module_path d.fn_sig.sig_name in
       let reg_key = "fn::" ^ qname in
-      if List.mem_assoc qname env.functions then begin
+      if (function_of_name env qname <> None) then begin
         (* audit P0-6: the duplicate-function tolerance keeps the FIRST
            registration.  The canonical declaration re-registering in a
            later fixpoint round compares equal by its own decl key and is
@@ -8813,7 +9075,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
   | Ast.TestDecl d ->
       let qname = qualified_name item.module_path d.test_name in
       let reg_key = "test::" ^ qname in
-      if List.mem_assoc qname env.functions then begin
+      if (function_of_name env qname <> None) then begin
         (match Hashtbl.find_opt env.state.decl_keys reg_key with
          | Some canon when canon <> fn_decl_key d.test_span ->
              note_dup_decl env reg_key canon (fn_decl_key d.test_span)
@@ -8843,14 +9105,14 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
       let scope = { empty_scope with generics = params } in
       (* re-registration merges newly resolvable fields into the nominal *)
       let existing, env_base =
-        match List.assoc_opt d.s_name env.nominals with
+        match nominal_by_name env d.s_name with
         | Some nom -> (Some nom, env)
         | None ->
             (* LangItem tid adoption (audit Fix 4): a source declaration of
                a builtin standard type reuses the builtin's TypeId, so
                Vec/Map/Set/Option/Result/Ptr have ONE identity *)
             let tid =
-              match List.assoc_opt d.s_name env.type_ids with
+              match type_id_by_name env d.s_name with
               | Some t -> t
               | None -> fresh_type_id env.state
             in
@@ -8872,7 +9134,11 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             type_names_global := (tid, d.s_name) :: !type_names_global;
             (None, env')
       in
-      let tid = List.assoc d.s_name env_base.type_ids in
+      let tid =
+        match type_id_by_name env_base d.s_name with
+        | Some t -> t
+        | None -> raise Not_found
+      in
       let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
       let env_fwd = env_base in
       (* resolve fields one by one; unresolvable ones are reported and
@@ -8937,14 +9203,14 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
       in
       let scope = { empty_scope with generics = params } in
       let existing, env_base =
-        match List.assoc_opt d.e_name env.nominals with
+        match nominal_by_name env d.e_name with
         | Some nom -> (Some nom, env)
         | None ->
             (* LangItem tid adoption (audit Fix 4): a source declaration of
                a builtin standard type reuses the builtin's TypeId, so
                Vec/Map/Set/Option/Result/Ptr have ONE identity *)
             let tid =
-              match List.assoc_opt d.e_name env.type_ids with
+              match type_id_by_name env d.e_name with
               | Some t -> t
               | None -> fresh_type_id env.state
             in
@@ -8963,7 +9229,11 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             in
             (None, env')
       in
-      let tid = List.assoc d.e_name env_base.type_ids in
+      let tid =
+        match type_id_by_name env_base d.e_name with
+        | Some t -> t
+        | None -> raise Not_found
+      in
       let _param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
       let env_fwd = env_base in
       let variants_acc, errs =
@@ -9051,11 +9321,11 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
          carry it — a trait mentioned in a local/return type with no
          def is the verifier's unknown-TypeId class *)
       let env1 =
-        match List.assoc_opt d.t_name env1.nominals with
+        match nominal_by_name env1 d.t_name with
         | Some _ -> env1
         | None ->
             let tid =
-              match List.assoc_opt d.t_name env1.type_ids with
+              match type_id_by_name env1 d.t_name with
               | Some t -> t
               | None -> fresh_type_id env1.state
             in
@@ -9176,25 +9446,25 @@ let reset_oracle (env : env) : unit =
 let item_param_ids (env : env) (item : Ast.item) : Ids.Generic_param_id.t list =
   match item.Ast.kind with
   | Ast.Function d -> (
-      match List.assoc_opt (qualified_name item.module_path d.fn_sig.sig_name) env.functions with
+      match function_of_name env (qualified_name item.module_path d.fn_sig.sig_name) with
       | Some s -> List.map snd s.ts_params_decl
       | None -> [])
   | Ast.TestDecl d -> (
-      match List.assoc_opt (qualified_name item.module_path d.test_name) env.functions with
+      match function_of_name env (qualified_name item.module_path d.test_name) with
       | Some s -> List.map snd s.ts_params_decl
       | None -> [])
   | Ast.StructDef d -> (
-      match List.assoc_opt d.s_name env.nominals with
+      match nominal_by_name env d.s_name with
       | Some n -> List.map snd n.nom_params
       | None -> [])
   | Ast.EnumDef d -> (
-      match List.assoc_opt d.e_name env.nominals with
+      match nominal_by_name env d.e_name with
       | Some n -> List.map snd n.nom_params
       | None -> [])
   | Ast.TraitDef d ->
       List.concat_map
         (fun (m : Ast.function_decl) ->
-          match List.assoc_opt (d.t_name, m.fn_sig.sig_name) env.methods with
+          match method_of_key env d.t_name m.fn_sig.sig_name with
           | Some s ->
               List.map snd s.ts_params_decl
               @ List.concat_map (fun p -> params_in p.Type_repr.pt_type) (Array.to_list s.ts_params)
@@ -9204,7 +9474,7 @@ let item_param_ids (env : env) (item : Ast.item) : Ids.Generic_param_id.t list =
   | Ast.ImplBlock d ->
       List.concat_map
         (fun (m : Ast.function_decl) ->
-          match List.assoc_opt (d.i_target_type, m.fn_sig.sig_name) env.methods with
+          match method_of_key env d.i_target_type m.fn_sig.sig_name with
           | Some s ->
               (* the impl's own type parameters appear in the method
                  signature (self type, params, return): they are bound by
@@ -9215,11 +9485,11 @@ let item_param_ids (env : env) (item : Ast.item) : Ids.Generic_param_id.t list =
           | None -> [])
         d.i_methods
   | Ast.ConstDecl d -> (
-      match List.assoc_opt (qualified_name item.module_path d.c_name) env.consts with
+      match const_of_name env (qualified_name item.module_path d.c_name) with
       | Some t -> params_in t
       | None -> [])
   | Ast.StaticDecl d -> (
-      match List.assoc_opt (qualified_name item.module_path d.st_name) env.statics with
+      match static_of_name env (qualified_name item.module_path d.st_name) with
       | Some t -> params_in t
       | None -> [])
   | _ -> []
@@ -9611,7 +9881,7 @@ let rec register_headers (env : env) (acc : string list) = function
   | item :: rest -> (
       match item.Ast.kind with
       | Ast.StructDef d ->
-          if List.mem_assoc d.s_name env.nominals then register_headers env acc rest
+          if (nominal_by_name env d.s_name <> None) then register_headers env acc rest
           else begin
             let params =
               let key = "nominal::" ^ d.s_name in
@@ -9629,7 +9899,7 @@ let rec register_headers (env : env) (acc : string list) = function
                a builtin standard type reuses the builtin's TypeId, so
                Vec/Map/Set/Option/Result/Ptr have ONE identity *)
             let tid =
-              match List.assoc_opt d.s_name env.type_ids with
+              match type_id_by_name env d.s_name with
               | Some t -> t
               | None -> fresh_type_id env.state
             in
@@ -9651,7 +9921,7 @@ let rec register_headers (env : env) (acc : string list) = function
             register_headers env' acc rest
           end
       | Ast.EnumDef d ->
-          if List.mem_assoc d.e_name env.nominals then register_headers env acc rest
+          if (nominal_by_name env d.e_name <> None) then register_headers env acc rest
           else begin
             let params =
               let key = "nominal::" ^ d.e_name in
@@ -9669,7 +9939,7 @@ let rec register_headers (env : env) (acc : string list) = function
                a builtin standard type reuses the builtin's TypeId, so
                Vec/Map/Set/Option/Result/Ptr have ONE identity *)
             let tid =
-              match List.assoc_opt d.e_name env.type_ids with
+              match type_id_by_name env d.e_name with
               | Some t -> t
               | None -> fresh_type_id env.state
             in
@@ -9693,7 +9963,7 @@ let rec register_headers (env : env) (acc : string list) = function
              `-> Iterator[T]` return positions); register the trait in the
              type tables so resolve_named finds it (traits are never
              value-lowered, but the signature surface resolves) *)
-          if List.mem_assoc d.t_name env.types then register_headers env acc rest
+          if (type_by_name env d.t_name <> None) then register_headers env acc rest
           else begin
             let params =
               let key = "trait::" ^ d.t_name in
@@ -9709,7 +9979,7 @@ let rec register_headers (env : env) (acc : string list) = function
                   ids
             in
             let tid =
-              match List.assoc_opt d.t_name env.type_ids with
+              match type_id_by_name env d.t_name with
               | Some t -> t
               | None -> fresh_type_id env.state
             in
@@ -9861,6 +10131,7 @@ and check_bodies (env : env) (program : Ast.program) : (env * string list, strin
         current_mod_global := program.Ast.prog_module_path;
         env.state.current_item_params <- item_param_ids env item;
         reset_oracle env;
+        prerr_endline ("TRACE-I " ^ mod_key ^ " :: " ^ name);
         let secondary = List.mem name env.state.failed_items in
         let tag m = if secondary then "[secondary] " ^ m else m in
         match check_item env item with

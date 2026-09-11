@@ -71,6 +71,87 @@ bh_boot_target() {
   printf '%s' "${TARGET_TRIPLE:-${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}}"
 }
 
+# ———————————————————————————————————————————————————————————————
+# OCaml seed (stage0)
+# ———————————————————————————————————————————————————————————————
+
+# The ONE stage-0 authority: the OCaml seed at stage0_ocaml/. The retired
+# Swift stage0 (stage0_swift/) is gone — no Swift build, no Swift binary
+# path, no silent fallback to a prebuilt seed. Both run_bootstrap.sh and
+# the OCaml gates resolve stage0 through these two helpers.
+#
+# bh_ocaml_seed_bin — echo the stage-0 binary path the seed build produces.
+# No filesystem check: callers build first (bh_ocaml_seed_build) and then
+# verify executability, so the path authority stays a single line.
+bh_ocaml_seed_bin() {
+  local root
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  printf '%s/stage0_ocaml/_build/default/bin/tg_stage0.exe' "$root"
+}
+
+# bh_ocaml_seed_build — build the stage-0 OCaml seed with its pinned
+# toolchain and echo the binary path. Fails (nonzero, message on stderr)
+# when the seed sources, dune, or the produced binary are missing. The
+# pinned OCaml/Dune versions are verified by
+# scripts/check_ocaml_toolchain.sh (run by the delegated ladder gate);
+# this helper assumes it has already passed.
+bh_ocaml_seed_build() {
+  local root bin
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [ ! -d "$root/stage0_ocaml" ]; then
+    bh_err "OCaml seed sources missing: $root/stage0_ocaml (the Swift stage0 is retired; there is no fallback seed)"
+    return 1
+  fi
+  if ! command -v dune >/dev/null 2>&1; then
+    bh_err "dune toolchain not found; the OCaml stage0 seed cannot be built (see bootstrap/ocaml-toolchain.lock)"
+    return 1
+  fi
+  ( cd "$root/stage0_ocaml" && dune build ) || {
+    bh_err "dune build failed in $root/stage0_ocaml"
+    return 1
+  }
+  bin="$root/stage0_ocaml/_build/default/bin/tg_stage0.exe"
+  if [ ! -x "$bin" ]; then
+    bh_err "OCaml stage0 binary not produced: $bin"
+    return 1
+  fi
+  printf '%s' "$bin"
+}
+
+# bh_ocaml_seed_compile — the seed compiles the kernel manifest closure
+# into a native stage binary (the stage1 production step). The seed's
+# `compile` command loads the manifest closure and interprets the kernel's
+# bootstrap_main in the VM; the kernel args are passed through verbatim
+# after `--`. Usage:
+#   bh_ocaml_seed_compile <seed-bin> <repo-root> <target> <output-bin>
+# The kernel's own paths (bootstrap/compiler_kernel.manifest, tg_compiler/
+# bootstrap_main.tg, -o <output>) resolve against the virtual root, so the
+# caller's repo root is the single path authority.
+bh_ocaml_seed_compile() {
+  local seed="$1" root="$2" target="$3" out="$4"
+  if [ ! -x "$seed" ]; then
+    bh_err "OCaml seed binary not executable: $seed"
+    return 1
+  fi
+  local rc=0
+  "$seed" compile \
+    --repo-root "$root" \
+    --manifest "$root/bootstrap/compiler_kernel.manifest" \
+    --target "$target" \
+    -- compile --strict-resolution tg_compiler/bootstrap_main.tg \
+       -o "$out" --target "$target" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    bh_err "the OCaml seed failed to compile the bootstrap closure into $out (exit $rc)"
+    return 1
+  fi
+  if [ ! -f "$out" ]; then
+    bh_err "the OCaml seed exited 0 but produced no artifact: $out"
+    return 1
+  fi
+  chmod +x "$out"
+  printf '%s' "$out"
+}
+
 # Map a target triple (or arch alias) to its canonical architecture token
 # used by otool -arch and the per-arch native test suites.
 bh_arch_of() {

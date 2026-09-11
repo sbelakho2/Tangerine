@@ -159,12 +159,10 @@ let registered_renderer (env : Typecheck.env) (bare : string)
 
 let nominal_of_tid (env : Typecheck.env) (tid : Ids.Type_id.t) :
     (string * Typecheck.nominal) option =
-  List.find_opt
-    (fun (name, _nom) ->
-      match List.assoc_opt name env.Typecheck.type_ids with
-      | Some t -> Ids.Type_id.compare t tid = 0
-      | None -> false)
-    env.Typecheck.nominals
+  (* the SAME authority the checker's nominal_of_tid resolves through
+     (its O(1) lookup cache — first nominal wins, exactly the walk
+     this used to spell out) *)
+  Typecheck.nominal_entry_of_tid env tid
 
 let nominal_shape_of (env : Typecheck.env) (ty : Type_repr.t) :
     (string * Typecheck.nominal * Type_repr.t array) option =
@@ -565,7 +563,7 @@ let rec emit_clone_value (env : Typecheck.env) (s : st)
   | Some (owner, ts, type_args) ->
       clone_call s ts owner type_args ty (read_op place)
   | None ->
-      if Typecheck.tc_is_copy env (Lang_items.of_types env.types) ty then read_op place
+      if Typecheck.tc_is_copy env (Typecheck.lang_items_of_env env) ty then read_op place
       else
         match ty with
         | Type_repr.Tuple elems ->

@@ -368,7 +368,7 @@ let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
   Array.of_list
     (List.filter_map
        (fun (name, nom : string * Typecheck.nominal) ->
-         match List.assoc_opt name env.Typecheck.type_ids with
+         match Typecheck.type_id_by_name env name with
          | None -> None
          | Some tid ->
              if nom.Typecheck.nom_params <> [] then None
@@ -461,7 +461,7 @@ let struct_fields_of ?(items : Ast.item list = []) (env : Typecheck.env) :
          with an owning payload *)
       if nom.Typecheck.nom_kind <> `Struct then None
       else
-        match List.assoc_opt name env.Typecheck.type_ids with
+        match Typecheck.type_id_by_name env name with
         | None -> None
         | Some tid ->
             let nf = List.length nom.Typecheck.nom_fields in
@@ -487,7 +487,7 @@ let enum_payloads_of (env : Typecheck.env) :
       match nom.Typecheck.nom_kind with
       | `Struct -> None
       | `Enum -> (
-          match List.assoc_opt name env.Typecheck.type_ids with
+          match Typecheck.type_id_by_name env name with
           | None -> None
           | Some tid ->
               Some (tid, List.map (fun (vname, pty) -> (vname, Array.to_list pty)) nom.Typecheck.nom_variants)))
@@ -693,7 +693,7 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
     fn_ret = Type_repr.Unit;
     struct_fields = struct_fields_of ~items env;
     enum_payloads = enum_payloads_of env;
-    lang_items = Lang_items.of_types env.Typecheck.types;
+    lang_items = Typecheck.lang_items_of_env env;
     copy_cache = Type_properties.create_cache ();
   }
 
@@ -897,7 +897,7 @@ let closure_generic_types (env : Typecheck.env) : Mono.generic_def array =
   Array.of_list
     (List.filter_map
        (fun (name, nom : string * Typecheck.nominal) ->
-         match List.assoc_opt name env.Typecheck.type_ids with
+         match Typecheck.type_id_by_name env name with
          | None -> None
          | Some tid ->
              if nom.Typecheck.nom_params = [] then None
@@ -1008,7 +1008,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
   match
          Mir_verify.require_valid_template ~generic_types:(closure_generic_types env)
                ~box_tid:(env.Typecheck.state.box_tid)
-                    ~lang_items:(Lang_items.of_types env.Typecheck.types)
+                    ~lang_items:(Typecheck.lang_items_of_env env)
            ~query_sigs:(closure_query_sigs ~lowered:(Some prog) env) prog
        with
   | Error errs ->
@@ -1025,7 +1025,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
       | None -> 0
       | Some main ->
           let host = Host.create ~repo_root:"." ~argv:[||] in
-          (match Vm.run_li ~lang_items:(Lang_items.of_types env.Typecheck.types) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] ~host with
+          (match Vm.run_li ~lang_items:(Typecheck.lang_items_of_env env) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] ~host with
            | Ok _ -> Printf.printf "// VM: exit 0\n"; 0
            | Error e -> Printf.printf "// VM: %s\n" e.Vm.message; 1))
 
@@ -1139,7 +1139,7 @@ let cmd_interpret (args : string list) : int =
               (match
                  Mir_verify.require_valid_template
                      ~box_tid:(env.Typecheck.state.box_tid)
-                    ~lang_items:(Lang_items.of_types env.Typecheck.types)
+                    ~lang_items:(Typecheck.lang_items_of_env env)
                      ~generic_types:(closure_generic_types env)
                      ~query_sigs:(closure_query_sigs env)
                      prog
@@ -1154,7 +1154,7 @@ let cmd_interpret (args : string list) : int =
                    with
                    | None -> die "no `main` function to interpret"
                    | Some main -> (
-                       match Vm.entry_frame_of_li ~lang_items:(Lang_items.of_types env.Typecheck.types) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] with
+                       match Vm.entry_frame_of_li ~lang_items:(Typecheck.lang_items_of_env env) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] with
                        | Error m -> die "interpret: %s" m
                        | Ok (vm, entry_frame) -> (
                            match Vm.run_inspect vm entry_frame with
@@ -1971,6 +1971,8 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
         let rec body_pass env = function
           | [] -> env
           | node :: rest -> (
+              prerr_endline
+                ("TRACE-M " ^ String.concat "::" node.Module_graph.node_path);
               match Typecheck.check_bodies (with_module env node) node.Module_graph.node_program with
               | Error m ->
                   let key = String.concat "::" node.Module_graph.node_path in
@@ -1983,10 +1985,12 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
                   body_pass env' rest)
         in
         env := body_pass env_after_decls nodes;
+        prerr_endline "TRACE-1 body-pass-done";
         (* final-state report (re-audit P0 #1): the compatibility-fallback
            activation count of the closure's resolution — exactly zero
            means the closure is strict-clean (per-module authority) *)
         let fallback_activations = Resolver.flat_fallback_activations resolved in
+        prerr_endline "TRACE-2 fallback-done";
         Printf.printf "  strict-mode status: %d compatibility-fallback activation(s) — %s\n"
           fallback_activations
           (if fallback_activations = 0 then
@@ -2024,7 +2028,9 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
            pattern bridges, closure_query_sigs, the oracle set, the
            mono-poison debug) read the ALREADY-FINAL channel contents
            and never chase a mutable historical journal again. *)
+        prerr_endline "TRACE-3 pre-finalize";
         (if type_errors = [] then env := Typecheck.finalize_inference !env);
+        prerr_endline "TRACE-4 finalize-done";
         (* ── the TYPED-PROFILE firewall (the audit's P0): the
            syntactic subset gate says the parser sees no categorically
            forbidden AST form — it does NOT prove every TYPED use of
@@ -2033,7 +2039,9 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
         let profile_items =
           List.concat_map (fun node -> node.Module_graph.node_items) (topological_nodes graph)
         in
+        prerr_endline "TRACE-5 pre-profile";
         let profile_findings = Typed_profile.check !env profile_items in
+        prerr_endline "TRACE-6 profile-done";
         Printf.printf "  TYPED_PROFILE = %s (%d findings)\n"
           (if profile_findings = [] then "PASS" else "FAIL")
           (List.length profile_findings);
@@ -4390,10 +4398,10 @@ let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts
    shape.  A name with no nominal (alias/builtin) falls back to the
    type registry. *)
 let nominal_def_of_tid (env : Typecheck.env) (tid : Ids.Type_id.t) : Type_repr.t option =
-  match List.assoc_opt tid env.Typecheck.type_names with
+  match Typecheck.name_by_tid env tid with
   | None -> None
   | Some name -> (
-      match List.assoc_opt name env.Typecheck.nominals with
+      match Typecheck.nominal_by_name env name with
       | Some nom ->
           Some
             (match nom.Typecheck.nom_kind with
@@ -4412,7 +4420,7 @@ let nominal_def_of_tid (env : Typecheck.env) (tid : Ids.Type_id.t) : Type_repr.t
                             })
                           nom.Typecheck.nom_variants),
                        Type_repr.Never ))
-      | None -> List.assoc_opt name env.Typecheck.types)
+      | None -> Typecheck.type_by_name env name)
 
 let run_access_resource_pass (ctx : closure_ctx) : Access_check.finding list =
   (* the compilation's LangItems record overlays the engine's resolver
@@ -4420,7 +4428,7 @@ let run_access_resource_pass (ctx : closure_ctx) : Access_check.finding list =
      verifier/drop planner: owning LangItems answer their direct
      properties, never their def shapes) *)
   Access_check.run_closure
-    ~lang_items:(Some (Lang_items.of_types ctx.ctx_env.Typecheck.types))
+    ~lang_items:(Some (Typecheck.lang_items_of_env ctx.ctx_env))
     (nominal_def_of_tid ctx.ctx_env)
     ctx.ctx_env.Typecheck.state.oracle.o_accesses
 
@@ -4449,7 +4457,7 @@ let report_access_resource_pass (ctx : closure_ctx) : unit =
     | None -> []
     | Some prog ->
         Resource_check.cfg_check_program
-          ~lang_items:(Some (Lang_items.of_types ctx.ctx_env.Typecheck.types))
+          ~lang_items:(Some (Typecheck.lang_items_of_env ctx.ctx_env))
           prog
   in
   let cfg_status = if cfg_findings = [] then "PASS" else "FAIL" in
@@ -4620,7 +4628,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
           match
             Mir_verify.require_valid_template
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
-                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
+                          ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                 prog
@@ -4652,7 +4660,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
             match
               run_mono_phase ~entry_name ~entry:entry_id
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
-                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
+                          ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                 prog
@@ -4704,7 +4712,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                           bs_oracle_incomplete = oracle_incomplete;
                         }
                   | Ok report -> (
-                      match Vm.run_li ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types) ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host with
+                      match Vm.run_li ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host with
                       | Error _ ->
                           Ok
                             {
@@ -4767,6 +4775,7 @@ let cmd_bootstrap_check (args : string list) : int =
        Printf.printf "  RESULT: FAIL\n";
        1
    | Ok ctx ->
+       prerr_endline "TRACE-A pipeline-returned";
        (match opts.diagnostics_jsonl with
         | Some p ->
             write_diagnostics_jsonl ~path:p
@@ -4792,11 +4801,13 @@ let cmd_bootstrap_check (args : string list) : int =
          1
        end
        else begin
+         prerr_endline "TRACE-B lowering-start";
          let prog = lower_closure ctx in
+         prerr_endline "TRACE-C lowering-done";
          (match
             Mir_verify.require_valid_template
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
-                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
+                          ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                 prog
@@ -4953,7 +4964,7 @@ let cmd_bootstrap_check (args : string list) : int =
                    match
                      run_mono_phase ~entry_name ~entry
                        ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
-                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
+                          ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                        ~generic_types:(closure_generic_types ctx.ctx_env)
                        ~query_sigs:mono_query_sigs
                        prog
@@ -4973,7 +4984,7 @@ let cmd_bootstrap_check (args : string list) : int =
                          match
                            Mir_verify.require_valid_concrete
                              ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
-                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
+                          ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                              ~query_sigs:mo.mo_query_sigs
                              ~post_rewrite:mo.mo_post_rewrite
                              ~box_instances:mo.mo_box_instances
@@ -5035,7 +5046,7 @@ let cmd_bootstrap_check (args : string list) : int =
                                 (List.length reachable) report.Host.declared report.Host.implemented;
                               Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
                               (match
-                                 Vm.run_li ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
+                                 Vm.run_li ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                                    ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host
                                with
                                | Error e ->
@@ -5129,7 +5140,7 @@ let cmd_compile (args : string list) : int =
          (match
             Mir_verify.require_valid_template
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
-                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
+                          ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                 prog
@@ -5148,7 +5159,7 @@ let cmd_compile (args : string list) : int =
                   match
                     run_mono_phase ~entry_name ~entry
                       ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
-                          ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types)
+                          ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                       ~generic_types:(closure_generic_types ctx.ctx_env)
                       ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                       prog
@@ -5181,7 +5192,7 @@ let cmd_compile (args : string list) : int =
                         let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
                         Printf.printf "  compile: kernel argv: %s\n" (String.concat " " (Array.to_list argv));
                         let host = Host.create ~repo_root:opts.repo_root ~argv in
-                        (match Vm.run_li ~lang_items:(Lang_items.of_types ctx.ctx_env.Typecheck.types) ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host with
+                        (match Vm.run_li ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host with
                          | Error e ->
                              Printf.printf "compile: VM bootstrap run TRAPPED: %s\n" e.Vm.message;
                              let out = Host.stdout_contents host in

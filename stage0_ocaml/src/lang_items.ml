@@ -122,20 +122,32 @@ let first_tid_of (types : (string * Type_repr.t) list) (names : string list) :
     (fun n -> match List.assoc_opt n types with Some ty -> tid_of_named ty | None -> None)
     names
 
-let of_types (types : (string * Type_repr.t) list) : t =
+(* The same identification through a caller-supplied name lookup (the
+   checker's cached O(1) name table): of_lookup find == of_types types
+   whenever find n == List.assoc_opt n types for every queried name. *)
+let first_tid_of_lookup (find : string -> Type_repr.t option) (names : string list) :
+    Ids.Type_id.t option =
+  List.find_map
+    (fun n -> match find n with Some ty -> tid_of_named ty | None -> None)
+    names
+
+let of_lookup (find : string -> Type_repr.t option) : t =
   {
-    vec = first_tid_of types [ "Vec"; "Array"; "List" ];
-    map = first_tid_of types [ "Map"; "HashMap" ];
-    set = first_tid_of types [ "Set"; "HashSet" ];
-    option = first_tid_of types [ "Option" ];
-    result = first_tid_of types [ "Result" ];
-    box_ = first_tid_of types [ "Box" ];
-    rc = first_tid_of types [ "Rc" ];
-    arc = first_tid_of types [ "ArcStrong"; "Arc" ];
-    weak_rc = first_tid_of types [ "WeakRc" ];
-    weak_arc = first_tid_of types [ "WeakArc" ];
-    unique_ptr = first_tid_of types [ "UniquePtr" ];
-    string = first_tid_of types [ "String" ];
-    ptr = first_tid_of types [ "Ptr" ];
-    ptr_mut = first_tid_of types [ "PtrMut" ];
+    vec = first_tid_of_lookup find [ "Vec"; "Array"; "List" ];
+    map = first_tid_of_lookup find [ "Map"; "HashMap" ];
+    set = first_tid_of_lookup find [ "Set"; "HashSet" ];
+    option = first_tid_of_lookup find [ "Option" ];
+    result = first_tid_of_lookup find [ "Result" ];
+    box_ = first_tid_of_lookup find [ "Box" ];
+    rc = first_tid_of_lookup find [ "Rc" ];
+    arc = first_tid_of_lookup find [ "ArcStrong"; "Arc" ];
+    weak_rc = first_tid_of_lookup find [ "WeakRc" ];
+    weak_arc = first_tid_of_lookup find [ "WeakArc" ];
+    unique_ptr = first_tid_of_lookup find [ "UniquePtr" ];
+    string = first_tid_of_lookup find [ "String" ];
+    ptr = first_tid_of_lookup find [ "Ptr" ];
+    ptr_mut = first_tid_of_lookup find [ "PtrMut" ];
   }
+
+let of_types (types : (string * Type_repr.t) list) : t =
+  of_lookup (fun n -> List.assoc_opt n types)

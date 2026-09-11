@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 #
-# scripts/run_differential.sh — three-way semantic migration gate driver
-# (audit P1): Swift stage0 vs OCaml stage0 vs self-hosted stage3, over the
-# differential corpus (tests/differential/corpus/*.tg).
+# scripts/run_differential.sh — semantic parity gate driver: the OCaml
+# seed vs the self-hosted stage3, over the differential corpus
+# (tests/differential/corpus/*.tg).
+#
+# The retired Swift stage0 is NO LONGER a participant: the OCaml seed is
+# THE bootstrap seed (stage0_ocaml/). The legacy `--swift-only` /
+# `--three-way` flags are recognized only to fail with a clear retirement
+# message — there is no Swift binary to compare against.
 #
 # The migration criterion is EXPLICIT and strict:
 #     "OCaml agrees with stage3 on the language semantics."
@@ -11,8 +16,6 @@
 # PASS — the gate never claims parity it cannot demonstrate.
 #
 # Participants
-#   swift   the existing Swift stage0 (`tg_stage0 diff`): normalized
-#           token/AST parity vs stage3 (the pre-existing harness, unchanged)
 #   ocaml   the OCaml seed (`tg_stage0.exe` + `tg_pipeline_smoke.exe`)
 #   stage3  the ladder artifact `build/tg_stage1` (consumed read-only)
 #
@@ -37,41 +40,31 @@
 #              `check` is compile-only), so the VM agreement is
 #              NOT-IMPLEMENTED.  The OCaml-side VM result is still reported.
 #
-#   (--three-way) swift tokens/ast: the pre-existing `tg_stage0 diff`
-#              verdict per file, parsed from the diff report.  A stage3
-#              binary without the dump hooks (probe failure) makes this
-#              point NOT-IMPLEMENTED ("PROBE-FAIL"), exactly as the legacy
-#              harness failed honestly.
-#
 # Modes
-#   scripts/run_differential.sh                     legacy full differential
-#                                                   (== --swift-only)
-#   scripts/run_differential.sh --swift-only        current behavior,
-#                                                   unchanged: `tg_stage0
-#                                                   diff --corpus ...
-#                                                   --stage3-bin ...`
-#                                                   (--self-check / --probe /
-#                                                   --no-stage3 still pass
-#                                                   through)
+#   scripts/run_differential.sh                     OCaml seed pipeline vs
+#                                                   stage3, per corpus file
+#                                                   (== --ocaml-only)
 #   scripts/run_differential.sh --ocaml-only        OCaml seed pipeline vs
 #                                                   stage3, per corpus file
-#   scripts/run_differential.sh --three-way         swift + OCaml + stage3
-#                                                   side by side, one table
+#   scripts/run_differential.sh --swift-only        RETIRED: the Swift stage0
+#                                                   is gone; exits 2 with the
+#                                                   retirement message
+#   scripts/run_differential.sh --three-way         RETIRED: no Swift
+#                                                   participant remains;
+#                                                   exits 2 with the
+#                                                   retirement message
 #
-# Exit status (ocaml-only / three-way)
+# Exit status
 #   0  every implemented comparison point agreed (no disagreements, no
 #      NOT-IMPLEMENTED points required by the mode)
 #   1  any implemented comparison point DISAGREED (a divergence dominates
 #      the exit code; the NOT-IMPLEMENTED summary is still printed)
 #   2  no disagreements, but the mode requires comparison points that are
 #      NOT-IMPLEMENTED (or a required binary is missing / the stage3 dump
-#      probe fails) — migration parity cannot be claimed
-# Exit status (swift-only) is the legacy mapping:
-#   0 all matched; 1 divergent/gap; 2 stage3 probe failure; 3 gate failure.
+#      probe fails), or a retired Swift mode was requested
 #
-# Binary resolution: TG_STAGE0_BIN / TG_STAGE3_BIN override the Swift and
-# stage3 binaries (as before); TG_OCAML_STAGE0_BIN / TG_OCAML_SMOKE_BIN
-# override the OCaml seed binaries.
+# Binary resolution: TG_STAGE3_BIN overrides the stage3 binary;
+# TG_OCAML_STAGE0_BIN / TG_OCAML_SMOKE_BIN override the OCaml seed binaries.
 #
 # This script performs NO ladder runs: the stage0 binaries are plain build
 # products, and the stage3 binary is a ladder artifact consumed read-only.
@@ -80,7 +73,6 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-SWIFT_STAGE0_BIN="${TG_STAGE0_BIN:-$ROOT/stage0_swift/.build/release/tg_stage0}"
 STAGE3_BIN="${TG_STAGE3_BIN:-$ROOT/build/tg_stage1}"
 OCAML_STAGE0_BIN="${TG_OCAML_STAGE0_BIN:-$ROOT/stage0_ocaml/_build/default/bin/tg_stage0.exe}"
 OCAML_SMOKE_BIN="${TG_OCAML_SMOKE_BIN:-$ROOT/stage0_ocaml/_build/default/selfcheck/tg_pipeline_smoke.exe}"
@@ -89,46 +81,27 @@ MANIFEST="$CORPUS_DIR/corpus.manifest"
 CORPUS_FILES_DIR="$CORPUS_DIR/corpus"
 
 # ── mode parsing ────────────────────────────────────────────────────────
-# Default (no mode flag) preserves the legacy behavior exactly.
-MODE=swift
+# The OCaml seed is THE bootstrap seed: the default mode is the OCaml
+# migration gate. The Swift modes are retired and fail explicitly.
+MODE=ocaml
 DIFF_ARGS=()
 for arg in "$@"; do
   case "$arg" in
-    --swift-only) MODE=swift ;;
+    --swift-only|--three-way) MODE=swift_retired; RETIRED_ARG="$arg" ;;
     --ocaml-only) MODE=ocaml ;;
-    --three-way)  MODE=three ;;
     *) DIFF_ARGS+=("$arg") ;;
   esac
 done
 
-# ── legacy mode: the pre-existing Swift-vs-stage3 harness, unchanged ─────
-if [ "$MODE" = swift ]; then
-  if [ ! -x "$SWIFT_STAGE0_BIN" ]; then
-    echo "run_differential: stage0 binary not found or not executable: $SWIFT_STAGE0_BIN" >&2
-    echo "  (build it with: cd stage0_swift && swift build -c release)" >&2
-    exit 2
-  fi
-
-  echo "=== Tangerine differential parity harness ==="
-  echo "Stage0 (Swift bootstrap): $SWIFT_STAGE0_BIN"
-  echo "Stage3 (self-host):       $STAGE3_BIN"
-  echo "Corpus:                   $CORPUS_DIR"
-  echo ""
-
-  BASE_ARGS=(--corpus "$CORPUS_DIR" --stage3-bin "$STAGE3_BIN")
-  "$SWIFT_STAGE0_BIN" diff "${BASE_ARGS[@]}" "${DIFF_ARGS[@]+"${DIFF_ARGS[@]}"}"
-  rc=$?
-
-  case $rc in
-    0) echo "run_differential: ALL MATCH (exit 0)" ;;
-    1) echo "run_differential: DIVERGENT or NORMALIZATION-GAP (exit 1)" >&2 ;;
-    2) echo "run_differential: stage3 probe failure — rebuild the ladder (exit 2)" >&2 ;;
-    3) echo "run_differential: corpus gate failure (exit 3)" >&2 ;;
-  esac
-  exit "$rc"
+# ── retired Swift modes: explicit failure, never a silent no-op ─────────
+if [ "$MODE" = swift_retired ]; then
+  echo "run_differential: $RETIRED_ARG is RETIRED — the Swift stage0 (stage0_swift/) no longer exists." >&2
+  echo "  The OCaml seed is THE bootstrap seed; run scripts/run_differential.sh (or --ocaml-only)" >&2
+  echo "  for the OCaml-seed-vs-stage3 semantic parity gate." >&2
+  exit 2
 fi
 
-# ── ocaml / three-way modes: the migration gate ─────────────────────────
+# ── the OCaml-seed migration gate ───────────────────────────────────────
 
 for bin in "$OCAML_STAGE0_BIN" "$OCAML_SMOKE_BIN"; do
   if [ ! -x "$bin" ]; then
@@ -140,11 +113,6 @@ done
 if [ ! -x "$STAGE3_BIN" ]; then
   echo "run_differential: stage3 binary not found or not executable: $STAGE3_BIN" >&2
   echo "  (the migration gate compares against the stage3 baseline; rebuild the ladder)" >&2
-  exit 2
-fi
-if [ "$MODE" = three ] && [ ! -x "$SWIFT_STAGE0_BIN" ]; then
-  echo "run_differential: --three-way needs the Swift stage0 binary: $SWIFT_STAGE0_BIN" >&2
-  echo "  (build it with: cd stage0_swift && swift build -c release)" >&2
   exit 2
 fi
 if [ ! -f "$MANIFEST" ]; then
@@ -168,42 +136,16 @@ if [ ${#CORPUS_FILES[@]} -eq 0 ]; then
   exit 2
 fi
 
-echo "=== Tangerine three-way semantic migration gate ==="
-case "$MODE" in
-  ocaml) echo "Mode:                     --ocaml-only (OCaml seed vs stage3)" ;;
-  three) echo "Mode:                     --three-way (Swift + OCaml + stage3)" ;;
-esac
+echo "=== Tangerine OCaml-seed semantic parity gate ==="
+echo "Mode:                    --ocaml-only (OCaml seed vs stage3)"
 echo "OCaml seed (driver):     $OCAML_STAGE0_BIN"
 echo "OCaml seed (smoke):      $OCAML_SMOKE_BIN"
 echo "Stage3 (self-host):      $STAGE3_BIN"
-[ "$MODE" = three ] && echo "Swift stage0:            $SWIFT_STAGE0_BIN"
 echo "Corpus:                  $CORPUS_DIR ($((${#CORPUS_FILES[@]})) files)"
 echo ""
 echo "Migration criterion: OCaml agrees with stage3 on the language semantics."
 echo "  NOT-IMPLEMENTED is reported, never PASS, where a stage3 baseline does not exist."
 echo ""
-
-# ── swift participant (--three-way): legacy diff report, parsed per file ──
-SWIFT_VERDICTS=""        # "file|verdict" lines
-SWIFT_PROBE_FAIL=""      # non-empty when the dump probe failed
-if [ "$MODE" = three ]; then
-  diff_out="$("$SWIFT_STAGE0_BIN" diff --corpus "$CORPUS_DIR" --stage3-bin "$STAGE3_BIN" 2>&1)"
-  if [[ "$diff_out" == *"Stage3 probe: FAIL"* || "$diff_out" == *"cannot dump"* ]]; then
-    SWIFT_PROBE_FAIL="stage3 binary lacks the dump hooks (--dump-tokens/--dump-ast); the legacy probe failed — swift-vs-stage3 parity cannot be computed"
-  else
-    SWIFT_VERDICTS="$(printf '%s\n' "$diff_out" | sed -n 's/^  \(corpus\/[^ ]*\) \[\(tokens\|ast\)\]: \([A-Z-]*\).*/\1|\2|\3/p')"
-  fi
-fi
-
-swift_verdict_for() { # $1 = manifest-relative file; echoes tokens,ast verdicts
-  local f="$1" t a
-  t="n/a"; a="n/a"
-  while IFS='|' read -r ff phase vv; do
-    [ "$ff" = "$f" ] || continue
-    if [ "$phase" = tokens ]; then t="$vv"; else a="$vv"; fi
-  done <<< "$SWIFT_VERDICTS"
-  echo "t:$t a:$a"
-}
 
 # ── participants ─────────────────────────────────────────────────────────
 
@@ -262,12 +204,11 @@ ocaml_lower_verdict() { # $1 = absolute file path
 
 NOT_IMPL_LOWER="no stage3 MIR projection pinned by the current harness (tokens/ast only; tests/differential/README.md documents MIR parity as an extension)"
 NOT_IMPL_VM="no stage3 observable-execution baseline (stage3 'check' is compile-only; the current script computes no stage3 VM result)"
-NOT_IMPL_SWIFT="stage3 dump probe failure — $SWIFT_PROBE_FAIL"
 
 TOTAL=0; AGREE_N=0; DISAGREE_N=0; UNKNOWN_N=0
-NI_LOWER_N=0; NI_VM_N=0; NI_SWIFT_N=0
+NI_LOWER_N=0; NI_VM_N=0
 
-printf "%-34s | %-22s | %-46s | %-10s | %s\n" "file" "swift" "ocaml" "stage3" "agreement"
+printf "%-34s | %-46s | %-10s | %s\n" "file" "ocaml" "stage3" "agreement"
 printf -- "----------------------------------------------------------------------------------------------------------------------------------------------------------\n"
 
 for mf in "${CORPUS_FILES[@]}"; do
@@ -299,16 +240,6 @@ for mf in "${CORPUS_FILES[@]}"; do
   NI_LOWER_N=$((NI_LOWER_N + 1)); ni_marks="$ni_marks lower-mir"
   NI_VM_N=$((NI_VM_N + 1));       ni_marks="$ni_marks vm"
 
-  swift_cell="—"
-  if [ "$MODE" = three ]; then
-    if [ -n "$SWIFT_PROBE_FAIL" ]; then
-      swift_cell="PROBE-FAIL"
-      NI_SWIFT_N=$((NI_SWIFT_N + 1)); ni_marks="$ni_marks swift-dump"
-    else
-      swift_cell="$(swift_verdict_for "$mf")"
-    fi
-  fi
-
   if [ "$OC_TC" = UNKNOWN ]; then
     agreement="UNKNOWN (smoke rc=$SMOKE_RC) | NI:$ni_marks"
     UNKNOWN_N=$((UNKNOWN_N + 1))
@@ -320,7 +251,7 @@ for mf in "${CORPUS_FILES[@]}"; do
     DISAGREE_N=$((DISAGREE_N + 1))
   fi
 
-  printf "%-34s | %-22s | %-46s | %-10s | %s\n" "$mf" "$swift_cell" "$oc_cell" "check:$s3" "$agreement"
+  printf "%-34s | %-46s | %-10s | %s\n" "$mf" "$oc_cell" "check:$s3" "$agreement"
 done
 
 # ── summary ─────────────────────────────────────────────────────────────
@@ -330,13 +261,6 @@ echo "=== Agreement summary (OCaml vs stage3) ==="
 echo "  typecheck verdict : $AGREE_N AGREE, $DISAGREE_N DISAGREE, $UNKNOWN_N UNKNOWN (implemented)"
 echo "  lower-mir         : NOT-IMPLEMENTED ($NI_LOWER_N/$TOTAL files) — $NOT_IMPL_LOWER"
 echo "  vm                : NOT-IMPLEMENTED ($NI_VM_N/$TOTAL files) — $NOT_IMPL_VM"
-if [ "$MODE" = three ]; then
-  if [ -n "$SWIFT_PROBE_FAIL" ]; then
-    echo "  swift tokens/ast  : NOT-IMPLEMENTED ($NI_SWIFT_N/$TOTAL files) — $NOT_IMPL_SWIFT"
-  else
-    echo "  swift tokens/ast  : reported per file above (legacy normalized-parity verdict)"
-  fi
-fi
 echo ""
 echo "  Comparison points from the audit P1 list with no per-file baseline on either side today:"
 echo "    module/DefId graph (per file), typed callable signatures, inferred substitutions,"
@@ -358,7 +282,7 @@ if [ "$UNKNOWN_N" -gt 0 ]; then
   echo "run_differential: $UNKNOWN_N file(s) without a usable OCaml verdict (exit 1)" >&2
   exit 1
 fi
-if [ "$NI_LOWER_N" -gt 0 ] || [ "$NI_VM_N" -gt 0 ] || [ "$NI_SWIFT_N" -gt 0 ]; then
+if [ "$NI_LOWER_N" -gt 0 ] || [ "$NI_VM_N" -gt 0 ]; then
   echo ""
   echo "run_differential: NOT-IMPLEMENTED comparison points — migration parity cannot be claimed (exit 2)" >&2
   exit 2
