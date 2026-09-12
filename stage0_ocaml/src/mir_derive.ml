@@ -802,6 +802,24 @@ let clone_call (s : st) (ts : Typecheck.typed_signature)
 let rec emit_clone_value (env : Typecheck.env) (s : st)
     (clone_bound : Ids.Generic_param_id.t list) (ty : Type_repr.t)
     (place : Seed_mir.place) : Seed_mir.operand =
+  let box_tid = (Typecheck.lang_items_of_env env).Lang_items.box_ in
+  let transparent_box = function
+    | Type_repr.Named (tid, [| _ |]) -> (
+        match box_tid with
+        | Some b -> Ids.Type_id.compare b tid = 0
+        | None -> false)
+    | _ -> false
+  in
+  if transparent_box ty then
+    (* the checker's transparent Box[T] convention: a Box-typed component
+       slot holds the CONTENT value (the seed lowering never materializes
+       an implicit box), so the derived clone clones the content in place
+       instead of calling the Box wrapper's own Clone (which would read
+       the content as a boxed allocation). *)
+    match ty with
+    | Type_repr.Named (_, [| inner |]) -> emit_clone_value env s clone_bound inner place
+    | _ -> assert false
+  else
   match resolve_clone_impl env ty with
   | Some (owner, ts, type_args) ->
       clone_call s ts owner type_args ty (read_op place)

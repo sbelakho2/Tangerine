@@ -646,6 +646,21 @@ let is_ptr_handle (ctx : ctx) (ty : Type_repr.t) : bool =
       | _ -> false)
   | _ -> false
 
+(* The checker's RefToRawPtr call-boundary adaptation (typecheck.ml's
+   ref_to_raw_ptr): a RAW-POINTER parameter (Ptr[T]/PtrMut[T] handle or
+   the structural raw-pointer form) accepts a `&place`/`&mut place`
+   argument — the argument's static type is the reference, the value
+   carried across the boundary is the ADDRESS (the seed's Ref value). *)
+let ref_to_raw_ptr_ok (ctx : ctx) (expected : Type_repr.t) (actual : Type_repr.t) : bool =
+  match actual with
+  | Type_repr.Ref_internal (_, ref_inner) -> (
+      match expected with
+      | Type_repr.Raw_ptr (_, inner) -> types_compatible ctx inner ref_inner
+      | Type_repr.Named (_, [| inner |]) when is_ptr_handle ctx expected ->
+          types_compatible ctx inner ref_inner
+      | _ -> false)
+  | _ -> false
+
 (* Whether the resolved type is an ENUM def (Function with Never ret),
    and the payload type of one of its variants.  The enum's runtime
    tag is the declaration-order vd_index: EnumCtor tags, SetDiscriminant
@@ -2612,6 +2627,7 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                         if not
                              (types_compatible ctx pty aty || ptr_addr_ok ctx pty aty
                               || deref_arg_ok ctx pty aty
+                              || ref_to_raw_ptr_ok ctx pty aty
                               || const_int_arg_fits_ok ctx arg.value pty)
                         then
                           add_err ctx
@@ -3092,11 +3108,12 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                   in
                   (match actual_ty with
                    | Some aty ->
-                       if
-                         not
-                           (intrinsic_type_compatible ctx declared_ty aty
-                           || ptr_addr_ok ctx (registry_type_to_checker declared_ty) aty)
-                       then
+                        if
+                          not
+                            (intrinsic_type_compatible ctx declared_ty aty
+                            || ptr_addr_ok ctx (registry_type_to_checker declared_ty) aty
+                            || ref_to_raw_ptr_ok ctx (registry_type_to_checker declared_ty) aty)
+                        then
                          add_err ctx
                            (Printf.sprintf
                               "%s: extern argument %d type mismatch: expected %s got %s" bb_ctx
@@ -3166,7 +3183,8 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                   | Some aty -> (
                       if i < Array.length ptys
                          && not
-                              (types_compatible ctx ptys.(i).Type_repr.pt_type aty)
+                              (types_compatible ctx ptys.(i).Type_repr.pt_type aty
+                              || ref_to_raw_ptr_ok ctx ptys.(i).Type_repr.pt_type aty)
                       then
                         add_err ctx
                           (Printf.sprintf

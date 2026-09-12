@@ -14,6 +14,11 @@ use tg_compiler::token::{Span, Token, TokenKind, token_new, span_new, keyword_fr
 
 struct Lexer
   source: String
+  # The source bytes, decoded ONCE per lexer (the scan loops index this
+  # vector instead of rebuilding `source.as_bytes()` per identifier /
+  # per classification call — the host `as_bytes` allocates an element
+  # per byte, so the per-call rebuild was O(source) per ident).
+  bytes: Vec[u8]
   file: String
   pos: Int
   len: Int
@@ -32,8 +37,10 @@ end
 
 def lexer_new(source: String, file: String) -> Lexer
   let source_len = source.len()
+  let source_bytes = source.as_bytes()
   Lexer {
     source: source,
+    bytes: source_bytes,
     file: file,
     pos: 0,
     len: source_len,
@@ -3103,8 +3110,12 @@ def nfc_singleton_decompose(cp: Int) -> Option[Int]
   if cp == 0xFAD9 then return Option::Some(0x9F8E) end
   Option::None
 end
-# Canonical Combining Classes (BMP marks with CCC > 0): 708 entries
+# Canonical Combining Classes (BMP marks with CCC > 0): 708 entries.
+# Everything below the first entry (U+0300) has CCC = 0, so the common
+# scalar (ASCII and all below the combining-mark block) answers without
+# scanning the table.
 def nfc_combining_class(cp: Int) -> Int
+  if cp < 0x0300 then return 0 end
   if cp == 0x0300 then return 230 end
   if cp == 0x0301 then return 230 end
   if cp == 0x0302 then return 230 end
@@ -3844,25 +3855,36 @@ def decode_scalar(bytes: Vec[u8], idx: Int) -> (Int, Int)
 end
 
 # The XID classes (UAX31): the ASCII fast path plus the UCD BMP tables.
+# ASCII is resolved DIRECTLY and the UCD tables are never entered for it:
+# the ASCII classes are exactly XID_Start = [A-Za-z_] and
+# XID_Continue = [0-9A-Za-z_] (the direct kernel's rules), and no UCD
+# range intersects ASCII — the generated tables start at U+00AA
+# (XID_Start) and U+00B7 (XID_Continue).  This keeps the per-character
+# classification of ASCII sources (identifiers AND the delimiter that
+# terminates one) off the 383/182-range table scans; the answer is
+# identical to the scan for every cp < 0x80.
 def is_xid_start_scalar(cp: Int) -> Bool
-  (cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A) || cp == 0x5F || xid_start_range(cp)
+  if cp < 0x80 then
+    return (cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A) || cp == 0x5F
+  end
+  xid_start_range(cp)
 end
 
 def is_xid_continue_scalar(cp: Int) -> Bool
-  (cp >= 0x30 && cp <= 0x39) || (cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A) || cp == 0x5F ||
+  if cp < 0x80 then
+    return (cp >= 0x30 && cp <= 0x39) || (cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A) || cp == 0x5F
+  end
   xid_start_range(cp) || xid_continue_range(cp)
 end
 
 # Whether the scalar at byte `idx` starts / continues an identifier.
 def ident_start_at(lex: Lexer, idx: Int) -> Bool
-  let bytes = lex.source.as_bytes()
-  let (cp, _clen) = decode_scalar(bytes, idx)
+  let (cp, _clen) = decode_scalar(lex.bytes, idx)
   is_xid_start_scalar(cp)
 end
 
 def ident_char_at(lex: Lexer, idx: Int) -> Bool
-  let bytes = lex.source.as_bytes()
-  let (cp, _clen) = decode_scalar(bytes, idx)
+  let (cp, _clen) = decode_scalar(lex.bytes, idx)
   is_xid_continue_scalar(cp)
 end
 
@@ -4018,10 +4040,27 @@ end
 
 # NFC(s): canonical decomposition, canonical ordering, canonical
 # composition — the identifier identity form.
+#
+# ASCII FAST PATH: NFC is the identity on every ASCII scalar (no ASCII
+# char has a canonical decomposition, a canonical combining class, or a
+# composition mapping), so a pure-ASCII identifier — the overwhelming
+# case — is returned unchanged without building the scalar vector or
+# touching the decomposition/ordering/composition tables.  The result is
+# identical to the full pipeline for every ASCII input.
 def identifier_nfc(s: String) -> String
   let bytes = s.as_bytes()
-  mut scalars = Vec::new()
   var i = 0
+  while i < bytes.len() do
+    if bytes[i] >= 0x80 then
+      break
+    end
+    i = i + 1
+  end
+  if i == bytes.len() then
+    return s
+  end
+  mut scalars = Vec::new()
+  i = 0
   while i < bytes.len() do
     let (cp, clen) = decode_scalar(bytes, i)
     nfc_decompose_into(cp, &mut scalars)
@@ -4044,25 +4083,24 @@ end
 # zero-AST outcome) — the errors carry the byte offsets.
 
 def validate_source(inout lex: Lexer) -> Bool
-  let bytes = lex.source.as_bytes()
   var i = 0
-  if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF then
+  if lex.bytes.len() >= 3 && lex.bytes[0] == 0xEF && lex.bytes[1] == 0xBB && lex.bytes[2] == 0xBF then
     # the leading BOM is accepted and skipped: the first token starts after it
     lex.pos = 3
     i = 3
   end
-  while i < bytes.len() do
-    let b = bytes[i]
+  while i < lex.bytes.len() do
+    let b = lex.bytes[i]
     if b < 0x80 then
       i = i + 1
     else
       let seq_len = utf8_seq_len(b)
-      if seq_len == 0 || i + seq_len > bytes.len() || !utf8_seq_valid(bytes, i, seq_len) then
+      if seq_len == 0 || i + seq_len > lex.bytes.len() || !utf8_seq_valid(lex.bytes, i, seq_len) then
         let span = Span { file: lex.file.clone(), start: i, end_pos: i + 1 }
         lex.errors.push(("invalid UTF-8 byte sequence at byte " + i.to_string(), span))
         return false
       end
-      let (cp, clen) = decode_scalar(bytes, i)
+      let (cp, clen) = decode_scalar(lex.bytes, i)
       if cp == 0xFEFF then
         let span = Span { file: lex.file.clone(), start: i, end_pos: i + 1 }
         lex.errors.push(("UTF-8 BOM inside the source: a BOM is only permitted at the start of the file", span))
@@ -4103,7 +4141,9 @@ end
 
 def lex_peek(lex: Lexer) -> Option[Char]
   if lex.pos >= 0 && lex.pos < lex.len then
-    Option::Some(lex.source.char_at(lex.pos))
+    # The byte read (`char_at` is the byte-derived Char contract, so the
+    # cached vector answers identically without a host call per char).
+    Option::Some(((lex.bytes[lex.pos] as Int) as Char))
   else
     Option::None
   end
@@ -4112,7 +4152,7 @@ end
 def lex_peek_next(lex: Lexer) -> Option[Char]
   let next_pos = lex.pos + 1
   if next_pos >= 0 && next_pos < lex.len then
-    Option::Some(lex.source.char_at(next_pos))
+    Option::Some(((lex.bytes[next_pos] as Int) as Char))
   else
     Option::None
   end
@@ -4270,7 +4310,7 @@ end
 def is_doc_comment_start(lex: Lexer, start: Int) -> Bool
   mut idx = start - 1
   while idx >= 0 do
-    let c = lex.source.char_at(idx)
+    let c = ((lex.bytes[idx] as Int) as Char)
     if c == '\n' then
       return true
     elsif c == ' ' || c == '\t' || c == '\r' then
@@ -4441,7 +4481,7 @@ def digit_text(digits: Vec[u8]) -> String
 end
 
 def lex_number(inout lex: Lexer, start: Int) -> Unit
-  let first_char = lex.source.char_at(start)
+  let first_char = ((lex.bytes[start] as Int) as Char)
   lex_advance(lex)  # consume first digit
   
   if first_char == '0' && !at_end(lex) then
@@ -4874,8 +4914,7 @@ def lex_char(inout lex: Lexer, start: Int) -> Unit
     if c != '\'' then
       # the literal character is the full UTF-8 scalar (the byte-wise
       # char_at can only see its first byte)
-      let bytes = lex.source.as_bytes()
-      let (cp, clen) = decode_scalar(bytes, lex.pos)
+      let (cp, clen) = decode_scalar(lex.bytes, lex.pos)
       lex.pos = lex.pos + clen
       match lex_peek(lex)
       when Option::Some('\'') then
@@ -4898,12 +4937,23 @@ end
 
 def lex_ident(inout lex: Lexer, start: Int) -> Unit
   # The XID_Continue scan over the UTF-8 scalars (the first scalar is
-  # already verified XID_Start by the dispatch).
-  let bytes = lex.source.as_bytes()
+  # already verified XID_Start by the dispatch). The scan also records
+  # whether EVERY identifier scalar was ASCII: NFC is the identity on
+  # ASCII (no ASCII scalar has a canonical decomposition, a combining
+  # class, or a composition mapping), so a pure-ASCII identifier — the
+  # overwhelming case — skips normalization and the NFC tables entirely,
+  # with the exact result the full pipeline produced.
   var pos = start
+  mut ascii_only = true
   while pos < lex.len do
-    let (cp, clen) = decode_scalar(bytes, pos)
+    let (cp, clen) = decode_scalar(lex.bytes, pos)
     if is_xid_continue_scalar(cp) then
+      # clen == 1 && cp < 0x80 is exactly "the scalar is one ASCII byte"
+      # (a malformed multi-byte sequence can decode to a small cp; the
+      # clen test keeps the shortcut OFF for it).
+      if clen != 1 || cp >= 0x80 then
+        ascii_only = false
+      end
       pos = pos + clen
     else
       break
@@ -4916,12 +4966,15 @@ def lex_ident(inout lex: Lexer, start: Int) -> Unit
   # spelling stays available through the token's span — the diagnostics
   # print the original bytes). The keywords are pure ASCII, so the
   # keyword check is unaffected by the normalization.
-  let norm = identifier_nfc(text)
   match keyword_from_str(text)
   when Option::Some(kw) then
     emit_token(lex, kw, start)
   when Option::None then
-    emit_token(lex, TokenKind::Ident(norm), start)
+    if ascii_only then
+      emit_token(lex, TokenKind::Ident(text), start)
+    else
+      emit_token(lex, TokenKind::Ident(identifier_nfc(text)), start)
+    end
   end
 end
 

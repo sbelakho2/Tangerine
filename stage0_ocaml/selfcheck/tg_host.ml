@@ -399,6 +399,152 @@ let check_reachable_closure_boundary () =
    | Ok _ ->
        pass "User-form host calls resolve to their host ids (callee instance -> declared host symbol name)")
 
+(* ── poll(2) adapter (the linker's macOS codesign step reads its two
+   stdio pipes through it) ──────────────────────────────────────────
+   Property: with a byte pending in a pipe, poll reports exactly one
+   ready entry and writes POLLIN into the pollfd record inside the Raw
+   arena region; after the byte is drained a zero-timeout poll reports
+   nothing; a guest fd without a host descriptor reports POLLNVAL. *)
+
+let poll_uint (n : int) : Vm_value.t =
+  Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:false (Int64.of_int n))
+
+(* Invoke the poll binding on one pollfd { fd; POLLIN } held in a fresh
+   Raw arena region; returns (ready count, revents). *)
+let poll_probe (binding : Host.binding) (host : Host.t) (fd : int)
+    (timeout : int) : int * int =
+  match Host.arena_alloc host 8 1 with
+  | Error e -> fail "poll self-check: arena_alloc failed: %s" e
+  | Ok p ->
+      let arr = Bytes.make 8 '\000' in
+      Raw_memory.put_u64_le arr 0 4 (Int64.of_int fd);
+      Raw_memory.put_u64_le arr 4 2 0x001L (* POLLIN *);
+      (match Host.arena_store host p arr with
+      | Error e -> fail "poll self-check: arena_store failed: %s" e
+      | Ok () -> ());
+      let ready =
+        match
+          binding.Host.invoke host
+            [| Vm_value.RawPtr p; poll_uint 1;
+               Vm_value.Int
+                 (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int timeout)) |]
+        with
+        | Error e -> fail "poll self-check: invoke failed: %s" e
+        | Ok res -> (
+            match res.Host.value with
+            | Vm_value.Int i -> Int64.to_int (Int_value.to_int64 i)
+            | _ -> fail "poll self-check: poll returned a non-integer value")
+      in
+      let revents =
+        match Host.arena_load host p 8 with
+        | Error e -> fail "poll self-check: arena_load failed: %s" e
+        | Ok rb -> Int64.to_int (Raw_memory.u64_le rb 6 2)
+      in
+      (ready, revents)
+
+(* Invoke the poll binding on TWO pollfd entries (the Command::output
+   interleave shape); returns (ready count, revents entry 1, revents
+   entry 2) — proving the per-entry writeback at a nonzero offset. *)
+let poll_probe2 (binding : Host.binding) (host : Host.t) (fd1 : int) (fd2 : int)
+    (timeout : int) : int * int * int =
+  match Host.arena_alloc host 16 1 with
+  | Error e -> fail "poll self-check: arena_alloc failed: %s" e
+  | Ok p ->
+      let arr = Bytes.make 16 '\000' in
+      Raw_memory.put_u64_le arr 0 4 (Int64.of_int fd1);
+      Raw_memory.put_u64_le arr 4 2 0x001L;
+      Raw_memory.put_u64_le arr 8 4 (Int64.of_int fd2);
+      Raw_memory.put_u64_le arr 12 2 0x001L;
+      (match Host.arena_store host p arr with
+      | Error e -> fail "poll self-check: arena_store failed: %s" e
+      | Ok () -> ());
+      let ready =
+        match
+          binding.Host.invoke host
+            [| Vm_value.RawPtr p; poll_uint 2;
+               Vm_value.Int
+                 (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int timeout)) |]
+        with
+        | Error e -> fail "poll self-check: invoke failed: %s" e
+        | Ok res -> (
+            match res.Host.value with
+            | Vm_value.Int i -> Int64.to_int (Int_value.to_int64 i)
+            | _ -> fail "poll self-check: poll returned a non-integer value")
+      in
+      match Host.arena_load host p 16 with
+      | Error e -> fail "poll self-check: arena_load failed: %s" e
+      | Ok rb ->
+          ( ready,
+            Int64.to_int (Raw_memory.u64_le rb 6 2),
+            Int64.to_int (Raw_memory.u64_le rb 14 2) )
+
+let check_poll_adapter () =
+  let binding = manifest_binding "poll" in
+  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let r, w = Unix.pipe ~cloexec:false () in
+  let r2, w2 = Unix.pipe ~cloexec:false () in
+  let guest_r = Host.register_guest_fd r in
+  let guest_w = Host.register_guest_fd w in
+  let guest_r2 = Host.register_guest_fd r2 in
+  let guest_w2 = Host.register_guest_fd w2 in
+  ignore (Unix.write w (Bytes.of_string "x") 0 1);
+  ignore (Unix.write w2 (Bytes.of_string "y") 0 1);
+  let ready, rev = poll_probe binding host guest_r (-1) in
+  if ready <> 1 then fail "poll self-check: expected 1 ready entry, got %d" ready;
+  if rev land 0x001 = 0 then fail "poll self-check: POLLIN not set in revents (0x%x)" rev;
+  ignore (Unix.read r (Bytes.make 1 ' ') 0 1);
+  let ready_after, _ = poll_probe binding host guest_r 0 in
+  if ready_after <> 0 then
+    fail "poll self-check: drained pipe reported %d ready entries" ready_after;
+  (* the two-entry shape: entry 1 drained (not ready), entry 2 has a byte *)
+  let ready2, rev1, rev2 = poll_probe2 binding host guest_r guest_r2 0 in
+  if ready2 <> 1 then fail "poll self-check: two-entry poll reported %d ready" ready2;
+  if rev1 <> 0 then fail "poll self-check: drained entry 1 reported revents 0x%x" rev1;
+  if rev2 land 0x001 = 0 then
+    fail "poll self-check: entry 2 POLLIN missing (revents=0x%x)" rev2;
+  let unknown, unknown_rev = poll_probe binding host 999999 0 in
+  if unknown <> 1 then fail "poll self-check: unknown fd reported %d ready entries" unknown;
+  if unknown_rev land 0x020 = 0 then
+    fail "poll self-check: unknown guest fd must report POLLNVAL (revents=0x%x)" unknown_rev;
+  Host.unregister_guest_fd guest_r |> ignore;
+  Host.unregister_guest_fd guest_w |> ignore;
+  Host.unregister_guest_fd guest_r2 |> ignore;
+  Host.unregister_guest_fd guest_w2 |> ignore;
+  pass
+    "poll decodes the arena pollfd array (1- and 2-entry), reports POLLIN/POLLNVAL and writes revents back"
+
+(* ── _exit adapter ───────────────────────────────────────────────────
+   Property (the direct kernel's semantics, split at the process
+   boundary): in the parent — the seed host running the VM — _exit traps
+   deterministically; in an OS child created by the guest's own fork it
+   terminates exactly that child with the requested code. *)
+let check_exit_adapter () =
+  let binding = manifest_binding "_exit" in
+  let code () =
+    Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true 42L)
+  in
+  let host = Host.create ~repo_root:"." ~argv:[||] in
+  (match binding.invoke host [| code () |] with
+  | Ok _ -> fail "_exit self-check: the parent-host _exit returned instead of trapping"
+  | Error m ->
+      if not (contains m "in-process VM must not terminate the seed host") then
+        fail "_exit self-check: parent trap has the wrong message: %s" m);
+  match Unix.fork () with
+  | 0 ->
+      let child_host = Host.create ~repo_root:"." ~argv:[||] in
+      child_host.Host.in_fork_child <- true;
+      (match binding.invoke child_host [| code () |] with
+      | Ok _ -> Unix._exit 7
+      | Error _ -> Unix._exit 8)
+  | pid -> (
+      let _, status = Unix.waitpid [] pid in
+      match status with
+      | Unix.WEXITED 42 ->
+          pass
+            "_exit traps in the parent seed host and terminates a guest-forked child with the requested code"
+      | Unix.WEXITED n -> fail "_exit self-check: child exited %d (expected 42)" n
+      | _ -> fail "_exit self-check: child did not exit normally")
+
 let () =
   Printf.printf "host closure self-check\n";
   check_declared_unbound ();
@@ -406,6 +552,8 @@ let () =
   check_independent_signature_mismatch ();
   check_vm_dispatch ();
   check_reachable_closure_boundary ();
+  check_poll_adapter ();
+  check_exit_adapter ();
   (* Informational: the default manifest host is fail-closed (the Ruby C
      API / map-set / dl* symbols are declared without bindings). *)
   let host = Host.create ~repo_root:"." ~argv:[||] in

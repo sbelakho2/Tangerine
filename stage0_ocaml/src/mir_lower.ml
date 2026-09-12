@@ -589,6 +589,17 @@ let transparent_desc (env : func_env) (tid : Ids.Type_id.t) : string =
   else if Lang_items.tid_eq env.lang_items.Lang_items.ptr tid then "Ptr"
   else "PtrMut"
 
+(* The explicit RefToRawPtr coercion's TARGET test (the checker's
+   ref_to_raw_ptr call-boundary adaptation): a parameter whose declared
+   type is a raw-pointer handle (`Ptr[T]`/`PtrMut[T]` — the LangItems
+   raw-pointer class) or the structural raw-pointer form receives the
+   ADDRESS of a `&place` argument, never a transparent value read. *)
+let is_raw_pointer_expect (env : func_env) (ty : Type_repr.t) : bool =
+  match ty with
+  | Type_repr.Raw_ptr _ -> true
+  | Type_repr.Named (id, [| _ |]) -> Lang_items.is_raw_pointer env.lang_items id
+  | _ -> false
+
 
 let element_type_of (env : func_env) (t : Type_repr.t) : Type_repr.t =
   match t with
@@ -1604,7 +1615,7 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
        emit st
          (Seed_mir.Assign
             ( cur_place st rid,
-              Seed_mir.Constant (Seed_mir.Bool (lop = Ast.BOr)) ));
+              Seed_mir.Use (Seed_mir.Constant (Seed_mir.Bool (lop = Ast.BOr))) ));
        set_terminator st (Seed_mir.Goto join_b);
        push_block st rhs_b;
        let ro, _rt = lower_expr env st r in
@@ -1726,7 +1737,25 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
           ( Seed_mir.Read { p with Seed_mir.projections = projs },
             pointee_ty )
       | Ast.Borrow | Ast.BorrowMut ->
-          lower_expr env st inner)
+          (match expect with
+           | Some pty when is_raw_pointer_expect env pty ->
+               (* the call-boundary RefToRawPtr adaptation (the checker's
+                  ref_to_raw_ptr): `&place`/`&mut place` at a raw-pointer
+                  parameter is the ADDRESS of the place — the direct
+                  kernel's ExprAccess place channel.  Materialize the
+                  place and yield a real reference: the VM's deref paths
+                  read/write through it and the host boundary crosses it
+                  as the pointee's image with copy-out. *)
+               let io, it = lower_expr env st inner in
+               let p = materialize_place st io in
+               (* the Seed MIR's Ref/RefMut rvalue carries no mutability
+                  bit (both type as &mut at the MIR boundary); the
+                  checker's borrow-kind rule is enforced above *)
+               let ref_ty = Type_repr.Ref_internal (Type_repr.Mutable, it) in
+               let id = fresh_local st ref_ty in
+               emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Ref p));
+               (copy_place st (cur_place st id), ref_ty)
+           | _ -> lower_expr env st inner))
   | Ast.Cast (nid, inner, ty, span) ->
       ignore span;
       let io, it = lower_expr env st inner in
@@ -2009,7 +2038,7 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
        let vo, vt = lower_expr env st value in
       let vo = assign_value vt vo in
       (match target with
-       | Ast.Name (_, n, _) -> (
+  | Ast.Name (_, n, _) -> (
            match List.assoc_opt n st.scope with
            | Some id ->
                emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo))
@@ -4828,6 +4857,8 @@ and fn_value_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
           (List.mapi
              (fun i a ->
                lower_argument env st
+                 ?expect:
+                   (if i < Array.length ptys then Some ptys.(i).Type_repr.pt_type else None)
                  (if i < Array.length ptys then ptys.(i).Type_repr.pt_convention
                   else Access_effect.Let)
                  a.Ast.ca_value)
@@ -4995,20 +5026,20 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
               adoption explicitly: convert the operand to the declared
               field kind through a Cast temp, exactly like an `as`
               conversion the checker made implicit. *)
-           let arg_ops =
-             List.mapi
-               (fun i op ->
-                 match (List.nth_opt spec.vs_fields i, List.nth_opt arg_tys i) with
-                 | Some (Type_repr.Int k), Some (Type_repr.Int k2)
-                   when not (int_kind_same k k2) ->
-                     let cid = fresh_local st (Type_repr.Int k) in
-                     emit st
-                       (Seed_mir.Assign
-                          (cur_place st cid, Seed_mir.Cast (op, Type_repr.Int k)));
-                     Seed_mir.Copy (cur_place st cid)
-                 | _ -> op)
-               arg_ops
-           in
+            let arg_ops =
+              List.mapi
+                (fun i op ->
+                  match (List.nth_opt spec.vs_fields i, List.nth_opt arg_tys i) with
+                  | Some (Type_repr.Int k), Some (Type_repr.Int k2)
+                    when not (int_kind_same k k2) ->
+                      let cid = fresh_local st (Type_repr.Int k) in
+                      emit st
+                        (Seed_mir.Assign
+                           (cur_place st cid, Seed_mir.Cast (op, Type_repr.Int k)));
+                      Seed_mir.Copy (cur_place st cid)
+                  | _ -> op)
+                arg_ops
+            in
            let id = fresh_local st ty in
            emit st
              (Seed_mir.Assign
@@ -5060,6 +5091,9 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                   (List.mapi
                      (fun i a ->
                        lower_argument env st
+                         ?expect:
+                           (if i < Array.length ce_params then Some ce_params.(i).Type_repr.pt_type
+                            else None)
                          (if i < Array.length ce_params then
                            ce_params.(i).Type_repr.pt_convention
                          else Access_effect.Let)
@@ -5211,6 +5245,10 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                                    (List.mapi
                                       (fun i a ->
                                         lower_argument env st
+                                          ?expect:
+                                            (if i + 1 < Array.length me.me_params then
+                                               Some me.me_params.(i + 1).Type_repr.pt_type
+                                             else None)
                                           (if i + 1 < Array.length me.me_params then
                                             me.me_params.(i + 1).Type_repr.pt_convention
                                           else Access_effect.Let)
@@ -5294,6 +5332,10 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                               (List.mapi
                                  (fun i a ->
                                    lower_argument env st
+                                     ?expect:
+                                       (if i < nparams then
+                                          Some me.me_params.(i).Type_repr.pt_type
+                                        else None)
                                      (if i < nparams then
                                        me.me_params.(i).Type_repr.pt_convention
                                      else Access_effect.Let)
@@ -5328,14 +5370,15 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                                Array.of_list
                                  (List.mapi
                                     (fun i a ->
-                                      let conv =
+                                      let conv, pty =
                                         match
                                           Intrinsic_registry.lookup
                                             Intrinsic_registry.manifest ~name:n
                                         with
                                         | Some (_, isig)
                                           when i < Array.length isig.Intrinsic_registry.params ->
-                                            isig.Intrinsic_registry.params.(i).Type_repr.pt_convention
+                                            ( isig.Intrinsic_registry.params.(i).Type_repr.pt_convention,
+                                              Some isig.Intrinsic_registry.params.(i).Type_repr.pt_type )
                                         | _ -> (
                                             match
                                               Extern_registry.lookup Extern_registry.manifest
@@ -5343,10 +5386,11 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                                             with
                                             | Some (_, esig)
                                               when i < Array.length esig.Intrinsic_registry.params ->
-                                                esig.Intrinsic_registry.params.(i).Type_repr.pt_convention
-                                            | _ -> Access_effect.Let)
+                                                ( esig.Intrinsic_registry.params.(i).Type_repr.pt_convention,
+                                                  Some esig.Intrinsic_registry.params.(i).Type_repr.pt_type )
+                                            | _ -> (Access_effect.Let, None))
                                       in
-                                      lower_argument env st conv a.Ast.ca_value)
+                                      lower_argument env st ?expect:pty conv a.Ast.ca_value)
                                     args)
                              in
                              let id = fresh_local st ty in
@@ -5404,6 +5448,10 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                                   (List.mapi
                                      (fun i a ->
                                        lower_argument env st
+                                         ?expect:
+                                           (if i < Array.length ce_params then
+                                              Some ce_params.(i).Type_repr.pt_type
+                                            else None)
                                          (if i < Array.length ce_params then
                                           ce_params.(i).Type_repr.pt_convention
                                          else Access_effect.Let)
@@ -5828,6 +5876,10 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                     :: List.mapi
                          (fun i a ->
                            lower_argument env st
+                             ?expect:
+                               (if i + 1 < Array.length me.me_params then
+                                  Some me.me_params.(i + 1).Type_repr.pt_type
+                                else None)
                              (if i + 1 < Array.length me.me_params then
                                me.me_params.(i + 1).Type_repr.pt_convention
                              else Access_effect.Let)

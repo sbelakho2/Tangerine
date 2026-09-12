@@ -102,6 +102,15 @@ let int_value (n : int64) : Seed_mir.constant =
 let int_op (n : int) : Seed_mir.operand = Seed_mir.Constant (int_value (Int64.of_int n))
 let str_op (s : string) : Seed_mir.operand = Seed_mir.Constant (Seed_mir.String s)
 
+(* The raw-pointer address codec (vm_memory.ml): the runtime `Ptr as Int`
+   spelling.  The pointer selfchecks name the harness's pre-allocated
+   regions through the codec — the address of region 0 is NOT the integer
+   0 (0 is the null address). *)
+let region0 : Vm_memory.pointer = { Vm_memory.region = 0; offset = 0 }
+
+let addr_op (p : Vm_memory.pointer) : Seed_mir.operand =
+  Seed_mir.Constant (int_value (Vm_memory.pointer_to_int64 p))
+
 let instance (callable : int) : Instance_id.t =
   Instance_id.make ~callable:(Ids.Callable_id.make callable) ~type_args:[||]
 
@@ -307,7 +316,7 @@ let check_pointer () =
                       Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (int_op 4242));
                       Seed_mir.Assign
                         ({ root = Seed_mir.Local 2; projections = [] },
-                         Seed_mir.Cast (int_op 0, raw_ptr_ty));
+                         Seed_mir.Cast (addr_op region0, raw_ptr_ty));
                       (* store the u64 through the RawPtr *)
                       Seed_mir.Assign
                         ({ root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] },
@@ -376,7 +385,7 @@ let check_pointer () =
                       Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (int_op 5));
                       Seed_mir.Assign
                         ({ root = Seed_mir.Local 2; projections = [] },
-                         Seed_mir.Cast (int_op 0, raw_ptr_ty));
+                         Seed_mir.Cast (addr_op region0, raw_ptr_ty));
                       Seed_mir.Assign
                         ({ root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] },
                          Seed_mir.Use (Seed_mir.Copy { root = Seed_mir.Local 1; projections = [] }));
@@ -417,7 +426,7 @@ let check_pointer () =
                       Seed_mir.Assign ({ root = Seed_mir.Local 1; projections = [] }, Seed_mir.Use (int_op 7));
                       Seed_mir.Assign
                         ({ root = Seed_mir.Local 2; projections = [] },
-                         Seed_mir.Cast (int_op 0, raw_ptr_ty));
+                         Seed_mir.Cast (addr_op region0, raw_ptr_ty));
                       Seed_mir.Assign
                         ({ root = Seed_mir.Local 3; projections = [] },
                          Seed_mir.Use
@@ -516,7 +525,7 @@ let check_ref_writeback () =
       [
         Seed_mir.Assign
           ({ root = Seed_mir.Local 2; projections = [] },
-           Seed_mir.Cast (int_op 0, raw_ptr_ty));
+           Seed_mir.Cast (addr_op region0, raw_ptr_ty));
         Seed_mir.Assign
           ({ root = Seed_mir.Local 3; projections = [] },
            Seed_mir.Ref { root = Seed_mir.Local 2; projections = [ Seed_mir.Deref ] });

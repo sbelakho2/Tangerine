@@ -31,9 +31,12 @@ type t =
      drop glue skips it, so a moved-out field never double-drops. *)
 
 (* Reference targets (the audit's real-references rule):
-   - `Place (frame, local, projections)` — a REAL reference: the target
-     is a live place in an execution frame; reads resolve to the target
-     place and writes through a RefMut resolve to it and write there;
+   - `Place (frame, key, projections)` — a REAL reference: the target is
+     a live place in an execution frame; key >= 0 indexes the frame's
+     locals, key < 0 the frame's statics slot (-1 - index — seed_mir.ml's
+     Local | Static root convention), so a `&STATIC` reference reaches
+     the global slot.  Reads resolve to the target place and writes
+     through a RefMut resolve to it and write there;
    - `Region p` — a computed-value reference (the source had no place,
      e.g. `&*ptr`): the value is kept as a copy in a fresh region; reads
      load the serialized copy back, and WRITES THROUGH IT ARE A

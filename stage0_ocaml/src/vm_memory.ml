@@ -24,7 +24,7 @@ type region_kind =
 
 type region = {
   mutable live : bool;
-  bytes : Bytes.t;
+  mutable bytes : Bytes.t;
   alignment : int;
   kind : region_kind;
 }
@@ -131,6 +131,30 @@ let region_length (m : t) (p : pointer) : (int, mem_error) result =
   match region_of m p with
   | Error e -> Error e
   | Ok r -> Ok (Bytes.length r.bytes)
+
+(* The GROWING store for the value model's self-describing images
+   (Vm_value.serialize): unlike a machine image, a serialized aggregate's
+   byte length is VALUE-dependent, so a region whose capacity came from a
+   layout query (`size_of[T]`) can be smaller than the image written into
+   it.  Growing the region keeps the written image intact and the
+   subsequent deserialize exact; the strict `store_bytes` (the raw scalar
+   / C-buffer path, and the VM's out-of-bounds trap tests) is unchanged. *)
+let store_bytes_grow (m : t) (p : pointer) (b : Bytes.t) : (unit, mem_error) result =
+  match region_of m p with
+  | Error e -> Error e
+  | Ok r ->
+      let blen = Bytes.length b in
+      if p.offset < 0 then Error (OutOfBounds (p, blen))
+      else begin
+        let needed = p.offset + blen in
+        if needed > Bytes.length r.bytes then begin
+          let grown = Bytes.make needed '\000' in
+          Bytes.blit r.bytes 0 grown 0 (Bytes.length r.bytes);
+          r.bytes <- grown
+        end;
+        Bytes.blit b 0 r.bytes p.offset blen;
+        Ok ()
+      end
 
 let load_u8 (m : t) (p : pointer) : (int, mem_error) result =
   match region_of m p with

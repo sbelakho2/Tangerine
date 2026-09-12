@@ -7618,6 +7618,14 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   let owner_ty =
     match owner_ty_raw with
     | Type_repr.Ref_internal (_, t) -> t
+    | Type_repr.Named (id, [| inner |])
+      when mname = "clone" && is_box env.state.box_tid id ->
+        (* transparent-Box clone: the seed value model carries the boxed
+           CONTENT in a Box-typed slot (the parser's implicit boxing and
+           `Box::new` are transparent), so `boxed.clone()` resolves the
+           CONTENT's own Clone — the Box wrapper's own `clone` body is
+           only reachable through qualified `Box::clone(...)` calls. *)
+        inner
     | _ -> owner_ty_raw
   in
   let owner_name =

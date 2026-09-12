@@ -94,16 +94,57 @@ type limits = {
   max_host_calls : int;
 }
 
+(* The default resource budget.  The step ceiling has an environment
+   override (TANGERINE_VM_MAX_STEPS) so a run can be given a larger
+   budget for deep compiles while the default stays a bounded, fail-fast
+   guard. *)
 let default_limits =
-  { max_steps = 100_000_000; max_depth = 10_000; max_alloc_bytes = 1_073_741_824; max_host_calls = 1_000_000 }
+  let max_steps =
+    match Sys.getenv_opt "TANGERINE_VM_MAX_STEPS" with
+    | Some s -> ( match int_of_string_opt (String.trim s) with Some n -> n | None -> 100_000_000)
+    | None -> 100_000_000
+  in
+  let max_host_calls =
+    match Sys.getenv_opt "TANGERINE_VM_MAX_HOST_CALLS" with
+    | Some s -> ( match int_of_string_opt (String.trim s) with Some n -> n | None -> 1_000_000)
+    | None -> 1_000_000
+  in
+  { max_steps; max_depth = 10_000; max_alloc_bytes = 1_073_741_824; max_host_calls }
 
 type t = {
   program : Seed_mir.program;
   fn_index : (Instance_id.t, int) Hashtbl.t;  (* lookup only; iteration is never semantic *)
+  (* per-function statement arrays, indexed [fn][block]: built ONCE at
+     VM creation from the immutable MIR.  The dispatch loop indexes a
+     statement by position, so the source statement LISTS must not be
+     re-traversed (List.length + List.nth) per instruction — that walk is
+     quadratic in the block's statement count and turns a char loop into
+     an O(n^2) scan.  The arrays mirror the list order exactly. *)
+  stmt_cache : Seed_mir.statement array array array;
+  (* TypeId -> def memo over the immutable program.types: the projection
+     resolvers (field_index_of / variant_index_of / proj_type_of) would
+     otherwise linearly scan every type def PER PROJECTION, which is
+     O(types) per struct-field access on a closure with hundreds of
+     defs.  Built with the exact first-match-wins semantics of the
+     array scan it replaces. *)
+  def_cache : (Ids.Type_id.t, Seed_mir.type_def) Hashtbl.t;
+  (* Box[T] instance membership as a table — is_box_tid is consulted at
+     every call argument and deref guard, and the mono'd Box instance
+     list can be long; the list scan would dominate the call path. *)
+  box_tbl : (Ids.Type_id.t, unit) Hashtbl.t;
+  (* per-function frame-shape validation: the shape is checked once per
+     function (immutable MIR) instead of re-walking every block of the
+     callee on every call *)
+  shape_checked : bool array;
   mutable memory : Vm_memory.t;
   (* the owning LangItems (the raw-pointer nominal class the typed raw
      deref dispatches on) *)
   lang_items : Lang_items.t;
+  (* every materialized Box[T] INSTANCE id of this program (mono re-keys
+     the generic Box nominal per instantiation, so the LangItems box_
+     identity alone does not cover the executed types; Mir_verify's
+     box_instances is the same materialization authority) *)
+  box_instances : Ids.Type_id.t list;
   (* The P1-26 canonical drop-plan table: per concrete TypeId the
      ordered (field/payload path, needs_drop) plan derived ONCE from
      program.types; the destruction sites (do_drop, the assign-overwrite
@@ -119,7 +160,14 @@ type t = {
   mutable stdout : Buffer.t;
   mutable stderr : Buffer.t;
   mutable frames : frame list;
+  (* call-depth counter — EXACTLY List.length frames (the depth guard's
+     quantity); maintained across push/pop so the per-call guard is O(1)
+     instead of O(depth) *)
+  mutable depth : int;
   mutable trace : string list;
+  (* per-function step histogram (TANGERINE_DEBUG_STEPS diagnostics only;
+     empty array when disabled) *)
+  mutable step_hist : int array;
 }
 
 let find_fn (vm : t) (inst : Instance_id.t) : int option =
@@ -130,8 +178,27 @@ let mk_error vm kind message =
 
 let step_limit (vm : t) : unit =
   vm.steps <- vm.steps + 1;
-  if vm.steps > vm.limits.max_steps then
+  (if Array.length vm.step_hist > 0 then
+     match vm.frames with
+     | f :: _ when f.fn >= 0 && f.fn < Array.length vm.step_hist ->
+         vm.step_hist.(f.fn) <- vm.step_hist.(f.fn) + 1
+     | _ -> ());
+  if vm.steps > vm.limits.max_steps then begin
+    (if Array.length vm.step_hist > 0 then begin
+       Printf.eprintf "STEP HISTOGRAM (top 15 of %d steps):\n" vm.steps;
+       let idx = Array.init (Array.length vm.step_hist) (fun i -> i) in
+       Array.sort
+         (fun a b -> compare vm.step_hist.(b) vm.step_hist.(a))
+         idx;
+       Array.iteri
+         (fun rank i ->
+           if rank < 15 && vm.step_hist.(i) > 0 then
+             Printf.eprintf "  %10d  %s (fn %d)\n" vm.step_hist.(i)
+               vm.program.Seed_mir.functions.(i).Seed_mir.name i)
+         idx
+     end);
     raise (Failure "vm: step limit exceeded")
+  end
 
 let err_trap vm msg =
   let where =
@@ -171,11 +238,37 @@ let type_of_local (vm : t) (fn_idx : int) (local : int) : Type_repr.t =
    an invariant failure (deterministic trap). *)
 
 let find_def (vm : t) (tid : Ids.Type_id.t) : Seed_mir.type_def option =
-  let found = ref None in
-  Array.iter
-    (fun d -> if Seed_mir.def_id d = tid && !found = None then found := Some d)
-    vm.program.Seed_mir.types;
-  !found
+  Hashtbl.find_opt vm.def_cache tid
+
+(* The raw-pointer HANDLE shape (Ptr[T]/PtrMut[T]: a single { address:
+   UInt } field).  Its runtime values are the VM's RawPtr/Null pointers
+   (the host allocator and the Int->Ptr casts produce them), so the
+   `.address` field projection is the one address codec
+   (Vm_memory.pointer_to_int64/pointer_of_int64), never a struct slot. *)
+let is_ptr_handle_ty (vm : t) (ty : Type_repr.t) : bool =
+  match ty with
+  | Type_repr.Named (tid, _) -> (
+      match find_def vm tid with
+      | Some (Seed_mir.StructDef { sd_fields = [ f ]; _ }) -> (
+          match f.Seed_mir.fd_ty with
+          | Type_repr.Int Type_repr.UInt -> true
+          | _ -> false)
+      | _ -> false)
+  | _ -> false
+
+(* The Box[T] nominal (the owning indirection the checker erases
+   transparently).  Its runtime value is the boxed CONTENT's allocation:
+   a { ptr: Ptr[T] } wrapper whose pointee holds the serialized content.
+   The identity test covers BOTH the generic LangItems Box id and every
+   mono-materialized Box instance id the program carries. *)
+let is_box_tid (vm : t) (tid : Ids.Type_id.t) : bool =
+  Lang_items.tid_eq vm.lang_items.Lang_items.box_ tid
+  || Hashtbl.mem vm.box_tbl tid
+
+let is_box_handle_ty (vm : t) (ty : Type_repr.t) : bool =
+  match ty with
+  | Type_repr.Named (tid, [| _ |]) -> is_box_tid vm tid
+  | _ -> false
 
 (* FieldId -> positional index within the owner StructDef. *)
 let field_index_of (vm : t) (ty : Type_repr.t) (fid : Ids.Field_id.t) : int =
@@ -189,7 +282,24 @@ let field_index_of (vm : t) (ty : Type_repr.t) (fid : Ids.Field_id.t) : int =
               sd_fields
           with
           | Some f -> Ids.Field_index.to_int f.Seed_mir.fd_index
-          | None -> err_trap vm "field identity not found in the owner struct def")
+          | None ->
+              let name_of tid =
+                match List.assoc_opt tid !Typecheck.type_names_global with
+                | Some n -> n
+                | None -> "?"
+              in
+              let have =
+                String.concat ","
+                  (List.map
+                     (fun (f : Seed_mir.field_def) ->
+                       string_of_int (Ids.Field_id.to_int f.Seed_mir.fd_id))
+                     sd_fields)
+              in
+              err_trap vm
+                (Printf.sprintf
+                   "field identity #%d not found in the owner struct def type#%d (%s) [have: %s]"
+                   (Ids.Field_id.to_int fid) (Ids.Type_id.to_int tid)
+                   (name_of tid) have))
       | _ -> err_trap vm "field projection on a non-struct value")
   | _ -> err_trap vm "field projection on a non-struct value"
 
@@ -221,11 +331,31 @@ let variant_index_of (vm : t) (ty : Type_repr.t) (vid : Ids.Variant_id.t) : int 
    MIR with imprecise locals — the verifier rejects such chains, so no
    verified program reaches the fallback), the static type is carried
    through unchanged and the value-side case still bounds-checks. *)
+(* The builtin collection nominals (Vec/Array, Set, Map): they carry no
+   def fields in the value model, and their type arguments name the
+   element types the static walk needs after an index projection. *)
+let is_container_of (vm : t) (tid : Ids.Type_id.t) : bool =
+  let eq = function
+    | Some t -> Ids.Type_id.compare t tid = 0
+    | None -> false
+  in
+  eq vm.lang_items.Lang_items.vec
+  || eq vm.lang_items.Lang_items.set
+  || eq vm.lang_items.Lang_items.map
+
 let proj_type_of (vm : t) (ty : Type_repr.t) (proj : Seed_mir.projection) : Type_repr.t =
   match proj with
   | Seed_mir.Deref -> (
       match ty with
       | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> t
+      | Type_repr.Named (id, args)
+        when Array.length args = 1
+             && (Lang_items.is_raw_pointer vm.lang_items id || is_box_tid vm id) ->
+          (* the transparent pointer/Box handle: the deref-on-field
+             projection's NEXT type is the pointee, so the remaining
+             projections resolve against the pointee's def, not the
+             handle's *)
+          args.(0)
       | _ -> ty)
   | Seed_mir.Field fid -> (
       match ty with
@@ -238,7 +368,26 @@ let proj_type_of (vm : t) (ty : Type_repr.t) (proj : Seed_mir.projection) : Type
                   sd_fields
               with
               | Some f -> f.Seed_mir.fd_ty
-              | None -> err_trap vm "field identity not found in the owner struct def")
+              | None ->
+                  let name_of tid =
+                    match List.assoc_opt tid !Typecheck.type_names_global with
+                    | Some n -> n
+                    | None -> "?"
+                  in
+                  let have =
+                    String.concat ","
+                      (List.map
+                         (fun (f : Seed_mir.field_def) ->
+                           Printf.sprintf "%d:%s"
+                             (Ids.Field_id.to_int f.Seed_mir.fd_id)
+                             (Seed_mir.print_type f.Seed_mir.fd_ty))
+                         sd_fields)
+                  in
+                  err_trap vm
+                    (Printf.sprintf
+                       "field identity #%d not found in the owner struct def type#%d (%s) [have: %s]"
+                       (Ids.Field_id.to_int fid) (Ids.Type_id.to_int tid)
+                       (name_of tid) have))
           | _ -> err_trap vm "field projection on a non-struct static type")
       | _ -> err_trap vm "field projection on a non-struct static type")
   | Seed_mir.ConstantIndex i -> (
@@ -251,6 +400,11 @@ let proj_type_of (vm : t) (ty : Type_repr.t) (proj : Seed_mir.projection) : Type
             err_trap vm "tuple index out of bounds (static)"
           else elems.(i)
       | Type_repr.String -> Type_repr.Char
+      | Type_repr.Named (tid, args) when is_container_of vm tid && Array.length args = 1 ->
+          (* Vec/Set constant index: the element type (the builtin
+             collection nominals carry no def fields; the element type
+             keeps the static walk in sync for a following Field) *)
+          args.(0)
       | _ -> ty)
   | Seed_mir.Index _ -> (
       match ty with
@@ -258,6 +412,8 @@ let proj_type_of (vm : t) (ty : Type_repr.t) (proj : Seed_mir.projection) : Type
       | Type_repr.Tuple elems when Array.length elems > 0 -> elems.(0)
       | Type_repr.Tuple _ -> err_trap vm "dynamic index on an empty tuple (static)"
       | Type_repr.String -> Type_repr.Char
+      | Type_repr.Named (tid, args) when is_container_of vm tid && Array.length args = 1 ->
+          args.(0)
       | _ -> ty)
   | Seed_mir.Downcast vid -> (
       match ty with
@@ -342,6 +498,17 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
    static type of the base (from the frame's locals) is threaded through
    the walk so Field/Downcast can resolve their semantic ids against the
    program's type-definition table (fd_index/vd_index metadata). *)
+
+(* Rebuild the Seed MIR place of a reference target from the recorded
+   (frame, key, projections): keys < 0 name the frame's statics slot
+   (seed_mir.ml's Local | Static root convention) — a `&STATIC` reference
+   round-trips through read_place/write_place like any other place. *)
+and place_of_ref_key (l : int) (projs : Seed_mir.projection list) : Seed_mir.place =
+  {
+    Seed_mir.root = (if l < 0 then Seed_mir.Static (-1 - l) else Seed_mir.Local l);
+    projections = projs;
+  }
+
 and read_place (vm : t) (frame : frame) (p : Seed_mir.place) :
     (Vm_value.t, Vm_value.slot_error) result =
   step_limit vm;
@@ -355,8 +522,14 @@ and read_place (vm : t) (frame : frame) (p : Seed_mir.place) :
   in
   match base with
   | Ok b ->
-      let base_ty = type_of_local vm frame.fn (Seed_mir.root_key p.Seed_mir.root) in
-      Ok (project_read vm frame b base_ty p.Seed_mir.projections)
+      (* the static type is only needed to resolve the projections'
+         semantic ids; a bare root read skips the local-type lookup (the
+         slot read above already bounds-checked the root) *)
+      (match p.Seed_mir.projections with
+       | [] -> Ok b
+       | _ ->
+           let base_ty = type_of_local vm frame.fn (Seed_mir.root_key p.Seed_mir.root) in
+           Ok (project_read vm frame b base_ty p.Seed_mir.projections))
   | Error e -> Error e
 
 and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_repr.t)
@@ -380,8 +553,20 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
               identity) *)
            let i = field_index_of vm base_ty fid in
            match base with
+           | Vm_value.RawPtr p when i = 0 && is_ptr_handle_ty vm base_ty ->
+               (* .address on a real pointer: the address codec *)
+               recurse
+                 (Vm_value.Int
+                    (Int_value.of_int64 ~width:64 ~signed:false
+                       (Vm_memory.pointer_to_int64 p)))
+           | Vm_value.Null when i = 0 && is_ptr_handle_ty vm base_ty ->
+               recurse
+                 (Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:false 0L))
            | Vm_value.Struct fields | Vm_value.Tuple fields ->
-               if i < 0 || i >= Array.length fields then err_trap vm "field index out of bounds"
+               if i < 0 || i >= Array.length fields then
+                 err_trap vm
+                   (Printf.sprintf "field index out of bounds (type %s, %d field(s), index %d)"
+                      (Seed_mir.print_type base_ty) (Array.length fields) i)
                else recurse fields.(i)
            | Vm_value.Enum (_, fields) ->
                if i < 0 || i >= Array.length fields then err_trap vm "enum field index out of bounds"
@@ -438,13 +623,49 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                (* a real reference: resolve the target place, then
                   continue the remaining projections on the target value *)
                let tv =
-                 match read_place vm tf { Seed_mir.root = Seed_mir.Local l; projections = projs } with
+                 match read_place vm tf (place_of_ref_key l projs) with
                  | Ok v -> v
                  | Error e -> err_trap vm (Vm_value.slot_error_string e)
                in
                recurse tv
            | Vm_value.Ref (Vm_value.Region ptr) -> recurse (memory_load vm ptr)
            | Vm_value.RawPtr ptr -> recurse (memory_load_typed vm ptr deref_ty)
+           | Vm_value.Struct [| Vm_value.Int a |] when is_ptr_handle_ty vm base_ty ->
+               (* the Ptr[T]/PtrMut[T] handle's value model: a
+                  single-address struct; deref decodes the address through
+                  the one codec *)
+               recurse
+                 (memory_load_typed vm
+                    (Vm_memory.pointer_of_int64 (Int_value.to_int64 a))
+                    deref_ty)
+           | Vm_value.Struct [| Vm_value.RawPtr boxed |] when is_box_handle_ty vm base_ty ->
+               (* the Box[T] wrapper { ptr: Ptr[T] }: deref loads the
+                  boxed content image from the box's allocation *)
+               recurse (memory_load_typed vm boxed deref_ty)
+           | Vm_value.Struct [| Vm_value.Struct [| Vm_value.Int a |] |]
+             when is_box_handle_ty vm base_ty ->
+               (* the Box[T] wrapper over a Ptr-handle struct *)
+               recurse
+                 (memory_load_typed vm
+                    (Vm_memory.pointer_of_int64 (Int_value.to_int64 a))
+                    deref_ty)
+           | _
+             when (match base_ty with
+                  | Type_repr.Ref_internal _ -> true
+                  | _ -> false) ->
+               (* the transparent-reference model: a `&T`/`&mut T`
+                  argument's value channel carries the POINTEE value (the
+                  lowering passes it by value; a real Ref value is handled
+                  above), so a Deref projection over a ref-typed base is
+                  the identity on the value already in hand *)
+               recurse base
+           | _ when is_box_handle_ty vm base_ty ->
+               (* the promoted transparent-Box content: `box_new` returns
+                  the CONTENT (the direct kernel's promote_heap_to_stack),
+                  so a `*box` deref on a Box-typed base is the identity on
+                  the content already in hand; the wrapper-shaped values
+                  are handled by the arms above *)
+               recurse base
            | _ -> err_trap vm "deref on non-pointer")))
 
 (* The dynamic-index form: the payload is a LOCAL whose value is the
@@ -483,18 +704,30 @@ and memory_load (vm : t) (ptr : Vm_memory.pointer) : Vm_value.t =
       Vm_value.deserialize sub
 
 (* Deref write: serialize the value into the region (in place, never a
-   copy). *)
+   copy).  The strict bounds check stays exact for every write whose
+   static pointee IS representable (the scalar machine images and the
+   serialized scalar stores); the growing variant below is only for a
+   value-model image (an aggregate with no flat layout), whose byte
+   length is value-dependent. *)
 and memory_store (vm : t) (ptr : Vm_memory.pointer) (v : Vm_value.t) : unit =
   if ptr.Vm_memory.region < 0 then err_trap vm "deref of null pointer";
   let bytes = Vm_value.serialize v in
-  match Vm_memory.region_of vm.memory ptr with
+  match Vm_memory.store_bytes vm.memory ptr bytes with
   | Error e -> err_trap vm ("deref write: " ^ Vm_memory.mem_error_string e)
-  | Ok r ->
-      let blen = Bytes.length bytes in
-      let rlen = Bytes.length r.Vm_memory.bytes in
-      if ptr.Vm_memory.offset < 0 || ptr.Vm_memory.offset > rlen - blen then
-        err_trap vm "deref write: out-of-bounds";
-      Bytes.blit bytes 0 r.Vm_memory.bytes ptr.Vm_memory.offset blen
+  | Ok () -> ()
+
+(* The growing serialized store: a self-describing aggregate image's
+   length is VALUE-dependent, so a region whose capacity came from a
+   layout query (`size_of[T]`) can be smaller than the image the seed
+   writes into it.  Growing the region keeps the image intact and the
+   subsequent deserialize exact; the strict scalar path above is
+   unchanged, so out-of-bounds scalar writes still trap. *)
+and memory_store_growing (vm : t) (ptr : Vm_memory.pointer) (v : Vm_value.t) : unit =
+  if ptr.Vm_memory.region < 0 then err_trap vm "deref of null pointer";
+  let bytes = Vm_value.serialize v in
+  match Vm_memory.store_bytes_grow vm.memory ptr bytes with
+  | Error e -> err_trap vm ("deref write: " ^ Vm_memory.mem_error_string e)
+  | Ok () -> ()
 
 (* The pointee type of a raw-pointer/reference static type.  The
    transparent pointer nominals (Ptr/PtrMut, the raw-pointer LangItem
@@ -504,7 +737,8 @@ and pointee_type_of (vm : t) (ty : Type_repr.t) : Type_repr.t option =
   match ty with
   | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) -> Some t
   | Type_repr.Named (id, args)
-    when Lang_items.is_raw_pointer vm.lang_items id && Array.length args = 1 ->
+    when Array.length args = 1
+         && (Lang_items.is_raw_pointer vm.lang_items id || is_box_tid vm id) ->
       Some args.(0)
   | _ -> None
 
@@ -536,14 +770,19 @@ and memory_store_typed (vm : t) (ptr : Vm_memory.pointer) (ty : Type_repr.t)
   if ptr.Vm_memory.region < 0 then err_trap vm "deref of null pointer";
   match Vm_memory.kind_of vm.memory ptr with
   | Error e -> err_trap vm ("deref write: " ^ Vm_memory.mem_error_string e)
-  | Ok Vm_memory.Serialized -> memory_store vm ptr v
+  | Ok Vm_memory.Serialized -> (
+      (* a computed-value region holds SERIALIZED images for every
+         pointee; the scalar store keeps the exact bounds check *)
+      match Raw_memory.encode ty v with
+      | Some _ -> memory_store vm ptr v
+      | None -> memory_store_growing vm ptr v)
   | Ok Vm_memory.Raw -> (
       match Raw_memory.encode ty v with
       | Some b -> (
           match Vm_memory.store_bytes vm.memory ptr b with
           | Error e -> err_trap vm ("deref write: " ^ Vm_memory.mem_error_string e)
           | Ok () -> Host.region_write_hook vm.host ptr b)
-      | None -> memory_store vm ptr v)
+      | None -> memory_store_growing vm ptr v)
 
 (* Write a value into a place (assign). *)
 and write_place (vm : t) (frame : frame) (p : Seed_mir.place) (v : Vm_value.t) : unit =
@@ -592,16 +831,43 @@ and update_place (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
   | proj :: rest -> (
       let next_ty = proj_type_of vm base_ty proj in
       match proj with
-      | Seed_mir.Field fid -> (
-          let i = field_index_of vm base_ty fid in
-          match base with
-          | Vm_value.Struct fields ->
-              if i < 0 || i >= Array.length fields then err_trap vm "field index out of bounds";
+       | Seed_mir.Field fid -> (
+           let i = field_index_of vm base_ty fid in
+           match base with
+           | Vm_value.RawPtr p when i = 0 && is_ptr_handle_ty vm base_ty ->
+               (* `.address = value` on a real pointer: rebuild the
+                  pointer from the new integer address *)
+               let cur =
+                 Vm_value.Int
+                   (Int_value.of_int64 ~width:64 ~signed:false
+                      (Vm_memory.pointer_to_int64 p))
+               in
+               (match update_place vm frame cur next_ty rest v with
+                | Vm_value.Int n ->
+                    Vm_value.RawPtr
+                      (Vm_memory.pointer_of_int64 (Int_value.to_int64 n))
+                | Vm_value.Null -> Vm_value.Null
+                | _ -> err_trap vm "pointer address write with a non-integer value")
+           | Vm_value.Null when i = 0 && is_ptr_handle_ty vm base_ty -> (
+               let cur = Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:false 0L) in
+               match update_place vm frame cur next_ty rest v with
+               | Vm_value.Int n ->
+                   Vm_value.RawPtr (Vm_memory.pointer_of_int64 (Int_value.to_int64 n))
+               | Vm_value.Null -> Vm_value.Null
+               | _ -> err_trap vm "pointer address write with a non-integer value")
+           | Vm_value.Struct fields ->
+              if i < 0 || i >= Array.length fields then
+                 err_trap vm
+                   (Printf.sprintf "field index out of bounds (type %s, %d field(s), index %d)"
+                      (Seed_mir.print_type base_ty) (Array.length fields) i);
               let copy = Array.copy fields in
               copy.(i) <- update_place vm frame fields.(i) next_ty rest v;
               Vm_value.Struct copy
           | Vm_value.Tuple fields ->
-              if i < 0 || i >= Array.length fields then err_trap vm "field index out of bounds";
+              if i < 0 || i >= Array.length fields then
+                 err_trap vm
+                   (Printf.sprintf "field index out of bounds (type %s, %d field(s), index %d)"
+                      (Seed_mir.print_type base_ty) (Array.length fields) i);
               let copy = Array.copy fields in
               copy.(i) <- update_place vm frame fields.(i) next_ty rest v;
               Vm_value.Tuple copy
@@ -664,9 +930,7 @@ and update_place (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                (* a real reference: write through to the target place; the
                   remaining projections extend the target path; the ref
                   value itself is unchanged *)
-               write_place vm tf
-                 { Seed_mir.root = Seed_mir.Local l; projections = projs @ rest }
-                 v;
+               write_place vm tf (place_of_ref_key l (projs @ rest)) v;
                base
            | Vm_value.Ref (Vm_value.Region _) ->
                err_trap vm "write through a region-backed ref (computed-value ref) is a deterministic trap"
@@ -679,6 +943,46 @@ and update_place (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                    memory_store_typed vm ptr deref_ty
                      (update_place vm frame cur next_ty rest v));
                base
+           | Vm_value.Struct [| Vm_value.Int a |] when is_ptr_handle_ty vm base_ty -> (
+               let ptr = Vm_memory.pointer_of_int64 (Int_value.to_int64 a) in
+               (match rest with
+                | [] -> memory_store_typed vm ptr deref_ty v
+                | _ ->
+                    let cur = memory_load_typed vm ptr deref_ty in
+                    memory_store_typed vm ptr deref_ty
+                      (update_place vm frame cur next_ty rest v));
+               base)
+           | Vm_value.Struct [| Vm_value.RawPtr boxed |] when is_box_handle_ty vm base_ty -> (
+               (match rest with
+                | [] -> memory_store_typed vm boxed deref_ty v
+                | _ ->
+                    let cur = memory_load_typed vm boxed deref_ty in
+                    memory_store_typed vm boxed deref_ty
+                      (update_place vm frame cur next_ty rest v));
+               base)
+           | Vm_value.Struct [| Vm_value.Struct [| Vm_value.Int a |] |]
+             when is_box_handle_ty vm base_ty -> (
+               let ptr = Vm_memory.pointer_of_int64 (Int_value.to_int64 a) in
+               (match rest with
+                | [] -> memory_store_typed vm ptr deref_ty v
+                | _ ->
+                    let cur = memory_load_typed vm ptr deref_ty in
+                    memory_store_typed vm ptr deref_ty
+                      (update_place vm frame cur next_ty rest v));
+               base)
+           | _
+             when (match base_ty with
+                  | Type_repr.Ref_internal _ -> true
+                  | _ -> false) ->
+               (* the transparent-reference model on the WRITE side: the
+                  ref-typed slot holds the pointee value; a Deref write
+                  updates that value in place (the caller write-back rides
+                  the parameter convention, as the copy-in/out model
+                  requires) *)
+               update_place vm frame base deref_ty rest v
+           | _ when is_box_handle_ty vm base_ty ->
+               (* the promoted transparent-Box content on the WRITE side *)
+               update_place vm frame base deref_ty rest v
            | _ -> err_trap vm "deref write on non-pointer"))
 
 (* Replace the byte at index i with the char's UTF-8 encoding (the byte
@@ -961,8 +1265,10 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
   match rv with
   | Seed_mir.Use op -> eval_operand vm frame op
   | Seed_mir.Ref p | Seed_mir.RefMut p ->
-      if Seed_mir.root_is_static p.Seed_mir.root || (Seed_mir.root_key p.Seed_mir.root) >= Array.length frame.locals then
-        err_trap vm "ref of out-of-range local";
+      if
+        (not (Seed_mir.root_is_static p.Seed_mir.root))
+        && Seed_mir.root_key p.Seed_mir.root >= Array.length frame.locals
+      then err_trap vm "ref of out-of-range local";
       if List.exists (function Seed_mir.Deref -> true | _ -> false) p.Seed_mir.projections then
         (* computed-value source (e.g. `&*ptr`): the target is not a
            local subplace; keep a serialized copy in a fresh region;
@@ -971,7 +1277,10 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
          | Ok v -> Vm_value.Ref (Vm_value.Region (vm_alloc_scalar vm v))
          | Error e -> err_trap vm (Vm_value.slot_error_string e))
       else
-        (* real reference: record the target (frame, local, projections) *)
+        (* real reference: record the target (frame, root key, projections);
+           a negative key names the frame's statics slot (seed_mir.ml's
+           Local | Static root convention), so `&STATIC`/`&mut STATIC` is a
+           real reference too *)
         Vm_value.Ref (Vm_value.Place (frame, (Seed_mir.root_key p.Seed_mir.root), p.Seed_mir.projections))
   | Seed_mir.Aggregate (kind, ops) ->
       let vals = Array.of_list (List.map (eval_operand vm frame) ops) in
@@ -1093,6 +1402,10 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
               Vm_value.Int
                 (Int_value.of_int64 ~width:(int_width kind) ~signed:(int_signed kind)
                    (Vm_memory.pointer_to_int64 p))
+          | Vm_value.Struct [| Vm_value.Int a |] ->
+              (* `p as Int` on the source Ptr { address } handle: the
+                 handle's address field is the address *)
+              Vm_value.Int (int_cast a kind)
           | Vm_value.Null ->
               Vm_value.Int
                 (Int_value.of_int64 ~width:(int_width kind) ~signed:(int_signed kind) 0L)
@@ -1122,6 +1435,10 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
               else Vm_value.RawPtr (Vm_memory.pointer_of_int64 (Int_value.to_int64 i))
           | Vm_value.RawPtr _ -> vv
           | Vm_value.Null -> Vm_value.Null
+          | Vm_value.Ref _ ->
+              (* a real reference IS the address value the deref paths and
+                 the host boundary consume (the RefToRawPtr adaptation) *)
+              vv
           | _ -> err_trap vm "invalid cast to pointer")
       | Type_repr.Unit -> Vm_value.Unit
       | Type_repr.Bool -> (
@@ -1137,6 +1454,19 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
               else Vm_value.Char (Uchar.of_int (Int64.to_int (Int_value.to_int64 i)))
           | Vm_value.Char _ -> vv
           | _ -> err_trap vm "invalid cast to char")
+      | Type_repr.Named (id, [| _ |]) when Lang_items.is_raw_pointer vm.lang_items id
+        -> (
+          (* the Ptr[T]/PtrMut[T] handle cast surface: a real reference or
+             an existing raw pointer passes through (the mutability tag
+             lives in the checker's type, not the value), an address Int
+             becomes the source handle `Ptr { address }` shape, and an
+             existing handle struct is already the target shape *)
+          match vv with
+          | Vm_value.Ref _ | Vm_value.RawPtr _ | Vm_value.Null -> vv
+          | Vm_value.Struct _ -> vv
+          | Vm_value.Int i ->
+              Vm_value.Struct [| Vm_value.Int (int_cast i Type_repr.UInt) |]
+          | _ -> err_trap vm "invalid cast to a raw-pointer handle")
       | Type_repr.Named _ | Type_repr.Tuple _ | Type_repr.Fixed_array _ ->
           (* re-audit P12: the enum-rebrand cast — the `?` failure path
              moves the WHOLE subject (Result[Int, E] -> Result[String,
@@ -1170,6 +1500,14 @@ and int_cast (i : Int_value.t) (kind : Type_repr.int_kind) : Int_value.t =
    never a silent fallback. *)
 and vm_alloc_scalar (vm : t) (v : Vm_value.t) : Vm_memory.pointer =
   let bytes = Vm_value.serialize v in
+  vm_alloc_bytes vm bytes
+
+(* Allocate a region holding EXACTLY the given bytes (the Ref-to-pointer
+   host boundary's copy-in images: the pointee's raw scalar layout when it
+   has one, the self-describing serialization otherwise).  Allocation
+   accounting and failures are the same deterministic checks as every
+   other VM allocation. *)
+and vm_alloc_bytes (vm : t) (bytes : Bytes.t) : Vm_memory.pointer =
   let size = Bytes.length bytes in
   vm.alloc_bytes <- vm.alloc_bytes + size;
   if vm.alloc_bytes > vm.limits.max_alloc_bytes then err_trap vm "allocation limit exceeded";
@@ -1269,10 +1607,14 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                       (Seed_mir.print_instance inst) caller_name)
            in
            vm.frames <- frame :: vm.frames;
-           if List.length vm.frames > vm.limits.max_depth then
+           vm.depth <- vm.depth + 1;
+           if vm.depth > vm.limits.max_depth then
              err_trap vm "call depth exceeded";
            let fn = vm.program.Seed_mir.functions.(fn_idx) in
-           check_fn_shape vm fn_idx;
+           if not vm.shape_checked.(fn_idx) then begin
+             check_fn_shape vm fn_idx;
+             vm.shape_checked.(fn_idx) <- true
+           end;
            let callee_frame =
              { fn = fn_idx;
                locals = Array.make (Array.length fn.Seed_mir.locals) Vm_value.Uninitialized;
@@ -1286,7 +1628,47 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                  as an UNINITIALIZED output place — the callee must
                  initialize it before returning; every other convention
                  enters as the copied Live value. *)
-              let all_args = Array.append arg_vals caps in
+               let arg_vals =
+                 Array.mapi
+                   (fun i v ->
+                     (* the transparent Box at the call boundary (the
+                        checker's unify erases the wrapper; the verifier's
+                        types_compatible accepts Box[T] where T is
+                        expected): a Box-typed ARGUMENT PLACE whose
+                        parameter's declared type is the CONTENT enters as
+                        the content — load through the box pointer.  The
+                        guard is the argument's static place type (a real
+                        Box nominal), never a value-shape guess. *)
+                     let param_ty =
+                       if i < Array.length fn.Seed_mir.params then
+                         Some fn.Seed_mir.params.(i).Type_repr.pt_type
+                       else None
+                     in
+                     let param_is_box =
+                       match param_ty with
+                       | Some (Type_repr.Named (ptid, _)) -> is_box_tid vm ptid
+                       | _ -> false
+                     in
+                     if param_is_box then v
+                     else
+                       match args.(i).Seed_mir.value with
+                       | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p
+                       | Seed_mir.Consume p -> (
+                           match place_type vm frame p with
+                           | Type_repr.Named (tid, [| inner |]) when is_box_tid vm tid -> (
+                               match v with
+                               | Vm_value.Struct [| Vm_value.RawPtr boxed |] ->
+                                   memory_load_typed vm boxed inner
+                               | Vm_value.Struct [| Vm_value.Struct [| Vm_value.Int a |] |] ->
+                                   memory_load_typed vm
+                                     (Vm_memory.pointer_of_int64 (Int_value.to_int64 a))
+                                     inner
+                               | _ -> v)
+                           | _ -> v)
+                       | Seed_mir.Constant _ -> v)
+                   arg_vals
+               in
+               let all_args = Array.append arg_vals caps in
               Array.iteri
                 (fun i _slot ->
                   if i < Array.length args
@@ -1354,15 +1736,63 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                | _ -> ())
              args;
            vm.frames <- List.tl vm.frames;
+           vm.depth <- vm.depth - 1;
            write_place vm frame dest ret;
            frame.block <- next;
            frame.stmt <- 0
        | Seed_mir.TypeQuery _ -> assert false (* trapped above, before dispatch *)
-       | Seed_mir.Intrinsic _ | Seed_mir.Extern _ as host_callee ->
-           vm.host_calls <- vm.host_calls + 1;
-           if vm.host_calls > vm.limits.max_host_calls then
-             err_trap vm "host call limit exceeded";
-        let hr = call_host vm host_callee arg_vals in
+        | Seed_mir.Intrinsic _ | Seed_mir.Extern _ as host_callee ->
+            vm.host_calls <- vm.host_calls + 1;
+            if vm.host_calls > vm.limits.max_host_calls then
+              err_trap vm "host call limit exceeded";
+            (* The Ref-to-pointer host boundary: a value-level reference
+               argument crossing into a host binding is materialized as
+               its pointee's byte image in a fresh region (the raw scalar
+               layout when the pointee has one, the self-describing
+               serialization otherwise); after the binding returns, the
+               possibly mutated image copies back into the reference
+               target.  This is the seed's host-side spelling of the
+               direct kernel's by-address ABI (a Vm_value.Ref is a frame
+               record, not a region address); in-VM deref through the
+               reference stays an exact alias. *)
+            let ref_bridge = ref [] in
+            let host_args =
+              Array.mapi
+                (fun _ v ->
+                  match v with
+                  | Vm_value.Ref (Vm_value.Place (tf, l, projs)) ->
+                      let p = place_of_ref_key l projs in
+                      let pointee_ty = place_type vm tf p in
+                      let cur =
+                        match read_place vm tf p with
+                        | Ok v -> v
+                        | Error e -> err_trap vm (Vm_value.slot_error_string e)
+                      in
+                      let bytes =
+                        match Raw_memory.encode pointee_ty cur with
+                        | Some b -> b
+                        | None -> Vm_value.serialize cur
+                      in
+                      let ptr = vm_alloc_bytes vm bytes in
+                      ref_bridge :=
+                        (tf, p, pointee_ty, ptr, Bytes.length bytes) :: !ref_bridge;
+                      Vm_value.RawPtr ptr
+                  | _ -> v)
+                arg_vals
+            in
+            let hr = call_host vm host_callee host_args in
+            List.iter
+              (fun (tf, p, pointee_ty, ptr, n) ->
+                match Vm_memory.load_bytes vm.memory ptr n with
+                | Error _ -> ()
+                | Ok bytes ->
+                    let v =
+                      match Raw_memory.decode pointee_ty bytes 0 with
+                      | Some (v, _) -> v
+                      | None -> Vm_value.deserialize bytes
+                    in
+                    write_place vm tf p v)
+              (List.rev !ref_bridge);
         (* re-audit P0-3: the writeback application runs the
            ownership-explicit host_result in the audit's ORDER — (1)
            the host call has already succeeded; (2) install each
@@ -1469,40 +1899,47 @@ and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Ho
              (Array.length args));
       (match b.Host.invoke vm.host args with
        | Ok r -> r
-       | Error msg -> err_trap vm (Printf.sprintf "host call %s: %s" b.Host.name msg))
+       | Error msg ->
+           err_trap vm (Printf.sprintf "host call %s: %s" b.Host.name msg))
 
 and run_frame (vm : t) (frame : frame) : unit =
   let fn = vm.program.Seed_mir.functions.(frame.fn) in
   let fn_tag () =
     Printf.sprintf "%s(inst %s)" fn.Seed_mir.name (Seed_mir.print_instance fn.Seed_mir.instance)
   in
+  (* The dispatch loop.  The statements/terminator are executed in a
+     TAIL-RECURSIVE `go`: the one `try` around it decorates a Failure
+     ONCE for this frame (the same text the faulting instruction's own
+     catch produced before), while the per-instruction recursion this
+     replaces was not a tail call (an active `try` handler keeps each
+     activation live) — it grew the OCaml stack and re-decorated the
+     message on every previously executed instruction, so a long loop
+     could exhaust the stack and a trap could stringify megabytes. *)
   let rec go () =
     let block = fn.Seed_mir.blocks.(frame.block) in
-    if frame.stmt < List.length block.Seed_mir.statements then begin
-      let st = List.nth block.Seed_mir.statements frame.stmt in
-      (try
-         exec_statement vm frame st;
-         frame.stmt <- frame.stmt + 1;
-         go ()
-       with Failure msg ->
-         raise
-           (Failure
-              (Printf.sprintf "%s [fn %d %s bb%d id=%d stmts=%d]"
-                 msg frame.fn (fn_tag ()) frame.block
-                 (if frame.block < Array.length fn.Seed_mir.blocks then fn.Seed_mir.blocks.(frame.block).Seed_mir.id else -1)
-                 (if frame.block < Array.length fn.Seed_mir.blocks then List.length fn.Seed_mir.blocks.(frame.block).Seed_mir.statements else -1))))
+    let stmts = vm.stmt_cache.(frame.fn).(frame.block) in
+    if frame.stmt < Array.length stmts then begin
+      let st = stmts.(frame.stmt) in
+      exec_statement vm frame st;
+      frame.stmt <- frame.stmt + 1;
+      go ()
     end
-    else
-      (try
-         exec_terminator vm frame block.Seed_mir.terminator;
-         go ()
-       with Failure msg ->
-         raise
-           (Failure
-              (Printf.sprintf "%s [fn %d %s bb%d term]" msg frame.fn (fn_tag ())
-                 frame.block)))
+    else begin
+      exec_terminator vm frame block.Seed_mir.terminator;
+      go ()
+    end
   in
-  go ()
+  try go ()
+  with Failure msg ->
+    let block = fn.Seed_mir.blocks.(frame.block) in
+    let stmts = vm.stmt_cache.(frame.fn).(frame.block) in
+    let where =
+      if frame.stmt < Array.length stmts then
+        Printf.sprintf "bb%d id=%d stmts=%d" frame.block block.Seed_mir.id
+          (Array.length stmts)
+      else Printf.sprintf "bb%d term" frame.block
+    in
+    raise (Failure (Printf.sprintf "%s [fn %d %s %s]" msg frame.fn (fn_tag ()) where))
 
 and exec_statement (vm : t) (frame : frame) (st : Seed_mir.statement) : unit =
   step_limit vm;
@@ -1610,7 +2047,8 @@ let statics_initial_values (program : Seed_mir.program) : Vm_value.slot array =
    shared-LangItem ids.  (The optional arg is spelled as the _li variant
    below — an all-labeled function cannot carry an erasable optional
    argument, so the default is the non-_li entry point.) *)
-let entry_frame_of_li ~(lang_items : Lang_items.t) ~(program : Seed_mir.program)
+let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
+    ~(box_instances : Ids.Type_id.t list) ~(program : Seed_mir.program)
     ~(entry : Instance_id.t) ~(argv : string array) : (t * frame, string) result =
   let fn_index = Hashtbl.create 64 in
   Array.iteri (fun i fn -> Hashtbl.replace fn_index fn.Seed_mir.instance i) program.Seed_mir.functions;
@@ -1618,25 +2056,56 @@ let entry_frame_of_li ~(lang_items : Lang_items.t) ~(program : Seed_mir.program)
   | None -> Error "entry instance not found"
   | Some fn_idx ->
       (try
+         (* one statement array per (function, block) — the dispatch
+            loop's indexable form of the immutable block statements *)
+         let stmt_cache =
+           Array.map
+             (fun fn ->
+               Array.map
+                 (fun b -> Array.of_list b.Seed_mir.statements)
+                 fn.Seed_mir.blocks)
+             program.Seed_mir.functions
+         in
+         (* TypeId -> def, first match wins (the exact semantics of the
+            linear find_def this replaces) *)
+         let def_cache = Hashtbl.create (Array.length program.Seed_mir.types * 2 + 16) in
+         Array.iter
+           (fun d ->
+             let tid = Seed_mir.def_id d in
+             if not (Hashtbl.mem def_cache tid) then Hashtbl.add def_cache tid d)
+           program.Seed_mir.types;
+         let box_tbl = Hashtbl.create (List.length box_instances * 2 + 16) in
+         List.iter (fun tid -> Hashtbl.replace box_tbl tid ()) box_instances;
          let vm =
            {
              program;
              fn_index;
+             stmt_cache;
+             def_cache;
+             box_tbl;
+             shape_checked = Array.make (Array.length program.Seed_mir.functions) false;
              memory = Vm_memory.create ();
              lang_items;
+             box_instances;
              drop_plans = Drop_plan.of_program ~lang_items program;
              host = Host.create ~repo_root:"." ~argv:[||];
-             limits = default_limits;
+             limits;
              steps = 0;
              host_calls = 0;
              alloc_bytes = 0;
              stdout = Buffer.create 256;
              stderr = Buffer.create 256;
              frames = [];
+             depth = 0;
              trace = [];
+             step_hist =
+               (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
+                  Array.make (Array.length program.Seed_mir.functions) 0
+                else [||]);
            }
          in
          check_fn_shape vm fn_idx;
+         vm.shape_checked.(fn_idx) <- true;
          let fn = program.Seed_mir.functions.(fn_idx) in
          let entry_frame =
            { fn = fn_idx;
@@ -1661,12 +2130,14 @@ let entry_frame_of_li ~(lang_items : Lang_items.t) ~(program : Seed_mir.program)
 
 let entry_frame_of ~(program : Seed_mir.program) ~(entry : Instance_id.t)
     ~(argv : string array) : (t * frame, string) result =
-  entry_frame_of_li ~lang_items:Lang_items.seed_defaults ~program ~entry ~argv
+  entry_frame_of_li ~limits:default_limits ~lang_items:Lang_items.seed_defaults
+    ~box_instances:[] ~program ~entry ~argv
 
-let run_li ~(lang_items : Lang_items.t) ~(program : Seed_mir.program)
+let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
+    ~(box_instances : Ids.Type_id.t list) ~(program : Seed_mir.program)
     ~(entry : Instance_id.t) ~(argv : string array) ~(host : Host.t) :
     (int, vm_error) result =
-  match entry_frame_of_li ~lang_items ~program ~entry ~argv with
+  match entry_frame_of_li ~limits ~lang_items ~box_instances ~program ~entry ~argv with
   | Error m -> Error { kind = Trap "entry instance not found"; message = m; trace = [] }
   | Ok (vm, entry_frame) ->
       vm.host <- host;
@@ -1677,11 +2148,23 @@ let run_li ~(lang_items : Lang_items.t) ~(program : Seed_mir.program)
       vm.memory <- host.Host.memory;
       (try
          run_frame vm entry_frame;
+         (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
+            Printf.eprintf "VM STEPS: %d (limit %d), host calls: %d (limit %d)\n"
+              vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls);
          Ok 0
        with
-      | Failure msg -> Error { kind = Trap msg; message = msg; trace = List.rev vm.trace }
-      | Exit -> Ok 0)
+      | Failure msg ->
+          (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
+             Printf.eprintf "VM STEPS: %d (limit %d), host calls: %d (limit %d)\n"
+               vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls);
+          Error { kind = Trap msg; message = msg; trace = List.rev vm.trace }
+      | Exit ->
+          (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
+             Printf.eprintf "VM STEPS: %d (limit %d), host calls: %d (limit %d)\n"
+               vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls);
+          Ok 0)
 
 let run ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array)
     ~(host : Host.t) : (int, vm_error) result =
-  run_li ~lang_items:Lang_items.seed_defaults ~program ~entry ~argv ~host
+  run_li ~limits:default_limits ~lang_items:Lang_items.seed_defaults ~box_instances:[]
+    ~program ~entry ~argv ~host

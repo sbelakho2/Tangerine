@@ -547,12 +547,12 @@ let check_verifier () =
 
 let vm_run (prog : Seed_mir.program) : (int, Vm.vm_error) result =
   let host = Host.create ~repo_root:"." ~argv:[||] in
-  Vm.run_li ~lang_items:Lang_items.seed_defaults ~program:prog ~entry:(entry_of prog) ~argv:[||]
+  Vm.run_li ~limits:Vm.default_limits ~box_instances:[] ~lang_items:Lang_items.seed_defaults ~program:prog ~entry:(entry_of prog) ~argv:[||]
     ~host
 
 let vm_inspect (prog : Seed_mir.program) : (string, string) result =
   match
-    Vm.entry_frame_of_li ~lang_items:Lang_items.seed_defaults ~program:prog
+    Vm.entry_frame_of_li ~limits:Vm.default_limits ~box_instances:[] ~lang_items:Lang_items.seed_defaults ~program:prog
       ~entry:(entry_of prog) ~argv:[||]
   with
   | Error m -> Error m
@@ -600,7 +600,7 @@ let check_vm () =
       types = [||];
     }
   in
-  (match Vm.entry_frame_of_li ~lang_items:Lang_items.seed_defaults ~program:drop_after_move
+  (match Vm.entry_frame_of_li ~limits:Vm.default_limits ~box_instances:[] ~lang_items:Lang_items.seed_defaults ~program:drop_after_move
           ~entry:(entry_of drop_after_move) ~argv:[||]
    with
    | Error m -> fail "drop-after-move: entry_frame_of: %s" m

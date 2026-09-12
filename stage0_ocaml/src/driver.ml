@@ -1065,7 +1065,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
       | None -> 0
       | Some main ->
           let host = Host.create ~repo_root:"." ~argv:[||] in
-          (match Vm.run_li ~lang_items:(Typecheck.lang_items_of_env env) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] ~host with
+          (match Vm.run_li ~limits:Vm.default_limits ~box_instances:[] ~lang_items:(Typecheck.lang_items_of_env env) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] ~host with
            | Ok _ -> Printf.printf "// VM: exit 0\n"; 0
            | Error e -> Printf.printf "// VM: %s\n" e.Vm.message; 1))
 
@@ -1197,7 +1197,7 @@ let cmd_interpret (args : string list) : int =
                    with
                    | None -> die "no `main` function to interpret"
                    | Some main -> (
-                       match Vm.entry_frame_of_li ~lang_items:(Typecheck.lang_items_of_env env) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] with
+                       match Vm.entry_frame_of_li ~limits:Vm.default_limits ~box_instances:[] ~lang_items:(Typecheck.lang_items_of_env env) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] with
                        | Error m -> die "interpret: %s" m
                        | Ok (vm, entry_frame) -> (
                            match Vm.run_inspect vm entry_frame with
@@ -3276,6 +3276,62 @@ type mono_outcome = {
   mo_same_canonical_instance : Ids.Type_id.t -> Ids.Type_id.t -> bool;
   mo_box_instances : Ids.Type_id.t list;
 }
+
+(* ── The bootstrap VM budget ──────────────────────────────────────────
+   Workload: the bootstrap-check / compile kernel invocation
+     compile tests/differential/corpus/01_defs_arith.tg -o bootstrap_check.out
+   The kernel does NOT compile only that one-file smoke: compile_startup_entry
+   runs merge_imported_deps with include_compiler_lib=false, which loads the
+   std prelude set (prelude_files(): std/alloc, collections, core, ffi, fmt,
+   fs, io, taint) plus every transitive `use` of those through the dependency
+   scanner (collect_dep_file lexes + parses each dependency), then lexes,
+   parses, typechecks, lowers and codegens that whole 45-module closure in
+   the interpreter.  The budget is the intended ceiling for THAT workload,
+   measured, not a mask for a slow implementation.
+
+   Measurements (TANGERINE_DEBUG_STEPS runs of the bootstrap-check kernel at
+   a 2e9 ceiling):
+     - kernel executions that finished early on semantic bail-outs consumed
+       0.46e9 - 0.67e9 steps and 3.7e6 - 11.4e6 host calls;
+     - the deepest-progressing run hit the old 2e9 ceiling while still inside
+       corpus typechecking (analyze_parsed -> check_item -> ... ->
+       subst_snapshot -> clone), with the step histogram dominated by the
+       dependency-merge/typecheck clone family (~0.58e9), entries_cloned
+       (~0.28e9), name resolution (~0.27e9) and check_expr (~0.12e9), and
+       30.5e6 host calls.
+   So the true full-run cost is demonstrably above 2e9 (the ceiling it hit)
+   and the lexer/dependency-scan hot-path fixes must land it well below this
+   constant.  5e9 keeps >2x over the observed partial floor and ~7.5x over
+   the largest completed kernel execution, while a runaway loop still fails
+   fast and deterministically (the guard stays a bounded resource budget,
+   never an unbounded run).  Host calls keep >6x over the worst observed
+   30.5e6. *)
+let bootstrap_vm_max_steps = 5_000_000_000
+let bootstrap_vm_max_host_calls = 200_000_000
+
+let bootstrap_vm_limits : Vm.limits =
+  {
+    Vm.default_limits with
+    max_steps = bootstrap_vm_max_steps;
+    max_host_calls = bootstrap_vm_max_host_calls;
+  }
+
+(* ── The VM-side layout fold (the TypeQuery resolution) ──────────────
+   The mono'd program keeps size_of/align_of as first-class TypeQuery
+   callees so the concrete verifier checks them against the registered
+   query signatures; the VM has no layout authority, so the queries are
+   resolved by LAYOUT FOLDING (the Seed MIR contract's named channel)
+   immediately before execution.  The fold replaces every
+   `Call (dest, TypeQuery (k, [ty]), [], next)` with a constant
+   assignment and `Goto next` (Layout_fold); mo_program itself stays
+   untouched — the concrete verify, the CFG dataflow, the reachable-host
+   scan and every evidence row inspect the pre-fold program. *)
+let vm_program_with_folded_queries (ctx : closure_ctx) (mo : mono_outcome) :
+    Seed_mir.program =
+  Layout_fold.fold_program
+    ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
+    ~name_of:(fun tid -> List.assoc_opt tid !Typecheck.type_names_global)
+    (Layout_fold.promote_box_constructors mo.mo_program)
 
 (* ── Post-mono type materialization (re-audit finding: "generic nominal
       type definitions disappear before MIR") ───────────────────────
@@ -5369,7 +5425,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                           bs_oracle_incomplete = oracle_incomplete;
                         }
                   | Ok report -> (
-                      match Vm.run_li ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host with
+                      match Vm.run_li ~limits:bootstrap_vm_limits ~box_instances:mo.mo_box_instances ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:(vm_program_with_folded_queries ctx mo) ~entry:mo.mo_entry ~argv ~host with
                       | Error _ ->
                           Ok
                             {
@@ -5727,10 +5783,11 @@ let cmd_bootstrap_check (args : string list) : int =
                               Printf.printf "EVIDENCE_HOST reachable_closure=pass reachable=%d declared=%d implemented=%d\n"
                                 (List.length reachable) report.Host.declared report.Host.implemented;
                                Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
-                               (match
-                                  Vm.run_li ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
-                                   ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host
-                               with
+                                (match
+                                   Vm.run_li ~limits:bootstrap_vm_limits ~box_instances:mo.mo_box_instances ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
+                                    ~program:(vm_program_with_folded_queries ctx mo)
+                                    ~entry:mo.mo_entry ~argv ~host
+                                with
                                | Error e ->
                                    let out = Host.stdout_contents host in
                                    if out <> "" then
@@ -5746,6 +5803,9 @@ let cmd_bootstrap_check (args : string list) : int =
                                     let out = Host.stdout_contents host in
                                    if out <> "" then
                                      Printf.printf "  kernel stdout:\n%s\n" out;
+                                   let err = Host.stderr_contents host in
+                                   if err <> "" then
+                                     Printf.printf "  kernel stderr:\n%s\n" err;
                                    Printf.printf "  VM bootstrap run: exit %d\n" code;
                                    if code <> 0 then begin
                                      Printf.printf
@@ -5875,7 +5935,7 @@ let cmd_compile (args : string list) : int =
                         let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
                         Printf.printf "  compile: kernel argv: %s\n" (String.concat " " (Array.to_list argv));
                         let host = Host.create ~repo_root:opts.repo_root ~argv in
-                        (match Vm.run_li ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:mo.mo_program ~entry:mo.mo_entry ~argv ~host with
+                        (match Vm.run_li ~limits:bootstrap_vm_limits ~box_instances:mo.mo_box_instances ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:(vm_program_with_folded_queries ctx mo) ~entry:mo.mo_entry ~argv ~host with
                          | Error e ->
                              Printf.printf "compile: VM bootstrap run TRAPPED: %s\n" e.Vm.message;
                              let out = Host.stdout_contents host in

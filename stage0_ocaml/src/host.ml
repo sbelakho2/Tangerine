@@ -130,6 +130,12 @@ and t = {
      guest's own Vec value observes the C-ABI write (the seed value model
      has no addressable Vec storage; the link is the materialization). *)
   array_links : (int, Vm_value.t array) Hashtbl.t;
+  (* True in an OS child process created by the guest's own c_fork.  The
+     direct kernel's `_exit` terminates the process; the seed host may
+     perform exactly that in a guest-created child (the child is the VM
+     process, the parent keeps the driver's report), never in the parent
+     where it would kill the seed host running the VM. *)
+  mutable in_fork_child : bool;
 }
 
 (* Output helpers (the VM's printf/intrinsic path — audit §45). *)
@@ -272,18 +278,13 @@ let adapter_raw_wb (params : (Access_effect.t * Type_repr.t) list) (ret : Type_r
     (invoke : t -> Vm_value.t array -> (host_result, string) result) : adapter =
   { signature = mk_sig params ret; invoke }
 
-(* An extern adapter whose semantics cannot cross the seed host boundary:
-   the parameter list carries a raw-memory pointer that the host has no
-   arena to decode (a borrowed C-string path/argv/buffer, or an
-   out-parameter the callee must write through).  The direct kernel
-   issues the raw syscall; the value-model seed host can only fail
-   closed, so the adapter is the honest deterministic trap — never a
-   fabricated fd/status/value.  The message names the symbol and the
-   boundary reason. *)
-let extern_trap (params : (Access_effect.t * Type_repr.t) list) (ret : Type_repr.t)
-    (why : string) : adapter =
-  adapter_raw params ret (fun _ _ -> Error why)
-
+(* The remaining deterministic traps are written inline at their
+   adapters (a direct `Error`): the unwind/function-value intrinsics
+   (__intrinsic_try_invoke, __intrinsic_longjmp), panic/abort, the
+   Option::expect None case and the checked-access errors (out-of-bounds
+   array/region access, invalid free).  They fire only on guest misuse or
+   on the program's own abort semantics — never on a valid host call the
+   executable closure reaches. *)
 let adapter_ret_unit (f : t -> unit) : adapter =
   {
     signature = mk_sig [] Type_repr.Unit;
@@ -438,11 +439,56 @@ let std_fd_of (fd : int) : Unix.file_descr option =
 
 let mem_error (e : Vm_memory.mem_error) : string = Vm_memory.mem_error_string e
 
-let ptr_arg (v : Vm_value.t) : (Vm_memory.pointer, string) result =
+(* The value's runtime shape, for boundary diagnostics. *)
+let value_kind_name (v : Vm_value.t) : string =
   match v with
-  | Vm_value.RawPtr p -> Ok p
-  | Vm_value.Null -> Error "null pointer"
-  | _ -> Error "argument mismatch: expected Ptr"
+  | Vm_value.Unit -> "Unit"
+  | Vm_value.Bool _ -> "Bool"
+  | Vm_value.Int _ -> "Int"
+  | Vm_value.Float32 _ -> "Float32"
+  | Vm_value.Float64 _ -> "Float64"
+  | Vm_value.Char _ -> "Char"
+  | Vm_value.String _ -> "String"
+  | Vm_value.Tuple _ -> "Tuple"
+  | Vm_value.Struct _ -> "Struct"
+  | Vm_value.Enum _ -> "Enum"
+  | Vm_value.Array _ -> "Array"
+  | Vm_value.Set _ -> "Set"
+  | Vm_value.Map _ -> "Map"
+  | Vm_value.Function _ -> "Function"
+  | Vm_value.Closure _ -> "Closure"
+  | Vm_value.RawPtr _ -> "RawPtr"
+  | Vm_value.Ref _ -> "Ref"
+  | Vm_value.Null -> "Null"
+  | Vm_value.MovedOut -> "MovedOut"
+
+(* The address-bearing pointer shapes the value model uses: the host's
+   RawPtr/Null, the Int address codec (the language's `p as Int`
+   spellings), the source `Ptr { address }` handle struct, and a handle
+   over a handle (the Box/Ptr wrapper shape).  None when the value is not
+   a pointer at all. *)
+let pointer_value_to_pointer (v : Vm_value.t) : Vm_memory.pointer option =
+  match v with
+  | Vm_value.RawPtr p -> Some p
+  | Vm_value.Null -> Some (Vm_memory.pointer_of_int64 0L)
+  | Vm_value.Int i -> Some (Vm_memory.pointer_of_int64 (Int_value.to_int64 i))
+  | Vm_value.Struct [| Vm_value.Int i |] ->
+      Some (Vm_memory.pointer_of_int64 (Int_value.to_int64 i))
+  | Vm_value.Struct [| Vm_value.Struct [| Vm_value.Int i |] |] ->
+      Some (Vm_memory.pointer_of_int64 (Int_value.to_int64 i))
+  | _ -> None
+
+let ptr_arg (v : Vm_value.t) : (Vm_memory.pointer, string) result =
+  match pointer_value_to_pointer v with
+  | Some p ->
+      if p.Vm_memory.region < 0 then
+        Error
+          (Printf.sprintf
+             "argument mismatch: expected Ptr (found %s, which is not an arena \
+              address — a null/foreign address)"
+             (value_kind_name v))
+      else Ok p
+  | None -> Error ("argument mismatch: expected Ptr (found " ^ value_kind_name v ^ ")")
 
 let arena_alloc (t : t) (size : int) (align : int) : (Vm_memory.pointer, string) result =
   match Vm_memory.alloc ~kind:Vm_memory.Raw t.memory size align with
@@ -504,6 +550,17 @@ let arena_link_mirror (t : t) (p : Vm_memory.pointer) (b : Bytes.t) : unit =
 
 let arena_store (t : t) (p : Vm_memory.pointer) (b : Bytes.t) : (unit, string) result =
   match Vm_memory.store_bytes t.memory p b with
+  | Ok () ->
+      arena_link_mirror t p b;
+      Ok ()
+  | Error e -> Error (mem_error e)
+
+(* The growing variant for the value-model images (__intrinsic_ptr_write):
+   a self-describing serialized image's length is value-dependent, so a
+   region sized from a layout query can be smaller; growing keeps the
+   image intact.  The strict machine-image stores stay on arena_store. *)
+let arena_store_grow (t : t) (p : Vm_memory.pointer) (b : Bytes.t) : (unit, string) result =
+  match Vm_memory.store_bytes_grow t.memory p b with
   | Ok () ->
       arena_link_mirror t p b;
       Ok ()
@@ -808,7 +865,152 @@ let host_chmod (t : t) (path : string) (mode : int) : int =
     0
   with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e
 
-(* ── The raw syscall surface (__intrinsic_syscall1..6) ────────────────
+(* ── poll(2) over the guest descriptor table ─────────────────────────
+   The guest's pollfd array is a Raw arena region of 8-byte records
+
+     { int fd; short events; short revents; }   (little-endian)
+
+   (std/process.tg _poll_fd_append).  The seed host maps readiness onto
+   Unix.select: POLLIN and POLLOUT are the selectable events the closure
+   watches (Command::output interleaves its two stdio pipes), a guest fd
+   with no host descriptor reports POLLNVAL, and negative entries are
+   ignored (POSIX).  revents is written back through arena_store, so a
+   linked guest byte Vec observes it.  The result is the number of
+   entries with a nonzero revents, or a negative errno on failure —
+   exactly poll(2)'s return contract. *)
+let poll_in = 0x001
+let poll_out = 0x004
+let poll_nval = 0x020
+
+let poll_fd_at (b : Bytes.t) (i : int) : int =
+  let raw = Raw_memory.u64_le b (i * 8) 4 in
+  let raw =
+    if Int64.logand raw 0x80000000L <> 0L then Int64.sub raw 0x100000000L
+    else raw
+  in
+  Int64.to_int raw
+
+let poll_events_at (b : Bytes.t) (i : int) : int =
+  Int64.to_int (Raw_memory.u64_le b ((i * 8) + 4) 2)
+
+let host_poll (t : t) (p : Vm_memory.pointer) (b : Bytes.t) (nfds : int)
+    (timeout_ms : int) : (int, string) result =
+  let entries =
+    Array.init nfds (fun i -> (poll_fd_at b i, poll_events_at b i))
+  in
+  let read_fds = ref [] and write_fds = ref [] in
+  Array.iter
+    (fun (fd, events) ->
+      if fd >= 0 then
+        match guest_fd fd with
+        | None -> ()
+        | Some d ->
+            if events land poll_in <> 0 && not (List.mem d !read_fds) then
+              read_fds := d :: !read_fds;
+            if events land poll_out <> 0 && not (List.mem d !write_fds) then
+              write_fds := d :: !write_fds)
+    entries;
+  let timeout =
+    if timeout_ms < 0 then -1.0 else float_of_int timeout_ms /. 1000.0
+  in
+  let select_result =
+    if !read_fds = [] && !write_fds = [] then begin
+      (* nothing selectable (all entries negative/unknown): a pure
+         timeout wait, never an indefinite block on an empty set *)
+      if timeout > 0.0 then
+        (try ignore (Unix.select [] [] [] timeout)
+         with Unix.Unix_error _ -> ());
+      Ok ([], [], [])
+    end
+    else
+      try Ok (Unix.select !read_fds !write_fds [] timeout)
+      with Unix.Unix_error (e, _, _) -> Error (-errno_of_unix_error e)
+  in
+  match select_result with
+  | Error code -> Ok code
+  | Ok (ready_r, ready_w, _) ->
+      let ready = ref 0 in
+      for i = 0 to nfds - 1 do
+        let fd, events = entries.(i) in
+        let revents =
+          if fd < 0 then 0
+          else
+            match guest_fd fd with
+            | None -> poll_nval
+            | Some d ->
+                let r = events land poll_in <> 0 && List.mem d ready_r in
+                let w = events land poll_out <> 0 && List.mem d ready_w in
+                (if r then poll_in else 0) lor (if w then poll_out else 0)
+        in
+        if revents <> 0 then incr ready;
+        Raw_memory.put_u64_le b ((i * 8) + 6) 2 (Int64.of_int revents)
+      done;
+      if nfds = 0 then Ok !ready
+      else (
+        match arena_store t p b with
+        | Ok () -> Ok !ready
+        | Error e -> Error ("poll: " ^ e))
+
+(* ── the stat family (raw_stat/raw_lstat/raw_fstat) ──────────────────
+   The kernel's stdout/stat_buffer_size is 160 bytes and its stat_layout
+   reads the Darwin stat layout: st_dev@0(u64), st_mode@4(u16),
+   st_nlink@6(u16), st_ino@8(u64), st_uid@16(u32), st_gid@20(u32),
+   st_rdev@24(u64), st_atime@32(i64), st_mtime@48, st_ctime@64,
+   st_birthtime@80, st_blocks@104, st_blksize@112, st_size@96(i64).
+   The host fills the same layout from the OCaml Unix stat record. *)
+let file_perm_bits (p : Unix.file_perm) : int = Obj.magic p
+
+let mode_kind_bits (k : Unix.file_kind) : int =
+  match k with
+  | Unix.S_REG -> 0x8000
+  | Unix.S_DIR -> 0x4000
+  | Unix.S_CHR -> 0x2000
+  | Unix.S_BLK -> 0x6000
+  | Unix.S_LNK -> 0xA000
+  | Unix.S_FIFO -> 0x1000
+  | Unix.S_SOCK -> 0xC000
+
+let host_stat_bytes (st : Unix.LargeFile.stats) : Bytes.t =
+  let open Unix.LargeFile in
+  let b = Bytes.make 160 '\000' in
+  let put64 off v = Raw_memory.put_u64_le b off 8 v in
+  let put32 off v = Raw_memory.put_u64_le b off 4 (Int64.of_int v) in
+  let put16 off v = Raw_memory.put_u64_le b off 2 (Int64.of_int v) in
+  let secs (f : float) : int64 = Int64.of_float (Float.trunc f) in
+  put64 0 (Int64.of_int st.st_dev);
+  put16 4 (mode_kind_bits st.st_kind lor file_perm_bits st.st_perm);
+  put16 6 st.st_nlink;
+  put64 8 (Int64.of_int st.st_ino);
+  put32 16 st.st_uid;
+  put32 20 st.st_gid;
+  put64 24 (Int64.of_int st.st_rdev);
+  put64 32 (secs st.st_atime);
+  put64 48 (secs st.st_mtime);
+  put64 64 (secs st.st_ctime);
+  put64 80 (secs st.st_mtime) (* birthtime: OCaml exposes none; mirror mtime *);
+  put64 96 st.st_size;
+  put64 104 0L (* st_blocks: not exposed *);
+  put64 112 4096L (* st_blksize: not exposed; the conventional page size *);
+  b
+
+let host_stat (t : t) (path : string) (kind : [ `Stat | `Lstat ]) :
+    (Unix.LargeFile.stats, int) result =
+  let real = host_real_path t path ~for_create:false in
+  try
+    Ok
+      (match kind with
+       | `Stat -> Unix.LargeFile.stat real
+       | `Lstat -> Unix.LargeFile.lstat real)
+  with Unix.Unix_error (e, _, _) -> Error (-errno_of_unix_error e)
+
+let host_fstat (fd : int) : (Unix.LargeFile.stats, int) result =
+  match guest_fd fd with
+  | None -> Error (-errno_badf)
+  | Some d -> (
+      try Ok (Unix.LargeFile.fstat d)
+      with Unix.Unix_error (e, _, _) -> Error (-errno_of_unix_error e))
+
+(* The raw syscall surface (__intrinsic_syscall1..6) ────────────────
    The direct kernel passes the standard library's canonical numbers to
    the target ABI (codegen adds 3 on macOS: read 0->3, write 1->4, open
    2->5, close 3->6, lseek 196->199, chmod 12->15, ...).  The seed host
@@ -908,6 +1110,26 @@ let host_syscall (t : t) (n : int) (args : int array) : (int, string) result =
             Unix.rmdir (host_real_path t path ~for_create:false);
             Ok 0
           with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e)))
+  | 189 | 190 | 191 ->
+      (* fstat/lstat/stat (the kernel's SYS_*_MAC values + the codegen
+         offset): fill the 160-byte stat buffer at the pointer argument *)
+      if so = 189 then (
+        match host_fstat (arg 0) with
+        | Error code -> Ok code
+        | Ok st -> (
+            match arena_store t (ptr 1) (host_stat_bytes st) with
+            | Ok () -> Ok 0
+            | Error _ -> Ok (-errno_fault)))
+      else (
+        match path_at 0 with
+        | Error e -> Error e
+        | Ok path -> (
+            match host_stat t path (if so = 190 then `Lstat else `Stat) with
+            | Error code -> Ok code
+            | Ok st -> (
+                match arena_store t (ptr 1) (host_stat_bytes st) with
+                | Ok () -> Ok 0
+                | Error _ -> Ok (-errno_fault))))
   | 199 -> Ok (Int64.to_int (host_lseek (arg 0) (Int64.of_int (arg (1))) (arg 2)))
   | _ ->
       Error
@@ -2482,11 +2704,14 @@ let binding_manifest : binding list =
               deterministic trap (the seed memory model is strict where
               the raw machine is UB). *)
            match args with
-           | [| Vm_value.RawPtr p; Vm_value.Int _ |] -> (
-               match Vm_memory.free t.memory p with
-               | Ok () -> Ok Vm_value.Unit
-               | Error e -> Error ("__intrinsic_mem_free: " ^ mem_error e))
-           | [| Vm_value.Null; _ |] -> Ok Vm_value.Unit
+           | [| ptrv; Vm_value.Int _ |] -> (
+               match pointer_value_to_pointer ptrv with
+               | Some p when p.Vm_memory.region >= 0 -> (
+                   match Vm_memory.free t.memory p with
+                   | Ok () -> Ok Vm_value.Unit
+                   | Error e -> Error ("__intrinsic_mem_free: " ^ mem_error e))
+               | Some _ -> Ok Vm_value.Unit
+               | None -> arg_mismatch "(Ptr[u8], UInt)")
            | _ -> arg_mismatch "(Ptr[u8], UInt)"));
     intrinsic_binding "__intrinsic_syscall1"
       (adapter_raw (lets [ ty_int; ty_int ]) ty_int (fun t args ->
@@ -2774,11 +2999,11 @@ let binding_manifest : binding list =
            | [| ptrv; value |] -> (
                match ptr_arg ptrv with
                | Error e -> Error e
-               | Ok p -> (
-                   let b = Vm_value.serialize value in
-                   match arena_store t p b with
-                   | Ok () -> Ok Vm_value.Unit
-                   | Error e -> Error ("__intrinsic_ptr_write: " ^ e)))
+                | Ok p -> (
+                    let b = Vm_value.serialize value in
+                    match arena_store_grow t p b with
+                    | Ok () -> Ok Vm_value.Unit
+                    | Error e -> Error ("__intrinsic_ptr_write: " ^ e)))
            | _ -> arg_mismatch "(Ptr, value)"));
     intrinsic_binding "__intrinsic_ptr_read"
       (adapter_raw (lets [ ptr_named p0 ]) p0 (fun t args ->
@@ -2801,9 +3026,15 @@ let binding_manifest : binding list =
     intrinsic_binding "__intrinsic_ptr_as_mut"
       (adapter_raw (lets [ ptr_named p0 ]) (ptrmut_named p0) (fun _ args ->
            (* the address-preserving cast: on the value model the
-              mutability tag lives in the checker's type, not the value *)
+              mutability tag lives in the checker's type, not the value.
+              Every address-bearing pointer shape passes through
+              unchanged (RawPtr/Null, the `Ptr { address }` handle
+              struct, and the handle over a handle). *)
            match args with
-           | [| (Vm_value.RawPtr _ | Vm_value.Null) as p |] -> Ok p
+           | [| ( Vm_value.RawPtr _ | Vm_value.Null | Vm_value.Int _
+                | Vm_value.Struct [| Vm_value.Int _ |]
+                | Vm_value.Struct [| Vm_value.Struct [| Vm_value.Int _ |] |] ) as p |] ->
+               Ok p
            | _ -> arg_mismatch "Ptr"));
 
     (* Option::expect (the None case is the std's defined panic — a
@@ -2986,23 +3217,33 @@ let binding_manifest : binding list =
               value operation on the seed's (region, offset) pointer model,
               no dereference involved. *)
            match args with
-           | [| Vm_value.RawPtr p; Vm_value.Int d |] ->
-               Ok
-                 (Vm_value.RawPtr
-                    { p with
-                      Vm_memory.offset =
-                        p.Vm_memory.offset + Int64.to_int (Int_value.to_int64 d) })
-           | [| Vm_value.Null; _ |] -> Ok Vm_value.Null
+           | [| ptrv; Vm_value.Int d |] -> (
+               match pointer_value_to_pointer ptrv with
+               | Some p when p.Vm_memory.region >= 0 ->
+                   Ok
+                     (Vm_value.RawPtr
+                        { p with
+                          Vm_memory.offset =
+                            p.Vm_memory.offset + Int64.to_int (Int_value.to_int64 d) })
+               | Some _ -> Ok Vm_value.Null
+               | None -> arg_mismatch "(Ptr[u8], Int)")
            | _ -> arg_mismatch "(Ptr[u8], Int)"));
 
     (* the POSIX process surface: fork/dup2/close are descriptor- or
        pid-valued and map onto the host's OCaml Unix calls; the
        raw-pointer-carrying members decode their arena arguments. *)
     extern_binding "c_fork"
-      (adapter_raw [] ty_i32 (fun _ args ->
+      (adapter_raw [] ty_i32 (fun t args ->
            match args with
            | [||] -> (
-               try Ok (vm_i32 (Unix.fork ()))
+               try
+                 let pid = Unix.fork () in
+                 (* the child continues the SAME VM with the forked host
+                    state; record its identity so `_exit` can terminate
+                    the child (the direct kernel's process) while the
+                    parent keeps executing the driver *)
+                 if pid = 0 then t.in_fork_child <- true;
+                 Ok (vm_i32 pid)
                with Unix.Unix_error _ -> Ok (vm_i32 (-1)))
            | _ -> arg_mismatch "no arguments"));
     extern_binding "dup2"
@@ -3107,9 +3348,24 @@ let binding_manifest : binding list =
                       Ok (vm_i32 (-errno_of_unix_error e))))
            | _ -> arg_mismatch "(i32, PtrMut[Int], i32)"));
     extern_binding "_exit"
-      (extern_trap (lets [ ty_int ]) Type_repr.Never
-         "_exit: terminating the seed host process is outside the executable \
-          closure (the VM traps and returns control to the driver instead)");
+      (adapter_raw (lets [ ty_int ]) Type_repr.Never (fun t args ->
+           (* the direct kernel's `_exit` terminates the process without
+              any cleanup.  The VM runs inside the seed host, so the only
+              process a guest exit may terminate is an OS child the GUEST
+              itself forked (Command::spawn's child arms — the pid == 0
+              branch runs in that child); there `Unix._exit` is the exact
+              POSIX semantics.  In the parent the call traps instead of
+              killing the seed host and the driver alongside it. *)
+           match args with
+           | [| Vm_value.Int code |] ->
+               if t.in_fork_child then
+                 Unix._exit (Int64.to_int (Int_value.to_int64 code))
+               else
+                 Error
+                   "_exit: the in-process VM must not terminate the seed host; \
+                    a guest exit is executable only in an OS child created by \
+                    the guest's own fork()"
+           | _ -> arg_mismatch "Int"));
     extern_binding "pipe"
       (adapter_raw (lets [ ptrmut_named ty_int ]) ty_i32 (fun t args ->
            match args with
@@ -3167,11 +3423,36 @@ let binding_manifest : binding list =
                        in
                        Ok (vm_i32 (host_open t path flags mode))))
            | _ -> arg_mismatch "(Ptr[u8], Int)"));
+    (* poll(2): the pollfd array is a Raw arena region — decodable now
+       that the arena landed (the old trap's stated blocker is gone).
+       The direct kernel's Command::output (the linker's macOS ad-hoc
+       codesign step) interleaves its two stdio pipes through this call,
+       so the executable path requires the real adapter. *)
     extern_binding "poll"
-      (extern_trap (lets [ ptr_named Intrinsic_registry.ty_u8; ty_uint; ty_int ]) ty_i32
-         "poll: the seed host cannot decode the pollfd array Ptr[u8] (no \
-          poll implementation at the host boundary); the direct kernel's runtime \
-          closure emits no poll helper either");
+      (adapter_raw (lets [ ptr_named Intrinsic_registry.ty_u8; ty_uint; ty_int ]) ty_i32
+         (fun t args ->
+           match args with
+           | [| fdsv; nfdsv; timeoutv |] -> (
+               let nfds = int_arg nfdsv in
+               let timeout_ms = int_arg timeoutv in
+               if nfds < 0 then Ok (vm_i32 (-errno_of_unix_error Unix.EINVAL))
+               else if nfds = 0 then (
+                 match
+                   host_poll t (Vm_memory.pointer_of_int64 0L) Bytes.empty 0 timeout_ms
+                 with
+                 | Ok n -> Ok (vm_i32 n)
+                 | Error e -> Error e)
+               else (
+                 match ptr_arg fdsv with
+                 | Error e -> Error e
+                 | Ok p -> (
+                     match arena_load t p (nfds * 8) with
+                     | Error e -> Error ("poll: " ^ e)
+                     | Ok b -> (
+                         match host_poll t p b nfds timeout_ms with
+                         | Ok n -> Ok (vm_i32 n)
+                         | Error e -> Error e))))
+           | _ -> arg_mismatch "(Ptr[u8], UInt, Int)"));
     extern_binding "libc_open_path"
       (adapter_raw (lets [ ptr_named Intrinsic_registry.ty_u8; ty_int; ty_int ]) ty_int
          (fun t args ->
@@ -3246,6 +3527,7 @@ let create_with ~repo_root ~(argv : string array) ~(intrinsics : Intrinsic_regis
     stderr = Buffer.create 4096;
     memory = Vm_memory.create ();
     array_links = Hashtbl.create 16;
+    in_fork_child = false;
   }
 
 (* The default host: manifest registries and the manifest binding table. *)
