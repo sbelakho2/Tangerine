@@ -38,7 +38,7 @@ fi
 cd stage0_ocaml
 dune build
 
-TEST_OUT="$(timeout 120 _build/default/test/test_main.exe 2>&1)"
+TEST_OUT="$(timeout 120 _build/default/test/test_main.exe 2>&1 || true)"
 if ! grep -qE '[0-9]+ passed, 0 failed' <<<"$TEST_OUT"; then
   echo "check_ocaml_seed_health: FAIL — unit test suite did not report a clean pass:"
   echo "$TEST_OUT" | tail -5
@@ -61,7 +61,12 @@ NAMES="$(
     }' selfcheck/dune
 )"
 SELFCHECK_COUNT=0
+SELFCHECK_TOTAL=0
 SELFCHECK_FAIL=0
+if [ -z "$NAMES" ]; then
+  echo "check_ocaml_seed_health: FAIL — could not enumerate the selfcheck executables from selfcheck/dune"
+  exit 1
+fi
 for name in $NAMES; do
   if [ "$name" = "tg_bootstrap_gate" ]; then
     # tg_bootstrap_gate is the FULL-COMPLETENESS gate (red by design
@@ -70,6 +75,10 @@ for name in $NAMES; do
     # split).
     continue
   fi
+  # The denominator is DERIVED from the enumerated dune names (minus
+  # tg_bootstrap_gate) — never a literal — so a new selfcheck cannot
+  # leave the summary stale.
+  SELFCHECK_TOTAL=$((SELFCHECK_TOTAL + 1))
   SELFCHECK_COUNT=$((SELFCHECK_COUNT + 1))
   if ! timeout 420 "_build/default/selfcheck/${name}.exe" >"/tmp/ocaml_sc_${name}.out" 2>&1; then
     echo "check_ocaml_seed_health: FAIL — selfcheck ${name} exited non-zero"
@@ -95,7 +104,10 @@ if grep -qE 'Fatal error|Stack overflow|Assertion failure' /tmp/ocaml_bootstrap_
   tail -20 /tmp/ocaml_bootstrap_check.out
   exit 1
 fi
-TC_COUNT="$(grep -oE 'typecheck: [0-9]+ modules, [0-9]+ items, [0-9]+ errors' /tmp/ocaml_bootstrap_check.out | head -1 | grep -oE '[0-9]+ errors$' | grep -oE '^[0-9]+')"
+# The greps below are guarded with `|| true`: under `set -e`/pipefail a
+# no-match grep in a command substitution aborts the whole script before
+# any explicit check, which is exactly the zero-debt failure mode.
+TC_COUNT="$(grep -oE 'typecheck: [0-9]+ modules, [0-9]+ items, [0-9]+ errors' /tmp/ocaml_bootstrap_check.out 2>/dev/null | head -1 | grep -oE '[0-9]+ errors$' | grep -oE '^[0-9]+' || true)"
 if [ -z "$TC_COUNT" ]; then
   echo "check_ocaml_seed_health: FAIL — could not read the bootstrap-check typecheck count"
   tail -20 /tmp/ocaml_bootstrap_check.out
@@ -118,7 +130,7 @@ EVIDENCE_JSON=""
 if [ -f "$ACCEPTED_JSON" ]; then
   EVIDENCE_JSON="$ACCEPTED_JSON"
 else
-  EVIDENCE_JSON="$(ls -1 "$ROOT/bootstrap/evidence/ocaml/" 2>/dev/null | grep -v history | grep -E '^[0-9a-f]{7}_.*\.json$' | sort | tail -1)"
+  EVIDENCE_JSON="$(ls -1 "$ROOT/bootstrap/evidence/ocaml/" 2>/dev/null | grep -v history | grep -E '^[0-9a-f]{7}_.*\.json$' | sort | tail -1 || true)"
   if [ -n "$EVIDENCE_JSON" ]; then
     EVIDENCE_JSON="$ROOT/bootstrap/evidence/ocaml/$EVIDENCE_JSON"
   fi
@@ -131,9 +143,36 @@ if [ -n "$EVIDENCE_JSON" ] && [ -f "$EVIDENCE_JSON" ]; then
   REC_PRIMARY="$(python3 -c "import json,sys; d=json.load(open('$EVIDENCE_JSON')); print(d.get('debt_primary') or d.get('debt',{}).get('primary',''))" 2>/dev/null)"
   REC_SECONDARY="$(python3 -c "import json,sys; d=json.load(open('$EVIDENCE_JSON')); print(d.get('debt_secondary') or d.get('debt',{}).get('secondary',''))" 2>/dev/null)"
 fi
-DEBT_TOTAL="$(grep -oE 'debt_total: [0-9]+' /tmp/ocaml_bootstrap_check.out | tail -1 | grep -oE '[0-9]+$')"
-DEBT_PRIMARY="$(grep -oE 'debt_primary: [0-9]+' /tmp/ocaml_bootstrap_check.out | tail -1 | grep -oE '[0-9]+$')"
-DEBT_SECONDARY="$(grep -oE 'debt_secondary: [0-9]+' /tmp/ocaml_bootstrap_check.out | tail -1 | grep -oE '[0-9]+$')"
+# Debt totals.  The `debt_total:` / `debt_primary:` / `debt_secondary:`
+# lines are emitted by record_module_debt as the ACCUMULATED per-module
+# report (Typecheck.state.debt_by_module) changes: each block already is
+# the per-module sum, and the LAST block is the closure's final debt
+# report (exactly the parse scripts/ocaml_seed_evidence.sh records as
+# the accepted facts).  The blocks are running cumulative snapshots —
+# never add them together.
+#
+# Zero-debt run: every module's report is empty and is dropped from
+# debt_by_module, so the block is never (re-)emitted and the output has
+# no debt line at all.  0 typecheck errors with no debt block therefore
+# IS zero debt.  The inverse is a hard FAIL: errors > 0 with no debt
+# line means truncated/malformed output — never silently treat it as 0.
+DEBT_TOTAL="$(grep -oE 'debt_total: [0-9]+' /tmp/ocaml_bootstrap_check.out 2>/dev/null | tail -1 | grep -oE '[0-9]+$' || true)"
+DEBT_PRIMARY="$(grep -oE 'debt_primary: [0-9]+' /tmp/ocaml_bootstrap_check.out 2>/dev/null | tail -1 | grep -oE '[0-9]+$' || true)"
+DEBT_SECONDARY="$(grep -oE 'debt_secondary: [0-9]+' /tmp/ocaml_bootstrap_check.out 2>/dev/null | tail -1 | grep -oE '[0-9]+$' || true)"
+if [ -z "$DEBT_TOTAL" ]; then
+  if [ "$TC_COUNT" -ne 0 ]; then
+    echo "check_ocaml_seed_health: FAIL — bootstrap-check reported $TC_COUNT typecheck error(s) but printed no debt_total line (truncated or malformed output; refusing to treat it as zero debt)"
+    tail -20 /tmp/ocaml_bootstrap_check.out
+    exit 1
+  fi
+  DEBT_TOTAL=0
+  DEBT_PRIMARY=0
+  DEBT_SECONDARY=0
+elif [ -z "$DEBT_PRIMARY" ] || [ -z "$DEBT_SECONDARY" ]; then
+  echo "check_ocaml_seed_health: FAIL — incomplete debt block in the bootstrap-check output (debt_total present without debt_primary/debt_secondary)"
+  tail -20 /tmp/ocaml_bootstrap_check.out
+  exit 1
+fi
 if [ -n "$REC_TOTAL" ] && [ -n "$DEBT_TOTAL" ]; then
   echo "check_ocaml_seed_health: debt policy — vs the last accepted evidence record $(basename "$EVIDENCE_JSON") (debt_total $REC_TOTAL / debt_primary $REC_PRIMARY / debt_secondary $REC_SECONDARY)"
   if [ -n "$REC_PRIMARY" ] && [ -n "$DEBT_PRIMARY" ] && [ "$DEBT_PRIMARY" -gt "$REC_PRIMARY" ]; then
@@ -153,7 +192,7 @@ set +e
 timeout 420 _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. >/tmp/ocaml_bootstrap_gate.out 2>&1
 GATE_STATUS=$?
 set -e
-SUBSET_N="$(grep -oE 'SUBSET_FIREWALL = (PASS|FAIL \([0-9]+ findings)' /tmp/ocaml_bootstrap_check.out | head -1 | grep -oE 'PASS|[0-9]+' | head -1)"
+SUBSET_N="$(grep -oE 'SUBSET_FIREWALL = (PASS|FAIL \([0-9]+ findings)' /tmp/ocaml_bootstrap_check.out 2>/dev/null | head -1 | grep -oE 'PASS|[0-9]+' | head -1 || true)"
 if [ "$GATE_STATUS" -eq 0 ]; then
   echo "check_ocaml_seed_health: DEVELOPMENT DEBT GATE: PASS (no regression vs the checked baseline)"
   echo "DEBT-GATE-PASS (FULL COMPLETENESS: NOT RUN / DEFERRED)" > /tmp/ocaml_full_completeness_verdict.txt
@@ -167,6 +206,12 @@ if [ "$SELFCHECK_FAIL" -ne 0 ]; then
   exit 1
 fi
 
-echo "check_ocaml_seed_health: tests=${TESTS} (pinned exact inventory) component_selfchecks=${SELFCHECK_COUNT}/24 selfcheck_fail=0 typecheck_debt=${DEBT_TOTAL:-$TC_COUNT} subset_findings=${SUBSET_N:-?}"
-echo "check_ocaml_seed_health: DEVELOPMENT HEALTH PASS — ${SELFCHECK_COUNT} component selfchecks green of 24 selfcheck executables; tg_bootstrap_gate is the DEVELOPMENT DEBT GATE, reported separately above. FULL COMPLETENESS is NOT RUN / DEFERRED while the typecheck debt is nonzero — run check_ocaml_bootstrap_complete.sh for the true closure gate"
+if [ "$DEBT_TOTAL" -eq 0 ]; then
+  FULL_COMPLETENESS_NOTE="the typecheck debt is 0, so the gate ran the full semantic closure (see the DEVELOPMENT DEBT GATE result above); check_ocaml_bootstrap_complete.sh is the true closure gate"
+else
+  FULL_COMPLETENESS_NOTE="FULL COMPLETENESS is NOT RUN / DEFERRED while the typecheck debt is nonzero — run check_ocaml_bootstrap_complete.sh for the true closure gate"
+fi
+echo "check_ocaml_seed_health: tests=${TESTS} (pinned exact inventory) component_selfchecks=${SELFCHECK_COUNT}/${SELFCHECK_TOTAL} selfcheck_fail=0 typecheck_debt=${DEBT_TOTAL:-$TC_COUNT} subset_findings=${SUBSET_N:-?}"
+echo "check_ocaml_seed_health: DEVELOPMENT HEALTH PASS — ${SELFCHECK_COUNT} component selfchecks green of ${SELFCHECK_TOTAL} selfcheck executables; tg_bootstrap_gate is the DEVELOPMENT DEBT GATE, reported separately above. ${FULL_COMPLETENESS_NOTE}"
 echo "check_ocaml_seed_health: seed health ALL REQUIRED CHECKS PASSED (this is NOT a compiler-closure PASS — run check_ocaml_bootstrap_complete.sh for the closure gate)"
+exit 0

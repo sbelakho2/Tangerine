@@ -55,6 +55,29 @@ let by_id (t : t) (i : int) : (string * Id.t * signature) option =
 let names (t : t) : string list =
   List.sort compare (List.map fst t.by_name)
 
+(* ── The sanctioned record-visit names (the ref-alpha exception) ─────
+   The five `__intrinsic_{map,set}_visit_*` declarations in
+   std/collections.tg are the kernel's documented internal
+   address/reference ABI — the only `&T` / `Option[&K]` positions in the
+   tree.  They ARE expressible on the seed value model (the Host's
+   record-visit adapters), so exactly these declarations classify and
+   verify with the standard alpha rules for `Ref_internal` rather than
+   the strict structural ref escape:
+     - typecheck.ml's registry_decl_exact (the classification gate),
+     - mir_verify.ml's intrinsic bind (the MIR signature check).
+   Every other ref/pointer-bearing declaration keeps the strict escape;
+   this is ONE closed name list, never a blanket weakening. *)
+let record_visit_names : string list =
+  [
+    "__intrinsic_map_visit_begin";
+    "__intrinsic_map_visit_next";
+    "__intrinsic_map_visit_value";
+    "__intrinsic_set_visit_begin";
+    "__intrinsic_set_visit_next";
+  ]
+
+let is_record_visit_name (name : string) : bool = List.mem name record_visit_names
+
 (* ———————————————————————————————————————————————————————————————
    Signature building blocks, shared with Extern_registry and Host.
    Named types are keyed by placeholder Type_ids that are consistent
@@ -69,6 +92,15 @@ module Type_id = struct
   let array_ = Ids.Type_id.make 5
   let ruby_value = Ids.Type_id.make 6
   let ruby_id = Ids.Type_id.make 7
+  (* The Result / raw-Ptr / PtrMut families of the called __intrinsic_*
+     wrapper surface (the std parse_int Result returns, the as_ptr /
+     mem_alloc pointer returns).  These placeholders live OUTSIDE the
+     legacy 1..7 ids and are adopted onto the checker LangItem ids by the
+     ONE table (Signature_identity.registry_type_to_checker), exactly
+     like option_/vec/map/set. *)
+  let result_ = Ids.Type_id.make 8
+  let ptr_ = Ids.Type_id.make 9
+  let ptrmut_ = Ids.Type_id.make 10
 end
 
 module Type_param = struct
@@ -84,6 +116,7 @@ let ty_bool : Type_repr.t = Type_repr.Bool
 let ty_int : Type_repr.t = Type_repr.Int Type_repr.Int
 let ty_uint : Type_repr.t = Type_repr.Int Type_repr.UInt
 let ty_u8 : Type_repr.t = Type_repr.Int Type_repr.U8
+let ty_u64 : Type_repr.t = Type_repr.Int Type_repr.U64
 let ty_i32 : Type_repr.t = Type_repr.Int Type_repr.I32
 let ty_float : Type_repr.t = Type_repr.Float Type_repr.F64
 let ty_string : Type_repr.t = Type_repr.String
@@ -98,6 +131,16 @@ let vec_of (t : Type_repr.t) : Type_repr.t = named Type_id.vec [| t |]
 let tuple_of (elems : Type_repr.t array) : Type_repr.t = Type_repr.Tuple elems
 let map_of (k : Type_repr.t) (v : Type_repr.t) : Type_repr.t = named Type_id.map [| k; v |]
 let set_of (t : Type_repr.t) : Type_repr.t = named Type_id.set [| t |]
+let result_of (a : Type_repr.t) (b : Type_repr.t) : Type_repr.t =
+  named Type_id.result_ [| a; b |]
+(* The NAMED raw-pointer families: source `Ptr[T]` / `PtrMut[T]` resolve
+   to the checker's LangItem nominals (Typecheck.b_ptr/b_ptrmut), not to
+   the structural Raw_ptr form — the closures compare them exactly after
+   the shared adoption table maps these placeholders onto those ids. *)
+let ptr_named (t : Type_repr.t) : Type_repr.t = named Type_id.ptr_ [| t |]
+let ptrmut_named (t : Type_repr.t) : Type_repr.t = named Type_id.ptrmut_ [| t |]
+(* `fn() -> T` — the zero-argument function type (__intrinsic_try_invoke). *)
+let fn0 (ret : Type_repr.t) : Type_repr.t = Type_repr.Function ([||], ret)
 let ruby_value : Type_repr.t = named Type_id.ruby_value [||]
 let ruby_id : Type_repr.t = named Type_id.ruby_id [||]
 let param (id : Ids.Generic_param_id.t) : Type_repr.t = Type_repr.Type_param id
@@ -136,6 +179,9 @@ let named_name (id : Ids.Type_id.t) : string =
   else if n = Ids.Type_id.to_int Type_id.array_ then "Array"
   else if n = Ids.Type_id.to_int Type_id.ruby_value then "RubyValue"
   else if n = Ids.Type_id.to_int Type_id.ruby_id then "RubyID"
+  else if n = Ids.Type_id.to_int Type_id.result_ then "Result"
+  else if n = Ids.Type_id.to_int Type_id.ptr_ then "Ptr"
+  else if n = Ids.Type_id.to_int Type_id.ptrmut_ then "PtrMut"
   else Printf.sprintf "type#%d" n
 
 let rec ty_to_string (ty : Type_repr.t) : string =
@@ -356,6 +402,289 @@ let manifest : t =
       ("__intrinsic_bool_to_string", sig_ ~params:[| ty_bool |] ~ret:ty_string);
       ("__intrinsic_char_to_string", sig_ ~params:[| Type_repr.Char |] ~ret:ty_string);
       ("__intrinsic_string_len", sig_ ~params:[| ty_string |] ~ret:ty_int);
+      (* The borrowed `str` view surface (std/core.tg's impl str block).
+         `str::to_string` produces the owned String from the borrowed
+         view; on the seed's value model `str` and String are the ONE
+         String value (the owned conversion is the identity on the
+         immutable value), so the declaration is the exact source
+         transcription.  New ids are appended, never renumbered. *)
+      ("__intrinsic_str_to_string", sig_ ~params:[| ty_string |] ~ret:ty_string);
+      (* ── The called kernel wrapper surface (std/core.tg, alloc.tg,
+         collections.tg, taint.tg declarations, transcribed exactly).
+         Every entry here is a real source `extern def` name the checker
+         registers with this exact signature; the host binding table
+         implements each one (Host.binding_manifest).  Appended after
+         the legacy surface so existing ids never move. *)
+
+      (* the borrowed `str` view: len/find/slice on the same String value
+         the owned surface uses; parse_int returns the Result pair
+         (Ok parsed / Err message). *)
+      ("__intrinsic_str_len", sig_ ~params:[| ty_string |] ~ret:ty_int);
+      ("__intrinsic_str_find",
+        sig_ ~params:[| ty_string; ty_string |] ~ret:(option_of ty_int));
+      ("__intrinsic_str_slice",
+        sig_ ~params:[| ty_string; ty_int; ty_int |] ~ret:ty_string);
+      ("__intrinsic_str_parse_int",
+        sig_ ~params:[| ty_string |] ~ret:(result_of ty_int ty_string));
+
+      (* the owned String surface: view conversions, search/slice,
+         parsing, growth (inout), transformation, splitting, bytes. *)
+      ("__intrinsic_string_as_str", sig_ ~params:[| ty_string |] ~ret:ty_string);
+      ("__intrinsic_string_from_static",
+        sig_ ~params:[| ty_string |] ~ret:ty_string);
+      ("__intrinsic_string_find",
+        sig_ ~params:[| ty_string; ty_string |] ~ret:(option_of ty_int));
+      ("__intrinsic_string_slice",
+        sig_ ~params:[| ty_string; ty_int; ty_int |] ~ret:ty_string);
+      ("__intrinsic_string_parse_int",
+        sig_ ~params:[| ty_string |] ~ret:(result_of ty_int ty_string));
+      ("__intrinsic_string_parse_float",
+        sig_ ~params:[| ty_string |] ~ret:(option_of ty_float));
+      ("__intrinsic_string_reserve",
+        sig_conv
+          ~params:[| (Access_effect.Inout, ty_string); (Access_effect.Let, ty_int) |]
+          ~ret:ty_unit);
+      ("__intrinsic_string_push",
+        sig_conv
+          ~params:
+            [| (Access_effect.Inout, ty_string); (Access_effect.Let, Type_repr.Char) |]
+          ~ret:ty_unit);
+      ("__intrinsic_string_push_str",
+        sig_conv
+          ~params:[| (Access_effect.Inout, ty_string); (Access_effect.Let, ty_string) |]
+          ~ret:ty_unit);
+      ("__intrinsic_string_replace",
+        sig_ ~params:[| ty_string; ty_string; ty_string |] ~ret:ty_string);
+      ("__intrinsic_string_trim", sig_ ~params:[| ty_string |] ~ret:ty_string);
+      ("__intrinsic_string_trim_matches",
+        sig_ ~params:[| ty_string; ty_string |] ~ret:ty_string);
+      ("__intrinsic_string_to_lowercase",
+        sig_ ~params:[| ty_string |] ~ret:ty_string);
+      ("__intrinsic_string_to_uppercase",
+        sig_ ~params:[| ty_string |] ~ret:ty_string);
+      ("__intrinsic_string_split",
+        sig_ ~params:[| ty_string; ty_string |] ~ret:(vec_of ty_string));
+      ("__intrinsic_string_lines", sig_ ~params:[| ty_string |] ~ret:(vec_of ty_string));
+      ("__intrinsic_string_as_bytes",
+        sig_ ~params:[| ty_string |] ~ret:(vec_of ty_u8));
+      ("__intrinsic_string_as_ptr",
+        sig_ ~params:[| ty_string |] ~ret:(ptr_named ty_u8));
+
+      (* the Float conversion/formatting surface. *)
+      ("__intrinsic_float_to_string",
+        sig_ ~params:[| ty_float |] ~ret:ty_string);
+      ("__intrinsic_float_to_bits", sig_ ~params:[| ty_float |] ~ret:ty_u64);
+      ("__intrinsic_int_to_float", sig_ ~params:[| ty_int |] ~ret:ty_float);
+      ("__intrinsic_float_to_int", sig_ ~params:[| ty_float |] ~ret:ty_int);
+      ("__intrinsic_pow",
+        sig_ ~params:[| ty_float; ty_float |] ~ret:ty_float);
+      ("__intrinsic_exp", sig_ ~params:[| ty_float |] ~ret:ty_float);
+
+      (* the growable-array family's remaining operations. *)
+      ("__intrinsic_array_destroy",
+        sig_conv ~params:[| (Access_effect.Inout, vec_of (param Type_param.t)) |]
+          ~ret:ty_unit);
+      ("__intrinsic_array_extend",
+        sig_conv
+          ~params:
+            [| (Access_effect.Inout, vec_of (param Type_param.t));
+               (Access_effect.Let, vec_of (param Type_param.t)) |]
+          ~ret:ty_unit);
+      ("__intrinsic_array_from_list",
+        sig_ ~params:[| vec_of (param Type_param.t) |]
+          ~ret:(vec_of (param Type_param.t)));
+      ("__intrinsic_array_slice",
+        sig_
+          ~params:[| vec_of (param Type_param.t); ty_int; ty_int |]
+          ~ret:(vec_of (param Type_param.t)));
+      ("__intrinsic_array_as_ptr",
+        sig_ ~params:[| vec_of (param Type_param.t) |]
+          ~ret:(ptr_named (param Type_param.t)));
+      ("__intrinsic_array_as_mut_ptr",
+        sig_conv ~params:[| (Access_effect.Inout, vec_of (param Type_param.t)) |]
+          ~ret:(ptrmut_named (param Type_param.t)));
+
+      (* the Map removal/drain/destroy surface. *)
+      ("__intrinsic_map_remove",
+        sig_conv
+          ~params:
+            [| (Access_effect.Inout, map_of (param Type_param.k) (param Type_param.v));
+               (Access_effect.Let, param Type_param.k) |]
+          ~ret:(option_of (param Type_param.v)));
+      ("__intrinsic_map_clear",
+        sig_conv
+          ~params:[| (Access_effect.Inout, map_of (param Type_param.k) (param Type_param.v)) |]
+          ~ret:ty_unit);
+      ("__intrinsic_map_drain_one",
+        sig_conv
+          ~params:[| (Access_effect.Inout, map_of (param Type_param.k) (param Type_param.v)) |]
+          ~ret:
+            (option_of
+               (tuple_of [| param Type_param.k; param Type_param.v |])));
+      ("__intrinsic_map_destroy",
+        sig_conv
+          ~params:[| (Access_effect.Inout, map_of (param Type_param.k) (param Type_param.v)) |]
+          ~ret:ty_unit);
+
+      (* the Set destroy surface. *)
+      ("__intrinsic_set_destroy",
+        sig_conv ~params:[| (Access_effect.Inout, set_of (param Type_param.t)) |]
+          ~ret:ty_unit);
+
+      (* the raw-memory, syscall, control-flow and regex wrapper surface. *)
+      ("__intrinsic_mem_alloc",
+        sig_ ~params:[| ty_uint |] ~ret:(ptr_named ty_u8));
+      ("__intrinsic_mem_free",
+        sig_ ~params:[| ptr_named ty_u8; ty_uint |] ~ret:ty_unit);
+      ("__intrinsic_syscall1", sig_ ~params:[| ty_int; ty_int |] ~ret:ty_int);
+      ("__intrinsic_syscall2",
+        sig_ ~params:[| ty_int; ty_int; ty_int |] ~ret:ty_int);
+      ("__intrinsic_syscall3",
+        sig_ ~params:[| ty_int; ty_int; ty_int; ty_int |] ~ret:ty_int);
+      ("__intrinsic_syscall4",
+        sig_ ~params:[| ty_int; ty_int; ty_int; ty_int; ty_int |] ~ret:ty_int);
+      ("__intrinsic_syscall5",
+        sig_ ~params:[| ty_int; ty_int; ty_int; ty_int; ty_int; ty_int |]
+          ~ret:ty_int);
+      ("__intrinsic_syscall6",
+        sig_
+          ~params:[| ty_int; ty_int; ty_int; ty_int; ty_int; ty_int; ty_int |]
+          ~ret:ty_int);
+      ("__intrinsic_try_invoke",
+        sig_ ~params:[| fn0 (param Type_param.t) |]
+          ~ret:(option_of (param Type_param.t)));
+      ("__intrinsic_longjmp", sig_ ~params:[| ty_int |] ~ret:ty_unit);
+      (* std/taint.tg's checker-registered pattern validator: the
+         documented literal-substring matcher subset (the runtime's
+         _tg_regex_match). *)
+      ("__intrinsic_regex_match",
+        sig_ ~params:[| ty_string; ty_string |] ~ret:ty_bool);
+
+      (* ── The builtin-method class (the checker's builtin method
+         tables and compiler-registered free builtins that carried no
+         registry binding, so every call classified User and the mono
+         audit kept a body-less callee).  Each declaration transcribes
+         the checker's registered signature EXACTLY (receiver first,
+         same access conventions); the host binding table implements
+         each one on the seed's value model with the same observable
+         semantics as the direct kernel (codegen intrinsic arms /
+         runtime helpers where they exist, deterministic traps where
+         the seed host genuinely has no executable surface).  Appended
+         after every existing entry so ids never move. *)
+
+      (* Vec/Array receiver methods (m_vec/m_array builtin tables). *)
+      ("__intrinsic_array_is_empty",
+        sig_ ~params:[| vec_of (param Type_param.t) |] ~ret:ty_bool);
+      ("__intrinsic_array_first",
+        sig_ ~params:[| vec_of (param Type_param.t) |]
+          ~ret:(option_of (param Type_param.t)));
+      ("__intrinsic_array_last",
+        sig_ ~params:[| vec_of (param Type_param.t) |]
+          ~ret:(option_of (param Type_param.t)));
+      ("__intrinsic_array_resize",
+        sig_conv
+          ~params:
+            [| (Access_effect.Inout, vec_of (param Type_param.t));
+               (Access_effect.Let, ty_int);
+               (Access_effect.Sink, param Type_param.t) |]
+          ~ret:ty_unit);
+      ("__intrinsic_array_sort",
+        sig_conv ~params:[| (Access_effect.Inout, vec_of (param Type_param.t)) |]
+          ~ret:ty_unit);
+      ("__intrinsic_array_truncate",
+        sig_conv
+          ~params:
+            [| (Access_effect.Inout, vec_of (param Type_param.t));
+               (Access_effect.Let, ty_int) |]
+          ~ret:ty_unit);
+
+      (* String char/iteration/construction surface. *)
+      ("__intrinsic_string_char_at",
+        sig_ ~params:[| ty_string; ty_int |] ~ret:Type_repr.Char);
+      ("__intrinsic_string_chars",
+        sig_ ~params:[| ty_string |] ~ret:(vec_of Type_repr.Char));
+      (* the constructor is declared under its bare checker name: the
+         qualified `String::new(...)` form resolves to the free
+         `string_new` builtin (the checker's mangled fallback) and
+         classifies through host_binding_of_name — never through the
+         owner/method alias channel, so a user-defined `impl String`
+         `new` method is not shadowed. *)
+      ("string_new", sig_ ~params:[||] ~ret:ty_string);
+      ("__intrinsic_string_from_chars",
+        sig_ ~params:[| vec_of Type_repr.Char |] ~ret:ty_string);
+      ("__intrinsic_string_from_bytes",
+        sig_ ~params:[| vec_of ty_u8 |] ~ret:ty_string);
+      (* the clone builtin is declared under its bare checker name: the
+         source `impl String { def clone }` body's `string_clone(self)`
+         call is the registered-only free function; declaring it under
+         the owner/method alias name (`__intrinsic_string_clone`) would
+         shadow the source `String::clone` method itself. *)
+      ("string_clone", sig_ ~params:[| ty_string |] ~ret:ty_string);
+
+      (* the integer to_string surface (m_int/m_uint/m_small_int). *)
+      ("__intrinsic_uint_to_string", sig_ ~params:[| ty_uint |] ~ret:ty_string);
+      ("__intrinsic_i8_to_string",
+        sig_ ~params:[| Type_repr.Int Type_repr.I8 |] ~ret:ty_string);
+      ("__intrinsic_i16_to_string",
+        sig_ ~params:[| Type_repr.Int Type_repr.I16 |] ~ret:ty_string);
+      ("__intrinsic_i32_to_string",
+        sig_ ~params:[| Type_repr.Int Type_repr.I32 |] ~ret:ty_string);
+      ("__intrinsic_i64_to_string",
+        sig_ ~params:[| Type_repr.Int Type_repr.I64 |] ~ret:ty_string);
+      ("__intrinsic_i128_to_string",
+        sig_ ~params:[| Type_repr.Int Type_repr.I128 |] ~ret:ty_string);
+      ("__intrinsic_u8_to_string",
+        sig_ ~params:[| Type_repr.Int Type_repr.U8 |] ~ret:ty_string);
+      ("__intrinsic_u16_to_string",
+        sig_ ~params:[| Type_repr.Int Type_repr.U16 |] ~ret:ty_string);
+      ("__intrinsic_u32_to_string",
+        sig_ ~params:[| Type_repr.Int Type_repr.U32 |] ~ret:ty_string);
+      ("__intrinsic_u64_to_string",
+        sig_ ~params:[| Type_repr.Int Type_repr.U64 |] ~ret:ty_string);
+      ("__intrinsic_u128_to_string",
+        sig_ ~params:[| Type_repr.Int Type_repr.U128 |] ~ret:ty_string);
+
+      (* Char predicates/conversions (m_char builtin table). *)
+      ("__intrinsic_char_is_digit",
+        sig_ ~params:[| Type_repr.Char |] ~ret:ty_bool);
+      ("__intrinsic_char_to_int",
+        sig_ ~params:[| Type_repr.Char |] ~ret:ty_int);
+
+      (* the raw-pointer receiver methods (the checker registers their
+         typed sigs; the seed host has no VM memory handle, so the
+         dereferencing ops are deterministic traps — as_mut is the
+         address-preserving cast). *)
+      ("__intrinsic_ptr_write",
+        sig_conv
+          ~params:
+            [| (Access_effect.Let, ptr_named (param Type_param.t));
+               (Access_effect.Sink, param Type_param.t) |]
+          ~ret:ty_unit);
+      ("__intrinsic_ptr_read",
+        sig_ ~params:[| ptr_named (param Type_param.t) |]
+          ~ret:(param Type_param.t));
+      ("__intrinsic_ptr_as_mut",
+        sig_ ~params:[| ptr_named (param Type_param.t) |]
+          ~ret:(ptrmut_named (param Type_param.t)));
+
+      (* Option::expect (the None case is the std panic). *)
+      ("__intrinsic_option_expect",
+        sig_conv
+          ~params:
+            [| (Access_effect.Sink, option_of (param Type_param.t));
+               (Access_effect.Let, ty_string) |]
+          ~ret:(param Type_param.t));
+
+      (* compiler-registered free builtins: the a64 condition-code
+         constant and Vec::filled.  (memcpy / sched_yield /
+         __sync_bool_compare_and_swap_1 are source `extern` declarations
+         and live in Extern_registry, exactly as spelled in the
+         closure.) *)
+      ("__intrinsic_a64_cc_hi",
+        sig_ ~params:[||] ~ret:(Type_repr.Int Type_repr.U32));
+      ("__intrinsic_vec_filled",
+        sig_ ~params:[| ty_int; param Type_param.t |]
+          ~ret:(vec_of (param Type_param.t)));
     ]
   in
   let tbl = ref empty in

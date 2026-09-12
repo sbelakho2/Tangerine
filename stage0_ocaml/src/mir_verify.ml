@@ -171,6 +171,15 @@ type ctx = {
      call's destination (a rewritten local) disagrees with the
      registered callee's return.  Identity in Template_mode. *)
   post_rewrite : Type_repr.t -> Type_repr.t;
+  (* Concrete_mode post-mono: logical identity between two canonical
+     specialized TypeIds.  The materializer's canonical key folds only
+     the 64-bit aliases and literal defaults, so two flavors of one
+     checker-transparent type (`Option[Expr]` vs `Option[Box[Expr]]` —
+     the checker's ctor unify erases the wrapper) keep separate defs;
+     the SAME cache's same_instance predicate recovers their identity
+     (keys equal under transparent erasure) so the exact-id nominal rule
+     below still sees one type.  The default is exact equality. *)
+  same_canonical_instance : Ids.Type_id.t -> Ids.Type_id.t -> bool;
   (* Concrete_mode post-mono: the canonical specialized TypeIds the
      materializer minted for the checker's transparent Box nominal
      instances (the cache's (box_tid, args) entries).  Box[T] unifies
@@ -462,20 +471,24 @@ let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool 
          either order at the call-arg/aggregate checks) *)
       types_compatible ctx t e
   | Type_repr.Named (ta, aargs), Type_repr.Named (tb, bargs) ->
-      (* NOMINAL identity is EXACT canonical-id equality (audit P0-13):
-         two materialized instances of generic templates are the same
-         type exactly when they are the SAME canonical specialized id —
-         the shared Canonical_type_instance cache interns every consumer,
-         so logically identical instances (the checker's literal-solved
-         vs integer-kind spellings, the 64-bit alias spellings) always
+      (* NOMINAL identity is canonical-id equality (audit P0-13): two
+         materialized instances of generic templates are the same type
+         exactly when they are the SAME canonical specialized id — the
+         shared Canonical_type_instance cache interns every consumer, so
+         logically identical instances (the checker's literal-solved vs
+         integer-kind spellings, the 64-bit alias spellings) always
          materialize under ONE id, never under two defs the verifier
          would have to reconcile by comparing their concrete def shapes
-         one level deep.  Distinct canonical ids — genuinely different
-         instances (Pair[Int] vs Pair[String]) — are never compatible,
-         however similar their def shapes; the args compare pairwise
-         under the same compatibility, exactly like every other
+         one level deep.  The cache's same_instance predicate extends
+         that identity over the checker's TRANSPARENT wrapper (the Box
+         nominal): `Option[Expr]` and `Option[Box[Expr]]` are one logical
+         type with two flavor-concrete defs, and their keys compare equal
+         under wrapper erasure.  Distinct canonical ids — genuinely
+         different instances (Pair[Int] vs Pair[String]) — are never
+         compatible, however similar their def shapes; the args compare
+         pairwise under the same compatibility, exactly like every other
          same-id pair. *)
-      (ta = tb
+      (ctx.same_canonical_instance ta tb
        && Array.length aargs = Array.length bargs
        && (let ok = ref true in
            Array.iteri
@@ -2668,6 +2681,16 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
               | Template_mode -> registry_type_to_checker t
             in
             let raw_arg = ref Type_repr.Unit in
+            (* The sanctioned record-visit ref-alpha rule (the checker's
+               classification exception, mirrored at the MIR boundary):
+               the five __intrinsic_{map,set}_visit_* declarations are the
+               ONLY ref-bearing declarations whose `Ref_internal` positions
+               compare alpha-equivalently — the verifier recurses into the
+               pointee under the SAME accumulated substitution, exactly
+               like every other generic position.  Every other
+               ref/pointer-bearing declaration keeps the strict structural
+               comparison. *)
+            let sanctioned_ref_alpha = Intrinsic_registry.is_record_visit_name name in
             let rec bind (declared : Type_repr.t) (actual : Type_repr.t) : unit =
               raw_arg := declared;
               let declared =
@@ -2685,6 +2708,24 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                       (Type_repr.substitute (List.rev !subst) declared)
                 | Template_mode -> declared
               in
+              (* The sanctioned record-visit deref-first rule: a ref-typed
+                 ACTUAL at a non-ref declared position is the borrowed
+                 READ of its pointee (the seed value model represents a
+                 visit `&K`/`&V` by the entry value itself; the checker's
+                 call boundary and deref_arg_ok document the same shape).
+                 Scoped to the five visit intrinsics by
+                 sanctioned_ref_alpha — every other declaration keeps the
+                 strict structural comparison, and ref-declared positions
+                 bind through the sanctioned Ref arm below. *)
+              let declared, actual =
+                if sanctioned_ref_alpha then
+                  match (declared, actual) with
+                  | (Type_repr.Ref_internal _ | Type_repr.Raw_ptr _), _ ->
+                      (declared, actual)
+                  | _, Type_repr.Ref_internal (_, inner) -> (declared, inner)
+                  | _ -> (declared, actual)
+                else (declared, actual)
+              in
               match declared with
               | Type_repr.Type_param pid -> (
                   match List.assoc_opt (Type_repr.KParam pid) !subst with
@@ -2699,6 +2740,20 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                              bb_ctx name (Seed_mir.print_type prev)
                              (Seed_mir.print_type actual))
                   | None -> subst := (Type_repr.KParam pid, actual) :: !subst)
+              | Type_repr.Ref_internal (m1, t1) when sanctioned_ref_alpha -> (
+                  (* the sanctioned record-visit ABI: `&K` / `&V` positions
+                     alpha-compare through the pointee under the SAME
+                     substitution accumulated from the arguments (the
+                     checker's registry_decl_exact exception). *)
+                  match actual with
+                  | Type_repr.Ref_internal (m2, t2) when m1 = m2 -> bind t1 t2
+                  | _ ->
+                      add_err ctx
+                        (Printf.sprintf
+                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s"
+                           bb_ctx name
+                           (Seed_mir.print_type (chk declared))
+                           (Seed_mir.print_type actual)))
               | Type_repr.Named (id1, a1) -> (
                   let id1' =
                     match ctx.mode with
@@ -2713,45 +2768,89 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                         with
                         | Type_repr.Named (i, _) -> i
                         | _ -> id1)
-                  in
-                  match actual with
-                  | Type_repr.Named (id2, a2)
-                    when Ids.Type_id.compare id1' id2 = 0 && Array.length a1 = Array.length a2 ->
-                      Array.iter2 (fun d a -> bind d a) a1 a2
-                  | Type_repr.Fixed_array (e2, _)
-                    when is_vec_langitem ctx id1' && Array.length a1 = 1 ->
-                      bind a1.(0) e2
-                  | _ ->
-                      let dbg =
-                        if Sys.getenv_opt "TANGERINE_DEBUG_INTRIN" <> None then begin
-                          let arg_ts =
-                            String.concat ";"
-                              (Array.to_list
-                                 (Array.map
-                                    (fun a ->
-                                      Seed_mir.print_type
-                                        (match a.Seed_mir.value with
-                                         | Copy p | Read p | Move p | Consume p -> (
-                                             match place_type ctx fn p with
-                                             | Some t -> t
-                                             | None -> Type_repr.Unit)
-                                         | Constant c -> constant_type ctx c))
-                                    args))
-                          in
-                          Printf.sprintf " [arg=%d rawdecl=%s argtypes=%s dest=%s]"
-                            !arg_kind (Seed_mir.print_type !raw_arg) arg_ts
-                            (match place_type ctx fn dest with
-                             | Some t -> Seed_mir.print_type t
-                             | None -> "?")
-                        end
-                        else ""
-                      in
-                      add_err ctx
-                        (Printf.sprintf
-                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s%s"
-                           bb_ctx name
-                           (Seed_mir.print_type (chk declared))
-                           (Seed_mir.print_type actual) dbg))
+                   in
+                   match actual with
+                   | Type_repr.Named (id2, a2) when Array.length a1 = Array.length a2 ->
+                       (* (a) the exact template identity, or (b) —
+                          Concrete_mode only — the declared TEMPLATE
+                          mention meeting the program's MATERIALIZED
+                          canonical instance of the same template: the
+                          materializer rewrote the program side, but the
+                          declared side cannot materialize at bind entry
+                          while its args are still Type params — re-run
+                          the materializer rewrite with the ACTUAL args
+                          substituted; a match is the same logical
+                          instance, then bind the parameters.
+                          `same_canonical_instance` extends the id
+                          equality over the checker's transparent Box
+                          wrapper (the same reconciliation
+                          types_compatible applies).  Template_mode keeps
+                          the strict exact-id path byte-identical — the
+                          post_rewrite identity has no canonical cache to
+                          reconcile against (the sibling mode gates the
+                          declared-id mapping the same way). *)
+                       let same =
+                         Ids.Type_id.compare id1' id2 = 0
+                         ||
+                         match ctx.mode with
+                         | Template_mode -> false
+                         | Concrete_mode -> (
+                             match ctx.post_rewrite (Type_repr.Named (id1', a2)) with
+                             | Type_repr.Named (id1'', _) -> ctx.same_canonical_instance id1'' id2
+                             | _ -> false)
+                       in
+                       if same then Array.iter2 (fun d a -> bind d a) a1 a2
+                       else
+                         let dbg =
+                           if Sys.getenv_opt "TANGERINE_DEBUG_INTRIN" <> None then
+                             match ctx.mode with
+                             | Concrete_mode ->
+                                 Printf.sprintf " [post_rewrite=%s]"
+                                   (Seed_mir.print_type
+                                      (ctx.post_rewrite (Type_repr.Named (id1', a2))))
+                             | Template_mode -> ""
+                           else ""
+                         in
+                         add_err ctx
+                           (Printf.sprintf
+                              "%s: intrinsic `%s` argument type mismatch: expected %s got %s%s"
+                              bb_ctx name
+                              (Seed_mir.print_type (chk declared))
+                              (Seed_mir.print_type actual) dbg)
+                   | Type_repr.Fixed_array (e2, _)
+                     when is_vec_langitem ctx id1' && Array.length a1 = 1 ->
+                       bind a1.(0) e2
+                   | _ ->
+                       let dbg =
+                         if Sys.getenv_opt "TANGERINE_DEBUG_INTRIN" <> None then begin
+                           let arg_ts =
+                             String.concat ";"
+                               (Array.to_list
+                                  (Array.map
+                                     (fun a ->
+                                       Seed_mir.print_type
+                                         (match a.Seed_mir.value with
+                                          | Copy p | Read p | Move p | Consume p -> (
+                                              match place_type ctx fn p with
+                                              | Some t -> t
+                                              | None -> Type_repr.Unit)
+                                          | Constant c -> constant_type ctx c))
+                                     args))
+                           in
+                           Printf.sprintf " [arg=%d rawdecl=%s argtypes=%s dest=%s]"
+                             !arg_kind (Seed_mir.print_type !raw_arg) arg_ts
+                             (match place_type ctx fn dest with
+                              | Some t -> Seed_mir.print_type t
+                              | None -> "?")
+                         end
+                         else ""
+                       in
+                       add_err ctx
+                         (Printf.sprintf
+                            "%s: intrinsic `%s` argument type mismatch: expected %s got %s%s"
+                            bb_ctx name
+                            (Seed_mir.print_type (chk declared))
+                            (Seed_mir.print_type actual) dbg))
                | Type_repr.Int _
                  when (match actual with Type_repr.Int _ -> true | _ -> false) ->
                    (* the int-kind adoption rule (the checker's
@@ -2804,52 +2903,85 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                            bb_ctx name
                            (Seed_mir.print_type (chk declared))
                            (Seed_mir.print_type actual) dbg))
-              | Type_repr.Tuple a1 -> (
-                  match actual with
-                  | Type_repr.Tuple a2 when Array.length a1 = Array.length a2 ->
-                      Array.iter2 (fun d a -> bind d a) a1 a2
-                  | _ ->
-                      let dbg =
-                        if Sys.getenv_opt "TANGERINE_DEBUG_INTRIN" <> None then begin
-                          let arg_ts =
-                            String.concat ";"
-                              (Array.to_list
-                                 (Array.map
-                                    (fun a ->
-                                      Seed_mir.print_type
-                                        (match a.Seed_mir.value with
-                                         | Copy p | Read p | Move p | Consume p -> (
-                                             match place_type ctx fn p with
-                                             | Some t -> t
-                                             | None -> Type_repr.Unit)
-                                         | Constant c -> constant_type ctx c))
-                                    args))
-                          in
-                          Printf.sprintf " [arg=%d rawdecl=%s argtypes=%s dest=%s]"
-                            !arg_kind (Seed_mir.print_type !raw_arg) arg_ts
-                            (match place_type ctx fn dest with
-                             | Some t -> Seed_mir.print_type t
-                             | None -> "?")
-                        end
-                        else ""
-                      in
-                      add_err ctx
-                        (Printf.sprintf
-                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s%s"
-                           bb_ctx name
-                           (Seed_mir.print_type (chk declared))
-                           (Seed_mir.print_type actual) dbg))
-               | declared' ->
-                   if not
+               | Type_repr.Tuple a1 -> (
+                   match actual with
+                   | Type_repr.Tuple a2 when Array.length a1 = Array.length a2 ->
+                       Array.iter2 (fun d a -> bind d a) a1 a2
+                   | _ ->
+                       let dbg =
+                         if Sys.getenv_opt "TANGERINE_DEBUG_INTRIN" <> None then begin
+                           let arg_ts =
+                             String.concat ";"
+                               (Array.to_list
+                                  (Array.map
+                                     (fun a ->
+                                       Seed_mir.print_type
+                                         (match a.Seed_mir.value with
+                                          | Copy p | Read p | Move p | Consume p -> (
+                                              match place_type ctx fn p with
+                                              | Some t -> t
+                                              | None -> Type_repr.Unit)
+                                          | Constant c -> constant_type ctx c))
+                                     args))
+                           in
+                           Printf.sprintf " [arg=%d rawdecl=%s argtypes=%s dest=%s]"
+                             !arg_kind (Seed_mir.print_type !raw_arg) arg_ts
+                             (match place_type ctx fn dest with
+                              | Some t -> Seed_mir.print_type t
+                              | None -> "?")
+                         end
+                         else ""
+                       in
+                       add_err ctx
+                         (Printf.sprintf
+                            "%s: intrinsic `%s` argument type mismatch: expected %s got %s%s"
+                            bb_ctx name
+                            (Seed_mir.print_type (chk declared))
+                            (Seed_mir.print_type actual) dbg))
+               | Type_repr.Function (p1, r1) -> (
+                   (* the function-type parameter (__intrinsic_try_invoke's
+                      `fn() -> T`): the declared parameter types and return
+                      are bound recursively so the rigid binder inside the
+                      function type participates in the SAME substitution
+                      as the rest of the signature (a Function reaching the
+                      generic fallback could never unify `fn() -> T0` with
+                      the caller's `fn() -> Tn`). *)
+                   match actual with
+                   | Type_repr.Function (p2, r2)
+                     when Array.length p1 = Array.length p2 ->
+                       Array.iteri
+                         (fun i (p : Type_repr.param_type) ->
+                           if
+                             Access_effect.compare p1.(i).Type_repr.pt_convention
+                               p.Type_repr.pt_convention
+                             <> 0
+                           then
+                             add_err ctx
+                               (Printf.sprintf
+                                  "%s: intrinsic `%s` function parameter %d contract mismatch"
+                                  bb_ctx name (i + 1));
+                           bind p1.(i).Type_repr.pt_type p.Type_repr.pt_type)
+                         p2;
+                       bind r1 r2
+                   | _ ->
+                       add_err ctx
+                         (Printf.sprintf
+                            "%s: intrinsic `%s` argument type mismatch: expected %s got %s"
+                            bb_ctx name
+                            (Seed_mir.print_type (chk declared))
+                            (Seed_mir.print_type actual)))
+                | declared' ->
+                    if
+                      not
                         (types_compatible ctx (chk declared') actual
                         || deref_arg_ok ctx (chk declared') actual)
-                   then
-                     add_err ctx
-                       (Printf.sprintf
-                          "%s: intrinsic `%s` argument type mismatch: expected %s got %s" bb_ctx
-                          name
-                          (Seed_mir.print_type (chk declared'))
-                          (Seed_mir.print_type actual))
+                    then
+                      add_err ctx
+                        (Printf.sprintf
+                           "%s: intrinsic `%s` argument type mismatch: expected %s got %s" bb_ctx
+                           name
+                           (Seed_mir.print_type (chk declared'))
+                           (Seed_mir.print_type actual))
             in
             Array.iteri
               (fun k a ->
@@ -3635,6 +3767,7 @@ let require_valid_template ?(generic_types : Mono.generic_def array = [||])
       box_tid;
       lang_items;
       post_rewrite = (fun ty -> ty);
+      same_canonical_instance = (fun a b -> Ids.Type_id.compare a b = 0);
       box_instances = [];
       copy_cache = Type_properties.create_cache ();
       drop_plans = Drop_plan.of_program ~lang_items prog;
@@ -3643,6 +3776,8 @@ let require_valid_template ?(generic_types : Mono.generic_def array = [||])
 
 let require_valid_concrete ?(query_sigs : query_sig list = [])
     ?(post_rewrite : Type_repr.t -> Type_repr.t = fun ty -> ty)
+    ?(same_canonical_instance : Ids.Type_id.t -> Ids.Type_id.t -> bool =
+      fun a b -> Ids.Type_id.compare a b = 0)
     ?(box_instances : Ids.Type_id.t list = [])
     ?(box_tid : Ids.Type_id.t option = None)
     ?(lang_items : Lang_items.t = Lang_items.seed_defaults)
@@ -3657,6 +3792,7 @@ let require_valid_concrete ?(query_sigs : query_sig list = [])
       box_tid;
       lang_items;
       post_rewrite;
+      same_canonical_instance;
       box_instances;
       copy_cache = Type_properties.create_cache ();
       drop_plans = Drop_plan.of_program ~lang_items prog;

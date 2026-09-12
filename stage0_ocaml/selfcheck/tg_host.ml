@@ -279,13 +279,13 @@ let check_vm_dispatch () =
                  other
            | Error m -> fail "char-to-string inspect failed: %s" m))
    | Ok _ -> fail "char-to-string program returned a non-zero exit code");
-  (* declared-but-unbound symbol traps fail-closed (the intrinsic
-     table's declared names without a host binding: the map/set record-
-     visit traversal intrinsics are declared in the registry but have
-     no binding in the default host) *)
+  (* declared-but-unbound symbol traps fail-closed (the registry's
+     declared names without a host binding: the Ruby C API externs are
+     declared in the manifest but have no binding in the default host —
+     the five record-visit intrinsics ARE bound now, so the trap proof
+     uses the still-deliberately-unbound rb_funcall) *)
   let p6 =
-    call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_map_visit_begin", [||]))
-      (Some (Type_repr.Unit, Seed_mir.Unit)) Type_repr.Unit
+    call_program (Seed_mir.Extern (extern_id "rb_funcall", [||])) None Type_repr.Unit
   in
   let e6 = p6.Seed_mir.functions.(0).Seed_mir.instance in
   let host6 = Host.create ~repo_root:"." ~argv:[||] in

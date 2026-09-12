@@ -964,7 +964,21 @@ let callee_owner_aliases (owner : string) : string list =
    per-parameter conventions and the SHARED signature-identity matcher
    (Signature_identity — the ONE matcher of the typed->host boundary),
    with the strict comparison for pointer/ref-bearing signatures.  A
-   drifted declaration never becomes a host call (fail closed). *)
+   drifted declaration never becomes a host call (fail closed).
+
+   THE SANCTIONED REF-ALPHA SURFACE (the record-visit ABI): the five
+   `__intrinsic_{map,set}_visit_*` declarations in std/collections.tg are
+   the kernel's documented internal address/reference ABI (the only
+   `&T`/`Option[&K]` positions in the tree; see language.md §Types and
+   memory_model.md §The Access Marker).  On the seed value model these
+   five signatures ARE expressible (the host's index/borrow adapters —
+   Host.binding_manifest), so their declarations are compared with the
+   standard alpha rules — the SAME rule the checker applies to every
+   signature in its OWN domain, where `Ref_internal` is structural
+   (mutability bit equal, pointee alpha-equivalent under the one binder
+   bijection; Signature_identity.types_agree).  Every OTHER ref/pointer-
+   bearing declaration keeps the strict escape: the exception is exactly
+   this closed name list, never a blanket weakening of the ref rule. *)
 let rec registry_ty_has_ref_kind (t : Type_repr.t) : bool =
   match t with
   | Type_repr.Ref_internal _ | Type_repr.Raw_ptr _ -> true
@@ -978,14 +992,88 @@ let rec registry_ty_has_ref_kind (t : Type_repr.t) : bool =
       || registry_ty_has_ref_kind r
   | _ -> false
 
-let registry_decl_exact ~(argc : int) (checker : typed_signature)
-    (params : Type_repr.param_type array) (ret : Type_repr.t) : bool =
+(* The sanctioned record-visit names: the ONLY declarations whose
+   ref-kind positions the strict escape stands down for.  The closed
+   name list lives in the intrinsic registry (the ONE authority shared
+   with Mir_verify's intrinsic signature check); every other name —
+   present or future — keeps the strict structural comparison. *)
+let is_sanctioned_ref_alpha (name : string) : bool =
+  Intrinsic_registry.is_record_visit_name name
+
+let registry_decl_exact ?(sanctioned_ref_alpha = false) ~(argc : int)
+    (checker : typed_signature) (params : Type_repr.param_type array)
+    (ret : Type_repr.t) : bool =
   Array.length params = argc
   && Array.length params = Array.length checker.ts_params
   &&
   Signature_identity.signatures_match
     ~canon_left:Signature_identity.canonicalize_registry_placeholder
-    ~strict_when:(fun a b -> registry_ty_has_ref_kind a || registry_ty_has_ref_kind b)
+    ~strict_when:(fun a b ->
+      (not sanctioned_ref_alpha)
+      && (registry_ty_has_ref_kind a || registry_ty_has_ref_kind b))
+    { Signature_identity.sig_params = params; sig_ret = ret }
+    {
+      Signature_identity.sig_params = checker.ts_params;
+      sig_ret = checker.ts_return;
+    }
+
+(* The EXTERN-surface classification adds the C integer-kind adoption to
+   the exact transcription gate (mir_verify.intrinsic_type_compatible's
+   documented rule, reproduced at CHECK time): the checker's call
+   boundary already adopts integer kinds (int_kind_adopt, check_call_sig
+   — "the kernel passes Int values where a typed-width integer is
+   expected"), and the verifier accepts any integer kind at every
+   registry-declared integer position, so a declaration that differs
+   from the checked signature only in integer width/kind still denotes
+   the same host symbol.  The closure's one conflicted extern is
+   `libc_close` (std/process.tg `-> i32`, tg_compiler/linker.tg
+   `-> Int`); both calls must classify against the single registry
+   entry.  Non-integer positions keep the exact rules (named ids,
+   binder bijection, conventions, arity); ref-bearing signatures keep
+   the strict structural escape. *)
+let rec registry_ty_adopt_int (t : Type_repr.t) : Type_repr.t =
+  match t with
+  | Type_repr.Int _ -> Type_repr.Int Type_repr.Int
+  | Type_repr.Named (tid, args) ->
+      Type_repr.Named (tid, Array.map registry_ty_adopt_int args)
+  | Type_repr.Fixed_array (e, n) -> Type_repr.Fixed_array (registry_ty_adopt_int e, n)
+  | Type_repr.Tuple elems -> Type_repr.Tuple (Array.map registry_ty_adopt_int elems)
+  | Type_repr.Function (ps, r) ->
+      Type_repr.Function
+        ( Array.map
+            (fun (p : Type_repr.param_type) ->
+              { p with Type_repr.pt_type = registry_ty_adopt_int p.Type_repr.pt_type })
+            ps,
+          registry_ty_adopt_int r )
+  | Type_repr.Raw_ptr (m, inner) -> Type_repr.Raw_ptr (m, registry_ty_adopt_int inner)
+  | Type_repr.Ref_internal (m, inner) ->
+      Type_repr.Ref_internal (m, registry_ty_adopt_int inner)
+  | t -> t
+
+let registry_decl_exact_extern ~(argc : int) (checker : typed_signature)
+    (params : Type_repr.param_type array) (ret : Type_repr.t) : bool =
+  (* the ref-bearing surface NEVER takes the int-adoption fallback: those
+     signatures keep the exact gate's strict structural escape (there is
+     no stricter comparison to fall back FROM, so a ref-bearing drift
+     stays a User class). *)
+  let ref_free =
+    (not (registry_ty_has_ref_kind ret))
+    && (not (registry_ty_has_ref_kind checker.ts_return))
+    && Array.for_all
+         (fun (p : Type_repr.param_type) -> not (registry_ty_has_ref_kind p.Type_repr.pt_type))
+         params
+    && Array.for_all
+         (fun (p : Type_repr.param_type) -> not (registry_ty_has_ref_kind p.Type_repr.pt_type))
+         checker.ts_params
+  in
+  ref_free
+  && Array.length params = argc
+  && Array.length params = Array.length checker.ts_params
+  &&
+  Signature_identity.signatures_match
+    ~canon_left:(fun t ->
+      registry_ty_adopt_int (Signature_identity.canonicalize_registry_placeholder t))
+    ~canon_right:registry_ty_adopt_int
     { Signature_identity.sig_params = params; sig_ret = ret }
     {
       Signature_identity.sig_params = checker.ts_params;
@@ -1006,7 +1094,8 @@ let method_intrinsic_of ~(owner : string) (mname : string) (checker : typed_sign
         match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name:iname with
         | Some (iid, isig) ->
             if
-              registry_decl_exact ~argc checker isig.Intrinsic_registry.params
+              registry_decl_exact ~sanctioned_ref_alpha:(is_sanctioned_ref_alpha iname)
+                ~argc checker isig.Intrinsic_registry.params
                 isig.Intrinsic_registry.ret
             then Some (Intrinsic_registry.Id.to_int iid)
             else None
@@ -1021,13 +1110,19 @@ let host_binding_of_name (name : string) (checker : typed_signature) ~(argc : in
     [ `Intrinsic of int | `Extern of int | `None ] =
   match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name with
   | Some (iid, isig) ->
-      if registry_decl_exact ~argc checker isig.Intrinsic_registry.params isig.Intrinsic_registry.ret
+      if
+        registry_decl_exact ~sanctioned_ref_alpha:(is_sanctioned_ref_alpha name)
+          ~argc checker isig.Intrinsic_registry.params isig.Intrinsic_registry.ret
       then `Intrinsic (Intrinsic_registry.Id.to_int iid)
       else `None
   | None -> (
       match Extern_registry.lookup Extern_registry.manifest ~name with
       | Some (eid, esig) ->
-          if registry_decl_exact ~argc checker esig.Intrinsic_registry.params esig.Intrinsic_registry.ret
+          if
+            registry_decl_exact ~argc checker esig.Intrinsic_registry.params
+              esig.Intrinsic_registry.ret
+            || registry_decl_exact_extern ~argc checker esig.Intrinsic_registry.params
+                 esig.Intrinsic_registry.ret
           then `Extern (Extern_registry.Id.to_int eid)
           else `None
       | None -> `None)
@@ -2750,7 +2845,7 @@ let rec resolve_type (env : env) (scope : scope) (t : Ast.type_expr) : (Type_rep
 
 and resolve_named (env : env) (scope : scope) (span : Span.span) (name : string)
     (args : Ast.type_expr list) : (Type_repr.t, string) result =
-  (if name = "IntrinsicId" then
+  (if name = "IntrinsicId" && Sys.getenv_opt "TANGERINE_DEBUG_TYPECHECK" <> None then
      Printf.eprintf "DBG rn IntrinsicId span=%d\n" span.Span.start);
   match List.assoc_opt name scope.generics with
   | Some id ->
@@ -4084,7 +4179,8 @@ and unify_expected (env : env) (actual : Type_repr.t) (expected : Type_repr.t)
       match same_named actual expected with
       | Some () -> Ok !s
       | None ->
-          (if context <> "transactional probe" then (
+          (if context <> "transactional probe"
+              && Sys.getenv_opt "TANGERINE_DEBUG_TYPECHECK" <> None then (
              let name_of_id i = match name_by_tid env i with
                | Some n -> n | None -> "?"
              in
@@ -4527,7 +4623,8 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
            | None -> Error (err span (Printf.sprintf "unknown variant `%s` of enum `%s`" member name))
            | Some pty -> (
                let payload = Array.map (substitute_fixpoint subst) pty in
-               (if name = "MirTerminatorKind::MirCall" then
+               (if name = "MirTerminatorKind::MirCall"
+                   && Sys.getenv_opt "TANGERINE_DEBUG_TYPECHECK" <> None then
                   Printf.eprintf "DBG MirCall payload: %s\n"
                     (String.concat " | " (Array.to_list (Array.map type_to_string payload))));
                if Array.length payload <> List.length fields then

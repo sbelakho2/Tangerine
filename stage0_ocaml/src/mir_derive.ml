@@ -83,6 +83,15 @@
    them resolve against), so their callable identities are the ones the
    mono / verifier / host-channel machinery already knows. *)
 
+(* ── Diagnostics (env-gated) ───────────────────────────────────────
+   TANGERINE_DEBUG_DERIVE=1 turns on derived-body synthesis diagnostics
+   (per-body summaries and sampled fresh-local lines).  Nothing prints
+   unconditionally: the old [derive-dbg] traces wrote one line per fresh
+   local / render call with %! and turned stderr into megabytes of
+   flush-bound output during the full-closure lowering. *)
+let derive_debug =
+  try Sys.getenv "TANGERINE_DEBUG_DERIVE" <> "" with Not_found -> false
+
 (* ── Registered-callee lookups ─────────────────────────────────────
    The checker's functions-table keys are module-qualified names
    ("std::core::__intrinsic_int_to_string"); the lookup matches the bare
@@ -217,11 +226,45 @@ type st = {
   mutable cur_stmts : Seed_mir.statement list; (* reversed *)
 }
 
+(* Runaway tripwire (audit P0-12): the derive renderer cuts nominal
+   cycles by calling the repeated type's own derived op, so a body is
+   bounded by the distinct nominal types on the render path.  A body
+   beyond this many locals means a cycle was NOT cut (the pre-fix
+   ItemKind::to_string reached 480k+); fail deterministically with the
+   signature name instead of growing the process to OOM.  Override with
+   TANGERINE_MAX_DERIVED_LOCALS if a legitimate closure ever needs more. *)
+let max_derived_locals =
+  match Sys.getenv_opt "TANGERINE_MAX_DERIVED_LOCALS" with
+  | Some s -> (match int_of_string_opt s with Some n -> n | None -> 200_000)
+  | None -> 200_000
+
+let current_derived_sig = ref "?"
+
 let fresh_local (s : st) (ty : Type_repr.t) : int =
   let id = s.next_local in
   s.next_local <- id + 1;
-  if id >= Array.length s.locals then s.locals <- Array.append s.locals [| ty |]
+  if id > max_derived_locals then
+    failwith
+      (Printf.sprintf
+         "mir_derive: derived body %s exceeded %d locals (uncut recursion)"
+         !current_derived_sig max_derived_locals);
+  let cap = Array.length s.locals in
+  if id >= cap then begin
+    (* geometric growth: a derived body can allocate tens of thousands of
+       locals (large recursive struct/enum renders); the previous
+       one-element Array.append recopied the whole prefix per local and
+       turned synthesis quadratic.  The buffer is truncated back to
+       next_local in synthesize, so the emitted locals array is exactly
+       the old one. *)
+    let ncap = if cap = 0 then 16 else cap * 2 in
+    let grown = Array.make ncap ty in
+    Array.blit s.locals 0 grown 0 cap;
+    s.locals <- grown
+  end
   else s.locals.(id) <- ty;
+  if derive_debug && id > 0 && id mod 20000 = 0 then
+    Printf.eprintf "[derive-dbg] fresh_local id=%d arrlen=%d ty=%s\n" id
+      (Array.length s.locals) (Seed_mir.print_type ty);
   id
 
 let place_of (id : int) : Seed_mir.place =
@@ -370,10 +413,207 @@ let render_int_kind (env : Typecheck.env) (s : st) (k : Type_repr.int_kind)
       renderer_call env s "__intrinsic_int_to_string"
         (Type_repr.Int Type_repr.Int) (read_op (place_of ci))
 
+(* ── Cycle-safe rendering: auxiliary derived to_string functions ──
+   A recursive nominal type (the compiler's own TypeExpr/TypeExprKind,
+   Expr/ExprKind, ...) has NO finite inline rendering: inlining the
+   fields of `TypeExprKind::Slice(TypeExpr)` re-enters TypeExpr, whose
+   fields re-enter TypeExprKind, forever.  render_into therefore tracks
+   the nominal types currently being rendered and, on re-entry, emits a
+   runtime CALL to that type's own derived to_string instead of inlining
+   it (exactly the recursive call a hand-written renderer would make, so
+   the produced string is unchanged).  The auxiliary receiver template
+   is minted through the checker's mk_sig with the SAME shape the
+   checker's derived mint uses (receiver's own carriers, `self: Let`,
+   String return) and queued on the lowering's pending list; the driver
+   synthesizes a real body for it exactly like the checker-minted
+   derived sigs, and the monomorphizer resolves the call to that body
+   (the derived-contract class). *)
+
+let aux_to_string_sigs : (string, Typecheck.typed_signature) Hashtbl.t =
+  Hashtbl.create 32
+
+let pending_derived :
+    (Ids.Callable_id.t * Typecheck.typed_signature) list ref =
+  ref []
+
+let take_pending_derived () =
+  let l = List.rev !pending_derived in
+  pending_derived := [];
+  l
+
+let find_derived_to_string (env : Typecheck.env) (ty : Type_repr.t) :
+    Typecheck.typed_signature option =
+  List.find_opt
+    (fun (_, (ts : Typecheck.typed_signature)) ->
+      Array.length ts.Typecheck.ts_params = 1
+      && Type_repr.compare ts.Typecheck.ts_params.(0).Type_repr.pt_type ty = 0
+      &&
+      let n = ts.Typecheck.ts_name in
+      let l = String.length n in
+      l >= 11 && String.sub n (l - 11) 11 = "::to_string")
+    env.Typecheck.state.Typecheck.derived_sigs
+  |> Option.map snd
+
+let mint_derived_to_string (env : Typecheck.env) (owner : string)
+    (ty : Type_repr.t) : Typecheck.typed_signature =
+  let key = owner ^ "\000" ^ Typecheck.type_to_string ty in
+  match Hashtbl.find_opt aux_to_string_sigs key with
+  | Some ts -> ts
+  | None ->
+      let ts =
+        match find_derived_to_string env ty with
+        | Some ts -> ts
+        | None ->
+            let params_decl =
+              List.mapi
+                (fun i p -> ("T" ^ string_of_int i, p))
+                (Typecheck.params_in ty)
+            in
+            let ts =
+              Typecheck.mk_sig env.Typecheck.state
+                ~name:("derived::" ^ owner ^ "::to_string")
+                ~params_decl
+                ~params:[ ("self", Access_effect.Let, ty) ]
+                ~ret:Type_repr.String ~where:[]
+            in
+            env.Typecheck.state.Typecheck.derived_sigs <-
+              (ts.Typecheck.ts_callable, ts)
+              :: env.Typecheck.state.Typecheck.derived_sigs;
+            env.Typecheck.state.Typecheck.oracle.o_derived_callables <-
+              ts.Typecheck.ts_callable
+              :: env.Typecheck.state.Typecheck.oracle.o_derived_callables;
+            pending_derived := (ts.Typecheck.ts_callable, ts) :: !pending_derived;
+            ts
+      in
+      Hashtbl.replace aux_to_string_sigs key ts;
+      ts
+
+(* The derived Clone counterpart: the mono dispatch injection re-dispatches
+   a bodyless `Clone::clone` contract call on a concrete receiver through
+   the checker's derived-Clone mint when the receiver has no registered
+   Clone impl.  The minted signature carries the receiver's own carriers
+   and the Clone where-clauses the checker's obligation authority
+   (`derived_clone_obligations`) returned; synthesis emits the real body
+   under the same callable identity. *)
+let find_derived_clone (env : Typecheck.env) (ty : Type_repr.t) :
+    Typecheck.typed_signature option =
+  List.find_opt
+    (fun (_, (ts : Typecheck.typed_signature)) ->
+      Array.length ts.Typecheck.ts_params = 1
+      && Type_repr.compare ts.Typecheck.ts_params.(0).Type_repr.pt_type ty = 0
+      &&
+      let n = ts.Typecheck.ts_name in
+      let l = String.length n in
+      l >= 7 && String.sub n (l - 7) 7 = "::clone")
+    env.Typecheck.state.Typecheck.derived_sigs
+  |> Option.map snd
+
+let mint_derived_clone (env : Typecheck.env) (owner : string)
+    (ty : Type_repr.t) : (Typecheck.typed_signature, string) result =
+  match find_derived_clone env ty with
+  | Some ts -> Ok ts
+  | None ->
+      (* The where-clauses the checker's obligation authority recorded (the
+         Clone bounds of rigid carriers).  A structural derivation is
+         admissible even when the checker's strict obligation check
+         reported a component without a registered Clone: the synthesized
+         body recursively derives that component's own Clone (the
+         emit_clone_value fallback), so the obligation is discharged by
+         construction — never by raw duplication of an owning value. *)
+      let where =
+        match Typecheck.derived_clone_obligations env ty with
+        | Ok w -> w
+        | Error _ -> []
+      in
+      let params_decl =
+        List.mapi
+          (fun i p -> ("T" ^ string_of_int i, p))
+          (Typecheck.params_in ty)
+      in
+      let ts =
+        Typecheck.mk_sig env.Typecheck.state
+          ~name:("derived::" ^ owner ^ "::clone")
+          ~params_decl
+          ~params:[ ("self", Access_effect.Let, ty) ]
+          ~ret:ty ~where
+      in
+      env.Typecheck.state.Typecheck.derived_sigs <-
+        (ts.Typecheck.ts_callable, ts)
+        :: env.Typecheck.state.Typecheck.derived_sigs;
+      env.Typecheck.state.Typecheck.oracle.o_derived_callables <-
+        ts.Typecheck.ts_callable
+        :: env.Typecheck.state.Typecheck.oracle.o_derived_callables;
+      pending_derived := (ts.Typecheck.ts_callable, ts) :: !pending_derived;
+      Ok ts
+
+(* The instance type arguments of a derived signature: its declared
+   binders positionally (the template spelling the monomorphizer
+   substitutes). *)
+let derived_instance_args (ts : Typecheck.typed_signature) : Type_repr.t array =
+  Array.of_list
+    (List.map (fun (_, pid) -> Type_repr.Type_param pid) ts.Typecheck.ts_params_decl)
+
+(* One runtime call of `ty`'s derived to_string on a value place: closes
+   the current block (the call terminator) and continues in a fresh
+   block with the returned String. *)
+let to_string_value_call (env : Typecheck.env) (s : st) (owner : string)
+    (ty : Type_repr.t) (place : Seed_mir.place) : Seed_mir.operand =
+  let ts = mint_derived_to_string env owner ty in
+  let dest = fresh_local s Type_repr.String in
+  let cont = new_block s in
+  let type_args =
+    Array.of_list
+      (List.map
+         (fun (_, pid) -> Type_repr.Type_param pid)
+         ts.Typecheck.ts_params_decl)
+  in
+  let callee =
+    Mir_lower.callee_of_typed
+      (Typecheck.classify_method_callee ~owner:None "to_string" ts ~argc:1
+         ~type_args)
+  in
+  close_with s
+    (Seed_mir.Call
+       ( place_of dest,
+         callee,
+         [| { Seed_mir.effect_ = Access_effect.Read; value = read_op place } |],
+         cont,
+         None ));
+  set_cur s cont;
+  read_op (place_of dest)
+
 (* ── The to_string renderer (recursive; nominal enums/structs switch or
    iterate, payload fields recurse through render_into) ──────────── *)
 
+let render_stack : Type_repr.t list ref = ref []
+
+(* TANGERINE_DEBUG_DERIVE=1: the first render calls of each body with
+   their inline depth and type identity (Type ids, so two same-named
+   nominals stay distinguishable). *)
+let dbg_render = ref 0
+
 let rec render_into (env : Typecheck.env) (s : st) (dest : int)
+    (p : Seed_mir.place) (ty : Type_repr.t) : unit =
+  if derive_debug && !dbg_render < 200 then begin
+    incr dbg_render;
+    Printf.eprintf "[derive-dbg] render #%d depth=%d ty=%s\n" !dbg_render
+      (List.length !render_stack) (Seed_mir.print_type ty)
+  end;
+  let repeated =
+    List.exists (fun t -> Type_repr.compare t ty = 0) !render_stack
+  in
+  match if repeated then nominal_shape_of env ty else None with
+  | Some (name, _, _) ->
+      (* a recursive nominal type: call its own derived to_string — the
+         recursive runtime call a hand-written renderer would make *)
+      let op = to_string_value_call env s name ty p in
+      emit s (Seed_mir.Assign (place_of dest, Seed_mir.Use op))
+  | None ->
+      render_stack := ty :: !render_stack;
+      render_into_inline env s dest p ty;
+      render_stack := List.tl !render_stack
+
+and render_into_inline (env : Typecheck.env) (s : st) (dest : int)
     (p : Seed_mir.place) (ty : Type_repr.t) : unit =
   let assign (op : Seed_mir.operand) : unit =
     emit s (Seed_mir.Assign (place_of dest, Seed_mir.Use op))
@@ -551,11 +791,14 @@ let clone_call (s : st) (ts : Typecheck.typed_signature)
    value duplication that bypasses the impl); without a registered
    clone, trivially copyable components read; aggregate VALUE shapes
    with no nominal owner (tuples, fixed arrays) recurse elementwise; a
-   rigid generic carrier discharges through the Clone trait contract
-   (the kernel's bound-generic clone surface), which the minted
-   signature's where-clause recorded.  A component that reaches
-   emission without any discharge is an internal error (the checker's
-   mint obligation authority must have rejected the receiver). *)
+   NOMINAL component with no registered clone gets its own derived
+   Clone minted and CALLED (recursively — the mint registers the
+   signature before its body synthesizes, so a cycle reaches the
+   already-minted function at runtime); a rigid generic carrier
+   discharges through the Clone trait contract (the kernel's
+   bound-generic clone surface), which the minted signature's
+   where-clause recorded.  A component with no discharge at all is an
+   internal error. *)
 let rec emit_clone_value (env : Typecheck.env) (s : st)
     (clone_bound : Ids.Generic_param_id.t list) (ty : Type_repr.t)
     (place : Seed_mir.place) : Seed_mir.operand =
@@ -601,6 +844,29 @@ let rec emit_clone_value (env : Typecheck.env) (s : st)
              | _ ->
                  failwith
                    "mir_derive: internal error — the Clone trait contract method is not registered")
+        | Type_repr.Named (tid, _) -> (
+            (* A nominal component with NO registered Clone impl: the
+               component's own derived Clone is minted and CALLED (never a
+               raw duplication — derived Clone stays trait-semantic).  The
+               mint registers the signature before its body synthesizes,
+               so a recursive component reaches the already-minted derived
+               function at runtime and the synthesis terminates. *)
+            match nominal_of_tid env tid with
+            | Some (name, _) -> (
+                match mint_derived_clone env name ty with
+                | Ok ts ->
+                    clone_call s ts name (derived_instance_args ts) ty
+                      (read_op place)
+                | Error m ->
+                    failwith
+                      (Printf.sprintf
+                         "mir_derive: cannot derive the Clone of component type `%s`: %s"
+                         (Seed_mir.print_type ty) m))
+            | None ->
+                failwith
+                  (Printf.sprintf
+                     "mir_derive: internal error — derived Clone emitted for nominal `%s` with no registered Clone and no def to derive from"
+                     (Seed_mir.print_type ty)))
         | _ ->
             failwith
               (Printf.sprintf
@@ -672,12 +938,99 @@ let emit_clone_receiver (env : Typecheck.env) (s : st)
          one component (tuple/array/scalar/String/LangItem receivers) *)
       emit s (Seed_mir.Assign (place_of dest, Seed_mir.Use (emit_clone_value env s clone_bound ty place)))
 
+(* ── Derived-body cache (audit P0-12 cost bound) ───────────────────
+   The checker's derived channel mints a FRESH signature (and callable
+   id) per accepted call site, so state.derived_sigs holds many
+   structurally identical templates ("derived::MirProgram::clone" etc.
+   48 times in the full closure).  The synthesized body depends only on
+   the derivation identity — operation, receiver/param/return types and
+   the Clone where-clauses — never on the callable id, so one body is
+   synthesized per identity and every duplicate signature reuses it
+   under its own callable identity (the same body the first synthesis
+   emitted; internal callee ids are stable across duplicates because
+   they resolve through the same env tables).
+
+   The cache is cleared once per closure by reset_derived_state (called
+   from the driver's lower_closure): Type_ids are only stable within one
+   compilation env. *)
+let synthesized_bodies : (string, Seed_mir.function_) Hashtbl.t =
+  Hashtbl.create 256
+
+(* Perf kill-switch (default: cache ON): lets a run measure the
+   cache-free synthesis cost for the same binary. *)
+let derive_cache_enabled =
+  match Sys.getenv_opt "TANGERINE_NO_DERIVE_CACHE" with
+  | Some "1" -> false
+  | _ -> true
+
+let body_key (ts : Typecheck.typed_signature) : string =
+  let b = Buffer.create 256 in
+  let add_ty (t : Type_repr.t) =
+    Buffer.add_char b '\000';
+    Buffer.add_string b (Seed_mir.print_type t)
+  in
+  Buffer.add_string b ts.Typecheck.ts_name;
+  Buffer.add_char b '\001';
+  Array.iter
+    (fun (p : Type_repr.param_type) ->
+      Buffer.add_string b (Access_effect.to_string p.Type_repr.pt_convention);
+      Buffer.add_char b ' ';
+      add_ty p.Type_repr.pt_type)
+    ts.Typecheck.ts_params;
+  add_ty ts.Typecheck.ts_return;
+  List.iter
+    (fun (wt, bounds) ->
+      add_ty wt;
+      List.iter
+        (fun (name, args) ->
+          Buffer.add_char b '\002';
+          Buffer.add_string b name;
+          Array.iter add_ty args)
+        bounds)
+    ts.Typecheck.ts_where;
+  Buffer.contents b
+
+let reset_derived_state () =
+  Hashtbl.reset synthesized_bodies;
+  Hashtbl.reset aux_to_string_sigs;
+  pending_derived := []
+
 (* synthesize ────────────────────────────────────────────────────
    One derived signature -> the Seed MIR function carrying the SAME
    callable identity the call sites reference. *)
 
-let synthesize (env : Typecheck.env) (ts : Typecheck.typed_signature) :
+let rec synthesize (env : Typecheck.env) (ts : Typecheck.typed_signature) :
     Seed_mir.function_ =
+  let instance_of () : Instance_id.t =
+    Instance_id.make ~callable:ts.Typecheck.ts_callable
+      ~type_args:
+        (Array.of_list
+           (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+              ts.Typecheck.ts_params_decl))
+  in
+  match
+    if derive_cache_enabled then Hashtbl.find_opt synthesized_bodies (body_key ts)
+    else None
+  with
+  | Some cached ->
+      if derive_debug then
+        Printf.eprintf "[derive-dbg] reuse %s (cached)\n" ts.Typecheck.ts_name;
+      {
+        cached with
+        Seed_mir.name = ts.Typecheck.ts_name;
+        instance = instance_of ();
+        params = ts.Typecheck.ts_params;
+      }
+  | None -> synthesize_fresh env ts instance_of
+
+and synthesize_fresh (env : Typecheck.env) (ts : Typecheck.typed_signature)
+    (instance_of : unit -> Instance_id.t) : Seed_mir.function_ =
+  let dbg_t0 = Unix.gettimeofday () in
+  current_derived_sig := ts.Typecheck.ts_name;
+  if derive_debug then begin
+    dbg_render := 0;
+    Printf.eprintf "[derive-dbg] begin %s\n" ts.Typecheck.ts_name
+  end;
   let op = op_of_name ts.Typecheck.ts_name in
   let ret_ty = ts.Typecheck.ts_return in
   let param_tys =
@@ -757,17 +1110,30 @@ let synthesize (env : Typecheck.env) (ts : Typecheck.typed_signature) :
          (fun a b -> compare a.Seed_mir.id b.Seed_mir.id)
          (List.rev s.blocks))
   in
-  {
-    Seed_mir.name = ts.Typecheck.ts_name;
-    instance =
-      Instance_id.make
-        ~callable:ts.Typecheck.ts_callable
-        ~type_args:
-          (Array.of_list
-             (List.map (fun (_, pid) -> Type_repr.Type_param pid)
-                ts.Typecheck.ts_params_decl));
-    params = ts.Typecheck.ts_params;
-    locals = s.locals;
-    blocks;
-    entry = 0;
-  }
+  let dbg_stmts =
+    Array.fold_left
+      (fun acc (b : Seed_mir.block) -> acc + List.length b.Seed_mir.statements)
+      0 blocks
+  in
+  if derive_debug then begin
+    Printf.eprintf
+      "[derive-dbg] %s: locals=%d blocks=%d stmts=%d elapsed=%.2fs\n"
+      ts.Typecheck.ts_name s.next_local (Array.length blocks) dbg_stmts
+      (Unix.gettimeofday () -. dbg_t0)
+  end;
+  let locals =
+    if Array.length s.locals = s.next_local then s.locals
+    else Array.sub s.locals 0 s.next_local
+  in
+  let f =
+    {
+      Seed_mir.name = ts.Typecheck.ts_name;
+      instance = instance_of ();
+      params = ts.Typecheck.ts_params;
+      locals;
+      blocks;
+      entry = 0;
+    }
+  in
+  Hashtbl.replace synthesized_bodies (body_key ts) f;
+  f

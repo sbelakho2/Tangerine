@@ -46,6 +46,15 @@ let manifest : t =
   let ty_string = Intrinsic_registry.ty_string in
   let ptr = Intrinsic_registry.ptr in
   let ptr_u8 = Intrinsic_registry.ptr_u8 in
+  (* the NAMED Ptr placeholder family: source `Ptr[T]` / `PtrMut[T]`
+     annotations resolve to the checker's LangItem nominals, so a
+     declaration transcribed from the source spelling must use the named
+     placeholders (the shared adoption table maps them onto the checker
+     ids); the structural Raw_ptr form never matches a checker-side
+     `Ptr[T]`. *)
+  let ptr_named = Intrinsic_registry.ptr_named in
+  let ptrmut_named = Intrinsic_registry.ptrmut_named in
+  let vec_of = Intrinsic_registry.vec_of in
   let ruby_value = Intrinsic_registry.ruby_value in
   let ruby_id = Intrinsic_registry.ruby_id in
   let e name params ret = (name, sig_ ~params ~ret) in
@@ -115,9 +124,16 @@ let manifest : t =
       e "rb_gc_unregister_address" [| ptr ruby_value |] ty_unit;
       e "rb_gv_set" [| ptr_u8; ruby_value |] ruby_value;
       e "rb_gv_get" [| ptr_u8 |] ruby_value;
-      (* std/ffi.tg — __sync primitives (Ruby runtime lock). *)
-      e "__sync_bool_compare_and_swap_1" [| ptr_u8; ty_u8; ty_u8 |] ty_bool;
+      (* std/ffi.tg — __sync primitives (Ruby runtime lock).  The atomic
+         CAS takes `Ptr[u8]` (the named LangItem pointer), transcribed
+         with the named placeholder so the checker's `Ptr[u8]` call
+         signature matches. *)
+      e "__sync_bool_compare_and_swap_1" [| ptr_named ty_u8; ty_u8; ty_u8 |] ty_bool;
       e "__sync_synchronize" [||] ty_unit;
+      (* std/alloc.tg — the allocator's libc/thread surface: the byte
+         copy and the scheduler yield. *)
+      e "memcpy" [| ptr_named ty_u8; ptr_named ty_u8; ty_uint |] (ptr_named ty_u8);
+      e "sched_yield" [||] ty_i32;
       (* std/ffi.tg — dynamic library loading. *)
       e "dlopen" [| ptr_u8; ty_int |] ptr_u8;
       e "dlsym" [| ptr_u8; ptr_u8 |] ptr_u8;
@@ -132,6 +148,40 @@ let manifest : t =
          declared surface. *)
       e "tg_get_argc" [||] ty_int;
       e "_tg_arg_copy" [| ty_int |] ty_string;
+      (* ── The process / descriptor / environment extern surface (audit
+         §70; std/process.tg, std/fs.tg, std/env.tg, and the linker /
+         compiler_core io externs).  Signatures are transcribed exactly
+         from the source `extern def` declarations; `Ptr[T]/PtrMut[T]`
+         use the NAMED wrapper placeholders (the checker's LangItem
+         nominals — see Signature_identity.registry_type_to_checker),
+         and Vec[u8] uses the vec placeholder (the checker's Array
+         nominal).  Ids are appended after the existing surface, never
+         renumbered.
+
+         `libc_close` is declared twice in the closure with the SAME
+         parameter list but different integer-kind returns
+         (std/process.tg: `-> i32`; tg_compiler/linker.tg: `-> Int`).
+         The registry carries the std declaration; the checker's
+         C-integer-kind adoption (mir_verify.intrinsic_type_compatible's
+         rule) lets the linker spelling classify against it — see
+         Typecheck.registry_decl_exact_extern. *)
+      e "_tg_env_entry" [| ty_int |] (ptr_named ty_u8);
+      e "_tg_env_count" [||] ty_int;
+      e "_tg_str_skip" [| ptr_named ty_u8; ty_int |] (ptr_named ty_u8);
+      e "c_fork" [||] ty_i32;
+      e "execvp" [| ptr_named ty_u8; ptr_named (ptr_named ty_u8) |] ty_i32;
+      e "c_waitpid" [| ty_i32; ptrmut_named ty_int; ty_i32 |] ty_i32;
+      e "_exit" [| ty_int |] Type_repr.Never;
+      e "pipe" [| ptrmut_named ty_int |] ty_i32;
+      e "dup2" [| ty_int; ty_int |] ty_i32;
+      e "libc_close" [| ty_int |] ty_i32;
+      e "libc_read" [| ty_int; ptrmut_named ty_u8; ty_uint |] ty_int;
+      e "libc_write" [| ty_int; ptr_named ty_u8; ty_uint |] ty_int;
+      e "_tg_write_vec_u8" [| ty_int; vec_of ty_u8; ty_uint |] ty_int;
+      e "libc_open" [| ptr_named ty_u8; ty_int |] ty_i32;
+      e "poll" [| ptr_named ty_u8; ty_uint; ty_int |] ty_i32;
+      e "libc_open_path" [| ptr_named ty_u8; ty_int; ty_int |] ty_int;
+      e "libc_chmod" [| ptr_named ty_u8; ty_int |] ty_int;
     ]
   in
   let tbl = ref empty in

@@ -717,7 +717,14 @@ let rec owned_ty (env : func_env) (t : Type_repr.t) : bool =
      - Int_literal vs a concrete integer kind whose range fits (the
        `Option::None`-vs-`Option::Some(8)` arm kinds: the None ctor's
        resolved type stays Option[int-literal] while the Some arms
-       adopt Option[Int]).
+       adopt Option[Int]).  The relation is the checker's own
+       integer-literal defaulting (typecheck.ml:2314-2358) and is
+       accepted in BOTH directions: the lowering's No_int_suffix default
+       leaf is the bare `Int` kind, so an arm lowered at that default
+       (`(Int, T)`) reconciles with a checker join that kept the
+       unadopted literal (`(int-literal, T)`) exactly as the checker's
+       unify does, and conversely.  Concrete-kind-vs-concrete-kind
+       leaves stay strict (the checker's Int k1/Int k2 clause).
    The verifier accepts the resulting store (the same rules), so a
    compatible-but-not-identical arm value must STORE — dropping it is
    the possibly-uninitialized-join class.  Types the verifier rejects
@@ -761,10 +768,68 @@ and join_types_compatible (env : func_env) (a : Type_repr.t) (b : Type_repr.t) :
         (fun i t -> if not (join_types_compatible env t bargs.(i)) then ok := false)
         aargs;
       !ok
+  | Type_repr.Tuple aargs, Type_repr.Tuple bargs
+    when Array.length aargs = Array.length bargs ->
+      let ok = ref true in
+      Array.iteri
+        (fun i t -> if not (join_types_compatible env t bargs.(i)) then ok := false)
+        aargs;
+      !ok
   | Type_repr.Int_literal m, Type_repr.Int k | Type_repr.Int k, Type_repr.Int_literal m ->
       int_literal_fits_kind k m
   | Type_repr.Int_literal _, Type_repr.Int_literal _ -> true
   | _ -> Type_repr.compare a b = 0
+
+(* Whether type (a) differs from type (b) ONLY by literal-default integer
+   leaves: a's bare default `Int` (the No_int_suffix lowering default) or
+   an inference-only `Int_literal` versus b's concrete integer kind, and
+   symmetrically b's inference-only `Int_literal` versus a's bare default
+   `Int`.  This is exactly the checker's integer-literal defaulting
+   relation (typecheck.ml:2314-2358: an unsuffixed literal unifies with
+   any integer kind whose range represents it, in BOTH argument orders).
+   The ctor lowering uses the predicate to pick the checker-resolved
+   concrete form (`Option[UInt]` for `Option::Some(0)` in a UInt return
+   context) while the callers keep the inference-only side from ever
+   becoming a MIR local type (the contains_inference_only guards).  A
+   STRUCTURAL disagreement — the checker's transparent-Box convention
+   recording Option[String] for Some(Box::new(x)) while the ctor aggregate
+   must carry Option[Box[String]] — is NOT this delta (compare <> 0 at a
+   non-literal-default leaf), so the argument-derived form stays
+   authoritative there. *)
+let rec literal_default_delta (a : Type_repr.t) (b : Type_repr.t) : bool =
+  match a, b with
+  | (Type_repr.Int (Type_repr.Int) | Type_repr.Int_literal _), Type_repr.Int _ -> true
+  | Type_repr.Int (Type_repr.Int), Type_repr.Int_literal _ -> true
+  | Type_repr.Named (ida, aa), Type_repr.Named (idb, ab) ->
+      Ids.Type_id.compare ida idb = 0
+      && Array.length aa = Array.length ab
+      && Array.for_all2 literal_default_delta aa ab
+  | Type_repr.Tuple aa, Type_repr.Tuple ab ->
+      Array.length aa = Array.length ab && Array.for_all2 literal_default_delta aa ab
+  | Type_repr.Fixed_array (ta, na), Type_repr.Fixed_array (tb, nb) ->
+      na = nb && literal_default_delta ta tb
+  | Type_repr.Ref_internal (ma, ta), Type_repr.Ref_internal (mb, tb) ->
+      ma = mb && literal_default_delta ta tb
+  | Type_repr.Raw_ptr (ma, ta), Type_repr.Raw_ptr (mb, tb) ->
+      ma = mb && literal_default_delta ta tb
+  | _ -> Type_repr.compare a b = 0
+
+(* Whether a type still carries an INFERENCE-ONLY component (an
+   unsuffixed-literal kind or an unsolved inference variable).  Such a
+   checker-resolved type is not a usable MIR local type — the join slot
+   of an if falls back to the arm's lowered (concrete) type, while the
+   structural check still reports a genuine arm disagreement. *)
+let rec contains_inference_only (t : Type_repr.t) : bool =
+  match t with
+  | Type_repr.Int_literal _ | Type_repr.Infer_var _ -> true
+  | Type_repr.Raw_ptr (_, i) | Type_repr.Ref_internal (_, i) | Type_repr.Fixed_array (i, _) ->
+      contains_inference_only i
+  | Type_repr.Tuple elems | Type_repr.Named (_, elems) ->
+      Array.exists contains_inference_only elems
+  | Type_repr.Function (ps, r) ->
+      Array.exists (fun p -> contains_inference_only p.Type_repr.pt_type) ps
+      || contains_inference_only r
+  | _ -> false
 
 (* ── Defer machinery ─────────────────────────────────────────────
 
@@ -1068,6 +1133,21 @@ let int_constant_of_words (k : Type_repr.int_kind) (lo : int64) (hi : int64) : S
   Seed_mir.Integer
     (Int_value.of_words ~width:(int_width_of k) ~signed:(int_signed_of k) ~bits_lo:lo ~bits_hi:hi)
 
+(* The verifier's int_kind_alias classes (mir_verify.ml: bare Int is the
+   I64 class, bare UInt the U64 class): two concrete integer kinds in the
+   same class need no explicit conversion — the aggregate element check
+   compares them through the alias relation.  The ctor-payload kind
+   normalization below only inserts a Cast when the classes genuinely
+   differ (UInt vs Int is the `LirPlaceEnumField(..., vid.index, ...)`
+   class the checker's int-kind adoption accepts implicitly). *)
+let int_kind_same (a : Type_repr.int_kind) (b : Type_repr.int_kind) : bool =
+  a = b
+  ||
+  match a, b with
+  | Type_repr.Int, Type_repr.I64 | Type_repr.I64, Type_repr.Int -> true
+  | Type_repr.UInt, Type_repr.U64 | Type_repr.U64, Type_repr.UInt -> true
+  | _ -> false
+
 (* ── Field resolution (re-audit: the typed-place (FieldId) rule) ──
 
    The lowerer's struct-field emission channel is the typed nominal
@@ -1307,10 +1387,16 @@ and field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string) :
      Inout          -> Modify / place channel
      Sink + Copy    -> Consume / Copy
      Sink + owning  -> Consume / Move
-     Set            -> Initialize / place channel                    *)
-and lower_argument (env : func_env) (st : lower_state) (conv : Access_effect.t)
-    (e : Ast.expr) : Seed_mir.call_arg =
-  let op, ty = lower_expr env st e in
+     Set            -> Initialize / place channel
+
+   [expect] is the SOLVED declared-parameter type when the caller has it
+   (a generic method's binder substituted against the receiver): an
+   unsuffixed literal argument then adopts the solved kind exactly like
+   the checker's argument unify (`out.push(0xC5)` on a Vec[u8] lowers
+   the constant at U8, never the No_int_suffix default Int). *)
+and lower_argument ?(expect : Type_repr.t option) (env : func_env) (st : lower_state)
+    (conv : Access_effect.t) (e : Ast.expr) : Seed_mir.call_arg =
+  let op, ty = lower_expr ?expect env st e in
   let eff = Access_effect.read_effect conv in
   match eff with
   | Access_effect.Read -> (
@@ -1333,20 +1419,33 @@ and lower_argument (env : func_env) (st : lower_state) (conv : Access_effect.t)
       | Seed_mir.Copy p ->
           let value =
             if copyable_ty env ty then Seed_mir.Copy p
-            else Seed_mir.Move p
-            (* re-audit P12: a PROJECTED sink of a non-Copy owning
-               value lowers as the projected Move — the VM executes the
-               partial move (the component transfers, the MovedOut hole
-               stays behind; the drop glue skips it), and the
-               verifier's moved lattice tracks the moved path *)
+            else Seed_mir.Read p
+            (* the caller-side operand form of a sink transfer is a
+               VALUE READ, never a caller-slot consume: the transfer
+               enters the callee (the reference verifier checks a sink
+               argument's place as a by-place COPY — mir_call_arg_operand
+               maps Place to MirCopy — and the callee owns the received
+               value), while the caller's local stays usable.  The
+               Tangerine kernel re-reads a sunk container after the
+               call (`segs_of.insert(v, segs)` then `segs.len()` /
+               `segs[si]`), so a `Move` here transitions the caller's
+               whole slot to Moved and every later read of the source
+               local is a spurious use-after-move.  The access EFFECT
+               (Consume) still records the transfer — only the operand
+               form is non-consuming. *)
           in
           { Seed_mir.effect_ = Access_effect.Consume; value }
       | _ -> { Seed_mir.effect_ = Access_effect.Consume; value = op })
   | Access_effect.Initialize -> { Seed_mir.effect_ = Access_effect.Initialize; value = op }
 
-(* Returns (place-or-constant operand, type). *)
-and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
-    Seed_mir.operand * Type_repr.t =
+(* Returns (place-or-constant operand, type).  [expect] is the optional
+   SOLVED context type at positions whose checker kind the expression's
+   own node did not retain (an unsuffixed literal ctor payload: the
+   checker checks arguments against a fresh inference var and records the
+   literal as Int_literal, solving the kind only later through the
+   enclosing call/return context). *)
+and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state)
+    (e : Ast.expr) : Seed_mir.operand * Type_repr.t =
   match e with
   | Ast.IntLit (nid, lit, _) -> (
       match Literal.parse_integer ~span:Span.synthetic lit with
@@ -1364,13 +1463,29 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                 (* re-audit: an unsuffixed integer literal in a context
                    whose checker-resolved type is a concrete Int kind
                    (`align == 0` where align: UInt) adopts that kind —
-                   the checker coerced the literal to the operand's type *)
+                   the checker coerced the literal to the operand's type.
+                   The literal's own node can stay Int_literal when the
+                   checker solved its kind only LATER (through the
+                   enclosing call/return context: the ctor-payload
+                   `Option::Some(0)`); the SOLVED context kind passed
+                   down as [expect] is then adopted too, mirroring
+                   check_expr's expected-concrete adoption. *)
                 match typed_node_of st nid with
                 | Some node -> (
                     match node.tn_type with
                     | Type_repr.Int k -> k
-                    | _ -> Type_repr.Int)
-                | None -> Type_repr.Int)
+                    | _ -> (
+                        match expect with
+                        | Some (Type_repr.Int k)
+                          when int_literal_fits_kind k p.Literal.magnitude ->
+                            k
+                        | _ -> Type_repr.Int))
+                | None -> (
+                    match expect with
+                    | Some (Type_repr.Int k)
+                      when int_literal_fits_kind k p.Literal.magnitude ->
+                        k
+                    | _ -> Type_repr.Int))
           in
           let magnitude = p.Literal.magnitude in
           if Big_nat.fits_ocaml_int magnitude then
@@ -1381,9 +1496,31 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
             (Seed_mir.Constant (int_constant_of_words kind lo hi), Type_repr.Int kind)
           else seed_bug "integer literal exceeds 128 bits in lowering")
       | None -> seed_bug "unparseable integer literal '%s'" lit)
-  | Ast.FloatLit (_, lit, _) -> (
+  | Ast.FloatLit (nid, lit, _) -> (
       match float_of_string_opt lit with
-      | Some f -> (Seed_mir.Constant (Seed_mir.Float64 (Int64.bits_of_float f)), Type_repr.Float Type_repr.F64)
+      | Some f ->
+          (* the checker's float-literal adoption (typecheck.ml:4217-
+             4221): an expected/resolved F32 makes the unsuffixed literal
+             an F32 constant; every other context defaults it to F64.
+             The literal's own typed node is authoritative when it
+             already carries the adopted kind; the SOLVED [expect]
+             context kind covers the positions whose kind the checker
+             solved only through the enclosing expectation — exactly the
+             integer-literal channel above. *)
+          let kind =
+            match typed_node_of st nid with
+            | Some { tn_type = Type_repr.Float k; _ } -> k
+            | _ -> (
+                match expect with
+                | Some (Type_repr.Float k) -> k
+                | _ -> Type_repr.F64)
+          in
+          ( (match kind with
+             | Type_repr.F32 ->
+                 Seed_mir.Constant (Seed_mir.Float32 (Int32.bits_of_float f))
+             | Type_repr.F64 ->
+                 Seed_mir.Constant (Seed_mir.Float64 (Int64.bits_of_float f))),
+            Type_repr.Float kind )
       | None -> seed_bug "unparseable float literal '%s'" lit)
   | Ast.StringLit (_, s, _) -> (Seed_mir.Constant (Seed_mir.String s), Type_repr.String)
   | Ast.CharLit (_, c, _) -> (
@@ -1415,15 +1552,15 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
                  argument can bind, so the raw declaration form must
                  never reach a local *)
               let ty = call_result_ty st nid ty in
-              let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:ty in
-              let id = fresh_local st ty in
-              emit st
-                (Seed_mir.Assign
-                   ( cur_place st id,
-                     Seed_mir.Aggregate
-                       ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_index.make spec.vs_index),
-                         [] ) ));
-              (copy_place st (cur_place st id), ty)
+            let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:ty in
+            let id = fresh_local st ty in
+               emit st
+                 (Seed_mir.Assign
+                    ( cur_place st id,
+                      Seed_mir.Aggregate
+                        ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_index.make spec.vs_index),
+                          [] ) ));
+               (copy_place st (cur_place st id), ty)
           | None -> (
               match List.assoc_opt n env.statics with
               | Some (idx, ty) ->
@@ -1443,6 +1580,38 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
   | Ast.Path (_, a, b, span) -> (
       ignore span;
       seed_bug "path value `%s::%s` reached lowering without a resolved callable identity" a b)
+   | Ast.Binary (_, l, ((Ast.BAnd | Ast.BOr) as lop), r, _) ->
+       (* `&&`/`||` SHORT-CIRCUIT: the direct kernel branches past the
+          RHS when the LHS settles the result (the RHS may contain a call
+          — `len() > 0 && char_at(0) == '-'` — that must not execute).
+          Lower to a SwitchInt on the LHS into the short-circuit result
+          block (the settling constant) and the RHS block (evaluate the
+          RHS into the same result local), then join. *)
+       let rid = fresh_local st Type_repr.Bool in
+       let lo, _lt = lower_expr env st l in
+       let short_b = new_block st in
+       let rhs_b = new_block st in
+       let join_b = new_block st in
+       (match lop with
+        | Ast.BAnd ->
+            set_terminator_to st
+              (Seed_mir.SwitchInt (lo, [ (0L, short_b) ], rhs_b))
+              short_b
+        | _ ->
+            set_terminator_to st
+              (Seed_mir.SwitchInt (lo, [ (1L, short_b) ], rhs_b))
+              short_b);
+       emit st
+         (Seed_mir.Assign
+            ( cur_place st rid,
+              Seed_mir.Constant (Seed_mir.Bool (lop = Ast.BOr)) ));
+       set_terminator st (Seed_mir.Goto join_b);
+       push_block st rhs_b;
+       let ro, _rt = lower_expr env st r in
+       emit st (Seed_mir.Assign (cur_place st rid, Seed_mir.Use ro));
+       set_terminator st (Seed_mir.Goto join_b);
+       push_block st join_b;
+       (Seed_mir.Copy (cur_place st rid), Type_repr.Bool)
    | Ast.Binary (_, l, op, r, _) ->
       let lo, lt = lower_expr env st l in
       let ro, rt = lower_expr env st r in
@@ -1600,11 +1769,30 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
            Unit-vs-empty-tuple compatibility, the `expected () got ()`
            aggregate class) *)
         (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
-      else begin
-      let lowered = List.map (fun e -> lower_expr env st e) elems in
-      let ops = List.map2 (fun (op, ty) _ -> owned_read env ty op) lowered lowered in
-      let tys = List.map snd lowered in
-      let rt = Type_repr.Tuple (Array.of_list tys) in
+       else begin
+       (* thread the resolved tuple context elementwise into each
+          element (the checker's expected-context adoption, mirroring the
+          enum-ctor payload channel below): an unsuffixed literal member
+          of a joined tuple — `(0, x)` where the if-arm's resolved join
+          type is `(UInt, T)` — must lower at the adopted element kind;
+          without the channel it lowers at the No_int_suffix default Int
+          and the arm store disagrees with the join local's element
+          kind.  Elements whose expect is absent or inference-only keep
+          their own typed-channel/default lowering. *)
+       let elem_expect =
+         match expect with
+         | Some (Type_repr.Tuple ts) when Array.length ts = List.length elems ->
+             Array.to_list ts
+         | _ -> []
+       in
+       let lowered =
+         List.mapi
+           (fun i e -> lower_expr ?expect:(List.nth_opt elem_expect i) env st e)
+           elems
+       in
+       let ops = List.map2 (fun (op, ty) _ -> owned_read env ty op) lowered lowered in
+       let tys = List.map snd lowered in
+       let rt = Type_repr.Tuple (Array.of_list tys) in
       let id = fresh_local st rt in
       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Aggregate (Seed_mir.TupleAgg, ops)));
       (copy_place st (cur_place st id), rt)
@@ -1745,11 +1933,11 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
          copy-of-T class) *)
       let p = { bp with Seed_mir.projections = bp.Seed_mir.projections @ projs } in
       if copyable_ty env fty then (Seed_mir.Copy p, fty) else (Seed_mir.Read p, fty)
-  | Ast.IfExpr (nid, i) -> lower_if env st nid i
+  | Ast.IfExpr (nid, i) -> lower_if ?expect env st nid i
   | Ast.MatchExpr (nid, m) -> lower_match env st nid m
   | Ast.WhileExpr (_, w) -> lower_while env st w
   | Ast.LoopExpr (nid, b, _) -> lower_loop env st nid b
-  | Ast.Block (_, b, _) -> lower_block env st b
+  | Ast.Block (_, b, _) -> lower_block ?expect env st b
   | Ast.ReturnExpr (_, Some e, _) ->
       let vo, vt = lower_expr env st e in
       (* an explicit return CONSUMES the value: a non-Copy owning value
@@ -1796,13 +1984,16 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
            seed_bug "next outside loop in lowering (file#%d[%d..%d))" sp.Span.file_id
              sp.Span.start sp.Span.end_)
    | Ast.Assign (_, target, value, _) ->
-       (* the assign TRANSFER rule: assigning an owning value into a
-          destination is a MOVE of the source (the seed has no
-          bitwise-copy of non-Copy values — the verifier's rule 16 —
-          and a let-bound/var target takes over ownership of the value;
-          a source that is a fresh call/aggregate temp is single-use, a
-          named source is consumed by the assignment).  The Copy form
-          survives only for trivially-copyable values.
+       (* the assign TRANSFER rule: an owning RHS is a value READ of the
+          source (never a bitwise Copy — the seed has no copy of
+          non-Copy values, rule 16 — and never a caller-slot Move).  The
+          reference lowering stores the source's MirCopy image (lr_ident
+          yields MirCopy for a named source) and the checker's linear
+          replay never consumes a local on a plain assignment, so a
+          `Move` here would poison every later read of the source local
+          (`b3p.types = b3_types.clone()` after `b3.types =
+          b3_types`).  The Copy form survives only for
+          trivially-copyable values.
           The assignment EXPRESSION's value is UNIT — exactly the
           checker's Assign typing (te_type = Unit): the write is the
           effect, and an assign-tail never contributes a value to an
@@ -1812,7 +2003,7 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
           Bool-into-Option arm-join mismatches). *)
        let assign_value (ty : Type_repr.t) (op : Seed_mir.operand) : Seed_mir.operand =
          match op with
-         | Seed_mir.Copy p when not (copyable_ty env ty) -> Seed_mir.Move p
+         | Seed_mir.Copy p when not (copyable_ty env ty) -> Seed_mir.Read p
          | op -> op
        in
        let vo, vt = lower_expr env st value in
@@ -1920,9 +2111,9 @@ and lower_expr (env : func_env) (st : lower_state) (e : Ast.expr) :
    | Ast.CompoundAssign (_, _, _, _, span) ->
        ignore span;
        seed_bug "CompoundAssign reached MIR lowering without a typed-place writeback rule"
-  | Ast.Call (nid, callee, _, args, span) ->
-      ignore span;
-      lower_call env st nid callee args
+   | Ast.Call (nid, callee, _, args, span) ->
+       ignore span;
+       lower_call ?expect env st nid callee args
   | Ast.TryOp (_, inner, _) -> (
       (* `?`: match the Option/Result subject; the success variant (tag
          0) supplies the payload as the expression value; the failure
@@ -2880,10 +3071,11 @@ and target_type (env : func_env) (target : Ast.expr) : Type_repr.t =
       | None -> seed_bug "assignment target '%s' unknown" n)
   | _ -> Type_repr.Unit
 
-and lower_block (env : func_env) (st : lower_state) (b : Ast.block_body) : Seed_mir.operand * Type_repr.t =
+and lower_block ?(expect : Type_repr.t option) (env : func_env) (st : lower_state)
+    (b : Ast.block_body) : Seed_mir.operand * Type_repr.t =
   List.iter (fun s -> lower_stmt env st s) b.Ast.b_stmts;
   match b.Ast.b_tail with
-  | Some t -> lower_expr env st t
+  | Some t -> lower_expr ?expect env st t
   | None -> (Seed_mir.Constant Seed_mir.Unit, Type_repr.Unit)
 
 and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
@@ -2903,13 +3095,16 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
       (match alias_id with
        | Some _ -> ()
        | None ->
-           (* the owning-value binding: a non-Copy initializer transfers
-              ownership (Move) — a bitwise Copy of an owning type is exactly
-              what the verifier rejects (an intrinsic/collection result is
-              owned by the caller, so the single-use binding moves it) *)
+           (* the owning-value binding: a non-Copy initializer binds by
+              value READ — a bitwise Copy of an owning type is exactly
+              what the verifier rejects, and a caller-slot Move is the
+              over-marking class (`var out_rvalue = rvalue`, `var
+              edge_st = st`, `var visited = ...`: the reference lowering
+              stores the source's MirCopy image and the binding local
+              owns the bound value while the source stays usable). *)
            let vo =
              match vo with
-             | Seed_mir.Copy p when not (copyable_ty env vt) -> Seed_mir.Move p
+             | Seed_mir.Copy p when not (copyable_ty env vt) -> Seed_mir.Read p
              | op -> op
            in
            emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo)));
@@ -3018,7 +3213,8 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
   | Ast.Item _ -> ()
   | Ast.AttributeStmt _ | Ast.Attributed _ -> ()
 
-and lower_if (env : func_env) (st : lower_state) (nid : Ids.Node_id.t) (i : Ast.if_expr) : Seed_mir.operand * Type_repr.t =
+and lower_if ?(expect : Type_repr.t option) (env : func_env) (st : lower_state)
+    (nid : Ids.Node_id.t) (i : Ast.if_expr) : Seed_mir.operand * Type_repr.t =
   let arms = (i.Ast.if_condition, i.Ast.if_then) :: i.Ast.if_elsif in
   let join_b = new_block st in
   let result_ty = ref Type_repr.Unit in
@@ -3047,6 +3243,48 @@ and lower_if (env : func_env) (st : lower_state) (nid : Ids.Node_id.t) (i : Ast.
      | Some node when is_unit_ty node.tn_type -> false
      | _ -> true)
   in
+  (* the checker-resolved join type (the if node's recorded value type):
+     the join slot is created with this type, and every non-Unit arm
+     value must reconcile with it.  A disagreement is REPORTED — never
+     silently dropped: a dropped store leaves the join local
+     uninitialized on that arm's path (the checked_mul class, where the
+     first arm's Option[Int] image used to win the slot and the
+     Option[UInt] else arm's store was skipped).  Unit/Never node types
+     carry no join value; an INFERENCE-ONLY resolved type (the checker
+     kept a literal-kind/inference leaf, e.g. the tuple `(int-literal,
+     T)` — not a usable MIR local type) falls back to the first arm's
+     concrete lowered type, still reporting a genuine arm disagreement
+     whenever the typed channel is present. *)
+  let typed_if = typed_node_of st nid <> None in
+  let resolved_join =
+    match typed_node_of st nid with
+    | Some node
+      when not (is_unit_ty node.tn_type)
+           && Type_repr.compare node.tn_type Type_repr.Never <> 0 ->
+        if not (contains_inference_only node.tn_type) then Some node.tn_type
+        else
+          (* the checker kept an inference-only leaf (the literal
+             `Option[Int_literal]` of a tail `Some(0)`); the enclosing
+             tail context's expected type is the concrete join when it
+             differs from the inference-only form ONLY by literal
+             defaults (`Option[UInt]`) AND is itself concrete.  An
+             inference-only expect (the tail context kept the raw
+             literal too: the recorded join `(int-literal, T)`) is not a
+             usable MIR local type — the join falls back to the first
+             arm's concrete lowered type below, and the compat guard
+             still reports genuine disagreements. *)
+          (match expect with
+           | Some e
+             when not (contains_inference_only e)
+                  && literal_default_delta node.tn_type e ->
+               Some e
+           | _ -> None)
+    | _ -> None
+  in
+  (* the type every arm tail is checked/lowered against: the concrete
+     join type, or the enclosing expected type (the inference-only leaf
+     adopts the context kind through the ctor-payload/literal channel) *)
+  let arm_expect = match resolved_join with Some rt -> Some rt | None -> expect in
   (* A Unit-valued arm (a statement-position if arm) contributes NO
      result value: creating a result local for it and joining it into
      the continuation would leave the result local uninitialized on the
@@ -3057,26 +3295,34 @@ and lower_if (env : func_env) (st : lower_state) (nid : Ids.Node_id.t) (i : Ast.
      an owning (non-Copy) value — a bitwise Copy of an owning arm
      result is a verifier no-copy-of-non-Copy finding. *)
   let arm_value bval bty =
-    if !has_result || not value_if then ()
+    if not value_if then ()
     else if not (is_unit_ty bty) then begin
-      result_ty := bty;
-      result_id := fresh_local st bty;
-      has_result := true
-    end;
-    (* A Unit-valued arm contributes no join value (statement-position
-       if arms — `if ... then acc = ... else () end` inside a loop
-       body), and a DISCARDED if's arms never reconcile in the checker,
-       so an arm whose value type differs from the join slot's type
-       (the first non-Unit arm's type) is a value the checker dropped —
-       storing it would be a verifier assign mismatch (the
-       String-into-Int / String-into-Bool arm-join classes). *)
-    if
-      !has_result
-      && not (is_unit_ty bty)
-      && join_types_compatible env bty !result_ty
-    then
-      emit st
-        (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use (owned_read env bty bval)))
+      if not !has_result then begin
+        result_ty := (match resolved_join with Some rt -> rt | None -> bty);
+        result_id := fresh_local st !result_ty;
+        has_result := true
+      end;
+      (* A Unit-valued arm contributes no join value (statement-position
+         if arms — `if ... then acc = ... else () end` inside a loop
+         body), and without the typed channel a DISCARDED if's arms
+         never reconcile in the checker, so an arm whose value type
+         differs from the join slot's type stays dropped (the
+         String-into-Int / String-into-Bool arm-join classes).  With
+         the resolved join type present the disagreement is a
+         checker/lowering contradiction: fail loudly instead. *)
+      if join_types_compatible env bty !result_ty then
+        emit st
+          (Seed_mir.Assign (cur_place st !result_id, Seed_mir.Use (owned_read env bty bval)))
+      else if typed_if then
+        seed_bug
+          "if node #%d: arm value of type %s disagrees with the %s join type %s — refusing to drop the store (the join local would be read uninitialized)"
+          (Ids.Node_id.to_int nid)
+          (Typecheck.type_to_string bty)
+          (match resolved_join with Some _ -> "checker-resolved" | None -> "earlier arm's")
+          (Typecheck.type_to_string
+             (match resolved_join with Some rt -> rt | None -> !result_ty))
+      else ()
+    end
   in
   (* A DIVERGING arm (its lowered value type is Never — a call to a
      Never-returning callee like `panic(...)`, a return-only loop):
@@ -3105,7 +3351,7 @@ and lower_if (env : func_env) (st : lower_state) (nid : Ids.Node_id.t) (i : Ast.
         set_terminator_to st
           (Seed_mir.SwitchInt (copy_place st (cur_place st cid), [ (1L, then_b) ], next_fall))
           then_b;
-        let bval = Some (lower_block env st b) in
+        let bval = Some (lower_block ?expect:arm_expect env st b) in
         arm_value_never bval;
         (if !diverged then set_terminator_to st Seed_mir.Abort next_fall
          else set_terminator_to st (Seed_mir.Goto join_b) next_fall);
@@ -3117,7 +3363,7 @@ and lower_if (env : func_env) (st : lower_state) (nid : Ids.Node_id.t) (i : Ast.
    | Some eb ->
        if st.cur_block <> else_cont then
          set_terminator_to st (Seed_mir.Goto else_cont) else_cont;
-       arm_value_never (Some (lower_block env st eb));
+       arm_value_never (Some (lower_block ?expect:arm_expect env st eb));
        (if !diverged then set_terminator_to st Seed_mir.Abort join_b
         else set_terminator_to st (Seed_mir.Goto join_b) join_b);
        diverged := false
@@ -4594,8 +4840,9 @@ and fn_value_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
       (copy_place st rp, ty)
   | _ -> seed_bug "fn-value call with a non-function callee type %s" (Seed_mir.print_type fty)
 
-and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
-    (callee : Ast.expr) (args : Ast.call_arg list) : Seed_mir.operand * Type_repr.t =
+and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state)
+    (node_id : Ids.Node_id.t) (callee : Ast.expr) (args : Ast.call_arg list) :
+    Seed_mir.operand * Type_repr.t =
   match callee with
   | Ast.Name (_, n, _) -> (
       match ctor_of st.variants n with
@@ -4613,7 +4860,42 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
             | None ->
                 seed_bug "enum constructor `%s` has no registered result type in the lowering env" n
           in
-          let arg_ops_ty = List.map (fun a -> lower_expr env st a.Ast.ca_value) args in
+          (* the checker-resolved ctor type (the call node's tn_type,
+             journal-substituted) is also the payload-kind SOURCE: the
+             solved payload positions pass down as the literal context, so
+             an unsuffixed payload literal adopts the kind the checker
+             solved (`Option::Some(0)` in a UInt return context lowers 0
+             as a UInt constant, never the No_int_suffix default Int).
+             The checker can keep an INFERENCE-ONLY literal leaf when its
+             argument check bound the ctor's fresh param to Int_literal
+             BEFORE the return reconciliation with the expected context;
+             the enclosing expected type (the tail context the checker
+             reconciled against) is then the concrete kind source when it
+             differs only by literal defaults (`Option[UInt]`) AND is
+             itself free of inference-only leaves (an inference-only
+             expect would be no more usable as a payload/local type than
+             the resolved form). *)
+          let resolved_ty = call_result_ty st node_id ty0 in
+          let typed_channel = typed_node_of st node_id <> None in
+          let context_ty =
+            if contains_inference_only resolved_ty then
+              match expect with
+              | Some e
+                when not (contains_inference_only e)
+                     && literal_default_delta resolved_ty e ->
+                  e
+              | _ -> resolved_ty
+            else resolved_ty
+          in
+          let payload_tys =
+            (variant_spec_of env st.variants ~enum_name ~vname ~repr:context_ty).vs_fields
+          in
+          let arg_ops_ty =
+            List.mapi
+              (fun i a ->
+                lower_expr ?expect:(List.nth_opt payload_tys i) env st a.Ast.ca_value)
+              args
+          in
           let arg_ops = List.map fst arg_ops_ty in
           let arg_tys = List.map snd arg_ops_ty in
           (* the EnumCtor's operand positions hold the payload fields;
@@ -4662,19 +4944,78 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
              local must carry the REAL payload type (Option[Box[String]])
              or the verifier's aggregate-vs-def element check fails on
              every op — the aggregate element mismatch class. *)
-          let ty =
-            match subst_ty with
-            | Some t when not (Type_repr.has_type_param t) -> t
-            | _ -> call_result_ty st node_id ty0
-          in
-          let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:ty in
-          let id = fresh_local st ty in
-          emit st
-            (Seed_mir.Assign
-               ( cur_place st id,
-                 Seed_mir.Aggregate
-                   ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_index.make spec.vs_index),
-                     arg_ops ) ));
+           let ty =
+             match subst_ty with
+             | Some t when not (Type_repr.has_type_param t) ->
+                  (* the argument-derived substitution stays authoritative
+                     for the documented transparent-Box case (the checker's
+                     unify records Option[String] for Some(Box::new(x))
+                     while the aggregate must carry Option[Box[String]]),
+                     but when the ONLY disagreement with the CONCRETE
+                     checker-resolved type is an unsuffixed literal's
+                     default-Int leaf (`Some(0)` in a UInt context before
+                     the payload re-kinding), the RESOLVED type is
+                     authoritative: the local's kind must be the checker's
+                     solved kind (Option[UInt]), never the lowering default
+                     (Option[Int]).  An inference-only resolved type is not
+                     a usable aggregate type, so the argument-derived form
+                     stays. *)
+                  if
+                    typed_channel
+                    && not (contains_inference_only resolved_ty)
+                    && Type_repr.compare t resolved_ty <> 0
+                    && literal_default_delta t resolved_ty
+                  then resolved_ty
+                  else t
+              | _ ->
+                  (* no full argument-derived substitution (the builtin
+                     multi-param ctors: `Result::Ok`/`Err` carry T and E
+                     but supply one payload arg, `Option::None` none), so
+                     the checker-resolved ctor type is the source — and
+                     when IT still carries an inference-only literal leaf
+                     (`Result[Vec[int-literal], String]` for a `Vec::new()`
+                     resolved through byte pushes) while the enclosing
+                     expected context is the concrete adopted form
+                     (`Result[Vec[u8], String]`), the aggregate local must
+                     carry the adopted form: the literal's kind was solved
+                     by the enclosing context, and keeping the stale
+                     literal leaf mints a second canonical instance in mono
+                     (the `Result[Vec[int-literal], String]`-into-
+                     `Result[Vec[u8], String]` assign class). *)
+                  context_ty
+           in
+            let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:ty in
+           (* the checker's integer-kind adoption at the ctor boundary:
+              an argument whose OWN place kind is a different concrete
+              integer kind than the declared payload field is accepted
+              by the checker (unify's Int k1/Int k2 clause — the kernel
+              passes `vid.index: UInt` into `LirPlaceEnumField(Int, Int,
+              Int)`), while the verifier's aggregate element check
+              compares concrete kinds (Int is not UInt).  State the
+              adoption explicitly: convert the operand to the declared
+              field kind through a Cast temp, exactly like an `as`
+              conversion the checker made implicit. *)
+           let arg_ops =
+             List.mapi
+               (fun i op ->
+                 match (List.nth_opt spec.vs_fields i, List.nth_opt arg_tys i) with
+                 | Some (Type_repr.Int k), Some (Type_repr.Int k2)
+                   when not (int_kind_same k k2) ->
+                     let cid = fresh_local st (Type_repr.Int k) in
+                     emit st
+                       (Seed_mir.Assign
+                          (cur_place st cid, Seed_mir.Cast (op, Type_repr.Int k)));
+                     Seed_mir.Copy (cur_place st cid)
+                 | _ -> op)
+               arg_ops
+           in
+           let id = fresh_local st ty in
+           emit st
+             (Seed_mir.Assign
+                ( cur_place st id,
+                  Seed_mir.Aggregate
+                    ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_index.make spec.vs_index),
+                      arg_ops ) ));
           (copy_place st (cur_place st id), ty)
       | None -> (
           (* re-audit (the bare-name collision class): a bare callee
@@ -5595,12 +5936,33 @@ and lower_call (env : func_env) (st : lower_state) (node_id : Ids.Node_id.t)
                 (Seed_mir.print_type recv_dest_ty));
            let id = fresh_local st recv_dest_ty in
            let rp2 = cur_place st id in
+           (* the declared parameter kinds solved against the receiver
+              (the same substitution the dest type above uses): an
+              unsuffixed literal argument adopts the solved kind exactly
+              as the checker's argument unify does — the byte pushes
+              `out.push(0xC5)` on a Vec[u8] must lower the constant at
+              U8, never the No_int_suffix default Int (the intrinsic
+              generic-param consistency channel).  A param that stays
+              abstract after substitution is inert: the literal lowering
+              only adopts concrete Int/Float/tuple contexts. *)
+           let arg_subst =
+             match me.me_params with
+             | [||] -> []
+             | _ -> subst_against me.me_params.(0).Type_repr.pt_type rty []
+           in
+           let arg_expect i =
+             if i + 1 < Array.length me.me_params then
+               let pt = me.me_params.(i + 1).Type_repr.pt_type in
+               Some
+                 (if arg_subst = [] then pt else Type_repr.substitute arg_subst pt)
+             else None
+           in
            let arg_vals =
              Array.of_list
                ({ Seed_mir.effect_ = self_eff; value = self_op }
                 :: List.mapi
                      (fun i a ->
-                       lower_argument env st
+                       lower_argument ?expect:(arg_expect i) env st
                          (if i + 1 < Array.length me.me_params then
                            me.me_params.(i + 1).Type_repr.pt_convention
                          else Access_effect.Let)
@@ -5822,8 +6184,9 @@ let lower_function_with_variants
   push_block st entry;
   let result =
     match fn.Ast.fn_body with
-    | Ast.FnBlock b -> Some (lower_block env st b)
-    | Ast.FnExpr e -> Some (lower_expr env st e)
+    | Ast.FnBlock b ->
+        Some (lower_block ?expect:(Some env.fn_ret) env st b)
+    | Ast.FnExpr e -> Some (lower_expr ?expect:(Some env.fn_ret) env st e)
     | Ast.FnSignatureOnly -> None
   in
   (* the function's final implicit return runs the defers (LIFO) BEFORE

@@ -48,7 +48,6 @@
    remaining whole-value masked-drop form, applying only to the
    whole-root replacement itself. *)
 
-module IntMap = Map.Make (Int)
 module IntSet = Set.Make (Int)
 
 type resource_state = Uninitialized | Live | Consumed | Maybe_live
@@ -210,17 +209,44 @@ let meet (a : resource_state) (b : resource_state) : resource_state =
   | Live, Live -> Live
   | Consumed, Consumed -> Consumed
 
+(* The root-state rows are SPARSE DEVIATIONS from the per-local default:
+   every owned local is Live except the return slot (local 0), which is
+   Uninitialized.  The default is constant for the whole dataflow, so a
+   row is stored only when the state differs from it — a local never
+   touched by the function keeps its default without materializing a row
+   in every block's state (the dense form carried one row per owned
+   local at every join/convergence test: on the kernel's 17k-local
+   derived functions that was both the seconds-per-function cost and the
+   multi-GB footprint).  `state_of` / `set_state` / `states_join` below
+   all fold the default in, so the lattice values and findings are
+   exactly the dense ones. *)
+let default_state (l : int) : resource_state =
+  if l = 0 then Uninitialized else Live
+
 let states_join (a : (int * resource_state) list) (b : (int * resource_state) list) :
     (int * resource_state) list =
-  let bm = List.fold_left (fun m (l, s) -> IntMap.add l s m) IntMap.empty b in
-  let rec go = function
-    | [] -> IntMap.bindings bm
-    | (l, s) :: rest -> (
-        match IntMap.find_opt l bm with
-        | None -> (l, s) :: go rest
-        | Some s' -> (l, meet s s') :: go rest)
+  (* Both inputs are canonically ordered (ascending local id, at most one
+     row per local, no row equal to the default — states_join /
+     set_state below maintain this), so the join is a linear merge: a key
+     in both states meets, a key in only one joins with the other side's
+     default.  Rows that land back on the default are dropped again.  The
+     pre-fix version rebuilt an IntMap from b, appended ALL of b's
+     bindings even for keys already met out of a (duplicating every shared
+     key on each join — the state lists then grew/oscillated and the
+     fixpoint never converged) and re-sorted with the polymorphic compare
+     on every edge. *)
+  let keep l s = if s = default_state l then [] else [ (l, s) ] in
+  let rec go a b =
+    match a, b with
+    | [], [] -> []
+    | [], (l, s) :: b' -> keep l (meet s (default_state l)) @ go [] b'
+    | (l, s) :: a', [] -> keep l (meet s (default_state l)) @ go a' []
+    | (l1, s1) :: a', (l2, s2) :: b' ->
+        if l1 = l2 then keep l1 (meet s1 s2) @ go a' b'
+        else if l1 < l2 then keep l1 (meet s1 (default_state l1)) @ go a' b
+        else keep l2 (meet s2 (default_state l2)) @ go a b'
   in
-  List.sort compare (go a)
+  go a b
 
 (* ────────────────────────────────────────────────────────────────
    The projected-place chain lattice (native resource_check.tg's
@@ -241,7 +267,17 @@ let states_join (a : (int * resource_state) list) (b : (int * resource_state) li
    when the value is owning (a move of a Copy field is a read).
    ──────────────────────────────────────────────────────────────── *)
 
-type chain_row = int * Seed_mir.projection list * resource_state
+(* ── the per-function chain universe ──────────────────────────────
+   Every distinct static projection chain is interned to a stable int id
+   for one cfg_check_function run, and every row/prefix/extension test
+   below compares those int ids.  The pre-fix row model compared
+   `Seed_mir.projection list` values structurally on every membership /
+   join / convergence test (caml_compare on boxed projection lists, the
+   sampled hotspot), scanned prefixes with List.nth (quadratic per read)
+   and joined with a nested structural scan (O(|a|·|b|) per edge).  The
+   intern table is exact (no hashing collision can merge two chains), so
+   the lattice semantics are unchanged. *)
+type chain_row = int * int * resource_state
 
 (* Render a chain for diagnostics (the Seed MIR pretty-printer's
    projection forms, without the root prefix). *)
@@ -257,30 +293,84 @@ let chain_to_string (ch : Seed_mir.projection list) : string =
              Printf.sprintf " as variant#%d" (Ids.Variant_id.to_int v))
        ch)
 
-let chain_row_find (rows : chain_row list) (l : int) (ch : Seed_mir.projection list) :
+type chain_env = {
+  chain_ids : (Seed_mir.projection list, int) Hashtbl.t;
+  chain_of_id : (int, Seed_mir.projection list) Hashtbl.t;
+  chain_prefix_ids : (int, int array) Hashtbl.t;
+  mutable chain_next : int;
+}
+
+let create_chain_env () : chain_env =
+  {
+    chain_ids = Hashtbl.create 64;
+    chain_of_id = Hashtbl.create 64;
+    chain_prefix_ids = Hashtbl.create 64;
+    chain_next = 0;
+  }
+
+let chain_intern (ce : chain_env) (ch : Seed_mir.projection list) : int =
+  match Hashtbl.find_opt ce.chain_ids ch with
+  | Some id -> id
+  | None ->
+      let id = ce.chain_next in
+      ce.chain_next <- id + 1;
+      Hashtbl.add ce.chain_ids ch id;
+      Hashtbl.add ce.chain_of_id id ch;
+      id
+
+(* The ancestor ids of a chain, shortest first: index k-1 is the id of
+   the k-projection prefix (k = 1..length).  Interning every prefix here
+   keeps the prefix scan exact and int-keyed; memoized per chain id. *)
+let chain_prefixes (ce : chain_env) (cid : int) : int array =
+  match Hashtbl.find_opt ce.chain_prefix_ids cid with
+  | Some a -> a
+  | None ->
+      let ch = Hashtbl.find ce.chain_of_id cid in
+      let n = List.length ch in
+      let a = Array.make n cid in
+      let rec fill k acc_rev = function
+        | [] -> ()
+        | p :: rest ->
+            a.(k - 1) <- chain_intern ce (List.rev (p :: acc_rev));
+            fill (k + 1) (p :: acc_rev) rest
+      in
+      fill 1 [] ch;
+      Hashtbl.add ce.chain_prefix_ids cid a;
+      a
+
+(* Does chain `a` extend `base` (a == base or base is a prefix of a)? *)
+let chain_extends (ce : chain_env) (a : int) (base : int) : bool =
+  let pa = chain_prefixes ce a in
+  let pb = chain_prefixes ce base in
+  Array.length pa >= Array.length pb && pa.(Array.length pb - 1) = base
+
+let chain_row_find (rows : chain_row list) (l : int) (cid : int) :
     resource_state option =
-  match List.find_opt (fun (l', ch', _) -> l' = l && ch' = ch) rows with
+  match List.find_opt (fun (l', cid', _) -> l' = l && cid' = cid) rows with
   | Some (_, _, st) -> Some st
   | None -> None
 
-(* Does `ch` extend `base` (ch == base or ch shares base as a prefix)? *)
-let chain_extends (ch : Seed_mir.projection list) (base : Seed_mir.projection list) : bool =
-  let nb = List.length base in
-  List.length ch >= nb
-  &&
-  let rec same k = k >= nb || (List.nth ch k = List.nth base k && same (k + 1)) in
-  same 0
-
-let chain_row_set (rows : chain_row list) (l : int) (ch : Seed_mir.projection list)
+(* Replace-or-insert keeping rows canonically ordered by (local, chain
+   id), so the per-edge joins are linear merges and the fixpoint check
+   compares canonical snapshots. *)
+let chain_row_set (rows : chain_row list) (l : int) (cid : int)
     (st : resource_state) : chain_row list =
-  (l, ch, st) :: List.filter (fun (l', ch', _) -> not (l' = l && ch' = ch)) rows
+  let rec go = function
+    | [] -> [ (l, cid, st) ]
+    | (l', cid', st') :: rest ->
+        if l' = l && cid' = cid then (l, cid, st) :: rest
+        else if l < l' || (l = l' && cid < cid') then
+          (l, cid, st) :: (l', cid', st') :: rest
+        else (l', cid', st') :: go rest
+  in
+  go rows
 
 (* Remove the chain and every extension of it (a store re-lives the
    target; the nested consumptions under it die with the
    re-initialization — the native frame_place_clear). *)
-let chain_rows_clear_at (rows : chain_row list) (l : int) (ch : Seed_mir.projection list) :
-    chain_row list =
-  List.filter (fun (l', ch', _) -> not (l' = l && chain_extends ch' ch)) rows
+let chain_rows_clear_at (ce : chain_env) (rows : chain_row list) (l : int)
+    (cid : int) : chain_row list =
+  List.filter (fun (l', cid', _) -> not (l' = l && chain_extends ce cid' cid)) rows
 
 let chain_rows_clear_root (rows : chain_row list) (l : int) : chain_row list =
   List.filter (fun (l', _, _) -> l' <> l) rows
@@ -298,41 +388,39 @@ let chain_root_has_moves (rows : chain_row list) (l : int) : bool =
    indeterminate.  Absent = Live.  (A Consumed/Uninitialized root makes
    every chain dead and a Maybe_live root makes every chain
    indeterminate — the callers fold that in through the root row.) *)
-let chain_prefix_state (rows : chain_row list) (l : int)
-    (ch : Seed_mir.projection list) : resource_state =
-  let n = List.length ch in
-  let take k = List.filteri (fun i _ -> i < k) ch in
+let chain_prefix_state (ce : chain_env) (rows : chain_row list) (l : int)
+    (cid : int) : resource_state =
+  let pids = chain_prefixes ce cid in
+  let n = Array.length pids in
   let rec scan k =
-    if k > n then Live
+    if k >= n then Live
     else (
-      match chain_row_find rows l (take k) with
+      match chain_row_find rows l pids.(k) with
       | Some Consumed -> Consumed
       | Some Maybe_live -> Maybe_live
       | Some Live | Some Uninitialized | None -> scan (k + 1))
   in
-  scan 1
+  scan 0
 
 (* The per-chain lattice join (the native merge_frames place_moves
    half): a chain recorded in some arms only joins to Maybe_live (absent
    = Live on the other paths — a field consumed on one path is live on
    the other, and the cleanup cannot be conditional); a chain recorded in
-   every arm keeps its state when the arms agree, else Maybe_live. *)
+   every arm keeps its state when the arms agree, else Maybe_live.  Both
+   inputs are canonically ordered, so this is a linear merge. *)
 let chain_rows_join (a : chain_row list) (b : chain_row list) : chain_row list =
-  let from_a =
-    List.fold_left
-      (fun acc (l, ch, st) ->
-        match chain_row_find b l ch with
-        | Some stb when stb = st -> (l, ch, st) :: acc
-        | Some _ | None -> (l, ch, Maybe_live) :: acc)
-      [] a
+  let rec go a b =
+    match a, b with
+    | [], [] -> []
+    | [], (l, cid, _) :: b' -> (l, cid, Maybe_live) :: go [] b'
+    | (l, cid, _) :: a', [] -> (l, cid, Maybe_live) :: go a' []
+    | (l1, c1, s1) :: a', (l2, c2, s2) :: b' ->
+        if l1 = l2 && c1 = c2 then
+          (l1, c1, (if s1 = s2 then s1 else Maybe_live)) :: go a' b'
+        else if l1 < l2 || (l1 = l2 && c1 < c2) then (l1, c1, Maybe_live) :: go a' b
+        else (l2, c2, Maybe_live) :: go a b'
   in
-  let from_b_only =
-    List.fold_left
-      (fun acc (l, ch, _) ->
-        if chain_row_find a l ch = None then (l, ch, Maybe_live) :: acc else acc)
-      [] b
-  in
-  from_a @ from_b_only
+  go a b
 
 (* ── place classification over the Seed MIR (the type walk) ─────────
    classify_place decides how a place rooted at an owned local behaves:
@@ -427,17 +515,16 @@ let classify_place (prog : Seed_mir.program) (root_ty : Type_repr.t)
    write-through case — chain_prefix_state reports Consumed for both, and
    the assign-target validation consults this exact row to tell them
    apart. *)
-let chain_self_consumed (rows : chain_row list) (l : int)
-    (ch : Seed_mir.projection list) : bool =
-  chain_row_find rows l ch = Some Consumed
+let chain_self_consumed (rows : chain_row list) (l : int) (cid : int) : bool =
+  chain_row_find rows l cid = Some Consumed
 
 (* Do two static chains overlap — equal, or one a prefix of the other?
    The exact-place drop of the target chain destroys an operand's storage
    when the operand chain equals the target, extends it (a sub-value
    inside the replaced value) or prefixes it (an ancestor value containing
    the replaced place). *)
-let chains_overlap (a : Seed_mir.projection list) (b : Seed_mir.projection list) : bool =
-  chain_extends a b || chain_extends b a
+let chains_overlap (ce : chain_env) (a : int) (b : int) : bool =
+  chain_extends ce a b || chain_extends ce b a
 
 (* cfg_check_function — the path-sensitive lattice over one function.
    `cache` is the Type_properties instance cache and `resolve` the
@@ -479,21 +566,29 @@ let cfg_check_function (cache : Type_properties.cache)
         (List.init (Array.length f.Seed_mir.locals) (fun i -> i))
     in
     let owned_set = IntSet.of_list owned in
+    (* the chain universe for THIS function: all row/prefix/extension
+       tests below compare interned int ids (see chain_env) *)
+    let ce = create_chain_env () in
     let in_states : (int * resource_state) list array = Array.make nb [] in
     let out_states : (int * resource_state) list array = Array.make nb [] in
     let in_chains : chain_row list array = Array.make nb [] in
     let out_chains : chain_row list array = Array.make nb [] in
-    (* the entry: the owned params are Live (the caller owns them); the
-       return slot is Uninitialized.  Only the IN state is seeded — the
-       out state starts empty so the entry block's FIRST processing is
-       always a change and the worklist propagates to its successors
-       (seeding the out state too made a statement-less entry silently
-       skip every downstream block). *)
-    let entry_init =
-      List.map
-        (fun l -> (l, if l = 0 then Uninitialized else Live))
-        owned
-    in
+    (* a block's FIRST processing must always propagate to its successors:
+       with the sparse states the entry's out state can legitimately be []
+       (all defaults), which would otherwise compare equal to the initial
+       empty out state and silently stop the worklist *)
+    let visited : bool array = Array.make nb false in
+    let profile = Sys.getenv_opt "TANGERINE_CFG_PROFILE" <> None in
+    let iterations = ref 0 in
+    let max_rows = ref 0 in
+    (* the entry: the owned params are Live and the return slot
+       Uninitialized — the constant defaults, so the sparse IN state is
+       empty (a read consults default_state).  Only the IN state is
+       seeded — the out state starts empty so the entry block's FIRST
+       processing is always a change and the worklist propagates to its
+       successors (seeding the out state too made a statement-less entry
+       silently skip every downstream block). *)
+    let entry_init : (int * resource_state) list = [] in
     in_states.(f.Seed_mir.entry) <- entry_init;
     in_chains.(f.Seed_mir.entry) <- [];
     let work = Queue.create () in
@@ -502,9 +597,25 @@ let cfg_check_function (cache : Type_properties.cache)
     Hashtbl.add in_work f.Seed_mir.entry ();
     let errors = ref [] in
     let err fmt = Printf.ksprintf (fun m -> errors := m :: !errors) fmt in
-    let state_of states l = List.assoc_opt l states |> Option.value ~default:Uninitialized in
+    let state_of states l =
+      match List.assoc_opt l states with Some s -> s | None -> default_state l
+    in
+    (* replace-or-insert preserving the canonical ascending-key order the
+       joins and the fixpoint comparison rely on; a value back on the
+       default drops the row *)
     let set_state states l s =
-      (l, s) :: List.filter (fun (l', _) -> l' <> l) states
+      let v = if s = default_state l then None else Some s in
+      let rec go = function
+        | [] -> ( match v with None -> [] | Some s -> [ (l, s) ])
+        | (l', s0) :: rest ->
+            if l' = l then ( match v with None -> rest | Some s -> (l, s) :: rest)
+            else if l < l' then
+              ( match v with
+              | None -> (l', s0) :: rest
+              | Some s -> (l, s) :: (l', s0) :: rest )
+            else (l', s0) :: go rest
+      in
+      go states
     in
 
     (* the root local of a place, when owned *)
@@ -552,8 +663,7 @@ let cfg_check_function (cache : Type_properties.cache)
        sibling) is untouched by the drop — accepted.  A whole-value
        operand of the same root and a boundary (indexed / deref) operand
        of the same root are unclassifiable — conservative overlap. *)
-    let rhs_overlaps (rv : Seed_mir.rvalue) (l : int) (tgt : Seed_mir.projection list) :
-        bool =
+    let rhs_overlaps (rv : Seed_mir.rvalue) (l : int) (tgt : int) : bool =
       List.exists
         (fun op ->
           match operand_place op with
@@ -564,7 +674,8 @@ let cfg_check_function (cache : Type_properties.cache)
                   match chain_of_place l' p with
                   | PWhole -> true
                   | PBoundary -> true
-                  | PChain (op_ch, _) -> chains_overlap op_ch tgt)
+                  | PChain (op_ch, _) ->
+                      chains_overlap ce (chain_intern ce op_ch) tgt)
               | _ -> false))
         (rv_operands rv)
     in
@@ -590,12 +701,13 @@ let cfg_check_function (cache : Type_properties.cache)
             err "_%d: cannot use owned local as a whole: fields of the resource were moved out" l
           else check_root_available states l
       | PChain (ch, _) -> (
+          let cid = chain_intern ce ch in
           match state_of states l with
           | Uninitialized -> err "_%d: read of uninitialized owned local" l
           | Consumed -> err "_%d: use-after-consume" l
           | Maybe_live -> err "_%d: owned local may be consumed on one path" l
           | Live -> (
-              match chain_prefix_state rows l ch with
+              match chain_prefix_state ce rows l cid with
               | Consumed ->
                   err "_%d: read of moved-out owned field %s" l (chain_to_string ch)
               | Maybe_live ->
@@ -606,29 +718,48 @@ let cfg_check_function (cache : Type_properties.cache)
     in
 
     while not (Queue.is_empty work) do
+      incr iterations;
+      if profile && !iterations mod 100000 = 0 then
+        Printf.eprintf "[cfg-profile]   %s iter=%d queue=%d max_rows=%d\n%!" f.Seed_mir.name
+          !iterations (Queue.length work) !max_rows;
       let bid = Queue.pop work in
       Hashtbl.remove in_work bid;
+      (* Join the predecessors' out states.  Only PROCESSED predecessors
+         contribute: an unprocessed predecessor's out state is unknown
+         (it will re-enqueue this block when it settles), while a
+         processed one with an empty out state is the legitimate
+         all-defaults state.  The fold starts from the first contributing
+         state (never from []): with sparse states [] is a state, not an
+         identity.  The ENTRY's own IN is joined in as well: the worklist
+         starts at the entry, but a lowered entry block can itself have a
+         predecessor (bb0 -> entry), and the entry IN carries the param
+         Live seeding / prior deviations. *)
+      let join_preds join acc outs =
+        match (if bid = f.Seed_mir.entry then acc :: outs else outs) with
+        | [] -> []
+        | x :: rest -> List.fold_left join x rest
+      in
       let in_s =
         match preds.(bid) with
         | [] -> in_states.(bid)
         | ps ->
-            (* the ENTRY seed must survive: the worklist starts at the
-               entry, but a lowered entry block can itself have a
-               predecessor (bb0 -> entry); joining only the visited
-               predecessors would drop the param Live seeding and report
-               spurious uninitialized reads *)
-            let acc = if bid = f.Seed_mir.entry then in_states.(bid) else [] in
-            List.fold_left (fun acc p -> states_join acc out_states.(p)) acc ps
+            join_preds states_join in_states.(bid)
+              (List.filter_map
+                 (fun p -> if visited.(p) then Some out_states.(p) else None)
+                 ps)
       in
       let in_c =
         match preds.(bid) with
         | [] -> in_chains.(bid)
         | ps ->
-            let acc = if bid = f.Seed_mir.entry then in_chains.(bid) else [] in
-            List.fold_left (fun acc p -> chain_rows_join acc out_chains.(p)) acc ps
+            join_preds chain_rows_join in_chains.(bid)
+              (List.filter_map
+                 (fun p -> if visited.(p) then Some out_chains.(p) else None)
+                 ps)
       in
       in_states.(bid) <- in_s;
       in_chains.(bid) <- in_c;
+      if List.length in_c > !max_rows then max_rows := List.length in_c;
       let st = ref in_s in
       let rows = ref in_c in
 
@@ -665,13 +796,14 @@ let cfg_check_function (cache : Type_properties.cache)
               (* a consuming transfer of a Copy value is a copy — a read *)
               read_place !st !rows l p
             else begin
+              let cid = chain_intern ce ch in
               (match state_of !st l with
                | Uninitialized -> err "_%d: read of uninitialized owned local" l
                | Consumed -> err "_%d: use-after-consume" l
                | Maybe_live ->
                    err "_%d: owned local may be consumed on one path" l
                | Live -> (
-                   match chain_prefix_state !rows l ch with
+                   match chain_prefix_state ce !rows l cid with
                    | Consumed ->
                        err "_%d: double-move of owned field %s" l (chain_to_string ch)
                    | Maybe_live ->
@@ -681,7 +813,7 @@ let cfg_check_function (cache : Type_properties.cache)
               (* the projected consume commits: the chain becomes
                  Consumed (its consumed extensions die with the
                  whole-chain move) *)
-              rows := chain_row_set (chain_rows_clear_at !rows l ch) l ch Consumed
+              rows := chain_row_set (chain_rows_clear_at ce !rows l cid) l cid Consumed
             end
         | PBoundary ->
             check_root_available !st l;
@@ -731,6 +863,7 @@ let cfg_check_function (cache : Type_properties.cache)
                     | PWhole -> Some (l, None)
                     | PBoundary -> Some (l, None)
                     | PChain (ch, cty) ->
+                        let cid = chain_intern ce ch in
                         let pre_rows = !rows in
                         let root_st = state_of !st l in
                         let owning = chain_owning cty in
@@ -741,7 +874,7 @@ let cfg_check_function (cache : Type_properties.cache)
                          | Maybe_live ->
                              err "_%d: assign into owned local that may be consumed on one path" l
                          | Live -> (
-                             match chain_prefix_state pre_rows l ch with
+                             match chain_prefix_state ce pre_rows l cid with
                              | Consumed ->
                                  (* the chain's own row Consumed = dead
                                     field storage: the store re-lives the
@@ -751,7 +884,7 @@ let cfg_check_function (cache : Type_properties.cache)
                                     storage lies inside a moved-out value —
                                     the assignment would write through it
                                     — rejected. *)
-                                 if chain_self_consumed pre_rows l ch then ()
+                                 if chain_self_consumed pre_rows l cid then ()
                                  else
                                    err "_%d: cannot assign into owned field %s: the containing value was moved out (the assignment would write through the moved-out value)" l
                                      (chain_to_string ch)
@@ -773,10 +906,10 @@ let cfg_check_function (cache : Type_properties.cache)
                                       materializes); a disjoint sibling
                                       chain RHS is accepted — the exact
                                       drop never touches the sibling. *)
-                                   if rhs_overlaps rv l ch then
+                                   if rhs_overlaps rv l cid then
                                      err "_%d: cannot assign over an owning projected place: the value reads or moves out of the replaced value's own storage (the drop-before-store would destroy its source)" l
                                  end));
-                        Some (l, Some ch))
+                        Some (l, Some cid))
               in
               (* 2. the RHS reads/moves *)
               List.iter step_op (rv_operands rv);
@@ -793,7 +926,7 @@ let cfg_check_function (cache : Type_properties.cache)
                            st := set_state !st l Live;
                            rows := chain_rows_clear_root !rows l
                        | PChain _ | PBoundary -> ())
-                   | Some ch ->
+                   | Some cid ->
                        (* the exact-place commit: the store re-lives the
                           target chain and its extensions (the old value's
                           drop destroyed exactly the chain's own state,
@@ -801,7 +934,7 @@ let cfg_check_function (cache : Type_properties.cache)
                           chains were NEVER touched — each keeps its own
                           record (a live sibling stays live; a consumed
                           sibling stays dead). *)
-                       rows := chain_rows_clear_at !rows l ch)))
+                       rows := chain_rows_clear_at ce !rows l cid)))
           | Seed_mir.StorageLive _ | Seed_mir.StorageDead _ | Seed_mir.SetDiscriminant _
           | Seed_mir.Nop -> ())
         f.Seed_mir.blocks.(bid).Seed_mir.statements;
@@ -832,22 +965,23 @@ let cfg_check_function (cache : Type_properties.cache)
                        own row Consumed) re-lives; a CONSUMED proper
                        prefix (a containing value moved out) rejects the
                        write-through. *)
+                    let cid = chain_intern ce ch in
                     (match state_of !st l with
                      | Uninitialized -> err "_%d: read of uninitialized owned local" l
                      | Consumed -> err "_%d: use-after-consume" l
                      | Maybe_live ->
                          err "_%d: assign into owned local that may be consumed on one path" l
                      | Live -> (
-                         match chain_prefix_state !rows l ch with
+                         match chain_prefix_state ce !rows l cid with
                          | Maybe_live ->
                              err "_%d: owned field %s may be consumed on one path" l
                                (chain_to_string ch)
                          | Consumed ->
-                             if not (chain_self_consumed !rows l ch) then
+                             if not (chain_self_consumed !rows l cid) then
                                err "_%d: cannot assign into owned field %s: the containing value was moved out (the assignment would write through the moved-out value)" l
                                  (chain_to_string ch)
                          | Live | Uninitialized -> ()));
-                    rows := chain_rows_clear_at !rows l ch
+                    rows := chain_rows_clear_at ce !rows l cid
                 | PBoundary -> ())
             | _ -> ())
        | Seed_mir.Drop (p, _, _) | Seed_mir.Deinit (p, _, _) -> (
@@ -861,27 +995,28 @@ let cfg_check_function (cache : Type_properties.cache)
                       skipped; the root dies *)
                    st := set_state !st l Consumed;
                    rows := chain_rows_clear_root !rows l
-               | PChain (ch, cty) ->
-                   (* a projected drop/destroy: the CHAIN's value is
-                      destroyed — deinit of a moved-out field is a
-                      double-drop (the root stays live) *)
-                   if chain_owning cty then begin
-                     (match state_of !st l with
-                      | Uninitialized -> err "_%d: read of uninitialized owned local" l
-                      | Consumed -> err "_%d: use-after-consume" l
-                      | Maybe_live ->
-                          err "_%d: owned local may be consumed on one path" l
-                      | Live -> (
-                          match chain_prefix_state !rows l ch with
-                          | Consumed ->
-                              err "_%d: double-drop of owned field %s" l
-                                (chain_to_string ch)
-                          | Maybe_live ->
-                              err "_%d: owned field %s may be consumed on one path" l
-                                (chain_to_string ch)
-                          | Live | Uninitialized -> ()));
-                     rows := chain_row_set !rows l ch Consumed
-                   end
+                | PChain (ch, cty) ->
+                    (* a projected drop/destroy: the CHAIN's value is
+                       destroyed — deinit of a moved-out field is a
+                       double-drop (the root stays live) *)
+                    if chain_owning cty then begin
+                      let cid = chain_intern ce ch in
+                      (match state_of !st l with
+                       | Uninitialized -> err "_%d: read of uninitialized owned local" l
+                       | Consumed -> err "_%d: use-after-consume" l
+                       | Maybe_live ->
+                           err "_%d: owned local may be consumed on one path" l
+                       | Live -> (
+                           match chain_prefix_state ce !rows l cid with
+                           | Consumed ->
+                               err "_%d: double-drop of owned field %s" l
+                                 (chain_to_string ch)
+                           | Maybe_live ->
+                               err "_%d: owned field %s may be consumed on one path" l
+                                 (chain_to_string ch)
+                           | Live | Uninitialized -> ()));
+                      rows := chain_row_set !rows l cid Consumed
+                    end
                 | PBoundary ->
                     err "_%d: cannot drop through a dynamic index or deref place: element-level state is not tracked (the container's elements are the ownership unit); destroy through the container's own ownership operations (clear / drain / remove) — never through an indexed place" l))
        | Seed_mir.SwitchInt (op, _, _) -> (
@@ -903,15 +1038,19 @@ let cfg_check_function (cache : Type_properties.cache)
       let out_c = !rows in
       let roots_same =
         List.length out_s = List.length out_states.(bid)
-        && List.for_all2 (fun (_, s) (_, s') -> s = s') out_s out_states.(bid)
+        && List.for_all2
+             (fun (l, s) (l', s') -> l = l' && s = s')
+             out_s out_states.(bid)
       in
       let chains_same =
         List.length out_c = List.length out_chains.(bid)
         && List.for_all2
-             (fun (_, c, s) (_, c', s') -> c = c' && s = s')
+             (fun (l, c, s) (l', c', s') -> l = l' && c = c' && s = s')
              out_c out_chains.(bid)
       in
-      if not (roots_same && chains_same) then begin
+      let first = not visited.(bid) in
+      visited.(bid) <- true;
+      if first || not (roots_same && chains_same) then begin
         out_states.(bid) <- out_s;
         out_chains.(bid) <- out_c;
         List.iter
@@ -928,6 +1067,9 @@ let cfg_check_function (cache : Type_properties.cache)
            | Seed_mir.Ret | Seed_mir.Unreachable | Seed_mir.Abort -> [])
       end
     done;
+    if profile then
+      Printf.eprintf "[cfg-profile]   fn=%s blocks=%d owned=%d iters=%d max_rows=%d\n%!"
+        f.Seed_mir.name nb (List.length owned) !iterations !max_rows;
     List.rev !errors
   end
 
@@ -952,12 +1094,37 @@ let cfg_check_program_items ?(lang_items : Lang_items.t option = None)
     Type_properties.with_lang_items lang_items
       (Type_properties.structural_resolver (resolve_named prog))
   in
-  List.concat_map
-    (fun (f : Seed_mir.function_) ->
-      List.map
-        (fun m -> (f.Seed_mir.name, m))
-        (cfg_check_function cache resolve prog f))
-    (Array.to_list prog.Seed_mir.functions)
+  let profile = Sys.getenv_opt "TANGERINE_CFG_PROFILE" <> None in
+  let timings = ref [] in
+  let results =
+    List.concat_map
+      (fun (f : Seed_mir.function_) ->
+        let t0 = if profile then Unix.gettimeofday () else 0.0 in
+        let items = cfg_check_function cache resolve prog f in
+        let dt = if profile then Unix.gettimeofday () -. t0 else 0.0 in
+        if profile then
+          timings :=
+            (dt, Array.length f.Seed_mir.blocks, f.Seed_mir.name)
+            :: !timings;
+        List.map (fun m -> (f.Seed_mir.name, m)) items)
+      (Array.to_list prog.Seed_mir.functions)
+  in
+  if profile then begin
+    let t_total = List.fold_left (fun a (t, _, _) -> a +. t) 0.0 !timings in
+    let sorted = List.sort (fun (a, _, _) (b, _, _) -> compare b a) !timings in
+    let rec top n = function
+      | [] -> []
+      | x :: rest -> if n = 0 then [] else x :: top (n - 1) rest
+    in
+    List.iter
+      (fun (t, nb, name) ->
+        if t >= 0.05 then
+          Printf.eprintf "[cfg-profile]   %7.3fs %4d blocks  %s\n" t nb name)
+      (top 10 sorted);
+    Printf.eprintf "[cfg-profile]   total %.2fs over %d functions (%d findings)\n%!"
+      t_total (List.length !timings) (List.length results)
+  end;
+  results
 
 (* cfg_check_program — the message-only view of the same pass (the
    historical entry point). *)

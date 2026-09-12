@@ -100,7 +100,10 @@ let default_limits =
 type t = {
   program : Seed_mir.program;
   fn_index : (Instance_id.t, int) Hashtbl.t;  (* lookup only; iteration is never semantic *)
-  memory : Vm_memory.t;
+  mutable memory : Vm_memory.t;
+  (* the owning LangItems (the raw-pointer nominal class the typed raw
+     deref dispatches on) *)
+  lang_items : Lang_items.t;
   (* The P1-26 canonical drop-plan table: per concrete TypeId the
      ordered (field/payload path, needs_drop) plan derived ONCE from
      program.types; the destruction sites (do_drop, the assign-overwrite
@@ -427,6 +430,9 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                else recurse (Vm_value.Struct fields)
            | _ -> err_trap vm "downcast on non-enum")
        | Seed_mir.Deref -> (
+           let deref_ty =
+             match pointee_type_of vm base_ty with Some t -> t | None -> next_ty
+           in
            match base with
            | Vm_value.Ref (Vm_value.Place (tf, l, projs)) ->
                (* a real reference: resolve the target place, then
@@ -438,7 +444,7 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                in
                recurse tv
            | Vm_value.Ref (Vm_value.Region ptr) -> recurse (memory_load vm ptr)
-           | Vm_value.RawPtr ptr -> recurse (memory_load vm ptr)
+           | Vm_value.RawPtr ptr -> recurse (memory_load_typed vm ptr deref_ty)
            | _ -> err_trap vm "deref on non-pointer")))
 
 (* The dynamic-index form: the payload is a LOCAL whose value is the
@@ -489,6 +495,55 @@ and memory_store (vm : t) (ptr : Vm_memory.pointer) (v : Vm_value.t) : unit =
       if ptr.Vm_memory.offset < 0 || ptr.Vm_memory.offset > rlen - blen then
         err_trap vm "deref write: out-of-bounds";
       Bytes.blit bytes 0 r.Vm_memory.bytes ptr.Vm_memory.offset blen
+
+(* The pointee type of a raw-pointer/reference static type.  The
+   transparent pointer nominals (Ptr/PtrMut, the raw-pointer LangItem
+   class) and the structural raw-pointer/ref forms all name their
+   pointee in their single type argument. *)
+and pointee_type_of (vm : t) (ty : Type_repr.t) : Type_repr.t option =
+  match ty with
+  | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) -> Some t
+  | Type_repr.Named (id, args)
+    when Lang_items.is_raw_pointer vm.lang_items id && Array.length args = 1 ->
+      Some args.(0)
+  | _ -> None
+
+(* Typed raw deref.  A `Raw` region holds the pointee's machine image:
+   scalar pointees are decoded/encoded from their raw little-endian
+   layout (u8 C buffers, numbers, pointers); a pointee with no flat
+   scalar layout keeps the self-describing serialized image (the same
+   channel the host's ptr_read/ptr_write speak).  A `Serialized` region
+   (a computed-value ref reached through a pointer) always uses the
+   serialized image. *)
+and memory_load_typed (vm : t) (ptr : Vm_memory.pointer) (ty : Type_repr.t) : Vm_value.t =
+  if ptr.Vm_memory.region < 0 then err_trap vm "deref of null pointer";
+  match Vm_memory.kind_of vm.memory ptr with
+  | Error e -> err_trap vm ("deref read: " ^ Vm_memory.mem_error_string e)
+  | Ok Vm_memory.Serialized -> memory_load vm ptr
+  | Ok Vm_memory.Raw -> (
+      match Raw_memory.raw_size ty with
+      | Some n -> (
+          match Vm_memory.load_bytes vm.memory ptr n with
+          | Error e -> err_trap vm ("deref read: " ^ Vm_memory.mem_error_string e)
+          | Ok b -> (
+              match Raw_memory.decode ty b 0 with
+              | Some (v, _) -> v
+              | None -> err_trap vm "deref read: truncated scalar image"))
+      | None -> memory_load vm ptr)
+
+and memory_store_typed (vm : t) (ptr : Vm_memory.pointer) (ty : Type_repr.t)
+    (v : Vm_value.t) : unit =
+  if ptr.Vm_memory.region < 0 then err_trap vm "deref of null pointer";
+  match Vm_memory.kind_of vm.memory ptr with
+  | Error e -> err_trap vm ("deref write: " ^ Vm_memory.mem_error_string e)
+  | Ok Vm_memory.Serialized -> memory_store vm ptr v
+  | Ok Vm_memory.Raw -> (
+      match Raw_memory.encode ty v with
+      | Some b -> (
+          match Vm_memory.store_bytes vm.memory ptr b with
+          | Error e -> err_trap vm ("deref write: " ^ Vm_memory.mem_error_string e)
+          | Ok () -> Host.region_write_hook vm.host ptr b)
+      | None -> memory_store vm ptr v)
 
 (* Write a value into a place (assign). *)
 and write_place (vm : t) (frame : frame) (p : Seed_mir.place) (v : Vm_value.t) : unit =
@@ -601,26 +656,30 @@ and update_place (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
           | _ -> err_trap vm "index write on non-array")
       | Seed_mir.Downcast _ -> base
       | Seed_mir.Deref -> (
-          match base with
-          | Vm_value.Ref (Vm_value.Place (tf, l, projs)) ->
-              (* a real reference: write through to the target place; the
-                 remaining projections extend the target path; the ref
-                 value itself is unchanged *)
-              write_place vm tf
-                { Seed_mir.root = Seed_mir.Local l; projections = projs @ rest }
-                v;
-              base
-          | Vm_value.Ref (Vm_value.Region _) ->
-              err_trap vm "write through a region-backed ref (computed-value ref) is a deterministic trap"
-          | Vm_value.RawPtr ptr -> (
-              match rest with
-              | [] -> memory_store vm ptr v
-              | _ ->
-                  (* projected write through the pointee: load, update, store *)
-                  let cur = memory_load vm ptr in
-                  memory_store vm ptr (update_place vm frame cur next_ty rest v));
-              base
-          | _ -> err_trap vm "deref write on non-pointer"))
+           let deref_ty =
+             match pointee_type_of vm base_ty with Some t -> t | None -> next_ty
+           in
+           match base with
+           | Vm_value.Ref (Vm_value.Place (tf, l, projs)) ->
+               (* a real reference: write through to the target place; the
+                  remaining projections extend the target path; the ref
+                  value itself is unchanged *)
+               write_place vm tf
+                 { Seed_mir.root = Seed_mir.Local l; projections = projs @ rest }
+                 v;
+               base
+           | Vm_value.Ref (Vm_value.Region _) ->
+               err_trap vm "write through a region-backed ref (computed-value ref) is a deterministic trap"
+           | Vm_value.RawPtr ptr -> (
+               match rest with
+               | [] -> memory_store_typed vm ptr deref_ty v
+               | _ ->
+                   (* projected write through the pointee: load, update, store *)
+                   let cur = memory_load_typed vm ptr deref_ty in
+                   memory_store_typed vm ptr deref_ty
+                     (update_place vm frame cur next_ty rest v));
+               base
+           | _ -> err_trap vm "deref write on non-pointer"))
 
 (* Replace the byte at index i with the char's UTF-8 encoding (the byte
    index is the seed String convention — see the header).  The char's
@@ -922,6 +981,19 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
        | Seed_mir.StructCtor _ -> Vm_value.Struct vals
        | Seed_mir.EnumCtor (_, vid) -> Vm_value.Enum (Ids.Variant_index.to_int vid, vals)
        | Seed_mir.ClosureAgg inst -> Vm_value.Closure (inst, vals))
+  | Seed_mir.BinaryOp ((Seed_mir.And | Seed_mir.Or) as op, l, r) -> (
+      (* `&&`/`||` SHORT-CIRCUIT: the direct kernel's codegen branches
+         past the RHS when the LHS settles the result, so the RHS (which
+         may be a call — `len() > 0 && char_at(0) == '-'`) is never
+         evaluated in that case. *)
+      match eval_operand vm frame l with
+      | Vm_value.Bool false when op = Seed_mir.And -> Vm_value.Bool false
+      | Vm_value.Bool true when op = Seed_mir.Or -> Vm_value.Bool true
+      | Vm_value.Bool _ -> (
+          match eval_operand vm frame r with
+          | Vm_value.Bool b -> Vm_value.Bool b
+          | _ -> err_trap vm "invalid bool binary op")
+      | _ -> err_trap vm "invalid bool binary op")
   | Seed_mir.BinaryOp (op, l, r) ->
       let lv = eval_operand vm frame l in
       let rv = eval_operand vm frame r in
@@ -958,11 +1030,20 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
             | Seed_mir.Gt -> Vm_value.Bool (fa > fb)
             | Seed_mir.Ge -> Vm_value.Bool (fa >= fb)
             | _ -> err_trap vm "invalid float binary op")
+        | Vm_value.Char a, Vm_value.Char b -> (
+            let ca = Uchar.to_int a and cb = Uchar.to_int b in
+            match op with
+            | Seed_mir.Eq -> Vm_value.Bool (ca = cb)
+            | Seed_mir.Ne -> Vm_value.Bool (ca <> cb)
+            | Seed_mir.Lt -> Vm_value.Bool (ca < cb)
+            | Seed_mir.Le -> Vm_value.Bool (ca <= cb)
+            | Seed_mir.Gt -> Vm_value.Bool (ca > cb)
+            | Seed_mir.Ge -> Vm_value.Bool (ca >= cb)
+            | _ -> err_trap vm "invalid char binary op")
         | ( Vm_value.Enum _, Vm_value.Enum _
           | Vm_value.Tuple _, Vm_value.Tuple _
           | Vm_value.Struct _, Vm_value.Struct _
           | Vm_value.Array _, Vm_value.Array _
-          | Vm_value.Char _, Vm_value.Char _
           | Vm_value.Float32 _, Vm_value.Float32 _ ) -> (
             (* aggregate/scalar equality beyond the int/bool/string
                primitives — the checker's fundamental equality accepts
@@ -1000,6 +1081,21 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
           | Vm_value.Int i -> Vm_value.Int (int_cast i kind)
           | Vm_value.Float64 f -> Vm_value.Int (Int_value.of_int64 ~width:(int_width kind) ~signed:(int_signed kind) (Int64.of_float (Int64.float_of_bits f)))
           | Vm_value.Bool b -> Vm_value.Int (Int_value.of_int64 ~width:(int_width kind) ~signed:(int_signed kind) (if b then 1L else 0L))
+          | Vm_value.Char c ->
+              Vm_value.Int
+                (Int_value.of_int64 ~width:(int_width kind) ~signed:(int_signed kind)
+                   (Int64.of_int (Uchar.to_int c)))
+          | Vm_value.RawPtr p ->
+              (* `p as Int`: the machine address through the one address
+                 codec every pointer/Int crossing uses (pointer_to_int64)
+                 — pointer arithmetic in Int space then composes with the
+                 Int->Ptr decode *)
+              Vm_value.Int
+                (Int_value.of_int64 ~width:(int_width kind) ~signed:(int_signed kind)
+                   (Vm_memory.pointer_to_int64 p))
+          | Vm_value.Null ->
+              Vm_value.Int
+                (Int_value.of_int64 ~width:(int_width kind) ~signed:(int_signed kind) 0L)
           | _ -> err_trap vm "invalid cast to int")
       | Type_repr.Float Type_repr.F64 -> (
           match vv with
@@ -1023,8 +1119,9 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
           | Vm_value.Int i ->
               if i.Int_value.width > 64 then
                 err_trap vm "128-bit value cast to a pointer (not representable in the seed)"
-              else Vm_value.RawPtr { Vm_memory.region = Int64.to_int (Int_value.to_int64 i); offset = 0 }
+              else Vm_value.RawPtr (Vm_memory.pointer_of_int64 (Int_value.to_int64 i))
           | Vm_value.RawPtr _ -> vv
+          | Vm_value.Null -> Vm_value.Null
           | _ -> err_trap vm "invalid cast to pointer")
       | Type_repr.Unit -> Vm_value.Unit
       | Type_repr.Bool -> (
@@ -1526,6 +1623,7 @@ let entry_frame_of_li ~(lang_items : Lang_items.t) ~(program : Seed_mir.program)
              program;
              fn_index;
              memory = Vm_memory.create ();
+             lang_items;
              drop_plans = Drop_plan.of_program ~lang_items program;
              host = Host.create ~repo_root:"." ~argv:[||];
              limits = default_limits;
@@ -1572,6 +1670,11 @@ let run_li ~(lang_items : Lang_items.t) ~(program : Seed_mir.program)
   | Error m -> Error { kind = Trap "entry instance not found"; message = m; trace = [] }
   | Ok (vm, entry_frame) ->
       vm.host <- host;
+      (* ONE arena: the VM dereferences through the host's region table,
+         so host-materialized pointers (as_ptr views, mem_alloc blocks,
+         libc buffers) and VM-created computed refs share the address
+         space. *)
+      vm.memory <- host.Host.memory;
       (try
          run_frame vm entry_frame;
          Ok 0

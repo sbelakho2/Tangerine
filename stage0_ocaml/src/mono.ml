@@ -163,6 +163,39 @@ let rec scan_type (generic_types : generic_def array)
   | Int_literal _ | Error | Never ->
       ()
 
+(* ── Bodyless-dispatch injection ────────────────────────────────────
+   The mono analogue of the tg `inject_map_dispatch_calls` /
+   `apply_dispatch_injection` two-wave pattern: after the first drain
+   every call's type arguments are CONCRETE (including formerly
+   Param-carrying calls in specialized generic bodies), so a bodyless
+   User callee whose SEMANTIC resolution depends on the receiver type
+   can be re-dispatched to its concrete emitted body.  The driver owns
+   the resolution authority (the checker's registered method / derived
+   tables) and supplies it as this callback; mono owns the rewrite and
+   the re-drain, so the injected callee instances are specialized by
+   the SAME work queue that produced the receiver's body.
+
+   The resolver answers for ONE bodyless call:
+   - Bl_keep      — not handled here (left for another class's fix);
+   - Bl_identity  — the operation IS the receiver value (a Copy clone):
+                    the call rewrites to an assignment of the argument
+                    to the destination;
+   - Bl_callee c  — rewrite the callee to the concrete emitted body;
+   - Bl_error m   — fail closed with the precise reason. *)
+type bodyless_action =
+  | Bl_keep
+  | Bl_identity
+  | Bl_callee of callee
+  | Bl_error of string
+
+type bodyless_context = {
+  bc_instance : Instance_id.t;   (* the bodyless User callee instance *)
+  bc_args : call_arg array;      (* the call's arguments (receiver first) *)
+  bc_locals : Type_repr.t array; (* the CALLING body's local types *)
+}
+
+type bodyless_resolver = bodyless_context -> bodyless_action
+
 let find_template (prog : program) (inst : Instance_id.t) : function_ option =
   let found = ref None in
   Array.iter
@@ -375,6 +408,7 @@ let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
     ?(canonical : Canonical_type_instance.t option = None)
     ?(on_type_instance : type_instance -> unit = fun _ -> ())
     ?(registered_only : (Ids.Callable_id.t -> int option) = fun _ -> None)
+    ?(resolve_bodyless : bodyless_resolver = fun _ -> Bl_keep)
     (prog : program) : (function_ array, string list) result =
   let errors = ref [] in
   let err msg = errors := msg :: !errors in
@@ -561,17 +595,95 @@ let build ~(entry : Instance_id.t) ?(generic_types : generic_def array = [||])
      seen-set and cache hold post-substitution instances).  An arity
      disagreement is an internal error reported through the errors list;
      the mismatched work item is skipped (it cannot produce a body). *)
-  while not (Queue.is_empty queue) do
-    let wi = Queue.pop queue in
-    match substitution wi.fn wi.instance with
-    | Error m -> err m
-    | Ok subst ->
-        let body = specialize_under subst wi.fn wi.instance in
-        Hashtbl.replace cache wi.instance body;
-        cache_order := body :: !cache_order;
-        walk_instances body (fun inst -> enqueue_instance (subst_instance subst inst));
-        scan_body_types body
-  done;
+  let drain () =
+    while not (Queue.is_empty queue) do
+      let wi = Queue.pop queue in
+      match substitution wi.fn wi.instance with
+      | Error m -> err m
+      | Ok subst ->
+          let body = specialize_under subst wi.fn wi.instance in
+          Hashtbl.replace cache wi.instance body;
+          cache_order := body :: !cache_order;
+          walk_instances body (fun inst -> enqueue_instance (subst_instance subst inst));
+          scan_body_types body
+    done
+  in
+  drain ();
+  (* ── phase 2b: the bodyless-dispatch injection wave ──────────────
+     After the first drain every call's type arguments are concrete, so
+     the driver's resolver can re-dispatch a bodyless User callee to its
+     concrete emitted body.  Each call SITE is visited at most once (the
+     `injected` set); a rewritten body is re-walked so the injected
+     callee instances are specialized by the same queue, and the wave
+     repeats until no site rewrites and the queue drains — exactly the
+     tg mono's inject_map_dispatch_calls -> re-seed -> drain shape. *)
+  let injected : ((Instance_id.t * int), unit) Hashtbl.t = Hashtbl.create 256 in
+  let rewrite_body (body : function_) : bool =
+    let changed = ref false in
+    let blocks =
+      Array.map
+        (fun (b : block) ->
+          match b.terminator with
+          | Call (dest, User inst, args, next, unwind)
+            when not (Hashtbl.mem cache inst)
+                 && not (Hashtbl.mem injected (body.instance, b.id)) ->
+              Hashtbl.add injected (body.instance, b.id) ();
+              let ctx =
+                { bc_instance = inst; bc_args = args; bc_locals = body.locals }
+              in
+              (match resolve_bodyless ctx with
+               | Bl_keep -> b
+               | Bl_error m -> err m; b
+               | Bl_identity -> (
+                   match args with
+                   | [| a |] ->
+                       changed := true;
+                       {
+                         b with
+                         statements = b.statements @ [ Assign (dest, Use a.value) ];
+                         terminator = Goto next;
+                       }
+                   | _ ->
+                       err
+                         (Printf.sprintf
+                            "mono: Copy-identity clone injection for %s expects exactly the receiver argument"
+                            (Seed_mir.print_instance inst));
+                       b)
+               | Bl_callee c ->
+                   changed := true;
+                   (match callee_instance c with
+                    | Some ci -> enqueue_instance ci
+                    | None -> ());
+                   {
+                     b with
+                     terminator = Call (dest, c, args, next, unwind);
+                   })
+          | _ -> b)
+        body.blocks
+    in
+    if !changed then begin
+      let body' = { body with blocks } in
+      Hashtbl.replace cache body.instance body';
+      cache_order :=
+        List.map
+          (fun (x : function_) ->
+            if Instance_id.compare x.instance body.instance = 0 then body' else x)
+          !cache_order;
+      walk_instances body' enqueue_instance;
+      scan_body_types body'
+    end;
+    !changed
+  in
+  let rec injection_rounds () =
+    let changed = ref false in
+    List.iter
+      (fun (b : function_) -> if rewrite_body b then changed := true)
+      (List.rev !cache_order);
+    let had_queued = not (Queue.is_empty queue) in
+    drain ();
+    if !changed || had_queued then injection_rounds ()
+  in
+  injection_rounds ();
   (* final validation: every embedded instance is concrete and
      specialized; every body is concrete; the output is self-contained *)
   let concrete (inst : Instance_id.t) =

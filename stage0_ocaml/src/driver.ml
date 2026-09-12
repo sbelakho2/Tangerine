@@ -2166,6 +2166,7 @@ let run_closure_pipeline ~(repo_root : string) ~(manifest_path : string)
    with their types; initializers arrive with the typed-expression
    channel (the subset firewall rejects const uses until then). *)
 let lower_closure (ctx : closure_ctx) : Seed_mir.program =
+  let lc_t0 = Unix.gettimeofday () in
   let all_items =
     List.concat_map (fun node -> node.Module_graph.node_items) ctx.ctx_graph.Module_graph.nodes
   in
@@ -2415,15 +2416,37 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
      agree, the verifier checks a real body, and no body-less derived
      User call can reach the VM. *)
   let seen_derived = Hashtbl.create 256 in
-  List.iter
-    (fun ((callable, ts) : Ids.Callable_id.t * Typecheck.typed_signature) ->
-      if not (Hashtbl.mem seen_derived callable) then begin
-        Hashtbl.add seen_derived callable ();
-        let f = Mir_derive.synthesize ctx.ctx_env ts in
-        admit f (prov_of ts ts.Typecheck.ts_name DerivedFn ts.Typecheck.ts_span f);
-        note f (Printf.sprintf "derived op %s" ts.Typecheck.ts_name)
-      end)
-    ctx.ctx_env.Typecheck.state.derived_sigs;
+  (* the derived-body cache is scoped to THIS closure: Type_ids are only
+     stable inside one typecheck env, so a new closure starts empty *)
+  Mir_derive.reset_derived_state ();
+  (* A recursive to_string rendering cuts the cycle by calling the
+     repeated type's own derived to_string; those auxiliary signatures
+     are minted during synthesis (Mir_derive's pending queue) and MUST
+     get real bodies here, so the worklist drains it after every
+     synthesized body instead of walking one frozen snapshot. *)
+  let derived_queue =
+    ref (List.rev ctx.ctx_env.Typecheck.state.derived_sigs)
+  in
+  let rec drain_derived () =
+    match !derived_queue with
+    | [] -> ()
+    | (callable, ts) :: rest ->
+        derived_queue := rest;
+        if not (Hashtbl.mem seen_derived callable) then begin
+          Hashtbl.add seen_derived callable ();
+          let f = Mir_derive.synthesize ctx.ctx_env ts in
+          admit f (prov_of ts ts.Typecheck.ts_name DerivedFn ts.Typecheck.ts_span f);
+          note f (Printf.sprintf "derived op %s" ts.Typecheck.ts_name);
+          derived_queue :=
+            List.rev_append (Mir_derive.take_pending_derived ()) !derived_queue
+        end;
+        drain_derived ()
+  in
+  let derived_t0 = Unix.gettimeofday () in
+  drain_derived ();
+  if Mir_derive.derive_debug then
+    Printf.eprintf "[derive-dbg] derived phase: %.2fs\n"
+      (Unix.gettimeofday () -. derived_t0);
   ctx.lowered_methods <- !lowered_methods;
   (* audit P0-6 report: the map holds every emitted instance exactly
      once, the same-declaration-twice list the discipline allowed, and
@@ -2455,11 +2478,17 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
         else Hashtbl.add seen k ())
       ctx.ctx_env.Typecheck.methods
   end;
-  {
-    Seed_mir.functions = Array.of_list functions;
-    statics = closure_statics ctx.ctx_env all_items;
-    types = closure_types ctx.ctx_env;
-  }
+  let prog =
+    {
+      Seed_mir.functions = Array.of_list functions;
+      statics = closure_statics ctx.ctx_env all_items;
+      types = closure_types ctx.ctx_env;
+    }
+  in
+  if Mir_derive.derive_debug then
+    Printf.eprintf "[derive-dbg] lower_closure total: %.2fs\n"
+      (Unix.gettimeofday () -. lc_t0);
+  prog
 
 (* MIR-side counts for the completeness oracle: calls, callable#0 uses,
    enum variant operations (EnumCtor aggregates, SetDiscriminant,
@@ -3240,6 +3269,11 @@ type mono_outcome = {
      same registry against the same canonical generic-instance ids *)
   mo_query_sigs : Mir_verify.query_sig list;
   mo_post_rewrite : Type_repr.t -> Type_repr.t;
+  (* the shared canonical cache's logical-identity predicate (see
+     Mir_verify.ctx.same_canonical_instance): consumers that re-verify
+     mo_program use the SAME cache to reconcile transparent-wrapper
+     flavors of one instance *)
+  mo_same_canonical_instance : Ids.Type_id.t -> Ids.Type_id.t -> bool;
   mo_box_instances : Ids.Type_id.t list;
 }
 
@@ -4014,11 +4048,313 @@ let assert_no_bodyless_user_calls (prog : Seed_mir.program) : string list =
    classified it at check time), so no post-mono host-channel rewrite
    runs; assert_no_bodyless_user_calls fails the phase on any User
    callee without an emitted body. *)
+(* ── Mono bodyless-dispatch resolution (the injection's authority) ──
+   The mono phase keeps a User callee with no lowered template only when
+   the callable is registered-only, but several registered-only classes
+   are NOT legitimately bodyless: the trait CONTRACTS (`Clone::clone`,
+   `Display::fmt`) resolved on a generic receiver at check time, and the
+   builtin method sigs whose receivers turn out concrete after
+   specialization.  This resolver is the driver-side semantic authority
+   the mono injection calls for each such call (the checker's registered
+   method tables, its derived-contract registry and its copy authority):
+   - a bodyless `Clone::clone(recv)` re-dispatches to the receiver's
+     registered Clone method (explicit impl), to the checker's derived
+     Clone body, or rewrites to the value identity for a Copy receiver;
+   - a bodyless `Display::fmt(recv)` re-dispatches to the registered
+     `(recv, fmt)` impl, the registered `to_string`, or the derived
+     to_string body;
+   - a bodyless call whose instance still carries an INFERENCE-ONLY
+     Int_literal argument (`inst{callable#N; [int-literal]}`) is
+     re-dispatched through the CONCRETE adopter — the receiver's MIR
+     type — to the same-named registered method that has a real emitted
+     body (the owner-alias convention).
+   Receivers whose concrete Clone/to_string body does not exist yet are
+   recorded for the mint pass (the driver synthesizes the derived body
+   and re-runs the build); genuinely unresolved receivers fail closed
+   through Mono.Bl_error with the precise reason. *)
+let mono_bodyless_resolver (env : Typecheck.env) (prog : Seed_mir.program)
+    ~(needs_clone : (Type_repr.t * string) list ref)
+    ~(needs_to_string : (Type_repr.t * string) list ref) : Mono.bodyless_resolver =
+  let li = Typecheck.lang_items_of_env env in
+  let contract (key : string * string) : Ids.Callable_id.t option =
+    match List.assoc_opt key env.Typecheck.methods with
+    | Some ts -> Some ts.Typecheck.ts_callable
+    | None -> None
+  in
+  let clone_contract = contract ("Clone", "clone") in
+  let fmt_contract = contract ("Display", "fmt") in
+  let has_template (c : Ids.Callable_id.t) : bool =
+    Array.exists
+      (fun (f : Seed_mir.function_) ->
+        Ids.Callable_id.compare (Instance_id.callable f.Seed_mir.instance) c = 0)
+      prog.Seed_mir.functions
+  in
+  let derived_sig_of (op : string) (ty : Type_repr.t) :
+      Typecheck.typed_signature option =
+    let suffix = "::" ^ op in
+    List.find_opt
+      (fun (_, (ts : Typecheck.typed_signature)) ->
+        Array.length ts.Typecheck.ts_params = 1
+        && Type_repr.compare ts.Typecheck.ts_params.(0).Type_repr.pt_type ty = 0
+        && Util.has_suffix ts.Typecheck.ts_name suffix)
+      env.Typecheck.state.Typecheck.derived_sigs
+    |> Option.map snd
+  in
+  let instance_args_of (ts : Typecheck.typed_signature)
+      (subst : (Type_repr.generic_key * Type_repr.t) list) : Type_repr.t array =
+    Array.of_list
+      (List.map
+         (fun (_, pid) ->
+           match List.assoc_opt (Type_repr.KParam pid) subst with
+           | Some t -> Typecheck.substitute_fixpoint subst t
+           | None -> Type_repr.Type_param pid)
+         ts.Typecheck.ts_params_decl)
+  in
+  let derived_args (ts : Typecheck.typed_signature) : Type_repr.t array =
+    Array.of_list
+      (List.map (fun (_, pid) -> Type_repr.Type_param pid) ts.Typecheck.ts_params_decl)
+  in
+  let owner_candidates (ty : Type_repr.t) : string list =
+    match ty with
+    | Type_repr.Named _ | Type_repr.String | Type_repr.Fixed_array _ ->
+        Typecheck.type_owner_candidates env ty
+    | _ -> (
+        match Typecheck.primitive_name ty with
+        | Some n -> Typecheck.callee_owner_aliases n
+        | None -> [])
+  in
+  (* The first registered (owner, mname) entry under the owner-alias
+     convention whose receiver unifies with `ty` AND whose callable has
+     a lowered body in the program (a bodyless alias entry — a builtin
+     sig shadowing the source impl — is skipped, so the resolution lands
+     on the real method under the aliased owner). *)
+  let registered_method_with_body (ty : Type_repr.t) (mname : string) :
+      (string * Typecheck.typed_signature * (Type_repr.generic_key * Type_repr.t) list)
+      option =
+    let rec go = function
+      | [] -> None
+      | o :: rest -> (
+          match Typecheck.method_of_key env o mname with
+          | Some ts
+            when Array.length ts.Typecheck.ts_params >= 1
+                 && has_template ts.Typecheck.ts_callable -> (
+              match
+                Trait_solver.unify_target []
+                  ts.Typecheck.ts_params.(0).Type_repr.pt_type ty
+              with
+              | Some subst -> Some (o, ts, subst)
+              | None -> go rest)
+          | _ -> go rest)
+    in
+    go (owner_candidates ty)
+  in
+  let receiver_type (ctx : Mono.bodyless_context) : Type_repr.t option =
+    let args = Instance_id.type_args ctx.Mono.bc_instance in
+    let literal_like = function
+      | Type_repr.Int_literal _ | Type_repr.Infer_var _ | Type_repr.Error -> true
+      | _ -> false
+    in
+    let from_operand () =
+      if Array.length ctx.Mono.bc_args = 0 then None
+      else
+        let place =
+          match ctx.Mono.bc_args.(0).Seed_mir.value with
+          | Seed_mir.Copy p | Seed_mir.Move p | Seed_mir.Read p
+          | Seed_mir.Consume p ->
+              Some p
+          | Seed_mir.Constant _ -> None
+        in
+        match place with
+        | Some { Seed_mir.root = Seed_mir.Local i; _ }
+          when i >= 0 && i < Array.length ctx.Mono.bc_locals ->
+            Some ctx.Mono.bc_locals.(i)
+        | _ -> None
+    in
+    (* The instance's Self argument is the receiver spelling, but an
+       inference-only spelling (an unresolved literal/inference variable)
+       is not a concrete adopter: prefer the ACTUAL receiver operand's
+       local type, which the lowering solved to the concrete kind (the
+       `Vec[Int]` of a `Vec::is_empty[int-literal]` call). *)
+    if
+      Array.length args >= 1
+      && not (Type_repr.has_type_param args.(0))
+      && not (literal_like args.(0))
+    then Some args.(0)
+    else (
+      match from_operand () with
+      | Some t -> Some t
+      | None -> if Array.length args >= 1 then Some args.(0) else None)
+  in
+  let label_of (ty : Type_repr.t) : string =
+    match ty with
+    | Type_repr.Named (tid, _) -> (
+        match Typecheck.first_name_of_tid env tid with
+        | Some n -> n
+        | None -> Typecheck.display_type_name env ty)
+    | _ -> Typecheck.display_type_name env ty
+  in
+  (* The receiver operand is a deref-passed VISIT ref (`&K` from the
+     record-visit surface): the Copy-identity injection (`Bl_identity`,
+     the operation IS the receiver value) is valid only when the
+     argument value's type equals the receiver type — a bare `&K`
+     argument must keep the CLONE CALL, whose declared parameter is K
+     and whose call boundary applies the deref-first rule
+     (Mir_verify.deref_arg_ok) exactly like every other `key_ref.clone()`
+     call site.  Injecting the identity would emit `dest = read ref`
+     (an `&K` value into a K place) — the ref-ABI shape the verifier
+     rejects. *)
+  let receiver_operand_is_ref (ctx : Mono.bodyless_context) : bool =
+    if Array.length ctx.Mono.bc_args = 0 then false
+    else
+      let place =
+        match ctx.Mono.bc_args.(0).Seed_mir.value with
+        | Seed_mir.Copy p | Seed_mir.Move p | Seed_mir.Read p
+        | Seed_mir.Consume p ->
+            Some p
+        | Seed_mir.Constant _ -> None
+      in
+      match place with
+      | Some { Seed_mir.root = Seed_mir.Local i; projections = []; _ }
+        when i >= 0 && i < Array.length ctx.Mono.bc_locals -> (
+          match ctx.Mono.bc_locals.(i) with
+          | Type_repr.Ref_internal _ -> true
+          | _ -> false)
+      | _ -> false
+  in
+  fun (ctx : Mono.bodyless_context) ->
+    let c = Instance_id.callable ctx.Mono.bc_instance in
+    let recv_error what =
+      Mono.Bl_error
+        (Printf.sprintf
+           "mono: bodyless %s (%s): cannot determine the concrete receiver type (no instance type argument and no place-shaped receiver argument)"
+           what (Seed_mir.print_instance ctx.Mono.bc_instance))
+    in
+    let residual what ty =
+      Mono.Bl_error
+        (Printf.sprintf
+           "mono: bodyless %s on receiver `%s`, which still carries an unresolved type parameter after specialization"
+           what (Typecheck.display_type_name env ty))
+    in
+    match (clone_contract, fmt_contract) with
+    | Some cc, _ when Ids.Callable_id.compare c cc = 0 -> (
+        match receiver_type ctx with
+        | None -> recv_error "Clone::clone"
+        | Some ty ->
+            if Type_repr.has_type_param ty then residual "Clone::clone" ty
+            else if
+              Typecheck.tc_is_copy env li ty && not (receiver_operand_is_ref ctx)
+            then Mono.Bl_identity
+            else (
+              match registered_method_with_body ty "clone" with
+              | Some (_, ts, subst) ->
+                  Mono.Bl_callee
+                    (Seed_mir.User
+                       (Instance_id.make ~callable:ts.Typecheck.ts_callable
+                          ~type_args:(instance_args_of ts subst)))
+              | None -> (
+                  match derived_sig_of "clone" ty with
+                  | Some ts ->
+                      Mono.Bl_callee
+                        (Seed_mir.Derived
+                           (ts.Typecheck.ts_callable, derived_args ts))
+                  | None ->
+                      if
+                        not
+                          (List.exists
+                             (fun (t, _) -> Type_repr.compare t ty = 0)
+                             !needs_clone)
+                      then needs_clone := (ty, label_of ty) :: !needs_clone;
+                      Mono.Bl_keep)))
+    | _, Some fc when Ids.Callable_id.compare c fc = 0 -> (
+        match receiver_type ctx with
+        | None -> recv_error "Display::fmt"
+        | Some ty ->
+            if Type_repr.has_type_param ty then residual "Display::fmt" ty
+            else (
+              match registered_method_with_body ty "fmt" with
+              | Some (_, ts, subst) ->
+                  Mono.Bl_callee
+                    (Seed_mir.User
+                       (Instance_id.make ~callable:ts.Typecheck.ts_callable
+                          ~type_args:(instance_args_of ts subst)))
+              | None -> (
+                  match derived_sig_of "to_string" ty with
+                  | Some ts ->
+                      Mono.Bl_callee
+                        (Seed_mir.Derived
+                           (ts.Typecheck.ts_callable, derived_args ts))
+                  | None -> (
+                      match registered_method_with_body ty "to_string" with
+                      | Some (_, ts, subst) ->
+                          Mono.Bl_callee
+                            (Seed_mir.User
+                               (Instance_id.make ~callable:ts.Typecheck.ts_callable
+                                  ~type_args:(instance_args_of ts subst)))
+                      | None ->
+                          if
+                            not
+                              (List.exists
+                                 (fun (t, _) -> Type_repr.compare t ty = 0)
+                                 !needs_to_string)
+                          then
+                            needs_to_string := (ty, label_of ty) :: !needs_to_string;
+                          Mono.Bl_keep))))
+    | _ ->
+        (* The inference-only literal adoption: an instance argument that
+           is still `Int_literal` never got a concrete kind from the
+           checker's journal.  The concrete adopter is the call's ACTUAL
+           receiver type (the MIR operand's local type); the same-named
+           registered method that owns a real emitted body is the
+           concrete dispatch target, and its declared binders instantiate
+           from the receiver — so the instance reaches mono concrete and
+           the call reaches the body the source implementation lowered. *)
+        let iargs = Instance_id.type_args ctx.Mono.bc_instance in
+        let has_literal =
+          Array.exists
+            (function Type_repr.Int_literal _ -> true | _ -> false)
+            iargs
+        in
+        if not has_literal then Mono.Bl_keep
+        else
+          let method_name =
+            List.find_map
+              (fun ((_, m), (ts : Typecheck.typed_signature)) ->
+                if Ids.Callable_id.compare ts.Typecheck.ts_callable c = 0 then
+                  Some m
+                else None)
+              env.Typecheck.methods
+          in
+          match method_name, receiver_type ctx with
+          | Some mname, Some rt when not (Type_repr.has_type_param rt) -> (
+              match registered_method_with_body rt mname with
+              | Some (_, ts, subst) ->
+                  Mono.Bl_callee
+                    (Seed_mir.User
+                       (Instance_id.make ~callable:ts.Typecheck.ts_callable
+                          ~type_args:(instance_args_of ts subst)))
+              | None ->
+                  Mono.Bl_error
+                    (Printf.sprintf
+                       "mono: bodyless %s with inference-only literal instance argument(s): no registered `%s` method with a lowered body on the concrete receiver `%s`"
+                       (Seed_mir.print_instance ctx.Mono.bc_instance) mname
+                       (Typecheck.display_type_name env rt)))
+          | Some mname, _ ->
+              Mono.Bl_error
+                (Printf.sprintf
+                   "mono: bodyless %s with inference-only literal instance argument(s): cannot determine the concrete adopter for `%s`"
+                   (Seed_mir.print_instance ctx.Mono.bc_instance) mname)
+          | None, _ ->
+              Mono.Bl_error
+                (Printf.sprintf
+                   "mono: bodyless %s with inference-only literal instance argument(s): the callable has no registered (owner, method) entry to re-dispatch"
+                   (Seed_mir.print_instance ctx.Mono.bc_instance))
+
 let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
     ?(generic_types : Mono.generic_def array = [||])
     ?(box_tid : Ids.Type_id.t option = None)
     ?(lang_items : Lang_items.t = Lang_items.seed_defaults)
     ?(query_sigs : Mir_verify.query_sig list = [])
+    ?(env : Typecheck.env option = None)
     (prog : Seed_mir.program) : (mono_outcome, string list) result =
   Printf.printf "  mono: entry '%s' (%s)\n" entry_name (Seed_mir.print_instance entry);
   let type_instances = ref [] in
@@ -4026,34 +4362,192 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
      mono queue, the materializer and the post-mono concrete verifier.
      Its mint starts above the largest TypeId the program can see, so a
      canonical specialized id can never alias an existing identity; the
-     ids are minted in first-discovery order (deterministic). *)
+     ids are minted in first-discovery order (deterministic).  The
+     checker's transparent Box nominal is the cache's transparent
+     wrapper: Box[T] denotes T (its unify erases the wrapper in both
+     directions), so `Option[Box[Expr]]` and `Option[Expr]` intern under
+     ONE canonical specialized id and the mention rewrite is idempotent
+     through the verifier's registered-sig post_rewrite. *)
   let canonical =
     Canonical_type_instance.create
       ~mint_from:(program_max_type_id ~generic_types prog + 1)
+      ~transparent:(fun tid ->
+        match box_tid with
+        | Some b -> Ids.Type_id.compare b tid = 0
+        | None -> false)
       ()
   in
   (* the body-less callable surface: callable -> declared-parameter
      count (the registry's qs_decl carries the declaration-order
      binders) *)
-  let registered_only (c : Ids.Callable_id.t) : int option =
-    List.find_opt
-      (fun (q : Mir_verify.query_sig) ->
-        Ids.Callable_id.compare q.Mir_verify.qs_callable c = 0)
-      query_sigs
-    |> Option.map (fun q -> Array.length q.Mir_verify.qs_decl)
+  let query_sig_of (ts : Typecheck.typed_signature) : Mir_verify.query_sig =
+    {
+      Mir_verify.qs_callable = ts.Typecheck.ts_callable;
+      qs_decl =
+        Array.of_list
+          (List.map (fun (_, pid) -> Type_repr.Type_param pid)
+             ts.Typecheck.ts_params_decl);
+      qs_params = ts.Typecheck.ts_params;
+      qs_ret = ts.Typecheck.ts_return;
+    }
   in
-  match
-    Mono.build ~entry ~generic_types ~registered_only ~canonical:(Some canonical)
-      ~on_type_instance:(fun ti -> type_instances := ti :: !type_instances)
-      prog
-  with
+  (* ── the bodyless-dispatch injection loop (the tg mono's
+     inject_map_dispatch_calls -> re-seed -> drain shape) ──────────
+     The first build runs with the driver's resolver; when the resolver
+     records receivers whose concrete Clone/to_string body does not
+     exist yet, the derived signature is minted through the checker's
+     obligation authority, its real body is synthesized, and the build
+     re-runs over the extended program (the minted templates are
+     specialized by the same work queue).  Rounds are bounded: each
+     round strictly adds derived bodies, and exhaustion fails closed. *)
+  let build_dispatch () =
+    match env with
+    | None ->
+        let registered_only (c : Ids.Callable_id.t) : int option =
+          List.find_opt
+            (fun (q : Mir_verify.query_sig) ->
+              Ids.Callable_id.compare q.Mir_verify.qs_callable c = 0)
+            query_sigs
+          |> Option.map (fun q -> Array.length q.Mir_verify.qs_decl)
+        in
+        (match
+           Mono.build ~entry ~generic_types ~registered_only
+             ~canonical:(Some canonical)
+             ~on_type_instance:(fun ti -> type_instances := ti :: !type_instances)
+             prog
+         with
+         | Error errs -> Error errs
+         | Ok fns -> Ok (fns, prog, query_sigs))
+    | Some env ->
+    let rec attempt (rounds : int) (p : Seed_mir.program)
+        (qs : Mir_verify.query_sig list) :
+        (Seed_mir.function_ array * Seed_mir.program * Mir_verify.query_sig list,
+         string list)
+        result =
+      let needs_clone = ref [] in
+      let needs_to_string = ref [] in
+      let resolver = mono_bodyless_resolver env p ~needs_clone ~needs_to_string in
+      let registered_only (c : Ids.Callable_id.t) : int option =
+        List.find_opt
+          (fun (q : Mir_verify.query_sig) ->
+            Ids.Callable_id.compare q.Mir_verify.qs_callable c = 0)
+          qs
+        |> Option.map (fun q -> Array.length q.Mir_verify.qs_decl)
+      in
+      match
+        Mono.build ~entry ~generic_types ~registered_only
+          ~canonical:(Some canonical) ~resolve_bodyless:resolver
+          ~on_type_instance:(fun ti -> type_instances := ti :: !type_instances)
+          p
+      with
+      | Error errs -> Error errs
+      | Ok fns ->
+          if !needs_clone = [] && !needs_to_string = [] then Ok (fns, p, qs)
+          else if rounds <= 0 then
+            Error
+              [
+                "mono: bodyless-dispatch injection did not converge (derived-body mint rounds exhausted)";
+              ]
+          else begin
+            let errs = ref [] in
+            let added : Seed_mir.function_ list ref = ref [] in
+            let added_c : (Ids.Callable_id.t, unit) Hashtbl.t = Hashtbl.create 64 in
+            let seen_synth : (Ids.Callable_id.t, unit) Hashtbl.t =
+              Hashtbl.create 64
+            in
+            (* Synthesize the recorded derived bodies and, transitively, the
+               component bodies their synthesis mints (Mir_derive's pending
+               queue: a derived Clone whose component has no registered
+               impl mints the component's own derived Clone). *)
+            let rec synth_all
+                (todo : (Ids.Callable_id.t * Typecheck.typed_signature) list) :
+                unit =
+              match todo with
+              | [] -> ()
+              | (c, ts) :: rest ->
+                  if Hashtbl.mem seen_synth c then synth_all rest
+                  else begin
+                    Hashtbl.add seen_synth c ();
+                    (try
+                       let f = Mir_derive.synthesize env ts in
+                       if not (Hashtbl.mem added_c c) then begin
+                         Hashtbl.add added_c c ();
+                         added := f :: !added
+                       end
+                     with e ->
+                       errs :=
+                         Printf.sprintf
+                           "mono: derived-body synthesis failed for `%s`: %s"
+                           ts.Typecheck.ts_name (Printexc.to_string e)
+                         :: !errs);
+                    synth_all
+                      (List.rev_append (Mir_derive.take_pending_derived ()) rest)
+                  end
+            in
+            let minted =
+              List.filter_map
+                (fun (ty, owner) ->
+                  match Mir_derive.mint_derived_clone env owner ty with
+                  | Ok ts -> Some (ts.Typecheck.ts_callable, ts)
+                  | Error m ->
+                      errs :=
+                        Printf.sprintf
+                          "mono: cannot synthesize the derived Clone body for receiver `%s`: %s"
+                          (Typecheck.display_type_name env ty) m
+                        :: !errs;
+                      None)
+                !needs_clone
+              @ List.map
+                  (fun (ty, owner) ->
+                    let ts = Mir_derive.mint_derived_to_string env owner ty in
+                    (ts.Typecheck.ts_callable, ts))
+                  !needs_to_string
+            in
+            synth_all (List.rev_append (Mir_derive.take_pending_derived ()) minted);
+            if !errs <> [] then Error (List.rev !errs)
+            else
+              let p' =
+                {
+                  p with
+                  Seed_mir.functions =
+                    Array.append p.Seed_mir.functions
+                      (Array.of_list (List.rev !added));
+                }
+              in
+              let qs' =
+                List.fold_left
+                  (fun acc (f : Seed_mir.function_) ->
+                    let c = Instance_id.callable f.Seed_mir.instance in
+                    if
+                      List.exists
+                        (fun (q : Mir_verify.query_sig) ->
+                          Ids.Callable_id.compare q.Mir_verify.qs_callable c = 0)
+                        acc
+                    then acc
+                    else
+                      match
+                        List.find_opt
+                          (fun (_, (ts : Typecheck.typed_signature)) ->
+                            Ids.Callable_id.compare ts.Typecheck.ts_callable c = 0)
+                          env.Typecheck.state.Typecheck.derived_sigs
+                      with
+                      | Some (_, ts) -> query_sig_of ts :: acc
+                      | None -> acc)
+                  qs !added
+              in
+              attempt (rounds - 1) p' qs'
+          end
+    in
+    attempt 16 prog query_sigs
+  in
+  match build_dispatch () with
   | Error errs ->
       Printf.printf "  mono: BUILD FAILED\n";
       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
       Error errs
-  | Ok fns ->
-      let mono_prog = { prog with Seed_mir.functions = fns } in
-      let pre = Array.length prog.Seed_mir.functions in
+  | Ok (fns, input_prog, final_query_sigs) ->
+      let mono_prog = { input_prog with Seed_mir.functions = fns } in
+      let pre = Array.length input_prog.Seed_mir.functions in
       let post = Array.length fns in
       let queued = List.rev !type_instances in
       (match
@@ -4117,14 +4611,43 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
                       if Ids.Type_id.compare t bt = 0 then Some ntid else None)
                     mat_map
             in
-            (match
-               Mir_verify.require_valid_concrete ~box_tid ~box_instances ~lang_items
-                 ~post_rewrite:(rewrite_ty canonical) ~query_sigs final_prog
+             (match
+                Mir_verify.require_valid_concrete ~box_tid ~box_instances ~lang_items
+                  ~post_rewrite:(rewrite_ty canonical) ~query_sigs:final_query_sigs
+                  ~same_canonical_instance:
+                    (Canonical_type_instance.same_instance canonical)
+                  final_prog
              with
             | Error errs ->
                 Printf.printf "  MONO_MIR_STRUCTURAL_GATE = FAIL\n";
                 List.iter (fun e -> Printf.printf "    %s\n" e) errs;
+                (if Sys.getenv_opt "TANGERINE_DEBUG_NAMES" <> None then begin
+                   (* the checker's source-level names for the original
+                      template ids (canonical specialized ids are above the
+                      program's id space and appear only in DBG-CANON) *)
+                   List.iter
+                     (fun (tid, name) ->
+                       Printf.printf "DBG-TYPE %d %s\n" (Ids.Type_id.to_int tid) name)
+                     (List.sort
+                        (fun (a, _) (b, _) -> Ids.Type_id.compare a b)
+                        !Typecheck.type_names_global);
+                   (* the ONE canonical materialization map: template tid +
+                      discovered args => canonical specialized id *)
+                   List.iter
+                     (fun (tid, args, ntid) ->
+                       Printf.printf "DBG-CANON type#%d[%s] => type#%d\n"
+                         (Ids.Type_id.to_int tid)
+                         (String.concat ", "
+                            (Array.to_list (Array.map Seed_mir.print_type args)))
+                         (Ids.Type_id.to_int ntid))
+                     mat_map
+                 end);
                 (if Sys.getenv_opt "TANGERINE_DEBUG_MONO_FNS" <> None then
+                   let extra_frags =
+                     match Sys.getenv_opt "TANGERINE_DEBUG_GATE_EXTRA" with
+                     | Some s -> String.split_on_char ',' s
+                     | None -> []
+                   in
                    Array.iter
                      (fun (f : Seed_mir.function_) ->
                        let name = f.Seed_mir.name in
@@ -4139,7 +4662,8 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
                                    else go (i + 1)
                                  in
                                  go 0))
-                           [ "join"; "expand_expr"; "typed_kind_for"; "link_elf64" ]
+                           ([ "join"; "expand_expr"; "typed_kind_for"; "link_elf64" ]
+                           @ extra_frags)
                        then Printf.printf "  --- fn %s ---\n%s\n" name
                          (Seed_mir.print_function f))
                      final_prog.Seed_mir.functions);
@@ -4163,9 +4687,11 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
                      mo_post_instances = post;
                      mo_type_instances = n_type_instances;
                      mo_residual_type_params = residual;
-                     mo_query_sigs = query_sigs;
-                     mo_post_rewrite = rewrite_ty canonical;
-                     mo_box_instances = box_instances }
+                      mo_query_sigs = final_query_sigs;
+                      mo_post_rewrite = rewrite_ty canonical;
+                      mo_same_canonical_instance =
+                        Canonical_type_instance.same_instance canonical;
+                      mo_box_instances = box_instances }
                  end))
 
 let oracle_of_ctx (ctx : closure_ctx) (stats : mir_stats option) : oracle_counts =
@@ -4473,9 +4999,23 @@ let cfg_state_findings (ctx : closure_ctx) : (string * string) list =
   match ctx.ctx_cfg_program with
   | None -> []
   | Some prog ->
-      Resource_check.cfg_check_program_items
-        ~lang_items:(Some (Typecheck.lang_items_of_env ctx.ctx_env))
-        prog
+      if Sys.getenv_opt "TANGERINE_CFG_PROFILE" <> None then
+        Printf.eprintf
+          "[cfg-profile] entering cfg_check_program_items on %d functions\n%!"
+          (Array.length prog.Seed_mir.functions);
+      let t0 = Unix.gettimeofday () in
+      let items =
+        Resource_check.cfg_check_program_items
+          ~lang_items:(Some (Typecheck.lang_items_of_env ctx.ctx_env))
+          prog
+      in
+      if Sys.getenv_opt "TANGERINE_CFG_PROFILE" <> None then
+        Printf.eprintf
+          "[cfg-profile] cfg_check_program_items: %.2fs (%d functions, %d finding(s))\n%!"
+          (Unix.gettimeofday () -. t0)
+          (Array.length prog.Seed_mir.functions)
+          (List.length items);
+      items
 
 let cfg_finding (item, message) : Access_check.finding =
   { Access_check.f_item = item; f_kind = "state-conflict"; f_message = message }
@@ -4773,6 +5313,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                           ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
+                ~env:(Some ctx.ctx_env)
                 prog
             with
             | Error _ ->
@@ -5097,6 +5638,7 @@ let cmd_bootstrap_check (args : string list) : int =
                           ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                        ~generic_types:(closure_generic_types ctx.ctx_env)
                        ~query_sigs:mono_query_sigs
+                       ~env:(Some ctx.ctx_env)
                        prog
                    with
                    | Error _ ->
@@ -5120,13 +5662,14 @@ let cmd_bootstrap_check (args : string list) : int =
                            it does not change the gate's verdicts *)
                          let concrete_ok =
                           match
-                            Mir_verify.require_valid_concrete
-                             ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
-                          ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
-                             ~query_sigs:mo.mo_query_sigs
-                             ~post_rewrite:mo.mo_post_rewrite
-                             ~box_instances:mo.mo_box_instances
-                             mo.mo_program
+                             Mir_verify.require_valid_concrete
+                              ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                           ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
+                              ~query_sigs:mo.mo_query_sigs
+                              ~post_rewrite:mo.mo_post_rewrite
+                              ~same_canonical_instance:mo.mo_same_canonical_instance
+                              ~box_instances:mo.mo_box_instances
+                              mo.mo_program
                          with
                          | Ok () -> true
                          | Error _ -> false
@@ -5301,6 +5844,7 @@ let cmd_compile (args : string list) : int =
                           ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                       ~generic_types:(closure_generic_types ctx.ctx_env)
                       ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
+                      ~env:(Some ctx.ctx_env)
                       prog
                   with
                   | Error _ ->

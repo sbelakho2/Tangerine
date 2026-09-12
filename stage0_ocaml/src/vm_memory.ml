@@ -10,10 +10,23 @@ type pointer = {
   offset : int;
 }
 
+(* The region's byte interpretation:
+   - `Serialized` — the region holds Vm_value.serialize images (the
+     computed-value refs allocated by vm_alloc_scalar; derefers use
+     Vm_value.deserialize);
+   - `Raw` — the region holds raw little-endian storage (host/C byte
+     buffers: string/array as_ptr views, mem_alloc blocks, environment
+     entries).  The VM's raw-pointer deref decodes the pointee's scalar
+     raw layout from these bytes. *)
+type region_kind =
+  | Serialized
+  | Raw
+
 type region = {
   mutable live : bool;
   bytes : Bytes.t;
   alignment : int;
+  kind : region_kind;
 }
 
 type t = {
@@ -45,13 +58,14 @@ let mem_error_string = function
 
 let is_power_of_two (n : int) : bool = n > 0 && n land (n - 1) = 0
 
-let alloc (m : t) (size : int) (alignment : int) : (pointer, mem_error) result =
+let alloc ?(kind = Serialized) (m : t) (size : int) (alignment : int) :
+    (pointer, mem_error) result =
   if size < 0 then Error (NegativeSize size)
   else if not (is_power_of_two alignment) then Error (BadAlignment alignment)
   else begin
     let region_id = m.next_region in
     m.next_region <- m.next_region + 1;
-    let region = { live = true; bytes = Bytes.make size '\000'; alignment } in
+    let region = { live = true; bytes = Bytes.make size '\000'; alignment; kind } in
     m.regions <- Array.append m.regions [| region |];
     Ok { region = region_id; offset = 0 }
   end
@@ -79,6 +93,9 @@ let region_of (m : t) (p : pointer) : (region, mem_error) result =
     let r = m.regions.(p.region) in
     if not r.live then Error (DeadRegion p) else Ok r
 
+let kind_of (m : t) (p : pointer) : (region_kind, mem_error) result =
+  match region_of m p with Error e -> Error e | Ok r -> Ok r.kind
+
 let check_bounds (r : region) (p : pointer) (size : int) (alignment : int) :
     (unit, mem_error) result =
   if size < 0 then Error (Overflow "negative size")
@@ -87,6 +104,33 @@ let check_bounds (r : region) (p : pointer) (size : int) (alignment : int) :
   else if alignment > 1 && p.offset mod alignment <> 0 then
     Error (Misaligned (p, alignment))
   else Ok ()
+
+(* Contiguous byte-array access (the host arena adapters and the typed
+   raw deref): bounds-checked copy in/out of a region starting at the
+   pointer's offset. *)
+let load_bytes (m : t) (p : pointer) (len : int) : (Bytes.t, mem_error) result =
+  match region_of m p with
+  | Error e -> Error e
+  | Ok r -> (
+      match check_bounds r p len 1 with
+      | Error e -> Error e
+      | Ok () -> Ok (Bytes.sub r.bytes p.offset len))
+
+let store_bytes (m : t) (p : pointer) (b : Bytes.t) : (unit, mem_error) result =
+  match region_of m p with
+  | Error e -> Error e
+  | Ok r -> (
+      match check_bounds r p (Bytes.length b) 1 with
+      | Error e -> Error e
+      | Ok () ->
+          Bytes.blit b 0 r.bytes p.offset (Bytes.length b);
+          Ok ())
+
+(* The region's byte length (the host C-string/bounds scans need it). *)
+let region_length (m : t) (p : pointer) : (int, mem_error) result =
+  match region_of m p with
+  | Error e -> Error e
+  | Ok r -> Ok (Bytes.length r.bytes)
 
 let load_u8 (m : t) (p : pointer) : (int, mem_error) result =
   match region_of m p with
@@ -240,6 +284,34 @@ let offset (m : t) (p : pointer) (delta : int) : (pointer, mem_error) result =
   if Int64.compare off (Int64.of_int max_int) > 0 || Int64.compare off (Int64.of_int min_int) < 0 then
     Error (Overflow "offset")
   else Ok { p with offset = Int64.to_int off }
+
+(* ── The raw-address codec (Ptr as Int and back) ─────────────────────
+   The language's `Ptr.address` is a machine address: the seed models it
+   as an injective 64-bit virtual address whose high 32 bits carry the
+   region id (biased by one so region 0 is distinguishable from the
+   null address 0) and whose low 32 bits carry the byte offset.  Pointer
+   arithmetic performed in Int space (the kernel's `(p as Int + delta)
+   as Ptr[T]` spellings) therefore adds to the byte offset exactly like
+   a real flat address.  A zero address decodes to a null pointer
+   (region -1); any other address decodes to its (region, offset) pair —
+   an address whose high word is zero names null-region storage and
+   traps deterministically on deref, never a fabricated region. *)
+let is_null_pointer (p : pointer) : bool = p.region < 0
+
+let pointer_to_int64 (p : pointer) : int64 =
+  if p.region < 0 then 0L
+  else
+    Int64.logor
+      (Int64.shift_left (Int64.of_int (p.region + 1)) 32)
+      (Int64.logand (Int64.of_int p.offset) 0xFFFFFFFFL)
+
+let pointer_of_int64 (a : int64) : pointer =
+  if Int64.compare a 0L = 0 then { region = -1; offset = 0 }
+  else
+    {
+      region = Int64.to_int (Int64.shift_right_logical a 32) - 1;
+      offset = Int64.to_int (Int64.logand a 0xFFFFFFFFL);
+    }
 
 let bytes_of_region (m : t) (p : pointer) : (Bytes.t, mem_error) result =
   match region_of m p with

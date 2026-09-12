@@ -81,9 +81,11 @@ let of_registry (s : Intrinsic_registry.signature) : signature =
       the typechecker's P4 drift check and every other pre-Mir_verify
       site can canonicalize without a module edge to Mir_verify).
       Registry placeholder ids: option_=1, vec=2, map=3, set=4 (the
-      registry's own domain — Intrinsic_registry.Type_id); checker
-      LangItem ids: Array=0, Map=1, Set=2, Option=3 (Typecheck's
-      b_array/b_map/b_set/b_option — mir_verify's re-audit P0-C row).
+      registry's own domain — Intrinsic_registry.Type_id), plus the
+      wrapper-surface families result_=8, ptr_=9, ptrmut_=10; checker
+      LangItem ids: Array=0, Map=1, Set=2, Option=3, Result=4, Ptr=5,
+      PtrMut=6 (Typecheck's b_array/b_map/b_set/b_option/b_result/
+      b_ptr/b_ptrmut — mir_verify's re-audit P0-C row).
       The registry's `array_` placeholder (id 5) is NOT adopted here: it
       is an ALIAS spelling of `vec` and is folded onto it by
       canonicalize_builtin_alias first (a raw id-5 adoption would
@@ -103,6 +105,12 @@ let registry_type_to_checker (ty : Type_repr.t) : Type_repr.t =
             Ids.Type_id.make 1
           else if Ids.Type_id.compare tid (Intrinsic_registry.Type_id.set) = 0 then
             Ids.Type_id.make 2
+          else if Ids.Type_id.compare tid (Intrinsic_registry.Type_id.result_) = 0 then
+            Ids.Type_id.make 4
+          else if Ids.Type_id.compare tid (Intrinsic_registry.Type_id.ptr_) = 0 then
+            Ids.Type_id.make 5
+          else if Ids.Type_id.compare tid (Intrinsic_registry.Type_id.ptrmut_) = 0 then
+            Ids.Type_id.make 6
           else tid
         in
         Type_repr.Named (tid', Array.map go args)
