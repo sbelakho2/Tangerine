@@ -11,7 +11,7 @@ use std::collections::{Vec, Map}
 use std::alloc::{Layout, FieldLayout, VariantLayout}
 use tg_compiler::token::{span_dummy}
 use tg_compiler::ast::{LayoutAttrs, layout_attrs_plain}
-use tg_compiler::types::{Type, TypeId, subst_type_args}
+use tg_compiler::types::{Type, TypeId, subst_type_args, simd_vector_family_name}
 use tg_compiler::mir::{MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef, mir_type_identity_key}
 # The canonical per-target ABI record (audit items 28 + 29): the ABI call
 # plan below is driven by TargetDesc (arch / arg_regs / float_abi / fpu /
@@ -2721,9 +2721,13 @@ def simd_lane_size_of_type(ty: Type) -> Int
 end
 
 # The std SIMD vector family names — the ONLY names the vector row
-# recognizes (the real vector type).
+# recognizes (the real vector type). (audit order item 8) The family
+# vocabulary lives in the TypeProperties engine
+# (types.tg simd_vector_family_name — the shared authority the vector
+# property also reads), so the layout's VECTOR ROW and the compiler-owned
+# is_vector_type property can never disagree on the family.
 def is_simd_vector_type_name(name: String) -> Bool
-  name == "Vec2" || name == "Vec4" || name == "Vec8" || name == "Vec16"
+  simd_vector_family_name(name)
 end
 
 # THE vector-type gate: a CONCRETE Adt of the std vector family whose
@@ -3536,27 +3540,23 @@ end
 # pair in registers) exactly where the C ABI matters: a C-repr struct of
 # 12 bytes (the packed epoll_event { u32 @ 0, u64 @ 4 } shape) crosses in
 # two integer registers per the C rules, never by address.
-# (audit P1-13 — HFA/HVA, not implemented): this size-only
-# classification is exact for C aggregates whose eightbytes are all
-# INTEGER-class, but NOT for aggregates containing FLOAT/DOUBLE members.
-# The platform rules:
+# (audit P1-13 — HFA/HVA): this ValueCategory layer stays size-only;
+# the float-member scan runs ONE layer up in the typed-class image
+# (abi_extern_aggregate_image under the ExternC flavor), so the internal
+# value categories — and every internal crossing — are unchanged.  The
+# platform member rules the scan implements:
 #   AArch64 AAPCS64 — a composite of 1..4 members ALL of the same
-#   floating-point type (HFA) or the same vector type (HVA) passes in
-#   FP/vector registers v0-v7 (one member per register); a composite
-#   whose members are a MIX (or that exceeds 16 bytes) is passed in
-#   memory (or via x8 on return). A 16-byte struct of two Doubles is an
-#   HFA (v0,v1), NOT two GP slots; a 16-byte struct { f32, f32, f32, f32 }
-#   is an HFA (v0-v3).
+#   floating-point type (HFA) or the same short-vector type (HVA) passes
+#   in FP/vector registers v0-v7 (one member per register); a composite
+#   whose members are a MIX rides the general registers (or memory when
+#   >16 bytes / the file is exhausted). A 16-byte struct of two Doubles
+#   is an HFA (v0,v1), NOT two GP slots; a 16-byte struct
+#   { f32, f32, f32, f32 } is an HFA (v0-v3).
 #   x86-64 SysV — eightbytes classify as SSE when they contain only
 #   float members (one 8-byte chunk per xmm register up to 2 registers
-#   for <=16-byte aggregates).
-# The ValueCategory model has no float-kind member information, so the
-# classifier cannot emit these classes; implementing HFA/HVA/SSE requires
-# classifying by MEMBER types (a float-member scan of the layout record),
-# emitting FP-register slots, and splitting the extern vs internal call
-# path (internal calls keep the by-reference model). Until then, extern
-# declarations whose C contract passes float-containing composites BY
-# VALUE are not representable and must use pointer parameters instead.
+#   for <=16-byte aggregates); the exact eightbyte SSE classifier is the
+#   documented remaining gap, while the FP-first mixed SSE+INTEGER pair
+#   is modeled as MixedPair.
 def c_aggregate_category(inout engine: LayoutEngine, ty: Type) -> Result[ValueCategory, LayoutError]
   match layout_of_concrete(engine, ty)
   when Result::Ok(l) then
@@ -3955,8 +3955,8 @@ end
 #     registers is still ONE entry; its AbiParam.location is the typed
 #     AbiLocation (kind + register names / stack offset).
 #   ret: AbiReturn — the result crossing.  VoidT for a zero-sized result,
-#     GprT/GprPairT for the integer word(s), FprT/FprPairT for the
-#     floating-point/vector register file, SRetT for the indirect
+#     GprT/GprPairT for the integer word(s), FprT/FprPairT/FprSeqT for
+#     the floating-point/vector register file, SRetT for the indirect
 #     (caller-supplied buffer) crossing.  Every non-void variant carries
 #     the result's AbiValueClass, so the return class renders through the
 #     same helper as an argument's.
@@ -4057,12 +4057,24 @@ end
 #   TaggedPtr(w)   the canonical ONE-word registered-enum value (audit
 #                  item 29); renders "scalar:<w>" so the persisted ABI
 #                  surface rows stay byte-identical
-# The remaining variants are the RESERVED structured forms of documented
-# gaps — no classifier path constructs them yet, and abi_place_value
-# fails closed on them:
-#   PairFloat(a, b) / MixedPair(a, b) — the AAPCS64/SysV HFA/SSE
-#                  aggregate classes (audit P1-13; the member-type scan
-#                  lands them)
+# (audit P1-13 — the member-type scan): the homogeneous-aggregate
+# classes the ExternC classification constructs from the AAPCS64
+# member scan (abi_extern_aggregate_image):
+#   PairFloat(a, b) the TWO-member HFA (a=b=the member float width);
+#                  ExternC places it in two consecutive FP registers
+#                  (d0,d1 / xmm0,xmm1)
+#   MixedPair(a, b) the mixed float/integer aggregate class where the
+#                  ABI passes it in registers (AAPCS64: the general
+#                  pair; x86-64 SysV: the FP-first SSE+INTEGER
+#                  eightbyte pair); `a` is the float member bytes, `b`
+#                  the payload bytes that are not float members
+#                  (integer members + padding), so a + b = size
+#   Hfa(count, width) the 3/4-member HFA (count 3..4, one member
+#                  `width` bytes); ExternC places it in `count`
+#                  consecutive FP registers (d0-d3 / xmm0-xmm3)
+#   Hva(count, width) the 2..4-member HVA (short-vector members
+#                  `width` bytes each); ExternC places it in `count`
+#                  consecutive vector registers (v0-v3 / xmm0-xmm3)
 #
 # AbiLocation — WHERE it crosses: a typed kind (None / Register /
 # RegisterPairGpr / RegisterPairFp / RegisterVector / StackOffset) plus
@@ -4086,6 +4098,8 @@ pub enum AbiValueClass
   PairInt(width_a: Int, width_b: Int)
   PairFloat(width_a: Int, width_b: Int)
   MixedPair(width_a: Int, width_b: Int)
+  Hfa(count: Int, width: Int)
+  Hva(count: Int, width: Int)
   Vector(width: Int)
   ByAddress(size: Int)
   TaggedPtr(width: Int)
@@ -4096,6 +4110,14 @@ pub enum AbiLocationKind
   Register
   RegisterPairGpr
   RegisterPairFp
+  # A mixed two-register pair: one SIMD&FP-file register and one
+  # general register (the x86-64 SysV SSE+INTEGER mixed eightbytes).
+  # reg_a is the FP/vector register, reg_b the general register.
+  RegisterPairMixed
+  # An ordered sequence of >= 3 SIMD&FP-file registers (the AAPCS64 HFA
+  # v0-v3 / HVA v0-v3 crossing): the names are the target's own FP or
+  # vector names, in consumption order.
+  RegisterSeqFp(regs: Vec[String])
   RegisterVector
   StackOffset
 end
@@ -4105,6 +4127,42 @@ pub struct AbiLocation
   reg_a: String
   reg_b: String
   offset: Int
+end
+
+# The registered Clone surface of the location carriers (audit P1-13):
+# the HFA/HVA work added RegisterSeqFp's Vec[String] register list, which
+# makes AbiLocationKind owning (not Copy), so the LIR aggregate clones
+# that duplicate plan locations (abi_verify rows, the FP stream walk)
+# can no longer discharge through the derived channel — these impls
+# register the duplication explicitly, mirroring the LirStmtKind /
+# TargetDescriptor convention.  The scalar carriers (AbiValueClass's
+# Hfa/Hva Int widths, AbiReturn's copies of them) stay Copy and need no
+# registration; RegisterSeqFp duplicates its register names through
+# Vec[String]'s own clone.
+impl Clone for AbiLocationKind
+  def clone(self: Self) -> AbiLocationKind
+    match self
+    when AbiLocationKind::None then AbiLocationKind::None
+    when AbiLocationKind::Register then AbiLocationKind::Register
+    when AbiLocationKind::RegisterPairGpr then AbiLocationKind::RegisterPairGpr
+    when AbiLocationKind::RegisterPairFp then AbiLocationKind::RegisterPairFp
+    when AbiLocationKind::RegisterPairMixed then AbiLocationKind::RegisterPairMixed
+    when AbiLocationKind::RegisterSeqFp(regs) then AbiLocationKind::RegisterSeqFp(regs.clone())
+    when AbiLocationKind::RegisterVector then AbiLocationKind::RegisterVector
+    when AbiLocationKind::StackOffset then AbiLocationKind::StackOffset
+    end
+  end
+end
+
+impl Clone for AbiLocation
+  def clone(self: Self) -> AbiLocation
+    AbiLocation {
+      kind: self.kind.clone(),
+      reg_a: self.reg_a.clone(),
+      reg_b: self.reg_b.clone(),
+      offset: self.offset
+    }
+  end
 end
 
 pub enum AbiExtension
@@ -4120,6 +4178,11 @@ pub enum AbiReturn
   GprPairT(class: AbiValueClass)
   FprT(class: AbiValueClass)
   FprPairT(class: AbiValueClass)
+  # The AAPCS64 homogeneous aggregate return (3/4 HFA or 2..4 HVA): the
+  # payload crosses in v0..v3 / d0..d3, one member per register.  The
+  # internal convention never emits it (aggregate returns cross through
+  # sret there), so it appears only under the ExternC flavor.
+  FprSeqT(class: AbiValueClass)
   SRetT(class: AbiValueClass)
 end
 
@@ -4177,7 +4240,10 @@ end
 # The canonical class word: Zero -> "zero", the scalar/tagged-pointer
 # classes -> "scalar:<width>", the pair classes -> "pair:<a>:<b>",
 # Vector -> "vector:<width>", ByAddress -> "by-address:<size>" —
-# byte-identical to the old vocabulary.
+# byte-identical to the old vocabulary.  The homogeneous-aggregate
+# carriers (audit P1-13) render "hfa:<count>x<width>" /
+# "hva:<count>x<width>"; the 1- and 2-member HFA rows reuse the scalar
+# and pair vocabulary above (their width carries the member identity).
 pub def abi_value_class_word(cls: AbiValueClass) -> String
   match cls
   when AbiValueClass::Zero then "zero"
@@ -4186,6 +4252,8 @@ pub def abi_value_class_word(cls: AbiValueClass) -> String
   when AbiValueClass::PairInt(a, b) then "pair:" + a.to_string() + ":" + b.to_string()
   when AbiValueClass::PairFloat(a, b) then "pair:" + a.to_string() + ":" + b.to_string()
   when AbiValueClass::MixedPair(a, b) then "pair:" + a.to_string() + ":" + b.to_string()
+  when AbiValueClass::Hfa(count, width) then "hfa:" + count.to_string() + "x" + width.to_string()
+  when AbiValueClass::Hva(count, width) then "hva:" + count.to_string() + "x" + width.to_string()
   when AbiValueClass::Vector(w) then "vector:" + w.to_string()
   when AbiValueClass::ByAddress(sz) then "by-address:" + sz.to_string()
   when AbiValueClass::TaggedPtr(w) then "scalar:" + w.to_string()
@@ -4205,10 +4273,20 @@ pub def abi_location_pair_gpr(a: String, b: String) -> AbiLocation
   AbiLocation { kind: AbiLocationKind::RegisterPairGpr, reg_a: a, reg_b: b, offset: 0 }
 end
 
-# The two-FP-register pair, reserved for the HFA/SSE aggregate classes
-# (audit P1-13): no path constructs it yet.
-pub def abi_location_pair_fp(a: String, b: String) -> AbiLocation
+# The two-FP-register pair of the 2-member HFA (audit P1-13).
+def abi_location_pair_fp(a: String, b: String) -> AbiLocation
   AbiLocation { kind: AbiLocationKind::RegisterPairFp, reg_a: a, reg_b: b, offset: 0 }
+end
+
+# A mixed FP+GP register pair (the x86-64 SysV SSE+INTEGER eightbytes).
+pub def abi_location_pair_mixed(a: String, b: String) -> AbiLocation
+  AbiLocation { kind: AbiLocationKind::RegisterPairMixed, reg_a: a, reg_b: b, offset: 0 }
+end
+
+# An ordered SIMD&FP-register sequence (the AAPCS64 HFA/HVA crossing,
+# 3 or 4 registers).
+pub def abi_location_seq_fp(regs: Vec[String]) -> AbiLocation
+  AbiLocation { kind: AbiLocationKind::RegisterSeqFp(regs), reg_a: "".to_string(), reg_b: "".to_string(), offset: 0 }
 end
 
 pub def abi_location_stack(offset: Int) -> AbiLocation
@@ -4244,6 +4322,16 @@ pub def abi_location_text(loc: AbiLocation) -> String
   when AbiLocationKind::Register then loc.reg_a.clone()
   when AbiLocationKind::RegisterPairGpr then loc.reg_a.clone() + "," + loc.reg_b.clone()
   when AbiLocationKind::RegisterPairFp then loc.reg_a.clone() + "," + loc.reg_b.clone()
+  when AbiLocationKind::RegisterPairMixed then loc.reg_a.clone() + "," + loc.reg_b.clone()
+  when AbiLocationKind::RegisterSeqFp(regs) then
+    var s = ""
+    var i = 0
+    while i < regs.len() do
+      if i > 0 then s = s + "," end
+      s = s + regs[i].clone()
+      i = i + 1
+    end
+    s
   when AbiLocationKind::RegisterVector then loc.reg_a.clone()
   when AbiLocationKind::StackOffset then "stack+" + loc.offset.to_string()
   end
@@ -4679,20 +4767,281 @@ pub def abi_plan_vector_promote(inout engine: LayoutEngine, desc: TargetDesc, ty
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# THE HOMOGENEOUS-AGGREGATE MEMBER SCAN (audit P1-13)
+# ———————————————————————————————————————————————————————————————
+# THE AAPCS64 HFA/HVA member-type scan, shared by the ExternC call
+# classifier (abi_extern_aggregate_image below) and the ABI verifier
+# (lir.tg's abi_verify_hfa_members) — ONE rule, two consumers.
+#
+# The scan flattens an aggregate's inline members into their
+# fundamental kinds (the AAPCS64 5.10.5 flattening):
+#   - a FLOAT member (F32/F64/Float) is a Float leaf of its width;
+#   - a short-vector member (the std SIMD family, <= 16 bytes) is a
+#     Vector leaf of its width;
+#   - an integer/pointer/handle member (including a field whose Adt is
+#     an indirection: Box/Rc/Slice/String/...) is an Integer leaf;
+#   - a nested STRUCT/TUPLE/FIXED-ARRAY member is flattened into its
+#     own leaves (in declaration order; a fixed array repeats its
+#     element count times);
+#   - an empty aggregate contributes NO leaf (the AAPCS rules ignore
+#     zero-sized members);
+#   - an ENUM member (a tagged union) disqualifies the whole aggregate,
+#     as a union does in C.
+# The homogeneous answers (AAPCS64 5.10.5):
+#   - HFA: 1..4 leaves, ALL Float, ALL the same width;
+#   - HVA: 1..4 leaves, ALL Vector, ALL the same width.
+# Anything else — mixed kinds, > 4 leaves, a > 16-byte vector member,
+# an enum/unresolved member — is not homogeneous and keeps the size
+# rule.
+pub enum AbiAggregateLeafKind
+  Float
+  Vector
+  Integer
+end
+
+pub struct AbiAggregateLeaf
+  kind: AbiAggregateLeafKind
+  width: Int
+end
+
+pub struct AbiHomogeneousAggregate
+  kind: AbiAggregateLeafKind       # Float (HFA) or Vector (HVA)
+  count: Int                       # 1..4 members
+  width: Int                       # bytes per member
+end
+
+# The recursive flattening walk.  True when the whole subtree is
+# scannable; every accepted leaf is appended to `out` in order.  The
+# depth bound keeps a malformed inline cycle from recursing without
+# end; the leaf bound keeps a huge fixed array from materializing an
+# unbounded list (both only affect shapes the size rule already owns).
+def abi_aggregate_leaves_scan(inout engine: LayoutEngine, ty: Type, depth: Int, inout out: Vec[AbiAggregateLeaf]) -> Bool
+  if depth > 32 then return false end
+  if out.len() > 64 then return false end
+  if abi_is_float_type(ty) then
+    out.push(AbiAggregateLeaf { kind: AbiAggregateLeafKind::Float, width: abi_float_width(ty) })
+    return true
+  end
+  if is_simd_vector_type(engine, ty) then
+    let w = simd_vector_width_of(engine, ty)
+    # Only the 64/128-bit short vectors are HVA members; a wider
+    # vector (the 256/512-bit family rows) disqualifies the aggregate.
+    if w <= 0 || w > 16 then return false end
+    out.push(AbiAggregateLeaf { kind: AbiAggregateLeafKind::Vector, width: w })
+    return true
+  end
+  match ty
+  when Type::Adt(tid, _) then
+    if is_enum_type_def(engine, tid.id) then return false end
+    match type_repr(engine, ty)
+    when Repr::Inline then
+      match substituted_type_def(engine, ty)
+      when Option::Some(std) then
+        match std.kind
+        when MirTypeDefKind::Struct(fields) then
+          var fi = 0
+          var ok = true
+          while fi < fields.len() do
+            if !abi_aggregate_leaves_scan(engine, fields[fi].ty.clone(), depth + 1, out) then
+              ok = false
+            end
+            fi = fi + 1
+          end
+          ok
+        when _ then false
+        end
+      when Option::None then false
+      end
+    when _ then
+      # An indirection-represented Adt (Box/Rc/Slice/String/...) is an
+      # INTEGER-class member: the scan never follows it.
+      let sa = abi_value_size_align(engine, ty)
+      if sa.0 <= 0 then return false end
+      out.push(AbiAggregateLeaf { kind: AbiAggregateLeafKind::Integer, width: sa.0 })
+      true
+    end
+  when Type::Tuple(elems) then
+    var ei = 0
+    var ok = true
+    while ei < elems.len() do
+      if !abi_aggregate_leaves_scan(engine, elems[ei].clone(), depth + 1, out) then
+        ok = false
+      end
+      ei = ei + 1
+    end
+    ok
+  when Type::FixedArray(elem, n) then
+    var ai = 0
+    var ok = true
+    while ai < n do
+      if !abi_aggregate_leaves_scan(engine, elem.clone(), depth + 1, out) then
+        ok = false
+      end
+      ai = ai + 1
+    end
+    ok
+  when Type::Var(_) | Type::Param(_) | Type::Error then false
+  when _ then
+    let sa = abi_value_size_align(engine, ty)
+    if sa.0 <= 0 then return false end
+    out.push(AbiAggregateLeaf { kind: AbiAggregateLeafKind::Integer, width: sa.0 })
+    true
+  end  end
+end
+
+# The flattened leaf list of an aggregate type (Option::None for a
+# non-aggregate or a shape the scan refuses — an enum/tagged union, an
+# unresolved member, a > 16-byte vector member).  An EMPTY aggregate
+# returns Option::Some of the empty list.
+pub def abi_aggregate_leaves(inout engine: LayoutEngine, ty: Type) -> Option[Vec[AbiAggregateLeaf]]
+  match ty
+  when Type::Adt(tid, _) then
+    if is_enum_type_def(engine, tid.id) then return Option::None end
+    if is_simd_vector_type(engine, ty) then return Option::None end
+    match type_repr(engine, ty)
+    when Repr::Inline then ()
+    when _ then return Option::None
+    end
+  when Type::Tuple(_) then ()
+  when Type::FixedArray(_, _) then ()
+  when _ then return Option::None
+  end
+  var leaves: Vec[AbiAggregateLeaf] = Vec::new()
+  if !abi_aggregate_leaves_scan(engine, ty, 0, &mut leaves) then
+    return Option::None
+  end
+  Option::Some(leaves)
+end
+
+# The homogeneous answer of a flattened leaf list: 1..4 leaves of the
+# SAME Float (HFA) or Vector (HVA) kind and width.  A homogeneous
+# INTEGER list is not an HFA/HVA answer (it keeps the size rule).
+def abi_homogeneous_from_leaves(leaves: Vec[AbiAggregateLeaf]) -> Option[AbiHomogeneousAggregate]
+  if leaves.len() == 0 || leaves.len() > 4 then return Option::None end
+  let kind = leaves[0].kind.clone()
+  if kind == AbiAggregateLeafKind::Integer then return Option::None end
+  let width = leaves[0].width
+  var i = 0
+  var ok = true
+  while i < leaves.len() do
+    if leaves[i].kind != kind || leaves[i].width != width then ok = false end
+    i = i + 1
+  end
+  if ok then
+    Option::Some(AbiHomogeneousAggregate { kind: kind, count: leaves.len(), width: width })
+  else
+    Option::None
+  end
+end
+
+# The homogeneous-aggregate answer for a type: Option::Some when the
+# flattened members are 1..4 same-kind, same-width Float (HFA) or
+# Vector (HVA) leaves — the AAPCS64 rule shape the ExternC classifier
+# and the ABI verifier both consume.
+pub def abi_homogeneous_aggregate(inout engine: LayoutEngine, ty: Type) -> Option[AbiHomogeneousAggregate]
+  match abi_aggregate_leaves(engine, ty)
+  when Option::Some(leaves) then abi_homogeneous_from_leaves(leaves)
+  when Option::None then Option::None
+  end
+end
+
+# The AbiValueClass a homogeneous aggregate classifies as (the ONE
+# classifier/verifier shared mapping): 1 member -> the scalar FP/vector
+# class, 2 -> the pair class, 3/4 -> the Hfa/Hva carrier.
+pub def abi_homogeneous_class(agg: AbiHomogeneousAggregate) -> AbiValueClass
+  match agg.kind
+  when AbiAggregateLeafKind::Float then
+    if agg.count == 1 then
+      AbiValueClass::ScalarFloat(agg.width)
+    elsif agg.count == 2 then
+      AbiValueClass::PairFloat(agg.width, agg.width)
+    else
+      AbiValueClass::Hfa(agg.count, agg.width)
+    end
+  when AbiAggregateLeafKind::Vector then
+    if agg.count == 1 then AbiValueClass::Vector(agg.width) else AbiValueClass::Hva(agg.count, agg.width) end
+  when AbiAggregateLeafKind::Integer then AbiValueClass::Zero
+  end
+end
+
+# The ExternC class of a member-scannable aggregate: Option::Some of
+# (class, size, align) when the platform member rule replaces the size
+# rule, Option::None when the aggregate keeps the size-based class.
+# The platform rules:
+#   AArch64 (AAPCS64): an HFA (1..4 same-width floats) crosses in the
+#     FP file (1 -> ScalarFloat, 2 -> PairFloat, 3/4 -> Hfa); an HVA
+#     (1..4 same-width short vectors) crosses in the vector file
+#     (1 -> Vector, 2..4 -> Hva).  Mixed aggregates are NOT FP
+#     aggregates on AAPCS64 — they ride the general registers, carried
+#     as the MixedPair member-kind class (placement decides the pair).
+#   X86_64 (SysV): the AAPCS HFA/HVA rule does not apply (the exact
+#     eightbyte SSE classifier is a documented remaining gap); a
+#     <= 16-byte aggregate whose float members come FIRST and whose
+#     integer members follow is the SSE+INTEGER mixed pair
+#     (MixedPair(float_bytes, rest)).
+#   Every other target: only the member-kind mixed class (placed as the
+#   general pair, like PairInt).
+def abi_extern_aggregate_image(inout engine: LayoutEngine, desc: TargetDesc, ty: Type) -> Option[(AbiValueClass, Int, Int)]
+  match abi_aggregate_leaves(engine, ty.clone())
+  when Option::None then Option::None
+  when Option::Some(leaves) then
+    let sa = abi_value_size_align(engine, ty.clone())
+    match abi_homogeneous_from_leaves(leaves.clone())
+    when Option::Some(agg) then
+      if desc.arch == Arch::AArch64 then
+        Option::Some((abi_homogeneous_class(agg), sa.0, sa.1))
+      else
+        Option::None
+      end
+    when Option::None then
+      var fp_bytes = 0
+      var int_bytes = 0
+      var has_vector = false
+      var first_int = -1
+      var last_fp = -1
+      var i = 0
+      while i < leaves.len() do
+        match leaves[i].kind
+        when AbiAggregateLeafKind::Float then
+          fp_bytes = fp_bytes + leaves[i].width
+          last_fp = i
+        when AbiAggregateLeafKind::Vector then has_vector = true
+        when AbiAggregateLeafKind::Integer then
+          int_bytes = int_bytes + leaves[i].width
+          if first_int < 0 then first_int = i end
+        end
+        i = i + 1
+      end
+      if has_vector || fp_bytes == 0 || int_bytes == 0 then return Option::None end
+      # The mixed pair is the two-slot, register-passable class only.
+      if sa.0 <= 8 || sa.0 > 16 then return Option::None end
+      # The x86-64 mixed pair placement is FP-slot-first (SysV
+      # SSE+INTEGER); an integer-first mix keeps the size rule there.
+      if desc.arch == Arch::X86_64 && first_int < last_fp then return Option::None end
+      Option::Some((AbiValueClass::MixedPair(fp_bytes, sa.0 - fp_bytes), sa.0, sa.1))
+    end
+  end
+end
+
 # The generic image of a parameter type: (AbiValueClass, size, align).
-# The class is flavor-independent — the flavor decides only the CROSSING
-# (the internal by-reference aggregate vs the C two-register composite)
-# in abi_place_value.  For a <=16-byte composite that is the PairInt
-# class crossing in two integer registers by value under ExternC, and a
-# >16-byte one takes the by-value stack placement.
-# (AUDIT P1-13 — HFA/HVA, documented gap): the classifier has no
-# float-member information, so a float-containing composite is classified
-# by its size like an all-integer one; the C plan therefore reports the
-# GP-register class for a two-F64/two-F32 aggregate where AAPCS64/SysV
-# would use FP/SSE registers.  The gap is closed by a member-type scan in
-# a later slice, never by a consumer-side rule (the typed
-# PairFloat/MixedPair classes are its reserved forms).
-def abi_value_image(inout engine: LayoutEngine, cat: ValueCategory, ty: Type) -> Result[(AbiValueClass, Int, Int), LayoutError]
+# Under InternalValue the class follows the size-based ValueCategory
+# answer; under ExternC the member scan below may replace it with the
+# platform homogeneous/mixed aggregate class, and the flavor still
+# decides the CROSSING (the internal by-reference aggregate vs the C
+# register file) in abi_place_value.
+# (audit P1-13 — HFA/HVA, implemented): under ExternC the generic image
+# first asks the shared member-type scan (abi_extern_aggregate_image):
+#   AArch64 — a homogeneous floating aggregate crosses in the FP file
+#   (1 -> ScalarFloat, 2 -> PairFloat, 3/4 -> Hfa), a homogeneous
+#   short-vector aggregate in the vector file (1 -> Vector, 2..4 ->
+#   Hva), a mixed float/integer aggregate as the MixedPair class (its
+#   general-register pair on AAPCS64); x86-64 — the FP-first mixed
+#   SSE+INTEGER pair as MixedPair.  Every other shape (5+ members, a
+#   >16-byte aggregate, a non-homogeneous mix outside the modeled
+#   mixed rule, an enum member) keeps the size-based PairInt/ByAddress
+#   class exactly as before.
+def abi_value_image(inout engine: LayoutEngine, desc: TargetDesc, flavor: AbiFlavor, cat: ValueCategory, ty: Type) -> Result[(AbiValueClass, Int, Int), LayoutError]
   # (third-audit item 29 + 41): a registered TaggedPtr enum's crossing
   # is its own class — the canonical ONE value word, rendered
   # "scalar:<pointer width>" — never a plain scalar.
@@ -4700,6 +5049,15 @@ def abi_value_image(inout engine: LayoutEngine, cat: ValueCategory, ty: Type) ->
     let pw = engine.target.pointer_size
     let sa = abi_value_size_align(engine, ty)
     return Result::Ok((AbiValueClass::TaggedPtr(pw), pw, sa.1))
+  end
+  # (audit P1-13) THE MEMBER-TYPE SCAN, ExternC only: the compiler's
+  # INTERNAL convention keeps the by-reference aggregate model, so the
+  # scan never changes an InternalValue crossing.
+  if flavor == AbiFlavor::ExternC then
+    match abi_extern_aggregate_image(engine, desc.clone(), ty.clone())
+    when Option::Some(img) then return Result::Ok(img)
+    when Option::None then ()
+    end
   end
   match cat
   when ValueCategory::ZeroSized then
@@ -4726,8 +5084,10 @@ end
 # ONLY place a location is formed for the plan; consumers read the typed
 # answer.  (third-audit item 41): the class/location/extension outputs
 # are structured values; the only strings formed here are the target's
-# own register names.  The reserved classes (PairFloat / MixedPair)
-# fail closed — no classifier path constructs them yet.
+# own register names.  (audit P1-13): the homogeneous/mixed aggregate
+# classes (PairFloat / MixedPair / Hfa / Hva) have real ExternC
+# placements now — consecutive FP/vector registers, the SysV mixed pair,
+# or the by-value caller stack when the register file is exhausted.
 def abi_place_value(desc: TargetDesc, flavor: AbiFlavor, class: AbiValueClass, size: Int, align: Int, extension: AbiExtension, inout gp_pos: Int, inout fp_pos: Int, inout stack_bytes: Int) -> AbiParam
   let gpr_count = desc.arg_regs.len()
   let fpr_count = if abi_fpr_available(desc) then 8 else 0 end
@@ -4813,10 +5173,143 @@ def abi_place_value(desc: TargetDesc, flavor: AbiFlavor, class: AbiValueClass, s
         AbiParam { value_class: AbiValueClass::ByAddress(size), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
       end
     end
-  when AbiValueClass::PairFloat(_, _) then
-    panic("abi_place_value: the PairFloat class is the reserved structured form of the AAPCS64/SysV HFA/SSE aggregate class (audit P1-13): no classifier path emits it yet — the member-type scan must add its FP-register placement (fail-closed)")
-  when AbiValueClass::MixedPair(_, _) then
-    panic("abi_place_value: the MixedPair class is the reserved structured form of the mixed float/integer aggregate class (audit P1-13): no classifier path emits it yet — the member-type scan must add its placement (fail-closed)")
+  when AbiValueClass::PairFloat(a, b) then
+    if internal_convention then
+      # The internal convention never emits this class (the scan is
+      # ExternC-only); if placement is ever asked anyway it follows the
+      # PairInt rule — ONE general slot carries the image address.
+      if gp_pos < gpr_count then
+        let loc = abi_location_register(abi_gpr_name(desc, gp_pos))
+        gp_pos = gp_pos + 1
+        AbiParam { value_class: AbiValueClass::PairFloat(a, b), location: loc, indirect: true, extension: AbiExtension::None, alignment: align, size: size }
+      else
+        let off = stack_bytes
+        stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+        AbiParam { value_class: AbiValueClass::PairFloat(a, b), location: abi_location_stack(off), indirect: true, extension: AbiExtension::None, alignment: align, size: size }
+      end
+    else
+      # (audit P1-13) The 2-member HFA: TWO consecutive FP registers
+      # (d0,d1 / xmm0,xmm1 — the shared SIMD&FP file).  When the file
+      # lacks two positions the whole aggregate crosses BY VALUE on the
+      # caller stack: AAPCS64 passes an HFA that cannot use the FP
+      # registers in memory, never split.
+      if fp_pos + 2 <= fpr_count then
+        let a_reg = abi_fpr_name(desc, fp_pos)
+        let b_reg = abi_fpr_name(desc, fp_pos + 1)
+        fp_pos = fp_pos + 2
+        AbiParam { value_class: AbiValueClass::PairFloat(a, b), location: abi_location_pair_fp(a_reg, b_reg), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
+      else
+        let off = stack_bytes
+        stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+        AbiParam { value_class: AbiValueClass::ByAddress(size), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
+      end
+    end
+  when AbiValueClass::MixedPair(a, b) then
+    if internal_convention then
+      # The internal convention never emits this class; the PairInt
+      # image-address rule stands if placement is ever asked anyway.
+      if gp_pos < gpr_count then
+        let loc = abi_location_register(abi_gpr_name(desc, gp_pos))
+        gp_pos = gp_pos + 1
+        AbiParam { value_class: AbiValueClass::MixedPair(a, b), location: loc, indirect: true, extension: AbiExtension::None, alignment: align, size: size }
+      else
+        let off = stack_bytes
+        stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+        AbiParam { value_class: AbiValueClass::MixedPair(a, b), location: abi_location_stack(off), indirect: true, extension: AbiExtension::None, alignment: align, size: size }
+      end
+    elsif desc.arch == Arch::X86_64 then
+      # The SysV SSE+INTEGER mixed pair: the FP slot first (xmm0),
+      # then the integer slot (rdi).  The classification only
+      # constructs the FP-first order, so the placement order is exact.
+      if fp_pos < fpr_count && gp_pos < gpr_count then
+        let fp_reg = abi_fpr_name(desc, fp_pos)
+        let gp_reg = abi_gpr_name(desc, gp_pos)
+        fp_pos = fp_pos + 1
+        gp_pos = gp_pos + 1
+        AbiParam { value_class: AbiValueClass::MixedPair(a, b), location: abi_location_pair_mixed(fp_reg, gp_reg), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
+      else
+        let off = stack_bytes
+        stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+        AbiParam { value_class: AbiValueClass::ByAddress(size), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
+      end
+    else
+      # AAPCS64 (and the embedded routes): a mixed float/integer
+      # aggregate rides the general-register pair, exactly like the
+      # all-integer C composite (the class records the member kinds,
+      # the location the target's register files).
+      if gp_pos + 1 < gpr_count then
+        let a_reg = abi_gpr_name(desc, gp_pos)
+        let b_reg = abi_gpr_name(desc, gp_pos + 1)
+        gp_pos = gp_pos + 2
+        AbiParam { value_class: AbiValueClass::MixedPair(a, b), location: abi_location_pair_gpr(a_reg, b_reg), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
+      else
+        let off = stack_bytes
+        stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+        AbiParam { value_class: AbiValueClass::ByAddress(size), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
+      end
+    end
+  when AbiValueClass::Hfa(count, width) then
+    if internal_convention then
+      # Never emitted internally; the PairInt image-address rule stands.
+      if gp_pos < gpr_count then
+        let loc = abi_location_register(abi_gpr_name(desc, gp_pos))
+        gp_pos = gp_pos + 1
+        AbiParam { value_class: AbiValueClass::Hfa(count, width), location: loc, indirect: true, extension: AbiExtension::None, alignment: align, size: size }
+      else
+        let off = stack_bytes
+        stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+        AbiParam { value_class: AbiValueClass::Hfa(count, width), location: abi_location_stack(off), indirect: true, extension: AbiExtension::None, alignment: align, size: size }
+      end
+    else
+      # (audit P1-13) The 3/4-member HFA: `count` consecutive FP
+      # registers v0.. / d0..; the file must have all of them, else the
+      # aggregate crosses BY VALUE on the caller stack (AAPCS64).
+      if fp_pos + count <= fpr_count then
+        var regs: Vec[String] = Vec::new()
+        var k = 0
+        while k < count do
+          regs.push(abi_fpr_name(desc, fp_pos + k))
+          k = k + 1
+        end
+        fp_pos = fp_pos + count
+        AbiParam { value_class: AbiValueClass::Hfa(count, width), location: abi_location_seq_fp(regs), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
+      else
+        let off = stack_bytes
+        stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+        AbiParam { value_class: AbiValueClass::ByAddress(size), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
+      end
+    end
+  when AbiValueClass::Hva(count, width) then
+    if internal_convention then
+      # Never emitted internally; the PairInt image-address rule stands.
+      if gp_pos < gpr_count then
+        let loc = abi_location_register(abi_gpr_name(desc, gp_pos))
+        gp_pos = gp_pos + 1
+        AbiParam { value_class: AbiValueClass::Hva(count, width), location: loc, indirect: true, extension: AbiExtension::None, alignment: align, size: size }
+      else
+        let off = stack_bytes
+        stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+        AbiParam { value_class: AbiValueClass::Hva(count, width), location: abi_location_stack(off), indirect: true, extension: AbiExtension::None, alignment: align, size: size }
+      end
+    else
+      # (audit P1-13) The 2..4-member HVA: `count` consecutive vector
+      # registers v0.. (the shared SIMD&FP file); the file must have
+      # all of them, else the aggregate crosses BY VALUE on the stack.
+      if fp_pos + count <= fpr_count then
+        var regs: Vec[String] = Vec::new()
+        var k = 0
+        while k < count do
+          regs.push(abi_vector_name(desc, fp_pos + k, width * 8))
+          k = k + 1
+        end
+        fp_pos = fp_pos + count
+        AbiParam { value_class: AbiValueClass::Hva(count, width), location: abi_location_seq_fp(regs), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
+      else
+        let off = stack_bytes
+        stack_bytes = stack_bytes + abi_stack_slot_size(desc, internal_convention, size)
+        AbiParam { value_class: AbiValueClass::ByAddress(size), location: abi_location_stack(off), indirect: false, extension: AbiExtension::None, alignment: align, size: size }
+      end
+    end
   when AbiValueClass::ByAddress(sz) then
     if internal_convention then
       if gp_pos < gpr_count then
@@ -4902,6 +5395,30 @@ def abi_classify_return(inout engine: LayoutEngine, desc: TargetDesc, flavor: Ab
   match classify_value_category(engine, ret_ty)
   when Result::Err(e) then Result::Err(e)
   when Result::Ok(cat0) then
+    # (audit P1-13) THE EXTERN C HOMOGENEOUS-RETURN SCAN: the SAME
+    # member scan the parameter path uses classifies an HFA/HVA return
+    # into the fixed v0.. return registers (1..4 consecutive FP/vector
+    # registers, per AAPCS64).  An internal return never takes this
+    # path — aggregate returns cross through sret there.
+    if !internal_convention then
+      match abi_extern_aggregate_image(engine, desc.clone(), ret_ty.clone())
+      when Option::Some(img) then
+        match img.0
+        when AbiValueClass::ScalarFloat(w) then
+          if abi_fpr_available(desc) then return Result::Ok(AbiReturn::FprT(AbiValueClass::ScalarFloat(w))) end
+        when AbiValueClass::PairFloat(a, b) then
+          if abi_fpr_available(desc) then return Result::Ok(AbiReturn::FprPairT(AbiValueClass::PairFloat(a, b))) end
+        when AbiValueClass::Hfa(count, width) then
+          if abi_fpr_available(desc) then return Result::Ok(AbiReturn::FprSeqT(AbiValueClass::Hfa(count, width))) end
+        when AbiValueClass::Vector(w) then
+          if vector_crossing_legal(desc, w * 8) then return Result::Ok(AbiReturn::FprT(AbiValueClass::Vector(w))) end
+        when AbiValueClass::Hva(count, width) then
+          if vector_crossing_legal(desc, width * 8) then return Result::Ok(AbiReturn::FprSeqT(AbiValueClass::Hva(count, width))) end
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+    end
     # The plan-level v256 promotion (audit item 34 stage 2): a 32-byte
     # SIMD vector return crosses in the vector return register (ymm0)
     # where the descriptor models the 256-bit facility; otherwise the
@@ -4968,6 +5485,7 @@ pub def abi_return_text(ret: AbiReturn) -> String
   when AbiReturn::GprPairT(c) then "direct:" + abi_value_class_word(c)
   when AbiReturn::FprT(c) then "direct:" + abi_value_class_word(c)
   when AbiReturn::FprPairT(c) then "direct:" + abi_value_class_word(c)
+  when AbiReturn::FprSeqT(c) then "direct:" + abi_value_class_word(c)
   when AbiReturn::SRetT(c) then "sret:" + abi_value_class_word(c)
   end
 end
@@ -5058,20 +5576,33 @@ pub def classify_call_plan(inout engine: LayoutEngine, desc: TargetDesc, flavor:
       when Result::Err(e) then return Result::Err(e)
       end
     end
-    let img = match abi_value_image(engine, cat, ty)
+    let img = match abi_value_image(engine, desc.clone(), flavor, cat, ty)
     when Result::Ok(i) then i
     when Result::Err(e) then return Result::Err(e)
     end
     # (audit item 34 stage 2) The vector-width gate: a vector parameter
     # crosses only where the descriptor models the width (v128) or the
     # x86-64 ymm file (v256); every other pair fails closed NAMING the
-    # descriptor, before any placement consumes a position.
+    # descriptor, before any placement consumes a position.  The HVA
+    # carrier's members are short vectors, so the same gate applies to
+    # their width.
     match img.0
     when AbiValueClass::Vector(w) then
       if !vector_crossing_legal(desc, w * 8) then
         return Result::Err(LayoutError {
           class: LayoutFailureClass::UNSUPPORTED_TYPE,
           message: "A " + (w * 8).to_string() + "-bit SIMD vector parameter has no crossing on the `" + desc.name + "` target: " + vector_crossing_reason(desc, w * 8),
+          type_name: mir_type_identity_key(ty),
+          expected: 0,
+          actual: 0,
+          context: "classify_call_plan"
+        })
+      end
+    when AbiValueClass::Hva(_, width) then
+      if !vector_crossing_legal(desc, width * 8) then
+        return Result::Err(LayoutError {
+          class: LayoutFailureClass::UNSUPPORTED_TYPE,
+          message: "A " + (width * 8).to_string() + "-bit HVA member vector has no crossing on the `" + desc.name + "` target: " + vector_crossing_reason(desc, width * 8),
           type_name: mir_type_identity_key(ty),
           expected: 0,
           actual: 0,
@@ -5098,15 +5629,16 @@ pub def classify_call_plan(inout engine: LayoutEngine, desc: TargetDesc, flavor:
 end
 
 # The number of VECTOR-class arguments in a plan: the count of
-# AbiValueClass::Vector parameters, independent of their placement (the
-# register class is read off the class, so a file overflow's stacked
-# vector still counts).  This is the "vector args" half of the x86-64
-# SysV variadic AL rule.
+# AbiValueClass::Vector parameters (and of the vector members of an Hva
+# argument), independent of their placement (the register class is read
+# off the class, so a file overflow's stacked vector still counts).
+# This is the "vector args" half of the x86-64 SysV variadic AL rule.
 pub def abi_vector_arg_count(plan: AbiCallPlan) -> Int
   var n = 0
   for p in plan.args do
     match p.value_class
     when AbiValueClass::Vector(_) then n = n + 1
+    when AbiValueClass::Hva(count, _) then n = n + count
     when _ then ()
     end
   end
@@ -5118,7 +5650,8 @@ end
 # used by the arguments — the SSE/AVX register file positions, which
 # scalar floats SHARE with vectors (the same shared `fp_pos` stream
 # abi_place_value consumes).  Counts every argument whose location is the
-# register file at a file position (RegisterVector, or Register carrying
+# register file at a file position (RegisterVector, the FP pair of a
+# 2-member HFA, an ordered FP/vector sequence, or Register carrying
 # ScalarFloat), saturating at the file's 8 positions.  A variadic call
 # with more file positions than 8 passes the rest on the stack and AL
 # stays 8 (the psABI's cap); non-x86 targets ignore the value (it is the
@@ -5128,6 +5661,9 @@ pub def abi_vector_reg_count(plan: AbiCallPlan) -> Int
   for p in plan.args do
     match p.location.kind
     when AbiLocationKind::RegisterVector then n = n + 1
+    when AbiLocationKind::RegisterPairFp then n = n + 2
+    when AbiLocationKind::RegisterSeqFp(regs) then n = n + regs.len()
+    when AbiLocationKind::RegisterPairMixed then n = n + 1
     when AbiLocationKind::Register then
       match p.value_class
       when AbiValueClass::ScalarFloat(_) then n = n + 1

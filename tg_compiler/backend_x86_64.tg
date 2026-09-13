@@ -163,7 +163,7 @@
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Set}
 use tg_compiler::mir::{MirProgram, MirFunction, MirStatic, MirTypeDef}
-use tg_compiler::types::{DeinitPlan}
+use tg_compiler::types::{DeinitPlan, Type}
 use tg_compiler::lir::{
   LirFunction, LirAlloc, LirStmt, LirStmtKind, LirTermKind, LirValue,
   LirCond, LirBinOp, LirUnOp, LirDivOp,
@@ -182,7 +182,9 @@ use tg_compiler::lir::{
   lir_static_scalar_ok,
   lir_static_init_word_value, lir_static_unsupported_type_rule,
   lir_scalar_word_size, lir_is_bool_word,
-  LirVerifyRoute, verify_lir, lir_verify_fail_err
+  LirVerifyRoute, verify_lir, lir_verify_fail_err,
+  AbiCalleeSig, AbiVerifyCtx, AbiVerifyFn, abi_verify_ctx, abi_callee_sigs_of_program,
+  verify_abi_fn, abi_verify_fail_err
 }
 use tg_compiler::codegen::{build_static_label_table}
 use tg_compiler::asm::{
@@ -6270,6 +6272,10 @@ def x86_64_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u
     glue_names.insert(glue_nm.clone())
   end
   let drop_glue_fns = program.drop_glue_fns.clone()
+  # (audit order item 7) the ABI verifier context of this compile: the
+  # route's desc, the program type table and every declared signature.
+  # Built once; each function is verified right after allocation.
+  let abi_ctx = abi_verify_ctx(desc, LirVerifyRoute::LirVerifyX86_64, type_defs, abi_callee_sigs_of_program(program))
   # (fourth-audit P0-20) The program-wide enum-ABI version state, the
   # uniformity check and the object-metadata note are deleted: every
   # route crosses the canonical TaggedPtr value word.
@@ -6323,6 +6329,27 @@ def x86_64_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u
       if lir_violations.len() > 0 then
         return Result::Err(lir_verify_fail_err(peeped.name.clone(), lir_violations))
       end
+      # The mandatory ABI verification (audit order item 7 — verify_abi):
+      # the same post-allocation boundary chain check as the aarch64
+      # route; the route fails closed with the violation rows.
+      var abi_params: Vec[Type] = Vec::new()
+      var api = 0
+      while api < f.params.len() do
+        abi_params.push(f.params[api].ty.clone())
+        api = api + 1
+      end
+      let abi_rows = verify_abi_fn(abi_ctx, AbiVerifyFn {
+        name: f.name.clone(),
+        params: abi_params,
+        ret: f.ret_type.clone(),
+        variadic: f.is_extern_variadic,
+        is_extern: false,
+        lir: peeped,
+        alloc: alloc
+      })
+      if abi_rows.len() > 0 then
+        return Result::Err(abi_verify_fail_err(f.name.clone(), abi_rows))
+      end
       match x86_emit_fn(xe, peeped, alloc, externs, defined)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
@@ -6339,6 +6366,78 @@ def x86_64_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u
   let exts = x86_collect_exts(xe)
   let rels = xe.relocs.clone()
   Result::Ok(x86_elf64_obj(xe.buf.bytes.clone(), xe.data.clone(), fns, datas, xe.bss_size, exts, rels))
+end
+
+# The MirTypeDef table (TypeId.id -> def, the classifier's aggregate
+# registry) of a program — the x86-64 program verifier's setup.
+def x86_type_defs_for_abi_verify(program: MirProgram) -> Map[Int, MirTypeDef]
+  var out: Map[Int, MirTypeDef] = Map::new()
+  var i = 0
+  while i < program.types.len() do
+    out.insert(program.types[i].id.id, program.types[i].clone())
+    i = i + 1
+  end
+  out
+end
+
+# (audit order item 7) The x86-64 program verifier: rebuild the route's
+# FINAL LIR exactly as x86_64_compile_object does (x86_lower_mir_fn ->
+# lir_peephole -> x86_alloc_registers) for every body-bearing function
+# and run the ONE ABI verifier.  The driver evidence capture consumes
+# this entry on x86-64 hosts; the compile route gates on the SAME
+# function per boundary.
+pub def verify_abi_program_x86(program: MirProgram, desc: TargetDesc) -> Vec[String]
+  let ctx = abi_verify_ctx(desc, LirVerifyRoute::LirVerifyX86_64, x86_type_defs_for_abi_verify(program), abi_callee_sigs_of_program(program))
+  var static_labels: Map[String, String] = Map::new()
+  build_static_label_table(program, &mut static_labels)
+  let deinit_plans = program.deinit_plans.clone()
+  let finalizer_names = program.method_names_by_def.clone()
+  let drop_glue_fns = program.drop_glue_fns.clone()
+  var glue_names: Set[String] = Set::new()
+  for (_, glue_nm) in program.drop_glue_fns do
+    glue_names.insert(glue_nm.clone())
+  end
+  var out: Vec[String] = Vec::new()
+  var fi = 0
+  while fi < program.functions.len() do
+    let f = program.functions[fi]
+    if f.is_extern then
+      # No body: the call sites own the extern-boundary checks.
+    else
+      match x86_lower_mir_fn(f.clone(), x86_type_defs_for_abi_verify(program), deinit_plans.clone(), finalizer_names.clone(), glue_names.clone(), static_labels.clone(), drop_glue_fns.clone())
+      when Result::Err(e) then
+        out.push("abi-verify: " + f.name.clone() + ": lowering failed before ABI verification: " + e)
+      when Result::Ok(lir_fn) then
+        match x86_validate_fn(lir_fn)
+        when Result::Err(e) then
+          out.push("abi-verify: " + f.name.clone() + ": the x86-64 validator refused the lowered function before ABI verification: " + e)
+        when Result::Ok(_) then
+          let peeped = lir_peephole(lir_fn)
+          let alloc = x86_alloc_registers(peeped)
+          var pty: Vec[Type] = Vec::new()
+          var pi = 0
+          while pi < f.params.len() do
+            pty.push(f.params[pi].ty.clone())
+            pi = pi + 1
+          end
+          for row in verify_abi_fn(ctx, AbiVerifyFn {
+            name: f.name.clone(),
+            params: pty,
+            ret: f.ret_type.clone(),
+            variadic: f.is_extern_variadic,
+            is_extern: false,
+            lir: peeped,
+            alloc: alloc
+          }) do
+            out.push(row)
+          end
+        end
+      end
+    end
+    fi = fi + 1
+  end
+  out.sort()
+  out
 end
 
 # Executable/image emission is out of this stage: fail closed with the

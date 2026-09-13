@@ -59,6 +59,19 @@
 #   mut-equality-to-permissive   conv-neg  (the trait-conformance
 #                               negatives)
 #
+# THE KILLING TEST IDENTIFIERS (audit order item 5 closeout): a kill is
+# no longer reported as a suite id alone. For every failed suite the
+# harness scans the suite's OWN output for the per-test failure lines
+# `tg test` prints ("FAIL  <file>::<name>: <message>") and records the
+# DECLARED TEST NAME (or stable key — the contract
+# coverage_graph.tg's mutation_kill_mapping resolves through the run
+# snapshot's discovery table). A suite that failed WITHOUT a per-test
+# name (a compile/check-driven canary suite or a crashed runner) records
+# the suite + `crash` marker; a mutation killed at the BUILD step records
+# the `build` marker. Markers are suite-level instruments, never test
+# identities: the mapping reports them in `unmapped` and never fabricates
+# a discovery row from them.
+#
 # Usage: scripts/run_mutation_tests.sh [--binary <tg>] [--only <id,...>]
 #                                      [--out <file>] [--gate]
 #   --binary  a usable CURRENT-GRAMMAR compiler binary (the ladder's
@@ -508,12 +521,40 @@ run_behavioral_suite() {
   esac
 }
 
+# failing_test_identifiers <suite-log> — the per-suite failing TEST
+# IDENTIFIERS the suite's own output reports, one per line, first-seen
+# order. `tg test` prints one line per failing test:
+#     "  FAIL  <file>::<name>: <message>"
+# and the stable key/declared name (<name>) is the identifier the
+# mutation_kill_mapping contract resolves through the run snapshot's
+# discovery table. Compile/check-driven suite lines ("  FAIL  <file>:
+# parse errors", "FAIL: negative ...") carry NO per-test name and are
+# skipped here: the caller records the suite + `crash` marker instead —
+# never a fabricated identifier.
+failing_test_identifiers() {
+  awk '
+    $1 == "FAIL" {
+      ident = $2
+      sub(/:$/, "", ident)
+      if (ident !~ /::/) next
+      sub(/^.*::/, "", ident)
+      if (ident == "") next
+      if (!seen[ident]++) print ident
+    }' "$1" 2>/dev/null
+}
+
 # ———————————————————————————————————————————————————————————————
 # Step 4 — one mutation at a time, against a fresh copy
 # (mutate -> source-integrity confirmation -> build -> behavioral suite)
 # ———————————————————————————————————————————————————————————————
 declare -a KILLED_IDS=()
 declare -a KILLED_BY=()
+# (audit order item 5 closeout) the per-mutation KILLING TEST IDENTIFIER
+# rows: newline-joined "suite|identifier" rows parallel to KILLED_IDS
+# (identifier = the failing test's declared name/stable key parsed from
+# the suite's own output, or the `crash`/`build` marker when no per-test
+# name exists — never a fabricated test identity).
+declare -a KILLED_TESTS=()
 declare -a SURVIVED_IDS=()
 declare -a SURVIVED_REASON=()
 declare -a PENDING_IDS=()
@@ -646,8 +687,10 @@ for entry in "${CATALOG[@]}"; do
     KILLED=$((KILLED + 1))
     KILLED_IDS+=("$id")
     KILLED_BY+=("the BUILD step: the mutated kernel does not compile under the current-grammar binary (the mutation is caught at the compiler's own gate)")
+    KILLED_TESTS+=("build|build")
     echo "== $id — KILLED-BEHAVIORALLY (the BUILD step: the mutated kernel failed to compile under the current-grammar binary)"
     echo "   $file — $desc"
+    echo "   killing test identifier: build|build (no behavioral suite ran — the compiler's own build gate is the instrument; a marker, not a test identity)"
     continue
   fi
 
@@ -663,9 +706,32 @@ for entry in "${CATALOG[@]}"; do
   fi
   SUITE_LOG="$LOGS/$id.suite"
   FAILED_SUITES=""
+  KILL_ROWS=""
   for suite in $SUITES; do
-    if ! (cd "$WORK" && run_behavioral_suite "$suite" "$MUT_BIN" >>"$SUITE_LOG" 2>&1); then
+    # Per-suite log (audit order item 5 closeout): each suite's output is
+    # kept on its own so the FAILING TEST IDENTIFIERS can be parsed per
+    # suite; the combined log still carries every suite's output.
+    SUITE_ONE_LOG="$LOGS/$id.$suite.suite"
+    : > "$SUITE_ONE_LOG"
+    if (cd "$WORK" && run_behavioral_suite "$suite" "$MUT_BIN" >>"$SUITE_ONE_LOG" 2>&1); then
+      cat "$SUITE_ONE_LOG" >>"$SUITE_LOG"
+    else
+      cat "$SUITE_ONE_LOG" >>"$SUITE_LOG"
       FAILED_SUITES="${FAILED_SUITES:+$FAILED_SUITES, }$suite"
+      IDS="$(failing_test_identifiers "$SUITE_ONE_LOG")"
+      if [ -n "$IDS" ]; then
+        while IFS= read -r ident; do
+          [ -n "$ident" ] || continue
+          KILL_ROWS="${KILL_ROWS}${KILL_ROWS:+$'\n'}${suite}|${ident}"
+        done <<KILL_IDS_EOF
+$IDS
+KILL_IDS_EOF
+      else
+        # No per-test name: the suite failed without one (a compile/check
+        # canary or a crashed runner). The suite + `crash` marker is the
+        # honest identifier — never a fabricated test name.
+        KILL_ROWS="${KILL_ROWS}${KILL_ROWS:+$'\n'}${suite}|crash"
+      fi
     fi
   done
 
@@ -673,8 +739,13 @@ for entry in "${CATALOG[@]}"; do
     KILLED=$((KILLED + 1))
     KILLED_IDS+=("$id")
     KILLED_BY+=("the behavioral suite failed under the mutated compiler: $FAILED_SUITES")
+    KILLED_TESTS+=("$KILL_ROWS")
     echo "== $id — KILLED-BEHAVIORALLY (the behavioral suite failed under the mutated compiler: $FAILED_SUITES)"
     echo "   $file — $desc"
+    if [ -n "$KILL_ROWS" ]; then
+      echo "   killing test identifiers (suite|name-or-marker — the mutation_kill_mapping contract):"
+      printf '%s\n' "$KILL_ROWS" | sed 's/^/     /'
+    fi
     if [ -s "$SUITE_LOG" ]; then
       echo "   behavioral suite log (tail):"
       tail -n 25 "$SUITE_LOG" | sed 's/^/     /'
@@ -813,6 +884,36 @@ done
     idx=0
     for id in "${KILLED_IDS[@]}"; do
       echo "  $id — ${KILLED_BY[$idx]}"
+      if [ -n "${KILLED_TESTS[$idx]}" ]; then
+        printf '%s\n' "${KILLED_TESTS[$idx]}" | sed 's/^/      killing test identifier: /'
+      fi
+      idx=$((idx + 1))
+    done
+  fi
+  # (audit order item 5 closeout) THE KILLING TEST IDENTIFIERS: the
+  # harness now EMITS the per-suite failing test identifiers its suite
+  # logs report (`tg test` prints "FAIL  <file>::<name>" — the declared
+  # test name/stable key coverage_graph.mutation_kill_mapping resolves
+  # through the run snapshot's discovery table). The rows below are the
+  # mapping input in "mutation|suite|identifier" form; a suite that
+  # failed with no per-test name records the suite + `crash` marker and a
+  # BUILD-step kill records `build` — markers are suite-level instruments,
+  # NOT test identities: the mapping lands them in `unmapped` and never
+  # fabricates a discovery row from them.
+  echo "killing test identifier rows (mutation|suite|identifier — the"
+  echo "mutation_kill_mapping contract: name or stable key resolves; a"
+  echo "crash/build marker is an instrument, not a test identity):"
+  if [ "$KILLED" -gt 0 ]; then
+    idx=0
+    for id in "${KILLED_IDS[@]}"; do
+      if [ -n "${KILLED_TESTS[$idx]}" ]; then
+        while IFS= read -r row; do
+          [ -n "$row" ] || continue
+          echo "  $id|${row}"
+        done <<KILL_ROWS_EOF
+${KILLED_TESTS[$idx]}
+KILL_ROWS_EOF
+      fi
       idx=$((idx + 1))
     done
   fi

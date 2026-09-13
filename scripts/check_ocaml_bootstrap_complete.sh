@@ -33,8 +33,17 @@ fi
 cd stage0_ocaml
 dune build
 
+# Harness timeout calibration (shared with check_ocaml_seed_health.sh;
+# measured 2026-09-13 on the development host, seed at commit 7e2f449):
+# tg_bootstrap_gate measured 364.9 s wall (6:04.93); the cap is the
+# measurement x 2 rounded up to the next 60 s = 780 s, matching the health
+# script's calibrated gate cap (the host carries unrelated background load:
+# a 600 s cap tripped under a 1.4-1.6x contention factor on the
+# calibration day). A cap is a bound, never a skip. Re-measure when the
+# closure grows materially.
+GATE_TIMEOUT_S=780
 set +e
-timeout 600 _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. >/tmp/ocaml_bootstrap_gate.out 2>&1
+timeout "$GATE_TIMEOUT_S" _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. >/tmp/ocaml_bootstrap_gate.out 2>&1
 GATE_STATUS=$?
 set -e
 if [ "$GATE_STATUS" -ne 0 ]; then

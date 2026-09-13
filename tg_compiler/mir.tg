@@ -10,7 +10,7 @@
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Map, Set}
 use std::fs::{write_file_string}
-use tg_compiler::parser::{DiagnosticSemanticData, EffectViolationData}
+use tg_compiler::parser::{DiagnosticSemanticData, EffectViolationData, ContractDiagnosticData}
 use tg_compiler::token::{Span, span_dummy, parsed_int_to_host, parsed_float_to_host}
 use tg_compiler::ast::{
   Program, Crate, ItemKind, FunctionDecl, FnBody, ConstDecl,
@@ -201,11 +201,18 @@ struct MirProgram
   # default and keeps their behavior identical (no row is ever built).
   # opt_decisions_of_mir returns a copy of the rows (empty for
   # Option::None). See the decision-record section above the optimizer for
-  # the captured site list, the row vocabulary and the documented ABSENT
-  # sites (a scalar access-fact load/store forwarding pass DOES exist
-  # since audit item 32 and records "load-forwarding-rejected" rows on its
-  # alias-rule reject paths; no vectorizer exists in this optimizer, so no
-  # vectorization rows are produced).
+  # the captured site list and the row vocabulary: every named pass records
+  # ACCEPT and REJECT rows at its decision point — the inliner (inline-
+  # applied / inline-rejected with the size counts and active thresholds),
+  # bounds-check elimination (bounds-check-removed with the proof witness /
+  # bounds-check-retained with the proof gap), escape analysis
+  # (escape-promoted with the escape proof / escape-rejected with the real
+  # blocker), LICM (licm-hoisted with the loop-invariance fact /
+  # licm-rejected), the SLP vectorizer (slp-vectorized /
+  # slp-vectorize-rejected with the deciding blocker / slp-vectorize-skipped
+  # on a vector-less target), plus devirtualization and tail-call
+  # recognition. perf_report derives its bounds_checks_removed and
+  # inline_decisions metrics from these rows.
   opt_decisions: Option[Vec[OptimizationDecision]] = Option::None
   # (third-audit item 39 — the stable-keyed PGO profile): the profile the
   # driver loaded through --pgo-use (apply_pgo_profile) or the default
@@ -5249,7 +5256,10 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
           match expr.kind
           when ExprKind::ExprIntLit(n) then disc = parsed_int_to_host(&n)
           when ExprKind::ExprUnaryOp(UnOp::Neg, inner) then
-            match inner.kind
+            # The operand is an OWNED Box[Expr]: unbox it explicitly
+            # (Box is the wrapper, never transparent to the Expr it holds).
+            let inner_expr = inner.into_inner()
+            match inner_expr.kind
             when ExprKind::ExprIntLit(n) then disc = 0 - parsed_int_to_host(&n)
             when _ then ()
             end
@@ -6900,7 +6910,10 @@ def lower_enum_def(inout b: MirBuilder, e: EnumDecl) -> MirTypeDef
       match expr.kind
       when ExprKind::ExprIntLit(n) then disc = parsed_int_to_host(&n)
       when ExprKind::ExprUnaryOp(UnOp::Neg, inner) then
-        match inner.kind
+        # The operand is an OWNED Box[Expr]: unbox it explicitly
+        # (Box is the wrapper, never transparent to the Expr it holds).
+        let inner_expr = inner.into_inner()
+        match inner_expr.kind
         when ExprKind::ExprIntLit(n) then disc = 0 - parsed_int_to_host(&n)
         when _ then ()
         end
@@ -7264,7 +7277,7 @@ def lower_string_literal_to_owned(inout b: MirBuilder, arg_expr: Expr, span: Spa
   let callee_op = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("string_from_static".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::String), Vec::new()),
+      ty: Type::FnPtr(Vec::new(), Type::String, Vec::new()),
       instance: Option::None
     })
   }
@@ -7320,7 +7333,7 @@ def lower_call_arg(inout b: MirBuilder, callee: Option[Expr], callee_name: Optio
     value = MirCallValue::Value(lower_string_literal_to_owned(b, arg_expr, span))
   elsif kind_name == "ExprAccess" then
     match arg_expr.kind
-    when ExprKind::ExprAccess(inner) then value = MirCallValue::Place(lower_place(b, &inner))
+    when ExprKind::ExprAccess(inner) then value = MirCallValue::Place(lower_place(b, inner.into_inner()))
     when _ then ()
     end
   elsif effect == AccessEffect::Consume then
@@ -7344,7 +7357,7 @@ def qualify_field_callee_name(expr: Expr, field_name: String) -> String
   when ExprKind::ExprIdent(name) then
     name.clone() + "::" + field_name
   when ExprKind::ExprFieldAccess(base, inner_field) then
-    qualify_field_callee_name(&base, inner_field.clone()) + "::" + field_name
+    qualify_field_callee_name(base.into_inner(), inner_field.clone()) + "::" + field_name
   when ExprKind::ExprPath(path) then
     var qualified = ""
     for seg in path.segments do
@@ -7383,7 +7396,7 @@ def mir_fn_operand_with_instance(b: MirBuilder, fn_name: String, instance: Optio
   MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem(emission_name),
-      ty: Type::FnPtr(Vec::new(), Box::new(ret_type), Vec::new()),
+      ty: Type::FnPtr(Vec::new(), ret_type, Vec::new()),
       instance: instance
     })
   }
@@ -9206,13 +9219,16 @@ def mir_emit_accessor_writeback(inout b: MirBuilder, expr: Expr, local_id: MirLo
       b.errors.push("internal error: a Map::get_modify accessor call without its key argument reached the with write-back lowering (node " + expr.node_id.to_string() + ")")
       return true
     end
-    if !expr_is_place_like(&recv) then
+    # The receiver is an OWNED Box[Expr]: unbox it once (Box is the
+    # wrapper, never transparent to the Expr it holds).
+    let recv_expr = recv.into_inner()
+    if !expr_is_place_like(&recv_expr) then
       b.errors.push("internal error: the with-scoped access write-back needs the accessor's map receiver as a place (node " + expr.node_id.to_string() + ")")
       return true
     end
-    let recv_place = lower_place(b, &recv)
+    let recv_place = lower_place(b, &recv_expr)
     let recv_place_ty = mir_place_type(recv_place, b)
-    let recv_ty = mir_source_expr_ty(b, &recv)
+    let recv_ty = mir_source_expr_ty(b, &recv_expr)
     let recv_op = mir_recv_operand(b, recv_place, &recv_place_ty, recv_ty, span)
     # The entry's value type V (the receiver Map's second type argument):
     # the intrinsic's destination is the discarded Option[V] of the
@@ -9227,7 +9243,7 @@ def mir_emit_accessor_writeback(inout b: MirBuilder, expr: Expr, local_id: MirLo
     let ins_callee = MirOperand {
       kind: MirOperandKind::MirConstant(MirConstant {
         kind: MirConstantKind::MirFnItem("__intrinsic_map_insert".to_string()),
-        ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+        ty: Type::FnPtr(Vec::new(), Type::Unit, Vec::new()),
         instance: Option::None
       })
     }
@@ -10455,7 +10471,7 @@ def lower_callee_expr(inout b: MirBuilder, callee_expr: Expr, span: Span) -> Mir
   elsif ck == "ExprFieldAccess" then
     match callee_expr.kind
     when ExprKind::ExprFieldAccess(recv, field) then
-      return mir_fn_operand(b, qualify_field_callee_name(&recv, field.clone()))
+      return mir_fn_operand(b, qualify_field_callee_name(recv.into_inner(), field.clone()))
     when _ then ()
     end
   elsif ck == "ExprEnumVariant" then
@@ -10728,7 +10744,7 @@ def lr_call(inout b: MirBuilder, callee_expr: Expr, arg_exprs: Vec[Expr], span: 
       when _ then ret_type = mir_lookup_fn_ret_type(b, name.clone())
       end
     when ExprKind::ExprFieldAccess(recv, field_name) then
-      ret_type = mir_lookup_fn_ret_type(b, qualify_field_callee_name(&recv, field_name.clone()))
+      ret_type = mir_lookup_fn_ret_type(b, qualify_field_callee_name(recv.into_inner(), field_name.clone()))
     when ExprKind::ExprEnumVariant(path, _, _) then
       ret_type = mir_lookup_fn_ret_type(b, resolve_static_path_callee_name(b, &path))
     when ExprKind::ExprPath(path) then
@@ -10830,7 +10846,7 @@ def lr_static_path_call(inout b: MirBuilder, path: AstPath, args: Vec[Expr], spa
   var callee_op = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem(fn_name.clone()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+      ty: Type::FnPtr(Vec::new(), Type::Unit, Vec::new()),
       instance: Option::None
     })
   }
@@ -11174,7 +11190,7 @@ def mir_emit_map_remove_owned(
   let rm_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_map_remove_key".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+      ty: Type::FnPtr(Vec::new(), Type::Unit, Vec::new()),
       instance: Option::None
     })
   }
@@ -11215,7 +11231,7 @@ def mir_emit_map_remove_owned(
   let wrap_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_option_wrap".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+      ty: Type::FnPtr(Vec::new(), Type::Unit, Vec::new()),
       instance: Option::None
     })
   }
@@ -11256,7 +11272,7 @@ def mir_emit_set_remove_owned(
   let rm_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_set_remove_key".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+      ty: Type::FnPtr(Vec::new(), Type::Unit, Vec::new()),
       instance: Option::None
     })
   }
@@ -11332,7 +11348,7 @@ def mir_emit_map_insert_owned(
   let ins_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_map_insert".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+      ty: Type::FnPtr(Vec::new(), Type::Unit, Vec::new()),
       instance: Option::None
     })
   }
@@ -11399,7 +11415,7 @@ def mir_emit_set_insert_owned(
   let ins_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_set_insert".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+      ty: Type::FnPtr(Vec::new(), Type::Unit, Vec::new()),
       instance: Option::None
     })
   }
@@ -11509,7 +11525,7 @@ def mir_emit_array_clear_owned(
   let cl_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_array_clear".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+      ty: Type::FnPtr(Vec::new(), Type::Unit, Vec::new()),
       instance: Option::None
     })
   }
@@ -11551,7 +11567,7 @@ def mir_emit_map_clear_owned(
   let dr_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_map_drain_one".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+      ty: Type::FnPtr(Vec::new(), Type::Unit, Vec::new()),
       instance: Option::None
     })
   }
@@ -11638,7 +11654,7 @@ def mir_emit_set_clear_owned(
   let sd_callee = MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem("__intrinsic_set_drain_one".to_string()),
-      ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+      ty: Type::FnPtr(Vec::new(), Type::Unit, Vec::new()),
       instance: Option::None
     })
   }
@@ -11737,7 +11753,9 @@ def mir_try_collection_ownership_lowering(
           # frame slot holding the consumed key image).
           let key_slot = match arg_exprs[0].kind
           when ExprKind::ExprAccess(inner) then
-            if expr_is_place_like(&inner) then Option::Some(lower_place(b, &inner)) else Option::None end
+            # The access operand is an OWNED Box[Expr]: unbox it once.
+            let inner_expr = inner.into_inner()
+            if expr_is_place_like(&inner_expr) then Option::Some(lower_place(b, &inner_expr)) else Option::None end
           when _ then
             if expr_is_place_like(&arg_exprs[0]) then Option::Some(lower_place(b, &arg_exprs[0])) else Option::None end
           end
@@ -11754,7 +11772,9 @@ def mir_try_collection_ownership_lowering(
         when Option::Some(t_glue) then
           let item_slot = match arg_exprs[0].kind
           when ExprKind::ExprAccess(inner) then
-            if expr_is_place_like(&inner) then Option::Some(lower_place(b, &inner)) else Option::None end
+            # The access operand is an OWNED Box[Expr]: unbox it once.
+            let inner_expr = inner.into_inner()
+            if expr_is_place_like(&inner_expr) then Option::Some(lower_place(b, &inner_expr)) else Option::None end
           when _ then
             if expr_is_place_like(&arg_exprs[0]) then Option::Some(lower_place(b, &arg_exprs[0])) else Option::None end
           end
@@ -11868,21 +11888,21 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
     match expr.kind
     when ExprKind::ExprBinaryOp(op, left, right) then
       let bt_ty = mir_binop_result_type(b, &expr)
-      return Result::Ok(lr_binary(b, op, &left, &right, span, &bt_ty))
+      return Result::Ok(lr_binary(b, op, left.into_inner(), right.into_inner(), span, &bt_ty))
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
     
   elsif kind_name == "ExprUnaryOp" then
     match expr.kind
-    when ExprKind::ExprUnaryOp(op, inner) then return Result::Ok(lr_unary(b, op, &inner, span))
+    when ExprKind::ExprUnaryOp(op, inner) then return Result::Ok(lr_unary(b, op, inner.into_inner(), span))
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
     
   elsif kind_name == "ExprRawDeref" then
     match expr.kind
-    when ExprKind::ExprRawDeref(inner) then return Result::Ok(lr_deref(b, &inner, span))
+    when ExprKind::ExprRawDeref(inner) then return Result::Ok(lr_deref(b, inner.into_inner(), span))
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -11896,7 +11916,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
 
   elsif kind_name == "ExprArrayRepeat" then
     match expr.kind
-    when ExprKind::ExprArrayRepeat(elem, count) then return lr_array_repeat(b, &elem, &count, span)
+    when ExprKind::ExprArrayRepeat(elem, count) then return lr_array_repeat(b, elem.into_inner(), count.into_inner(), span)
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -11911,7 +11931,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
   elsif kind_name == "ExprCall" then
     match expr.kind
     when ExprKind::ExprCall(callee_expr, arg_exprs) then
-      return Result::Ok(lr_call(b, &callee_expr, &arg_exprs, span, expr.node_id))
+      return Result::Ok(lr_call(b, callee_expr.into_inner(), &arg_exprs, span, expr.node_id))
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -11919,12 +11939,15 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
   elsif kind_name == "ExprMethodCall" then
     match expr.kind
     when ExprKind::ExprMethodCall(receiver, method_name, type_args, arg_exprs) then
+      # The receiver is an OWNED Box[Expr]: unbox it once (Box is the
+      # wrapper, never transparent to the Expr it holds).
+      let receiver_expr = receiver.into_inner()
       let normalized_method_name = normalize_method_name(method_name.clone())
       # Lower receiver as a reference (address-of) for method calls.
       # If the receiver is not already place-like (for example a chained call
       # like vec.len().to_string()), first spill it into a temp local so we can
       # borrow that temp instead of falling back to local 0.
-      var recv_place = lower_receiver_place(b, &receiver, span)
+      var recv_place = lower_receiver_place(b, &receiver_expr, span)
   
       # Try to resolve the receiver type for method name mangling.
       # For field access chains (e.g.  lex.tokens.push(x)), the AST-level
@@ -11934,7 +11957,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       # correctly, producing Vec__push rather than Lexer__push.
       var recv_place_type = mir_place_type(&recv_place, b)
       if recv_place_type == Type::Unit then
-        recv_place_type = mir_source_expr_ty(b, &receiver)
+        recv_place_type = mir_source_expr_ty(b, &receiver_expr)
       end
 
       match recv_place_type
@@ -12183,7 +12206,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       # effect is the TypedCall's receiver_effect (typed_arg_idx = -1); the
       # explicit args' effects are the TypedCallArg effects (the flat
       # access_effects / convention fallback covers the unrecorded nodes).
-      let recv_effect = call_arg_effect(b, Option::None, 0, &receiver, expr.node_id, -1)
+      let recv_effect = call_arg_effect(b, Option::None, 0, &receiver_expr, expr.node_id, -1)
       var mir_args = Vec::new()
       mir_args.push(MirCallArg { effect: recv_effect, value: MirCallValue::Value(recv_op) })
       var arg_idx = 0
@@ -12337,7 +12360,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       # emission-name index of the registered Drop/deinit callables), never
       # a bare name pattern.
       if b.finalizer_emission_names.contains(&resolved_method) then
-        let recv_ty = mir_source_expr_ty(b, &receiver)
+        let recv_ty = mir_source_expr_ty(b, &receiver_expr)
         var vis2 = Set::new()
         let recv_plan = deinit_plan_for_type(b, &recv_ty, &mut vis2)
         let fields_plan = match recv_plan
@@ -12361,7 +12384,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
   elsif kind_name == "ExprFieldAccess" then
     match expr.kind
     when ExprKind::ExprFieldAccess(recv, field_name) then
-      let base_place = lower_place(b, &recv)
+      let base_place = lower_place(b, recv.into_inner())
       # If the base local has a reference type, auto-insert a ProjDeref
       let base_ty = lookup_local_type(b, &base_place.local)
       let needs_deref = match base_ty
@@ -12389,8 +12412,8 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
   elsif kind_name == "ExprIndex" then
     match expr.kind
     when ExprKind::ExprIndex(base_expr, index_expr) then
-      let base_place = lower_place(b, &base_expr)
-      let idx_op = lower_expr(b, &index_expr, span)
+      let base_place = lower_place(b, base_expr.into_inner())
+      let idx_op = lower_expr(b, index_expr.into_inner(), span)
       # Store index into a temp so we can reference it as a MirLocalId
       let idx_tmp = add_temp(b, Type::Int, span)
       push_stmt(b, MirStatementKind::MirAssign(place_local(idx_tmp), MirRvalue {
@@ -12542,7 +12565,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
         captures: captures.clone(),
         capture_types: capture_types.clone(),
         capture_ids: capture_ids.clone(),
-        body: body.clone(),
+        body: body.into_inner(),
         ret_type: ret_type.clone(),
         node_id: expr.node_id
       })
@@ -12552,7 +12575,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       let fn_op = MirOperand {
         kind: MirOperandKind::MirConstant(MirConstant {
           kind: MirConstantKind::MirFnItem(closure_name.clone()),
-          ty: Type::FnPtr(fn_param_types_of(&param_types), Box::new(ret_type.clone()), Vec::new()),
+          ty: Type::FnPtr(fn_param_types_of(&param_types), ret_type.clone(), Vec::new()),
           instance: Option::None
         })
       }
@@ -12655,7 +12678,10 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
   elsif kind_name == "ExprCast" then
     match expr.kind
     when ExprKind::ExprCast(inner, target_ty) then
-      let inner_op = lower_expr(b, &inner, span)
+      # The operand is an OWNED Box[Expr]: unbox it once (Box is the
+      # wrapper, never transparent to the Expr it holds).
+      let inner_expr = inner.into_inner()
+      let inner_op = lower_expr(b, &inner_expr, span)
   # the cast's TARGET type is the cast expression's typed-tree
       # record (the checker's resolved cast result type — the typed table
       # is the authority; TypeExpr is never interpreted after checking).
@@ -12668,7 +12694,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       # zero; int -> float rounds once under the strict RNE environment).
       # Everything else keeps the generic Transmute (bit-preserving)
       # marker exactly as before.
-      let cast_kind = match mir_source_expr_ty(b, &inner)
+      let cast_kind = match mir_source_expr_ty(b, &inner_expr)
       when Type::Float then
         match target
         when Type::Int then CastKind::FloatToInt
@@ -12786,13 +12812,17 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
     when ExprKind::ExprAssign(target, value) then
       # Assignment EXPRESSIONS share the statement-assignment replacement
       # semantics (drop old -> store new), keyed on the EXPRESSION's node id
-      # ("assign::<expr id>" — the checker records the same key).
-      let place = lower_place(b, &target)
-      let value_ty = mir_source_expr_ty(b, &value)
+      # ("assign::<expr id>" — the checker records the same key). The
+      # target/value payloads are OWNED Box[Expr]s: unbox them once (Box
+      # is the wrapper, never transparent to the Expr it holds).
+      let target_expr = target.into_inner()
+      let value_expr = value.into_inner()
+      let place = lower_place(b, &target_expr)
+      let value_ty = mir_source_expr_ty(b, &value_expr)
       match lower_assign_drop_chain(b, expr.node_id, span, place.clone())
       when Option::Some(cont) then
         switch_to_block(b, cont)
-        match lower_expr_to_rvalue(b, &value, span)
+        match lower_expr_to_rvalue(b, &value_expr, span)
         when Result::Ok(rvalue) then
           push_assign(b, place, rvalue, span)
           refine_assignment_target_type(b, &place, &value_ty)
@@ -12804,7 +12834,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
  # the indexed-assignment old element (same as the
         # statement form — the store overwrites data + index*stride, so an
         # owning element type is dropped through its concrete glue first).
-        match mir_try_indexed_assign_drop(b, &target, &place)
+        match mir_try_indexed_assign_drop(b, &target_expr, &place)
         when Option::Some(ig) then
           let cont_blk = create_block(b)
           let drop_blk = create_block(b)
@@ -12822,7 +12852,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
           when Option::None then ()
           end
           switch_to_block(b, cont_blk)
-          match lower_expr_to_rvalue(b, &value, span)
+          match lower_expr_to_rvalue(b, &value_expr, span)
           when Result::Ok(rvalue) then
             push_assign(b, place, rvalue, span)
             refine_assignment_target_type(b, &place, &value_ty)
@@ -12831,7 +12861,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
             b.errors.push(e)
           end
         when Option::None then
-          match lower_expr_to_rvalue(b, &value, span)
+          match lower_expr_to_rvalue(b, &value_expr, span)
           when Result::Ok(rvalue) then
             push_assign(b, place, rvalue, span)
             refine_assignment_target_type(b, &place, &value_ty)
@@ -12864,7 +12894,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       # runtime. Erasure matches the stage0 lowering and keeps the
       # compiler kernel — which uses `?` throughout (e.g.
       # `parse_toml(s)?`) — compiling through MIR.
-      return lower_expr_to_rvalue(b, &inner, span)
+      return lower_expr_to_rvalue(b, inner.into_inner(), span)
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -13016,12 +13046,15 @@ def lower_place(inout b: MirBuilder, expr: Expr) -> Place
     # that as the place base.  Falling through to lower_place's catch-all
     # would otherwise yield place_local(MirLocalId{id:0}) and silently
     # compute the field address off local 0, corrupting unrelated memory.
-    let base = if expr_is_place_like(recv) then
-      lower_place(b, recv)
+    # The receiver is an OWNED Box[Expr]: unbox it once (Box is the
+    # wrapper, never transparent to the Expr it holds).
+    let recv_expr = recv.into_inner()
+    let base = if expr_is_place_like(&recv_expr) then
+      lower_place(b, &recv_expr)
     else
       let recv_tmp_span = Span { file: "", start: 0, end_pos: 0 }
-      let recv_tmp = add_temp(b, mir_source_expr_ty(b, recv), recv_tmp_span)
-      match lower_expr_to_rvalue(b, recv, recv_tmp_span)
+      let recv_tmp = add_temp(b, mir_source_expr_ty(b, &recv_expr), recv_tmp_span)
+      match lower_expr_to_rvalue(b, &recv_expr, recv_tmp_span)
       when Result::Ok(rv) then
         push_assign(b, place_local(recv_tmp), rv, recv_tmp_span)
       when Result::Err(e) then
@@ -13050,12 +13083,14 @@ def lower_place(inout b: MirBuilder, expr: Expr) -> Place
   elsif kind_name == "ExprRawDeref" then
     match expr.kind
     when ExprKind::ExprRawDeref(inner) then
-    let base = if expr_is_place_like(inner) then
-      lower_place(b, inner)
+    # The operand is an OWNED Box[Expr]: unbox it once.
+    let inner_expr = inner.into_inner()
+    let base = if expr_is_place_like(&inner_expr) then
+      lower_place(b, &inner_expr)
     else
       let tmp_span = Span { file: "", start: 0, end_pos: 0 }
-      let tmp = add_temp(b, mir_source_expr_ty(b, inner), tmp_span)
-      match lower_expr_to_rvalue(b, inner, tmp_span)
+      let tmp = add_temp(b, mir_source_expr_ty(b, &inner_expr), tmp_span)
+      match lower_expr_to_rvalue(b, &inner_expr, tmp_span)
       when Result::Ok(rv) then
         push_assign(b, place_local(tmp), rv, tmp_span)
       when Result::Err(e) then
@@ -13069,13 +13104,15 @@ def lower_place(inout b: MirBuilder, expr: Expr) -> Place
   elsif kind_name == "ExprIndex" then
     match expr.kind
     when ExprKind::ExprIndex(recv, index) then
-    # Same spill-non-place-receivers rule as ExprFieldAccess.
-    let base = if expr_is_place_like(recv) then
-      lower_place(b, recv)
+    # Same spill-non-place-receivers rule as ExprFieldAccess. The receiver
+    # and index payloads are OWNED Box[Expr]s: unbox them explicitly.
+    let recv_expr = recv.into_inner()
+    let base = if expr_is_place_like(&recv_expr) then
+      lower_place(b, &recv_expr)
     else
       let recv_tmp_span = Span { file: "", start: 0, end_pos: 0 }
-      let recv_tmp = add_temp(b, mir_source_expr_ty(b, recv), recv_tmp_span)
-      match lower_expr_to_rvalue(b, recv, recv_tmp_span)
+      let recv_tmp = add_temp(b, mir_source_expr_ty(b, &recv_expr), recv_tmp_span)
+      match lower_expr_to_rvalue(b, &recv_expr, recv_tmp_span)
       when Result::Ok(rv) then
         push_assign(b, place_local(recv_tmp), rv, recv_tmp_span)
       when Result::Err(e) then
@@ -13084,7 +13121,7 @@ def lower_place(inout b: MirBuilder, expr: Expr) -> Place
       place_local(recv_tmp)
     end
     # Evaluate the index expression and store in a temp
-    let idx_op = lower_expr(b, index, Span { file: "", start: 0, end_pos: 0 })
+    let idx_op = lower_expr(b, index.into_inner(), Span { file: "", start: 0, end_pos: 0 })
     let idx_tmp = add_temp(b, Type::Int, Span { file: "", start: 0, end_pos: 0 })
     push_stmt(b, MirStatementKind::MirAssign(place_local(idx_tmp), MirRvalue {
       kind: MirRvalueKind::MirMove(idx_op)
@@ -13156,7 +13193,8 @@ def lower_call_callee(inout b: MirBuilder, expr: Expr, span: Span) -> MirOperand
     end
   when ExprKind::ExprFieldAccess(recv, field) then
     # Preserve qualified static calls such as Module::func or Type::new.
-    mir_fn_operand(b, qualify_field_callee_name(&recv, field.clone()))
+    # The receiver is an OWNED Box[Expr]: unbox it explicitly.
+    mir_fn_operand(b, qualify_field_callee_name(recv.into_inner(), field.clone()))
   when ExprKind::ExprEnumVariant(path, _, _) then
     mir_fn_operand(b, resolve_static_path_callee_name(b, &path))
   when ExprKind::ExprPath(path) then
@@ -13504,21 +13542,21 @@ def mir_collect_free_vars(expr: Expr, bound: Set[String]) -> Set[String]
       free.insert(name.clone())
     end
   when ExprKind::ExprBinaryOp(_, left, right) then
-    let left_free = mir_collect_free_vars(&left, bound)
+    let left_free = mir_collect_free_vars(left.into_inner(), bound)
     for name in left_free do
       free.insert(name.clone())
     end
-    let right_free = mir_collect_free_vars(&right, bound)
+    let right_free = mir_collect_free_vars(right.into_inner(), bound)
     for name in right_free do
       free.insert(name.clone())
     end
   when ExprKind::ExprUnaryOp(_, inner) then
-    let inner_free = mir_collect_free_vars(&inner, bound)
+    let inner_free = mir_collect_free_vars(inner.into_inner(), bound)
     for name in inner_free do
       free.insert(name.clone())
     end
   when ExprKind::ExprCall(callee, args) then
-    let callee_free = mir_collect_free_vars(&callee, bound)
+    let callee_free = mir_collect_free_vars(callee.into_inner(), bound)
     for name in callee_free do
       free.insert(name.clone())
     end
@@ -13531,7 +13569,7 @@ def mir_collect_free_vars(expr: Expr, bound: Set[String]) -> Set[String]
       arg_idx = arg_idx + 1
     end
   when ExprKind::ExprMethodCall(recv, _, _, args) then
-    let recv_free = mir_collect_free_vars(&recv, bound)
+    let recv_free = mir_collect_free_vars(recv.into_inner(), bound)
     for name in recv_free do
       free.insert(name.clone())
     end
@@ -13544,26 +13582,26 @@ def mir_collect_free_vars(expr: Expr, bound: Set[String]) -> Set[String]
       arg_idx = arg_idx + 1
     end
   when ExprKind::ExprFieldAccess(recv, _) then
-    let recv_free = mir_collect_free_vars(&recv, bound)
+    let recv_free = mir_collect_free_vars(recv.into_inner(), bound)
     for name in recv_free do
       free.insert(name.clone())
     end
   when ExprKind::ExprIndex(base, idx) then
-    let base_free = mir_collect_free_vars(&base, bound)
+    let base_free = mir_collect_free_vars(base.into_inner(), bound)
     for name in base_free do
       free.insert(name.clone())
     end
-    let index_free = mir_collect_free_vars(&idx, bound)
+    let index_free = mir_collect_free_vars(idx.into_inner(), bound)
     for name in index_free do
       free.insert(name.clone())
     end
   when ExprKind::ExprAccess(inner) then
-    let inner_free = mir_collect_free_vars(&inner, bound)
+    let inner_free = mir_collect_free_vars(inner.into_inner(), bound)
     for name in inner_free do
       free.insert(name.clone())
     end
   when ExprKind::ExprRawDeref(inner) then
-    let inner_free = mir_collect_free_vars(&inner, bound)
+    let inner_free = mir_collect_free_vars(inner.into_inner(), bound)
     for name in inner_free do
       free.insert(name.clone())
     end
@@ -13577,11 +13615,11 @@ def mir_collect_free_vars(expr: Expr, bound: Set[String]) -> Set[String]
       elem_idx = elem_idx + 1
     end
   when ExprKind::ExprArrayRepeat(elem, count) then
-    let elem_free = mir_collect_free_vars(&elem, bound)
+    let elem_free = mir_collect_free_vars(elem.into_inner(), bound)
     for name in elem_free do
       free.insert(name.clone())
     end
-    let count_free = mir_collect_free_vars(&count, bound)
+    let count_free = mir_collect_free_vars(count.into_inner(), bound)
     for name in count_free do
       free.insert(name.clone())
     end
@@ -13628,7 +13666,7 @@ def mir_collect_free_vars(expr: Expr, bound: Set[String]) -> Set[String]
         inner_bound.insert(name.clone())
       end
     end
-    let inner_free = mir_collect_free_vars(&inner_body, &inner_bound)
+    let inner_free = mir_collect_free_vars(inner_body.into_inner(), &inner_bound)
     for name in inner_free do
       free.insert(name.clone())
     end
@@ -14558,12 +14596,12 @@ def for_expr_rooted_at_name(name: String, expr: Expr) -> Bool
     end
   elsif kind_name == "ExprFieldAccess" then
     match expr.kind
-    when ExprKind::ExprFieldAccess(base, _) then for_expr_rooted_at_name(name, &base)
+    when ExprKind::ExprFieldAccess(base, _) then for_expr_rooted_at_name(name, base.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprIndex" then
     match expr.kind
-    when ExprKind::ExprIndex(base, _) then for_expr_rooted_at_name(name, &base)
+    when ExprKind::ExprIndex(base, _) then for_expr_rooted_at_name(name, base.into_inner())
     when _ then false
     end
   else
@@ -14594,7 +14632,7 @@ def for_expr_uses_name(b: MirBuilder, name: String, expr: Expr) -> Bool
   elsif kind_name == "ExprArrayRepeat" then
     match expr.kind
     when ExprKind::ExprArrayRepeat(elem, count) then
-      if for_expr_uses_name(b, name, &elem) then true else for_expr_uses_name(b, name, &count) end
+      if for_expr_uses_name(b, name, elem.into_inner()) then true else for_expr_uses_name(b, name, count.into_inner()) end
     when _ then false
     end
   elsif kind_name == "ExprTupleLit" then
@@ -14630,42 +14668,47 @@ def for_expr_uses_name(b: MirBuilder, name: String, expr: Expr) -> Bool
   elsif kind_name == "ExprBinaryOp" then
     match expr.kind
     when ExprKind::ExprBinaryOp(_, lhs, rhs) then
-      for_expr_uses_name(b, name, &lhs) || for_expr_uses_name(b, name, &rhs)
+      for_expr_uses_name(b, name, lhs.into_inner()) || for_expr_uses_name(b, name, rhs.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprUnaryOp" then
     match expr.kind
-    when ExprKind::ExprUnaryOp(_, operand) then for_expr_uses_name(b, name, &operand)
+    when ExprKind::ExprUnaryOp(_, operand) then for_expr_uses_name(b, name, operand.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprFieldAccess" then
     match expr.kind
     when ExprKind::ExprFieldAccess(base, _) then
-      if for_expr_is_bare_name(name, &base) then
+      # The child is an OWNED Box[Expr]: unbox it exactly once.
+      let base_expr = base.into_inner()
+      if for_expr_is_bare_name(name, &base_expr) then
         false
       else
-        for_expr_uses_name(b, name, &base)
+        for_expr_uses_name(b, name, &base_expr)
       end
     when _ then false
     end
   elsif kind_name == "ExprIndex" then
     match expr.kind
     when ExprKind::ExprIndex(base, idx) then
-      let base_unsafe = if for_expr_is_bare_name(name, &base) then
+      let base_expr = base.into_inner()
+      let idx_expr = idx.into_inner()
+      let base_unsafe = if for_expr_is_bare_name(name, &base_expr) then
         false
       else
-        for_expr_uses_name(b, name, &base)
+        for_expr_uses_name(b, name, &base_expr)
       end
-      base_unsafe || for_expr_uses_name(b, name, &idx)
+      base_unsafe || for_expr_uses_name(b, name, &idx_expr)
     when _ then false
     end
   elsif kind_name == "ExprMethodCall" then
     match expr.kind
     when ExprKind::ExprMethodCall(receiver, _, _, args) then
-      if for_expr_rooted_at_name(name, &receiver) then
+      let receiver_expr = receiver.into_inner()
+      if for_expr_rooted_at_name(name, &receiver_expr) then
         true
       else
-        if for_expr_uses_name(b, name, &receiver) then
+        if for_expr_uses_name(b, name, &receiver_expr) then
           true
         else
           for_exprs_uses_name(b, name, &args)
@@ -14676,10 +14719,11 @@ def for_expr_uses_name(b: MirBuilder, name: String, expr: Expr) -> Bool
   elsif kind_name == "ExprCall" then
     match expr.kind
     when ExprKind::ExprCall(callee, args) then
-      if for_expr_rooted_at_name(name, &callee) then
+      let callee_expr = callee.into_inner()
+      if for_expr_rooted_at_name(name, &callee_expr) then
         true
       else
-        if for_expr_uses_name(b, name, &callee) then
+        if for_expr_uses_name(b, name, &callee_expr) then
           true
         else
           for_call_args_uses_name(b, name, &args)
@@ -14689,26 +14733,28 @@ def for_expr_uses_name(b: MirBuilder, name: String, expr: Expr) -> Bool
     end
   elsif kind_name == "ExprClosure" then
     match expr.kind
-    when ExprKind::ExprClosure(_, _, body) then for_expr_mentions_name(b, name, &body)
+    when ExprKind::ExprClosure(_, _, body) then for_expr_mentions_name(b, name, body.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprAccess" then
     match expr.kind
     when ExprKind::ExprAccess(inner) then
-      if for_expr_rooted_at_name(name, &inner) then
+      let inner_expr = inner.into_inner()
+      if for_expr_rooted_at_name(name, &inner_expr) then
         true
       else
-        for_expr_uses_name(b, name, &inner)
+        for_expr_uses_name(b, name, &inner_expr)
       end
     when _ then false
     end
   elsif kind_name == "ExprRawDeref" then
     match expr.kind
     when ExprKind::ExprRawDeref(inner) then
-      if for_expr_rooted_at_name(name, &inner) then
+      let inner_expr = inner.into_inner()
+      if for_expr_rooted_at_name(name, &inner_expr) then
         true
       else
-        for_expr_uses_name(b, name, &inner)
+        for_expr_uses_name(b, name, &inner_expr)
       end
     when _ then false
     end
@@ -14739,23 +14785,23 @@ def for_expr_uses_name(b: MirBuilder, name: String, expr: Expr) -> Bool
     end
   elsif kind_name == "ExprAwait" then
     match expr.kind
-    when ExprKind::ExprAwait(inner) then for_expr_uses_name(b, name, &inner)
+    when ExprKind::ExprAwait(inner) then for_expr_uses_name(b, name, inner.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprTry" then
     match expr.kind
-    when ExprKind::ExprTry(inner) then for_expr_uses_name(b, name, &inner)
+    when ExprKind::ExprTry(inner) then for_expr_uses_name(b, name, inner.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprRange" then
     match expr.kind
     when ExprKind::ExprRange(lo, hi, _) then
       let lo_unsafe = match lo
-      when Option::Some(lo_e) then for_expr_uses_name(b, name, &lo_e)
+      when Option::Some(lo_e) then for_expr_uses_name(b, name, lo_e.into_inner())
       when Option::None then false
       end
       let hi_unsafe = match hi
-      when Option::Some(hi_e) then for_expr_uses_name(b, name, &hi_e)
+      when Option::Some(hi_e) then for_expr_uses_name(b, name, hi_e.into_inner())
       when Option::None then false
       end
       lo_unsafe || hi_unsafe
@@ -14763,12 +14809,12 @@ def for_expr_uses_name(b: MirBuilder, name: String, expr: Expr) -> Bool
     end
   elsif kind_name == "ExprCast" then
     match expr.kind
-    when ExprKind::ExprCast(inner, _) then for_expr_uses_name(b, name, &inner)
+    when ExprKind::ExprCast(inner, _) then for_expr_uses_name(b, name, inner.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprTypeCheck" then
     match expr.kind
-    when ExprKind::ExprTypeCheck(inner, _) then for_expr_uses_name(b, name, &inner)
+    when ExprKind::ExprTypeCheck(inner, _) then for_expr_uses_name(b, name, inner.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprComptime" then
@@ -14784,17 +14830,19 @@ def for_expr_uses_name(b: MirBuilder, name: String, expr: Expr) -> Bool
   elsif kind_name == "ExprAssign" then
     match expr.kind
     when ExprKind::ExprAssign(target, value) then
-      if for_expr_rooted_at_name(name, &target) then
+      let target_expr = target.into_inner()
+      let value_expr = value.into_inner()
+      if for_expr_rooted_at_name(name, &target_expr) then
         true
       else
-        for_expr_uses_name(b, name, &target) || for_expr_uses_name(b, name, &value)
+        for_expr_uses_name(b, name, &target_expr) || for_expr_uses_name(b, name, &value_expr)
       end
     when _ then false
     end
   elsif kind_name == "ExprPipe" then
     match expr.kind
     when ExprKind::ExprPipe(lhs, rhs) then
-      for_expr_uses_name(b, name, &lhs) || for_expr_uses_name(b, name, &rhs)
+      for_expr_uses_name(b, name, lhs.into_inner()) || for_expr_uses_name(b, name, rhs.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprMacroCall" then
@@ -14822,14 +14870,16 @@ def for_call_arg_uses_name(b: MirBuilder, name: String, arg: Expr) -> Bool
   if kind_name == "ExprAccess" then
     match arg.kind
     when ExprKind::ExprAccess(inner) then
-      if for_expr_rooted_at_name(name, &inner) then
-        if for_expr_is_bare_name(name, &inner) then
+      # The access operand is an OWNED Box[Expr]: unbox it once.
+      let inner_expr = inner.into_inner()
+      if for_expr_rooted_at_name(name, &inner_expr) then
+        if for_expr_is_bare_name(name, &inner_expr) then
           true
         else
-          !for_ref_param_is_let(b, &inner)
+          !for_ref_param_is_let(b, &inner_expr)
         end
       else
-        for_expr_uses_name(b, name, &inner)
+        for_expr_uses_name(b, name, &inner_expr)
       end
     when _ then true
     end
@@ -14868,7 +14918,7 @@ def for_expr_mentions_name(b: MirBuilder, name: String, expr: Expr) -> Bool
   elsif kind_name == "ExprArrayRepeat" then
     match expr.kind
     when ExprKind::ExprArrayRepeat(elem, count) then
-      if for_expr_mentions_name(b, name, &elem) then true else for_expr_mentions_name(b, name, &count) end
+      if for_expr_mentions_name(b, name, elem.into_inner()) then true else for_expr_mentions_name(b, name, count.into_inner()) end
     when _ then false
     end
   elsif kind_name == "ExprTupleLit" then
@@ -14904,29 +14954,29 @@ def for_expr_mentions_name(b: MirBuilder, name: String, expr: Expr) -> Bool
   elsif kind_name == "ExprBinaryOp" then
     match expr.kind
     when ExprKind::ExprBinaryOp(_, lhs, rhs) then
-      for_expr_mentions_name(b, name, &lhs) || for_expr_mentions_name(b, name, &rhs)
+      for_expr_mentions_name(b, name, lhs.into_inner()) || for_expr_mentions_name(b, name, rhs.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprUnaryOp" then
     match expr.kind
-    when ExprKind::ExprUnaryOp(_, operand) then for_expr_mentions_name(b, name, &operand)
+    when ExprKind::ExprUnaryOp(_, operand) then for_expr_mentions_name(b, name, operand.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprFieldAccess" then
     match expr.kind
-    when ExprKind::ExprFieldAccess(base, _) then for_expr_mentions_name(b, name, &base)
+    when ExprKind::ExprFieldAccess(base, _) then for_expr_mentions_name(b, name, base.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprIndex" then
     match expr.kind
     when ExprKind::ExprIndex(base, idx) then
-      for_expr_mentions_name(b, name, &base) || for_expr_mentions_name(b, name, &idx)
+      for_expr_mentions_name(b, name, base.into_inner()) || for_expr_mentions_name(b, name, idx.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprMethodCall" then
     match expr.kind
     when ExprKind::ExprMethodCall(receiver, _, _, args) then
-      if for_expr_mentions_name(b, name, &receiver) then
+      if for_expr_mentions_name(b, name, receiver.into_inner()) then
         true
       else
         for_exprs_mention_name(b, name, &args)
@@ -14936,7 +14986,7 @@ def for_expr_mentions_name(b: MirBuilder, name: String, expr: Expr) -> Bool
   elsif kind_name == "ExprCall" then
     match expr.kind
     when ExprKind::ExprCall(callee, args) then
-      if for_expr_mentions_name(b, name, &callee) then
+      if for_expr_mentions_name(b, name, callee.into_inner()) then
         true
       else
         for_exprs_mention_name(b, name, &args)
@@ -14945,17 +14995,17 @@ def for_expr_mentions_name(b: MirBuilder, name: String, expr: Expr) -> Bool
     end
   elsif kind_name == "ExprClosure" then
     match expr.kind
-    when ExprKind::ExprClosure(_, _, body) then for_expr_mentions_name(b, name, &body)
+    when ExprKind::ExprClosure(_, _, body) then for_expr_mentions_name(b, name, body.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprAccess" then
     match expr.kind
-    when ExprKind::ExprAccess(inner) then for_expr_mentions_name(b, name, &inner)
+    when ExprKind::ExprAccess(inner) then for_expr_mentions_name(b, name, inner.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprRawDeref" then
     match expr.kind
-    when ExprKind::ExprRawDeref(inner) then for_expr_mentions_name(b, name, &inner)
+    when ExprKind::ExprRawDeref(inner) then for_expr_mentions_name(b, name, inner.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprIf" then
@@ -14985,23 +15035,23 @@ def for_expr_mentions_name(b: MirBuilder, name: String, expr: Expr) -> Bool
     end
   elsif kind_name == "ExprAwait" then
     match expr.kind
-    when ExprKind::ExprAwait(inner) then for_expr_mentions_name(b, name, &inner)
+    when ExprKind::ExprAwait(inner) then for_expr_mentions_name(b, name, inner.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprTry" then
     match expr.kind
-    when ExprKind::ExprTry(inner) then for_expr_mentions_name(b, name, &inner)
+    when ExprKind::ExprTry(inner) then for_expr_mentions_name(b, name, inner.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprRange" then
     match expr.kind
     when ExprKind::ExprRange(lo, hi, _) then
       let lo_unsafe = match lo
-      when Option::Some(lo_e) then for_expr_mentions_name(b, name, &lo_e)
+      when Option::Some(lo_e) then for_expr_mentions_name(b, name, lo_e.into_inner())
       when Option::None then false
       end
       let hi_unsafe = match hi
-      when Option::Some(hi_e) then for_expr_mentions_name(b, name, &hi_e)
+      when Option::Some(hi_e) then for_expr_mentions_name(b, name, hi_e.into_inner())
       when Option::None then false
       end
       lo_unsafe || hi_unsafe
@@ -15009,12 +15059,12 @@ def for_expr_mentions_name(b: MirBuilder, name: String, expr: Expr) -> Bool
     end
   elsif kind_name == "ExprCast" then
     match expr.kind
-    when ExprKind::ExprCast(inner, _) then for_expr_mentions_name(b, name, &inner)
+    when ExprKind::ExprCast(inner, _) then for_expr_mentions_name(b, name, inner.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprTypeCheck" then
     match expr.kind
-    when ExprKind::ExprTypeCheck(inner, _) then for_expr_mentions_name(b, name, &inner)
+    when ExprKind::ExprTypeCheck(inner, _) then for_expr_mentions_name(b, name, inner.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprComptime" then
@@ -15030,13 +15080,13 @@ def for_expr_mentions_name(b: MirBuilder, name: String, expr: Expr) -> Bool
   elsif kind_name == "ExprAssign" then
     match expr.kind
     when ExprKind::ExprAssign(target, value) then
-      for_expr_mentions_name(b, name, &target) || for_expr_mentions_name(b, name, &value)
+      for_expr_mentions_name(b, name, target.into_inner()) || for_expr_mentions_name(b, name, value.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprPipe" then
     match expr.kind
     when ExprKind::ExprPipe(lhs, rhs) then
-      for_expr_mentions_name(b, name, &lhs) || for_expr_mentions_name(b, name, &rhs)
+      for_expr_mentions_name(b, name, lhs.into_inner()) || for_expr_mentions_name(b, name, rhs.into_inner())
     when _ then false
     end
   elsif kind_name == "ExprMacroCall" then
@@ -15639,13 +15689,13 @@ def lower_for(inout b: MirBuilder, pat: Pattern, iter: Expr, body: Block, span: 
     var lo_op = operand_int(0)
     match lo_box
     when Option::Some(lo_e) then
-      lo_op = lower_expr(b, &lo_e, span)
+      lo_op = lower_expr(b, lo_e.into_inner(), span)
     when Option::None then ()
     end
     var hi_op = operand_int(0)
     match hi_box
     when Option::Some(hi_e) then
-      hi_op = lower_expr(b, &hi_e, span)
+      hi_op = lower_expr(b, hi_e.into_inner(), span)
     when Option::None then ()
     end
 
@@ -17047,22 +17097,27 @@ def format_mir_type(names: Map[Int, String], param_names: Map[Int, String], ty: 
 end
 
 # ———————————————————————————————————————————————————————————————
-# Optimization decision records (audit item 58)
+# Optimization decision records (audit item 58; audit order item 8)
 # ———————————————————————————————————————————————————————————————
-# ONE OptimizationDecision row per REJECTED optimization at the decision
-# sites that hold the deciding evidence. Captured sites (a SUBSET of the
-# optimizer's decision points — only where the pass can state WHY):
-#   - the INLINER's reject path (inline_calls_in_function): a call to a
-#     named in-program callee that is not inlined because the call site
-#     passes a place by a non-Read effect, or because should_inline's
-#     guards rejected the callee — extern body, @noinline hint, recursion,
-#     or the statement/block size thresholds (the evidence carries the
-#     actual counts). decision = "inline-rejected".
-#   - eliminate_bounds_checks' RETAIN path: a BoundsCheck assert the proof
-#     lattice could not discharge survives (the proven ones become
-#     MirGoto). decision = "bounds-check-retained", with the actual
-#     proof-gap evidence (e.g. "induction range unknown for index local
-#     'i'").
+# ONE typed OptimizationDecision row per optimization DECISION at the site
+# that holds the deciding evidence — ACCEPT and REJECT both, with the real
+# reason read from the pass's own predicate data (never a generic string).
+# Captured decision points:
+#   - the INLINER (inline_calls_in_function): an accepted call site records
+#     "inline-applied" with the callee body's actual statement/block counts
+#     and the ACTIVE (profile-selected) threshold pair; a rejected site
+#     records "inline-rejected" naming the deciding guard — the call-site
+#     non-Read place argument, an extern body, @noinline, recursion, or the
+#     size thresholds with the actual counts.
+#   - eliminate_bounds_checks: a check the prover discharged records
+#     "bounds-check-removed" with the PROOF FACT (the constant-index
+#     window, rule A's constant upper bound vs the constant length, rule
+#     B's same-cap length local, or rule C's single-def same-never-mutated-
+#     array proof with both defs dominating the check). A check the proof
+#     lattice could not discharge records "bounds-check-retained" with the
+#     actual proof-gap evidence. Both reasons are read from the same state
+#     facts the prover consumed (mir_bounds_prove_check returns the proof
+#     witness; opt_dec_bounds_retain_reason renders the gap).
 #   - (audit item 32) the access-fact forwarding pass' ALIAS-RULE reject
 #     path (mir_forward_record_rejects): a constant carried by a local
 #     that a call kills because the local is passed by place, by a
@@ -17073,28 +17128,45 @@ end
 #     condition folds to a constant whose arm value appears more than
 #     once (the target is ambiguous). decision = "sccp-branch-retained",
 #     with the constant and the occurrence count.
-#   - (audit item 32) mem2reg/SROA's dominance reject path: a
-#     single-store local read in a block the store does not dominate (no
-#     phi insertion in this pass). decision = "promotion-rejected".
-# DOCUMENTED ABSENT SITES: the access-fact forwarding pass is
-# region-driven since third-audit item 38 (mir_alias_facts_of_call:
-# let/inout/sink/set per call root, barrier for pointer/indirect calls);
-# it still records only the reject rows — a successful forwarding writes
-# no row. The vectorizer is absent entirely (vectorization_eligibility is a
-# perf-report counter only), so no vectorization rows exist. The
-# non-owning-scalar deinit elision and the IV counter canonicalization
-# have no reject rows (their rejected shapes are not decisions with
-# evidence worth a row).
+#   - (audit item 32) mem2reg/SROA's reject paths (mir_promote_select): a
+#     single-store local the store does not dominate (no phi insertion), or
+#     a self-referencing store, records "promotion-rejected" with the gap.
+#     Accepted promotions write no row (the rewritten IR is the evidence).
+#   - escape analysis (escape_analysis_program_impl): a NoEscape
+#     allocation destination whose value-flow is closed and whose stack
+#     size fits records "escape-promoted" with the escape proof (the state
+#     + the value-flow closure); a destination that is NOT promoted records
+#     "escape-rejected" with the real blocker — the escape state, the
+#     value-flow closure gap, or the stack-size cap.
+#   - LICM (hoist_loop_invariants): a statement hoisted to the preheader
+#     records "licm-hoisted" with the loop-invariance fact (the operand
+#     locals defined outside the loop header / constants); a statement
+#     carrying a side-effecting (Consume) rvalue records "licm-rejected"
+#     (hoisting it would run the consume once per function instead of once
+#     per iteration).
+#   - the SLP vectorizer (slp_vectorize_function): an accepted group
+#     records "slp-vectorized" (lane class + op + lane count); a
+#     candidate-shaped rejection records "slp-vectorize-rejected" with the
+#     deciding blocker (count/divisibility, mixed class, alias window,
+#     incomplete quadruple, out-of-bounds window, external temporary use,
+#     missing vector type); a vector-less target records one
+#     "slp-vectorize-skipped" note.
+#   - (third-audit item 37) devirtualization ("devirt") and tail-call
+#     recognition ("tail-marked").
+# DOCUMENTED ABSENT SITES: the non-owning-scalar deinit elision and the IV
+# counter canonicalization have no reject rows (their rejected shapes are
+# not decisions with evidence worth a row). A successful access-fact
+# forwarding writes no row.
 #
 # Rows are appended ONLY when the capturing optimizer entry
 # (optimize_mir_with_decisions) runs with an Option::Some collector; the
 # plain optimize_mir / optimize_mir_verified entries build no row at all
 # (behavior identical). The row text is deterministic: `pass` mirrors the
-# verifier checkpoint names ("inline", "bounds-check elimination"),
-# `symbol` is the function key of the function CONTAINING the site,
-# `decision` is the fixed decision word and `reason` is the evidence text
-# read from the site. (fourth-audit P1-6) `site` is the site node's P0-7
-# SEMANTIC identity — stable_mir_node_key_of(origin), the revision-stable
+# verifier checkpoint names ("inline", "bounds-check elimination"), `symbol`
+# is the function key of the function CONTAINING the site, `decision` is
+# the fixed decision word and `reason` is the evidence text read from the
+# site. (fourth-audit P1-6) `site` is the site node's P0-7 SEMANTIC identity
+# — stable_mir_node_key_of(origin), the revision-stable
 # "<fn key>#N@<hi>-<lo>" key; the "file:start-end"/"bbN" span locator
 # survives ONLY as the documented fallback for hand-built IR whose nodes
 # carry no origin (opt_dec_node_site / opt_dec_block_site /
@@ -17230,6 +17302,140 @@ def opt_dec_guard_reason(args: Vec[MirCallArg]) -> String
   end
   "a call argument passes a place by a non-Read effect"
 end
+
+# (audit order item 8) The escape-state word the escape-analysis rows name.
+def opt_dec_escape_state_word(st: EscapeState) -> String
+  match st
+  when EscapeState::NoEscape then "NoEscape"
+  when EscapeState::ArgEscape then "ArgEscape"
+  when EscapeState::GlobalEscape then "GlobalEscape"
+  end
+end
+
+# (audit order item 8) The recognized allocation callee at a local's
+# allocation call site ("" when the local is not an allocation
+# destination) — the evidence an escape row names.
+def opt_dec_alloc_callee(f: MirFunction, lid: Int) -> String
+  for block in f.blocks do
+    match block.terminator.kind
+    when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic, tail } then
+      if dest.local.id == lid && dest.projections.is_empty() then
+        match mir_escape_alloc_callee_name(func.clone())
+        when Option::Some(name) then return name
+        when Option::None then ()
+        end
+      end
+    when _ then ()
+    end
+  end
+  ""
+end
+
+# (audit order item 8) The op word of a binary rvalue.
+def opt_dec_binop_word(op: MirBinOp) -> String
+  match op
+  when MirBinOp::Add then "add"
+  when MirBinOp::Sub then "sub"
+  when MirBinOp::Mul then "mul"
+  when MirBinOp::Div then "div"
+  when MirBinOp::Mod then "rem"
+  when MirBinOp::BitAnd then "and"
+  when MirBinOp::BitOr then "or"
+  when MirBinOp::BitXor then "xor"
+  when MirBinOp::Shl then "shl"
+  when MirBinOp::Shr then "shr"
+  when MirBinOp::Eq then "eq"
+  when MirBinOp::Ne then "ne"
+  when MirBinOp::Lt then "lt"
+  when MirBinOp::Le then "le"
+  when MirBinOp::Gt then "gt"
+  when MirBinOp::Ge then "ge"
+  end
+end
+
+# (audit order item 8) The shape word of a unary rvalue.
+def opt_dec_unop_word(op: MirUnOp) -> String
+  match op
+  when MirUnOp::Neg then "neg"
+  when MirUnOp::Not then "not"
+  when MirUnOp::BitNot then "bit-not"
+  end
+end
+
+# (audit order item 8) The op word of an rvalue (the form the hoist/fact
+# evidence names).
+def opt_dec_rvalue_word(rv: MirRvalue) -> String
+  match rv.kind
+  when MirRvalueKind::MirMove(_) then "move"
+  when MirRvalueKind::MirBinOp(op, _, _) then opt_dec_binop_word(op)
+  when MirRvalueKind::MirUnOp(op, _) then opt_dec_unop_word(op)
+  when MirRvalueKind::MirCast(_, _, _) then "cast"
+  when MirRvalueKind::MirAggregate(_, _) then "aggregate"
+  when MirRvalueKind::MirRepeat(_, _) then "repeat"
+  when MirRvalueKind::MirRef(_) then "ref"
+  when MirRvalueKind::MirDiscriminant(_) then "discriminant"
+  when MirRvalueKind::MirLen(_) then "len"
+  when MirRvalueKind::MirPhi(_) then "phi"
+  end
+end
+
+# (audit order item 8) Append the display names of an operand's local (or
+# "a constant" for a constant operand) — the invariance evidence names the
+# operand locals the loop-def set test consulted.
+def opt_dec_collect_operand_names(f: MirFunction, op: MirOperand, inout names: Vec[String]) -> Unit
+  match op.kind
+  when MirOperandKind::MirCopy(p) then names.push("'" + opt_dec_local_name(f, p.local.id) + "'")
+  when MirOperandKind::MirMovePlace(p) then names.push("'" + opt_dec_local_name(f, p.local.id) + "'")
+  when MirOperandKind::MirRead(p) then names.push("'" + opt_dec_local_name(f, p.local.id) + "'")
+  when MirOperandKind::MirConsume(p) then names.push("'" + opt_dec_local_name(f, p.local.id) + "'")
+  when MirOperandKind::MirConstant(_) then names.push("a constant")
+  end
+end
+
+def opt_dec_collect_rvalue_operand_names(f: MirFunction, rv: MirRvalue, inout names: Vec[String]) -> Unit
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then opt_dec_collect_operand_names(f, op, names)
+  when MirRvalueKind::MirBinOp(_, lhs, rhs) then
+    opt_dec_collect_operand_names(f, lhs, names)
+    opt_dec_collect_operand_names(f, rhs, names)
+  when MirRvalueKind::MirUnOp(_, op) then opt_dec_collect_operand_names(f, op, names)
+  when MirRvalueKind::MirCast(_, op, _) then opt_dec_collect_operand_names(f, op, names)
+  when MirRvalueKind::MirRepeat(op, _) then opt_dec_collect_operand_names(f, op, names)
+  when _ then ()
+  end
+end
+
+# (audit order item 8) The loop-invariance fact of one HOISTED statement:
+# the assignment's destination local, its op word and the operand locals
+# the per-loop defined-local set test proved defined outside the loop.
+def opt_dec_licm_reason(f: MirFunction, stmt: MirStatement, header_id: Int, preheader_id: Int) -> String
+  match stmt.kind
+  when MirStatementKind::MirAssign(place, rvalue) then
+    let word = opt_dec_rvalue_word(rvalue)
+    var names: Vec[String] = Vec::new()
+    opt_dec_collect_rvalue_operand_names(f, rvalue, &mut names)
+    var operands = "no operands"
+    if !names.is_empty() then
+      operands = "operand locals [" + names.join(", ") + "]"
+    end
+    "the assignment to local '" + opt_dec_local_name(f, place.local.id) + "' (" + word + ") is loop-invariant: " + operands + " are all defined outside loop header bb" + header_id.to_string() + " (or are constants); hoisted to preheader bb" + preheader_id.to_string()
+  when _ then
+    "the statement is loop-invariant; hoisted to preheader bb" + preheader_id.to_string()
+  end  end
+end
+
+# (audit order item 8) The real blocker of a LICM rejection: the rvalue
+# carries a MirConsume operand — hoisting it to the preheader would run the
+# consuming operation once per function instead of once per iteration.
+def opt_dec_licm_reject_reason(f: MirFunction, stmt: MirStatement, header_id: Int) -> String
+  match stmt.kind
+  when MirStatementKind::MirAssign(place, rvalue) then
+    "the assignment to local '" + opt_dec_local_name(f, place.local.id) + "' (" + opt_dec_rvalue_word(rvalue) + ") consumes an operand (MirConsume) inside loop header bb" + header_id.to_string() + "; hoisting it to the preheader would run the consume once instead of once per iteration"
+  when _ then
+    "the statement carries a side-effecting rvalue inside the loop; never hoisted"
+  end  end
+end
+
 
 # The exact-duplicate filter for one capture run (the inliner re-scans its
 # call sites on every fixpoint iteration, so a rejected site is seen more
@@ -17477,7 +17683,14 @@ def optimize_mir_impl(inout program: MirProgram, opt_level: Int, verify_everythi
     for f in program.functions do global_value_numbering(f) end
     if verify_everything then verifier_program_checkpoint(program, "global value numbering") end
 
-    for f in program.functions do loop_invariant_code_motion(f) end
+    # (audit order item 8) LICM records its per-statement decisions in
+    # capture mode: "licm-hoisted" (the loop-invariance fact) / "licm-rejected"
+    # (a side-effecting statement that can never move).
+    if capture then
+      for f in program.functions do loop_invariant_code_motion_impl(f, true, rows) end
+    else
+      for f in program.functions do loop_invariant_code_motion(f) end
+    end
     if verify_everything then verifier_program_checkpoint(program, "loop-invariant code motion") end
 
     if capture then
@@ -22783,7 +22996,7 @@ def mir_alias_lane_call(name: String, dest_lid: Int, args: Vec[MirCallArg], succ
       func: MirOperand {
         kind: MirOperandKind::MirConstant(MirConstant {
           kind: MirConstantKind::MirFnItem(name),
-          ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
+          ty: Type::FnPtr(Vec::new(), Type::Unit, Vec::new()),
           instance: Option::None
         })
       },
@@ -23613,7 +23826,7 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def mir_opt_next_lane_fnptr_ty() -> Type
-  Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new())
+  Type::FnPtr(Vec::new(), Type::Unit, Vec::new())
 end
 
 def mir_opt_next_lane_fn_ret(name: String, ret_ty: Type, locals: Vec[MirLocal], blocks: Vec[MirBlock]) -> MirFunction
@@ -25517,7 +25730,20 @@ def eliminate_bounds_checks_impl(inout f: MirFunction, capture: Bool, inout rows
         when Option::Some(s) then s
         when Option::None then mir_bounds_empty_state()
         end
-        if mir_bounds_prove_check(f, &st, &index_op, &len_op, block.id.id, &len_prov, &def_blocks, &mutated, &lo_ok, &dom_info.idom) then
+        let (proved, proof) = mir_bounds_prove_check(f, &st, &index_op, &len_op, block.id.id, &len_prov, &def_blocks, &mutated, &lo_ok, &dom_info.idom)
+        if proved then
+          # (audit order item 8) The REMOVAL path: the prover discharged the
+          # check — capture the proof witness at the check's semantic site
+          # before the terminator is rewritten to the goto.
+          if capture then
+            rows.push(opt_dec_row(
+              "bounds-check elimination",
+              f.name.clone(),
+              opt_dec_node_site(block.terminator.origin.clone(), &block.terminator.span, block.id.id),
+              "bounds-check-removed",
+              proof
+            ))
+          end
           block.terminator = MirTerminator {
             kind: MirTerminatorKind::MirGoto(target),
             span: block.terminator.span.clone(),
@@ -25689,7 +25915,11 @@ end
 
 # Prove 0 <= index < len for a BoundsCheck terminator at block_id, from
 # the terminator-time cap/ub state and the function-wide facts (see the
-# pass banner for the exact rules).
+# pass banner for the exact rules). (audit order item 8) The Bool result is
+# paired with the PROOF WITNESS text of the rule that discharged the check
+# ("" on every non-proof) — the elimination walk records it verbatim as the
+# "bounds-check-removed" row's reason, so the journal names the actual fact
+# the prover consumed and never re-derives it.
 def mir_bounds_prove_check(
   f: MirFunction,
   st: MirBoundsState,
@@ -25701,7 +25931,7 @@ def mir_bounds_prove_check(
   mutated: Set[Int],
   lo_ok: Map[Int, Set[Int]],
   dom_idom: Map[Int, Int]
-) -> Bool
+) -> (Bool, String)
   let idx_local = extract_local_from_operand(index_op)
   let len_local = extract_local_from_operand(len_op)
   match idx_local
@@ -25711,8 +25941,10 @@ def mir_bounds_prove_check(
     # a same-block copy/const store of such a local.
     let idx_lo_ok = mir_bounds_idx_lo_ok(f, block_id, i_lid.id, lo_ok)
     if !idx_lo_ok then
-      return false
+      return (false, "")
     end
+    let idx_name = opt_dec_local_name(f, i_lid.id)
+    let lo_fact = "0 <= index local '" + idx_name + "' (nonnegative range fact)"
     # Rule A: the length operand is a constant and the state carries a
     # const upper bound below it.
     match extract_int_constant(len_op)
@@ -25720,7 +25952,7 @@ def mir_bounds_prove_check(
       match st.ubs.get(i_lid.id)
       when Option::Some(u) then
         if u <= lc then
-          return true
+          return (true, lo_fact + "; rule A: the constant upper bound " + u.to_string() + " of index local '" + idx_name + "' is <= the constant length " + lc.to_string())
         end
       when Option::None then ()
       end
@@ -25729,11 +25961,12 @@ def mir_bounds_prove_check(
     # Rules B and C need the check's length to be a bare local.
     match len_local
     when Option::Some(l_lid) then
+      let len_name = opt_dec_local_name(f, l_lid.id)
       match st.caps.get(i_lid.id)
       when Option::Some(cap_id) then
         # Rule B: the cap local IS the check's length local.
         if cap_id == l_lid.id then
-          return true
+          return (true, lo_fact + "; rule B: the check's length local '" + len_name + "' is the same cap fact recorded for index local '" + idx_name + "'")
         end
         # Rule C: the cap and the length are length temps of the SAME
         # array, the array is never mutated, and both single defs
@@ -25749,7 +25982,7 @@ def mir_bounds_prove_check(
                 when Option::Some(def_l) then
                   if mir_idom_dominates(&dom_idom, def_c, block_id) &&
                      mir_idom_dominates(&dom_idom, def_l, block_id) then
-                    return true
+                    return (true, lo_fact + "; rule C: the cap local '" + opt_dec_local_name(f, cap_id) + "' and the length local '" + len_name + "' are single-def length temps of the same never-mutated array '" + arr_c.to_string() + "', both defs dominating the check")
                   end
                 when Option::None then ()
                 end
@@ -25764,21 +25997,26 @@ def mir_bounds_prove_check(
       end
     when Option::None then ()
     end
-    false
+    (false, "")
   when Option::None then
     # Constant index: prove 0 <= c < len against a constant length.
     match extract_int_constant(index_op)
     when Option::Some(c) then
       if c < 0 then
-        false
+        (false, "")
       else
         match extract_int_constant(len_op)
-        when Option::Some(lc) then c < lc
-        when Option::None then false
+        when Option::Some(lc) then
+          if c < lc then
+            (true, "the constant index " + c.to_string() + " is within [0, " + lc.to_string() + ")")
+          else
+            (false, "")
+          end
+        when Option::None then (false, "")
         end
       end
     when Option::None then
-      false
+      (false, "")
     end
   end  end
 end
@@ -26157,6 +26395,23 @@ def slp_ensure_engine_type(inout program: MirProgram, td: MirTypeDef) -> Unit
   if td.id.id >= program.engine_env.type_id_counter then
     program.engine_env.type_id_counter = td.id.id + 1
   end
+end
+
+# (audit order item 8) Register a MirTypeDef into BOTH the program's type
+# table and its engine snapshot — the ONE entry a hand-built program uses
+# to make a definition visible to the TypeProperties engine (the vector
+# property the perf report queries). A definition already in either table
+# is not duplicated. The compiler's own lowering registers through the same
+# path (slp_ensure_engine_type) — tests and synthesized types share it.
+pub def mir_program_register_type(inout program: MirProgram, td: MirTypeDef) -> Unit
+  var present = false
+  for existing in program.types do
+    if existing.id.id == td.id.id then present = true end
+  end
+  if !present then
+    program.types.push(td.clone())
+  end
+  slp_ensure_engine_type(program, td)
 end
 
 # The vector temporary type for a class: the registered VecK definition
@@ -27034,7 +27289,7 @@ def slp_fnptr(params: Vec[Type], ret: Type) -> Type
   for p in params do
     pts.push(ParamType { ty: p.clone(), convention: AccessConvention::Let })
   end
-  Type::FnPtr(pts, Box::new(ret), Vec::new())
+  Type::FnPtr(pts, ret, Vec::new())
 end
 
 # One Read value argument of a synthesized call.
@@ -27660,6 +27915,270 @@ pub def mir_slp_lane_check() -> Vec[String]
   out
 end
 
+# ———————————————————————————————————————————————————————————————
+# The optimizer journal lane (audit order item 8)
+# ———————————————————————————————————————————————————————————————
+# Rows asserted by mir_opt_journal_lane_check (minimal hand-built IR, the
+# mir_slp_lane_check construction style):
+#   J1 bounds-check elimination records "bounds-check-removed" with the
+#      constant-index proof witness, at the assert's semantic site key;
+#   J2 a check with no range fact records "bounds-check-retained" with the
+#      proof-gap evidence;
+#   J3 the inliner records "inline-applied" with the callee size counts and
+#      the active threshold pair (the cost-model evidence);
+#   J4 an @noinline callee records "inline-rejected" naming the hint;
+#   J5 escape analysis records "escape-promoted" with the recognized
+#      allocation callee and the NoEscape + value-flow-closure proof;
+#   J6 an allocation destination read outside its call records
+#      "escape-rejected" naming the closure gap;
+#   J7 LICM records "licm-hoisted" with the loop-invariance fact (operand
+#      locals defined outside the loop header) and "licm-rejected" for a
+#      consuming statement that can never move;
+#   J8 the SLP vectorizer records "slp-vectorize-rejected" with the alias
+#      blocker.
+
+# Whether a journal has a row for (pass, decision) whose site equals `site`.
+def mir_journal_row_site_is(rows: Vec[OptimizationDecision], pass: String, decision: String, site: String) -> Bool
+  for r in rows do
+    if r.pass == pass && r.decision == decision && r.site == site then
+      return true
+    end
+  end
+  false
+end
+
+# Whether a journal has a row for (pass, decision) on the given function
+# whose reason contains `needle`.
+def mir_journal_row_symbol_reason_is(rows: Vec[OptimizationDecision], pass: String, decision: String, symbol: String, needle: String) -> Bool
+  for r in rows do
+    if r.pass == pass && r.decision == decision && r.symbol == symbol && mir_slp_lane_contains(r.reason.clone(), needle.clone()) then
+      return true
+    end
+  end
+  false
+end
+
+# One two-block bounds-check function: bb0 asserts a BoundsCheck terminator
+# carrying `index_op` against `len_op`, bb1 returns.
+def mir_journal_bounds_fn(name: String, index_op: MirOperand, len_op: MirOperand, origin: Option[StableMirNodeId]) -> MirFunction
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(mir_alias_lane_local(0, "_ret".to_string(), Type::Unit))
+  locals.push(mir_alias_lane_local(1, "i".to_string(), Type::Int))
+  let assert_block = MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: Vec::new(),
+    terminator: MirTerminator {
+      kind: MirTerminatorKind::MirAssert {
+        cond: operand_bool(true),
+        expected: true,
+        msg: AssertMessage::BoundsCheck(index_op, len_op),
+        target: MirBlockId { id: 1 },
+        unwind: Option::None
+      },
+      span: span_dummy(),
+      origin: origin
+    }
+  }
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(assert_block)
+  blocks.push(mir_alias_lane_block(1, Vec::new(), mir_alias_lane_return()))
+  mir_alias_lane_fn(name, locals, blocks)
+end
+
+# One caller/callee pair for the inliner: the caller calls the callee with
+# no arguments; the callee is a one-block body (inlinable) or carries the
+# @noinline hint (never inlinable).
+def mir_journal_inline_program(callee_name: String, noinline: Bool) -> MirProgram
+  var callee_locals: Vec[MirLocal] = Vec::new()
+  callee_locals.push(mir_alias_lane_local(0, "_ret".to_string(), Type::Unit))
+  var callee_blocks: Vec[MirBlock] = Vec::new()
+  callee_blocks.push(mir_alias_lane_block(0, Vec::new(), mir_alias_lane_return()))
+  var callee = mir_alias_lane_fn(callee_name.clone(), callee_locals, callee_blocks)
+  callee.attr_noinline = noinline
+  var caller_locals: Vec[MirLocal] = Vec::new()
+  caller_locals.push(mir_alias_lane_local(0, "_ret".to_string(), Type::Unit))
+  caller_locals.push(mir_alias_lane_local(1, "x".to_string(), Type::Unit))
+  var caller_blocks: Vec[MirBlock] = Vec::new()
+  caller_blocks.push(mir_alias_lane_block(0, Vec::new(), mir_alias_lane_call(callee_name, 1, Vec::new(), 1)))
+  caller_blocks.push(mir_alias_lane_block(1, Vec::new(), mir_alias_lane_return()))
+  let caller = mir_alias_lane_fn("lane_journal_inline_caller".to_string(), caller_locals, caller_blocks)
+  mir_origin_lane_program(Vec::from([caller, callee]))
+end
+
+# One escape-analysis program: a caller whose `x` is the destination of a
+# recognized allocation call to the in-program callee `Box::new` (a valid
+# NoEscape summary). With `read_after`, bb1 reads `x` — the value-flow
+# closure gate then fails and the promotion must be rejected with a row.
+def mir_journal_escape_program(read_after: Bool) -> MirProgram
+  var callee_locals: Vec[MirLocal] = Vec::new()
+  callee_locals.push(mir_alias_lane_local(0, "_ret".to_string(), Type::Unit))
+  var callee_blocks: Vec[MirBlock] = Vec::new()
+  callee_blocks.push(mir_alias_lane_block(0, Vec::new(), mir_alias_lane_return()))
+  var callee = mir_alias_lane_fn("Box::new".to_string(), callee_locals, callee_blocks)
+  callee.params.push(mir_alias_lane_local(1, "v".to_string(), Type::Int))
+  var caller_locals: Vec[MirLocal] = Vec::new()
+  caller_locals.push(mir_alias_lane_local(0, "_ret".to_string(), Type::Unit))
+  caller_locals.push(mir_alias_lane_local(1, "x".to_string(), Type::Int))
+  caller_locals.push(mir_alias_lane_local(2, "y".to_string(), Type::Int))
+  var args: Vec[MirCallArg] = Vec::new()
+  args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(operand_int(7)) })
+  var caller_blocks: Vec[MirBlock] = Vec::new()
+  caller_blocks.push(mir_alias_lane_block(0, Vec::new(), mir_alias_lane_call("Box::new".to_string(), 1, args, 1)))
+  var tail_stmts: Vec[MirStatement] = Vec::new()
+  if read_after then
+    tail_stmts.push(mir_alias_lane_move_store(2, 1))
+  end
+  caller_blocks.push(mir_alias_lane_block(1, tail_stmts, mir_alias_lane_return()))
+  let caller = mir_alias_lane_fn("lane_journal_escape_caller".to_string(), caller_locals, caller_blocks)
+  mir_origin_lane_program(Vec::from([caller, callee]))
+end
+
+# One natural-loop function: bb0 -> bb1 (header) -> bb2 (body) -> bb1. The
+# body's `x = a + b` is loop-invariant (a and b are defined nowhere); the
+# second statement consumes `p` — the LICM hard reject.
+def mir_journal_licm_fn(name: String) -> MirFunction
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(mir_alias_lane_local(0, "_ret".to_string(), Type::Unit))
+  locals.push(mir_alias_lane_local(1, "a".to_string(), Type::Int))
+  locals.push(mir_alias_lane_local(2, "b".to_string(), Type::Int))
+  locals.push(mir_alias_lane_local(3, "x".to_string(), Type::Int))
+  locals.push(mir_alias_lane_local(4, "y".to_string(), Type::Int))
+  locals.push(mir_alias_lane_local(5, "p".to_string(), Type::Int))
+  let origin = stable_mir_node_id_of_source(
+    name.clone(), stable_hir_node_id_of(stable_decl_of_key(&name), 5), "assign".to_string())
+  let invariant = MirStatement {
+    kind: MirStatementKind::MirAssign(
+      place_local(MirLocalId { id: 3 }),
+      MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Add, operand_copy_local(MirLocalId { id: 1 }), operand_copy_local(MirLocalId { id: 2 })) }
+    ),
+    span: span_dummy(),
+    origin: Option::Some(origin.clone())
+  }
+  let consuming = MirStatement {
+    kind: MirStatementKind::MirAssign(
+      place_local(MirLocalId { id: 4 }),
+      MirRvalue { kind: MirRvalueKind::MirMove(operand_consume(place_local(MirLocalId { id: 5 }))) }
+    ),
+    span: span_dummy()
+  }
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(mir_alias_lane_block(0, Vec::new(), MirTerminator { kind: MirTerminatorKind::MirGoto(MirBlockId { id: 1 }), span: span_dummy() }))
+  blocks.push(mir_alias_lane_block(1, Vec::new(), MirTerminator { kind: MirTerminatorKind::MirGoto(MirBlockId { id: 2 }), span: span_dummy() }))
+  blocks.push(mir_alias_lane_block(2, Vec::from([invariant, consuming]), MirTerminator { kind: MirTerminatorKind::MirGoto(MirBlockId { id: 1 }), span: span_dummy() }))
+  mir_alias_lane_fn(name, locals, blocks)
+end
+
+pub def mir_opt_journal_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # ——— J1: bounds-check removed with the proof witness at the node site ———
+  let bounds_proof_name = "lane_journal_bounds_proved".to_string()
+  let bounds_origin = stable_mir_node_id_of_source(
+    bounds_proof_name.clone(),
+    stable_hir_node_id_of(stable_decl_of_key(&bounds_proof_name), 7),
+    "assert".to_string())
+  let bounds_site = stable_mir_node_key_of(bounds_origin.clone())
+  let f_proved = mir_journal_bounds_fn(bounds_proof_name.clone(), operand_int(2), operand_int(4), Option::Some(bounds_origin))
+  var prog_proved = mir_origin_lane_program(Vec::from([f_proved]))
+  var rows_bounds: Vec[OptimizationDecision] = Vec::new()
+  var f_proved_mut = prog_proved.functions[0]
+  eliminate_bounds_checks_impl(f_proved_mut, true, &mut rows_bounds)
+  prog_proved.functions[0] = f_proved_mut
+  mir_alias_lane_expect(&mut out, "J1-removed-row",
+    mir_journal_row_symbol_reason_is(rows_bounds, "bounds-check elimination".to_string(), "bounds-check-removed".to_string(), bounds_proof_name.clone(), "constant index"))
+  mir_alias_lane_expect(&mut out, "J1-removed-site",
+    mir_journal_row_site_is(rows_bounds, "bounds-check elimination".to_string(), "bounds-check-removed".to_string(), bounds_site.clone()))
+  var j1_rewritten = false
+  match prog_proved.functions[0].blocks[0].terminator.kind
+  when MirTerminatorKind::MirGoto(_) then j1_rewritten = true
+  when _ then ()
+  end
+  mir_alias_lane_expect(&mut out, "J1-check-gone", j1_rewritten)
+
+  # ——— J2: the retained check records the proof gap ———
+  let bounds_gap_name = "lane_journal_bounds_gap".to_string()
+  let f_gap = mir_journal_bounds_fn(bounds_gap_name.clone(), operand_copy_local(MirLocalId { id: 1 }), operand_int(4), Option::None)
+  var prog_gap = mir_origin_lane_program(Vec::from([f_gap]))
+  var rows_gap: Vec[OptimizationDecision] = Vec::new()
+  var f_gap_mut = prog_gap.functions[0]
+  eliminate_bounds_checks_impl(f_gap_mut, true, &mut rows_gap)
+  prog_gap.functions[0] = f_gap_mut
+  mir_alias_lane_expect(&mut out, "J2-retained-row",
+    mir_journal_row_symbol_reason_is(rows_gap, "bounds-check elimination".to_string(), "bounds-check-retained".to_string(), bounds_gap_name.clone(), "induction range unknown"))
+
+  # ——— J3: inline accepted with the cost evidence ———
+  var prog_inline_ok = mir_journal_inline_program("lane_journal_callee_tiny".to_string(), false)
+  var rows_inline_ok: Vec[OptimizationDecision] = Vec::new()
+  inline_functions_impl(prog_inline_ok, true, &mut rows_inline_ok)
+  mir_alias_lane_expect(&mut out, "J3-applied-row",
+    mir_journal_row_symbol_reason_is(rows_inline_ok, "inline".to_string(), "inline-applied".to_string(), "lane_journal_inline_caller".to_string(), "active thresholds"))
+
+  # ——— J4: @noinline rejected naming the hint ———
+  var prog_inline_no = mir_journal_inline_program("lane_journal_callee_big".to_string(), true)
+  var rows_inline_no: Vec[OptimizationDecision] = Vec::new()
+  inline_functions_impl(prog_inline_no, true, &mut rows_inline_no)
+  mir_alias_lane_expect(&mut out, "J4-rejected-row",
+    mir_journal_row_symbol_reason_is(rows_inline_no, "inline".to_string(), "inline-rejected".to_string(), "lane_journal_inline_caller".to_string(), "@noinline"))
+
+  # ——— J5: escape promotion with the NoEscape + closure proof ———
+  var prog_escape_ok = mir_journal_escape_program(false)
+  var rows_escape_ok: Vec[OptimizationDecision] = Vec::new()
+  escape_analysis_program_impl(prog_escape_ok, true, &mut rows_escape_ok)
+  mir_alias_lane_expect(&mut out, "J5-promoted-row",
+    mir_journal_row_symbol_reason_is(rows_escape_ok, "escape analysis".to_string(), "escape-promoted".to_string(), "lane_journal_escape_caller".to_string(), "NoEscape"))
+  var j5_rewritten = false
+  match prog_escape_ok.functions[0].blocks[0].terminator.kind
+  when MirTerminatorKind::MirGoto(_) then j5_rewritten = true
+  when _ then ()
+  end
+  mir_alias_lane_expect(&mut out, "J5-promoted-rewrite", j5_rewritten)
+
+  # ——— J6: an outside read rejects the promotion with the closure gap ———
+  var prog_escape_no = mir_journal_escape_program(true)
+  var rows_escape_no: Vec[OptimizationDecision] = Vec::new()
+  escape_analysis_program_impl(prog_escape_no, true, &mut rows_escape_no)
+  mir_alias_lane_expect(&mut out, "J6-rejected-row",
+    mir_journal_row_symbol_reason_is(rows_escape_no, "escape analysis".to_string(), "escape-rejected".to_string(), "lane_journal_escape_caller".to_string(), "value-flow closure gate fails"))
+  var j6_still_call = false
+  match prog_escape_no.functions[0].blocks[0].terminator.kind
+  when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic, tail } then j6_still_call = true
+  when _ then ()
+  end
+  mir_alias_lane_expect(&mut out, "J6-no-rewrite", j6_still_call)
+
+  # ——— J7: LICM hoist fact + consuming reject ———
+  let licm_name = "lane_journal_licm".to_string()
+  var f_licm = mir_journal_licm_fn(licm_name.clone())
+  var rows_licm: Vec[OptimizationDecision] = Vec::new()
+  loop_invariant_code_motion_impl(f_licm, true, &mut rows_licm)
+  mir_alias_lane_expect(&mut out, "J7-hoisted-row",
+    mir_journal_row_symbol_reason_is(rows_licm, "licm".to_string(), "licm-hoisted".to_string(), licm_name.clone(), "loop-invariant"))
+  mir_alias_lane_expect(&mut out, "J7-hoisted-fact",
+    mir_journal_row_symbol_reason_is(rows_licm, "licm".to_string(), "licm-hoisted".to_string(), licm_name.clone(), "'a', 'b'"))
+  var j7_hoisted = false
+  var j7_bi = 0
+  while j7_bi < f_licm.blocks.len() do
+    if j7_bi != 2 && f_licm.blocks[j7_bi].statements.len() == 1 then
+      j7_hoisted = true
+    end
+    j7_bi = j7_bi + 1
+  end
+  mir_alias_lane_expect(&mut out, "J7-hoisted-into-preheader", j7_hoisted)
+  mir_alias_lane_expect(&mut out, "J7-rejected-row",
+    mir_journal_row_symbol_reason_is(rows_licm, "licm".to_string(), "licm-rejected".to_string(), licm_name.clone(), "consume"))
+
+  # ——— J8: SLP rejection with the aliasing blocker ———
+  let f_slp = mir_slp_lane_add_fn("lane_journal_slp_alias".to_string(), Type::I32, 4, true, false)
+  var prog_slp = mir_origin_lane_program(Vec::from([f_slp]))
+  prog_slp.slp_vector_facility = true
+  var rows_slp: Vec[OptimizationDecision] = Vec::new()
+  slp_vectorize(prog_slp, true, &mut rows_slp)
+  mir_alias_lane_expect(&mut out, "J8-rejected-blocker",
+    mir_journal_row_symbol_reason_is(rows_slp, "slp-vectorize".to_string(), "slp-vectorize-rejected".to_string(), "lane_journal_slp_alias".to_string(), "aliases"))
+
+  out
+end
+
 def simplify_moves(inout f: MirFunction) -> Unit
   # Remove redundant moves: _x = Move(_x) or _x = Copy(_x) where src == dst.
   # Also remove chains like: _tmp = Move(_x); _y = Move(_tmp) → _y = Move(_x)
@@ -28257,12 +28776,20 @@ end
 #   - All its operands are themselves loop-invariant
 
 def loop_invariant_code_motion(inout f: MirFunction) -> Unit
+  var discard: Vec[OptimizationDecision] = Vec::new()
+  loop_invariant_code_motion_impl(f, false, &mut discard)
+end
+
+# The capture-capable LICM body (audit order item 8): `capture` gates the
+# per-statement decision rows; `rows` is the collector threaded from the
+# capturing optimizer entry. Behavior is byte-identical with capture=false.
+def loop_invariant_code_motion_impl(inout f: MirFunction, capture: Bool, inout rows: Vec[OptimizationDecision]) -> Unit
   # Step 1: Detect natural loops using back edges
   let loops = find_natural_loops(f)
   
   # Step 2: For each loop, find invariant statements and hoist them
   for loop_info in loops do
-    hoist_loop_invariants(f, &loop_info)
+    hoist_loop_invariants(f, &loop_info, capture, rows)
   end
 end
 
@@ -28414,7 +28941,7 @@ def find_natural_loops(f: MirFunction) -> Vec[NaturalLoop]
   loops
 end
 
-def hoist_loop_invariants(inout f: MirFunction, loop_info: NaturalLoop) -> Unit
+def hoist_loop_invariants(inout f: MirFunction, loop_info: NaturalLoop, capture: Bool, inout rows: Vec[OptimizationDecision]) -> Unit
   # Find definitions inside the loop
   var loop_defs: Set[Int] = Set::new()
   for block in f.blocks do
@@ -28431,15 +28958,35 @@ def hoist_loop_invariants(inout f: MirFunction, loop_info: NaturalLoop) -> Unit
   
   # Find loop-invariant statements:
   # An assignment is invariant if all its operand locals are defined outside the loop
-  var invariant_stmts: Vec[MirStatement] = Vec::new()
+  # (audit order item 8) each candidate carries its source block id so the
+  # decision row's site falls back to the right locator for hand-built IR.
+  var invariant_stmts: Vec[(MirStatement, Int)] = Vec::new()
   
   for block in f.blocks do
     if loop_contains_block(loop_info, block.id.id) && block.id.id != loop_info.header.id then
       var remaining_stmts = Vec::new()
       for stmt in block.statements do
         if is_loop_invariant_stmt(&stmt, &loop_defs) then
-          invariant_stmts.push(stmt.clone())
+          invariant_stmts.push((stmt.clone(), block.id.id))
         else
+          # (audit order item 8) The REJECT path a row is worth: a
+          # statement whose rvalue carries a side effect (a Consume) can
+          # never be hoisted — its per-iteration semantics are observable.
+          if capture then
+            match stmt.kind
+            when MirStatementKind::MirAssign(_, rvalue) then
+              if rvalue_has_side_effect(&rvalue) then
+                rows.push(opt_dec_row(
+                  "licm",
+                  f.name.clone(),
+                  opt_dec_node_site(stmt.origin.clone(), &stmt.span, block.id.id),
+                  "licm-rejected",
+                  opt_dec_licm_reject_reason(f, stmt, loop_info.header.id)
+                ))
+              end
+            when _ then ()
+            end
+          end
           remaining_stmts.push(stmt.clone())
         end
       end
@@ -28504,9 +29051,20 @@ def hoist_loop_invariants(inout f: MirFunction, loop_info: NaturalLoop) -> Unit
     match get_block_index(f, preheader_id)
     when Option::Some(preheader_idx) then
       # Shared iteration is projected: clone the hoisted invariants
-      # (consuming iteration is not supported yet).
-      for inv_stmt in invariant_stmts do
+      # (consuming iteration is not supported yet). (audit order item 8)
+      # each append records the loop-invariance fact at the statement's
+      # semantic site.
+      for (inv_stmt, source_block) in invariant_stmts do
         f.blocks[preheader_idx].statements.push(inv_stmt.clone())
+        if capture then
+          rows.push(opt_dec_row(
+            "licm",
+            f.name.clone(),
+            opt_dec_node_site(inv_stmt.origin.clone(), &inv_stmt.span, source_block),
+            "licm-hoisted",
+            opt_dec_licm_reason(f, inv_stmt, loop_info.header.id, preheader_id.id)
+          ))
+        end
       end
     when Option::None then ()
     end
@@ -29111,8 +29669,13 @@ end
 #      promote_heap_to_stack rewrite (`_X = Box::new(v)` -> `_X = v`)
 #      assumes the promoted value is unobservable, and only the closure
 #      gate proves that at the MIR level this slice can express.
-# Evidence: one "escape-promoted" row per promoted local in capture mode
-# (the summary table itself is observable through escape_summary_of).
+# Evidence: one "escape-promoted" row per promoted local in capture mode,
+# naming the recognized allocation callee, the NoEscape state, the
+# value-flow closure and the stack byte size; a recognized allocation
+# destination that is NOT promoted records "escape-rejected" with the real
+# blocker (the escape state, the value-flow closure gap, or the shared
+# MAX_STACK_PROMOTION_BYTES cap). (the summary table itself is observable
+# through escape_summary_of).
 
 struct EscapeSummary
   # Exit escape state of every parameter, in declaration order (valid
@@ -29493,6 +30056,11 @@ pub def escape_summary_of(program: MirProgram, name: String) -> Option[EscapeSum
   sums.get(name)
 end
 
+# (audit order item 8) The stack-promotion byte cap — the ONE authority the
+# selection (rows) and the rewrite (behavior) share, so a promotion row can
+# never name a rewrite the pass did not perform.
+const MAX_STACK_PROMOTION_BYTES: Int = 4096
+
 def escape_analysis_program(inout program: MirProgram) -> Unit
   var discard: Vec[OptimizationDecision] = Vec::new()
   escape_analysis_program_impl(program, false, &mut discard)
@@ -29504,18 +30072,39 @@ def escape_analysis_program_impl(inout program: MirProgram, capture: Bool, inout
     if f.is_extern then next end
     let states = compute_escape_states_using(f, sums, false)
     var promote: Set[Int] = Set::new()
-    for entry in states.entries() do
-      let lid = entry.0
-      match entry.1
-      when EscapeState::NoEscape then
-        if mir_escape_dest_is_alloc_call(f, lid) && mir_escape_local_value_closed(f, lid) then
-          promote.insert(lid)
+    # (audit order item 8) The decision order is the DECLARATION order of
+    # f.locals (the only stack-promotable destinations: a param destination
+    # never fits local_stack_promotion_size_bytes and the rewrite was always
+    # a no-op for it), so the journal rows are deterministic.
+    for l in f.locals do
+      let lid = l.id.id
+      if mir_escape_dest_is_alloc_call(f, lid) then
+        let st = lookup_escape(&states, lid)
+        let callee = opt_dec_alloc_callee(f, lid)
+        match st
+        when EscapeState::NoEscape then
+          if mir_escape_local_value_closed(f, lid) then
+            let size_bytes = local_stack_promotion_size_bytes(f, lid)
+            if size_bytes <= MAX_STACK_PROMOTION_BYTES then
+              promote.insert(lid)
+              if capture then
+                rows.push(opt_dec_row("escape analysis", f.name.clone(), opt_dec_alloc_site(f, lid), "escape-promoted",
+                  "allocation destination local '" + opt_dec_local_name(f, lid) + "' is the destination of the recognized '" + callee + "' allocation; the interprocedural escape state is NoEscape and the value-flow closure gate proves its only mention is the allocation call itself — promoted to stack storage (" + size_bytes.to_string() + " bytes, cap " + MAX_STACK_PROMOTION_BYTES.to_string() + ")"))
+              end
+            elsif capture then
+              rows.push(opt_dec_row("escape analysis", f.name.clone(), opt_dec_alloc_site(f, lid), "escape-rejected",
+                "allocation destination local '" + opt_dec_local_name(f, lid) + "' is NoEscape and value-flow closed, but its estimated stack size " + size_bytes.to_string() + " bytes exceeds the " + MAX_STACK_PROMOTION_BYTES.to_string() + "-byte stack-promotion cap"))
+            end
+          elsif capture then
+            rows.push(opt_dec_row("escape analysis", f.name.clone(), opt_dec_alloc_site(f, lid), "escape-rejected",
+              "allocation destination local '" + opt_dec_local_name(f, lid) + "' ('" + callee + "') is NoEscape, but the value-flow closure gate fails: the local is read, copied, moved, projected, address-taken or deinited outside its allocation call"))
+          end
+        when _ then
           if capture then
-            rows.push(opt_dec_row("escape analysis", f.name.clone(), opt_dec_alloc_site(f, lid), "escape-promoted",
-              "allocation destination local '" + opt_dec_local_name(f, lid) + "' is interprocedurally NoEscape and value-flow closed — promoted to stack storage"))
+            rows.push(opt_dec_row("escape analysis", f.name.clone(), opt_dec_alloc_site(f, lid), "escape-rejected",
+              "allocation destination local '" + opt_dec_local_name(f, lid) + "' ('" + callee + "') escapes (EscapeState::" + opt_dec_escape_state_word(st.clone()) + "): the value crosses the function boundary, so stack promotion would be unsound"))
           end
         end
-      when _ then ()
       end
     end
     if !promote.is_empty() then
@@ -29555,8 +30144,7 @@ end
 
 def promote_heap_to_stack(inout f: MirFunction, non_escaping: Set[Int]) -> Unit
   # Rewrite heap allocation calls (Box::new, alloc::allocate) to stack alloca
-  # when the destination local does not escape.
-  let max_stack_promotion_bytes = 4096
+  # when the destination local does not escape and fits the shared cap.
   for block in f.blocks do
     match block.terminator.kind
     when MirTerminatorKind::MirCall { dest, func: callee, args, success: succ, unwind, intrinsic, tail: _ } then
@@ -29574,7 +30162,7 @@ def promote_heap_to_stack(inout f: MirFunction, non_escaping: Set[Int]) -> Unit
 
       let dest_id = dest.local.id
       let estimated_size = local_stack_promotion_size_bytes(f, dest_id)
-      if is_alloc && non_escaping.contains(&dest_id) && estimated_size <= max_stack_promotion_bytes then
+      if is_alloc && non_escaping.contains(&dest_id) && estimated_size <= MAX_STACK_PROMOTION_BYTES then
         # Replace the call with a stack allocation:
         # Instead of: _X = Box::new(val) -> bb_succ
         # Produce:    _X = StackAlloc(val) as a statement; goto bb_succ
@@ -35549,17 +36137,21 @@ def mir_effect_ev_empty() -> Vec[String]
 end
 
 # The per-class slots' evidence set (first wins) for one function's
-# direct scan.
+# direct scan. The vector grows to the requested class slot, so the
+# widened §11 class vocabulary (types.tg EffectClass: Sleep/Panic/Unsafe
+# appended after the four annotation classes — audit order item 8) can
+# never index out of bounds; annotation claims only ever pass the four
+# behavioral classes (slots 0..3).
 def mir_effect_ev_set(inout state: MirEffectState, fn_name: String, c: EffectClass, text: String) -> Unit
   var evs = Vec::new()
   match state.direct_evidence.get(fn_name.clone())
   when Option::Some(cur) then evs = cur.clone()
   when Option::None then ()
   end
-  while evs.len() < 4 do
+  let slot = effect_class_slot_index(c)
+  while evs.len() <= slot do
     evs.push("".to_string())
   end
-  let slot = effect_class_slot_index(c)
   if evs[slot].len() == 0 then
     evs[slot] = text
     state.direct_evidence.insert(fn_name.clone(), evs)
@@ -37785,6 +38377,31 @@ end
 # call/deinit arms consume the ONE shared typed operation classification
 # (operation_class_of_call/_deinit), exactly like mir_budget_alloc_sites_of.
 def mir_budget_alloc_aggregate_of(mir: MirProgram, f: MirFunction, type_index: Map[Int, String], fn_index: Map[String, Int], type_defs: Map[Int, MirTypeDef]) -> HeapSizeAggregate
+  mir_budget_alloc_aggregate_filtered(mir, f, &type_index, &fn_index, &type_defs, false)
+end
+
+# (audit order item 8) The DIRECT arena-only P1-7 heap aggregate of one
+# function: the same walk restricted to the sites whose operation carries
+# the §11 arena capability (MirOperationClass::ArenaAllocate — the typed
+# predicate mir_operation_summary_arena). Statements (concat / effect
+# perform) are never arena sites; the call/deinit arms keep only
+# op.arena_allocation sites. The snapshot's AllocationSummary
+# bounded_arena_bytes consumes this through the SAME transitive join.
+def mir_budget_alloc_arena_aggregate_of(mir: MirProgram, f: MirFunction, type_index: Map[Int, String], fn_index: Map[String, Int], type_defs: Map[Int, MirTypeDef]) -> HeapSizeAggregate
+  mir_budget_alloc_aggregate_filtered(mir, f, &type_index, &fn_index, &type_defs, true)
+end
+
+# The shared walk of both aggregate entries (arena_only selects the
+# arena-site filter) — ONE site classification authority, never a
+# duplicated walk.
+def mir_budget_alloc_aggregate_filtered(
+  mir: MirProgram,
+  f: MirFunction,
+  type_index: Map[Int, String],
+  fn_index: Map[String, Int],
+  type_defs: Map[Int, MirTypeDef],
+  arena_only: Bool
+) -> HeapSizeAggregate
   var agg = heap_size_aggregate_empty()
   for block in f.blocks do
     var si = 0
@@ -37794,18 +38411,23 @@ def mir_budget_alloc_aggregate_of(mir: MirProgram, f: MirFunction, type_index: M
       when MirStatementKind::MirAssign(dest, rvalue) then
         match rvalue.kind
         when MirRvalueKind::MirBinOp(MirBinOp::Add, lhs, rhs) then
-          let dest_str = mir_effect_type_is_string_like(&mir_effect_place_type(f, &dest))
-          let lhs_str = mir_effect_operand_is_string(f, &lhs)
-          let rhs_str = mir_effect_operand_is_string(f, &rhs)
-          if dest_str || lhs_str || rhs_str then
-            agg = heap_size_aggregate_join(agg.clone(), heap_size_aggregate_of_class(mir_budget_concat_site_class(lhs.clone(), rhs.clone())))
+          if !arena_only then
+            let dest_str = mir_effect_type_is_string_like(&mir_effect_place_type(f, &dest))
+            let lhs_str = mir_effect_operand_is_string(f, &lhs)
+            let rhs_str = mir_effect_operand_is_string(f, &rhs)
+            if dest_str || lhs_str || rhs_str then
+              agg = heap_size_aggregate_join(agg.clone(), heap_size_aggregate_of_class(mir_budget_concat_site_class(lhs.clone(), rhs.clone())))
+            end
           end
         when _ then ()
         end
       when MirStatementKind::MirEffectPerform(_, _, _, _, _) then
         # An algebraic-effects perform's handler is not statically bounded
-        # — fail closed (the effect scan's rule): Unknown.
-        agg = heap_size_aggregate_join(agg.clone(), heap_size_aggregate_of_class(AllocSizeClass::Unknown))
+        # — fail closed (the effect scan's rule): Unknown. A perform is
+        # never an arena call site.
+        if !arena_only then
+          agg = heap_size_aggregate_join(agg.clone(), heap_size_aggregate_of_class(AllocSizeClass::Unknown))
+        end
       when _ then ()
       end
       si = si + 1
@@ -37813,7 +38435,7 @@ def mir_budget_alloc_aggregate_of(mir: MirProgram, f: MirFunction, type_index: M
     match block.terminator.kind
     when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic, tail: _ } then
       let op = operation_class_of_call(mir, f, &type_index, &fn_index, &func, &args, intrinsic.clone())
-      if op.allocate && op.callee.len() == 0 then
+      if op.allocate && op.callee.len() == 0 && (!arena_only || op.arena_allocation) then
         var cls = AllocSizeClass::Unknown
         match intrinsic
         when Option::Some(iid) then
@@ -37842,7 +38464,7 @@ def mir_budget_alloc_aggregate_of(mir: MirProgram, f: MirFunction, type_index: M
       end
     when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
       let op2 = operation_class_of_deinit(mir, &fn_index, &deinit_fn)
-      if op2.allocate && op2.callee.len() == 0 then
+      if op2.allocate && op2.callee.len() == 0 && (!arena_only || op2.arena_allocation) then
         # A drop glue outside this compilation (deferred generic drop):
         # Unknown (fail closed). An in-program glue contributes through
         # the transitive edge.
@@ -38123,7 +38745,16 @@ pub def check_budget_annotations_mir_with_frames(mir: MirProgram, env: TypeEnv, 
             semantic_site: Option::Some("budget enforcement"),
             effect_trace: trace,
             related_symbols: Vec::from([f.name.clone()]),
-            semantic_data: Option::None
+            # (universal-typed-derivation closure) the @budget contract
+            # rejection always carries its typed derivation: the claim, the
+            # violated obligation row, the subject and the first fact row.
+            semantic_data: Option::Some(DiagnosticSemanticData::Contract(ContractDiagnosticData {
+              contract: "@budget".to_string(),
+              obligation: rows[0].clone(),
+              subject: f.name.clone(),
+              state_before: "violated".to_string(),
+              fact: rows[0].clone()
+            }))
           })
         end
       end

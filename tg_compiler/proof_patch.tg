@@ -262,8 +262,12 @@ use tg_compiler::semantic_delta::{
   EffectSummaryView, DropPlanDelta, DropSiteDelta,
   semantic_delta_empty, semantic_delta_rows_same, semantic_delta_rows_diff,
   semantic_delta_unsafe_marker_text,
+  # (audit item 9) the affected closure's verdict + the shared completeness
+  # render the patch's analysis row carries.
+  AffectedResult,
   DeltaStatus
 }
+use tg_compiler::semantic_model::{CompletenessInfo, completeness_info_subset, completeness_info_render}
 use tg_compiler::change_budget::{
   ChangeBudget, budget_verify_with_equivalence, budget_refactor_default,
   budget_refactor_with_level
@@ -344,6 +348,12 @@ struct PatchEvidenceBundle
   coverage_delta_rows: Vec[String] = Vec::new()
   performance_delta_rows: Vec[String] = Vec::new()
   equivalence: Option[EquivalenceResult] = Option::None
+  # (audit item 9) the affected closure the change was verified over, when
+  # the caller computed one: its shared CompletenessInfo (class / reason /
+  # counts / analysis model) is attached to the patch's
+  # analysis_completeness rows so a consumer sees HOW COMPLETE the
+  # analysis behind the patch's claims was.
+  affected: Option[AffectedResult] = Option::None
 end
 
 # (fourth-audit P0-16) THE TYPED VERIFICATION STATUS. Every verification
@@ -408,8 +418,12 @@ end
 
 # The captured stage names of the driver's snapshot route (fourth-audit
 # P0-16, mirroring the driver's capture doc): the stages THAT route's
-# pipeline actually runs. mono/abi are NOT captured there, so the patch
-# reports them Unavailable — and can never report complete verification.
+# pipeline actually runs. Since audit order item 7 the route runs the
+# REAL post-lowering ABI verifier (driver_abi_verify_rows), so "abi" IS
+# captured and a false abi_verify_ok is Failed, never Unavailable.
+# post-mono-mir is NOT captured there (no post-mono checker exists on
+# this route): that status stays Unavailable and the patch can never
+# report complete verification from this capture alone.
 pub def verification_stage_names_driver_route() -> Vec[String]
   Vec::from([
     "parse".to_string(),
@@ -420,7 +434,8 @@ pub def verification_stage_names_driver_route() -> Vec[String]
     "mir".to_string(),
     "post-opt-mir".to_string(),
     "effects".to_string(),
-    "capabilities".to_string()
+    "capabilities".to_string(),
+    "abi".to_string()
   ])
 end
 
@@ -533,6 +548,13 @@ struct ProofCarryingPatch
   # budget envelope AND the budget's equivalence requirement, when one is
   # declared, holds).
   budget_result: Vec[String] = Vec::new()
+  # (audit item 9) The completeness of every analysis underlying the
+  # patch's claims, as canonical render rows (completeness_info_render:
+  # "<model>|<class>|visited=<n>|returned=<n>|omitted=<n>|<reason>").
+  # Filled from PatchEvidenceBundle.affected when the caller computed the
+  # affected closure (the closure's CompletenessInfo rides here); EMPTY
+  # otherwise — no analysis claim is invented.
+  analysis_completeness: Vec[String] = Vec::new()
 end
 
 # The empty / claim-nothing patch: the empty §31 delta (which verifies
@@ -958,6 +980,15 @@ def proof_patch_with_evidence(
   var out = patch
   match bundle.source_delta
   when Option::Some(sd) then out.source_delta = sd
+  when Option::None then ()
+  end
+  # (audit item 9) the affected closure's shared completeness rides the
+  # patch's analysis rows (the ONE attachment point every assembler uses —
+  # proof_patch_of_delta / proof_patch_between / proof_patch_of_status all
+  # end in this function).
+  match bundle.affected
+  when Option::Some(affected) then
+    out.analysis_completeness = Vec::from([completeness_info_render(affected.completeness_info.clone())])
   when Option::None then ()
   end
   out.obligation_results = bundle.obligation_results
@@ -1572,20 +1603,23 @@ pub def proof_patch_lane_check() -> Vec[String]
     verification_status_word(empty.post_opt_mir_status) == "unavailable" &&
     verification_status_word(empty.abi_status) == "unavailable" &&
     !proof_patch_all_verified(&empty))
-  # The driver route's captured set lacks mono and abi: those stages are
-  # Unavailable, and complete verification is NEVER reported.
+  # The driver route's captured set lacks post-mono-mir (no such
+  # checkpoint exists there), so complete verification is NEVER reported
+  # from this capture.  Since audit order item 7 the route CAPTURES abi
+  # (the real post-lowering verifier), so the false abi flag here is
+  # Failed — never Unavailable.
   let route_evidence = verified_compilation_evidence_stages(
     "rev-route".to_string(), true, true, true, true, true, true,
     false,  # mono — no captured post-mono checkpoint
     true, true,
-    false,  # abi — no ABI-verify stage
+    false,  # abi — a false CAPTURED flag (Failed, not Unavailable)
     true,   # capability/contract surface
     verification_stage_names_driver_route())
   let route_patch = proof_patch_of_delta(&ChangeBudget {}, &semantic_delta_empty(), &route_evidence)
   proof_lane_expect(&mut out, "P7-route-post-mono-mir-unavailable",
     verification_status_word(route_patch.post_mono_mir_status) == "unavailable")
-  proof_lane_expect(&mut out, "P7-route-abi-unavailable",
-    verification_status_word(route_patch.abi_status) == "unavailable")
+  proof_lane_expect(&mut out, "P7-route-abi-captured-failed",
+    verification_status_word(route_patch.abi_status) == "failed")
   proof_lane_expect(&mut out, "P7-route-not-all-verified",
     !proof_patch_all_verified(&route_patch))
   # A false flag for a CAPTURED stage is Failed, not Unavailable.
@@ -1683,6 +1717,31 @@ pub def proof_patch_lane_check() -> Vec[String]
     verified_proof_patch(VerificationLevel::ProvisionalFrontEnd, gated_full.clone(), lane_hash.clone()).is_none())
   proof_lane_expect(&mut out, "P10-verified-proof-frontend-none",
     verified_proof_patch(VerificationLevel::VerifiedFrontend, gated_full.clone(), lane_hash.clone()).is_none())
+
+  # P11 (audit item 9) — the analysis-completeness attachment: a patch
+  # assembled from a bundle carrying an AffectedResult renders the shared
+  # completeness record as its ONE analysis row; a bundle without one
+  # leaves the rows empty (never an invented claim).
+  var affected_lane = AffectedResult {
+    entities: Vec::from(["m::A".to_string(), "m::B".to_string()]),
+    completeness: "unavailable".to_string(),
+    missing_relations: Vec::from(["LayoutDependency".to_string()])
+  }
+  affected_lane.completeness_info = completeness_info_subset("semantic-affected-closure",
+    "relation families unavailable: LayoutDependency", 1, 2, 1)
+  let with_analysis = PatchEvidenceBundle {
+    affected: Option::Some(affected_lane.clone())
+  }
+  let carried_analysis = proof_patch_of_delta(&ChangeBudget {}, &semantic_delta_empty(),
+    &proof_lane_evidence(), with_analysis)
+  proof_lane_expect(&mut out, "P11-analysis-completeness-attached",
+    carried_analysis.analysis_completeness.len() == 1 &&
+    carried_analysis.analysis_completeness[0] ==
+      "semantic-affected-closure|conservative-subset|visited=1|returned=2|omitted=1|relation families unavailable: LayoutDependency")
+  proof_lane_expect(&mut out, "P11-analysis-completeness-defaulted-empty",
+    proof_patch_new().analysis_completeness.len() == 0 &&
+    proof_patch_of_delta(&ChangeBudget {}, &semantic_delta_empty(),
+      &proof_lane_evidence()).analysis_completeness.len() == 0)
 
   out
 end

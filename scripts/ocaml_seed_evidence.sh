@@ -118,6 +118,22 @@ LOCK="$ROOT_DIR/bootstrap/ocaml-toolchain.lock"
 TG_BIN="$STAGE_DIR/_build/default/bin/tg_stage0.exe"
 TEST_BIN="$STAGE_DIR/_build/default/test/test_main.exe"
 
+# Harness timeout calibration (measured 2026-09-13 on the development host,
+# seed at commit 7e2f449): the FULL bootstrap-check closure measured 400.4 s
+# wall (6:40.37), tg_bootstrap_gate 364.9 s (6:04.93) and the tg_evidence
+# component 385.6 s (6:25.61). Each cap is the measurement x 2 rounded up to
+# the next 60 s (bootstrap-check 800.8 -> 840 s; gate 729.9 -> 780 s;
+# tg_evidence 771.2 -> 780 s): the host carries unrelated background load
+# and a 1.4-1.6x contention factor was observed on the calibration day. A
+# cap is a bound, never a skip: the full runs still execute under them.
+# Re-measure when the closure grows materially.
+BOOTSTRAP_CHECK_TIMEOUT_S=840
+GATE_TIMEOUT_S=780
+EVIDENCE_TIMEOUT_S=780
+# The generic component-selfcheck bound (components other than the full
+# closure phases); the tests binary is fast and keeps its own bound.
+COMPONENT_TIMEOUT_S=420
+
 sha256_of() { shasum -a 256 "$1" | awk '{print $1}'; }
 
 # (a) Toolchain gate: fail fast when the locked OCaml/Dune versions
@@ -173,10 +189,19 @@ for EXE in "$STAGE_DIR"/_build/default/selfcheck/*.exe; do
   [ -x "$EXE" ] || continue
   NAME="$(basename "$EXE" .exe)"
   set +e
+  # The full-closure phases use the calibrated caps: tg_bootstrap_gate runs
+  # the whole manifest closure (measured 364.9 s on 2026-09-13) and
+  # tg_evidence the full evidence phase (measured 385.6 s); both exceeded
+  # the generic component bound under host contention.
+  SC_TIMEOUT_S="$COMPONENT_TIMEOUT_S"
+  if [ "$NAME" = "tg_bootstrap_gate" ]; then
+    SC_TIMEOUT_S="$GATE_TIMEOUT_S"
+  fi
   if [ "$NAME" = "tg_evidence" ]; then
-    (cd "$STAGE_DIR" && timeout 300 "$EXE" "$ROOT_DIR") > "$WORK_DIR/sc_$NAME.out" 2>&1
+    SC_TIMEOUT_S="$EVIDENCE_TIMEOUT_S"
+    (cd "$STAGE_DIR" && timeout "$SC_TIMEOUT_S" "$EXE" "$ROOT_DIR") > "$WORK_DIR/sc_$NAME.out" 2>&1
   else
-    (cd "$STAGE_DIR" && timeout 300 "$EXE") > "$WORK_DIR/sc_$NAME.out" 2>&1
+    (cd "$STAGE_DIR" && timeout "$SC_TIMEOUT_S" "$EXE") > "$WORK_DIR/sc_$NAME.out" 2>&1
   fi
   RC=$?
   set -e
@@ -184,7 +209,7 @@ for EXE in "$STAGE_DIR"/_build/default/selfcheck/*.exe; do
 done
 
 # The deterministic tg_evidence phase lines.
-EVIDENCE_OUT="$(timeout 300 "$STAGE_DIR/_build/default/selfcheck/tg_evidence.exe" "$ROOT_DIR" 2>&1 || true)"
+EVIDENCE_OUT="$(timeout "$EVIDENCE_TIMEOUT_S" "$STAGE_DIR/_build/default/selfcheck/tg_evidence.exe" "$ROOT_DIR" 2>&1 || true)"
 printf '%s\n' "$EVIDENCE_OUT" | grep '^evidence ' > "$WORK_DIR/evidence_lines" || true
 
 # The bootstrap-check gate output (the gate may FAIL — the record keeps
@@ -193,7 +218,7 @@ printf '%s\n' "$EVIDENCE_OUT" | grep '^evidence ' > "$WORK_DIR/evidence_lines" |
 # structured per-diagnostic JSONL (audit P0 fix): the evidence consumes
 # that file directly instead of scraping rendered stdout.
 set +e
-BC_OUT="$(timeout 300 "$TG_BIN" bootstrap-check --repo-root "$ROOT_DIR" --diagnostics-jsonl "$WORK_DIR/diagnostics.jsonl" 2>&1)"
+BC_OUT="$(timeout "$BOOTSTRAP_CHECK_TIMEOUT_S" "$TG_BIN" bootstrap-check --repo-root "$ROOT_DIR" --diagnostics-jsonl "$WORK_DIR/diagnostics.jsonl" 2>&1)"
 BC_RC=$?
 set -e
 printf '%s\n' "$BC_OUT" > "$WORK_DIR/bc_out"

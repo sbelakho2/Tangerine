@@ -91,6 +91,11 @@ SUITES=(
   # round-trip + fail-closed v2 conversion, structural tail eligibility,
   # coverage control-origin ids carried by the LIR route's plan).
   "tests/mir_origin_identity_lane_test.tg"
+  # audit order item 8: the optimizer decision journal (accept AND reject
+  # rows per named pass with the real proof/cost/blocker evidence) and the
+  # perf metrics derived from it (bounds_checks_removed / inline_decisions)
+  # plus the compiler-owned vector type property (real SIMD vs name-alikes).
+  "tests/mir_optimizer_journal_test.tg"
   "tests/unit/test_int_overflow_behavior.tg"
   # audit item 1: the Slice ownership split (copied_slice / cloned_slice
   # drop counts, sub-view range validation) + the fixed-decimal suite.
@@ -140,7 +145,12 @@ SUITES=(
   # discriminant normalization, heap downcast), heap-handle fields
   # (String move + plan destructor), nested projection through a
   # pointer (p.inner.x, p.e downcast) and sub-word F32 fields (4-byte
-  # width accesses + GP<->FP bit moves) + the verify_lir gate.
+  # width accesses + GP<->FP bit moves), plus the packed-placement
+  # rows: a String handle / opaque-pointer / enum-typed field at a
+  # non-8-byte offset (byte-mode width-8 value-word access, the tag
+  # still at offset 0 of the word, destruction at the byte-offset
+  # field address) and the declaration-level @packed/@align/sub-word
+  # enum payload boundaries still refused + the verify_lir gate.
   "tests/lir_aggregate_residual_test.tg"
   # audit item 34 stage 2: the LIR vector params/returns + ABI crossings
   # (the shared SIMD&FP file positions from classify_call_plan, the
@@ -148,6 +158,14 @@ SUITES=(
   # image across a call, the v256 admission gated by the desc's AVX
   # tokens) + the verify_lir gate.
   "tests/lir_vector_abi_rows_test.tg"
+  # audit order item 7: the post-lowering ABI verifier (verify_abi /
+  # abi_verified) — clean plan/LIR/allocation boundaries on
+  # aarch64/x86-64/cm/riscv64, the precise wrong-class / wrong-position /
+  # sret / alignment / fixed-register / callee-saved failures, the
+  # variadic SysV AL rule, the extern C classification mismatch + the
+  # real HFA placement rows (d0,d1 / v0.., audit P1-13), and the real
+  # captured "abi" evidence stage.
+  "tests/abi_verify_test.tg"
   # the explicit-op extension lane: the andnot / compare / shift /
   # splat / lane / pack-unpack lowering rows (each extension intrinsic
   # becomes one marked LirVecOp and verify_lir stays clean) + the
@@ -169,6 +187,12 @@ SUITES=(
   # over a synthetic counter array — the contract the LIR-route runtime
   # blob is built from.
   "tests/coverage_emission_test.tg"
+  # (audit order item 5 closeout) the test-synthesis closed loop: the
+  # uncovered-path -> synthesis-request promotion (deterministic naming
+  # from the stable id/constraint digest), the generator round trip
+  # (std::test_gen.generate_test_suite -> concrete @test source), the
+  # typed request render fallback and the affected-test skip.
+  "tests/test_synthesis_test.tg"
   # third-audit item 45: the @budget guarantee vocabulary + classification
   # lane (the BudgetGuarantee / BudgetDerivations records, the
   # budget_classification_of rule, the derivation-aware static

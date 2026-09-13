@@ -13,8 +13,9 @@
 # third audit item 27), the refactor-equivalence requirement (third audit
 # item 32 — a configured minimum §41 EquivalenceLevel plus whether a proof
 # is demanded; evaluated by budget_verify_with_equivalence) and (optionally)
-# the alloc-class effect rows it may introduce plus the RESERVED allocation
-# byte budget. The module reads ONLY
+# the alloc-class effect rows it may introduce plus the allocation byte
+# budget (verified against the §31 delta's typed AllocationSummary rows —
+# audit order item 8). The module reads ONLY
 # SemanticDelta / EquivalenceResult records (semantic_delta.tg +
 # equivalence.tg, never AST / typed / MIR state)
 # and mirrors the semantic_delta.tg / repair_candidates.tg idioms. An EMPTY
@@ -163,15 +164,21 @@
 #   8. allocation — only when max_allocation_delta = Some(n): the count of
 #      effect delta rows whose after view newly carries the alloc class
 #      (bit 1 — the §11 payload marks allocation as the word's low bit); a
-#      count above n lists every counted row. The RESERVED allocation byte
-#      budget allocation_budget_bytes = Some(n) additionally fails closed:
-#      the §11 effect view the delta carries (bits + capability ids)
-#      contains NO allocation byte count — no snapshot row or delta payload
-#      serializes allocation bytes — so the verifier cannot derive a
-#      bytes-used value from a SemanticDelta and reports the precise gap
-#      instead of silently passing a declared byte cap. (A future
-#      byte-carrying effect payload plugs in here; the field and this gate
-#      are the wiring point.)
+#      count above n lists every counted row. The allocation BYTE budget
+#      (allocation_budget_bytes = Some(n), audit order item 8) now verifies
+#      against the delta's TYPED AllocationSummary rows (the snapshot
+#      builder's persisted per-function budget derivations): every changed
+#      after row must be a finite static proof/bound (bytes_level
+#      static-proof / static-bound, max_dynamic_bytes ≥ 0, no unbounded
+#      sites); then the introduced bytes Σ max(0, after − before) must be
+#      ≤ n. An after row with no finite bound fails closed listing its
+#      unbounded site keys (a row with a non-finite level but no listed
+#      sites names the level); a delta that introduces alloc-class effects
+#      with NO summary rows at all is the producer gap (also fail closed);
+#      a delta with no allocation-summary rows and no alloc-class effect
+#      additions provably introduces 0 bytes and PASSES. The former
+#      reserved always-fail result is gone — the byte payload the gap
+#      documented now exists (AllocationSummary + the §31 delta rows).
 #   9. refactor equivalence — ONLY in budget_verify_with_equivalence (the
 #      envelope verifier budget_verify holds no §41 result): when the
 #      budget declares equivalence_requirement = Some(req), the supplied
@@ -223,9 +230,15 @@
 #   budget:allocation <n> added alloc-class effect rows exceed
 #     max_allocation_delta <m>
 #   budget:allocation row <fn-key>
+#   budget:allocation-bytes unbounded site <fn-key>|<site> cannot be
+#     verified against allocation_budget_bytes <n> (no finite static bound
+#     on that function's allocations) — one row per unbounded site key
+#     (a non-finite level with no listed sites renders "<fn-key> (no finite
+#     static bound: <level-word>)")
 #   budget:allocation-bytes <n> cannot be verified: the semantic delta
-#     carries no allocation byte payload (effect views are bits + capability
-#     ids only); allocation_budget_bytes is reserved
+#     introduces alloc-class effects but carries no allocation summary rows
+#     (the producer gap; an allocation-free delta passes instead)
+#   budget:allocation-bytes <used> used exceeds allocation_budget_bytes <n>
 #   budget:equivalence-required missing equivalence result: minimum
 #     <level-word> (require_proven=<b>) — check 9, only in
 #     budget_verify_with_equivalence
@@ -241,7 +254,7 @@ use std::core::{Option}
 use std::collections::{Vec, Set}
 
 use tg_compiler::ids::{EffectId}
-use tg_compiler::types::{CapabilityId}
+use tg_compiler::types::{CapabilityId, EffectClass}
 use tg_compiler::stable_ids::{
   StableDeclId, stable_decl_of_key, stable_decl_eq,
   StableAbiSurfaceId,
@@ -253,11 +266,20 @@ use tg_compiler::semantic_delta::{
   contract_compatibility_of, contract_compatibility_word,
   contract_conjunction, contract_conjunction_relation,
   AbiDeltaView, AbiSurfaceView, EffectSummaryView, CapabilityDelta,
-  semantic_delta_rows_diff, semantic_delta_unsafe_marker_text, semantic_delta_empty
+  semantic_delta_rows_diff, semantic_delta_unsafe_marker_text, semantic_delta_empty,
+  # (audit order item 8) the typed allocation-summary delta row the
+  # byte lane reads.
+  AllocationSummaryDelta
 }
 # (fourth-audit P0-19) the typed unsafe-site lane builds real UnsafeFact
 # rows carrying site_id.
-use tg_compiler::semantic_model::{UnsafeFact, UnsafeKind, UnsafeDelta}
+use tg_compiler::semantic_model::{
+  UnsafeFact, UnsafeKind, UnsafeDelta,
+  # (audit order item 8) the typed per-function allocation summary the
+  # allocation-byte lane consumes (bytes + proof level + unbounded sites)
+  # and its typed snapshot/delta rows.
+  AllocationSummary, ProofLevel, semantic_proof_level_word
+}
 # (third audit item 32) The refactor-equivalence gate reads the §41 result
 # vocabulary: the configured minimum is an EquivalenceLevel, and the
 # satisfaction decision is equivalence_result_satisfies (equivalence.tg's
@@ -291,15 +313,17 @@ struct EquivalenceRequirement
   require_proven: Bool = true
 end
 
-# (fourth-audit P0-19) The TYPED effect allowance member of the budget's
-# allowed_effects set: one (function declaration, class word) pair. The
-# class word is the §11 dirty-class text (budget_class_text: alloc / block /
-# io / spawn / sleep / panic / unsafe). Eq/Hash compare the declaration
-# digest words and the class text — NO delimiter parsing anywhere in the
+# (fourth-audit P0-19; audit order item 8) The TYPED effect allowance
+# member of the budget's allowed_effects set: one (function declaration,
+# EffectClass) pair. The class is the compiler's §11 class enum
+# (types.tg EffectClass — the full dirty-class vocabulary Alloc / Block /
+# Io / Spawn / Sleep / Panic / Unsafe), never a class-word String: Eq/Hash
+# compare the declaration digest words and the typed class's declaration
+# ordinal — NO delimiter parsing and NO text spelling anywhere in the
 # membership path.
 struct AllowedEffect
   function: StableDeclId
-  class: String
+  class: EffectClass
 end
 
 impl Eq for AllowedEffect
@@ -313,7 +337,7 @@ impl Hash for AllowedEffect
     var h = 0
     h = ((h as UInt) * 31 + self.function.digest_hi) as Int
     h = ((h as UInt) * 31 + self.function.digest_lo) as Int
-    h = ((h as UInt) * 31 + (self.class.len() as UInt)) as Int
+    h = ((h as UInt) * 31 + (budget_effect_class_numeric(self.class) as UInt)) as Int
     h
   end
 end
@@ -410,11 +434,13 @@ struct ChangeBudget
   # The most effect rows newly carrying the alloc class permitted; None =
   # no cap.
   max_allocation_delta: Option[Int] = Option::None
-  # The RESERVED allocation byte budget (third audit item 28): None = no
-  # byte cap. The §11 effect view a delta carries serializes bits +
-  # capability ids and NO allocation byte count, so no bytes-used value is
-  # derivable from a SemanticDelta today; Some(n) fails closed on the
-  # reservation (check 8) instead of silently passing.
+  # The allocation byte budget (third audit item 28; audit order item 8):
+  # None = no byte cap. Some(n) verifies the delta's TYPED
+  # AllocationSummary rows — the introduced bytes Σ max(0, after − before)
+  # over the changed after rows must be ≤ n and every changed after row
+  # must carry a finite static proof/bound with no unbounded sites;
+  # otherwise the lane fails closed with the unbounded site list (or the
+  # producer-gap row). See the module doc's check 8 for the exact rules.
   allocation_budget_bytes: Option[Int] = Option::None
   # (third audit item 32) The refactor-equivalence requirement: None (the
   # default) imposes no equivalence gate; Some(req) makes
@@ -517,14 +543,83 @@ end
 
 # The class word of a §11 dirty-class bit (the §11 may_* field names minus
 # the "may_" prefix; the fallback keeps the word deterministic for any bit).
+# (audit order item 8) The bit -> EffectClass mapping is the ONE authority;
+# the word renderer below is the class enum's §11 spelling.
+def budget_effect_class_of_bit(bit: Int) -> Option[EffectClass]
+  if bit == 1 then
+    Option::Some(EffectClass::Alloc)
+  elsif bit == 2 then
+    Option::Some(EffectClass::Block)
+  elsif bit == 4 then
+    Option::Some(EffectClass::Io)
+  elsif bit == 8 then
+    Option::Some(EffectClass::Spawn)
+  elsif bit == 16 then
+    Option::Some(EffectClass::Sleep)
+  elsif bit == 32 then
+    Option::Some(EffectClass::Panic)
+  elsif bit == 64 then
+    Option::Some(EffectClass::Unsafe)
+  else
+    Option::None
+  end
+end
+
+# The §11 class word of a typed EffectClass (the allowance-row grammar and
+# the violation rows' vocabulary: alloc / block / io / spawn / sleep /
+# panic / unsafe).
+pub def budget_effect_class_word(c: EffectClass) -> String
+  match c
+  when EffectClass::Alloc then "alloc"
+  when EffectClass::Block then "block"
+  when EffectClass::Io then "io"
+  when EffectClass::Spawn then "spawn"
+  when EffectClass::Sleep then "sleep"
+  when EffectClass::Panic then "panic"
+  when EffectClass::Unsafe then "unsafe"
+  end
+end
+
+# The typed class of one §11 class word (the allowance-row grammar parser;
+# None = an unknown word — the constructor inserts nothing, fail closed).
+pub def budget_effect_class_of_word(word: String) -> Option[EffectClass]
+  if word == "alloc" then
+    Option::Some(EffectClass::Alloc)
+  elsif word == "block" then
+    Option::Some(EffectClass::Block)
+  elsif word == "io" then
+    Option::Some(EffectClass::Io)
+  elsif word == "spawn" then
+    Option::Some(EffectClass::Spawn)
+  elsif word == "sleep" then
+    Option::Some(EffectClass::Sleep)
+  elsif word == "panic" then
+    Option::Some(EffectClass::Panic)
+  elsif word == "unsafe" then
+    Option::Some(EffectClass::Unsafe)
+  else
+    Option::None
+  end
+end
+
+# The declaration-order discriminant of a typed class (the Hash projection;
+# types.tg effect_class_slot_index's §11 order).
+def budget_effect_class_numeric(c: EffectClass) -> Int
+  match c
+  when EffectClass::Alloc then 0
+  when EffectClass::Block then 1
+  when EffectClass::Io then 2
+  when EffectClass::Spawn then 3
+  when EffectClass::Sleep then 4
+  when EffectClass::Panic then 5
+  when EffectClass::Unsafe then 6
+  end
+end
+
 def budget_class_text(bit: Int) -> String
-  if bit == 1 then "alloc"
-  elsif bit == 2 then "block"
-  elsif bit == 4 then "io"
-  elsif bit == 8 then "spawn"
-  elsif bit == 16 then "sleep"
-  elsif bit == 32 then "panic"
-  else "unsafe"
+  match budget_effect_class_of_bit(bit)
+  when Option::Some(c) then budget_effect_class_word(c)
+  when Option::None then "unsafe"
   end
 end
 
@@ -575,14 +670,19 @@ def budget_abi_surface_text(s: StableAbiSurfaceId) -> String
   end
 end
 
-# (fourth-audit P0-19) The typed allowed_effects member an effect row's
-# added class maps to: the row's typed function declaration + the class
-# word. None = the row carries no typed declaration member (the membership
-# check fails closed).
+# (fourth-audit P0-19; audit order item 8) The typed allowed_effects
+# member an effect row's added class maps to: the row's typed function
+# declaration + the TYPED EffectClass of the bit (the §11 class enum, never
+# a word). None = the row carries no typed declaration member or the bit
+# is outside the class band (the membership check fails closed).
 def budget_allowed_effect_member(row: EffectDelta, bit: Int) -> Option[AllowedEffect]
   match row.function_decl
   when Option::Some(d) then
-    Option::Some(AllowedEffect { function: d, class: budget_class_text(bit) })
+    match budget_effect_class_of_bit(bit)
+    when Option::Some(c) then
+      Option::Some(AllowedEffect { function: d, class: c })
+    when Option::None then Option::None
+    end
   when Option::None then Option::None
   end
 end
@@ -869,8 +969,7 @@ end
 
 # The allocation-class row count of a delta: the effect rows whose after
 # view newly carries the alloc class (bit 1). Shared by the
-# max_allocation_delta count check and the reserved byte-budget gate's gap
-# row.
+# max_allocation_delta count check and the byte lane's producer-gap row.
 def budget_allocation_alloc_row_count(delta: SemanticDelta) -> Int
   var count = 0
   for row in delta.effect_delta do
@@ -879,6 +978,45 @@ def budget_allocation_alloc_row_count(delta: SemanticDelta) -> Int
     end
   end
   count
+end
+
+# (audit order item 8) Whether an AllocationSummary's byte fact is a finite
+# static proof/bound: a non-negative max_dynamic_bytes, a StaticProof or
+# StaticBound level, and no unbounded/unknown site. Every other shape
+# (RuntimeMeasured / Unavailable / -1 / a listed unbounded site) is NOT a
+# bound and the allocation-byte lane fails closed on it.
+def budget_allocation_summary_finite(s: AllocationSummary) -> Bool
+  (s.bytes_level == ProofLevel::StaticProof || s.bytes_level == ProofLevel::StaticBound) &&
+    s.max_dynamic_bytes >= 0 && s.unbounded_sites.len() == 0
+end
+
+# The introduced allocation bytes of ONE changed summary row: the after
+# bound minus the before bound when the before row was itself finite (an
+# absent or unbounded before side contributes no prior bytes), clamped at
+# 0. Only called for FINITE after rows.
+def budget_allocation_delta_bytes(row: AllocationSummaryDelta) -> Int
+  match row.after
+  when Option::None then
+    0
+  when Option::Some(after) then
+    if !budget_allocation_summary_finite(&after) then
+      0
+    else
+      var before_bytes = 0
+      match row.before
+      when Option::Some(bv) then
+        if budget_allocation_summary_finite(&bv) then
+          before_bytes = bv.max_dynamic_bytes
+        end
+      when Option::None then ()
+      end
+      if after.max_dynamic_bytes > before_bytes then
+        after.max_dynamic_bytes - before_bytes
+      else
+        0
+      end
+    end
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1126,10 +1264,16 @@ pub def budget_verify(budget: ChangeBudget, delta: SemanticDelta) -> Vec[String]
 
   # 8. allocation — only under an explicit Some(n) count cap: the effect
   #    delta rows whose after view newly carries the alloc class (bit 1).
-  #    The RESERVED allocation byte budget fails closed when set: the
-  #    delta carries no allocation byte payload (the §11 view is bits +
-  #    capability ids), so no bytes-used value is derivable (see the
-  #    module doc's check 8).
+  #    The allocation BYTE budget (audit order item 8) verifies against the
+  #    delta's TYPED AllocationSummary rows (the snapshot builder's
+  #    per-function derivations): every changed after row must carry a
+  #    finite static proof/bound and no unbounded sites — then the
+  #    introduced bytes (Σ max(0, after − before)) must stay within the
+  #    cap. An unbounded/unknown after row FAILS CLOSED with its unbounded
+  #    site keys; an alloc-class addition with NO summary rows at all is
+  #    the producer gap and also fails closed; an allocation-free delta
+  #    introduces 0 bytes and passes (the old always-fail reservation is
+  #    gone — see the module doc's check 8).
   match budget.max_allocation_delta
   when Option::Some(max_alloc) then
     let alloc_count = budget_allocation_alloc_row_count(&delta)
@@ -1148,9 +1292,48 @@ pub def budget_verify(budget: ChangeBudget, delta: SemanticDelta) -> Vec[String]
   end
   match budget.allocation_budget_bytes
   when Option::Some(max_bytes) then
-    out.push("budget:allocation-bytes " + max_bytes.to_string() +
-      " cannot be verified: the semantic delta carries no allocation byte payload " +
-      "(effect views are bits + capability ids only); allocation_budget_bytes is reserved")
+    var any_rows = false
+    var used = 0
+    var unbounded_rows: Vec[String] = Vec::new()
+    for row in delta.allocation_summary_delta do
+      any_rows = true
+      match row.after
+      when Option::Some(after) then
+        if !budget_allocation_summary_finite(&after) then
+          if after.unbounded_sites.len() == 0 then
+            unbounded_rows.push(row.function.clone() + " (no finite static bound: " +
+              semantic_proof_level_word(&after.bytes_level) + ")")
+          else
+            for site in after.unbounded_sites do
+              unbounded_rows.push(row.function.clone() + "|" + site.clone())
+            end
+          end
+        else
+          used = used + budget_allocation_delta_bytes(&row)
+        end
+      when Option::None then ()
+      end
+    end
+    if unbounded_rows.len() > 0 then
+      for ur in unbounded_rows do
+        out.push("budget:allocation-bytes unbounded site " + ur.clone() +
+          " cannot be verified against allocation_budget_bytes " + max_bytes.to_string() +
+          " (no finite static bound on that function's allocations)")
+      end
+    elsif !any_rows then
+      # No allocation-summary rows: the delta carries no byte payload. When
+      # the delta claims an alloc-class addition the producer gap is the
+      # old fail-closed result; an allocation-free change provably
+      # introduces 0 bytes.
+      if budget_allocation_alloc_row_count(&delta) > 0 then
+        out.push("budget:allocation-bytes " + max_bytes.to_string() +
+          " cannot be verified: the semantic delta introduces alloc-class effects " +
+          "but carries no allocation summary rows")
+      end
+    elsif used > max_bytes then
+      out.push("budget:allocation-bytes " + used.to_string() +
+        " used exceeds allocation_budget_bytes " + max_bytes.to_string())
+    end
   when Option::None then
     ()
   end
@@ -1278,11 +1461,18 @@ end
 #       allow_new_capabilities is empty (set PRIMARY); the empty-set
 #       control falls back to allow_new_capabilities and rejects.
 #   T7  the effect set allows the function's added class while
-#       allow_new_effects is empty (set PRIMARY); the empty-set control
-#       falls back to allow_new_effects and rejects.
-#   T8  a declared allocation_budget_bytes fails closed even on the empty
-#       delta — the reserved field cannot be verified against a delta that
-#       carries no allocation byte payload.
+#       allow_new_effects is empty (set PRIMARY; the typed member is the
+#       §11 EffectClass enum, never a class-word String); the empty-set
+#       control falls back to allow_new_effects and rejects.
+#   T8  (audit order item 8) the allocation BYTE budget over the delta's
+#       typed AllocationSummary rows: T8a a no-allocation delta passes
+#       (introduced 0 bytes); T8b a bounded row under the cap passes; T8c
+#       a bounded row over the cap violates; T8d a runtime-sized
+#       (Unbounded) row fails closed naming the unbounded site key; T8e
+#       an alloc-class addition with no summary rows fails closed (the
+#       producer gap); T8f only introduced bytes are charged; T8g a
+#       reduction passes. The former reserved always-fail expectation is
+#       updated to the data-driven rules above.
 #   T9-T15 (third audit item 32) the refactor-equivalence gate over
 #       budget_verify_with_equivalence:
 #       T9  the default refactor budget with NO equivalence result ->
@@ -1459,6 +1649,58 @@ def budget_lane_capability_delta(function: String, capability: String) -> Semant
   delta
 end
 
+# (audit order item 8) The lane's allocation-summary fixtures: one typed
+# AllocationSummary row and the one-row SemanticDelta carrying it (before
+# None = a newly created row; Some(b) = a changed row).
+def budget_lane_allocation_summary(
+  function: String,
+  bytes: Int,
+  level: ProofLevel,
+  unbounded: Vec[String]
+) -> AllocationSummary
+  AllocationSummary {
+    function: function,
+    max_dynamic_bytes: bytes,
+    bounded_arena_bytes: -1,
+    site_count: 1,
+    unbounded_sites: unbounded,
+    bytes_level: level,
+    arena_bytes_level: ProofLevel::Unavailable,
+    sites_level: level
+  }
+end
+
+def budget_lane_allocation_summary_delta_full(
+  function: String,
+  before_bytes: Option[Int],
+  after_bytes: Int,
+  level: ProofLevel,
+  unbounded: Vec[String]
+) -> SemanticDelta
+  var delta = semantic_delta_empty()
+  var row = AllocationSummaryDelta {
+    function: function.clone(),
+    after: Option::Some(budget_lane_allocation_summary(function.clone(), after_bytes, level, unbounded))
+  }
+  match before_bytes
+  when Option::Some(b) then
+    row.before = Option::Some(budget_lane_allocation_summary(
+      function.clone(), b, ProofLevel::StaticProof, Vec::new()))
+  when Option::None then ()
+  end
+  delta.allocation_summary_delta = Vec::from([row])
+  delta
+end
+
+def budget_lane_allocation_summary_delta(
+  function: String,
+  bytes: Int,
+  level: ProofLevel,
+  unbounded: Vec[String]
+) -> SemanticDelta
+  budget_lane_allocation_summary_delta_full(function, Option::None, bytes, level, unbounded)
+end
+
 # One assertion: the budget verdict matches the expectation (a mismatch row
 # names the expected verdict and the actual violation list).
 def budget_lane_expect(
@@ -1588,7 +1830,7 @@ pub def budget_lane_check() -> Vec[String]
   var t7_effects: Set[AllowedEffect] = Set::new()
   t7_effects.insert(AllowedEffect {
     function: stable_decl_of_key("m::pub#fn()->unit".to_string()),
-    class: "io".to_string()
+    class: EffectClass::Io
   })
   let t7_budget = ChangeBudget { allowed_effects: t7_effects }
   budget_lane_expect(&mut out, "T7-effect-set-allows", &t7_budget, &t7, false)
@@ -1599,7 +1841,7 @@ pub def budget_lane_check() -> Vec[String]
   var t7_wrong_class: Set[AllowedEffect] = Set::new()
   t7_wrong_class.insert(AllowedEffect {
     function: stable_decl_of_key("m::pub#fn()->unit".to_string()),
-    class: "panic".to_string()
+    class: EffectClass::Panic
   })
   budget_lane_expect(&mut out, "T7b-effect-typed-class-mismatch-rejects",
     &ChangeBudget { allowed_effects: t7_wrong_class }, &t7, true)
@@ -1616,12 +1858,52 @@ pub def budget_lane_check() -> Vec[String]
   budget_lane_expect(&mut out, "T7c-effect-untyped-member-fail-closed",
     &t7_budget, &t7_untyped, true)
 
-  # T8 — the RESERVED allocation byte budget fails closed: a budget that
-  # declares allocation_budget_bytes rejects even the empty delta (no
-  # delta-side byte payload exists to verify the cap).
+  # T8 (audit order item 8) — the allocation BYTE budget verifies against
+  # the delta's typed AllocationSummary rows; the old always-fail
+  # reservation is gone. The changed-after rows are the authority:
+  # T8a: an allocation-free delta introduces 0 bytes -> the cap PASSES
+  # (the previously fail-closed lane's updated expectation).
   let t8_budget = ChangeBudget { allocation_budget_bytes: Option::Some(4096) }
-  budget_lane_expect(&mut out, "T8-allocation-bytes-reserved-fails-closed",
-    &t8_budget, &semantic_delta_empty(), true)
+  budget_lane_expect(&mut out, "T8a-allocation-bytes-empty-delta-passes",
+    &t8_budget, &semantic_delta_empty(), false)
+  # T8b: a bounded (static-proof) after row within the cap passes.
+  let t8_bounded = budget_lane_allocation_summary_delta(
+    "m::bounded#fn()->unit".to_string(), 2048, ProofLevel::StaticProof, Vec::new())
+  budget_lane_expect(&mut out, "T8b-allocation-bytes-bounded-passes",
+    &t8_budget, &t8_bounded, false)
+  # T8c: a bounded after row ABOVE the cap violates.
+  let t8_over = budget_lane_allocation_summary_delta(
+    "m::bounded#fn()->unit".to_string(), 8192, ProofLevel::StaticProof, Vec::new())
+  budget_lane_expect(&mut out, "T8c-allocation-bytes-over-cap-violates",
+    &t8_budget, &t8_over, true)
+  # T8d: a runtime-sized (Unbounded) after row fails closed listing the
+  # unbounded site key (the provability mandate).
+  let t8_unbounded = budget_lane_allocation_summary_delta(
+    "m::runtime#fn()->unit".to_string(), -1, ProofLevel::RuntimeMeasured,
+    Vec::from(["m::runtime#fn()->unit#B0#S1".to_string()]))
+  let t8_violations = budget_verify(&t8_budget, &t8_unbounded)
+  budget_lane_expect(&mut out, "T8d-allocation-bytes-unbounded-fails-closed",
+    &t8_budget, &t8_unbounded, true)
+  budget_lane_evidence_contains(&mut out, "T8d-allocation-bytes-unbounded-site-named",
+    t8_violations, "m::runtime#fn()->unit#B0#S1")
+  # T8e: alloc-class additions with NO summary rows are the producer gap —
+  # still fail closed.
+  let t8_gap = budget_lane_effect_delta("m::pub#fn()->unit", 0, 1)
+  budget_lane_expect(&mut out, "T8e-allocation-bytes-producer-gap-fails-closed",
+    &t8_budget, &t8_gap, true)
+  # T8f: only the INTRODUCED bytes are charged (after − before): a row
+  # grown from 1024 to 2048 bytes passes the 4096 cap, and a row SHRUNK
+  # from 8192 to 2048 passes too (a reduction introduces nothing).
+  let t8_grown = budget_lane_allocation_summary_delta_full(
+    "m::bounded#fn()->unit".to_string(), Option::Some(1024), 2048,
+    ProofLevel::StaticProof, Vec::new())
+  budget_lane_expect(&mut out, "T8f-allocation-bytes-introduced-delta-passes",
+    &t8_budget, &t8_grown, false)
+  let t8_shrunk = budget_lane_allocation_summary_delta_full(
+    "m::bounded#fn()->unit".to_string(), Option::Some(8192), 2048,
+    ProofLevel::StaticProof, Vec::new())
+  budget_lane_expect(&mut out, "T8g-allocation-bytes-reduction-passes",
+    &t8_budget, &t8_shrunk, false)
 
   # T8b (fourth audit P0-19) — the TYPED allowed_unsafe membership: a
   # created UnsafeFact's site_id (declaration + kind + site) must be named;

@@ -97,7 +97,8 @@
 #                MirFnItem instance DefIds, the def-emission-name join,
 #                the intrinsic-name family excluded — an intrinsic site
 #                has no def key); one row per (test, target), deduped; span
-#                = None (provenance is never serialized). A discovered
+#                = the test declaration's item span (provenance; never
+#                serialized). A discovered
 #                test with NO lowered body (not compiled into the verified
 #                program) has no call sites: the record's target is
 #                MANDATORY, so no row can materialize an "empty target
@@ -306,7 +307,7 @@ use tg_compiler::stable_ids::{
   # rows digest the owner declaration lineage + test-kind; the snapshot-text
   # boundary reconstructs from the persisted words + name/attrs cargo.
   StableTestId, stable_test_id_of_decl, stable_test_id_from_row,
-  stable_decl_id_from_digest
+  stable_decl_id_from_digest, stable_decl_with_display
 }
 # (fourth-audit P1-5a) The compilation options record the header's
 # feature_set / semantic_options are derived from — the ONE option
@@ -332,13 +333,20 @@ use tg_compiler::types::{
   # (fourth-audit P1-5c) the documented conservative per-allocation-site
   # byte cap the UpperBound size kind charges (the same constant the
   # @budget heap_bytes derivation consumes).
-  BUDGET_ALLOC_SITE_BYTES
+  BUDGET_ALLOC_SITE_BYTES,
+  # (audit order item 8) the EXISTING budget-derivation record/constants the
+  # resource summaries are read off (never re-derived): the P1-7 size
+  # classes and aggregates, the P1-8 frame facts and the §11 class view.
+  HeapSizeAggregate, heap_size_aggregate_class_word,
+  heap_size_aggregate_bound_bytes, StackFrameFact, stack_frame_fact_exact,
+  stack_frame_fact_bound, EffectClass, effect_summary_has_class,
+  BudgetDerivations
 }
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi}
 use tg_compiler::target_desc::{
   TargetDesc, Cpu, Endianness, FloatAbi, Fpu, IntegerDiv, UnalignedPolicy, InterruptAbi
 }
-use tg_compiler::token::{parsed_int_to_host}
+use tg_compiler::token::{parsed_int_to_host, Span}
 use tg_compiler::mono::{mir_fn_abi_signature}
 use tg_compiler::layout_engine::{
   LayoutEngine, TargetDescriptor, LayoutFailureClass,
@@ -357,7 +365,7 @@ use tg_compiler::layout_engine::{
 }
 use tg_compiler::mir::{
   MirProgram, MirFunction, MirOperand, MirStatementKind, MirTerminatorKind, MirOperandKind,
-  MirConstantKind, MirRvalue, MirRvalueKind, MirTypeDefKind, CastKind, Place, Projection,
+  MirConstantKind, MirRvalue, MirRvalueKind, MirTypeDefKind, MirTypeDef, CastKind, Place, Projection,
   MirEffectState, mir_effect_scan_function, MirCallArg, MirCallValue,
   MirTerminator, AssertMessage, MirBinOp,
   # (audit order item 1 closeout) the untracked-artifact detector: a
@@ -370,7 +378,15 @@ use tg_compiler::mir::{
   # @budget static allocation-site analysis: the site's size kind is read
   # from the SAME classification, never re-derived.
   mir_effect_classify_call, mir_effect_classify_deinit,
-  mir_effect_type_is_string_like, mir_effect_place_type, mir_effect_operand_is_string
+  mir_effect_type_is_string_like, mir_effect_place_type, mir_effect_operand_is_string,
+  # (audit order item 8) the EXISTING @budget derivation stack the resource
+  # summaries are populated from — the derivation context, the per-function
+  # direct/arena aggregates, the max-stack call graph and the direct-call
+  # graph + recursion detector. NEVER a duplicated analysis here.
+  mir_budget_derivations_of, mir_budget_alloc_aggregate_of,
+  mir_budget_alloc_arena_aggregate_of, mir_budget_alloc_aggregate_facts,
+  mir_budget_stack_edges_of,
+  mir_budget_stack_bound_mir, mir_build_call_graph, find_recursive_functions
 }
 use tg_compiler::semantic_model::{
   SemanticSnapshot, StableTargetId, TargetId, ContractExprIR, IndirectCallEdge,
@@ -402,6 +418,16 @@ use tg_compiler::semantic_model::{
   SemanticAllocationSite, SemanticAllocationSizeKind,
   semantic_allocation_sites_sort, semantic_allocation_site_text,
   semantic_allocation_size_kind_text,
+  # (audit order item 8) the per-function resource summaries and their
+  # proof levels (built here from the EXISTING budget derivations).
+  ProofLevel, semantic_proof_level_word, semantic_proof_level_numeric,
+  semantic_proof_level_of_allocation_class_word,
+  AllocationSummary, StackSummary, BlockingSummary, CodeSizeSummary,
+  semantic_allocation_summaries_sort, semantic_stack_summaries_sort,
+  semantic_blocking_summaries_sort, semantic_code_size_summaries_sort,
+  semantic_allocation_summary_text, semantic_stack_summary_text,
+  semantic_blocking_summary_text, semantic_code_size_summary_text,
+  semantic_resource_summaries_text,
   SemanticParam, SemanticField, SemanticVariant, SemanticCallableSignature,
   SemanticTraitMethod,
   semantic_fields_sort, semantic_variants_sort, semantic_callable_signatures_sort,
@@ -2380,50 +2406,66 @@ def snapshot_item_attr_names(item: Item) -> Vec[String]
   out
 end
 
-def snapshot_walk_decl_attrs(inout attrs: Map[String, Vec[String]], item: Item, path: Vec[String]) -> Unit
+def snapshot_walk_decl_attrs(
+  inout attrs: Map[String, Vec[String]],
+  inout spans: Map[String, Span],
+  item: Item,
+  path: Vec[String]
+) -> Unit
   match item.kind
   when ItemKind::ItemFunction(f) then
     let key = snapshot_qualified_key(&path, f.name.clone())
     if !attrs.contains_key(&key) then
       let names = snapshot_item_attr_names(&item)
       if names.len() > 0 then
-        attrs.insert(key, names)
+        attrs.insert(key.clone(), names)
       end
+      # The declaration span rides the SAME first-wins walk (provenance
+      # metadata for the discovery rows; never serialized).
+      spans.insert(key, item.span.clone())
     end
   when _ then ()
   end
 end
 
-def snapshot_walk_module_tree_attrs(inout attrs: Map[String, Vec[String]], m: ModuleDecl, path: Vec[String]) -> Unit
+def snapshot_walk_module_tree_attrs(
+  inout attrs: Map[String, Vec[String]],
+  inout spans: Map[String, Span],
+  m: ModuleDecl,
+  path: Vec[String]
+) -> Unit
   var nested: Vec[String] = Vec::new()
   for p in path do
     nested.push(p.clone())
   end
   nested.push(m.name.clone())
   for item in m.items do
-    snapshot_walk_decl_attrs(&mut attrs, &item, &nested)
+    snapshot_walk_decl_attrs(&mut attrs, &mut spans, &item, &nested)
     match item.kind
     when ItemKind::ItemModule(m2) then
-      snapshot_walk_module_tree_attrs(&mut attrs, m2, &nested)
+      snapshot_walk_module_tree_attrs(&mut attrs, &mut spans, m2, &nested)
     when _ then ()
     end
   end
 end
 
-def snapshot_walk_fn_attrs(ctx: SnapshotBuildCtx) -> Map[String, Vec[String]]
+# The test cargo walk's result: the attrs map plus the declaration spans
+# (both keyed by the registration key; first-wins like the metadata walk).
+def snapshot_walk_fn_test_meta(ctx: SnapshotBuildCtx) -> (Map[String, Vec[String]], Map[String, Span])
   var attrs: Map[String, Vec[String]] = Map::new()
+  var spans: Map[String, Span] = Map::new()
   var item_idx = 0
   while item_idx < ctx.typed.ast.items.len() do
     let path = snapshot_item_owner_path(ctx, item_idx)
-    snapshot_walk_decl_attrs(&mut attrs, &ctx.typed.ast.items[item_idx], &path)
+    snapshot_walk_decl_attrs(&mut attrs, &mut spans, &ctx.typed.ast.items[item_idx], &path)
     match ctx.typed.ast.items[item_idx].kind
     when ItemKind::ItemModule(m) then
-      snapshot_walk_module_tree_attrs(&mut attrs, m, &path)
+      snapshot_walk_module_tree_attrs(&mut attrs, &mut spans, m, &path)
     when _ then ()
     end
     item_idx = item_idx + 1
   end
-  attrs
+  (attrs, spans)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -3226,9 +3268,23 @@ end
 # every body-bearing lowered function. The snapshot writer persists the
 # purity projection on both the effect rows (def-keyed lowerings) and the
 # mir_functions rows (every lowered body).
+#
+# (audit order item 8) The SAME scan context ALSO carries the budget
+# derivation stack the resource summaries are populated from (never
+# re-derived): the §11 state (direct summaries / evidence / call edges),
+# the per-function direct ordinary/arena P1-7 aggregates, the P1-8 frame
+# facts + max-stack call graph, the direct-call recursion set and the
+# merged BudgetDerivations per emission name.
 struct SnapshotEffectFinals
   effects: Map[String, SnapshotEffectFinal]
   purity: Map[String, PurityStatus]
+  scan_state: MirEffectState = MirEffectState {}
+  direct_aggs: Map[String, HeapSizeAggregate] = Map::new()
+  direct_arena_aggs: Map[String, HeapSizeAggregate] = Map::new()
+  frames: Map[String, StackFrameFact] = Map::new()
+  stack_edges: Map[String, Vec[String]] = Map::new()
+  recursion: Set[String] = Set::new()
+  derivations: Map[String, BudgetDerivations] = Map::new()
 end
 
 def snapshot_effect_caps_equal(a: EffectSummary, b: EffectSummary) -> Bool
@@ -3252,7 +3308,16 @@ def snapshot_effect_same(a: EffectSummary, b: EffectSummary) -> Bool
   snapshot_effect_caps_equal(a, b)
 end
 
-def snapshot_effect_finals(ctx: SnapshotBuildCtx, scans: Map[String, SnapshotScan]) -> SnapshotEffectFinals
+def snapshot_effect_finals(
+  ctx: SnapshotBuildCtx,
+  scans: Map[String, SnapshotScan],
+  # (audit order item 8) The LIR route's post-RA frame_bytes per emission
+  # name (lir.tg's lir_frame_bytes_map), when the caller holds them: those
+  # facts are EXACT (static-proof frames); absent ones fall back to the
+  # MIR-derived bound (static-bound). Defaulted empty — the MIR-only
+  # route stays valid.
+  lir_frame_bytes: Map[String, Int] = Map::new()
+) -> SnapshotEffectFinals
   var fn_index: Map[String, Int] = Map::new()
   var fi = 0
   while fi < ctx.mir.functions.len() do
@@ -3369,7 +3434,63 @@ def snapshot_effect_finals(ctx: SnapshotBuildCtx, scans: Map[String, SnapshotSca
     end
   end
   let purity_finals = mir_purity_join_fixed_point(&ctx.mir.functions, &direct_purity, &state.edges)
-  SnapshotEffectFinals { effects: out, purity: purity_finals }
+
+  # (audit order item 8) The budget-derivation stack over the SAME scan
+  # context — the ONE authority the resource summaries (and the @budget
+  # pass) consume. The MirTypeDef table feeds the P1-7 element-stride
+  # model; the frame facts prefer the supplied exact LIR bytes and fall
+  # back to the MIR-derived bound; the max-stack call graph and the
+  # direct-call recursion set come from the existing helpers.
+  var type_defs: Map[Int, MirTypeDef] = Map::new()
+  for td in ctx.mir.types do
+    type_defs.insert(td.id.id, td.clone())
+  end
+  var direct_aggs: Map[String, HeapSizeAggregate] = Map::new()
+  var direct_arena_aggs: Map[String, HeapSizeAggregate] = Map::new()
+  for f in ctx.mir.functions do
+    direct_aggs.insert(f.name.clone(),
+      mir_budget_alloc_aggregate_of(&ctx.mir, f.clone(), &type_index, &fn_index, &type_defs))
+    direct_arena_aggs.insert(f.name.clone(),
+      mir_budget_alloc_arena_aggregate_of(&ctx.mir, f.clone(), &type_index, &fn_index, &type_defs))
+  end
+  var frames: Map[String, StackFrameFact] = Map::new()
+  for f in ctx.mir.functions do
+    if !f.is_extern && f.blocks.len() > 0 then
+      match lir_frame_bytes.get(f.name.clone())
+      when Option::Some(fb) then
+        frames.insert(f.name.clone(), stack_frame_fact_exact(fb))
+      when Option::None then
+        frames.insert(f.name.clone(), stack_frame_fact_bound(mir_budget_stack_bound_mir(&f)))
+      end
+    end
+  end
+  var stack_edges: Map[String, Vec[String]] = Map::new()
+  for f in ctx.mir.functions do
+    if !f.is_extern && f.blocks.len() > 0 then
+      stack_edges.insert(f.name.clone(), mir_budget_stack_edges_of(&ctx.mir, &state, f.clone(), &type_index, &fn_index))
+    end
+  end
+  let call_graph = mir_build_call_graph(&ctx.mir)
+  let recursion = find_recursive_functions(&call_graph)
+  var derivations: Map[String, BudgetDerivations] = Map::new()
+  for f in ctx.mir.functions do
+    if !f.is_extern && f.blocks.len() > 0 then
+      derivations.insert(f.name.clone(),
+        mir_budget_derivations_of(&state, &direct_aggs, &f, &frames, &stack_edges))
+    end
+  end
+
+  SnapshotEffectFinals {
+    effects: out,
+    purity: purity_finals,
+    scan_state: state,
+    direct_aggs: direct_aggs,
+    direct_arena_aggs: direct_arena_aggs,
+    frames: frames,
+    stack_edges: stack_edges,
+    recursion: recursion,
+    derivations: derivations
+  }
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -5306,7 +5427,28 @@ pub def semantic_snapshot_domain_digests(snapshot: SemanticSnapshot) -> Semantic
   for d in drop_rows do
     drop_text = drop_text + semantic_drop_plan_fact_text(&d) + "\n"
   end
+  # (audit item 16, next tier) The DMA-ownership table's digest: the
+  # canonical sorted DmaOwnershipFact row text (empty text for no rows —
+  # the fixed zero-digest preimage of the empty table).
+  var dma_text = ""
+  var dma_rows = snapshot.dma_ownership.clone()
+  semantic_dma_ownership_sort(&mut dma_rows)
+  for dm in dma_rows do
+    dma_text = dma_text + semantic_dma_ownership_fact_text(&dm) + "\n"
+  end
   let feature_text = semantic_snapshot_header_features_text(&semantic_snapshot_header(&snapshot))
+  # (audit order item 8) The resource-summary tables' digest: the four
+  # sorted tables in their fixed family order (the same text the writer
+  # renders, through the model's ONE combined text helper).
+  var resource_alloc = snapshot.allocation_summaries.clone()
+  var resource_stack = snapshot.stack_summaries.clone()
+  var resource_blocking = snapshot.blocking_summaries.clone()
+  var resource_code = snapshot.code_size_summaries.clone()
+  semantic_allocation_summaries_sort(&mut resource_alloc)
+  semantic_stack_summaries_sort(&mut resource_stack)
+  semantic_blocking_summaries_sort(&mut resource_blocking)
+  semantic_code_size_summaries_sort(&mut resource_code)
+  let resource_text = semantic_resource_summaries_text(resource_alloc, resource_stack, resource_blocking, resource_code)
   SemanticDomainDigests {
     public_api: snapshot.public_api_hash,
     abi: snapshot.abi_hash,
@@ -5314,7 +5456,9 @@ pub def semantic_snapshot_domain_digests(snapshot: SemanticSnapshot) -> Semantic
     concrete_types: stable_digest_of(&concrete_text),
     drop_plans: stable_digest_of(&drop_text),
     allocation_sites: stable_digest_of(&alloc_text),
-    features: stable_digest_of(&feature_text)
+    features: stable_digest_of(&feature_text),
+    resource_summaries: stable_digest_of(&resource_text),
+    dma_ownership: stable_digest_of(&dma_text)
   }
 end
 
@@ -5356,6 +5500,30 @@ pub def snapshot_drop_plan_facts(resource_facts: Vec[ResourceDropPlanFact]) -> V
   out
 end
 
+# (audit item 16, next tier) The builder-boundary mapper: the resource
+# checker's kernel-side DMA facts -> the persisted SemanticSnapshot rows.
+# The state word is parsed STRICTLY (dma_state_of_word): an unrecognized
+# word drops the row — the table never fabricates a state (the kernel's
+# emit vocabulary is closed and the lane covers all five words).
+pub def snapshot_dma_ownership_facts(resource_facts: Vec[ResourceDmaFact]) -> Vec[DmaOwnershipFact]
+  var out: Vec[DmaOwnershipFact] = Vec::new()
+  for f in resource_facts do
+    match dma_state_of_word(f.state.clone())
+    when Option::Some(st) then
+      out.push(DmaOwnershipFact {
+        function: f.function.clone(),
+        place: f.place.clone(),
+        state: st,
+        op: f.op.clone(),
+        site: f.site.clone()
+      })
+    when Option::None then ()
+    end
+  end
+  semantic_dma_ownership_sort(&mut out)
+  out
+end
+
 end
 
 # (audit order item 1 closeout) The snapshot builder's origin gate as its
@@ -5365,6 +5533,460 @@ end
 # asserts both outcomes through this entry.
 pub def semantic_snapshot_untracked_artifact(mir: MirProgram) -> Option[UntrackedArtifact]
   mir_untracked_artifact("semantic-snapshot".to_string(), mir)
+end
+
+# ———————————————————————————————————————————————————————————————
+# (audit order item 8) The per-function RESOURCE SUMMARY rows
+# ———————————————————————————————————————————————————————————————
+# Builds the four summary tables (allocation / stack / blocking / code
+# size) from the budget-derivation stack `finals` carries — the SAME
+# analysis the @budget pass runs, never a re-derivation:
+#   * AllocationSummary.max_dynamic_bytes / site_count /
+#     bytes_level / sites_level come from the merged BudgetDerivations of
+#     mir_budget_derivations_of (the transitive P1-7 heap aggregate);
+#     bounded_arena_bytes / arena_bytes_level come from the transitive
+#     join of the arena-only direct aggregates
+#     (mir_budget_alloc_arena_aggregate_facts reuses the ONE P1-7 walk);
+#     unbounded_sites is the union of the persisted allocation_sites
+#     rows whose size kind is Unbounded/Unknown over the reachable call
+#     graph (so a caller that is unbounded through a callee names the
+#     exact sites — fail closed with evidence, never a bare -1).
+#   * StackSummary reads the P1-8 frame facts + max-transitive-stack from
+#     the same derivations (frame_level exact only for a supplied LIR
+#     frame; max_stack_level exact only for an exact chain; an unbounded
+#     chain is RuntimeMeasured with max_stack_bytes -1) and the direct-call
+#     recursion set.
+#   * BlockingSummary reads the transitive §11 Block class (may_block OR
+#     may_sleep), the first-wins blocking evidence phrases unioned over the
+#     reachable scan graph, and the fail-closed unknown status.
+#   * CodeSizeSummary reads the emitted/estimated code size (exact when a
+#     producer supplied an emitter count, else the MIR estimate as
+#     static-bound).
+# A function with no derivation row (a bodyless extern) gets Unavailable
+# levels — never a fabricated bound. Rows are deduped per function key
+# text and sorted through the model's canonical summary orders.
+def snapshot_unbounded_sites_add_direct(
+  inout m: Map[String, Vec[String]],
+  key: String,
+  site: String
+) -> Unit
+  var cur: Vec[String] = Vec::new()
+  match m.get(key.clone())
+  when Option::Some(v) then cur = v.clone()
+  when Option::None then ()
+  end
+  if !cur.contains(&site) then
+    cur.push(site)
+  end
+  m.insert(key, cur)
+  ()
+end
+
+# The transitive unbounded-site set of one emission name: the direct
+# Unbounded/Unknown site keys of every reachable function (the scan
+# edges), sorted.
+def snapshot_unbounded_sites_of(
+  finals: SnapshotEffectFinals,
+  origin_key_of_name: Map[String, String],
+  unbounded_by_origin: Map[String, Vec[String]],
+  root: String
+) -> Vec[String]
+  var sites: Vec[String] = Vec::new()
+  var seen_names: Set[String] = Set::new()
+  var todo: Vec[String] = Vec::new()
+  todo.push(root.clone())
+  seen_names.insert(root.clone())
+  var ti = 0
+  while ti < todo.len() do
+    let cur = todo[ti].clone()
+    match origin_key_of_name.get(cur.clone())
+    when Option::Some(ok) then
+      match unbounded_by_origin.get(ok)
+      when Option::Some(direct) then
+        for s in direct do
+          if !sites.contains(&s) then
+            sites.push(s.clone())
+          end
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+    match finals.scan_state.edges.get(cur.clone())
+    when Option::Some(callees) then
+      for c in callees do
+        if !seen_names.contains(&c) then
+          seen_names.insert(c.clone())
+          todo.push(c.clone())
+        end
+      end
+    when Option::None then ()
+    end
+    ti = ti + 1
+  end
+  semantic_strings_sort(&mut sites)
+  sites
+end
+
+# The transitive blocking evidence rows of one emission name: the Block
+# slot's first-wins phrase of every reachable scanned function (slot 1 —
+# the §11 class-slot layout), deduped and sorted.
+def snapshot_blocking_sites_of(finals: SnapshotEffectFinals, root: String) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  var seen_names: Set[String] = Set::new()
+  var todo: Vec[String] = Vec::new()
+  todo.push(root.clone())
+  seen_names.insert(root.clone())
+  var ti = 0
+  while ti < todo.len() do
+    let cur = todo[ti].clone()
+    match finals.scan_state.direct_evidence.get(cur.clone())
+    when Option::Some(evs) then
+      if evs.len() > 1 && evs[1].len() > 0 && !rows.contains(&evs[1]) then
+        rows.push(evs[1].clone())
+      end
+    when Option::None then ()
+    end
+    match finals.scan_state.edges.get(cur.clone())
+    when Option::Some(callees) then
+      for c in callees do
+        if !seen_names.contains(&c) then
+          seen_names.insert(c.clone())
+          todo.push(c.clone())
+        end
+      end
+    when Option::None then ()
+    end
+    ti = ti + 1
+  end
+  semantic_strings_sort(&mut rows)
+  rows
+end
+
+def snapshot_resource_summaries(
+  finals: SnapshotEffectFinals,
+  origin_key_of_name: Map[String, String],
+  allocation_sites: Vec[SemanticAllocationSite]
+) -> (Vec[AllocationSummary], Vec[StackSummary], Vec[BlockingSummary], Vec[CodeSizeSummary])
+  # The direct Unbounded/Unknown site keys per ORIGIN KEY text (the
+  # allocation_sites rows are keyed by the body's mir row key).
+  var unbounded_by_origin: Map[String, Vec[String]] = Map::new()
+  for row in allocation_sites do
+    var unbounded_site = false
+    match row.size_kind
+    when SemanticAllocationSizeKind::Unbounded then unbounded_site = true
+    when SemanticAllocationSizeKind::Unknown then unbounded_site = true
+    when _ then ()
+    end
+    if unbounded_site then
+      snapshot_unbounded_sites_add_direct(&mut unbounded_by_origin, row.function.clone(), row.site.clone())
+    end
+  end
+
+  var allocation_rows: Vec[AllocationSummary] = Vec::new()
+  var stack_rows: Vec[StackSummary] = Vec::new()
+  var blocking_rows: Vec[BlockingSummary] = Vec::new()
+  var code_size_rows: Vec[CodeSizeSummary] = Vec::new()
+  var seen_keys: Set[String] = Set::new()
+  for entry in origin_key_of_name.entries() do
+    let name = entry.0.clone()
+    let key = entry.1.clone()
+    if !seen_keys.contains(&key) then
+      seen_keys.insert(key.clone())
+
+      # AllocationSummary.
+      var max_dynamic = -1
+      var arena_bytes = -1
+      var site_count = 0
+      var bytes_level = ProofLevel::Unavailable
+      var arena_level = ProofLevel::Unavailable
+      var sites_level = ProofLevel::Unavailable
+      var unbounded_sites: Vec[String] = Vec::new()
+      match finals.derivations.get(name.clone())
+      when Option::Some(d) then
+        bytes_level = semantic_proof_level_of_allocation_class_word(&d.heap_size_class)
+        if bytes_level == ProofLevel::StaticProof || bytes_level == ProofLevel::StaticBound then
+          max_dynamic = d.heap_bound_bytes
+        end
+        site_count = d.alloc_sites
+        sites_level = bytes_level
+        let arena_facts = mir_budget_alloc_aggregate_facts(&finals.scan_state, &finals.direct_arena_aggs, name.clone())
+        arena_level = semantic_proof_level_of_allocation_class_word(&heap_size_aggregate_class_word(&arena_facts.1))
+        if arena_level == ProofLevel::StaticProof || arena_level == ProofLevel::StaticBound then
+          arena_bytes = heap_size_aggregate_bound_bytes(&arena_facts.1)
+        end
+        unbounded_sites = snapshot_unbounded_sites_of(&finals, &origin_key_of_name, &unbounded_by_origin, name.clone())
+      when Option::None then ()
+      end
+      allocation_rows.push(AllocationSummary {
+        function: key.clone(),
+        max_dynamic_bytes: max_dynamic,
+        bounded_arena_bytes: arena_bytes,
+        site_count: site_count,
+        unbounded_sites: unbounded_sites,
+        bytes_level: bytes_level,
+        arena_bytes_level: arena_level,
+        sites_level: sites_level
+      })
+
+      # StackSummary.
+      var frame_bytes = 0
+      var max_stack = -1
+      var frame_level = ProofLevel::Unavailable
+      var max_stack_level = ProofLevel::Unavailable
+      match finals.derivations.get(name.clone())
+      when Option::Some(d) then
+        frame_bytes = d.stack_bound_bytes
+        if d.stack_exact then
+          frame_level = ProofLevel::StaticProof
+        else
+          frame_level = ProofLevel::StaticBound
+        end
+        if d.max_stack_unbounded then
+          max_stack_level = ProofLevel::RuntimeMeasured
+        elsif d.max_stack_exact then
+          max_stack = d.max_stack_bytes
+          max_stack_level = ProofLevel::StaticProof
+        else
+          max_stack = d.max_stack_bytes
+          max_stack_level = ProofLevel::StaticBound
+        end
+      when Option::None then ()
+      end
+      stack_rows.push(StackSummary {
+        function: key.clone(),
+        frame_bytes: frame_bytes,
+        max_stack_bytes: max_stack,
+        recursive: finals.recursion.contains(&name),
+        frame_level: frame_level,
+        max_stack_level: max_stack_level
+      })
+
+      # BlockingSummary.
+      var blocking = false
+      var blocking_unbounded = false
+      var blocking_level = ProofLevel::Unavailable
+      match finals.effects.get(name.clone())
+      when Option::Some(fin) then
+        blocking = effect_summary_has_class(&fin.summary, &EffectClass::Block)
+        blocking_unbounded = fin.unknown
+        if fin.unknown then
+          blocking_level = ProofLevel::RuntimeMeasured
+        else
+          blocking_level = ProofLevel::StaticProof
+        end
+      when Option::None then ()
+      end
+      blocking_rows.push(BlockingSummary {
+        function: key.clone(),
+        blocking: blocking,
+        blocking_sites: snapshot_blocking_sites_of(&finals, name.clone()),
+        unbounded: blocking_unbounded,
+        level: blocking_level
+      })
+
+      # CodeSizeSummary.
+      var code_size = 0
+      var code_exact = false
+      var code_level = ProofLevel::Unavailable
+      match finals.derivations.get(name.clone())
+      when Option::Some(d2) then
+        code_size = d2.code_size_bytes
+        code_exact = d2.code_exact
+        if d2.code_exact then
+          code_level = ProofLevel::StaticProof
+        elsif d2.code_size_bytes > 0 then
+          code_level = ProofLevel::StaticBound
+        else
+          code_level = ProofLevel::Unavailable
+        end
+      when Option::None then ()
+      end
+      code_size_rows.push(CodeSizeSummary {
+        function: key.clone(),
+        code_size_bytes: code_size,
+        exact: code_exact,
+        level: code_level
+      })
+    end
+  end
+  semantic_allocation_summaries_sort(&mut allocation_rows)
+  semantic_stack_summaries_sort(&mut stack_rows)
+  semantic_blocking_summaries_sort(&mut blocking_rows)
+  semantic_code_size_summaries_sort(&mut code_size_rows)
+  (allocation_rows, stack_rows, blocking_rows, code_size_rows)
+end
+
+# ———————————————————————————————————————————————————————————————
+# (audit order item 8) The resource-summary population lane
+# ———————————————————————————————————————————————————————————————
+# The builder-logic unit lane: ONE SnapshotEffectFinals fixture with two
+# functions (a bounded static-proof row and a runtime-sized row) carrying
+# REAL BudgetDerivations records, §11 effect finals and evidence state —
+# snapshot_resource_summaries maps them to the four summary tables with
+# the exact proof levels / byte values / unbounded site keys / blocking
+# evidence the consumer (the §36 byte lane) reads. Empty arena aggregates
+# resolve to the exact-zero arena facts (StaticProof, 0 bytes).
+def snapshot_resource_lane_expect(inout out: Vec[String], name: String, ok: Bool) -> Unit
+  if !ok then
+    out.push(name)
+  end
+  ()
+end
+
+pub def snapshot_resource_summaries_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # The bounded function: exact 64-byte aggregate, exact 16-byte frame,
+  # exact finite 48-byte max-stack, estimated 48-byte code size, a §11
+  # Block summary with its direct evidence phrase and a call-cycle
+  # recursion status.
+  var derivations: Map[String, BudgetDerivations] = Map::new()
+  derivations.insert("lane::bounded", BudgetDerivations {
+    alloc_sites: 1,
+    heap_size_class: "exact",
+    heap_bound_bytes: 64,
+    stack_bound_bytes: 16,
+    stack_exact: true,
+    max_stack_computed: true,
+    max_stack_bytes: 48,
+    max_stack_exact: true,
+    code_size_bytes: 48,
+    code_exact: false
+  })
+  # The runtime-sized function: an unbounded aggregate and an unbounded
+  # max-stack chain (no finite static facts).
+  derivations.insert("lane::runtime", BudgetDerivations {
+    alloc_sites: 2,
+    heap_size_class: "unbounded",
+    heap_bound_bytes: 0,
+    stack_bound_bytes: 24,
+    stack_exact: false,
+    max_stack_computed: true,
+    max_stack_bytes: 0,
+    max_stack_unbounded: true,
+    code_size_bytes: 0,
+    code_exact: false
+  })
+  var effects: Map[String, SnapshotEffectFinal] = Map::new()
+  effects.insert("lane::bounded", SnapshotEffectFinal {
+    summary: EffectSummary { may_block: true },
+    unsafe_: false,
+    unknown: false
+  })
+  effects.insert("lane::runtime", SnapshotEffectFinal {
+    summary: EffectSummary { may_sleep: true },
+    unsafe_: false,
+    unknown: true
+  })
+  var state = MirEffectState {}
+  state.direct_evidence.insert("lane::bounded",
+    Vec::from(["".to_string(), "mutex-lock@B1".to_string()]))
+  state.direct_evidence.insert("lane::runtime",
+    Vec::from(["".to_string(), "sleep-ms@B2".to_string()]))
+  var recursion: Set[String] = Set::new()
+  recursion.insert("lane::bounded")
+  let finals = SnapshotEffectFinals {
+    effects: effects,
+    purity: Map::new(),
+    scan_state: state,
+    recursion: recursion,
+    derivations: derivations
+  }
+  var origin_key_of_name: Map[String, String] = Map::new()
+  origin_key_of_name.insert("lane::bounded", "lane::bounded#fn()->unit")
+  origin_key_of_name.insert("lane::runtime", "lane::runtime#fn(i64)->unit")
+  var allocation_sites: Vec[SemanticAllocationSite] = Vec::new()
+  allocation_sites.push(SemanticAllocationSite {
+    function: "lane::runtime#fn(i64)->unit".to_string(),
+    site: "lane::runtime#fn(i64)->unit#B0#S1".to_string(),
+    size_kind: SemanticAllocationSizeKind::Unbounded,
+    size: -1
+  })
+  let tables = snapshot_resource_summaries(&finals, &origin_key_of_name, allocation_sites)
+  let allocs = tables.0
+  let stacks = tables.1
+  let blockings = tables.2
+  let codes = tables.3
+
+  # AllocationSummary: the bounded row proves (static-proof) 64 bytes over
+  # one site; the runtime row is runtime-measured with -1 and the
+  # transitive unbounded site key.
+  var alloc_ok = allocs.len() == 2
+  if alloc_ok then
+    alloc_ok = allocs[0].function == "lane::bounded#fn()->unit" &&
+      allocs[0].max_dynamic_bytes == 64 &&
+      semantic_proof_level_numeric(&allocs[0].bytes_level) == 0 &&
+      semantic_proof_level_numeric(&allocs[0].sites_level) == 0 &&
+      allocs[0].site_count == 1 &&
+      allocs[0].unbounded_sites.len() == 0 &&
+      semantic_proof_level_numeric(&allocs[0].arena_bytes_level) == 0 &&
+      allocs[0].bounded_arena_bytes == 0 &&
+      allocs[1].function == "lane::runtime#fn(i64)->unit" &&
+      allocs[1].max_dynamic_bytes == -1 &&
+      semantic_proof_level_numeric(&allocs[1].bytes_level) == 2 &&
+      allocs[1].site_count == 2 &&
+      allocs[1].unbounded_sites.len() == 1 &&
+      allocs[1].unbounded_sites[0] == "lane::runtime#fn(i64)->unit#B0#S1" &&
+      semantic_proof_level_numeric(&allocs[1].sites_level) == 2
+  end
+  snapshot_resource_lane_expect(&mut out, "resource-summary-lane: allocation rows", alloc_ok)
+
+  # StackSummary: exact frame/max-stack + recursion for the bounded row;
+  # the runtime row's unbounded chain is runtime-measured with -1.
+  var stack_ok = stacks.len() == 2
+  if stack_ok then
+    stack_ok = stacks[0].function == "lane::bounded#fn()->unit" &&
+      stacks[0].frame_bytes == 16 &&
+      stacks[0].max_stack_bytes == 48 &&
+      stacks[0].recursive &&
+      semantic_proof_level_numeric(&stacks[0].frame_level) == 0 &&
+      semantic_proof_level_numeric(&stacks[0].max_stack_level) == 0 &&
+      stacks[1].function == "lane::runtime#fn(i64)->unit" &&
+      stacks[1].frame_bytes == 24 &&
+      stacks[1].max_stack_bytes == -1 &&
+      !stacks[1].recursive &&
+      semantic_proof_level_numeric(&stacks[1].frame_level) == 1 &&
+      semantic_proof_level_numeric(&stacks[1].max_stack_level) == 2
+  end
+  snapshot_resource_lane_expect(&mut out, "resource-summary-lane: stack rows", stack_ok)
+
+  # BlockingSummary: may_block is the Block class (static-proof, not
+  # unbounded); may_sleep folds into Block and the unknown status makes
+  # the runtime row runtime-measured + unbounded. The evidence phrases are
+  # the first-wins Block-slot entries.
+  var blocking_ok = blockings.len() == 2
+  if blocking_ok then
+    blocking_ok = blockings[0].function == "lane::bounded#fn()->unit" &&
+      blockings[0].blocking &&
+      !blockings[0].unbounded &&
+      blockings[0].blocking_sites.len() == 1 &&
+      blockings[0].blocking_sites[0] == "mutex-lock@B1" &&
+      semantic_proof_level_numeric(&blockings[0].level) == 0 &&
+      blockings[1].function == "lane::runtime#fn(i64)->unit" &&
+      blockings[1].blocking &&
+      blockings[1].unbounded &&
+      blockings[1].blocking_sites.len() == 1 &&
+      blockings[1].blocking_sites[0] == "sleep-ms@B2" &&
+      semantic_proof_level_numeric(&blockings[1].level) == 2
+  end
+  snapshot_resource_lane_expect(&mut out, "resource-summary-lane: blocking rows", blocking_ok)
+
+  # CodeSizeSummary: the estimated size is a static bound; the zero
+  # estimate is unavailable (no producer data).
+  var code_ok = codes.len() == 2
+  if code_ok then
+    code_ok = codes[0].function == "lane::bounded#fn()->unit" &&
+      codes[0].code_size_bytes == 48 &&
+      !codes[0].exact &&
+      semantic_proof_level_numeric(&codes[0].level) == 1 &&
+      codes[1].function == "lane::runtime#fn(i64)->unit" &&
+      codes[1].code_size_bytes == 0 &&
+      semantic_proof_level_numeric(&codes[1].level) == 3
+  end
+  snapshot_resource_lane_expect(&mut out, "resource-summary-lane: code-size rows", code_ok)
+
+  out
 end
 
 # The persistent snapshot builder (semantic_snapshot_of_final_state): the
@@ -5383,13 +6005,22 @@ pub def semantic_snapshot_of_final_state(
   # (AnalyzedProgram.drop_plan_facts); defaulted empty so a caller that
   # has no resource run persists an empty drop-plan table.
   resource_drop_facts: Vec[ResourceDropPlanFact] = Vec::new(),
+  # (audit item 16, next tier) the resource checker's emitted
+  # DMA-ownership facts (AnalyzedProgram.dma_facts); defaulted empty so a
+  # caller that has no resource run persists an empty DMA table.
+  resource_dma_facts: Vec[ResourceDmaFact] = Vec::new(),
   # (fourth-audit P1-5a) the semantically relevant features/options in
   # effect (snapshot_feature_set_of / snapshot_semantic_options_of over
   # the REAL options record + target desc); defaulted empty so a caller
   # without an options record still builds (the header then carries no
   # feature rows — the parser reads them back as empty).
   feature_set: Vec[String] = Vec::new(),
-  semantic_options: Vec[String] = Vec::new()
+  semantic_options: Vec[String] = Vec::new(),
+  # (audit order item 8) The LIR route's post-RA per-function frame_bytes
+  # (lir.tg's lir_frame_bytes_map), when the caller holds them: the
+  # StackSummary frame facts then carry the exact static-proof form;
+  # defaulted empty — the MIR-only route persists static-bound frames.
+  lir_frame_bytes: Map[String, Int] = Map::new()
 ) -> Result[SemanticSnapshot, SnapshotError]
   # (audit order item 1 closeout) The FINALIZED-MIR origin invariant: a
   # persistent snapshot is never built from origin-less MIR (hand-built
@@ -5468,7 +6099,7 @@ pub def semantic_snapshot_of_final_state(
     end
     fn_i = fn_i + 1
   end
-  let finals = snapshot_effect_finals(&ctx, &scans)
+  let finals = snapshot_effect_finals(&ctx, &scans, lir_frame_bytes)
 
   # 3. The semantic tables.
   var symbols: Vec[SemanticSymbol] = Vec::new()
@@ -5741,14 +6372,17 @@ pub def semantic_snapshot_of_final_state(
   # and stay out; a callee whose def row is missing (no registered
   # identity) stays out — exactly the call-row builder's resolution; a
   # synthesized caller (-1) has no def row and can never match. The attrs
-  # cargo rides the first-wins attribute walk (snapshot_walk_fn_attrs).
-  # Rows are deduped per (test, target); span stays None (never
+  # cargo and the declaration SPAN ride the first-wins attribute walk
+  # (snapshot_walk_fn_test_meta). Rows are deduped per (test, target);
+  # span is the test item's declaration span (provenance metadata — never
   # serialized). A test with no lowered body has no call sites and
   # therefore NO rows: the record's target is mandatory, so an "empty
   # target list" test cannot materialize under the current model record
   # (documented in the module header — a target-optional row would be a
   # semantic_model.tg change).
-  let fn_attrs = snapshot_walk_fn_attrs(&ctx)
+  let fn_test_meta = snapshot_walk_fn_test_meta(&ctx)
+  var fn_attrs = fn_test_meta.0
+  var fn_spans = fn_test_meta.1
   var test_rows: Vec[TestRelationship] = Vec::new()
   var seen_test_targets: Set[String] = Set::new()
   var tcj = 0
@@ -5774,11 +6408,19 @@ pub def semantic_snapshot_of_final_state(
                   end
                   let test_sid = stable_test_id_of_decl(trow_def.decl.clone(), trow_def.sid.key.clone(),
                     "attr".to_string(), trow_def.name.clone(), attrs)
-                  let target_decl = defs[cal_row].decl.clone()
+                  let test_span = match fn_spans.get(trow_def.key.clone())
+                  when Option::Some(s) then Option::Some(s.clone())
+                  when Option::None then Option::None
+                  end
+                  # The target declaration identity carries the def row's
+                  # FULL canonical key text as display cargo (the seed
+                  # record's display key is the registration text only), so
+                  # the index/delta value texts stay full def keys.
+                  let target_decl = stable_decl_with_display(defs[cal_row].decl.clone(), defs[cal_row].sid.key.clone())
                   test_rows.push(TestRelationship {
                     test: test_sid,
                     target: target_decl,
-                    span: Option::None
+                    span: test_span
                   })
                 end
               end
@@ -5925,6 +6567,10 @@ pub def semantic_snapshot_of_final_state(
   # (fourth-audit P0-17) the persisted typed drop-plan facts (the resource
   # checker's emitted rows, mapped + sorted; empty when no resource run).
   snapshot.drop_plans = snapshot_drop_plan_facts(resource_drop_facts)
+  # (audit item 16, next tier) the persisted DMA-ownership facts (the
+  # resource checker's committed-op rows, mapped + sorted; empty when no
+  # resource run).
+  snapshot.dma_ownership = snapshot_dma_ownership_facts(resource_dma_facts)
   # The persisted ABI/layout rows (item 18) — the explanatory payload
   # behind abi_hash (which stays the §30 CanonExternal text digest).
   var abi_rows = snapshot_abi_surface_rows(&ctx, &defs, &snapshot.types, &target)
@@ -5959,6 +6605,16 @@ pub def semantic_snapshot_of_final_state(
   when Result::Ok(rows) then rows
   when Result::Err(e) then return Result::Err(e)
   end
+  # (audit order item 8) The per-function resource summaries, built from
+  # the SAME budget-derivation stack (`finals`) — the allocation-site table
+  # is the unbounded-site evidence source. The four tables join the digest
+  # preimage through semantic_snapshot_serialize and the
+  # resource_summaries domain digest (finalize recomputes it).
+  let summaries = snapshot_resource_summaries(&finals, &origin_key_of_name, &snapshot.allocation_sites)
+  snapshot.allocation_summaries = summaries.0
+  snapshot.stack_summaries = summaries.1
+  snapshot.blocking_summaries = summaries.2
+  snapshot.code_size_summaries = summaries.3
   snapshot.public_api_hash = stable_digest_of(&snapshot_public_api_text(&snapshot))
   match snapshot_abi_text(&ctx, &defs)
   when Result::Err(e) then return Result::Err(e)
@@ -6254,9 +6910,10 @@ end
 # field rather than reconstructing fabricated identity words.
 # (fourth-audit P1-5) The header also carries the semantically relevant
 # feature_set / semantic_options (";;"-joined; the join keeps a path
-# option carrying a comma exact) and the four new per-domain digests
+# option carrying a comma exact) and the per-domain digests
 # ("d_concrete_types" / "d_drop_plans" / "d_allocation_sites" /
-# "d_features"). All of them ride the digest preimage, so two builds
+# "d_features" / "d_dma_ownership" — audit item 16's DMA table).
+# All of them ride the digest preimage, so two builds
 # differing in a semantically relevant feature produce different
 # revisions.
 def snapshot_header_line(snapshot: SemanticSnapshot, zero_revision: Bool) -> String
@@ -6280,6 +6937,8 @@ def snapshot_header_line(snapshot: SemanticSnapshot, zero_revision: Bool) -> Str
     "\"d_concrete_types\":\"" + semantic_digest_render(&snapshot.domain_digests.concrete_types) + "\"," +
     "\"d_drop_plans\":\"" + semantic_digest_render(&snapshot.domain_digests.drop_plans) + "\"," +
     "\"d_allocation_sites\":\"" + semantic_digest_render(&snapshot.domain_digests.allocation_sites) + "\"," +
+    "\"d_resource_summaries\":\"" + semantic_digest_render(&snapshot.domain_digests.resource_summaries) + "\"," +
+    "\"d_dma_ownership\":\"" + semantic_digest_render(&snapshot.domain_digests.dma_ownership) + "\"," +
     "\"d_features\":\"" + semantic_digest_render(&snapshot.domain_digests.features) + "\"," +
     "\"revision\":\"" + semantic_digest_render(&rev) + "\"," +
     "\"public_api_hash\":\"" + semantic_digest_render(&snapshot.public_api_hash) + "\"," +
@@ -6475,6 +7134,17 @@ def snapshot_drop_plan_line(f: DropPlanFact) -> String
     "\"kind\":\"" + semantic_json_escape(&f.kind) + "\"}"
 end
 
+# (audit item 16, next tier) ONE DMA-ownership fact row: the function owner
+# key, the buffer place text, the state word, the canonical op word and the
+# commit site label. Every value escaped (the row grammar convention).
+def snapshot_dma_ownership_line(f: DmaOwnershipFact) -> String
+  "{\"s\":\"dma\",\"f\":\"" + semantic_json_escape(&f.function) + "\"," +
+    "\"place\":\"" + semantic_json_escape(&f.place) + "\"," +
+    "\"state\":\"" + semantic_json_escape(&dma_state_word(f.state)) + "\"," +
+    "\"op\":\"" + semantic_json_escape(&f.op) + "\"," +
+    "\"site\":\"" + semantic_json_escape(&f.site) + "\"}"
+end
+
 # ———— (fourth-audit P1-5/P1-3) the new table row renderers ————
 # One concrete-type row: identity, template key, canonical args, layout
 # summary. Vectors join with ';;' (an arg render carries no ';;').
@@ -6495,6 +7165,44 @@ def snapshot_allocation_site_line(a: SemanticAllocationSite) -> String
     "\"site\":\"" + semantic_json_escape(&a.site) + "\"," +
     "\"kind\":\"" + semantic_allocation_size_kind_text(&a.size_kind) + "\"," +
     "\"size\":" + a.size.to_string() + "}"
+end
+
+# ———— (audit order item 8) the resource-summary row renderers ————
+# The unbounded site keys / blocking evidence phrases join with ';;' (the
+# node keys and evidence phrases carry no ';;').
+def snapshot_allocation_summary_line(s: AllocationSummary) -> String
+  "{\"s\":\"alloc-summary\",\"f\":\"" + semantic_json_escape(&s.function) + "\"," +
+    "\"dynamic\":" + s.max_dynamic_bytes.to_string() + "," +
+    "\"arena\":" + s.bounded_arena_bytes.to_string() + "," +
+    "\"sites\":" + s.site_count.to_string() + "," +
+    "\"usites\":\"" + semantic_json_escape(&s.unbounded_sites.join(";;")) + "\"," +
+    "\"blevel\":\"" + semantic_proof_level_word(&s.bytes_level) + "\"," +
+    "\"alevel\":\"" + semantic_proof_level_word(&s.arena_bytes_level) + "\"," +
+    "\"slevel\":\"" + semantic_proof_level_word(&s.sites_level) + "\"}"
+end
+
+def snapshot_stack_summary_line(s: StackSummary) -> String
+  "{\"s\":\"stack-summary\",\"f\":\"" + semantic_json_escape(&s.function) + "\"," +
+    "\"frame\":" + s.frame_bytes.to_string() + "," +
+    "\"max\":" + s.max_stack_bytes.to_string() + "," +
+    "\"recursive\":" + snapshot_bool_text(s.recursive) + "," +
+    "\"flevel\":\"" + semantic_proof_level_word(&s.frame_level) + "\"," +
+    "\"mlevel\":\"" + semantic_proof_level_word(&s.max_stack_level) + "\"}"
+end
+
+def snapshot_blocking_summary_line(s: BlockingSummary) -> String
+  "{\"s\":\"blocking-summary\",\"f\":\"" + semantic_json_escape(&s.function) + "\"," +
+    "\"blocking\":" + snapshot_bool_text(s.blocking) + "," +
+    "\"bsites\":\"" + semantic_json_escape(&s.blocking_sites.join(";;")) + "\"," +
+    "\"unbounded\":" + snapshot_bool_text(s.unbounded) + "," +
+    "\"level\":\"" + semantic_proof_level_word(&s.level) + "\"}"
+end
+
+def snapshot_code_size_summary_line(s: CodeSizeSummary) -> String
+  "{\"s\":\"code-size-summary\",\"f\":\"" + semantic_json_escape(&s.function) + "\"," +
+    "\"bytes\":" + s.code_size_bytes.to_string() + "," +
+    "\"exact\":" + snapshot_bool_text(s.exact) + "," +
+    "\"level\":\"" + semantic_proof_level_word(&s.level) + "\"}"
 end
 
 # One typed parameter's row encoding "conv|name|ty" (the ';;' separator
@@ -6689,6 +7397,8 @@ def semantic_snapshot_serialize(inout snapshot: SemanticSnapshot) -> String
   semantic_mir_summaries_sort(&mut snapshot.mir_functions)
   semantic_unsafe_facts_sort(&mut snapshot.unsafe_facts)
   semantic_drop_plans_sort(&mut snapshot.drop_plans)
+  # (audit item 16, next tier) the DMA-ownership table's canonical order.
+  semantic_dma_ownership_sort(&mut snapshot.dma_ownership)
   semantic_abi_surfaces_sort(&mut snapshot.abi_surfaces)
   semantic_dependency_graph_sort(&mut snapshot.dependencies)
   # (fourth-audit P1-3/P1-5) the new typed tables, sorted through their
@@ -6699,6 +7409,12 @@ def semantic_snapshot_serialize(inout snapshot: SemanticSnapshot) -> String
   semantic_trait_methods_sort(&mut snapshot.trait_methods)
   semantic_concrete_types_sort(&mut snapshot.concrete_types)
   semantic_allocation_sites_sort(&mut snapshot.allocation_sites)
+  # (audit order item 8) the resource-summary tables, sorted through their
+  # model orders.
+  semantic_allocation_summaries_sort(&mut snapshot.allocation_summaries)
+  semantic_stack_summaries_sort(&mut snapshot.stack_summaries)
+  semantic_blocking_summaries_sort(&mut snapshot.blocking_summaries)
+  semantic_code_size_summaries_sort(&mut snapshot.code_size_summaries)
 
   var text = snapshot_header_line(&snapshot, false) + "\n"
   for s in snapshot.symbols do
@@ -6757,9 +7473,27 @@ def semantic_snapshot_serialize(inout snapshot: SemanticSnapshot) -> String
   for dp in snapshot.drop_plans do
     text = text + snapshot_drop_plan_line(&dp) + "\n"
   end
+  # (audit item 16, next tier) the DMA-ownership rows.
+  for dmo in snapshot.dma_ownership do
+    text = text + snapshot_dma_ownership_line(&dmo) + "\n"
+  end
   # (fourth-audit P1-5c) the allocation-site rows.
   for asite in snapshot.allocation_sites do
     text = text + snapshot_allocation_site_line(&asite) + "\n"
+  end
+  # (audit order item 8) the resource-summary rows, in their fixed family
+  # order (allocation / stack / blocking / code size).
+  for asum in snapshot.allocation_summaries do
+    text = text + snapshot_allocation_summary_line(&asum) + "\n"
+  end
+  for ssum in snapshot.stack_summaries do
+    text = text + snapshot_stack_summary_line(&ssum) + "\n"
+  end
+  for bsum in snapshot.blocking_summaries do
+    text = text + snapshot_blocking_summary_line(&bsum) + "\n"
+  end
+  for csum in snapshot.code_size_summaries do
+    text = text + snapshot_code_size_summary_line(&csum) + "\n"
   end
   for ar in snapshot.abi_surfaces do
     text = text + snapshot_abi_surface_line(&ar) + "\n"
@@ -6863,8 +7597,9 @@ end
 #   header        — s, v, format, compiler_version, features, options, target,
 #                   tarch, tcpu, tptr, tendian, tabi, tfloat, tisa, tnative,
 #                   tident, tdigest, d_concrete_types, d_drop_plans,
-#                   d_allocation_sites, d_features, revision, public_api_hash,
-#                   abi_hash, unsafe_hash
+#                   d_allocation_sites, d_resource_summaries, d_features,
+#                   d_dma_ownership, revision, public_api_hash, abi_hash,
+#                   unsafe_hash
 #   symbol        — s, i, key, kind, name, module, pub, generic
 #   type          — s, i, key, tkind, name, module, generic_arity, pub
 #   field         — s, o, name, index, ty, member, pub
@@ -6873,6 +7608,10 @@ end
 #   trait-method  — s, o, name, index, params, ret, member
 #   concrete-type — s, i, template, args, size, align, status, fields
 #   alloc-site    — s, f, site, kind, size
+#   alloc-summary — s, f, dynamic, arena, sites, usites, blevel, alevel, slevel
+#   stack-summary — s, f, frame, max, recursive, flevel, mlevel
+#   blocking-summary — s, f, blocking, bsites, unbounded, level
+#   code-size-summary — s, f, bytes, exact, level
 #   call          — s, from, to, ekind
 #   indirect      — s, caller, site, sig, candidates, completeness
 #   effect        — s, f, flags, caps, purity, pevidence
@@ -6885,6 +7624,7 @@ end
 #                   unknown, flags, caps, purity, pevidence
 #   unsafe-fact   — s, i, f, ukind, site
 #   drop-plan     — s, f, place, site, paths, kind
+#   dma           — s, f, place, state, op, site
 #   abi-surface   — s, surface, symbol, kind, size, align, args, ret, fields,
 #                   conv, extern, pclasses, plocs, ownin, ownout, null,
 #                   variadic, ext, platform, failure, thread, taint, boundary
@@ -6902,11 +7642,13 @@ end
 # duplicate field, an unquoted string / quoted scalar type mismatch, an
 # unknown row tag, a malformed digest, an unsupported header version or a
 # row before the header all fail closed with the line number, the row tag
-# and the offending field name. The P1-5 header additions (features,
-# options, d_concrete_types, d_drop_plans, d_allocation_sites, d_features)
-# are the documented exception: they are OPTIONAL ON READ with empty/zero
-# defaults so an artifact written before P1-5 still loads (the writer
-# always emits them). Unknown EXTRA fields are tolerated (skipped) so a
+# and the offending field name. The P1-5 / item-8 / item-16 header
+# additions (features, options, d_concrete_types, d_drop_plans,
+# d_allocation_sites, d_resource_summaries, d_features, d_dma_ownership)
+# are the documented exception: they are
+# OPTIONAL ON READ with empty/zero defaults so an artifact written before
+# the addition still loads (the writer always emits them). Unknown EXTRA
+# fields are tolerated (skipped) so a
 # future writer can append fields without breaking this reader; the
 # round-trip lane covers the serializer's own (exact) field set. The
 # parser materializes rows in file order (the serializer already sorted
@@ -7610,7 +8352,17 @@ def snapshot_parse_header_row(fields: Vec[SnapshotField], line_no: Int) -> Resul
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(v) then v
   end
+  # (audit order item 8) optional on read like the pre-P1-5 digest fields.
+  let d_resource_summaries = match snapshot_opt_digest_field(fields.clone(), "d_resource_summaries".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
   let d_features = match snapshot_opt_digest_field(fields.clone(), "d_features".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  # (audit item 16, next tier) optional on read like the pre-DMA digest fields.
+  let d_dma_ownership = match snapshot_opt_digest_field(fields.clone(), "d_dma_ownership".to_string(), tag.clone(), line_no)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(v) then v
   end
@@ -7621,7 +8373,9 @@ def snapshot_parse_header_row(fields: Vec[SnapshotField], line_no: Int) -> Resul
     concrete_types: d_concrete_types,
     drop_plans: d_drop_plans,
     allocation_sites: d_allocation_sites,
-    features: d_features
+    features: d_features,
+    resource_summaries: d_resource_summaries,
+    dma_ownership: d_dma_ownership
   }
   Result::Ok(SnapshotParsedHeader {
     revision: revision,
@@ -8157,6 +8911,45 @@ def snapshot_parse_drop_plan_row(fields: Vec[SnapshotField], line_no: Int) -> Re
   })
 end
 
+# (audit item 16, next tier) ONE DMA row -> the model record. The state
+# word is parsed STRICTLY: an unknown word fails the row closed (the
+# dma_state_of_word vocabulary is the closed set the writer emits).
+def snapshot_parse_dma_row(fields: Vec[SnapshotField], line_no: Int) -> Result[DmaOwnershipFact, String]
+  let tag = "dma".to_string()
+  let function_key = match snapshot_string_field(fields.clone(), "f".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let place = match snapshot_string_field(fields.clone(), "place".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let state_text = match snapshot_string_field(fields.clone(), "state".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let op = match snapshot_string_field(fields.clone(), "op".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let site = match snapshot_string_field(fields.clone(), "site".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let state = match dma_state_of_word(state_text.clone())
+  when Option::Some(st) then st
+  when Option::None then
+    return Result::Err("row dma: unknown DMA state word `" + state_text + "`")
+  end
+  Result::Ok(DmaOwnershipFact {
+    function: function_key,
+    place: place,
+    state: state,
+    op: op,
+    site: site
+  })
+end
+
 # (fourth-audit P1-3/P1-5) The new row parsers — the exact inverse of the
 # snapshot_*_line renderers above.
 def snapshot_access_convention_of_word(word: String) -> Result[AccessConvention, String]
@@ -8189,6 +8982,24 @@ def snapshot_allocation_size_kind_of_word(word: String) -> Result[SemanticAlloca
     return Result::Ok(SemanticAllocationSizeKind::Unknown)
   end
   Result::Err("unknown allocation size kind word '" + word.clone() + "'")
+end
+
+# (audit order item 8) The proof-level word parser: the four words are
+# closed (a malformed word fails closed with the line/tag).
+def snapshot_proof_level_of_word(word: String) -> Result[ProofLevel, String]
+  if word == "static-proof" then
+    return Result::Ok(ProofLevel::StaticProof)
+  end
+  if word == "static-bound" then
+    return Result::Ok(ProofLevel::StaticBound)
+  end
+  if word == "runtime-measured" then
+    return Result::Ok(ProofLevel::RuntimeMeasured)
+  end
+  if word == "unavailable" then
+    return Result::Ok(ProofLevel::Unavailable)
+  end
+  Result::Err("unknown proof level word '" + word.clone() + "'")
 end
 
 # One "conv|name|ty" row of a ";;"-joined param list. A malformed row fails
@@ -8311,6 +9122,175 @@ def snapshot_parse_allocation_site_row(fields: Vec[SnapshotField], line_no: Int)
     site_id: site_id
   })
 end
+
+# ———— (audit order item 8) the resource-summary row parsers ————
+def snapshot_parse_allocation_summary_row(fields: Vec[SnapshotField], line_no: Int) -> Result[AllocationSummary, String]
+  let tag = "alloc-summary".to_string()
+  let function_key = match snapshot_string_field(fields.clone(), "f".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let dynamic = match snapshot_int_field(fields.clone(), "dynamic".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let arena = match snapshot_int_field(fields.clone(), "arena".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let sites = match snapshot_int_field(fields.clone(), "sites".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let usites = match snapshot_opt_string_list_field(fields.clone(), "usites".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let blevel_word = match snapshot_string_field(fields.clone(), "blevel".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let blevel = match snapshot_proof_level_of_word(blevel_word.clone())
+  when Result::Err(e) then return Result::Err(snapshot_line_error(line_no, tag.clone(), e))
+  when Result::Ok(v) then v
+  end
+  let alevel_word = match snapshot_string_field(fields.clone(), "alevel".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let alevel = match snapshot_proof_level_of_word(alevel_word.clone())
+  when Result::Err(e) then return Result::Err(snapshot_line_error(line_no, tag.clone(), e))
+  when Result::Ok(v) then v
+  end
+  let slevel_word = match snapshot_string_field(fields.clone(), "slevel".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let slevel = match snapshot_proof_level_of_word(slevel_word.clone())
+  when Result::Err(e) then return Result::Err(snapshot_line_error(line_no, tag.clone(), e))
+  when Result::Ok(v) then v
+  end
+  Result::Ok(AllocationSummary {
+    function: function_key,
+    max_dynamic_bytes: dynamic,
+    bounded_arena_bytes: arena,
+    site_count: sites,
+    unbounded_sites: usites,
+    bytes_level: blevel,
+    arena_bytes_level: alevel,
+    sites_level: slevel
+  })
+end
+
+def snapshot_parse_stack_summary_row(fields: Vec[SnapshotField], line_no: Int) -> Result[StackSummary, String]
+  let tag = "stack-summary".to_string()
+  let function_key = match snapshot_string_field(fields.clone(), "f".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let frame = match snapshot_int_field(fields.clone(), "frame".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let max_stack = match snapshot_int_field(fields.clone(), "max".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let recursive = match snapshot_bool_field(fields.clone(), "recursive".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let flevel_word = match snapshot_string_field(fields.clone(), "flevel".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let flevel = match snapshot_proof_level_of_word(flevel_word.clone())
+  when Result::Err(e) then return Result::Err(snapshot_line_error(line_no, tag.clone(), e))
+  when Result::Ok(v) then v
+  end
+  let mlevel_word = match snapshot_string_field(fields.clone(), "mlevel".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let mlevel = match snapshot_proof_level_of_word(mlevel_word.clone())
+  when Result::Err(e) then return Result::Err(snapshot_line_error(line_no, tag.clone(), e))
+  when Result::Ok(v) then v
+  end
+  Result::Ok(StackSummary {
+    function: function_key,
+    frame_bytes: frame,
+    max_stack_bytes: max_stack,
+    recursive: recursive,
+    frame_level: flevel,
+    max_stack_level: mlevel
+  })
+end
+
+def snapshot_parse_blocking_summary_row(fields: Vec[SnapshotField], line_no: Int) -> Result[BlockingSummary, String]
+  let tag = "blocking-summary".to_string()
+  let function_key = match snapshot_string_field(fields.clone(), "f".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let blocking = match snapshot_bool_field(fields.clone(), "blocking".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let bsites = match snapshot_opt_string_list_field(fields.clone(), "bsites".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let unbounded = match snapshot_bool_field(fields.clone(), "unbounded".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let level_word = match snapshot_string_field(fields.clone(), "level".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let level = match snapshot_proof_level_of_word(level_word.clone())
+  when Result::Err(e) then return Result::Err(snapshot_line_error(line_no, tag.clone(), e))
+  when Result::Ok(v) then v
+  end
+  Result::Ok(BlockingSummary {
+    function: function_key,
+    blocking: blocking,
+    blocking_sites: bsites,
+    unbounded: unbounded,
+    level: level
+  })
+end
+
+def snapshot_parse_code_size_summary_row(fields: Vec[SnapshotField], line_no: Int) -> Result[CodeSizeSummary, String]
+  let tag = "code-size-summary".to_string()
+  let function_key = match snapshot_string_field(fields.clone(), "f".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let bytes = match snapshot_int_field(fields.clone(), "bytes".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let exact = match snapshot_bool_field(fields.clone(), "exact".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let level_word = match snapshot_string_field(fields.clone(), "level".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let level = match snapshot_proof_level_of_word(level_word.clone())
+  when Result::Err(e) then return Result::Err(snapshot_line_error(line_no, tag.clone(), e))
+  when Result::Ok(v) then v
+  end
+  Result::Ok(CodeSizeSummary {
+    function: function_key,
+    code_size_bytes: bytes,
+    exact: exact,
+    level: level
+  })
+end
+
 
 def snapshot_parse_field_row(fields: Vec[SnapshotField], line_no: Int) -> Result[SemanticField, String]
   let tag = "field".to_string()
@@ -8883,6 +9863,8 @@ pub def semantic_snapshot_parse(text: String) -> Result[SemanticSnapshot, String
   var mir_functions: Vec[MirSemanticSummary] = Vec::new()
   var unsafe_facts: Vec[UnsafeFact] = Vec::new()
   var drop_plans: Vec[DropPlanFact] = Vec::new()
+  # (audit item 16, next tier) the parsed DMA-ownership rows.
+  var dma_rows: Vec[DmaOwnershipFact] = Vec::new()
   var abi_surfaces: Vec[AbiSurfaceRow] = Vec::new()
   var dependencies = SemanticDependencyGraph {}
   # (fourth-audit P1-3/P1-5) the typed member/signature tables, the
@@ -8895,6 +9877,11 @@ pub def semantic_snapshot_parse(text: String) -> Result[SemanticSnapshot, String
   var trait_method_rows: Vec[SemanticTraitMethod] = Vec::new()
   var concrete_type_rows: Vec[SemanticConcreteType] = Vec::new()
   var allocation_site_rows: Vec[SemanticAllocationSite] = Vec::new()
+  # (audit order item 8) the parsed resource-summary rows.
+  var allocation_summary_rows: Vec[AllocationSummary] = Vec::new()
+  var stack_summary_rows: Vec[StackSummary] = Vec::new()
+  var blocking_summary_rows: Vec[BlockingSummary] = Vec::new()
+  var code_size_summary_rows: Vec[CodeSizeSummary] = Vec::new()
   var feature_set: Vec[String] = Vec::new()
   var semantic_options: Vec[String] = Vec::new()
   var domain_digests = SemanticDomainDigests {}
@@ -9016,6 +10003,12 @@ pub def semantic_snapshot_parse(text: String) -> Result[SemanticSnapshot, String
         when Result::Ok(v) then v
         end
         drop_plans.push(row)
+      elsif tag == "dma" then
+        let row = match snapshot_parse_dma_row(fields.clone(), line_no)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(v) then v
+        end
+        dma_rows.push(row)
       elsif tag == "concrete-type" then
         let row = match snapshot_parse_concrete_type_row(fields.clone(), line_no)
         when Result::Err(e) then return Result::Err(e)
@@ -9028,6 +10021,30 @@ pub def semantic_snapshot_parse(text: String) -> Result[SemanticSnapshot, String
         when Result::Ok(v) then v
         end
         allocation_site_rows.push(row)
+      elsif tag == "alloc-summary" then
+        let row = match snapshot_parse_allocation_summary_row(fields.clone(), line_no)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(v) then v
+        end
+        allocation_summary_rows.push(row)
+      elsif tag == "stack-summary" then
+        let row = match snapshot_parse_stack_summary_row(fields.clone(), line_no)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(v) then v
+        end
+        stack_summary_rows.push(row)
+      elsif tag == "blocking-summary" then
+        let row = match snapshot_parse_blocking_summary_row(fields.clone(), line_no)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(v) then v
+        end
+        blocking_summary_rows.push(row)
+      elsif tag == "code-size-summary" then
+        let row = match snapshot_parse_code_size_summary_row(fields.clone(), line_no)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(v) then v
+        end
+        code_size_summary_rows.push(row)
       elsif tag == "field" then
         let row = match snapshot_parse_field_row(fields.clone(), line_no)
         when Result::Err(e) then return Result::Err(e)
@@ -9158,7 +10175,12 @@ pub def semantic_snapshot_parse(text: String) -> Result[SemanticSnapshot, String
     unsafe_facts: unsafe_facts,
     concrete_types: concrete_type_rows,
     allocation_sites: allocation_site_rows,
+    allocation_summaries: allocation_summary_rows,
+    stack_summaries: stack_summary_rows,
+    blocking_summaries: blocking_summary_rows,
+    code_size_summaries: code_size_summary_rows,
     drop_plans: drop_plans,
+    dma_ownership: dma_rows,
     abi_surfaces: abi_surfaces,
     dependencies: dependencies,
     domain_digests: domain_digests,
@@ -9353,6 +10375,59 @@ pub def snapshot_parse_lane_snapshot() -> SemanticSnapshot
         size: -1
       }
     ]),
+    # (audit order item 8) the four resource-summary tables: the f row
+    # exercises a runtime-measured allocation summary with its unbounded
+    # site list, a recursive bounded stack, a blocking row and an
+    # estimated code size; the g row exercises every static level.
+    allocation_summaries: Vec::from([
+      AllocationSummary {
+        function: f.key.clone(),
+        max_dynamic_bytes: -1,
+        bounded_arena_bytes: 0,
+        site_count: 2,
+        unbounded_sites: Vec::from([f.key.clone() + "#B0#T"]),
+        bytes_level: ProofLevel::RuntimeMeasured,
+        arena_bytes_level: ProofLevel::StaticProof,
+        sites_level: ProofLevel::RuntimeMeasured
+      },
+      AllocationSummary {
+        function: g.key.clone(),
+        max_dynamic_bytes: 64,
+        bounded_arena_bytes: 8,
+        site_count: 1,
+        unbounded_sites: Vec::new(),
+        bytes_level: ProofLevel::StaticProof,
+        arena_bytes_level: ProofLevel::StaticBound,
+        sites_level: ProofLevel::StaticProof
+      }
+    ]),
+    stack_summaries: Vec::from([
+      StackSummary {
+        function: f.key.clone(),
+        frame_bytes: 32,
+        max_stack_bytes: 96,
+        recursive: true,
+        frame_level: ProofLevel::StaticProof,
+        max_stack_level: ProofLevel::StaticBound
+      }
+    ]),
+    blocking_summaries: Vec::from([
+      BlockingSummary {
+        function: f.key.clone(),
+        blocking: true,
+        blocking_sites: Vec::from(["lock@B1".to_string(), "sleep@B2".to_string()]),
+        unbounded: true,
+        level: ProofLevel::RuntimeMeasured
+      }
+    ]),
+    code_size_summaries: Vec::from([
+      CodeSizeSummary {
+        function: f.key.clone(),
+        code_size_bytes: 48,
+        exact: false,
+        level: ProofLevel::StaticBound
+      }
+    ]),
     calls: Vec::from([
       CallEdge { caller: f.clone(), callee: g.clone(), kind: CallEdgeKind::Direct },
       CallEdge { caller: f.clone(), callee: snapshot_parse_lane_def("intrinsic::memcpy#op"), kind: CallEdgeKind::Intrinsic }
@@ -9453,6 +10528,17 @@ pub def snapshot_parse_lane_snapshot() -> SemanticSnapshot
         kind: "branch-cleanup".to_string()
       }
     ]),
+    # (audit item 16, next tier) the DMA-ownership row carries adversarial
+    # text (quotes / backslashes / pipes) in its place and site.
+    dma_ownership: Vec::from([
+      DmaOwnershipFact {
+        function: f.key.clone(),
+        place: "b\\uf[0]|\"x".to_string(),
+        state: DmaState::PinnedRead,
+        op: "dma-pin-read".to_string(),
+        site: "lane.tg:4\"2\\|\\".to_string()
+      }
+    ]),
     abi_surfaces: Vec::from([
       AbiSurfaceRow {
         surface_id: "fn:" + f.key.clone(),
@@ -9489,6 +10575,8 @@ pub def snapshot_parse_lane_snapshot() -> SemanticSnapshot
       concrete_types: StableDigest { hi: 0xdddddddddddddddd, lo: 0xeeeeeeeeeeeeeeee },
       drop_plans: StableDigest { hi: 0x0101010101010101, lo: 0x0202020202020202 },
       allocation_sites: StableDigest { hi: 0x0303030303030303, lo: 0x0404040404040404 },
+      resource_summaries: StableDigest { hi: 0x0707070707070707, lo: 0x0808080808080808 },
+      dma_ownership: StableDigest { hi: 0x0909090909090909, lo: 0x0a0a0a0a0a0a0a0a },
       features: StableDigest { hi: 0x0505050505050505, lo: 0x0606060606060606 }
     },
     public_api_hash: StableDigest { hi: 0x1111111111111111, lo: 0x2222222222222222 },
@@ -9584,6 +10672,10 @@ pub def semantic_snapshot_parse_lane_check() -> Vec[String]
     parsed.domain_digests.concrete_types.lo == 0xeeeeeeeeeeeeeeee &&
     parsed.domain_digests.drop_plans.hi == 0x0101010101010101 &&
     parsed.domain_digests.allocation_sites.lo == 0x0404040404040404 &&
+    parsed.domain_digests.resource_summaries.hi == 0x0707070707070707 &&
+    parsed.domain_digests.resource_summaries.lo == 0x0808080808080808 &&
+    parsed.domain_digests.dma_ownership.hi == 0x0909090909090909 &&
+    parsed.domain_digests.dma_ownership.lo == 0x0a0a0a0a0a0a0a0a &&
     parsed.domain_digests.features.hi == 0x0505050505050505)
   # A feature-set-only edit moves the snapshot digest (the header joins the
   # preimage).
@@ -9623,6 +10715,55 @@ pub def semantic_snapshot_parse_lane_check() -> Vec[String]
     parsed.allocation_sites[0].size_kind == SemanticAllocationSizeKind::Exact &&
     parsed.allocation_sites[0].size == 64 &&
     parsed.allocation_sites[1].size_kind == SemanticAllocationSizeKind::Unbounded)
+  # (audit order item 8) the resource-summary tables round-trip with their
+  # typed proof levels, unbounded site list and blocking evidence rows.
+  snapshot_parse_lane_row(&mut out, "allocation-summaries-roundtrip",
+    parsed.allocation_summaries.len() == 2 &&
+    parsed.allocation_summaries[0].function == f.key &&
+    parsed.allocation_summaries[0].bytes_level == ProofLevel::RuntimeMeasured &&
+    parsed.allocation_summaries[0].arena_bytes_level == ProofLevel::StaticProof &&
+    parsed.allocation_summaries[0].sites_level == ProofLevel::RuntimeMeasured &&
+    parsed.allocation_summaries[0].max_dynamic_bytes == -1 &&
+    parsed.allocation_summaries[0].unbounded_sites.len() == 1 &&
+    parsed.allocation_summaries[0].unbounded_sites[0] == f.key.clone() + "#B0#T" &&
+    parsed.allocation_summaries[1].function == g.key &&
+    parsed.allocation_summaries[1].max_dynamic_bytes == 64 &&
+    parsed.allocation_summaries[1].bytes_level == ProofLevel::StaticProof)
+  snapshot_parse_lane_row(&mut out, "stack-summaries-roundtrip",
+    parsed.stack_summaries.len() == 1 &&
+    parsed.stack_summaries[0].function == f.key &&
+    parsed.stack_summaries[0].frame_bytes == 32 &&
+    parsed.stack_summaries[0].max_stack_bytes == 96 &&
+    parsed.stack_summaries[0].recursive &&
+    parsed.stack_summaries[0].frame_level == ProofLevel::StaticProof &&
+    parsed.stack_summaries[0].max_stack_level == ProofLevel::StaticBound)
+  snapshot_parse_lane_row(&mut out, "blocking-summaries-roundtrip",
+    parsed.blocking_summaries.len() == 1 &&
+    parsed.blocking_summaries[0].function == f.key &&
+    parsed.blocking_summaries[0].blocking && parsed.blocking_summaries[0].unbounded &&
+    parsed.blocking_summaries[0].level == ProofLevel::RuntimeMeasured &&
+    parsed.blocking_summaries[0].blocking_sites.len() == 2 &&
+    parsed.blocking_summaries[0].blocking_sites[0] == "lock@B1")
+  snapshot_parse_lane_row(&mut out, "code-size-summaries-roundtrip",
+    parsed.code_size_summaries.len() == 1 &&
+    parsed.code_size_summaries[0].function == f.key &&
+    parsed.code_size_summaries[0].code_size_bytes == 48 &&
+    !parsed.code_size_summaries[0].exact &&
+    parsed.code_size_summaries[0].level == ProofLevel::StaticBound)
+  # A resource-summary edit moves the snapshot digest (the tables join the
+  # revision preimage) and the domain digest.
+  var rs_a = original.clone()
+  var rs_b = original.clone()
+  rs_b.allocation_summaries[0].max_dynamic_bytes = 128
+  let rs_a_words = semantic_snapshot_digest(&rs_a)
+  let rs_b_words = semantic_snapshot_digest(&rs_b)
+  let rs_a_domains = semantic_snapshot_domain_digests(&rs_a)
+  let rs_b_domains = semantic_snapshot_domain_digests(&rs_b)
+  snapshot_parse_lane_row(&mut out, "resource-summary-join-digest",
+    rs_a_words.hi != rs_b_words.hi || rs_a_words.lo != rs_b_words.lo)
+  snapshot_parse_lane_row(&mut out, "resource-summary-domain-digest",
+    rs_a_domains.resource_summaries.hi != rs_b_domains.resource_summaries.hi ||
+    rs_a_domains.resource_summaries.lo != rs_b_domains.resource_summaries.lo)
   snapshot_parse_lane_row(&mut out, "effect-flags",
     parsed.effects.len() > 0 && parsed.effects[0].summary.may_allocate &&
     parsed.effects[0].summary.may_io && parsed.effects[0].summary.may_sleep &&
@@ -9648,6 +10789,14 @@ pub def semantic_snapshot_parse_lane_check() -> Vec[String]
     parsed.drop_plans[0].conditional_paths.len() == 2 &&
     parsed.drop_plans[0].conditional_paths[0] == "branch:false" &&
     parsed.drop_plans[0].kind == "branch-cleanup")
+  # (audit item 16, next tier) the DMA-ownership row round-trips with its
+  # adversarial place/site text and its strict state word.
+  snapshot_parse_lane_row(&mut out, "dma-roundtrip",
+    parsed.dma_ownership.len() == 1 &&
+    parsed.dma_ownership[0].place == "b\\uf[0]|\"x" &&
+    parsed.dma_ownership[0].state == DmaState::PinnedRead &&
+    parsed.dma_ownership[0].op == "dma-pin-read" &&
+    parsed.dma_ownership[0].site == "lane.tg:4\"2\\|\\")
   snapshot_parse_lane_row(&mut out, "abi-negative-size",
     parsed.abi_surfaces.len() > 0 && parsed.abi_surfaces[0].size == -1 &&
     parsed.abi_surfaces[0].alignment == -1)
@@ -9949,6 +11098,40 @@ pub def snapshot_lineage_lane_check() -> Vec[String]
     snapshot_lineage_seed("m".to_string(), "Function".to_string(), "moved".to_string(), "fn(bool)->bool".to_string())
   ]))
   snapshot_lineage_row(&mut out, "restart-v2-continuation-still-wins", snapshot_lineage_same(p1[0], p2[0]))
+
+  # ———— (12) (audit order item 5) the STABLE TEST identity is keyed by
+  # the test DECLARATION's persistent lineage + the test-kind word: an
+  # unrelated insertion before the test keeps the digest; the declared
+  # name and attrs ride as cargo (never digested); the canonical key text
+  # renders "<owner key>|test@<kind>#<name>". No ordinal participates.
+  var test_store = stable_lineage_store_new()
+  let t1 = snapshot_stamp_decls(&mut test_store, Vec::from([
+    snapshot_lineage_seed("m".to_string(), "Function".to_string(), "test_a".to_string(), "fn()->unit".to_string())
+  ]))
+  let t1_id = stable_test_id_of_decl(t1[0].clone(), "m::test_a#fn()->unit".to_string(),
+    "attr".to_string(), "test_a".to_string(), Vec::from(["test".to_string()]))
+  let t2 = snapshot_stamp_decls(&mut test_store, Vec::from([
+    snapshot_lineage_seed("m".to_string(), "Function".to_string(), "helper".to_string(), "fn()->unit".to_string()),
+    snapshot_lineage_seed("m".to_string(), "Function".to_string(), "test_a".to_string(), "fn()->unit".to_string())
+  ]))
+  let t2_id = stable_test_id_of_decl(t2[1].clone(), "m::test_a#fn()->unit".to_string(),
+    "attr".to_string(), "test_a".to_string(), Vec::from(["test".to_string()]))
+  snapshot_lineage_row(&mut out, "test-id-digest-stable-across-insertion",
+    t1_id.digest_hi == t2_id.digest_hi && t1_id.digest_lo == t2_id.digest_lo)
+  snapshot_lineage_row(&mut out, "test-id-canonical-key",
+    t1_id.stable_key == "m::test_a#fn()->unit|test@attr#test_a".to_string())
+  snapshot_lineage_row(&mut out, "test-id-name-cargo", t1_id.test_name == "test_a".to_string())
+  snapshot_lineage_row(&mut out, "test-id-attrs-cargo", t1_id.attrs.len() == 1 && t1_id.attrs[0] == "test".to_string())
+  # A rename WITHOUT an explicit continuation is removed+created exactly
+  # like any declaration (lineage authority unchanged).
+  let t3 = snapshot_stamp_decls(&mut test_store, Vec::from([
+    snapshot_lineage_seed("m".to_string(), "Function".to_string(), "helper".to_string(), "fn()->unit".to_string()),
+    snapshot_lineage_seed("m".to_string(), "Function".to_string(), "test_renamed".to_string(), "fn()->unit".to_string())
+  ]))
+  let t3_id = stable_test_id_of_decl(t3[1].clone(), "m::test_renamed#fn()->unit".to_string(),
+    "attr".to_string(), "test_renamed".to_string(), Vec::new())
+  snapshot_lineage_row(&mut out, "test-id-rename-fresh",
+    !(t3_id.digest_hi == t2_id.digest_hi && t3_id.digest_lo == t2_id.digest_lo))
 
   out
 end

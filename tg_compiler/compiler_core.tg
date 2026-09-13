@@ -4,7 +4,7 @@ use std::args::{raw_arg_copy}
 use std::fs::{read_file, write_file_bytes, delete_file, file_exists, IoError}
 use std::env::{args}
 
-use tg_compiler::token::{Token, Span}
+use tg_compiler::token::{Token, Span, span_dummy}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::ast::{
   Program, ModuleId, Module, Crate, AstPath,
@@ -267,8 +267,8 @@ end
 #          that glue body still passes its own local/glue gate
 #          (lir_resolve_glue_head_bind needs an admitted aggregate
 #          `value` local for the head copy) — where the delegated
-#          image is outside the admitted set (a packed handle/enum
-#          placement, a SIMD vector field, an unresolved type) it fails
+#          image is outside the admitted set (a SIMD vector field, an
+#          unresolved type) it fails
 #          closed there;
 #        - variadic float marshalling on the embedded LIR routes: the
 #          cortex-m AAPCS32 BASE-convention crossing is re-derived at
@@ -318,16 +318,44 @@ end
 #          x86_vmovdqu_store / x86_vex_rrr / x86_vex_pshufb). Pinned by
 #          tests/lir_vector_abi_rows_test.tg + the plan rows of
 #          tests/abi/abi_call_plan_rows_test.tg;
+#        - the packed/misaligned ONE-WORD field placements (the
+#          aggregate-residual packed-placement slice): a String/Vec/
+#          Map/Set handle field, an opaque-pointer (FnPtr/Closure/Dyn/
+#          Effect) field and an enum-typed field whose layout offset is
+#          NOT 8-byte aligned now admit — the field's ONE word (the
+#          handle/opaque pointer word, the enum's canonical value word)
+#          is stored/read by the byte-mode width-sized access at the
+#          layout byte offset, exactly the direct emitter's unaligned
+#          packed handling. lir_agg_field_rec's StringPtr /
+#          HeapVecHeader / HeapMapHeader / HeapSetHeader / OpaquePtr /
+#          enum-field arms now verify the field's engine storage slot
+#          (>= one pointer/canonical word, the layout-authority
+#          divergence guard) instead of requiring offset alignment;
+#          lir_agg_field_word_mode marks a packed one-word field BYTE
+#          MODE; lir_lower_agg_field_read / _store carry enum/handle
+#          words through the same width-8 access; the enum word
+#          consumers (lir_enum_value_word_of_place,
+#          lir_enum_place_word, lir_enum_field_base_word, the
+#          whole-copy enum source, the value-class finalizer receiver)
+#          materialize a packed field's word into a fresh vreg; a
+#          payloaded enum's tag still reads at offset 0 OF THE
+#          materialized value word (lir_normalize_tagged_enum_tag) and
+#          the deinit plan addresses the field as base + byte offset
+#          (lir_deinit_plan_place_addr). Pinned by the packed rows of
+#          tests/lir_aggregate_residual_test.tg;
 #      What remains fail-closed (the live gates):
-#        - packed enum/handle placements: a String/Vec/Map/Set handle
-#          field, an opaque-pointer (FnPtr/Closure/Dyn/Effect) field or
-#          an enum-typed field whose offset is not 8-byte aligned, and
-#          the tagged-enum payload layouts outside the whole-word
-#          natural placement (a @packed/@align enum, a sub-word payload
-#          field, a union word needing two classes or float widths) —
-#          lir_agg_field_rec's StringPtr / HeapVecHeader /
-#          HeapMapHeader / HeapSetHeader / OpaquePtr / enum-field
-#          offset arms and lir_tagged_enum_shape's layout gates;
+#        - the DECLARATION-level tagged-enum payload layouts outside
+#          the whole-word natural placement: a @packed or
+#          @align-attributed enum declaration and a sub-word payload
+#          field (or a union word needing two classes / float widths) —
+#          lir_tagged_enum_shape's layout gates (the LIR canonical heap
+#          image mirrors the direct layout engine's natural-alignment
+#          payload placement; a declaration attribute would move the
+#          payload offsets without a matching image rule, and a
+#          sub-word payload field has no whole-word image slot — the
+#          value word itself is expressible at packed FIELD placements,
+#          see the closed entry above, but the declaration-level image
+#          offsets are not);
 #        - unresolved types: a field whose type_repr is Invalid, a
 #          named field type with no registered definition, and an enum
 #          payload field whose generic parameter has no concrete
@@ -742,7 +770,7 @@ def layout_error_message(e: LayoutError) -> String
 end
 
 # Use Diagnostic definition from parser
-use tg_compiler::parser::{Diagnostic, DiagLevel, Suggestion}
+use tg_compiler::parser::{Diagnostic, DiagLevel, Suggestion, diagnostic_category_for_parts, diag_nonsemantic, diag_syntax, diag_internal, DiagnosticCategory}
 
 #
 # Diagnostics Emitter
@@ -1284,6 +1312,11 @@ end
 # semantic_data payload rides the same conversion — the typed facts
 # survive to the shared channel for the repair engine's typed rules.
 def type_error_to_diag(e: TypeError) -> Diagnostic
+  # (universal-typed-derivation closure) the category rides the phase
+  # conversion: payload class first (the derivation authority), code
+  # ranges second, Internal for the genuinely untyped legacy forms. The
+  # category is resolved BEFORE the fields move into the record literal.
+  let category = diagnostic_category_for_parts(e.code.clone(), e.semantic_data.clone())
   Diagnostic {
     level: DiagLevel::Error,
     message: e.message,
@@ -1303,22 +1336,19 @@ def type_error_to_diag(e: TypeError) -> Diagnostic
     related_symbols: e.related_symbols,
     minimal_slice: e.minimal_slice,
     repair_candidates: e.repair_candidates,
-    semantic_data: e.semantic_data
+    semantic_data: e.semantic_data,
+    category: category
   }
 end
 
+# The access/safety failures have no typed derivation contract today: they
+# are the NONSEMANTIC Internal category (routed through the constructor).
 def access_error_to_diag(e: AccessError) -> Diagnostic
-  Diagnostic {
-    level: DiagLevel::Error,
-    message: e.message,
-    span: Option::Some(e.span),
-    notes: Vec::new(),
-    suggestions: Vec::new(),
-    code: Option::None
-  }
+  diag_nonsemantic(DiagnosticCategory::Internal, "".to_string(), e.message, e.span)
 end
 
 def resource_error_to_diag(e: ResourceError) -> Diagnostic
+  let category = diagnostic_category_for_parts(Option::None, e.semantic_data.clone())
   Diagnostic {
     level: DiagLevel::Error,
     message: e.message,
@@ -1338,19 +1368,15 @@ def resource_error_to_diag(e: ResourceError) -> Diagnostic
     related_symbols: e.related_symbols,
     minimal_slice: e.minimal_slice,
     repair_candidates: e.repair_candidates,
-    semantic_data: e.semantic_data
+    semantic_data: e.semantic_data,
+    category: category
   }
 end
 
+# Name resolution is the front end's binding pass: the NONSEMANTIC Syntax
+# category (routed through the constructor; no typed derivation).
 def resolution_error_to_diag(e: ResolutionError) -> Diagnostic
-  Diagnostic {
-    level: DiagLevel::Error,
-    message: e.message,
-    span: Option::Some(e.span),
-    notes: Vec::new(),
-    suggestions: Vec::new(),
-    code: Option::None
-  }
+  diag_syntax("".to_string(), e.message, e.span)
 end
 
 def type_errors_to_diags(errors: Vec[TypeError]) -> Vec[Diagnostic]
@@ -1755,6 +1781,9 @@ pub def analyze_parsed(inout env: TypeEnv, inout program: Program, opts: Compile
       # (fourth-audit P0-17) the emitted typed drop-plan facts ride the
       # analysis artifact into the snapshot builder.
       drop_plan_facts: res_result.drop_plan_facts,
+      # (audit item 16, next tier) the emitted typed DMA-ownership facts
+      # ride the same artifact into the snapshot builder.
+      dma_facts: res_result.dma_facts,
       context: ctx,
       engine_snapshot: engine_snapshot,
       access_errors: access_errors,
@@ -1765,14 +1794,7 @@ pub def analyze_parsed(inout env: TypeEnv, inout program: Program, opts: Compile
       Result::Err(resolution_errors_to_diags(&res_errors))
     else
       var empty_res: Vec[Diagnostic] = Vec::new()
-      empty_res.push(Diagnostic {
-        level: DiagLevel::Error,
-        message: "name resolution failed",
-        span: Option::None,
-        notes: Vec::new(),
-        suggestions: Vec::new(),
-        code: Option::None
-      })
+      empty_res.push(diag_internal("name resolution failed", span_dummy()))
       Result::Err(empty_res)
     end
   end
@@ -2273,16 +2295,17 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   # AUDIT ITEM 20 (where the verification-evidence capture lives — and
   # why not here): this success boundary (after the unconditional post-mono
   # checkpoint, the post-opt verify_mir and the pre-codegen firewall) is
-  # where EVERY stage flag of a §37 VerifiedCompilationEvidence except
-  # abi_verify_ok would be provable — but this module is in the BOOTSTRAP
-  # KERNEL closure (lib_kernel.tg; see bootstrap/compiler_kernel.manifest)
-  # and must never import the full-library proof_patch.tg record. The
-  # evidence is therefore assembled at the driver's compile_snapshot_route
-  # boundary (driver.tg — the full-library pipeline that runs the SAME
-  # phase shape: the post-lower verify_mir, check_effect_class_
-  # annotations_mir, monomorphization, the post-opt verify_mir) and rides
-  # the §39 CompilerSession's evidence slot; abi_verify_ok stays false
-  # everywhere with the doc note that NO ABI-verify stage exists yet.
+  # where every stage flag of a §37 VerifiedCompilationEvidence is
+  # provable — but this module is in the BOOTSTRAP KERNEL closure
+  # (lib_kernel.tg; see bootstrap/compiler_kernel.manifest) and must
+  # never import the full-library proof_patch.tg record. The evidence is
+  # therefore assembled at the driver's compile_snapshot_route boundary
+  # (driver.tg — the full-library pipeline that runs the SAME phase
+  # shape) and rides the §39 CompilerSession's evidence slot. Since
+  # audit order item 7 that boundary sets abi_verify_ok from the REAL
+  # post-lowering verifier (driver_abi_verify_rows -> verify_abi over
+  # the route's final LIR); this kernel route cannot run it and simply
+  # does not capture an abi stage (Unavailable, never claimed).
 
   match opts.emit
   when EmitMode::Object then

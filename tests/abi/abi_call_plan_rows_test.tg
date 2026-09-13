@@ -11,8 +11,11 @@
 #   - a payload-carrying registered enum (canonical TaggedPtr word —
 #     audit item 29)
 #   - a payload-less registered enum (both routes cross the same word)
-#   - a two-F64 aggregate and a two-F32 aggregate (the documented P1-13
-#     HFA gap: classified by size, so the C plan reports the GP class)
+#   - the homogeneous-aggregate rows (audit P1-13, implemented): the
+#     2x F64 / 3x F32 / 4x F64 HFAs, the 5x F64 non-HFA (size rule),
+#     the nested same-kind flatten, the mixed FP/int pair, and the
+#     single-vector / two-vector HVA rows — with their FP/vector
+#     register placements (d0.. / v0..)
 #   - String (not FFI-safe under ExternC)
 #   - the raw UnsafeSlice view (the 16-byte ScalarPair image)
 #   - i128 (ScalarPair, sret return)
@@ -52,10 +55,14 @@ use tg_compiler::layout_engine::{
   classify_enum_crossing, abi_internal_image_class, layout_error_to_string,
   # (third-audit item 41) the typed carriers, their location
   # constructors and the report-boundary renders.
-  AbiValueClass, AbiLocationKind, AbiExtension,
+  AbiValueClass, AbiLocationKind, AbiLocation, AbiExtension,
   abi_value_class_word, abi_location_text, abi_extension_word, abi_return_text,
   abi_location_none, abi_location_register, abi_location_pair_gpr,
-  abi_location_pair_fp, abi_location_stack
+  abi_location_pair_fp, abi_location_pair_mixed, abi_location_stack,
+  abi_location_seq_fp, abi_location_vector,
+  # (audit P1-13) the shared member-type scan (the classifier and the
+  # ABI verifier consume this ONE rule).
+  AbiHomogeneousAggregate, AbiAggregateLeafKind, abi_homogeneous_aggregate
 }
 use tg_compiler::target_desc::{
   TargetDesc, aarch64_desc, x86_64_desc,
@@ -140,8 +147,17 @@ end
 # Packed12    — @packed struct { a: U32, b: U64 }         (12 bytes, C class)
 # PayloadEnum — enum { None, Some(Int) }                  (TaggedPtr, payload)
 # UnitEnum    — enum { Off, On }                          (TaggedPtr, no payload)
-# TwoF64      — struct { a: F64, b: F64 }                 (16 bytes)
-# TwoF32      — struct { a: F32, b: F32 }                 (8 bytes)
+# TwoF64      — struct { a: F64, b: F64 }                 (HFA 2 x 8)
+# TwoF32      — struct { a: F32, b: F32 }                 (HFA 2 x 4)
+# ThreeF32    — struct { a: F32, b: F32, c: F32 }         (HFA 3 x 4)
+# FourF64     — struct { a..d: F64 }                      (HFA 4 x 8)
+# FiveF64     — struct { a..e: F64 }                      (5 members -> size rule)
+# InnerF64    — struct { a: F64, b: F64 }                 (nested same-kind)
+# NestedHfa3  — struct { head: F64, tail: InnerF64 }      (flattens to HFA 3 x 8)
+# MixedFI     — struct { a: F64, b: Int }                 (mixed FP/int pair)
+# Vec4        — the std SIMD family vector row (4 x F32)  (16-byte short vector)
+# OneVec      — struct { v: Vec4 }                        (HVA 1 member)
+# TwoVec      — struct { a: Vec4, b: Vec4 }               (HVA 2 members)
 # SliceView   — the UnsafeSlice[u8] raw view              (16 bytes)
 def row_defs() -> Vec[MirTypeDef]
   var defs: Vec[MirTypeDef] = Vec::new()
@@ -179,6 +195,61 @@ def row_defs() -> Vec[MirTypeDef]
   # MirTypeDef in real compilations; the layout engine keys it by NAME.
   # The fixture registers a placeholder def under that name.
   defs.push(row_struct_def(7, "UnsafeSlice", Vec::new(), false))
+
+  var three_f32_fields: Vec[RowField] = Vec::new()
+  three_f32_fields.push(row_field("a", Type::F32))
+  three_f32_fields.push(row_field("b", Type::F32))
+  three_f32_fields.push(row_field("c", Type::F32))
+  defs.push(row_struct_def(8, "ThreeF32", three_f32_fields, false))
+
+  var four_f64_fields: Vec[RowField] = Vec::new()
+  four_f64_fields.push(row_field("a", Type::F64))
+  four_f64_fields.push(row_field("b", Type::F64))
+  four_f64_fields.push(row_field("c", Type::F64))
+  four_f64_fields.push(row_field("d", Type::F64))
+  defs.push(row_struct_def(9, "FourF64", four_f64_fields, false))
+
+  var five_f64_fields: Vec[RowField] = Vec::new()
+  five_f64_fields.push(row_field("a", Type::F64))
+  five_f64_fields.push(row_field("b", Type::F64))
+  five_f64_fields.push(row_field("c", Type::F64))
+  five_f64_fields.push(row_field("d", Type::F64))
+  five_f64_fields.push(row_field("e", Type::F64))
+  defs.push(row_struct_def(10, "FiveF64", five_f64_fields, false))
+
+  var inner_fields: Vec[RowField] = Vec::new()
+  inner_fields.push(row_field("a", Type::F64))
+  inner_fields.push(row_field("b", Type::F64))
+  defs.push(row_struct_def(11, "InnerF64", inner_fields, false))
+
+  var nested_fields: Vec[RowField] = Vec::new()
+  nested_fields.push(row_field("head", Type::F64))
+  nested_fields.push(row_field("tail", Type::Adt(TypeId { id: 11 }, Vec::new())))
+  defs.push(row_struct_def(12, "NestedHfa3", nested_fields, false))
+
+  var mixed_fields: Vec[RowField] = Vec::new()
+  mixed_fields.push(row_field("a", Type::F64))
+  mixed_fields.push(row_field("b", Type::Int))
+  defs.push(row_struct_def(13, "MixedFI", mixed_fields, false))
+
+  # The vector family row: the layout engine keys it by the family name
+  # plus a non-empty concrete argument list (is_simd_vector_type).
+  var vec4_lanes: Vec[RowField] = Vec::new()
+  vec4_lanes.push(row_field("x", Type::F32))
+  vec4_lanes.push(row_field("y", Type::F32))
+  vec4_lanes.push(row_field("z", Type::F32))
+  vec4_lanes.push(row_field("w", Type::F32))
+  defs.push(row_struct_def(14, "Vec4", vec4_lanes, false))
+
+  var one_vec_fields: Vec[RowField] = Vec::new()
+  one_vec_fields.push(row_field("v", Type::Adt(TypeId { id: 14 }, Vec::from([Type::F32]))))
+  defs.push(row_struct_def(15, "OneVec", one_vec_fields, false))
+
+  var two_vec_fields: Vec[RowField] = Vec::new()
+  two_vec_fields.push(row_field("a", Type::Adt(TypeId { id: 14 }, Vec::from([Type::F32]))))
+  two_vec_fields.push(row_field("b", Type::Adt(TypeId { id: 14 }, Vec::from([Type::F32]))))
+  defs.push(row_struct_def(16, "TwoVec", two_vec_fields, false))
+
   defs
 end
 
@@ -189,6 +260,15 @@ def unit_enum_ty() -> Type = Type::Adt(TypeId { id: 4 }, Vec::new())
 def two_f64_ty() -> Type = Type::Adt(TypeId { id: 5 }, Vec::new())
 def two_f32_ty() -> Type = Type::Adt(TypeId { id: 6 }, Vec::new())
 def unsafe_slice_ty() -> Type = Type::Adt(TypeId { id: 7 }, Vec::from([Type::U8]))
+def three_f32_ty() -> Type = Type::Adt(TypeId { id: 8 }, Vec::new())
+def four_f64_ty() -> Type = Type::Adt(TypeId { id: 9 }, Vec::new())
+def five_f64_ty() -> Type = Type::Adt(TypeId { id: 10 }, Vec::new())
+def inner_f64_ty() -> Type = Type::Adt(TypeId { id: 11 }, Vec::new())
+def nested_hfa3_ty() -> Type = Type::Adt(TypeId { id: 12 }, Vec::new())
+def mixed_fi_ty() -> Type = Type::Adt(TypeId { id: 13 }, Vec::new())
+def vec4_ty() -> Type = Type::Adt(TypeId { id: 14 }, Vec::from([Type::F32]))
+def one_vec_ty() -> Type = Type::Adt(TypeId { id: 15 }, Vec::new())
+def two_vec_ty() -> Type = Type::Adt(TypeId { id: 16 }, Vec::new())
 
 # ———————————————————————————————————————————————————————————————
 # Plan invocation helpers
@@ -235,6 +315,25 @@ def expect_ret(plan: AbiCallPlan, class_text: String, what: String) -> Unit
   assert(text == class_text, what + ": return class expected `" + class_text + "`, got `" + text + "`")
 end
 
+# The FP/vector register SEQUENCE location check (the HFA/HVA rows): the
+# sequence variant carries its register list, so the check goes through
+# the render + the variant match rather than a Vec-payload equality.
+def location_is_seq_fp(loc: AbiLocation) -> Bool
+  match loc.kind
+  when AbiLocationKind::RegisterSeqFp(_) then true
+  when _ then false
+  end
+end
+
+def expect_arg_seq(plan: AbiCallPlan, idx: Int, value_class: AbiValueClass, location_text: String, indirect: Bool, size: Int, what: String) -> Unit
+  let p = plan.args[idx]
+  assert(p.value_class == value_class, what + ": value class expected `" + abi_value_class_word(&value_class) + "`, got `" + abi_value_class_word(&p.value_class) + "`")
+  assert(location_is_seq_fp(p.location.clone()), what + ": expected an FP/vector register sequence, got `" + abi_location_text(&p.location) + "`")
+  assert(abi_location_text(&p.location) == location_text, what + ": location expected `" + location_text + "`, got `" + abi_location_text(&p.location) + "`")
+  assert(p.indirect == indirect, what + ": indirect expected " + indirect.to_string() + ", got " + p.indirect.to_string())
+  assert(p.size == size, what + ": size expected " + size.to_string() + ", got " + p.size.to_string())
+end
+
 # ———————————————————————————————————————————————————————————————
 # 0. the typed carriers (third-audit item 41): one render row per
 # AbiValueClass variant, the location kinds, the extensions and the
@@ -249,6 +348,9 @@ def test_value_class_render_rows() -> Unit
   assert(abi_value_class_word(AbiValueClass::PairInt(8, 8)) == "pair:8:8", "class PairInt: pair:8:8")
   assert(abi_value_class_word(AbiValueClass::PairFloat(4, 4)) == "pair:4:4", "class PairFloat: pair:4:4")
   assert(abi_value_class_word(AbiValueClass::MixedPair(8, 4)) == "pair:8:4", "class MixedPair: pair:8:4")
+  assert(abi_value_class_word(AbiValueClass::Hfa(3, 4)) == "hfa:3x4", "class Hfa: hfa:3x4")
+  assert(abi_value_class_word(AbiValueClass::Hfa(4, 8)) == "hfa:4x8", "class Hfa 4: hfa:4x8")
+  assert(abi_value_class_word(AbiValueClass::Hva(2, 16)) == "hva:2x16", "class Hva: hva:2x16")
   assert(abi_value_class_word(AbiValueClass::Vector(16)) == "vector:16", "class Vector: vector:16")
   assert(abi_value_class_word(AbiValueClass::ByAddress(24)) == "by-address:24", "class ByAddress: by-address:24")
   assert(abi_value_class_word(AbiValueClass::TaggedPtr(8)) == "scalar:8", "class TaggedPtr: scalar:8")
@@ -261,6 +363,9 @@ def test_location_render_rows() -> Unit
   assert(abi_location_text(abi_location_register("d0".to_string())) == "d0", "location FP register: d0")
   assert(abi_location_text(abi_location_pair_gpr("x0".to_string(), "x1".to_string())) == "x0,x1", "location GPR pair: x0,x1")
   assert(abi_location_text(abi_location_pair_fp("d0".to_string(), "d1".to_string())) == "d0,d1", "location FP pair: d0,d1")
+  assert(abi_location_text(abi_location_pair_mixed("xmm0".to_string(), "rdi".to_string())) == "xmm0,rdi", "location mixed pair: xmm0,rdi")
+  assert(abi_location_text(abi_location_seq_fp(Vec::from(["d0".to_string(), "d1".to_string(), "d2".to_string()]))) == "d0,d1,d2", "location FP seq: d0,d1,d2")
+  assert(abi_location_text(abi_location_vector("v0".to_string(), 0)) == "v0", "location vector: v0")
   assert(abi_location_text(abi_location_stack(16)) == "stack+16", "location stack: stack+16")
 end
 
@@ -298,6 +403,54 @@ def test_internal_image_class_rows() -> Unit
 end
 
 # ———————————————————————————————————————————————————————————————
+# 1b. the shared homogeneous-aggregate member scan (audit P1-13) —
+# the ONE rule the ExternC classifier and the ABI verifier consume:
+# flattening, the same-kind/width requirement, the <= 4 limit and the
+# mixed-kinds rejection.
+# ———————————————————————————————————————————————————————————————
+
+def scan_aggregate(ty: Type) -> Option[AbiHomogeneousAggregate]
+  mut engine = layout_engine_new(aarch64_target())
+  let defs = row_defs()
+  layout_engine_register_types(&mut engine, &defs)
+  compute_all_layouts(&mut engine)
+  abi_homogeneous_aggregate(&mut engine, ty)
+end
+
+def scan_pins(ty: Type, kind: AbiAggregateLeafKind, count: Int, width: Int, what: String) -> Unit
+  match scan_aggregate(ty)
+  when Option::Some(agg) then
+    assert(agg.kind == kind, what + ": kind mismatch")
+    assert(agg.count == count, what + ": count expected " + count.to_string() + ", got " + agg.count.to_string())
+    assert(agg.width == width, what + ": width expected " + width.to_string() + ", got " + agg.width.to_string())
+  when Option::None then panic(what + ": expected a homogeneous aggregate, got none")
+  end
+end
+
+@test
+def test_homogeneous_member_scan_rows() -> Unit
+  scan_pins(two_f64_ty(), AbiAggregateLeafKind::Float, 2, 8, "TwoF64")
+  scan_pins(two_f32_ty(), AbiAggregateLeafKind::Float, 2, 4, "TwoF32")
+  scan_pins(three_f32_ty(), AbiAggregateLeafKind::Float, 3, 4, "ThreeF32")
+  scan_pins(four_f64_ty(), AbiAggregateLeafKind::Float, 4, 8, "FourF64")
+  scan_pins(nested_hfa3_ty(), AbiAggregateLeafKind::Float, 3, 8, "NestedHfa3")
+  scan_pins(one_vec_ty(), AbiAggregateLeafKind::Vector, 1, 16, "OneVec")
+  scan_pins(two_vec_ty(), AbiAggregateLeafKind::Vector, 2, 16, "TwoVec")
+
+  # Five members exceeds the ABI's <= 4 limit: not homogeneous.
+  match scan_aggregate(five_f64_ty())
+  when Option::Some(_) then panic("FiveF64 must not be a homogeneous aggregate (<= 4 members)")
+  when Option::None then ()
+  end
+
+  # A mixed FP/int aggregate is not homogeneous either.
+  match scan_aggregate(mixed_fi_ty())
+  when Option::Some(_) then panic("MixedFI must not be a homogeneous aggregate (mixed kinds)")
+  when Option::None then ()
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # 2. aarch64 — internal flavor (the direct/LIR compiler convention)
 # ———————————————————————————————————————————————————————————————
 
@@ -327,8 +480,9 @@ def test_aarch64_internal_rows() -> Unit
   let p_unit = row_plan(desc.clone(), lt.clone(), fl, Vec::from([unit_enum_ty()]), Type::Unit)
   expect_arg(&p_unit, 0, AbiValueClass::TaggedPtr(8), AbiLocationKind::Register, "x0", false, 8, "aarch64 internal unit enum arg")
 
-  # The two-F64 aggregate: 16 bytes -> pair (the HFA gap is documented;
-  # the size rule is what both routes implement).
+  # The two-F64 aggregate under the INTERNAL convention: 16 bytes -> the
+  # by-reference PairInt image (the member scan is ExternC-only; internal
+  # crossings keep the compiler's by-reference aggregate model).
   let p_f64 = row_plan(desc.clone(), lt.clone(), fl, Vec::from([two_f64_ty()]), Type::Unit)
   expect_arg(&p_f64, 0, AbiValueClass::PairInt(8, 8), AbiLocationKind::Register, "x0", true, 16, "aarch64 internal two-F64 arg")
 
@@ -444,15 +598,52 @@ def test_aarch64_extern_c_rows() -> Unit
   expect_arg(&p_unit, 0, AbiValueClass::TaggedPtr(8), AbiLocationKind::Register, "x0", false, 8, "aarch64 ExternC unit enum arg")
   expect_ret(&p_unit, "direct:scalar:8", "aarch64 ExternC unit enum ret")
 
-  # HFA gap (audit P1-13): a two-F64 aggregate is classified by size,
-  # so the C plan reports the integer pair (the AAPCS64 HFA answer is
-  # d0,d1; the member-type scan is the documented remaining step).
+  # (audit P1-13, implemented) THE HFA/HVA ROWS: the member-type scan
+  # classifies the all-float aggregates into the FP file — one member
+  # per register, in order — and the all-vector aggregates into the
+  # vector file.
   let p_f64 = row_plan(desc.clone(), lt.clone(), fl, Vec::from([two_f64_ty()]), Type::Unit)
-  expect_arg(&p_f64, 0, AbiValueClass::PairInt(8, 8), AbiLocationKind::RegisterPairGpr, "x0,x1", false, 16, "aarch64 ExternC two-F64 arg (documented HFA gap)")
+  expect_arg(&p_f64, 0, AbiValueClass::PairFloat(8, 8), AbiLocationKind::RegisterPairFp, "d0,d1", false, 16, "aarch64 ExternC two-F64 HFA arg")
+  expect_ret(&p_f64, "direct:pair:8:8", "aarch64 ExternC two-F64 HFA ret")
 
-  # A two-F32 aggregate fits ONE 8-byte eightbyte.
   let p_f32 = row_plan(desc.clone(), lt.clone(), fl, Vec::from([two_f32_ty()]), Type::Unit)
-  expect_arg(&p_f32, 0, AbiValueClass::ScalarInt(8), AbiLocationKind::Register, "x0", false, 8, "aarch64 ExternC two-F32 arg (documented HFA gap)")
+  expect_arg(&p_f32, 0, AbiValueClass::PairFloat(4, 4), AbiLocationKind::RegisterPairFp, "d0,d1", false, 8, "aarch64 ExternC two-F32 HFA arg")
+
+  # 3 x F32: the three-FP-register sequence d0,d1,d2.
+  let p_three = row_plan(desc.clone(), lt.clone(), fl, Vec::from([three_f32_ty()]), Type::Unit)
+  expect_arg_seq(&p_three, 0, AbiValueClass::Hfa(3, 4), "d0,d1,d2", false, 12, "aarch64 ExternC three-F32 HFA arg")
+  expect_ret(&p_three, "direct:hfa:3x4", "aarch64 ExternC three-F32 HFA ret")
+
+  # 4 x F64: the AAPCS64 HFA crosses four registers (32 bytes, never the
+  # >16-byte memory rule).
+  let p_four = row_plan(desc.clone(), lt.clone(), fl, Vec::from([four_f64_ty()]), Type::Unit)
+  expect_arg_seq(&p_four, 0, AbiValueClass::Hfa(4, 8), "d0,d1,d2,d3", false, 32, "aarch64 ExternC four-F64 HFA arg")
+  expect_ret(&p_four, "direct:hfa:4x8", "aarch64 ExternC four-F64 HFA ret")
+
+  # 5 x F64: five members is NOT homogeneous (the ABI's <= 4 limit), so
+  # the 40-byte aggregate keeps the size rule: by value on the stack.
+  let p_five = row_plan(desc.clone(), lt.clone(), fl, Vec::from([five_f64_ty()]), Type::Unit)
+  expect_arg(&p_five, 0, AbiValueClass::ByAddress(40), AbiLocationKind::StackOffset, "stack+0", false, 40, "aarch64 ExternC five-F64 (non-HFA) arg")
+  expect_ret(&p_five, "sret:by-address:40", "aarch64 ExternC five-F64 (non-HFA) ret")
+
+  # The nested same-kind flatten: { F64, { F64, F64 } } is an HFA of 3.
+  let p_nested = row_plan(desc.clone(), lt.clone(), fl, Vec::from([nested_hfa3_ty()]), Type::Unit)
+  expect_arg_seq(&p_nested, 0, AbiValueClass::Hfa(3, 8), "d0,d1,d2", false, 24, "aarch64 ExternC nested HFA arg")
+
+  # A mixed FP/int aggregate is NOT an AAPCS64 FP aggregate: the class
+  # records the member kinds, the placement is the general pair.
+  let p_mixed = row_plan(desc.clone(), lt.clone(), fl, Vec::from([mixed_fi_ty()]), Type::Unit)
+  expect_arg(&p_mixed, 0, AbiValueClass::MixedPair(8, 8), AbiLocationKind::RegisterPairGpr, "x0,x1", false, 16, "aarch64 ExternC mixed FP/int arg")
+
+  # A struct wrapping ONE short vector is an HVA of one member (v0); two
+  # vectors cross in v0,v1.
+  let p_vec1 = row_plan(desc.clone(), lt.clone(), fl, Vec::from([one_vec_ty()]), Type::Unit)
+  expect_arg(&p_vec1, 0, AbiValueClass::Vector(16), AbiLocationKind::RegisterVector, "v0", false, 16, "aarch64 ExternC one-vector HVA arg")
+  expect_ret(&p_vec1, "direct:vector:16", "aarch64 ExternC one-vector HVA ret")
+
+  let p_vec2 = row_plan(desc.clone(), lt.clone(), fl, Vec::from([two_vec_ty()]), Type::Unit)
+  expect_arg_seq(&p_vec2, 0, AbiValueClass::Hva(2, 16), "v0,v1", false, 32, "aarch64 ExternC two-vector HVA arg")
+  expect_ret(&p_vec2, "direct:hva:2x16", "aarch64 ExternC two-vector HVA ret")
 
   # String is not a C boundary value.
   assert(row_plan_is_err(desc.clone(), lt.clone(), fl, Vec::from([Type::String]), Type::Unit), "aarch64 ExternC String must fail closed")
@@ -497,6 +688,17 @@ def test_x86_64_extern_c_rows() -> Unit
 
   let p_packed = row_plan(desc.clone(), lt.clone(), fl, Vec::from([packed12_ty()]), Type::Unit)
   expect_arg(&p_packed, 0, AbiValueClass::PairInt(8, 8), AbiLocationKind::RegisterPairGpr, "rdi,rsi", false, 12, "x86_64 ExternC packed12 arg")
+
+  # (audit P1-13) The AAPCS64 HFA rule is NOT applied on x86-64 (the
+  # eightbyte SSE classifier is the documented remaining gap), so a
+  # two-F64 aggregate keeps the size-based integer pair here.
+  let p_f64 = row_plan(desc.clone(), lt.clone(), fl, Vec::from([two_f64_ty()]), Type::Unit)
+  expect_arg(&p_f64, 0, AbiValueClass::PairInt(8, 8), AbiLocationKind::RegisterPairGpr, "rdi,rsi", false, 16, "x86_64 ExternC two-F64 (size rule) arg")
+
+  # The FP-first mixed SSE+INTEGER pair: the FP slot in xmm0, the
+  # integer slot in rdi.
+  let p_mixed = row_plan(desc.clone(), lt.clone(), fl, Vec::from([mixed_fi_ty()]), Type::Unit)
+  expect_arg(&p_mixed, 0, AbiValueClass::MixedPair(8, 8), AbiLocationKind::RegisterPairMixed, "xmm0,rdi", false, 16, "x86_64 ExternC mixed FP/int arg")
 
   assert(row_plan_is_err(desc.clone(), lt.clone(), fl, Vec::from([payload_enum_ty()]), Type::Unit), "x86_64 ExternC payload enum must fail closed")
 end

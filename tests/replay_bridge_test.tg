@@ -1,0 +1,447 @@
+# tests/replay_bridge_test.tg — audit order item 6: the replay production
+# bridge (the compact stable event dictionary + the recorder run artifact
+# + the session decode/compare).
+#
+# The model lives in tg_compiler/replay_bridge.tg:
+#   * the dictionary renders one {token, stable node key, stable decl key,
+#     operation word} row per wired nondeterminism call site of the
+#     finalized MIR, sorted and token-stamped deterministically;
+#   * replay_run_encode / replay_run_decode are the byte-exact run-artifact
+#     grammar the runtime recorder writes (48-byte header + dictionary text
+#     + fixed records);
+#   * replay_run_compare maps both runs' tokens through their EMBEDDED
+#     dictionaries (exact stable ids), answers the first divergence and its
+#     minimal causal slice, and returns the documented untracked result for
+#     raw/unknown/origin-less input.
+#
+# Run with the repo root as the working directory:
+#   tg test tests/replay_bridge_test.tg
+
+use std::core::{Option, Result, Unit, panic}
+use std::collections::{Vec}
+use std::test::*
+
+use tg_compiler::token::{span_dummy}
+use tg_compiler::types::{Type}
+use tg_compiler::mir::{
+  MirFunction, MirBlock, MirBlockId, MirLocal, MirLocalId, MirTerminator,
+  MirTerminatorKind, MirOperand, MirOperandKind, MirConstant, MirConstantKind,
+  MirCallArg, Place
+}
+use tg_compiler::stable_ids::{stable_mir_node_id_of_generated, stable_mir_block_id_of_node}
+use tg_compiler::replay_bridge::{
+  ReplayEmissionPlan, ReplayEventDictionary, ReplayRawChoice,
+  replay_emission_plan_of_functions, replay_plan_disabled,
+  replay_dictionary_is_sorted, replay_dictionary_render, replay_dictionary_parse,
+  replay_run_encode, replay_run_decode, replay_run_compare,
+  replay_comparison_is_untracked, replay_comparison_untracked_reason,
+  replay_plan_token_of, replay_plan_tag_of, replay_tag_time, replay_tag_random,
+  replay_tag_external, replay_callee_commits, replay_syscall_nargs_of,
+  replay_unwired_source_note, replay_bridge_const_fn,
+  replay_bridge_syscall_call_fn, replay_bridge_syscall_dynamic_fn,
+  replay_bridge_lane_check
+}
+
+# A minimal origin-stamped function with one wired call terminator.
+def replay_bridge_test_fn(fn_key: String, callee: String, node_seq: Int) -> MirFunction
+  let origin = stable_mir_node_id_of_generated(fn_key.clone(),
+    fn_key.clone(), "lower".to_string(), "call".to_string(), node_seq)
+  let ret_origin = stable_mir_node_id_of_generated(fn_key.clone(),
+    fn_key.clone(), "lower".to_string(), "return".to_string(), node_seq + 1)
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: Vec::new(),
+    terminator: MirTerminator {
+      kind: MirTerminatorKind::MirCall {
+        dest: Place {
+          local: MirLocalId { id: 0 },
+          projections: Vec::new()
+        },
+        func: MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirFnItem(callee.clone()),
+            ty: Type::Unit,
+            instance: Option::None
+          })
+        },
+        args: Vec::new(),
+        success: MirBlockId { id: 1 },
+        unwind: Option::None,
+        intrinsic: Option::None,
+        tail: false
+      },
+      span: span_dummy(),
+      origin: Option::Some(origin.clone())
+    },
+    origin: Option::Some(stable_mir_block_id_of_node(origin.clone()))
+  })
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 1 },
+    statements: Vec::new(),
+    terminator: MirTerminator {
+      kind: MirTerminatorKind::MirReturn,
+      span: span_dummy(),
+      origin: Option::Some(ret_origin.clone())
+    },
+    origin: Option::Some(stable_mir_block_id_of_node(ret_origin.clone()))
+  })
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(MirLocal {
+    id: MirLocalId { id: 0 },
+    name: "_ret".to_string(),
+    ty: Type::Unit,
+    is_mut: false,
+    span: span_dummy()
+  })
+  MirFunction {
+    name: fn_key,
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "",
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def replay_bridge_test_plan(name: String) -> ReplayEmissionPlan
+  let f = replay_bridge_test_fn(name.clone(), "__tg_clock_ns".to_string(), 0)
+  match replay_emission_plan_of_functions(Vec::from([f]), "/tmp/tg.replay.test".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(_) then replay_plan_disabled()
+  end
+end
+
+def replay_bridge_test_word_bytes(value: Int) -> Vec[u8]
+  let v = value as UInt
+  var out: Vec[u8] = Vec::new()
+  out.push(((v >> 0) & 0xFF) as u8)
+  out.push(((v >> 8) & 0xFF) as u8)
+  out.push(((v >> 16) & 0xFF) as u8)
+  out.push(((v >> 24) & 0xFF) as u8)
+  out.push(((v >> 32) & 0xFF) as u8)
+  out.push(((v >> 40) & 0xFF) as u8)
+  out.push(((v >> 48) & 0xFF) as u8)
+  out.push(((v >> 56) & 0xFF) as u8)
+  out
+end
+
+@test
+def test_replay_bridge_lane() -> Unit
+  let rows = replay_bridge_lane_check()
+  assert(rows.len() == 0, "replay bridge lane mismatches: " + rows.join("; "))
+end
+
+@test
+def test_dictionary_emission_is_deterministic_and_sorted() -> Unit
+  let f1 = replay_bridge_test_fn("m::one#fn()->unit".to_string(), "__tg_clock_ns".to_string(), 0)
+  let f2 = replay_bridge_test_fn("m::two#fn()->unit".to_string(), "_tg_read_vec_u8".to_string(), 0)
+  let plan_a = match replay_emission_plan_of_functions(Vec::from([f1.clone(), f2.clone()]), "/tmp/a".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(_) then replay_plan_disabled()
+  end
+  let plan_b = match replay_emission_plan_of_functions(Vec::from([f2.clone(), f1.clone()]), "/tmp/a".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(_) then replay_plan_disabled()
+  end
+  assert(plan_a.enabled && plan_b.enabled, "both plans must build")
+  assert(replay_dictionary_render(plan_a.dictionary.clone()) ==
+    replay_dictionary_render(plan_b.dictionary.clone()),
+    "the dictionary render must be independent of function iteration order")
+  assert(replay_dictionary_is_sorted(plan_a.dictionary.clone()),
+    "the token table must be in canonical sorted order")
+  assert(plan_a.dictionary.entries.len() == 2, "two wired sites must yield two entries")
+  assert(replay_plan_token_of(plan_a.clone(), "m::one#fn()->unit".to_string(), 0) == 2,
+    "the time site sorts after the external site")
+  assert(replay_plan_token_of(plan_a.clone(), "m::two#fn()->unit".to_string(), 0) == 1,
+    "the external site takes token 1")
+end
+
+@test
+def test_token_round_trip_decode() -> Unit
+  let plan = replay_bridge_test_plan("m::clock_site#fn()->unit".to_string())
+  let text = replay_dictionary_render(plan.dictionary.clone())
+  let parsed = match replay_dictionary_parse(text.clone())
+  when Result::Ok(d) then d
+  when Result::Err(e) then panic("dictionary parse failed: " + e)
+  end
+  assert(replay_dictionary_render(parsed.clone()) == text,
+    "render -> parse -> render must be the identity")
+  assert(parsed.entries.len() == 1, "one site expected")
+  assert(parsed.entries[0].token == 1, "the first token is 1 (0 is the raw token)")
+  assert(parsed.entries[0].operation_word == "time".to_string(),
+    "the clock site is a time event")
+end
+
+@test
+def test_run_artifact_round_trip() -> Unit
+  let plan = replay_bridge_test_plan("m::clock_site#fn()->unit".to_string())
+  var records: Vec[ReplayRawChoice] = Vec::new()
+  records.push(ReplayRawChoice {
+    token: 1,
+    tag: replay_tag_time(),
+    payload: replay_bridge_test_word_bytes(7)
+  })
+  let bytes = replay_run_encode(plan.dictionary_text.clone(), records.clone())
+  let decoded = match replay_run_decode(bytes.clone())
+  when Result::Ok(d) then d
+  when Result::Err(e) then panic("run decode failed: " + e)
+  end
+  assert(decoded.records.len() == 1, "one record expected")
+  assert(decoded.records[0].token == 1, "token round trip")
+  assert(decoded.records[0].tag == replay_tag_time(), "tag round trip")
+  assert(decoded.records[0].payload.len() == 8, "payload round trip")
+  # a truncated artifact is a decode failure (the untracked anchor)
+  match replay_run_decode(Vec::from([84 as u8, 71 as u8]))
+  when Result::Ok(_) then assert(false, "a truncated artifact must not decode")
+  when Result::Err(_) then ()
+  end
+end
+
+@test
+def test_compare_first_divergence_and_slice() -> Unit
+  let plan = replay_bridge_test_plan("m::clock_site#fn()->unit".to_string())
+  var records_a: Vec[ReplayRawChoice] = Vec::new()
+  records_a.push(ReplayRawChoice {
+    token: 1, tag: replay_tag_time(), payload: replay_bridge_test_word_bytes(11)
+  })
+  var records_b: Vec[ReplayRawChoice] = Vec::new()
+  records_b.push(ReplayRawChoice {
+    token: 1, tag: replay_tag_time(), payload: replay_bridge_test_word_bytes(22)
+  })
+  let run_a = replay_run_encode(plan.dictionary_text.clone(), records_a.clone())
+  let run_b = replay_run_encode(plan.dictionary_text.clone(), records_b.clone())
+  let cmp = replay_run_compare(run_a.clone(), run_b.clone())
+  assert(!replay_comparison_is_untracked(cmp.clone()),
+    "two well-formed runs from the same executable must compare")
+  match cmp.first_divergence.clone()
+  when Option::Some(id) then
+    assert(id.sequence == 0, "the differing choice is the first divergence")
+    assert(id.stmt_key == plan.dictionary.entries[0].stable_node_key,
+      "the divergence anchors on the exact stable node key")
+  when Option::None then
+    assert(false, "the differing choice must diverge")
+  end
+  assert(cmp.slice.len() == 1, "the minimal causal slice is the divergence itself")
+  # identical runs never diverge
+  let same = replay_run_compare(run_a.clone(), run_a.clone())
+  match same.first_divergence.clone()
+  when Option::None then ()
+  when Option::Some(_) then assert(false, "identical runs must not diverge")
+  end
+end
+
+@test
+def test_untracked_inputs_return_the_documented_result() -> Unit
+  let plan = replay_bridge_test_plan("m::clock_site#fn()->unit".to_string())
+  var good: Vec[ReplayRawChoice] = Vec::new()
+  good.push(ReplayRawChoice {
+    token: 1, tag: replay_tag_time(), payload: replay_bridge_test_word_bytes(1)
+  })
+  let run_good = replay_run_encode(plan.dictionary_text.clone(), good.clone())
+  # the raw token: no site was armed at record time
+  var raw: Vec[ReplayRawChoice] = Vec::new()
+  raw.push(ReplayRawChoice {
+    token: 0, tag: replay_tag_time(), payload: replay_bridge_test_word_bytes(1)
+  })
+  let run_raw = replay_run_encode(plan.dictionary_text.clone(), raw.clone())
+  let cmp_raw = replay_run_compare(run_raw, run_good.clone())
+  assert(replay_comparison_is_untracked(cmp_raw.clone()),
+    "a raw token is the documented untracked result")
+  assert(replay_comparison_untracked_reason(cmp_raw.clone()).contains("raw-token"),
+    "the raw-token reason must name the anchor")
+  # an unknown token
+  var unknown: Vec[ReplayRawChoice] = Vec::new()
+  unknown.push(ReplayRawChoice {
+    token: 77, tag: replay_tag_time(), payload: replay_bridge_test_word_bytes(1)
+  })
+  let run_unknown = replay_run_encode(plan.dictionary_text.clone(), unknown.clone())
+  let cmp_unknown = replay_run_compare(run_unknown, run_good.clone())
+  assert(replay_comparison_is_untracked(cmp_unknown.clone()),
+    "an unknown token is the documented untracked result")
+  # an origin-less embedded dictionary entry
+  var erased: Vec[ReplayRawChoice] = Vec::new()
+  erased.push(ReplayRawChoice {
+    token: 1, tag: replay_tag_external(), payload: Vec::new()
+  })
+  let erased_text = "tg.replay.dict.v1\nsite|1|external||m::x#fn()->unit"
+  let run_erased = replay_run_encode(erased_text, erased.clone())
+  let cmp_erased = replay_run_compare(run_erased.clone(), run_erased.clone())
+  assert(replay_comparison_is_untracked(cmp_erased.clone()),
+    "an origin-less dictionary entry is the documented untracked result")
+  assert(replay_comparison_untracked_reason(cmp_erased.clone()).contains("origin-less"),
+    "the origin-less reason must name the anchor")
+end
+
+# ———————————————————————————————————————————————————————————————
+# The extended nondeterminism sources (the syscall read, clock_gettime,
+# getrandom, the libc read binding) and the per-call token protocol.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_syscall_family_recognition_and_dispositions() -> Unit
+  # the __intrinsic_syscall1..6 grammar (the LIR classifier's mirror)
+  match replay_syscall_nargs_of("__intrinsic_syscall3".to_string())
+  when Option::Some(n) then assert(n == 3, "the syscall3 family index is 3")
+  when Option::None then assert(false, "__intrinsic_syscall3 must classify")
+  end
+  match replay_syscall_nargs_of("syscall6".to_string())
+  when Option::Some(n) then assert(n == 6, "the bare router spelling classifies")
+  when Option::None then assert(false, "syscall6 must classify")
+  end
+  match replay_syscall_nargs_of("read".to_string())
+  when Option::Some(_) then assert(false, "read is not a syscall-family name")
+  when Option::None then ()
+  end
+  # the wired runtime-symbol bindings (no exclusion note)
+  match replay_callee_commits("clock_gettime".to_string())
+  when Option::Some(op) then assert(op == "time".to_string(), "clock_gettime is a wired time source")
+  when Option::None then assert(false, "clock_gettime must commit")
+  end
+  match replay_callee_commits("getrandom".to_string())
+  when Option::Some(op) then assert(op == "random".to_string(), "getrandom is a wired random source")
+  when Option::None then assert(false, "getrandom must commit")
+  end
+  match replay_callee_commits("read".to_string())
+  when Option::Some(op) then assert(op == "external".to_string(), "the libc read binding is a wired external source")
+  when Option::None then assert(false, "read must commit")
+  end
+  match replay_callee_commits("libc_read".to_string())
+  when Option::Some(op) then assert(op == "external".to_string(), "the libc_read alias is a wired external source")
+  when Option::None then assert(false, "libc_read must commit")
+  end
+  match replay_unwired_source_note("clock_gettime".to_string())
+  when Option::Some(_) then assert(false, "clock_gettime is wired — no exclusion note")
+  when Option::None then ()
+  end
+  match replay_unwired_source_note("getrandom".to_string())
+  when Option::Some(_) then assert(false, "getrandom is wired — no exclusion note")
+  when Option::None then ()
+  end
+  # the recognized-but-unwired siblings keep their typed kind + note
+  match replay_unwired_source_note("getentropy".to_string())
+  when Option::Some(note) then assert(note.starts_with("random:"), "getentropy keeps the random note")
+  when Option::None then assert(false, "getentropy must keep a documented note")
+  end
+  match replay_unwired_source_note("pthread_mutex_trylock".to_string())
+  when Option::Some(note) then
+    assert(note.starts_with("scheduler:"), "the guest-visible trylock outcome is a scheduler note")
+  when Option::None then assert(false, "pthread_mutex_trylock must keep a documented note")
+  end
+  match replay_unwired_source_note("__intrinsic_syscall3".to_string())
+  when Option::Some(note) then
+    assert(note.starts_with("external:"), "the dynamic syscall number keeps the external note")
+  when Option::None then assert(false, "__intrinsic_syscall3 must keep a documented note")
+  end
+end
+
+@test
+def test_syscall_read_plan_wiring() -> Unit
+  # `<SYS_READ() constant>` + `<__intrinsic_syscall3(n, ...)>`: the read
+  # number (0) wiring — one external site.
+  let read_const = replay_bridge_const_fn("m::SYS_READ#fn()->int".to_string(), 0, 0)
+  let read_call = replay_bridge_syscall_call_fn("m::sysread#fn()->unit".to_string(),
+    "__intrinsic_syscall3".to_string(), "m::SYS_READ#fn()->int".to_string(), 0)
+  let plan = match replay_emission_plan_of_functions(
+      Vec::from([read_const.clone(), read_call.clone()]), "/tmp/tg.replay.test".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(_) then replay_plan_disabled()
+  end
+  assert(plan.enabled, "the read syscall plan must build")
+  assert(plan.dictionary.entries.len() == 1, "exactly one read site")
+  assert(plan.dictionary.entries[0].operation_word == "external".to_string(),
+    "the syscall read records as an external event")
+  assert(replay_plan_token_of(plan.clone(), "m::sysread#fn()->unit".to_string(), 1) == 1,
+    "the syscall call block carries token 1")
+  assert(replay_plan_tag_of(plan.clone(), "m::sysread#fn()->unit".to_string(), 1) ==
+    replay_tag_external(), "the syscall read site carries the external tag")
+  # a WRITE number (1) is not a site
+  let write_const = replay_bridge_const_fn("m::SYS_WRITE#fn()->int".to_string(), 1, 0)
+  let write_call = replay_bridge_syscall_call_fn("m::syswrite#fn()->unit".to_string(),
+    "__intrinsic_syscall3".to_string(), "m::SYS_WRITE#fn()->int".to_string(), 0)
+  let plan_write = match replay_emission_plan_of_functions(
+      Vec::from([write_const.clone(), write_call.clone()]), "/tmp/tg.replay.test".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(_) then replay_plan_disabled()
+  end
+  assert(plan_write.dictionary.entries.len() == 0, "a write syscall is not a dictionary site")
+  # a dynamic number (a parameter) is not a site
+  let dyn_call = replay_bridge_syscall_dynamic_fn("m::sysdyn#fn()->unit".to_string(),
+    "__intrinsic_syscall3".to_string(), 0)
+  let plan_dyn = match replay_emission_plan_of_functions(
+      Vec::from([dyn_call.clone()]), "/tmp/tg.replay.test".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(_) then replay_plan_disabled()
+  end
+  assert(plan_dyn.dictionary.entries.len() == 0, "a dynamic syscall number is not a dictionary site")
+end
+
+@test
+def test_clock_random_read_plans() -> Unit
+  let clock_fn = replay_bridge_test_fn("m::clk#fn()->unit".to_string(), "clock_gettime".to_string(), 0)
+  let random_fn = replay_bridge_test_fn("m::rnd#fn()->unit".to_string(), "getrandom".to_string(), 0)
+  let read_fn = replay_bridge_test_fn("m::rd#fn()->unit".to_string(), "read".to_string(), 0)
+  let plan = match replay_emission_plan_of_functions(
+      Vec::from([clock_fn.clone(), random_fn.clone(), read_fn.clone()]), "/tmp/tg.replay.test".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(_) then replay_plan_disabled()
+  end
+  assert(plan.dictionary.entries.len() == 3, "clock + random + read = three sites")
+  # canonical op order: external (read) < random (getrandom) < time (clock)
+  assert(plan.dictionary.entries[0].operation_word == "external".to_string(), "read sorts first")
+  assert(plan.dictionary.entries[1].operation_word == "random".to_string(), "getrandom sorts second")
+  assert(plan.dictionary.entries[2].operation_word == "time".to_string(), "clock_gettime sorts third")
+  assert(replay_plan_tag_of(plan.clone(), "m::clk#fn()->unit".to_string(), 0) == replay_tag_time(),
+    "clock_gettime records as a time choice")
+  assert(replay_plan_tag_of(plan.clone(), "m::rnd#fn()->unit".to_string(), 0) == replay_tag_random(),
+    "the entropy seed read records as a random choice")
+  assert(replay_plan_tag_of(plan.clone(), "m::rd#fn()->unit".to_string(), 0) == replay_tag_external(),
+    "the libc read binding records as an external read")
+end
+
+@test
+def test_looping_read_records_each_chunk() -> Unit
+  # The per-call token protocol: a looping read records every chunk with
+  # the SAME site token — the artifact accepts repeated tokens, both map to
+  # the same semantic site, and a differing chunk diverges at its own
+  # sequence (a run that stopped early diverges on the missing record).
+  let dict_text = "tg.replay.dict.v1\nsite|1|external|m::x#fn()->unit#N@1-1|m::x#fn()->unit"
+  var chunks: Vec[ReplayRawChoice] = Vec::new()
+  chunks.push(ReplayRawChoice { token: 1, tag: replay_tag_external(), payload: Vec::from([1 as u8]) })
+  chunks.push(ReplayRawChoice { token: 1, tag: replay_tag_external(), payload: Vec::from([2 as u8, 3 as u8]) })
+  let run_chunks = replay_run_encode(dict_text.clone(), chunks.clone())
+  # repeated-token shape decodes and maps both records to the same site
+  let decoded = match replay_run_decode(run_chunks.clone())
+  when Result::Ok(d) then d
+  when Result::Err(e) then panic("chunk run decode failed: " + e)
+  end
+  assert(decoded.records.len() == 2, "both chunks are recorded")
+  # a differing second chunk diverges at sequence 1
+  var other: Vec[ReplayRawChoice] = Vec::new()
+  other.push(ReplayRawChoice { token: 1, tag: replay_tag_external(), payload: Vec::from([1 as u8]) })
+  other.push(ReplayRawChoice { token: 1, tag: replay_tag_external(), payload: Vec::from([9 as u8]) })
+  let run_other = replay_run_encode(dict_text.clone(), other.clone())
+  let cmp = replay_run_compare(run_chunks.clone(), run_other.clone())
+  match cmp.first_divergence.clone()
+  when Option::Some(id) then
+    assert(id.sequence == 1, "the second chunk is the divergence")
+    assert(id.stmt_key == "m::x#fn()->unit#N@1-1".to_string(),
+      "the chunk divergence anchors on the site's node key")
+  when Option::None then assert(false, "a differing chunk must diverge")
+  end
+  # an early-terminated run diverges on the missing record
+  var one: Vec[ReplayRawChoice] = Vec::new()
+  one.push(chunks[0].clone())
+  let run_one = replay_run_encode(dict_text.clone(), one.clone())
+  let cmp_len = replay_run_compare(run_one, run_chunks.clone())
+  match cmp_len.first_divergence.clone()
+  when Option::Some(id) then assert(id.sequence == 1, "the missing chunk diverges at sequence 1")
+  when Option::None then assert(false, "a shorter chunk run must diverge")
+  end
+end

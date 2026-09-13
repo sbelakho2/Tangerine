@@ -37,6 +37,7 @@ use tg_compiler::semantic_diagnostics::{
   stable_diagnostic_id_text
 }
 use tg_compiler::semantic_query::{explain_lane_check, diagnostic_get}
+use tg_compiler::repair_candidates::{repair_candidates_lane_check}
 
 def diag_test_target() -> StableTargetId
   StableTargetId {
@@ -103,6 +104,16 @@ end
 def test_explain_node_lane() -> Unit
   let rows = explain_lane_check()
   assert(rows.len() == 0, "explain lane mismatches: " + rows.join("; "))
+end
+
+@test
+def test_repair_candidates_lane() -> Unit
+  # (repair-candidates-as-semantic-operations closure) the durable repair
+  # model lane: stable targets, the real SemanticEdit instantiation, the
+  # typed Unavailable marker, the explain round trip and the fail-closed
+  # no-prose rule.
+  let rows = repair_candidates_lane_check()
+  assert(rows.len() == 0, "repair candidates lane mismatches: " + rows.join("; "))
 end
 
 @test
@@ -192,6 +203,9 @@ def test_operation_registry() -> Unit
   assert(server_op_known("replay.run"), "replay.run must be registered (P1-9)")
   assert(server_op_known("replay.diff"), "replay.diff must be registered (P1-9)")
   assert(server_op_known("build.plan"), "build.plan must be registered")
+  # (repair-candidates-as-semantic-operations closure) the durable repair ops.
+  assert(server_op_known("repair.candidates"), "repair.candidates must be registered")
+  assert(server_op_known("repair.instantiate"), "repair.instantiate must be registered")
   assert(!server_op_known("no.such.op"), "an unknown op must not be registered")
   match server_operation_resolve("diagnostic.get".to_string())
   when Option::Some(op) then
@@ -199,9 +213,84 @@ def test_operation_registry() -> Unit
   when Option::None then
     assert(false, "diagnostic.get must resolve")
   end
+  match server_operation_resolve("repair.candidates".to_string())
+  when Option::Some(op) then
+    assert(op.handler_kind == "repair", "repair.candidates family: " + op.handler_kind.clone())
+  when Option::None then
+    assert(false, "repair.candidates must resolve")
+  end
   # An unregistered op answers kind "unknown" exactly like §38's query().
   var session = new_compiler_session(diag_test_snapshot())
   let resp = session_handle_request(&session,
     diag_test_request(9, "no.such.op".to_string(), "".to_string()))
   assert(resp.kind == "unknown", "an unregistered op must answer kind unknown")
+end
+
+@test
+def test_repair_ops_round_trip() -> Unit
+  var session = new_compiler_session(diag_test_snapshot())
+  let diag = diag_test_diagnostic()
+  let id = session_diagnostics_add(&mut session, diag.clone())
+  let id_text = stable_diagnostic_id_text(id.clone())
+
+  # ———— repair.candidates: the typed candidates of the stored record ————
+  let resp = session_handle_request(&session,
+    diag_test_request(1, "repair.candidates".to_string(), id_text.clone()))
+  assert(resp.ok, "repair.candidates must answer ok")
+  assert(resp.kind == "repair.candidates", "repair.candidates kind: " + resp.kind.clone())
+  assert(resp.keys.len() == 3, "the use-after-move family yields three candidates")
+  var candidate_id = ""
+  if resp.keys.len() > 0 then
+    let row = resp.keys[0].clone()
+    var end_of_id = row.len()
+    var i = 0
+    while i < row.len() do
+      if row.slice(i, i + 1) == ";" then
+        end_of_id = i
+        break
+      end
+      i = i + 1
+    end
+    candidate_id = row.slice(3, end_of_id)
+  end
+  assert(candidate_id.starts_with("repair|"), "the candidate row must carry the stable repair id")
+  var saw_place_target = false
+  for k in resp.keys do
+    if k.contains("target=place|r") then saw_place_target = true end
+  end
+  assert(saw_place_target, "the candidate target must be the stable place id of `r`")
+
+  # ———— repair.instantiate: the candidate becomes a real SemanticEdit ————
+  let payload = candidate_id.clone() +
+    "\nfunction_key=m::f#fn()->unit" +
+    "\nbefore_stmt_key=m::f#fn()->unit#H7" +
+    "\nstatement_text=let r2 = R { }"
+  let resp2 = session_handle_request(&session,
+    diag_test_request(2, "repair.instantiate".to_string(), payload))
+  assert(resp2.kind == "repair.instantiate", "repair.instantiate kind: " + resp2.kind.clone())
+  var saw_kind = false
+  var saw_edit = false
+  for k in resp2.keys do
+    if k == "kind:edit" then saw_kind = true end
+    if k.starts_with("edit:InsertStatement(") then saw_edit = true end
+  end
+  assert(saw_kind, "the instantiation must answer the edit kind")
+  assert(saw_edit, "the instantiation must produce a real InsertStatement edit")
+
+  # ———— fail-closed answers ————
+  let missing = session_handle_request(&session,
+    diag_test_request(3, "repair.candidates".to_string(), "no-such-id".to_string()))
+  assert(missing.kind == "repair.candidates_unavailable", "absent subject kind: " + missing.kind.clone())
+  let missing2 = session_handle_request(&session,
+    diag_test_request(4, "repair.instantiate".to_string(), "no-such-candidate\n".to_string()))
+  assert(missing2.kind == "repair.instantiate_unavailable", "absent candidate kind: " + missing2.kind.clone())
+
+  # ———— missing parameters fail closed (no marker edit) ————
+  let resp3 = session_handle_request(&session,
+    diag_test_request(5, "repair.instantiate".to_string(), candidate_id.clone()))
+  var saw_missing = false
+  for k in resp3.keys do
+    if k == "kind:missing-parameter" then saw_missing = true end
+  end
+  assert(saw_missing, "an unparameterized instantiation must fail closed")
 end

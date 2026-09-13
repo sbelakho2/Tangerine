@@ -38,7 +38,7 @@ use tg_compiler::ast::{
   FunctionDecl, FieldDecl, StructDecl, EnumDecl, Attribute, type_expr_name,
   assign_node_ids
 }
-use tg_compiler::parser::{parse, diag_has_errors}
+use tg_compiler::parser::{parse, diag_has_errors, diagnostic_category_for_parts, diag_syntax, diag_internal, DiagnosticCategory}
 use tg_compiler::types::{type_check_typed, type_env_new, builtin_adt}
 use tg_compiler::resolver::{resolve_names}
 use tg_compiler::access_check::{access_check}
@@ -47,11 +47,11 @@ use tg_compiler::mir::{MirProgram, optimize_mir, opt_decisions_of_mir, verify_mi
 use tg_compiler::codegen::{detect_host_target, stamp_tail_abi_plans, stamp_slp_vector_facility_desc}
 use tg_compiler::lir::{
   lir_compile_object_cov, lir_compile_executable_cov, lir_target_desc,
-  LirReplayPlan, LirReplaySite, lir_replay_plan_disabled
+  LirReplayPlan, LirReplaySite, lir_replay_plan_disabled, abi_verify_program_a64
 }
 use tg_compiler::backend_thumb::{thumb_compile_object, thumb_compile_executable}
 use tg_compiler::backend_rv::{rv_compile_object, rv_compile_executable}
-use tg_compiler::backend_x86_64::{x86_64_compile_object, x86_64_compile_executable}
+use tg_compiler::backend_x86_64::{x86_64_compile_object, x86_64_compile_executable, verify_abi_program_x86}
 use tg_compiler::target_desc::{
   TargetDesc, aarch64_desc, x86_64_desc, target_desc_of_triple,
   target_desc_is_thumb_family, target_desc_is_riscv_family
@@ -100,15 +100,33 @@ use tg_compiler::compiler_core::{
 # the LIR route consumes (coverage_graph.tg section 2b). The driver builds
 # it from the finalized MIR when --coverage is on and hands it to the
 # plan-aware LIR entries.
-use tg_compiler::coverage_graph::{coverage_emission_plan_of_functions, coverage_emission_plan_disabled}
+use tg_compiler::coverage_graph::{
+  coverage_emission_plan_of_functions, coverage_emission_plan_disabled,
+  coverage_ingest, coverage_trace_bind_stable
+}
+# (audit order item 5 closeout) THE FULL-LIBRARY TEST-SYNTHESIS ENTRY:
+# coverage_graph.tg (kernel) exposes ONLY the typed targeted requests —
+# std::test_gen is NOT in bootstrap/compiler_kernel.manifest, so the
+# kernel closure can never import the generator. driver.tg is the
+# out-of-manifest tooling root: its imports load from the repo through
+# the canonical recursive loader (the closure-scoped load path — the
+# same path std::test_gen's own imports ride), so this import is what
+# makes the synthesis producer reachable by the full compiler. The
+# driver-side entry below wires test_targeted_for_delta's uncovered-path
+# rows to concrete test sources (deterministic naming from the stable
+# id/constraint digest) and returns the test-source text; the kernel
+# never calls the generator and never fabricates a test.
+use tg_compiler::test_synthesis::{
+  synthesize_tests_for_delta, render_synthesized_suite
+}
+use tg_compiler::semantic_delta::{SemanticDelta}
 # (audit order item 6 — the replay production bridge): the event-dictionary
 # / run-artifact builder the LIR replay producer consumes. The driver
 # renders the dictionary from the finalized MIR when --replay is on,
 # converts it to the kernel-side LirReplayPlan and hands that to the
 # plan-aware LIR entries.
 use tg_compiler::replay_bridge::{
-  ReplayEmissionPlan, replay_emission_plan_of_functions, replay_plan_disabled,
-  untracked_artifact_report
+  ReplayEmissionPlan, replay_emission_plan_of_functions, replay_plan_disabled
 }
 # The §30 semantic snapshot route (audit §30; default-off): the driver
 # house of the env-gated artifact gates (shared with the driver-level LIR
@@ -124,7 +142,7 @@ use tg_compiler::replay_bridge::{
 use tg_compiler::semantic_snapshot::{
   semantic_snapshot_of_final_state, semantic_snapshot_finalize, semantic_snapshot_serialize,
   snapshot_feature_set_of, snapshot_semantic_options_of,
-  SnapshotError
+  SemanticSnapshot, SnapshotError
 }
 # The persistent declaration-lineage store (third-audit item 11;
 # fourth-audit P0-2): the snapshot route's SIBLING artifact
@@ -135,7 +153,7 @@ use tg_compiler::semantic_snapshot::{
 use tg_compiler::stable_ids::{
   stable_lineage_store_new, stable_lineage_store_load,
   stable_lineage_store_save_atomic,
-  untracked_artifact_text
+  untracked_artifact_text, DeclLineageStore
 }
 use tg_compiler::semantic_model::{semantic_digest_zero, semantic_digest_render}
 use tg_compiler::semantic_index::{build_semantic_index}
@@ -318,6 +336,22 @@ def coverage_flag_in_args(argv: Vec[String]) -> Bool
     i = i + 1
   end
   false
+end
+
+# (audit order item 5) The --coverage-out=<path> extraction from RAW argv
+# for `tg test` (whose discovery paths never consume parsed options): Err
+# on a present-but-invalid value (fail closed); Ok("") when the flag is
+# absent (the caller keeps the resolved default).
+def coverage_out_from_args(argv: Vec[String]) -> Result[String, String]
+  var i = 0
+  while i < argv.len() do
+    let a = argv[i].clone()
+    if a.starts_with("--coverage-out=") then
+      return parse_coverage_out_flag(a.clone())
+    end
+    i = i + 1
+  end
+  Result::Ok("".to_string())
 end
 
 # The --replay route gate (audit order item 6): the compact event
@@ -1260,15 +1294,38 @@ end
 # 
 
 def cmd_test(argv: Vec[String]) -> Int
-  # (third-audit item 34) `tg test` compiles each suite through the
-  # DIRECT emitter (compile_and_run_tests -> compile_file), which has no
-  # counter emission — fail closed on the RAW argv before discovery so
-  # the "no files" project path cannot silently ignore --coverage. The
-  # LIR producer is the ordinary compile route:
-  #   tg compile --codegen=lir --coverage prog.tg && ./prog <test key>
-  if coverage_flag_in_args(argv) then
-    eprintln("--coverage is not supported by `tg test`: the test route compiles through the direct emitter (no counter emission) — compile the program with `tg compile --codegen=lir --coverage <file>` and run the produced binary to write the tg.cov.trace.v1 trace")
-    return 1
+  # (audit order item 5) `tg test --coverage`: the test harness is
+  # compiled through the canonical aarch64 host LIR route with the
+  # coverage emission plan attached, each test process dumps the
+  # tg.cov.trace.v1 trace, and the lane ingests it into the run's
+  # SemanticSnapshot (written beside the harness) after normalizing the
+  # trace's `test|<name>` binding through the discovery table. Without
+  # --coverage the direct-emitter behavior is unchanged.
+  let coverage_on = coverage_flag_in_args(argv)
+  var opts = default_options()
+  var coverage_out = resolve_coverage_out(opts.clone())
+  if coverage_on then
+    match coverage_out_from_args(argv)
+    when Result::Ok(p) then
+      if p.len() > 0 then
+        coverage_out = p
+      end
+    when Result::Err(e) then
+      eprintln(e)
+      return 1
+    end
+    if coverage_out == "-" then
+      eprintln("--coverage-out=- cannot be used with `tg test`: the runner reads the trace after each test process to ingest it into the run snapshot — use a file path")
+      return 1
+    end
+    opts.codegen = CodegenRoute::Lir
+    opts.emit = EmitMode::Executable
+    opts.coverage = true
+    opts.coverage_out = Option::Some(coverage_out.clone())
+    if !coverage_route_supported(opts.clone()) then
+      eprintln(coverage_route_refusal(opts.clone()))
+      return 1
+    end
   end
   if replay_flag_in_args(argv) then
     eprintln("--replay is not supported by `tg test`: the test route compiles through the direct emitter (no recorder emission) — compile the program with `tg compile --codegen=lir --replay <file>` and run the produced binary to write the replay run artifact")
@@ -1310,6 +1367,9 @@ def cmd_test(argv: Vec[String]) -> Int
     if e == "help" then
       println("Usage: tg test [OPTIONS] [FILES]...")
       println("Discover and run @test functions")
+      println("  --coverage           Compile the test harness with block/edge counters (aarch64 LIR route),")
+      println("                       run each test and ingest the traces into the run SemanticSnapshot")
+      println("  --coverage-out=PATH  Coverage dump path (default /tmp/tg.cov.trace)")
       return 0
     elsif e == "No input files" then
       match load_project(".")
@@ -1332,21 +1392,42 @@ def cmd_test(argv: Vec[String]) -> Int
   # silent vanish).
   implicit_files = select_test_sources(implicit_files)
 
-  let opts = default_options()
-
-  var summary = run_test_files(&opts, explicit_files, true)
-  let scan_summary = run_test_files(&opts, implicit_files, true)
+  var summary = run_test_files(&opts, explicit_files, true, coverage_on, coverage_out.clone())
+  let scan_summary = run_test_files(&opts, implicit_files, true, coverage_on, coverage_out.clone())
   summary.total = summary.total + scan_summary.total
   summary.passed = summary.passed + scan_summary.passed
   summary.failed = summary.failed + scan_summary.failed
   for n in scan_summary.fail_names do
     summary.fail_names.push(n)
   end
+  summary.coverage_rows = summary.coverage_rows + scan_summary.coverage_rows
+  summary.coverage_traces = summary.coverage_traces + scan_summary.coverage_traces
+  summary.coverage_missing_traces = summary.coverage_missing_traces + scan_summary.coverage_missing_traces
+  for a in scan_summary.coverage_artifacts do
+    summary.coverage_artifacts.push(a)
+  end
 
   println("")
   println("test result: " + if summary.failed == 0 then "ok" else "FAILED" end
     + ". " + summary.passed.to_string() + " passed; " + summary.failed.to_string()
     + " failed; " + summary.total.to_string() + " total")
+
+  # (audit order item 5) the semantic coverage summary: the run snapshots
+  # (coverage rows carrying the typed ids + the discovery TestRelationship
+  # rows) written beside each harness, the trace count and any test whose
+  # process wrote no trace (a crash before the exit-time dump — the
+  # coverage of that test is honestly absent, never fabricated).
+  if coverage_on then
+    println("semantic coverage: " + summary.coverage_rows.to_string() + " row(s) from "
+      + summary.coverage_traces.to_string() + " trace(s)"
+      + if summary.coverage_missing_traces > 0 then
+        ("; " + summary.coverage_missing_traces.to_string() + " run(s) wrote no trace")
+      else ""
+      end)
+    for a in summary.coverage_artifacts do
+      println("    " + a)
+    end
+  end
 
   if !summary.fail_names.is_empty() then
     println("")
@@ -1364,12 +1445,29 @@ struct TestRunSummary
   passed: Int
   failed: Int
   fail_names: Vec[String]
+  # (audit order item 5) the coverage aggregate of the batch: ingested
+  # coverage rows, trace files consumed, runs whose process wrote no trace
+  # and the written run-snapshot artifact paths.
+  coverage_rows: Int = 0
+  coverage_traces: Int = 0
+  coverage_missing_traces: Int = 0
+  coverage_artifacts: Vec[String] = Vec::new()
 end
 
 struct TestResult
   name: String
   passed: Bool
   message: String
+end
+
+# (audit order item 5) One test file's run outcome: the per-test results
+# plus the semantic-coverage aggregate of the file's run snapshot.
+struct TestFileRun
+  results: Vec[TestResult]
+  coverage_rows: Int = 0
+  coverage_traces: Int = 0
+  coverage_missing_traces: Int = 0
+  coverage_artifacts: Vec[String] = Vec::new()
 end
 
 # Run one batch of test files.
@@ -1385,11 +1483,20 @@ end
 #              so the strict discipline applies: a recognized test source's
 #              read/parse/compile failure fails the invocation; non-test
 #              sources are never selected.
-def run_test_files(opts: CompilerOptions, files: Vec[String], strict: Bool) -> TestRunSummary
+#   coverage_on / coverage_out — (audit order item 5) when true the harness
+#              is compiled through the LIR coverage route, each test process
+#              dumps the tg.cov.trace.v1 trace to coverage_out, and the lane
+#              ingests it into the file's run SemanticSnapshot. When false
+#              the direct-emitter behavior is byte-identical to before.
+def run_test_files(opts: CompilerOptions, files: Vec[String], strict: Bool, coverage_on: Bool, coverage_out: String) -> TestRunSummary
   var total = 0
   var passed = 0
   var failed = 0
   var fail_names: Vec[String] = Vec::new()
+  var coverage_rows = 0
+  var coverage_traces = 0
+  var coverage_missing_traces = 0
+  var coverage_artifacts: Vec[String] = Vec::new()
 
   for file in files do
     let source = match read_file(file.clone())
@@ -1473,14 +1580,14 @@ def run_test_files(opts: CompilerOptions, files: Vec[String], strict: Bool) -> T
     # that defines its own main is compiled as-is and run once (canary
     # convention).
     let outcome = if has_main then
-      compile_and_run_file_main(opts, file.clone())
+      compile_and_run_file_main(opts, file.clone(), coverage_on, coverage_out.clone())
     else
-      compile_and_run_tests(opts, file.clone(), source, tests.clone())
+      compile_and_run_tests(opts, file.clone(), source, tests.clone(), coverage_on, coverage_out.clone())
     end
 
     match outcome
-    when Result::Ok(results) then
-      for r in results do
+    when Result::Ok(run) then
+      for r in run.results do
         total = total + 1
         if r.passed then
           passed = passed + 1
@@ -1490,6 +1597,12 @@ def run_test_files(opts: CompilerOptions, files: Vec[String], strict: Bool) -> T
           fail_names.push(file.clone() + "::" + r.name)
           println("  FAIL  " + file + "::" + r.name + ": " + r.message)
         end
+      end
+      coverage_rows = coverage_rows + run.coverage_rows
+      coverage_traces = coverage_traces + run.coverage_traces
+      coverage_missing_traces = coverage_missing_traces + run.coverage_missing_traces
+      for a in run.coverage_artifacts do
+        coverage_artifacts.push(a)
       end
     when Result::Err(e) then
       # The file failed to compile (resolve/type/ownership/MIR/codegen/link):
@@ -1503,12 +1616,26 @@ def run_test_files(opts: CompilerOptions, files: Vec[String], strict: Bool) -> T
     end
   end
 
-  TestRunSummary { total: total, passed: passed, failed: failed, fail_names: fail_names }
+  TestRunSummary {
+    total: total,
+    passed: passed,
+    failed: failed,
+    fail_names: fail_names,
+    coverage_rows: coverage_rows,
+    coverage_traces: coverage_traces,
+    coverage_missing_traces: coverage_missing_traces,
+    coverage_artifacts: coverage_artifacts
+  }
 end
 
 # Compile the test file once with a generated dispatch main, then run each
-# @test function by name as its own process.
-def compile_and_run_tests(opts: CompilerOptions, file: String, source: String, tests: Vec[FunctionDecl]) -> Result[Vec[TestResult], String]
+# @test function by name as its own process. When coverage_on is true the
+# harness is compiled through the canonical LIR coverage route (the
+# emitted counters + the exit-time dump), every test process writes the
+# tg.cov.trace.v1 trace to coverage_out, and each trace is normalized
+# through the discovery table and ingested into the file's run
+# SemanticSnapshot (finalized and written beside the harness).
+def compile_and_run_tests(opts: CompilerOptions, file: String, source: String, tests: Vec[FunctionDecl], coverage_on: Bool, coverage_out: String) -> Result[TestFileRun, String]
   let harness_base = file.replace("/", "_").replace(".tg", "") + "_harness"
   let harness_path = "build/.tg_test_harness/" + harness_base + ".tg"
   match mkdir_p("build/.tg_test_harness".to_string())
@@ -1551,14 +1678,46 @@ def compile_and_run_tests(opts: CompilerOptions, file: String, source: String, t
     return Result::Err("failed to write test harness: " + e.to_string())
   end
 
-  match compile_file(opts, harness_path.clone())
-  when Result::Ok(_) then ()
-  when Result::Err(e) then
-    return Result::Err("compilation failed: " + e)
+  if !coverage_on then
+    match compile_file(opts, harness_path.clone())
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      return Result::Err("compilation failed: " + e)
+    end
+    let exe_path = get_output_path(&opts, harness_path.clone(), "")
+    let results = run_discovered_tests(exe_path, tests.clone())
+    return Result::Ok(TestFileRun { results: results })
   end
 
-  let exe_path = get_output_path(&opts, harness_path.clone(), "")
-  var results = Vec::new()
+  # (audit order item 5) the coverage route: compile the harness through the
+  # LIR plan-aware entries, run each test, ingest the traces into the run
+  # snapshot, then persist the snapshot + the mutated lineage store beside
+  # the harness.
+  let run_snapshot_path = "build/.tg_test_harness/" + harness_base + ".coverage.snapshot"
+  let compiled = match compile_test_harness_lir(opts, harness_path.clone(), run_snapshot_path.clone(), coverage_out.clone())
+  when Result::Err(e) then
+    return Result::Err("coverage compilation failed: " + e)
+  when Result::Ok(c) then c
+  end
+  let run = run_discovered_tests_coverage(compiled.exe_path.clone(), tests.clone(), compiled.snapshot.clone(), coverage_out.clone())
+  match write_test_run_snapshot(compiled, run_snapshot_path.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err(e)
+  end
+  Result::Ok(TestFileRun {
+    results: run.results.clone(),
+    coverage_rows: run.snapshot.coverage.len(),
+    coverage_traces: run.traces,
+    coverage_missing_traces: run.missing_traces,
+    coverage_artifacts: Vec::from([run_snapshot_path])
+  })
+end
+
+# The per-test driver over a compiled harness (no coverage): one process
+# per @test function, argv[1] = the declared test name.
+def run_discovered_tests(exe_path: String, tests: Vec[FunctionDecl]) -> Vec[TestResult]
+  var results: Vec[TestResult] = Vec::new()
   var ri = 0
   while ri < tests.len() do
     let t = tests[ri]
@@ -1574,28 +1733,301 @@ def compile_and_run_tests(opts: CompilerOptions, file: String, source: String, t
     })
     ri = ri + 1
   end
-  Result::Ok(results)
+  results
+end
+
+# The coverage per-test driver's outcome: the updated run snapshot, the
+# per-test results and the trace counters (consumed = a trace was read and
+# ingested; missing = the process wrote no trace).
+struct TestCoverageRun
+  snapshot: SemanticSnapshot
+  results: Vec[TestResult]
+  traces: Int = 0
+  missing_traces: Int = 0
+end
+
+# The coverage per-test driver: run each test (its exit-time dump writes the
+# trace to coverage_out), then read + normalize + ingest. The trace is
+# deleted before each run so a crashed process's missing trace is detected
+# (never a stale ingest of the previous test's trace).
+def run_discovered_tests_coverage(
+  exe_path: String,
+  tests: Vec[FunctionDecl],
+  snapshot: SemanticSnapshot,
+  coverage_out: String
+) -> TestCoverageRun
+  var results: Vec[TestResult] = Vec::new()
+  var current = snapshot
+  var traces = 0
+  var missing = 0
+  var ri = 0
+  while ri < tests.len() do
+    let t = tests[ri]
+    match delete_file(coverage_out.clone())
+    when Result::Ok(_) then ()
+    when Result::Err(_) then ()
+    end
+    var test_args: Vec[String] = Vec::new()
+    test_args.push(t.name.clone())
+    let exit_code = bootstrap_call_argv(exe_path.clone(), test_args)
+    let passed = exit_code == 0
+    var message = if passed then "" else "test exited with code " + exit_code.to_string() end
+    match read_file(coverage_out.clone())
+    when Result::Ok(trace_text) then
+      traces = traces + 1
+      let bound = coverage_trace_bind_stable(current.clone(), trace_text)
+      current = coverage_ingest(current, bound)
+    when Result::Err(_) then
+      missing = missing + 1
+      if passed then
+        message = "test passed but wrote no coverage trace"
+      end
+    end
+    results.push(TestResult {
+      name: t.name.clone(),
+      passed: passed,
+      message: message
+    })
+    ri = ri + 1
+  end
+  TestCoverageRun {
+    snapshot: current,
+    results: results,
+    traces: traces,
+    missing_traces: missing
+  }
+end
+
+# (audit order item 5) The run-snapshot publication: finalize the snapshot
+# (content-addressed revision over the ingested coverage rows + the
+# discovery TestRelationship rows) and write it plus the mutated lineage
+# store beside it. Both artifacts are written atomically-or-not at all:
+# the snapshot text first, the lineage store second (the store save itself
+# is atomic).
+def write_test_run_snapshot(compiled: TestHarnessCompiled, run_snapshot_path: String) -> Result[Unit, String]
+  var snapshot = compiled.snapshot.clone()
+  semantic_snapshot_finalize(&mut snapshot)
+  let snapshot_text = semantic_snapshot_serialize(&mut snapshot)
+  match write_file_bytes(run_snapshot_path.clone(), &snapshot_text.bytes())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err("failed to write test run snapshot '" + run_snapshot_path.clone() + "': " + e.message())
+  end
+  match stable_lineage_store_save_atomic(run_snapshot_path.clone() + ".lineages", compiled.lineage_store.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err("failed to write test run lineage store '" + run_snapshot_path.clone() + ".lineages': " + e.message())
+  end
+  Result::Ok(())
+end
+
+# (audit order item 5 closeout) THE DRIVER-SIDE SYNTHESIS ENTRY. The
+# kernel's typed targeted requests (coverage_graph.test_targeted_for_delta)
+# and the full-library generator (std::test_gen, imported through
+# test_synthesis.tg) meet HERE: given a snapshot, its §31 delta and one
+# module source, return the synthesized test-source text — a concrete
+# @test source for every uncovered-path request the generator can serve
+# (named deterministically from the request's stable id/constraint
+# digest), a comment-only typed request render otherwise. This is the
+# full-compiler call path the kernel closure cannot carry; the CLI does
+# not invoke it yet (the run lane has no §31 delta of its own — the
+# session/agentic layer holding two snapshots calls this entry with
+# semantic_delta_of(a, b)).
+pub def driver_synthesize_uncovered_tests(
+  snapshot: SemanticSnapshot,
+  delta: SemanticDelta,
+  module_source: String,
+  module_name: String
+) -> String
+  let tests = synthesize_tests_for_delta(snapshot, delta, module_source, module_name)
+  render_synthesized_suite(tests, module_name)
+end
+
+# (audit order item 5) ONE compiled coverage harness: the executable, the
+# run SemanticSnapshot built from the SAME finalized state the emitter
+# consumed (so coverage rows and discovery rows attach to the revision the
+# binary was compiled from) and the mutated lineage store the run's stable
+# test ids were stamped through.
+struct TestHarnessCompiled
+  exe_path: String
+  snapshot: SemanticSnapshot
+  lineage_store: DeclLineageStore
+end
+
+# Compile a test harness through the canonical LIR host route with the
+# coverage emission plan attached, mirroring compile_lir_route's host
+# slice phase-for-phase (parse -> merge -> analyze -> lower -> verify ->
+# effect/purity/budget -> mono -> tail/SLP stamps -> optimize -> verify)
+# and building the run snapshot at the same finalized boundary the
+# snapshot route uses. Host-only (aarch64) exactly like the LIR coverage
+# emitter; any other host fails closed with the route message.
+def compile_test_harness_lir(
+  opts: CompilerOptions,
+  harness_path: String,
+  run_snapshot_path: String,
+  coverage_out: String
+) -> Result[TestHarnessCompiled, String]
+  let source = match read_file(harness_path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then return Result::Err("failed to read " + harness_path.clone() + ": " + e)
+  end
+  var ast = match parse_source_program(source, harness_path.clone())
+  when Result::Ok(p) then p
+  when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
+  end
+  ast = match merge_imported_deps(ast, false)
+  when Result::Ok(a) then a
+  when Result::Err(e) then return Result::Err(e)
+  end
+  var env = type_env_new()
+  let typed = match analyze_program(&mut env, &mut ast, opts.clone())
+  when Result::Ok(tp) then tp
+  when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
+  end
+  var mir = match driver_lower_to_mir(&ast, Option::Some(typed.clone()))
+  when Result::Ok(m) then m
+  when Result::Err(e) then return Result::Err("MIR lowering failed: " + e)
+  end
+  let pre_errs = verify_mir(&mir)
+  if !pre_errs.is_empty() then
+    return Result::Err("MIR verification failed before monomorphization (" + pre_errs.len().to_string() + " error(s))")
+  end
+  let mir_effect_errs = check_effect_class_annotations_mir(&mir, env)
+  if !mir_effect_errs.is_empty() then
+    return Result::Err(join_diagnostics(&type_errors_to_diags(&mir_effect_errs)))
+  end
+  let mir_purity_errs = check_purity_annotations_mir(&mut mir, env)
+  if !mir_purity_errs.is_empty() then
+    return Result::Err(join_diagnostics(&type_errors_to_diags(&mir_purity_errs)))
+  end
+  let mir_budget_errs = check_budget_annotations_mir(&mir, env)
+  if !mir_budget_errs.is_empty() then
+    return Result::Err(join_diagnostics(&type_errors_to_diags(&mir_budget_errs)))
+  end
+  var mono_cache = mono_cache_new(&ast, &typed.resolutions)
+  match monomorphize_program(&mut mir, &mut mono_cache)
+  when Result::Ok(_) then ()
+  when Result::Err(me) then return Result::Err("monomorphization failed with " + me.len().to_string() + " error(s)")
+  end
+  let target_desc = match detect_host_target().arch
+  when Arch::AArch64 then aarch64_desc()
+  when Arch::X86_64 then x86_64_desc()
+  when _ then return Result::Err(coverage_route_message())
+  end
+  stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
+  stamp_slp_vector_facility_desc(&mut mir, target_desc.clone())
+  optimize_mir(&mut mir, opts.opt_level)
+  let post_errs = verify_mir(&mir)
+  if !post_errs.is_empty() then
+    return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
+  end
+  # The run's lineage store: the sibling convention of the run snapshot
+  # (loaded when present, fresh otherwise) so repeated `tg test --coverage`
+  # runs keep the test declarations' lineages stable across invocations.
+  var lineage_store = stable_lineage_store_new()
+  let lineage_path = run_snapshot_path.clone() + ".lineages"
+  match read_file(lineage_path.clone())
+  when Result::Ok(text) then lineage_store = stable_lineage_store_load(text)
+  when Result::Err(_) then ()
+  end
+  var snapshot = match semantic_snapshot_of_final_state(
+    &env, &typed.typed, &mir, &target_desc, VERSION, semantic_digest_zero(), &mut lineage_store,
+    typed.drop_plan_facts.clone(),
+    snapshot_feature_set_of(opts.clone(), target_desc.clone()),
+    snapshot_semantic_options_of(opts.clone(), target_desc.clone()))
+  when Result::Err(e) then
+    return Result::Err("semantic snapshot build failed: " + snapshot_error_text(e))
+  when Result::Ok(s) then s
+  end
+  # The coverage emission plan from the SAME finalized MIR the executable is
+  # emitted from; an untracked artifact fails the build closed.
+  let cov_plan = match coverage_emission_plan_of_functions(mir.functions.clone(), coverage_out.clone())
+  when Result::Ok(p) then p
+  when Result::Err(u) then return Result::Err(untracked_artifact_text(u))
+  end
+  let exe_path = get_output_path(&opts, harness_path.clone(), "")
+  match lir_compile_executable_cov(mir, detect_host_target(), exe_path.clone(), cov_plan, lir_replay_plan_of_bridge(replay_plan_disabled()))
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err(e)
+  end
+  Result::Ok(TestHarnessCompiled {
+    exe_path: exe_path,
+    snapshot: snapshot,
+    lineage_store: lineage_store
+  })
 end
 
 # Files that define their own main (canary convention) are compiled as-is and
-# run once; the process exit code is the test outcome.
-def compile_and_run_file_main(opts: CompilerOptions, file: String) -> Result[Vec[TestResult], String]
-  match compile_file(opts, file.clone())
+# run once; the process exit code is the test outcome. With coverage_on the
+# file is compiled through the LIR coverage route and the process's trace is
+# ingested into the run snapshot exactly like a generated harness.
+def compile_and_run_file_main(opts: CompilerOptions, file: String, coverage_on: Bool, coverage_out: String) -> Result[TestFileRun, String]
+  if !coverage_on then
+    match compile_file(opts, file.clone())
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      return Result::Err("compilation failed: " + e)
+    end
+    let exe_path = get_output_path(&opts, file.clone(), "")
+    let exit_code = bootstrap_call_argv(exe_path.clone(), Vec::new())
+    var results = Vec::new()
+    let passed = exit_code == 0
+    let message = if passed then "" else "test exited with code " + exit_code.to_string() end
+    results.push(TestResult {
+      name: "main".to_string(),
+      passed: passed,
+      message: message
+    })
+    return Result::Ok(TestFileRun { results: results })
+  end
+  let main_base = file.replace("/", "_").replace(".tg", "") + "_coverage"
+  let run_snapshot_path = "build/.tg_test_harness/" + main_base + ".snapshot"
+  match mkdir_p("build/.tg_test_harness".to_string())
   when Result::Ok(_) then ()
   when Result::Err(e) then
-    return Result::Err("compilation failed: " + e)
+    return Result::Err("failed to create test harness directory: " + e.to_string())
   end
-  let exe_path = get_output_path(&opts, file.clone(), "")
-  let exit_code = bootstrap_call_argv(exe_path.clone(), Vec::new())
-  var results = Vec::new()
+  let compiled = match compile_test_harness_lir(opts, file.clone(), run_snapshot_path.clone(), coverage_out.clone())
+  when Result::Err(e) then
+    return Result::Err("coverage compilation failed: " + e)
+  when Result::Ok(c) then c
+  end
+  var snapshot = compiled.snapshot.clone()
+  match delete_file(coverage_out.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(_) then ()
+  end
+  let exit_code = bootstrap_call_argv(compiled.exe_path.clone(), Vec::new())
   let passed = exit_code == 0
-  let message = if passed then "" else "test exited with code " + exit_code.to_string() end
+  var message = if passed then "" else "test exited with code " + exit_code.to_string() end
+  var traces = 0
+  var missing = 0
+  match read_file(coverage_out.clone())
+  when Result::Ok(trace_text) then
+    traces = 1
+    let bound = coverage_trace_bind_stable(snapshot.clone(), trace_text)
+    snapshot = coverage_ingest(snapshot, bound)
+  when Result::Err(_) then
+    missing = 1
+  end
+  var results: Vec[TestResult] = Vec::new()
   results.push(TestResult {
     name: "main".to_string(),
     passed: passed,
     message: message
   })
-  Result::Ok(results)  end  end
+  match write_test_run_snapshot(compiled, run_snapshot_path.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err(e)
+  end
+  Result::Ok(TestFileRun {
+    results: results,
+    coverage_rows: snapshot.coverage.len(),
+    coverage_traces: traces,
+    coverage_missing_traces: missing,
+    coverage_artifacts: Vec::from([run_snapshot_path])
+  })
 end
 
 # 
@@ -3951,9 +4383,23 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
   else
     coverage_emission_plan_disabled()
   end
+  # (audit order item 6) the replay emission plan: the DICTIONARY is
+  # rendered from the finalized MIR (replay_bridge.tg — origin-less wired
+  # call sites fail the build closed), then converted to the kernel-side
+  # LirReplayPlan the emitter consumes. A compile without --replay uses the
+  # disabled plan and emits the byte-identical pre-replay object.
+  let replay_plan = if opts.replay then
+    match replay_emission_plan_of_functions(mir.functions.clone(), resolve_replay_out(opts.clone()))
+    when Result::Ok(p) then p
+    when Result::Err(u) then return Result::Err(untracked_artifact_text(u))
+    end
+  else
+    replay_plan_disabled()
+  end
+  let lir_replay = lir_replay_plan_of_bridge(replay_plan)
   match opts.emit
   when EmitMode::Object then
-    let bytes = match lir_compile_object_cov(mir, target.clone(), cov_plan.clone())
+    let bytes = match lir_compile_object_cov(mir, target.clone(), cov_plan.clone(), lir_replay.clone())
     when Result::Err(e) then return Result::Err(e)
     when Result::Ok(b) then b
     end
@@ -3963,7 +4409,7 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
     end
     Result::Ok(())
   when EmitMode::Executable then
-    lir_compile_executable_cov(mir, target.clone(), out_path, cov_plan.clone())
+    lir_compile_executable_cov(mir, target.clone(), out_path, cov_plan.clone(), lir_replay.clone())
   when _ then
     Result::Err("the LIR host route supports --emit=obj and --emit=exe only (use --codegen=direct for other emit modes)")
   end
@@ -4014,7 +4460,7 @@ def compile_lir_route_aarch64(mir: MirProgram, opts: CompilerOptions, out_path: 
   let target = asm_target(Arch::AArch64, OsAbi::Linux)
   match opts.emit
   when EmitMode::Object then
-    let bytes = match lir_compile_object_cov(mir, target.clone(), coverage_emission_plan_disabled())
+    let bytes = match lir_compile_object_cov(mir, target.clone(), coverage_emission_plan_disabled(), lir_replay_plan_disabled())
     when Result::Err(e) then return Result::Err(e)
     when Result::Ok(b) then b
     end
@@ -4024,7 +4470,7 @@ def compile_lir_route_aarch64(mir: MirProgram, opts: CompilerOptions, out_path: 
     end
     Result::Ok(())
   when EmitMode::Executable then
-    lir_compile_executable_cov(mir, target.clone(), out_path, coverage_emission_plan_disabled())
+    lir_compile_executable_cov(mir, target.clone(), out_path, coverage_emission_plan_disabled(), lir_replay_plan_disabled())
   when _ then
     Result::Err("the aarch64-unknown-none LIR route supports --emit=obj and --emit=exe only (the object and the bare ELF image are its artifact contract)")
   end
@@ -4469,6 +4915,18 @@ def compile_snapshot_route(opts: CompilerOptions, files: Vec[String], snapshot_p
     semantic_server_requested())
 end
 
+# (audit order item 7) the host-route ABI verifier dispatch: the
+# finalized MIR of the snapshot/evidence route is lowered + allocated
+# exactly as the host route's compile entries do (no emission) and
+# verified by the ONE post-lowering ABI checker. Empty = ABI-verified.
+def driver_abi_verify_rows(program: MirProgram, desc: TargetDesc) -> Vec[String]
+  match desc.arch
+  when Arch::AArch64 then abi_verify_program_a64(program, desc)
+  when Arch::X86_64 then verify_abi_program_x86(program, desc)
+  when _ then Vec::from(["abi-verify: the host route has no ABI verifier for `" + desc.name + "` (aarch64/x86-64 only)"])
+  end
+end
+
 # The SHARED snapshot pipeline of the env route and `tg server`'s pipeline
 # form (third-audit item 22): compiles exactly one file to the finalized §30
 # snapshot, writes the artifact when a path was given (and the lineage store
@@ -4742,16 +5200,21 @@ def compile_snapshot_serve_route(
   # routes run none either — the pre-mono and post-opt verifications bound
   # the mono transform; compiler_core's compile flows run the unconditional
   # post-mono checkpoint, so only their evidence may claim the flag).
-  # abi_verify_ok stays false with this doc note: NO ABI-verify stage
-  # exists anywhere yet — the flag is reserved for the future pub/extern
-  # ABI surface check.
+  # abi_verify_ok is the REAL result (audit order item 7): the
+  # post-lowering ABI verifier runs over the finalized MIR on the host
+  # route's own lowering+allocation pipeline (driver_abi_verify_rows,
+  # no emission). Its violation rows are printed on failure; the stage
+  # is captured, so a false flag maps to Failed — never Unavailable.
   if serve then
+    let abi_rows = driver_abi_verify_rows(mir.clone(), target_desc.clone())
+    for abi_row in abi_rows do
+      eprintln(abi_row)
+    end
     let index = build_semantic_index(&snapshot)
     # (fourth-audit P0-16) the captured-stages constructor: this route
-    # CAPTURES parse..effects + the capability/contract surface, and does
-    # NOT capture post-mono-mir / abi (no checkpoints exist) — the patch
-    # maps those to Unavailable and can never report complete verification,
-    # exactly mirroring this capture doc.
+    # CAPTURES parse..effects + the capability/contract surface + abi,
+    # and does NOT capture post-mono-mir (no post-mono checker exists on
+    # this route) — the patch maps that one to Unavailable.
     let route_evidence = verified_compilation_evidence_stages(
       semantic_digest_render(&snapshot.revision),
       true,   # parse_ok — parse_source_program succeeded
@@ -4763,7 +5226,7 @@ def compile_snapshot_serve_route(
       false,  # mono_verify_ok — no post-mono verifier checkpoint on this route
       true,   # post_opt_mir_verify_ok — the final post-opt verify
       true,   # effect_verify_ok — the §11 annotation check above
-      false,  # abi_verify_ok — no ABI-verify stage exists yet
+      abi_rows.len() == 0,  # abi_verify_ok — the post-lowering ABI verifier's real result (audit order item 7)
       true,   # capability_contract_ok — the checker's contract + capability surface
       verification_stage_names_driver_route())
     # (audit order P0-15) the boundary carries the verified-edit
@@ -4837,6 +5300,12 @@ def cmd_compile(argv: Vec[String]) -> Int
   # compile_lir_route for the embedded route that reaches them.
   if opts.coverage && !coverage_route_supported(opts.clone()) then
     eprintln(coverage_route_refusal(opts.clone()))
+    return 1
+  end
+  # (audit order item 6) THE REPLAY ROUTE GATE — the same fail-closed
+  # policy for the compact event dictionary + recorder + run dump.
+  if opts.replay && !replay_route_supported(opts.clone()) then
+    eprintln(replay_route_refusal(opts.clone()))
     return 1
   end
 
@@ -5147,6 +5616,11 @@ def cmd_compile_direct(skip_subcommand: Bool) -> Int
   # wasm or desc'd backends.
   if opts.coverage && !coverage_route_supported(opts.clone()) then
     eprintln(coverage_route_refusal(opts.clone()))
+    return 1
+  end
+  # (audit order item 6) the raw-mode REPLAY ROUTE GATE.
+  if opts.replay && !replay_route_supported(opts.clone()) then
+    eprintln(replay_route_refusal(opts.clone()))
     return 1
   end
 
@@ -8097,14 +8571,7 @@ def lsp_check_document(inout server: LspServer, uri: String) -> Unit
     
     # Convert parse diagnostics
     for pd in parse_diags do
-      diags.push(Diagnostic {
-        level: DiagLevel::Error,
-        message: pd.message,
-        span: Option::Some(pd.span),
-        notes: Vec::new(),
-        suggestions: Vec::new(),
-        code: Option::None
-      })
+      diags.push(pd.clone())
     end
     
     if !diag_has_errors(&parse_diags) then
@@ -8118,13 +8585,31 @@ def lsp_check_document(inout server: LspServer, uri: String) -> Unit
         var env = type_env_new()
         let type_result = type_check_typed(&mut env, &ast, &res)
         for err in type_result.errors do
+          # (universal-typed-derivation closure) the LSP conversion carries
+          # the typed payload and its category through — the same
+          # payload-first resolution the pipeline boundary uses.
+          let category = diagnostic_category_for_parts(err.code.clone(), err.semantic_data.clone())
           diags.push(Diagnostic {
             level: DiagLevel::Error,
             message: err.message,
             span: Option::Some(err.span),
             notes: Vec::new(),
             suggestions: Vec::new(),
-            code: Option::None
+            code: err.code,
+            primary_symbol: err.primary_symbol,
+            semantic_site: err.semantic_site,
+            expected_type: err.expected_type,
+            actual_type: err.actual_type,
+            constraint_trace: err.constraint_trace,
+            trait_trace: err.trait_trace,
+            ownership_trace: err.ownership_trace,
+            effect_trace: err.effect_trace,
+            capability_trace: err.capability_trace,
+            related_symbols: err.related_symbols,
+            minimal_slice: err.minimal_slice,
+            repair_candidates: err.repair_candidates,
+            semantic_data: err.semantic_data,
+            category: category
           })
         end
         
@@ -8138,38 +8623,32 @@ def lsp_check_document(inout server: LspServer, uri: String) -> Unit
         var diag_ctx = analysis_context_new()
         let access_errors = access_check(&ast, &type_result.program.typed, &diag_cfg, &mut diag_ctx)
         for err in access_errors do
-          diags.push(Diagnostic {
-            level: DiagLevel::Error,
-            message: err.message,
-            span: Option::Some(err.span),
-            notes: Vec::new(),
-            suggestions: Vec::new(),
-            code: Option::None
-          })
+          diags.push(diag_internal(err.message, err.span))
         end
 
         var diag_engine = type_result.program.engine_snapshot
         let res_result = resource_check(&ast, &type_result.program.typed, &diag_cfg, &mut diag_ctx, &mut diag_engine)
         for err in res_result.errors do
+          let category = diagnostic_category_for_parts(Option::None, err.semantic_data.clone())
           diags.push(Diagnostic {
             level: DiagLevel::Error,
             message: err.message,
             span: Option::Some(err.span),
             notes: Vec::new(),
             suggestions: Vec::new(),
-            code: Option::None
+            code: Option::None,
+            primary_symbol: err.primary_symbol,
+            semantic_site: err.semantic_site,
+            ownership_trace: err.ownership_trace,
+            capability_trace: err.capability_trace,
+            related_symbols: err.related_symbols,
+            semantic_data: err.semantic_data,
+            category: category
           })
         end
       when Result::Err(res_errors) then
         for re in res_errors do
-          diags.push(Diagnostic {
-            level: DiagLevel::Error,
-            message: re.message,
-            span: Option::Some(re.span),
-            notes: Vec::new(),
-            suggestions: Vec::new(),
-            code: Option::Some("E0405")
-          })
+          diags.push(diag_syntax("E0405".to_string(), re.message, re.span))
         end
       end
     end

@@ -1,0 +1,301 @@
+# Tangerine Compiler — Test synthesis (audit order item 5 closeout)
+# Self-hosting compiler written in Tangerine
+#
+# THE CLOSED LOOP: the §40 coverage graph's test_targeted_for_delta
+# (tg_compiler/coverage_graph.tg) answers, per §31 delta, the tests that
+# MUST RUN (affected-test requests) plus the uncovered path constraints no
+# test covers (uncovered-path requests). This module is the FULL-LIBRARY
+# consumer that closes the loop: it turns the uncovered-path requests into
+# typed SYNTHESIS requests (deterministic identity + name derived from the
+# stable id/constraint digest) and calls the generator
+# (std::test_gen.generate_test_suite — the pub synthesis entry) to produce
+# CONCRETE @test source text. When the generator produces no case for the
+# request's function (the function is not in the given source, or it has no
+# boundary/contract candidates), the request is rendered as a TYPED
+# REQUEST RENDER — never a fabricated passing test.
+#
+# THE KERNEL BOUNDARY (documented in coverage_graph.tg): std::test_gen is
+# NOT in bootstrap/compiler_kernel.manifest, so the bootstrap kernel
+# closure cannot import it. The kernel exposes ONLY the typed constraints
+# (TargetedTestRequest); every synthesis consumer lives outside the kernel
+# closure. This module is imported by the out-of-manifest full driver
+# (tg_compiler/driver.tg), whose imports load from the repo through the
+# canonical recursive loader (the closure-scoped load path) — the same
+# path the other non-kernel std modules the driver names are loaded from.
+#
+# DETERMINISM: request order follows test_targeted_for_delta's sorted
+# order; the identity text is a length-prefixed concatenation (no
+# delimiter ambiguity) and the name carries the 128-bit stable digest of
+# that text rendered "hi-lo" with '-' -> '_'. The same constraint/module
+# always yields byte-identical requests, names and renders; no ordinal,
+# insertion order or wall clock participates.
+#
+# GENERATOR LIMITS (honest state): generate_test_suite is a heuristic
+# source generator — boundary values and simple contract heuristics over
+# the source text (it reads `def` lines and `pre`/`post` clauses), not a
+# path-sensitive synthesizer. For an uncovered call edge the generated
+# tests drive the caller function with boundary/default inputs; they do
+# not prove the new edge was traversed (the coverage trace of a generated
+# test is the proof). A request whose function is not found in the module
+# source honestly renders as a request (kind "request-render") instead of
+# claiming a test.
+
+use std::collections::{Vec}
+use std::test_gen::{generate_test_suite, format_test_case, TestSuite, TestCase}
+use tg_compiler::coverage_graph::{TargetedTestRequest, test_targeted_for_delta}
+use tg_compiler::semantic_model::{SemanticSnapshot, semantic_digest_render}
+use tg_compiler::semantic_delta::{SemanticDelta}
+use tg_compiler::stable_ids::{stable_key_digest}
+
+# ———————————————————————————————————————————————————————————————
+# 1. The typed synthesis request
+# ———————————————————————————————————————————————————————————————
+# ONE uncovered-path constraint promoted into a generator request:
+#   function_key / function_name — the constraint's source symbol key and
+#     its bare declaration name (the generator's fn_under_test spelling);
+#   edge_kind / source_key / target_key / constraint — the request fields
+#     verbatim from TargetedTestRequest (never re-parsed text);
+#   identity_digest — the 128-bit stable digest of the length-prefixed
+#     identity text; the deterministic name is derived from it.
+pub struct SynthesisRequest
+  kind: String
+  module_name: String
+  function_key: String
+  function_name: String
+  edge_kind: String
+  source_key: String
+  target_key: String
+  constraint: String
+  identity_digest: String
+end
+
+# ONE synthesized unit: a concrete generated @test source (kind
+# "generated") or the typed request render (kind "request-render") when no
+# generator case matched. test_name carries the deterministic name.
+pub struct SynthesizedTest
+  request_key: String
+  test_name: String
+  kind: String
+  module_name: String
+  function_key: String
+  function_name: String
+  constraint: String
+  source: String
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. The deterministic identity (stable ids + constraint digest)
+# ———————————————————————————————————————————————————————————————
+
+# The length-prefixed identity piece "<len>:<bytes>" — the injective
+# concatenation the composite stable-identity texts use (stable_ids.tg).
+def synthesis_identity_lenpref(piece: String) -> String
+  piece.len().to_string() + ":" + piece
+end
+
+# The identity text of one request: the request kind + edge kind + the
+# length-prefixed function/source/target/constraint pieces. No delimiter
+# can collide because every piece carries its length.
+pub def synthesis_identity_text(
+  edge_kind: String,
+  function_key: String,
+  target_key: String,
+  constraint: String
+) -> String
+  "test-synthesis|uncovered-path|" +
+    synthesis_identity_lenpref(edge_kind) +
+    synthesis_identity_lenpref(function_key) +
+    synthesis_identity_lenpref(target_key) +
+    synthesis_identity_lenpref(constraint)
+end
+
+# The canonical stable-key digest of the identity text, rendered "hi-lo".
+pub def synthesis_identity_digest(
+  edge_kind: String,
+  function_key: String,
+  target_key: String,
+  constraint: String
+) -> String
+  semantic_digest_render(stable_key_digest(synthesis_identity_text(
+    edge_kind, function_key, target_key, constraint)))
+end
+
+# The bare declaration name of a stable function key: "m::h#fn()->unit" ->
+# "h". The key's "#<signature>" tail and the module path are identity
+# grammar, never part of the generator's fn_under_test spelling.
+pub def synthesis_function_name_of_key(function_key: String) -> String
+  let hash_at = function_key.find("#").unwrap_or(function_key.len())
+  let head = function_key.slice(0, hash_at)
+  match head.rfind("::")
+  when Option::Some(i) then head.slice(i + 2, head.len())
+  when Option::None then head
+  end
+end
+
+# The deterministic test name of one request:
+# "test_uncovered_<fn>_<digest>" with the digest's '-' rendered '_'.
+pub def synthesis_test_name(request: SynthesisRequest) -> String
+  "test_uncovered_" + request.function_name.clone() + "_" +
+    request.identity_digest.clone().replace("-", "_")
+end
+
+# The canonical request key text (the request identity envelope).
+pub def synthesis_request_key(request: SynthesisRequest) -> String
+  "synthesis|" + request.kind.clone() + "|" + request.edge_kind.clone() + "|" +
+    request.function_key.clone() + "|" + request.target_key.clone() + "|" +
+    request.identity_digest.clone()
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. The targeted-request -> synthesis-request promotion
+# ———————————————————————————————————————————————————————————————
+
+# Promote the uncovered-path rows of a test_targeted_for_delta answer into
+# synthesis requests. affected-test rows are NOT synthesis input (they name
+# tests that already exist); they are skipped. Order is preserved (the
+# targeted answer is sorted/deduped upstream).
+pub def synthesis_requests_from_targeted(
+  requests: Vec[TargetedTestRequest],
+  module_name: String
+) -> Vec[SynthesisRequest]
+  var out: Vec[SynthesisRequest] = Vec::new()
+  for r in requests do
+    if r.kind == "uncovered-path" then
+      let function_key = r.source.clone()
+      let identity = synthesis_identity_digest(
+        r.edge_kind.clone(), function_key.clone(), r.target.clone(), r.constraint.clone())
+      out.push(SynthesisRequest {
+        kind: "uncovered-path".to_string(),
+        module_name: module_name.clone(),
+        function_key: function_key.clone(),
+        function_name: synthesis_function_name_of_key(function_key),
+        edge_kind: r.edge_kind.clone(),
+        source_key: r.source.clone(),
+        target_key: r.target.clone(),
+        constraint: r.constraint.clone(),
+        identity_digest: identity
+      })
+    end
+  end
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. The typed request render (the honest fallback)
+# ———————————————————————————————————————————————————————————————
+# A request with no generator case renders as COMMENT-ONLY text carrying
+# every typed field: it is a request artifact, not a test — nothing here
+# is executable and no assertion is invented.
+pub def render_synthesis_request(request: SynthesisRequest) -> String
+  var lines: Vec[String] = Vec::new()
+  lines.push("# synthesis-request: no generator case matched function `" + request.function_name.clone() + "` — the typed constraint below is the hand-off, never a fabricated test")
+  lines.push("# request-key: " + synthesis_request_key(request.clone()))
+  lines.push("# module: " + request.module_name.clone())
+  lines.push("# function-key: " + request.function_key.clone())
+  lines.push("# function-name: " + request.function_name.clone())
+  lines.push("# edge-kind: " + request.edge_kind.clone())
+  lines.push("# source-key: " + request.source_key.clone())
+  lines.push("# target-key: " + request.target_key.clone())
+  lines.push("# constraint: " + request.constraint.clone())
+  lines.push("# identity-digest: " + request.identity_digest.clone())
+  lines.join("\n")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 5. The generator wiring
+# ———————————————————————————————————————————————————————————————
+
+# Synthesize concrete test sources for the requests against ONE module
+# source. The generator runs ONCE over the source and each request takes
+# the generated cases for its function (in generator order), renamed to
+# the deterministic request name (a second and later case gets a stable
+# "_<n>" suffix in generator order). No matching case => the typed
+# request render.
+pub def synthesize_tests_for_requests(
+  module_source: String,
+  requests: Vec[SynthesisRequest]
+) -> Vec[SynthesizedTest]
+  var out: Vec[SynthesizedTest] = Vec::new()
+  if requests.is_empty() then
+    return out
+  end
+  let suite: TestSuite = generate_test_suite(module_source, requests[0].module_name.clone())
+  for req in requests do
+    var matching: Vec[TestCase] = Vec::new()
+    for tc in suite.tests do
+      if tc.fn_under_test == req.function_name then
+        matching.push(tc.clone())
+      end
+    end
+    let request_key = synthesis_request_key(req.clone())
+    let test_name = synthesis_test_name(req.clone())
+    if matching.is_empty() then
+      out.push(SynthesizedTest {
+        request_key: request_key,
+        test_name: test_name,
+        kind: "request-render".to_string(),
+        module_name: req.module_name.clone(),
+        function_key: req.function_key.clone(),
+        function_name: req.function_name.clone(),
+        constraint: req.constraint.clone(),
+        source: render_synthesis_request(req.clone())
+      })
+    else
+      var lines: Vec[String] = Vec::new()
+      lines.push("# Auto-generated by tg test-synthesis (the deterministic name carries the stable id/constraint digest)")
+      lines.push("# request-key: " + request_key.clone())
+      lines.push("# constraint: " + req.constraint.clone())
+      var idx = 0
+      for tc in matching do
+        var named = tc.clone()
+        idx = idx + 1
+        if idx == 1 then
+          named.name = test_name.clone()
+        else
+          named.name = test_name.clone() + "_" + idx.to_string()
+        end
+        lines.push(format_test_case(named))
+      end
+      out.push(SynthesizedTest {
+        request_key: request_key,
+        test_name: test_name,
+        kind: "generated".to_string(),
+        module_name: req.module_name.clone(),
+        function_key: req.function_key.clone(),
+        function_name: req.function_name.clone(),
+        constraint: req.constraint.clone(),
+        source: lines.join("\n")
+      })
+    end
+  end
+  out
+end
+
+# The end-to-end entry: a §31 delta + snapshot + one module source ->
+# synthesized units. The targeted requests come from the kernel's typed
+# answer; the generator stays outside the kernel.
+pub def synthesize_tests_for_delta(
+  snapshot: SemanticSnapshot,
+  delta: SemanticDelta,
+  module_source: String,
+  module_name: String
+) -> Vec[SynthesizedTest]
+  let targeted = test_targeted_for_delta(snapshot, delta)
+  let requests = synthesis_requests_from_targeted(targeted, module_name)
+  synthesize_tests_for_requests(module_source, requests)
+end
+
+# Render the synthesized units as ONE test-source file text (the writer
+# the driver entry returns). Comment-only renders ride through unchanged.
+pub def render_synthesized_suite(tests: Vec[SynthesizedTest], module_name: String) -> String
+  var lines: Vec[String] = Vec::new()
+  lines.push("# Auto-generated test-synthesis output (audit order item 5)")
+  lines.push("# module: " + module_name.clone())
+  lines.push("# units: " + tests.len().to_string())
+  lines.push("")
+  for t in tests do
+    lines.push(t.source.clone())
+    lines.push("")
+  end
+  lines.join("\n")
+end

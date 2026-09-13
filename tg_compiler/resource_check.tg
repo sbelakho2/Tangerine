@@ -1,7 +1,7 @@
 use std::core::{Option}
 use std::collections::{Vec, Map, Set}
 use tg_compiler::token::{Span, parsed_int_to_host}
-use tg_compiler::parser::{DiagnosticSemanticData, OwnershipDiagnosticData}
+use tg_compiler::parser::{DiagnosticSemanticData, OwnershipDiagnosticData, CapabilityDiagnosticData}
 use tg_compiler::ast::{
   Program, Item, ItemKind, FunctionDecl, FnBody, TraitMethod, ExternItem,
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
@@ -10,13 +10,156 @@ use tg_compiler::ast::{
 use tg_compiler::types::{Type, TypeKind, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, type_display, TypeDef, TypeDefKind, FieldInfo, VariantInfo, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, is_shared_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, AssignExactDrop, function_cleanup_table_new, crate_module_path_of, def_id_kind_of, ProjectionKey, ProjectionChain, projection_chain_of, projection_key_eq, place_move_path_of, TypedExprKind, effect_handler_synth_key}
 use tg_compiler::resolver::{module_path_of_item_resolver, ResolvedNames}
 use tg_compiler::access_check::{AccessError}
-use tg_compiler::ids::{DefId, LocalId, TraitId, FinalizerKind, generic_param_table_new, NodeId, AccessId, CfgEdgeId, CallableId}
+use tg_compiler::ids::{DefId, LocalId, TraitId, FinalizerKind, generic_param_table_new, NodeId, AccessId, CfgEdgeId, CallableId, def_id_numeric}
 
 enum ResourceState
   Uninitialized
   Live
   Consumed
   MaybeLive
+end
+
+# ———————————————————————————————————————————————————————————————
+# (audit item 16, next tier) The DMA ownership domain — the per-place
+# device-owned buffer states
+# ———————————————————————————————————————————————————————————————
+# DMA buffer ownership as a first-class resource-state dimension: a place
+# handed to a DMA engine through std::embedded's canonical
+# dma_pin_read/dma_pin_write/dma_pin_read_write surface leaves CPU
+# ownership until dma_await (completion) and dma_unpin (release). The
+# states, keyed by the semantic LocalId of the buffer's place ROOT:
+#   NotPinned        — CPU owns the place; ordinary use is legal.
+#   PinnedRead       — the engine READS the place (memory -> peripheral).
+#   PinnedWrite      — the engine WRITES the place (peripheral -> memory).
+#   PinnedReadWrite  — a bidirectional transfer owns the place.
+#   Returns          — the awaited transfer completed; ownership is being
+#                      handed back to the CPU (ordinary CPU use is legal
+#                      again; dma_unpin closes the pin bookkeeping).
+# The lattice is a SEPARATE dimension from ResourceState (a place can be
+# Live/Consumed and DMA-pinned independently): DmaPlaceRecord carries the
+# state plus the committing op/site for the diagnostic derivation chain.
+enum ResourceDmaState
+  NotPinned
+  PinnedRead
+  PinnedWrite
+  PinnedReadWrite
+  Returns
+end
+
+# The per-place DMA record: the ownership state and the last committing
+# canonical op + site (provenance/diagnostic metadata only — frame
+# equality and joins compare the STATE, mirroring the span rule).
+struct DmaPlaceRecord
+  state: ResourceDmaState
+  op: String
+  site: String
+end
+
+def resource_dma_state_word(st: ResourceDmaState) -> String
+  match st
+  when ResourceDmaState::NotPinned then "not-pinned"
+  when ResourceDmaState::PinnedRead then "pinned-read"
+  when ResourceDmaState::PinnedWrite then "pinned-write"
+  when ResourceDmaState::PinnedReadWrite then "pinned-readwrite"
+  when ResourceDmaState::Returns then "returns"
+  end
+end
+
+def resource_dma_state_pinned(st: ResourceDmaState) -> Bool
+  match st
+  when ResourceDmaState::PinnedRead then true
+  when ResourceDmaState::PinnedWrite then true
+  when ResourceDmaState::PinnedReadWrite then true
+  when _ then false
+  end
+end
+
+# The CONSERVATIVE flow join of two arms' DMA states: any pinned arm wins
+# (ordinary CPU use and a second pin stay rejected on the merged path);
+# two differently-pinned arms join to the read+write union; the CPU-owned
+# side (NotPinned / Returns) joins to Returns (the awaited form — CPU
+# access is legal on both). Documented flow-insensitive limit: the merged
+# unpin-acceptance mirrors the pinned arm.
+def resource_dma_state_join(a: ResourceDmaState, b: ResourceDmaState) -> ResourceDmaState
+  if a == b then return a end
+  if resource_dma_state_pinned(a) then
+    if resource_dma_state_pinned(b) then
+      return ResourceDmaState::PinnedReadWrite
+    end
+    return a
+  end
+  if resource_dma_state_pinned(b) then
+    return b
+  end
+  ResourceDmaState::Returns
+end
+
+# The canonical op words the checker recognizes (the module-qualified
+# std::embedded functions; never the source spelling).
+def resource_dma_op_of_qualified_name(name: String) -> String
+  if name == "std::embedded::dma_pin_read" then "dma-pin-read"
+  elsif name == "std::embedded::dma_pin_write" then "dma-pin-write"
+  elsif name == "std::embedded::dma_pin_read_write" then "dma-pin-read-write"
+  elsif name == "std::embedded::dma_await" then "dma-await"
+  elsif name == "std::embedded::dma_unpin" then "dma-unpin"
+  else ""
+  end
+end
+
+def resource_dma_op_is_pin(op: String) -> Bool
+  op == "dma-pin-read" || op == "dma-pin-write" || op == "dma-pin-read-write"
+end
+
+def resource_dma_pin_state(op: String) -> ResourceDmaState
+  if op == "dma-pin-read" then
+    ResourceDmaState::PinnedRead
+  elsif op == "dma-pin-write" then
+    ResourceDmaState::PinnedWrite
+  else
+    ResourceDmaState::PinnedReadWrite
+  end
+end
+
+# The transition decision of one canonical DMA op: Commit(next) = the
+# operation is legal and the place moves to next; Reject(reason) = the
+# diagnostic reason word. This is the ONE rule the resource checker
+# applies (apply_dma_call); the lane check exercises it directly.
+enum DmaTransition
+  Commit(ResourceDmaState)
+  Reject(String)
+end
+
+def resource_dma_transition(op: String, cur: ResourceDmaState) -> DmaTransition
+  if resource_dma_op_is_pin(op) then
+    if resource_dma_state_pinned(cur) then
+      DmaTransition::Reject("double-pin")
+    else
+      DmaTransition::Commit(resource_dma_pin_state(op))
+    end
+  elsif op == "dma-await" then
+    if resource_dma_state_pinned(cur) then
+      DmaTransition::Commit(ResourceDmaState::Returns)
+    else
+      DmaTransition::Reject("await-without-pin")
+    end
+  else
+    if cur == ResourceDmaState::NotPinned then
+      DmaTransition::Reject("unpin-without-pin")
+    else
+      DmaTransition::Commit(ResourceDmaState::NotPinned)
+    end
+  end
+end
+
+# The pin-op display word of a canonical op ("dma_pin_read" style — the
+# surface's function spelling, for diagnostic prose).
+def resource_dma_op_display(op: String) -> String
+  if op == "dma-pin-read" then "dma_pin_read"
+  elsif op == "dma-pin-write" then "dma_pin_write"
+  elsif op == "dma-pin-read-write" then "dma_pin_read_write"
+  elsif op == "dma-await" then "dma_await"
+  else "dma_unpin"
+  end
 end
 
 # (audit §34) The resource checker's error record mirrors the ONE
@@ -123,6 +266,13 @@ struct ResFrame
   # Live (the field holds its value) — the lattice records only the
   # deviations. The root's OWN availability stays in `locals`.
   place_moves: Map[tg_compiler::ids::LocalId, Map[ProjectionChain, ResourceState]]
+  # (audit item 16, next tier) The per-place DMA ownership lattice: root
+  # semantic local -> DmaPlaceRecord. An ABSENT entry is NotPinned (the
+  # lattice records only the DMA-owned deviations — the place_moves
+  # convention). The map is keyed by the place ROOT, so it tracks Copy
+  # buffer locals the owning-only `locals` map never registers (a
+  # `[u8; N]` DMA buffer is exactly that shape).
+  dma: Map[tg_compiler::ids::LocalId, DmaPlaceRecord]
 end
 
 # The ONE TypedCFG: build_typed_cfg pre-builds every CfgBlock record
@@ -440,6 +590,31 @@ pub struct ResourceDropPlanFact
   kind: String
 end
 
+# (audit item 16, next tier) ONE emitted DMA-ownership fact: one row per
+# COMMITTED canonical DMA op (pin / await / unpin) of a function body —
+# the owning function's owner key, the buffer place's binding text, the
+# state word AFTER the commit, the canonical op word and the commit site.
+# The record is the KERNEL-side mirror of semantic_model.tg's
+# DmaOwnershipFact (the snapshot builder maps it; the kernel closure
+# cannot import semantic_model). Emitted by the resource checker's DMA
+# transition sites (apply_dma_call) from the REAL frame lattice.
+pub struct ResourceDmaFact
+  # The owning function's owner key (the same key binding_name resolves
+  # against — the function emission key the snapshot rows carry).
+  function: String
+  # The canonical place binding text ("buf", "l<ordinal>" for an unnamed
+  # slot).
+  place: String
+  # The state word after the commit ("not-pinned" | "pinned-read" |
+  # "pinned-write" | "pinned-readwrite" | "returns").
+  state: String
+  # The canonical op word ("dma-pin-read" | "dma-pin-write" |
+  # "dma-pin-read-write" | "dma-await" | "dma-unpin").
+  op: String
+  # The commit site label ("<file>:<start>" — provenance metadata only).
+  site: String = ""
+end
+
 # Result of resource checking: the diagnostics plus the authoritative
 # per-function finalize plan (fn owner key -> local ids that must be
 # finalized at function end because they are live with Sink/OwnedLocal
@@ -506,6 +681,13 @@ struct ResourceCheckResult
   # reconciles every block-originating Return/Break/Continue edge against
   # these recorded frames.
   block_frames: Map[Int, (ResFrame, ResFrame)]
+  # (audit item 16, next tier) The emitted DMA-ownership facts: one row per
+  # committed canonical DMA op of every checked function body (the owner
+  # key + place + post-state word + op word + site). The snapshot builder
+  # persists them as DmaOwnershipFact rows; the ownership.dma_state query
+  # answers them per place. Defaulted empty so the placeholder literals
+  # stay legal.
+  dma_facts: Vec[ResourceDmaFact] = Vec::new()
 end
 
 # the typed iteration plan for a for-statement, produced by check_for.
@@ -619,6 +801,20 @@ struct AnalysisContext
   slice_views: Map[Int, SliceViewInfo]
   access_registry: Map[Int, Vec[AccessId]]
   access_counter: Int
+  # (audit item 16, next tier) The DMA domain's per-compilation tables:
+  # dma_callees  — the resolved DefId numeric of each canonical
+  #                std::embedded dma_* function -> its canonical op word
+  #                (built ONCE in resource_check from the resolver's
+  #                module_symbols — the call sites look the op up through
+  #                typed.call_targets, never by source name);
+  # current_owner_key — the function owner key the fact emitter stamps on
+  #                committed DMA ops (set by check_function /
+  #                check_trait_method);
+  # dma_facts    — the committed-op fact accumulator (the ResourceDmaFact
+  #                rows the result carries; sort/dedup at the run end).
+  dma_callees: Map[Int, String]
+  current_owner_key: String
+  dma_facts: Vec[ResourceDmaFact]
 end
 
 # one fresh context per compilation — the pipeline (analyze_parsed,
@@ -632,7 +828,10 @@ pub def analysis_context_new() -> AnalysisContext
     block_frames: Map::new(),
     slice_views: Map::new(),
     access_registry: Map::new(),
-    access_counter: 0
+    access_counter: 0,
+    dma_callees: Map::new(),
+    current_owner_key: "",
+    dma_facts: Vec::new()
   }
 end
 
@@ -668,6 +867,11 @@ pub struct AnalyzedProgram
   # builder persists them without re-running the checker. Defaulted empty
   # so the placeholder literals (types.tg) stay legal.
   drop_plan_facts: Vec[ResourceDropPlanFact] = Vec::new()
+  # (audit item 16, next tier) The typed DMA-ownership facts the resource
+  # checker emitted (resource_check's dma_facts) — carried so the snapshot
+  # builder persists them without re-running the checker. Defaulted empty
+  # so the placeholder literals (types.tg) stay legal.
+  dma_facts: Vec[ResourceDmaFact] = Vec::new()
 end
 
 # the checker-side iteration-plan accumulator is AnalysisContext
@@ -1082,6 +1286,71 @@ def resource_drop_plan_facts_sort(inout facts: Vec[ResourceDropPlanFact]) -> Uni
   end
 end
 
+# (audit item 16, next tier) The canonical DMA fact order: function,
+# place, commit site, op, then state — a total order over the row (the
+# worklist may visit a block more than once; the run-end sort + dedup
+# makes the emitted table visit-order independent).
+def resource_dma_fact_lt(a: ResourceDmaFact, b: ResourceDmaFact) -> Bool
+  if a.function != b.function then
+    a.function < b.function
+  elsif a.place != b.place then
+    a.place < b.place
+  elsif a.site != b.site then
+    a.site < b.site
+  elsif a.op != b.op then
+    a.op < b.op
+  else
+    a.state < b.state
+  end
+end
+
+def resource_dma_facts_sort(inout facts: Vec[ResourceDmaFact]) -> Unit
+  var i = 1
+  while i < facts.len() do
+    let current = facts[i].clone()
+    var j = i
+    while j > 0 && resource_dma_fact_lt(&facts[j - 1], &current) do
+      facts[j] = facts[j - 1].clone()
+      j = j - 1
+    end
+    facts[j] = current
+    i = i + 1
+  end
+end
+
+# Drop adjacent duplicate rows (the same commit recorded by a repeated
+# block visit). Sorting first makes duplicates adjacent.
+def resource_dma_facts_dedup(inout facts: Vec[ResourceDmaFact]) -> Unit
+  var out = Vec::new()
+  var i = 0
+  while i < facts.len() do
+    var same = false
+    if i > 0 then
+      if facts[i].function == facts[i - 1].function then
+        if facts[i].place == facts[i - 1].place then
+          if facts[i].state == facts[i - 1].state then
+            if facts[i].op == facts[i - 1].op then
+              if facts[i].site == facts[i - 1].site then
+                same = true
+              end
+            end
+          end
+        end
+      end
+    end
+    if !same then
+      out.push(facts[i].clone())
+    end
+    i = i + 1
+  end
+  facts.clear()
+  var k = 0
+  while k < out.len() do
+    facts.push(out[k].clone())
+    k = k + 1
+  end
+end
+
 pub def resource_check(program: Program, typed: TypedProgram, cfg_in: TypedCFG, inout ctx: AnalysisContext, inout env_snapshot: TypeEnv) -> ResourceCheckResult
  # the accumulators (iteration plans, typed iterations, block
   # frames, slice views, the access registry) live in the AnalysisContext —
@@ -1105,6 +1374,19 @@ pub def resource_check(program: Program, typed: TypedProgram, cfg_in: TypedCFG, 
   # Every ownership decision below queries type_properties_of through it.
   mut errors = Vec::new()
   var finalize_plan = function_cleanup_table_new()
+  # (audit item 16, next tier) The canonical DMA callee table: every
+  # module-qualified std::embedded dma_* symbol the resolver registered is
+  # mapped from its DefId numeric to the canonical op word. The call sites
+  # (check_expr_call) join typed.call_targets through this table, so the
+  # recognition is the RESOLVED callee identity — never a source spelling.
+  var dma_table: Map[Int, String] = Map::new()
+  for (sym_key, sym_did) in typed.resolutions.module_symbols do
+    let op_word = resource_dma_op_of_qualified_name(sym_key.clone())
+    if op_word.len() > 0 then
+      dma_table.insert(def_id_numeric(&sym_did), op_word)
+    end
+  end
+  ctx.dma_callees = dma_table
  # each top-level item is checked under its OWNER module path — the
   # same Program.modules pointer walk the type checker performs
   # (module_path_of_item_resolver) — so the owner-key fallback of a
@@ -1140,6 +1422,12 @@ pub def resource_check(program: Program, typed: TypedProgram, cfg_in: TypedCFG, 
   # cleanup edges + the pre-built parallel owner vector, in canonical order.
   var drop_facts = resource_drop_plan_facts(&typed, &cfg.edges, &cfg.edge_owners)
   resource_drop_plan_facts_sort(&mut drop_facts)
+  # (audit item 16, next tier) The committed DMA-ownership facts: the
+  # worklist may revisit blocks, so sort under the canonical row order and
+  # drop identical rows — the emitted table is visit-order independent.
+  var dma_facts = ctx.dma_facts.clone()
+  resource_dma_facts_sort(&mut dma_facts)
+  resource_dma_facts_dedup(&mut dma_facts)
   ResourceCheckResult {
     errors: errors,
     finalize_plan: finalize_plan,
@@ -1147,7 +1435,8 @@ pub def resource_check(program: Program, typed: TypedProgram, cfg_in: TypedCFG, 
     iteration_plans: iteration_plans_snapshot(ctx),
     typed_iterations: typed_iterations_snapshot(ctx),
     block_frames: body_block_frames,
-    drop_plan_facts: drop_facts
+    drop_plan_facts: drop_facts,
+    dma_facts: dma_facts
   }
 end
 
@@ -2797,6 +3086,9 @@ def check_item(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
 end
 
 def check_function(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, f: FunctionDecl, owner_key: String, callable: Option[CallableId], inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int]) -> Unit
+  # (audit item 16, next tier): the fact emitter stamps this function's
+  # owner key on every committed DMA op (the SDK row identity).
+  ctx.current_owner_key = owner_key.clone()
   mut frame = res_frame_new()
   # The function's own defer-scope chain: empty at the function boundary, the
   # function body block pushes its key when check_block enters it.
@@ -2869,6 +3161,9 @@ def check_function(program: Program, typed: TypedProgram, inout env: TypeEnv, in
 end
 
 def check_trait_method(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, m: TraitMethod, owner_key: String, callable: Option[CallableId], trait_is_drop: Bool, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int]) -> Unit
+  # (audit item 16, next tier): the fact emitter stamps this method's
+  # owner key on every committed DMA op (the SDK row identity).
+  ctx.current_owner_key = owner_key.clone()
   mut frame = res_frame_new()
   var defer_chain = Vec::new()
   let entry_ids = bind_params(env, typed, &m.sig.params, &mut frame, owner_key, errors)
@@ -4150,15 +4445,33 @@ end
 # a live capability reaching a function exit must have been returned,
 # transferred, delegated, or explicitly consumed by a capability operation —
 # an automatic deinitializer must NOT satisfy its linearity.
+# (universal-typed-derivation closure) this is a SEMANTIC capability
+# diagnostic and therefore carries the typed CapabilityDiagnosticData:
+# the capability class word, the local as the subject, the rejected
+# operation ("exit") and the state word — never a payload-less error.
 def validate_capability_exit(typed: TypedProgram, frame: ResFrame, span: Span, inout errors: Vec[ResourceError]) -> Unit
   # Frame keys are LocalId; binding_name is keyed by the raw Int semantic id.
   for (cid, ls) in frame.locals do
     if ls.is_capability then
       match ls.availability
       when ResourceState::Live then
+        let name = binding_name(typed, cid.id)
         errors.push(ResourceError {
-          message: "capability `" + binding_name(typed, cid.id) + "` must be returned, transferred, delegated, or explicitly consumed before function exit (authority cannot be silently discarded)",
-          span: span
+          message: "capability `" + name.clone() + "` must be returned, transferred, delegated, or explicitly consumed before function exit (authority cannot be silently discarded)",
+          span: span,
+          primary_symbol: Option::Some(name.clone()),
+          semantic_site: Option::Some("capability analysis (function exit)"),
+          capability_trace: Vec::from([
+            "capability `" + name.clone() + "`: state live at function exit"
+          ]),
+          related_symbols: Vec::from([name.clone()]),
+          semantic_data: Option::Some(DiagnosticSemanticData::Capability(CapabilityDiagnosticData {
+            capability: "linear-capability".to_string(),
+            subject: name.clone(),
+            operation: "exit".to_string(),
+            state_before: "live".to_string(),
+            fact: "capability `" + name.clone() + "`: state live at function exit"
+          }))
         })
       when _ then ()
       end
@@ -4641,12 +4954,15 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     check_block(program, typed, env, ctx, &body, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     match expr.kind
     when ExprKind::ExprIndex(base, _) then
+      # The index base is an OWNED Box[Expr]: unbox it once (Box is the
+      # wrapper, never transparent to the Expr it holds).
+      let base_expr = base.into_inner()
       mut parent_root = -1
       mut parent_fields = Vec::new()
-      match expr_root_id(typed, &base)
+      match expr_root_id(typed, &base_expr)
       when Option::Some(rid) then
         parent_root = rid
-        collect_place_field_chain(typed, &base, &mut parent_fields)
+        collect_place_field_chain(typed, &base_expr, &mut parent_fields)
       when Option::None then ()
       end
       if parent_root >= 0 then
@@ -5215,35 +5531,42 @@ def plan_expr_uses_binding(typed: TypedProgram, name: String, expr: Expr) -> Boo
   when ExprKind::ExprMapLit(entries) then plan_entries_uses_binding(typed, name, &entries)
   when ExprKind::ExprBinaryOp(_, lhs, rhs) then
     plan_expr_uses_binding(typed, name, lhs.into_inner()) || plan_expr_uses_binding(typed, name, rhs.into_inner())
-  when ExprKind::ExprUnaryOp(_, operand) then plan_expr_uses_binding(typed, name, &operand)
+  when ExprKind::ExprUnaryOp(_, operand) then plan_expr_uses_binding(typed, name, operand.into_inner())
   when ExprKind::ExprFieldAccess(base, _) then
-    if plan_expr_is_bare_binding(name, base.into_inner()) then
+    # The child is an OWNED Box[Expr]: unbox it exactly once (Box is the
+    # wrapper, never transparent to the Expr it holds).
+    let base_expr = base.into_inner()
+    if plan_expr_is_bare_binding(name, &base_expr) then
       false
     else
-      plan_expr_uses_binding(typed, name, base.into_inner())
+      plan_expr_uses_binding(typed, name, &base_expr)
     end
   when ExprKind::ExprIndex(base, idx) then
-    let base_unsafe = if plan_expr_is_bare_binding(name, base.into_inner()) then
+    let base_expr = base.into_inner()
+    let idx_expr = idx.into_inner()
+    let base_unsafe = if plan_expr_is_bare_binding(name, &base_expr) then
       false
     else
-      plan_expr_uses_binding(typed, name, base.into_inner())
+      plan_expr_uses_binding(typed, name, &base_expr)
     end
-    base_unsafe || plan_expr_uses_binding(typed, name, &idx)
+    base_unsafe || plan_expr_uses_binding(typed, name, &idx_expr)
   when ExprKind::ExprMethodCall(receiver, _, _, args) then
-    if plan_expr_rooted_at_binding(name, &receiver) then
+    let receiver_expr = receiver.into_inner()
+    if plan_expr_rooted_at_binding(name, &receiver_expr) then
       true
     else
-      if plan_expr_uses_binding(typed, name, &receiver) then
+      if plan_expr_uses_binding(typed, name, &receiver_expr) then
         true
       else
         plan_exprs_uses_binding(typed, name, &args)
       end
     end
   when ExprKind::ExprCall(callee, args) then
-    if plan_expr_rooted_at_binding(name, &callee) then
+    let callee_expr = callee.into_inner()
+    if plan_expr_rooted_at_binding(name, &callee_expr) then
       true
     else
-      if plan_expr_uses_binding(typed, name, &callee) then
+      if plan_expr_uses_binding(typed, name, &callee_expr) then
         true
       else
         plan_call_args_uses_binding(typed, name, &args)
@@ -5251,16 +5574,18 @@ def plan_expr_uses_binding(typed: TypedProgram, name: String, expr: Expr) -> Boo
     end
   when ExprKind::ExprClosure(_, _, body) then plan_expr_mentions_binding(typed, name, body.into_inner())
   when ExprKind::ExprAccess(inner) then
-    if plan_expr_rooted_at_binding(name, inner.into_inner()) then
+    let inner_expr = inner.into_inner()
+    if plan_expr_rooted_at_binding(name, &inner_expr) then
       true
     else
-      plan_expr_uses_binding(typed, name, inner.into_inner())
+      plan_expr_uses_binding(typed, name, &inner_expr)
     end
   when ExprKind::ExprRawDeref(inner) then
-    if plan_expr_rooted_at_binding(name, inner.into_inner()) then
+    let inner_expr = inner.into_inner()
+    if plan_expr_rooted_at_binding(name, &inner_expr) then
       true
     else
-      plan_expr_uses_binding(typed, name, inner.into_inner())
+      plan_expr_uses_binding(typed, name, &inner_expr)
     end
   when ExprKind::ExprIf(if_stmt) then plan_if_uses_binding(typed, name, &if_stmt)
   when ExprKind::ExprMatch(m) then plan_match_uses_binding(typed, name, &m)
@@ -5271,11 +5596,11 @@ def plan_expr_uses_binding(typed: TypedProgram, name: String, expr: Expr) -> Boo
   when ExprKind::ExprTry(inner) then plan_expr_uses_binding(typed, name, inner.into_inner())
   when ExprKind::ExprRange(lo, hi, _) then
     let lo_unsafe = match lo
-    when Option::Some(lo_e) then plan_expr_uses_binding(typed, name, &lo_e)
+    when Option::Some(lo_e) then plan_expr_uses_binding(typed, name, lo_e.into_inner())
     when Option::None then false
     end
     let hi_unsafe = match hi
-    when Option::Some(hi_e) then plan_expr_uses_binding(typed, name, &hi_e)
+    when Option::Some(hi_e) then plan_expr_uses_binding(typed, name, hi_e.into_inner())
     when Option::None then false
     end
     lo_unsafe || hi_unsafe
@@ -5284,10 +5609,12 @@ def plan_expr_uses_binding(typed: TypedProgram, name: String, expr: Expr) -> Boo
   when ExprKind::ExprComptime(block) then plan_block_uses_binding(typed, name, &block)
   when ExprKind::ExprEnumVariant(_, _, args) then plan_exprs_uses_binding(typed, name, &args)
   when ExprKind::ExprAssign(target, value) then
-    if plan_expr_rooted_at_binding(name, &target) then
+    let target_expr = target.into_inner()
+    let value_expr = value.into_inner()
+    if plan_expr_rooted_at_binding(name, &target_expr) then
       true
     else
-      plan_expr_uses_binding(typed, name, &target) || plan_expr_uses_binding(typed, name, &value)
+      plan_expr_uses_binding(typed, name, &target_expr) || plan_expr_uses_binding(typed, name, &value_expr)
     end
   when ExprKind::ExprPipe(lhs, rhs) then
     plan_expr_uses_binding(typed, name, lhs.into_inner()) || plan_expr_uses_binding(typed, name, rhs.into_inner())
@@ -5488,51 +5815,51 @@ def plan_expr_mentions_binding(typed: TypedProgram, name: String, expr: Expr) ->
   when ExprKind::ExprStructLit(_, fields) then plan_fields_mentions_binding(typed, name, &fields)
   when ExprKind::ExprMapLit(entries) then plan_entries_mentions_binding(typed, name, &entries)
   when ExprKind::ExprBinaryOp(_, lhs, rhs) then
-    plan_expr_mentions_binding(typed, name, &lhs) || plan_expr_mentions_binding(typed, name, &rhs)
-  when ExprKind::ExprUnaryOp(_, operand) then plan_expr_mentions_binding(typed, name, &operand)
-  when ExprKind::ExprFieldAccess(base, _) then plan_expr_mentions_binding(typed, name, &base)
+    plan_expr_mentions_binding(typed, name, lhs.into_inner()) || plan_expr_mentions_binding(typed, name, rhs.into_inner())
+  when ExprKind::ExprUnaryOp(_, operand) then plan_expr_mentions_binding(typed, name, operand.into_inner())
+  when ExprKind::ExprFieldAccess(base, _) then plan_expr_mentions_binding(typed, name, base.into_inner())
   when ExprKind::ExprIndex(base, idx) then
-    plan_expr_mentions_binding(typed, name, &base) || plan_expr_mentions_binding(typed, name, &idx)
+    plan_expr_mentions_binding(typed, name, base.into_inner()) || plan_expr_mentions_binding(typed, name, idx.into_inner())
   when ExprKind::ExprMethodCall(receiver, _, _, args) then
-    if plan_expr_mentions_binding(typed, name, &receiver) then
+    if plan_expr_mentions_binding(typed, name, receiver.into_inner()) then
       true
     else
       plan_exprs_mention_binding(typed, name, &args)
     end
   when ExprKind::ExprCall(callee, args) then
-    if plan_expr_mentions_binding(typed, name, &callee) then
+    if plan_expr_mentions_binding(typed, name, callee.into_inner()) then
       true
     else
       plan_exprs_mention_binding(typed, name, &args)
     end
   when ExprKind::ExprClosure(_, _, body) then plan_expr_mentions_binding(typed, name, body.into_inner())
-  when ExprKind::ExprAccess(inner) then plan_expr_mentions_binding(typed, name, &inner)
-  when ExprKind::ExprRawDeref(inner) then plan_expr_mentions_binding(typed, name, &inner)
+  when ExprKind::ExprAccess(inner) then plan_expr_mentions_binding(typed, name, inner.into_inner())
+  when ExprKind::ExprRawDeref(inner) then plan_expr_mentions_binding(typed, name, inner.into_inner())
   when ExprKind::ExprIf(if_stmt) then plan_if_mentions_binding(typed, name, &if_stmt)
   when ExprKind::ExprMatch(m) then plan_match_mentions_binding(typed, name, &m)
   when ExprKind::ExprBlock(block) then plan_block_mentions_binding(typed, name, &block)
   when ExprKind::ExprUnsafe(_, block) then plan_block_mentions_binding(typed, name, &block)
   when ExprKind::ExprAsync(block) then plan_block_mentions_binding(typed, name, &block)
-  when ExprKind::ExprAwait(inner) then plan_expr_mentions_binding(typed, name, &inner)
-  when ExprKind::ExprTry(inner) then plan_expr_mentions_binding(typed, name, &inner)
+  when ExprKind::ExprAwait(inner) then plan_expr_mentions_binding(typed, name, inner.into_inner())
+  when ExprKind::ExprTry(inner) then plan_expr_mentions_binding(typed, name, inner.into_inner())
   when ExprKind::ExprRange(lo, hi, _) then
     let lo_unsafe = match lo
-    when Option::Some(lo_e) then plan_expr_mentions_binding(typed, name, &lo_e)
+    when Option::Some(lo_e) then plan_expr_mentions_binding(typed, name, lo_e.into_inner())
     when Option::None then false
     end
     let hi_unsafe = match hi
-    when Option::Some(hi_e) then plan_expr_mentions_binding(typed, name, &hi_e)
+    when Option::Some(hi_e) then plan_expr_mentions_binding(typed, name, hi_e.into_inner())
     when Option::None then false
     end
     lo_unsafe || hi_unsafe
-  when ExprKind::ExprCast(inner, _) then plan_expr_mentions_binding(typed, name, &inner)
-  when ExprKind::ExprTypeCheck(inner, _) then plan_expr_mentions_binding(typed, name, &inner)
+  when ExprKind::ExprCast(inner, _) then plan_expr_mentions_binding(typed, name, inner.into_inner())
+  when ExprKind::ExprTypeCheck(inner, _) then plan_expr_mentions_binding(typed, name, inner.into_inner())
   when ExprKind::ExprComptime(block) then plan_block_mentions_binding(typed, name, &block)
   when ExprKind::ExprEnumVariant(_, _, args) then plan_exprs_mention_binding(typed, name, &args)
   when ExprKind::ExprAssign(target, value) then
-    plan_expr_mentions_binding(typed, name, &target) || plan_expr_mentions_binding(typed, name, &value)
+    plan_expr_mentions_binding(typed, name, target.into_inner()) || plan_expr_mentions_binding(typed, name, value.into_inner())
   when ExprKind::ExprPipe(lhs, rhs) then
-    plan_expr_mentions_binding(typed, name, &lhs) || plan_expr_mentions_binding(typed, name, &rhs)
+    plan_expr_mentions_binding(typed, name, lhs.into_inner()) || plan_expr_mentions_binding(typed, name, rhs.into_inner())
   when ExprKind::ExprMacroCall(_, args) then plan_exprs_mention_binding(typed, name, &args)
   when ExprKind::ExprError(_) then false
   when _ then false
@@ -5719,12 +6046,12 @@ end
 def collect_place_field_chain(typed: TypedProgram, expr: Expr, inout out: Vec[String]) -> Unit
   match expr.kind
   when ExprKind::ExprFieldAccess(base, name) then
-    collect_place_field_chain(typed, &base, out)
+    collect_place_field_chain(typed, base.into_inner(), out)
     out.push(name.clone())
-  when ExprKind::ExprIndex(base, _) then collect_place_field_chain(typed, &base, out)
-  when ExprKind::ExprAccess(inner) then collect_place_field_chain(typed, &inner, out)
-  when ExprKind::ExprRawDeref(inner) then collect_place_field_chain(typed, &inner, out)
-  when ExprKind::ExprCast(inner, _) then collect_place_field_chain(typed, &inner, out)
+  when ExprKind::ExprIndex(base, _) then collect_place_field_chain(typed, base.into_inner(), out)
+  when ExprKind::ExprAccess(inner) then collect_place_field_chain(typed, inner.into_inner(), out)
+  when ExprKind::ExprRawDeref(inner) then collect_place_field_chain(typed, inner.into_inner(), out)
+  when ExprKind::ExprCast(inner, _) then collect_place_field_chain(typed, inner.into_inner(), out)
   when _ then ()
   end  end
 end
@@ -5804,19 +6131,21 @@ def plan_expr_mutates_place(typed: TypedProgram, expr: Expr, root: Int, fields: 
     end
     found
   when ExprKind::ExprBinaryOp(_, lhs, rhs) then
-    plan_expr_mutates_place(typed, &lhs, root, fields) || plan_expr_mutates_place(typed, &rhs, root, fields)
-  when ExprKind::ExprUnaryOp(_, operand) then plan_expr_mutates_place(typed, &operand, root, fields)
-  when ExprKind::ExprFieldAccess(base, _) then plan_expr_mutates_place(typed, &base, root, fields)
+    plan_expr_mutates_place(typed, lhs.into_inner(), root, fields) || plan_expr_mutates_place(typed, rhs.into_inner(), root, fields)
+  when ExprKind::ExprUnaryOp(_, operand) then plan_expr_mutates_place(typed, operand.into_inner(), root, fields)
+  when ExprKind::ExprFieldAccess(base, _) then plan_expr_mutates_place(typed, base.into_inner(), root, fields)
   when ExprKind::ExprIndex(base, idx) then
-    plan_expr_mutates_place(typed, &base, root, fields) || plan_expr_mutates_place(typed, &idx, root, fields)
+    plan_expr_mutates_place(typed, base.into_inner(), root, fields) || plan_expr_mutates_place(typed, idx.into_inner(), root, fields)
   when ExprKind::ExprMethodCall(recv, _, _, args) then
-    let recv_eff = plan_expr_access_effect(typed, &recv)
-    var found = recv_eff != AccessEffect::Read && plan_place_key_matches(typed, &recv, root, fields)
-    if plan_expr_mutates_place(typed, &recv, root, fields) then found = true end
+    # The receiver is an OWNED Box[Expr]: unbox it exactly once.
+    let recv_expr = recv.into_inner()
+    let recv_eff = plan_expr_access_effect(typed, &recv_expr)
+    var found = recv_eff != AccessEffect::Read && plan_place_key_matches(typed, &recv_expr, root, fields)
+    if plan_expr_mutates_place(typed, &recv_expr, root, fields) then found = true end
     if plan_exprs_mutate_place(typed, &args, root, fields) then found = true end
     found
   when ExprKind::ExprCall(callee, args) then
-    var found = plan_expr_mutates_place(typed, &callee, root, fields)
+    var found = plan_expr_mutates_place(typed, callee.into_inner(), root, fields)
     var a_idx = 0
     while a_idx < args.len() do
       let arg_eff = plan_expr_access_effect(typed, &args[a_idx])
@@ -5827,38 +6156,40 @@ def plan_expr_mutates_place(typed: TypedProgram, expr: Expr, root: Int, fields: 
       a_idx = a_idx + 1
     end
     found
-  when ExprKind::ExprClosure(_, _, body) then plan_expr_mutates_place(typed, &body, root, fields)
-  when ExprKind::ExprAccess(inner) then plan_expr_mutates_place(typed, &inner, root, fields)
-  when ExprKind::ExprRawDeref(inner) then plan_expr_mutates_place(typed, &inner, root, fields)
+  when ExprKind::ExprClosure(_, _, body) then plan_expr_mutates_place(typed, body.into_inner(), root, fields)
+  when ExprKind::ExprAccess(inner) then plan_expr_mutates_place(typed, inner.into_inner(), root, fields)
+  when ExprKind::ExprRawDeref(inner) then plan_expr_mutates_place(typed, inner.into_inner(), root, fields)
   when ExprKind::ExprIf(if_stmt) then plan_if_mutates_place(typed, &if_stmt, root, fields)
   when ExprKind::ExprMatch(m) then plan_match_mutates_place(typed, &m, root, fields)
   when ExprKind::ExprBlock(block) then plan_block_mutates_place(typed, &block, root, fields)
   when ExprKind::ExprUnsafe(_, block) then plan_block_mutates_place(typed, &block, root, fields)
   when ExprKind::ExprAsync(block) then plan_block_mutates_place(typed, &block, root, fields)
-  when ExprKind::ExprAwait(inner) then plan_expr_mutates_place(typed, &inner, root, fields)
-  when ExprKind::ExprTry(inner) then plan_expr_mutates_place(typed, &inner, root, fields)
+  when ExprKind::ExprAwait(inner) then plan_expr_mutates_place(typed, inner.into_inner(), root, fields)
+  when ExprKind::ExprTry(inner) then plan_expr_mutates_place(typed, inner.into_inner(), root, fields)
   when ExprKind::ExprRange(lo, hi, _) then
     var found = false
     match lo
-    when Option::Some(lo_e) then if plan_expr_mutates_place(typed, &lo_e, root, fields) then found = true end
+    when Option::Some(lo_e) then if plan_expr_mutates_place(typed, lo_e.into_inner(), root, fields) then found = true end
     when Option::None then ()
     end
     match hi
-    when Option::Some(hi_e) then if plan_expr_mutates_place(typed, &hi_e, root, fields) then found = true end
+    when Option::Some(hi_e) then if plan_expr_mutates_place(typed, hi_e.into_inner(), root, fields) then found = true end
     when Option::None then ()
     end
     found
-  when ExprKind::ExprCast(inner, _) then plan_expr_mutates_place(typed, &inner, root, fields)
-  when ExprKind::ExprTypeCheck(inner, _) then plan_expr_mutates_place(typed, &inner, root, fields)
+  when ExprKind::ExprCast(inner, _) then plan_expr_mutates_place(typed, inner.into_inner(), root, fields)
+  when ExprKind::ExprTypeCheck(inner, _) then plan_expr_mutates_place(typed, inner.into_inner(), root, fields)
   when ExprKind::ExprComptime(block) then plan_block_mutates_place(typed, &block, root, fields)
   when ExprKind::ExprEnumVariant(_, _, args) then plan_exprs_mutate_place(typed, &args, root, fields)
   when ExprKind::ExprAssign(target, value) then
-    var found = plan_place_key_matches(typed, &target, root, fields)
-    if plan_expr_mutates_place(typed, &target, root, fields) then found = true end
-    if plan_expr_mutates_place(typed, &value, root, fields) then found = true end
+    let target_expr = target.into_inner()
+    let value_expr = value.into_inner()
+    var found = plan_place_key_matches(typed, &target_expr, root, fields)
+    if plan_expr_mutates_place(typed, &target_expr, root, fields) then found = true end
+    if plan_expr_mutates_place(typed, &value_expr, root, fields) then found = true end
     found
   when ExprKind::ExprPipe(lhs, rhs) then
-    plan_expr_mutates_place(typed, &lhs, root, fields) || plan_expr_mutates_place(typed, &rhs, root, fields)
+    plan_expr_mutates_place(typed, lhs.into_inner(), root, fields) || plan_expr_mutates_place(typed, rhs.into_inner(), root, fields)
   when ExprKind::ExprMacroCall(_, args) then plan_exprs_mutate_place(typed, &args, root, fields)
   when ExprKind::ExprError(_) then false
   when _ then false
@@ -6505,12 +6836,15 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     # single-element array literal — the checker gates the element to a
     # scalar image or a payload-less variant constant, so the transfer is a
     # plain read in practice). The count is a compile-time constant, never
-    # a runtime transfer.
-    check_expr(program, typed, env, ctx, &elem, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    # a runtime transfer. The elem/count payloads are OWNED Box[Expr]s:
+    # unbox each exactly once.
+    let elem_expr = elem.into_inner()
+    let count_expr = count.into_inner()
+    check_expr(program, typed, env, ctx, &elem_expr, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     if aggregate_child_owned(typed, expr, 0, errors) then
-      transfer_consume(env, typed, &elem, loop_outer, frame, errors, finalize_plan)
+      transfer_consume(env, typed, &elem_expr, loop_outer, frame, errors, finalize_plan)
     end
-    check_expr(program, typed, env, ctx, &count, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr(program, typed, env, ctx, &count_expr, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprTupleLit(elems) then
     mut i = 0
     while i < elems.len() do
@@ -6551,26 +6885,26 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
   when ExprKind::ExprPath(_) then ()
   when ExprKind::ExprSelfRef then ()
   when ExprKind::ExprBinaryOp(_, lhs, rhs) then
-    check_expr(program, typed, env, ctx, &lhs, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
-    check_expr(program, typed, env, ctx, &rhs, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr(program, typed, env, ctx, lhs.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr(program, typed, env, ctx, rhs.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprUnaryOp(_, operand) then
-    check_expr(program, typed, env, ctx, &operand, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr(program, typed, env, ctx, operand.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprFieldAccess(base, _) then
-    check_expr(program, typed, env, ctx, &base, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr(program, typed, env, ctx, base.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     # (partial moves): the field READ is a CHAIN read — the root stays
     # live under a partial move, and a consumed chain is a use-after-move.
     check_place_chain_read(env, typed, &expr, frame, errors)
   when ExprKind::ExprMethodCall(recv, method, _, args) then
-    check_expr_method_call(program, typed, env, ctx, &recv, &method, &args, expr.node_id, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr_method_call(program, typed, env, ctx, recv.into_inner(), &method, &args, expr.node_id, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprIndex(base, index) then
-    check_expr(program, typed, env, ctx, &base, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
-    check_expr(program, typed, env, ctx, &index, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr(program, typed, env, ctx, base.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr(program, typed, env, ctx, index.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     # (partial moves): the indexed READ is a chain read over the whole
     # value (the elements are the aggregate — the root-level check above
     # is the only per-index granularity the lattice has).
     check_place_chain_read(env, typed, &expr, frame, errors)
   when ExprKind::ExprCall(callee, args) then
-    check_expr_call(program, typed, env, ctx, &callee, &args, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr_call(program, typed, env, ctx, expr.node_id, callee.into_inner(), &args, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprClosure(params, _, body) then
     mut cframe = res_frame_new()
     let entry_ids = bind_closure_params(env, typed, &params, &mut cframe)
@@ -6645,7 +6979,7 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     # views (views bound inside the closure are closure-local — removed
     # after the body check; they must not outlive the closure).
     let closure_view_keys = slice_views_snapshot_keys(ctx)
-    check_expr(program, typed, env, ctx, &body, &Vec::new(), &mut cframe, errors, finalize_plan, edges, blocks, current_loop_entry, &mut closure_defer_chain)
+    check_expr(program, typed, env, ctx, body.into_inner(), &Vec::new(), &mut cframe, errors, finalize_plan, edges, blocks, current_loop_entry, &mut closure_defer_chain)
     slice_views_remove_after(ctx, &closure_view_keys)
     # Record the closure's authoritative finalize set BEFORE exit_scope
  # erases body-owned locals (see check_function). the SEMANTIC
@@ -6654,8 +6988,8 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     record_closure_cleanup(typed, &cframe, expr.node_id, finalize_plan)
     exit_scope(&mut cframe, &entry_ids, typed, errors)
     check_uninitialized_exit(&cframe, typed, errors)
-  when ExprKind::ExprAccess(inner) then check_expr(program, typed, env, ctx, &inner, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
-  when ExprKind::ExprRawDeref(inner) then check_expr(program, typed, env, ctx, &inner, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+  when ExprKind::ExprAccess(inner) then check_expr(program, typed, env, ctx, inner.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+  when ExprKind::ExprRawDeref(inner) then check_expr(program, typed, env, ctx, inner.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprIf(if_stmt) then
     check_if(program, typed, env, ctx, &if_stmt, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprMatch(m) then
@@ -6666,25 +7000,25 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     check_block(program, typed, env, ctx, &block, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprAsync(block) then
     check_block(program, typed, env, ctx, &block, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
-  when ExprKind::ExprAwait(inner) then check_expr(program, typed, env, ctx, &inner, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+  when ExprKind::ExprAwait(inner) then check_expr(program, typed, env, ctx, inner.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
  # `expr?` is ERASURE — no throwing path exists for it (no throw
   # expression, no error propagation, no Throw/Unwind CFG edge). The
   # operand is checked as a pure expression, the same treatment the type
   # checker and MIR give it. Only the block exceptional forms are rejected
   # (see check_stmt above); the compiler kernel itself uses `?` and must
   # keep compiling.
-  when ExprKind::ExprTry(inner) then check_expr(program, typed, env, ctx, &inner, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+  when ExprKind::ExprTry(inner) then check_expr(program, typed, env, ctx, inner.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprRange(start, end_, _) then
     match start
-    when Option::Some(s) then check_expr(program, typed, env, ctx, &s, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    when Option::Some(s) then check_expr(program, typed, env, ctx, s.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     when Option::None then ()
     end
     match end_
-    when Option::Some(e) then check_expr(program, typed, env, ctx, &e, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    when Option::Some(e) then check_expr(program, typed, env, ctx, e.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     when Option::None then ()
     end
-  when ExprKind::ExprCast(inner, _) then check_expr(program, typed, env, ctx, &inner, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
-  when ExprKind::ExprTypeCheck(inner, _) then check_expr(program, typed, env, ctx, &inner, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+  when ExprKind::ExprCast(inner, _) then check_expr(program, typed, env, ctx, inner.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+  when ExprKind::ExprTypeCheck(inner, _) then check_expr(program, typed, env, ctx, inner.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprComptime(block) then
     check_block(program, typed, env, ctx, &block, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprEnumVariant(_, _, args) then
@@ -6699,10 +7033,14 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     # semantics: drop the previous owning value first, store the new one.
  # the transition shape is identical to StmtAssign — prior_state
     # captured by check_assign_target, RHS validated, drop decision from
-    # prior_state, next_state committed.
-    let assign_trans = check_assign_target(program, typed, env, ctx, &target, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
-    check_expr(program, typed, env, ctx, &value, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
-    transfer_consume(env, typed, &value, loop_outer, frame, errors, finalize_plan)
+    # prior_state, next_state committed. The target/value payloads are
+    # OWNED Box[Expr]s: unbox them once (Box is the wrapper, never
+    # transparent to the Expr it holds).
+    let target_expr = target.into_inner()
+    let value_expr = value.into_inner()
+    let assign_trans = check_assign_target(program, typed, env, ctx, &target_expr, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr(program, typed, env, ctx, &value_expr, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    transfer_consume(env, typed, &value_expr, loop_outer, frame, errors, finalize_plan)
     match assign_trans
     when Option::Some(t) then
  # drops_old derives from the PRIOR state (see StmtAssign): a
@@ -6718,16 +7056,16 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
         # by the drop before the RHS materializes); a disjoint
         # sibling-chain RHS is accepted.
         var target_chain = Vec::new()
-        let target_is_field = if !expr_is_plain(target) then
-          place_projection_keys(typed, &target, &mut target_chain)
+        let target_is_field = if !expr_is_plain(&target_expr) then
+          place_projection_keys(typed, &target_expr, &mut target_chain)
         else
           false
         end
-        if !expr_is_plain(target) && target_is_field then
-          if rhs_reads_overlap_target(typed, &value, t.lid.id, &target_chain) then
+        if !expr_is_plain(&target_expr) && target_is_field then
+          if rhs_reads_overlap_target(typed, &value_expr, t.lid.id, &target_chain) then
             errors.push(ResourceError {
               message: "cannot assign over an owning projected place: the value reads or moves out of the replaced value's own storage (the drop-before-store would destroy its source)",
-              span: value.span
+              span: value_expr.span
             })
           else
             # the chain's own state is destroyed before the store, masked
@@ -6762,15 +7100,15 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
       res_frame_set(frame, t.lid, t.next)
       # A WHOLE-value store re-lives the root's every chain (see
       # StmtAssign): no chain record survives the store.
-      if expr_is_plain(target) then
+      if expr_is_plain(&target_expr) then
         frame.place_moves.remove(t.lid)
       end
       # (partial moves — the projected-target commit, see StmtAssign): the
       # store re-lives the target chain and its extensions (clear + Live);
       # the siblings are NEVER marked.
-      if !expr_is_plain(target) then
+      if !expr_is_plain(&target_expr) then
         var chain = Vec::new()
-        let field_chain = place_projection_keys(typed, &target, &mut chain)
+        let field_chain = place_projection_keys(typed, &target_expr, &mut chain)
         if field_chain then
           frame_place_clear(frame, t.lid, &chain)
           frame_place_mark(frame, t.lid, &chain, ResourceState::Live)
@@ -6779,8 +7117,8 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     when Option::None then ()
     end
   when ExprKind::ExprPipe(lhs, rhs) then
-    check_expr(program, typed, env, ctx, &lhs, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
-    check_expr(program, typed, env, ctx, &rhs, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr(program, typed, env, ctx, lhs.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr(program, typed, env, ctx, rhs.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprMacroCall(_, args) then
     mut i = 0
     while i < args.len() do
@@ -6792,14 +7130,36 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
   end  end
 end
 
-def check_expr_call(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, callee: Expr, args: Vec[Expr], loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
+def check_expr_call(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, call_node_id: Int, callee: Expr, args: Vec[Expr], loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   check_expr(program, typed, env, ctx, callee, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+  # (audit item 16, next tier): the canonical DMA ownership surface is
+  # recognized by the RESOLVED call target — the DefId carried in
+  # typed.call_targets under THIS call node, joined against the
+  # per-compilation dma_callees table the resolver's module_symbols built
+  # (the module-qualified std::embedded dma_* functions; never the source
+  # spelling, the typed-callee-identity rule). The buffer argument's
+  # ordinary access effect is SKIPPED (the sanctioned op must not trip the
+  # CPU gate); every other argument is applied normally.
+  var dma_op = ""
+  match typed.call_targets.get(call_node_id)
+  when Option::Some(dma_did) then
+    match ctx.dma_callees.get(def_id_numeric(&dma_did))
+    when Option::Some(op_word) then dma_op = op_word.clone()
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+  var start = 0
+  if dma_op.len() > 0 && args.len() > 0 then
+    apply_dma_call(typed, ctx, &dma_op, &args[0], frame, errors)
+    start = 1
+  end
   # The receiver/argument effects are the TYPED access effects recorded by
   # the type checker (typed.access_effects on each argument node) — never
   # re-derived from source names (find_function/find_method were unsound:
   # they returned the FIRST function/method with that name regardless of
   # receiver type, misclassifying conventions).
-  mut i = 0
+  mut i = start
   while i < args.len() do
     let eff = match typed.access_effects.get(args[i].node_id)
     when Option::Some(e) then e
@@ -6876,16 +7236,16 @@ end
 def check_assign_target_subexprs(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, target: Expr, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   match target.kind
   when ExprKind::ExprIndex(base, idx) then
-    check_assign_target_subexprs(program, typed, env, ctx, &base, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
-    check_expr(program, typed, env, ctx, &idx, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_assign_target_subexprs(program, typed, env, ctx, base.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_expr(program, typed, env, ctx, idx.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprFieldAccess(base, _) then
-    check_assign_target_subexprs(program, typed, env, ctx, &base, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_assign_target_subexprs(program, typed, env, ctx, base.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprAccess(inner) then
-    check_assign_target_subexprs(program, typed, env, ctx, &inner, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_assign_target_subexprs(program, typed, env, ctx, inner.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprRawDeref(inner) then
-    check_assign_target_subexprs(program, typed, env, ctx, &inner, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_assign_target_subexprs(program, typed, env, ctx, inner.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when ExprKind::ExprCast(inner, _) then
-    check_assign_target_subexprs(program, typed, env, ctx, &inner, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    check_assign_target_subexprs(program, typed, env, ctx, inner.into_inner(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
   when _ then ()
   end  end
 end
@@ -6903,6 +7263,11 @@ def check_assign_target(program: Program, typed: TypedProgram, inout env: TypeEn
  # boundary: the frame is LocalId-keyed; expr_root_id yields the raw
     # Int semantic id (check_use keeps the Int).
     let lid = tg_compiler::ids::LocalId { id: id }
+    # (audit item 16, next tier): an assignment into a DMA-pinned place is
+    # an ordinary CPU write against the engine — rejected. The gate sits
+    # before the res_frame_has dispatch because DMA-tracked buffer places
+    # (Copy arrays) are not owning locals and have no availability record.
+    check_dma_cpu_use(typed, frame, id, target.span, "write", errors)
     # The target's NON-ROOT sub-expressions (the index expressions of a
     # projected target) are walked here — their call/consume effects must
     # be visible to the state (`arr[consume(r)] = v` consumes r). The root
@@ -7295,11 +7660,26 @@ end
 # The whole-value rejection payload (apply_consume / check_use): the
 # local's recorded state word, the recorded first-consumption locator
 # ("" when none was recorded) and the rejected operation's dense locator.
+# (universal-typed-derivation closure) a capability local (linear value)
+# rejection is a SEMANTIC capability diagnostic: the same site carries the
+# typed CapabilityDiagnosticData (capability class "linear-capability",
+# the local as the subject, the rejected operation word and the state
+# word) — never Option::None. `ownership_site_data` is therefore total
+# over both local kinds; the ownership record still rides resource locals
+# only.
 def ownership_site_data(typed: TypedProgram, env: TypeEnv, frame: ResFrame, id: Int, name: String, op: String, site: Span) -> Option[DiagnosticSemanticData]
   match frame.locals.get(&tg_compiler::ids::LocalId { id: id })
   when Option::Some(ls) then
     if ls.is_capability then
-      Option::None
+      Option::Some(DiagnosticSemanticData::Capability(CapabilityDiagnosticData {
+        capability: "linear-capability".to_string(),
+        subject: name.clone(),
+        operation: op.clone(),
+        state_before: ownership_state_word(ls.availability),
+        fact: "capability `" + name.clone() + "` rejected operation `" + op.clone() +
+          "` in state " + ownership_state_word(ls.availability) +
+          " at " + span_site_label(site)
+      }))
     else
       var csite = ""
       match ls.consumed_at
@@ -7319,16 +7699,43 @@ def ownership_site_data(typed: TypedProgram, env: TypeEnv, frame: ResFrame, id: 
   end  end
 end
 
+# (audit item 16, next tier) The DMA rejection payload: the typed
+# OwnershipDiagnosticData record with the DMA state word as state_before
+# ("dma:<word>"), the rejected operation word (the CPU operation for a
+# pinned-use rejection, or the canonical op for a transition rejection)
+# and the pin site as the derivation chain's consume_site. type_id stays
+# "" — the DMA gate runs without an env at the assignment/consume sites
+# (the empty type render is the documented absence, never a fabrication).
+def dma_ownership_diagnostic_data(state: ResourceDmaState, name: String, op: String, site_text: String) -> Option[DiagnosticSemanticData]
+  Option::Some(DiagnosticSemanticData::Ownership(OwnershipDiagnosticData {
+    place: name,
+    state_before: "dma:" + resource_dma_state_word(state),
+    operation: op,
+    consume_site: site_text.clone(),
+    use_site: site_text,
+    type_id: ""
+  }))
+end
+
 # The moved-out chain-read rejection payload (the partial-move sites): the
 # state word is the CHAIN's effective state (the root may still be live),
 # the read site is the rejected chain read's dense locator. The frame's
 # lattice does not record where the chain was moved out, so consume_site
-# stays "".
+# stays "". (universal-typed-derivation closure) a capability local's
+# rejected chain read carries the typed CapabilityDiagnosticData, never
+# Option::None.
 def ownership_chain_read_data(typed: TypedProgram, env: TypeEnv, frame: ResFrame, id: Int, eff: ResourceState, expr: Expr) -> Option[DiagnosticSemanticData]
   match frame.locals.get(&tg_compiler::ids::LocalId { id: id })
   when Option::Some(ls) then
     if ls.is_capability then
-      Option::None
+      Option::Some(DiagnosticSemanticData::Capability(CapabilityDiagnosticData {
+        capability: "linear-capability".to_string(),
+        subject: binding_name(typed, id),
+        operation: "read".to_string(),
+        state_before: ownership_state_word(eff),
+        fact: "capability `" + binding_name(typed, id) + "` rejected a chain read in state " +
+          ownership_state_word(eff) + " at " + span_site_label(expr.span)
+      }))
     else
       Option::Some(DiagnosticSemanticData::Ownership(OwnershipDiagnosticData {
         place: binding_name(typed, id),
@@ -7343,11 +7750,116 @@ def ownership_chain_read_data(typed: TypedProgram, env: TypeEnv, frame: ResFrame
   end  end
 end
 
+# ———————————————————————————————————————————————————————————————
+# (audit item 16, next tier) The DMA ownership gate + transition
+# ———————————————————————————————————————————————————————————————
+# check_dma_cpu_use — THE CPU-access gate: called at every ordinary use
+# of a place root (reads through check_use, whole-value consumes,
+# assignment targets, initialization and the scope boundary). A place
+# whose DMA state is pinned-read/pinned-write/pinned-readwrite is
+# device-owned: the operation is rejected with the typed derivation chain
+# (the pin op + site from the lattice record). NotPinned / Returns /
+# untracked places pass.
+def check_dma_cpu_use(typed: TypedProgram, frame: ResFrame, id: Int, span: Span, op: String, inout errors: Vec[ResourceError]) -> Unit
+  let lid = tg_compiler::ids::LocalId { id: id }
+  match frame.dma.get(&lid)
+  when Option::Some(rec) then
+    if resource_dma_state_pinned(rec.state) then
+      let name = binding_name(typed, id)
+      var rows = Vec::new()
+      rows.push("`" + name.clone() + "` DMA state chain: not-pinned -> " + resource_dma_state_word(rec.state) + " at " + rec.site.clone() + " (" + resource_dma_op_display(rec.op.clone()) + ")")
+      rows.push("rejected at " + span_site_label(span) + ": " + op + " while the buffer is DMA-" + resource_dma_state_word(rec.state))
+      rows.push("sanctioned transition: dma_await(buf) then dma_unpin(buf)")
+      errors.push(ResourceError {
+        message: "use of DMA-pinned `" + name.clone() + "`: the buffer is " + resource_dma_state_word(rec.state) + " (call dma_await then dma_unpin before CPU access)",
+        span: span.clone(),
+        primary_symbol: Option::Some(name.clone()),
+        semantic_site: Option::Some("ownership analysis (DMA ownership)"),
+        ownership_trace: rows,
+        semantic_data: dma_ownership_diagnostic_data(rec.state, name.clone(), op, span_site_label(span))
+      })
+    end
+  when Option::None then ()
+  end
+end
+
+# apply_dma_call — the canonical DMA op commit site (check_expr_call's
+# interception of the std::embedded dma_* calls): looks the buffer's place
+# root up, applies the ONE pure transition rule and either commits the
+# new lattice state + emits the ResourceDmaFact, or emits the typed
+# rejection. The ordinary argument effect for the buffer argument is
+# SKIPPED by the caller (the sanctioned op must not trip the CPU gate);
+# the remaining arguments are applied normally.
+def apply_dma_call(typed: TypedProgram, inout ctx: AnalysisContext, op: String, arg: Expr, inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
+  let span = arg.span
+  match expr_root_id(typed, arg)
+  when Option::Some(id) then
+    let lid = tg_compiler::ids::LocalId { id: id }
+    let cur = res_frame_dma_get(frame, lid)
+    let name = binding_name(typed, id)
+    var prior_site = ""
+    var prior_op = ""
+    match frame.dma.get(&lid)
+    when Option::Some(rec) then
+      prior_site = rec.site.clone()
+      prior_op = rec.op.clone()
+    when Option::None then ()
+    end
+    match resource_dma_transition(op, cur)
+    when DmaTransition::Commit(next) then
+      res_frame_dma_set(&mut frame, lid, next, op.clone(), span_site_label(span))
+      ctx.dma_facts.push(ResourceDmaFact {
+        function: ctx.current_owner_key.clone(),
+        place: name.clone(),
+        state: resource_dma_state_word(next),
+        op: op.clone(),
+        site: span_site_label(span)
+      })
+    when DmaTransition::Reject(reason) then
+      var message = "rejected DMA operation `" + resource_dma_op_display(op.clone()) + "` on `" + name.clone() + "`"
+      var rows = Vec::new()
+      if reason == "double-pin" then
+        message = "cannot pin `" + name.clone() + "` for DMA: the buffer is already DMA-owned (" + resource_dma_state_word(cur) + " since " + prior_site.clone() + " by " + resource_dma_op_display(prior_op.clone()) + ") [double pin]"
+        rows.push("`" + name.clone() + "` DMA state chain: not-pinned -> " + resource_dma_state_word(cur) + " at " + prior_site.clone() + " (" + resource_dma_op_display(prior_op.clone()) + ")")
+        rows.push("rejected at " + span_site_label(span) + ": a second dma_pin_* while the buffer is still DMA-owned (double pin)")
+      elsif reason == "await-without-pin" then
+        message = "cannot await `" + name.clone() + "`: no DMA transfer is in flight on the buffer (dma_await without a dma_pin_*)"
+        rows.push("`" + name.clone() + "` DMA state chain: " + resource_dma_state_word(cur) + " (no in-flight transfer)")
+        rows.push("rejected at " + span_site_label(span) + ": dma_await without a preceding dma_pin_*")
+      else
+        message = "cannot unpin `" + name.clone() + "`: the buffer is not DMA-owned (dma_unpin without a dma_pin_*)"
+        rows.push("`" + name.clone() + "` DMA state chain: " + resource_dma_state_word(cur) + " (nothing pinned)")
+        rows.push("rejected at " + span_site_label(span) + ": dma_unpin without a preceding dma_pin_*")
+      end
+      errors.push(ResourceError {
+        message: message,
+        span: span.clone(),
+        primary_symbol: Option::Some(name.clone()),
+        semantic_site: Option::Some("ownership analysis (DMA ownership)"),
+        ownership_trace: rows,
+        semantic_data: dma_ownership_diagnostic_data(cur, name.clone(), reason, span_site_label(span))
+      })
+    end
+  when Option::None then
+    errors.push(ResourceError {
+      message: "`" + resource_dma_op_display(op.clone()) + "` requires a buffer place: the DMA state is keyed on the first argument's place root (a local, a field/index projection or an access expression)",
+      span: span.clone(),
+      semantic_site: Option::Some("ownership analysis (DMA ownership)")
+    })
+  end
+end
+
 def apply_consume(inout env: TypeEnv, typed: TypedProgram, id: Int, span: Span, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
  # boundary: the id is the raw Int semantic id (loop_outer and
   # binding_name are Int-keyed); the frame is LocalId-keyed.
   let lid = tg_compiler::ids::LocalId { id: id }
   let name = binding_name(typed, id)
+  # (audit item 16, next tier): a DMA-pinned place is device-owned — a
+  # move/consume of it is an ordinary CPU use and is rejected. The
+  # sanctioned dma_await/dma_unpin path bypasses this gate (apply_dma_call
+  # commits the transition with the buffer argument's ordinary effect
+  # skipped).
+  check_dma_cpu_use(typed, frame, id, span.clone(), "move", errors)
   # Permission enforcement: only locals that OWN their value (sink params,
   # owned locals) may be consumed. let params are read-only and inout params
   # may be modified but never consumed/escaped — a sink operation on them is
@@ -7473,6 +7985,9 @@ end
 # replaces. The state still commits Live after an error (the analysis
 # continues with the store the program asked for), mirroring apply_consume.
 def apply_set(typed: TypedProgram, inout frame: ResFrame, id: tg_compiler::ids::LocalId, span: Span, inout errors: Vec[ResourceError]) -> Unit
+  # (audit item 16, next tier): a callee INITIALIZING a DMA-pinned place
+  # would write device-owned storage — ordinary CPU mutation, rejected.
+  check_dma_cpu_use(typed, frame, id.id, span.clone(), "initialization", errors)
   # (partial moves — the whole-value boundary): a whole-root Initialize of
   # a partially-moved root would overwrite the live fields without
   # destroying their values (and the dead chains' storage) — conservative
@@ -7504,6 +8019,11 @@ def check_use(inout env: TypeEnv, typed: TypedProgram, id: Int, span: Span, fram
   # boundary: check_use keeps the raw Int semantic id (callers derive it
   # from expr_root_id / ident_resolutions); the frame is LocalId-keyed.
   let use_name = binding_name(typed, id)
+  # (audit item 16, next tier): every ordinary read of a DMA-pinned place
+  # is a concurrent CPU access against the engine — rejected before the
+  # availability checks (the DMA state is an independent dimension). The
+  # sanctioned dma_await/dma_unpin path never routes through check_use.
+  check_dma_cpu_use(typed, frame, id, span.clone(), "read", errors)
   match res_frame_get(frame, &tg_compiler::ids::LocalId { id: id })
   when Option::Some(ResourceState::Consumed) then
     errors.push(ResourceError {
@@ -7683,6 +8203,31 @@ def exit_scope(inout frame: ResFrame, entry_names: Vec[tg_compiler::ids::LocalId
       end
     end
   end
+  # (audit item 16, next tier) The DMA ownership scope boundary: a place
+  # that is still DMA-pinned when its declaring scope exits leaves
+  # device-owned storage behind (and the compiler cannot close the pin) —
+  # reject. The `returns` state is CPU-owned and may leave the scope; only
+  # the unpin bookkeeping stays open. The loop is separate from the
+  # locals loop above because DMA state tracks Copy buffer places the
+  # owning-only locals map never registers.
+  for (did, drec) in frame.dma do
+    if !entry_names.contains(&did) then
+      if resource_dma_state_pinned(drec.state) then
+        let dma_name = binding_name(typed, did.id)
+        var dma_rows = Vec::new()
+        dma_rows.push("`" + dma_name.clone() + "` DMA state chain: not-pinned -> " + resource_dma_state_word(drec.state) + " at " + drec.site.clone() + " (" + resource_dma_op_display(drec.op.clone()) + ")")
+        dma_rows.push("rejected at scope exit: a DMA-pinned buffer must be awaited and unpinned before its scope exits")
+        errors.push(ResourceError {
+          message: "DMA-pinned `" + dma_name.clone() + "` leaves scope while still " + resource_dma_state_word(drec.state) + ": call dma_await then dma_unpin before the scope exits",
+          span: frame_span(frame, did),
+          primary_symbol: Option::Some(dma_name.clone()),
+          semantic_site: Option::Some("ownership analysis (DMA ownership)"),
+          ownership_trace: dma_rows,
+          semantic_data: dma_ownership_diagnostic_data(drec.state, dma_name.clone(), "scope-exit", drec.site.clone())
+        })
+      end
+    end
+  end
   mut i = 0
   while i < to_forget.len() do
     res_frame_forget(frame, &to_forget[i])
@@ -7707,12 +8252,39 @@ end
 def res_frame_new() -> ResFrame
   ResFrame {
     locals: Map::new(),
-    place_moves: Map::new()
+    place_moves: Map::new(),
+    dma: Map::new()
   }
 end
 
 def res_frame_has(frame: ResFrame, id: tg_compiler::ids::LocalId) -> Bool
   frame.locals.contains_key(id)
+end
+
+# ———————————————————————————————————————————————————————————————
+# (audit item 16, next tier) The DMA lattice accessors — the ONE place
+# DMA state is read/written (the frame's `dma` map). An absent entry is
+# NotPinned; NotPinned is never stored (the map records deviations only,
+# the place_moves convention).
+# ———————————————————————————————————————————————————————————————
+
+def res_frame_dma_get(frame: ResFrame, id: tg_compiler::ids::LocalId) -> ResourceDmaState
+  match frame.dma.get(id)
+  when Option::Some(rec) then rec.state
+  when Option::None then ResourceDmaState::NotPinned
+  end
+end
+
+def res_frame_dma_set(inout frame: ResFrame, id: tg_compiler::ids::LocalId, state: ResourceDmaState, op: String, site: String) -> Unit
+  if state == ResourceDmaState::NotPinned then
+    frame.dma.remove(id)
+  else
+    frame.dma.insert(id, DmaPlaceRecord { state: state, op: op, site: site })
+  end
+end
+
+def res_frame_dma_remove(inout frame: ResFrame, id: tg_compiler::ids::LocalId) -> Unit
+  frame.dma.remove(id)
 end
 
 def res_frame_get_origin(frame: ResFrame, id: tg_compiler::ids::LocalId) -> Option[ParamOrigin]
@@ -7803,7 +8375,7 @@ def place_projection_keys(typed: TypedProgram, expr: Expr, inout out: Vec[Projec
   match expr.kind
   when ExprKind::ExprIdent(_) then true
   when ExprKind::ExprFieldAccess(base, _) then
-    if !place_projection_keys(typed, &base, out) then
+    if !place_projection_keys(typed, base.into_inner(), out) then
       return false
     end
     match typed.field_targets.get(expr.node_id)
@@ -7823,15 +8395,18 @@ def place_projection_keys(typed: TypedProgram, expr: Expr, inout out: Vec[Projec
       end
     end
   when ExprKind::ExprIndex(base, idx) then
-    if !place_projection_keys(typed, &base, out) then
+    # The base/index payloads are OWNED Box[Expr]s: unbox each exactly once.
+    let base_expr = base.into_inner()
+    let idx_expr = idx.into_inner()
+    if !place_projection_keys(typed, &base_expr, out) then
       return false
     end
     # The per-index lattice: a CONSTANT index over a FIXED-ARRAY base
     # tracks the element individually (the finite indices); a dynamic
     # index (or a non-fixed-array base) stays the whole-value lattice.
-    match typed_const_index(typed, &idx)
+    match typed_const_index(typed, &idx_expr)
     when Option::Some(ci) then
-      match typed_expr_ty(typed, &base)
+      match typed_expr_ty(typed, &base_expr)
       when Option::Some(bt) then
         match bt
         when Type::FixedArray(_, n) then
@@ -7855,12 +8430,12 @@ def place_projection_keys(typed: TypedProgram, expr: Expr, inout out: Vec[Projec
       false
     end
   when ExprKind::ExprRawDeref(inner) then
-    if !place_projection_keys(typed, &inner, out) then
+    if !place_projection_keys(typed, inner.into_inner(), out) then
       return false
     end
     false
-  when ExprKind::ExprAccess(inner) then place_projection_keys(typed, &inner, out)
-  when ExprKind::ExprCast(inner, _) then place_projection_keys(typed, &inner, out)
+  when ExprKind::ExprAccess(inner) then place_projection_keys(typed, inner.into_inner(), out)
+  when ExprKind::ExprCast(inner, _) then place_projection_keys(typed, inner.into_inner(), out)
   when _ then false
   end  end
 end
@@ -8130,10 +8705,10 @@ def rhs_scan_expr(typed: TypedProgram, expr: Expr, in_chain: Bool, lid: Int, cha
           end
         end
       when Option::None then
-        rhs_scan_expr(typed, &base, false, lid, chain, &mut found)
+        rhs_scan_expr(typed, base.into_inner(), false, lid, chain, &mut found)
       end
     else
-      rhs_scan_expr(typed, &base, true, lid, chain, &mut found)
+      rhs_scan_expr(typed, base.into_inner(), true, lid, chain, &mut found)
     end
   when ExprKind::ExprIndex(base, idx) then
     # Same spine rule; the INDEX expression is an operand position of its
@@ -8151,16 +8726,16 @@ def rhs_scan_expr(typed: TypedProgram, expr: Expr, in_chain: Bool, lid: Int, cha
           end
         end
       when Option::None then
-        rhs_scan_expr(typed, &base, false, lid, chain, &mut found)
+        rhs_scan_expr(typed, base.into_inner(), false, lid, chain, &mut found)
       end
     else
-      rhs_scan_expr(typed, &base, true, lid, chain, &mut found)
+      rhs_scan_expr(typed, base.into_inner(), true, lid, chain, &mut found)
     end
-    rhs_scan_expr(typed, &idx, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, idx.into_inner(), false, lid, chain, &mut found)
   when ExprKind::ExprAccess(inner) then
-    rhs_scan_place_spine(typed, expr, &inner, in_chain, lid, chain, &mut found)
+    rhs_scan_place_spine(typed, expr, inner.into_inner(), in_chain, lid, chain, &mut found)
   when ExprKind::ExprCast(inner, _) then
-    rhs_scan_place_spine(typed, expr, &inner, in_chain, lid, chain, &mut found)
+    rhs_scan_place_spine(typed, expr, inner.into_inner(), in_chain, lid, chain, &mut found)
   when ExprKind::ExprRawDeref(inner) then
     # A deref operand is the whole-value boundary: an operand rooted at
     # `lid` cannot be proven disjoint from the destroyed chain — the
@@ -8174,14 +8749,14 @@ def rhs_scan_expr(typed: TypedProgram, expr: Expr, in_chain: Bool, lid: Int, cha
       when Option::None then ()
       end
     end
-    rhs_scan_expr(typed, &inner, true, lid, chain, &mut found)
+    rhs_scan_expr(typed, inner.into_inner(), true, lid, chain, &mut found)
   when ExprKind::ExprBinaryOp(_, lhs, rhs) then
-    rhs_scan_expr(typed, &lhs, false, lid, chain, &mut found)
-    rhs_scan_expr(typed, &rhs, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, lhs.into_inner(), false, lid, chain, &mut found)
+    rhs_scan_expr(typed, rhs.into_inner(), false, lid, chain, &mut found)
   when ExprKind::ExprUnaryOp(_, operand) then
-    rhs_scan_expr(typed, &operand, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, operand.into_inner(), false, lid, chain, &mut found)
   when ExprKind::ExprTypeCheck(inner, _) then
-    rhs_scan_expr(typed, &inner, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, inner.into_inner(), false, lid, chain, &mut found)
   when ExprKind::ExprArrayLit(elems) then
     var ai = 0
     while ai < elems.len() do
@@ -8189,8 +8764,8 @@ def rhs_scan_expr(typed: TypedProgram, expr: Expr, in_chain: Bool, lid: Int, cha
       ai = ai + 1
     end
   when ExprKind::ExprArrayRepeat(elem, count) then
-    rhs_scan_expr(typed, &elem, false, lid, chain, &mut found)
-    rhs_scan_expr(typed, &count, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, elem.into_inner(), false, lid, chain, &mut found)
+    rhs_scan_expr(typed, count.into_inner(), false, lid, chain, &mut found)
   when ExprKind::ExprTupleLit(elems) then
     var ti = 0
     while ti < elems.len() do
@@ -8211,14 +8786,14 @@ def rhs_scan_expr(typed: TypedProgram, expr: Expr, in_chain: Bool, lid: Int, cha
       pi = pi + 1
     end
   when ExprKind::ExprCall(callee, args) then
-    rhs_scan_expr(typed, &callee, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, callee.into_inner(), false, lid, chain, &mut found)
     var ci2 = 0
     while ci2 < args.len() do
       rhs_scan_expr(typed, &args[ci2], false, lid, chain, &mut found)
       ci2 = ci2 + 1
     end
   when ExprKind::ExprMethodCall(receiver, _, _, args) then
-    rhs_scan_expr(typed, &receiver, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, receiver.into_inner(), false, lid, chain, &mut found)
     var mi = 0
     while mi < args.len() do
       rhs_scan_expr(typed, &args[mi], false, lid, chain, &mut found)
@@ -8237,7 +8812,7 @@ def rhs_scan_expr(typed: TypedProgram, expr: Expr, in_chain: Bool, lid: Int, cha
       mi2 = mi2 + 1
     end
   when ExprKind::ExprClosure(_, _, body) then
-    rhs_scan_expr(typed, &body, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, body.into_inner(), false, lid, chain, &mut found)
   when ExprKind::ExprIf(if_stmt) then
     rhs_scan_expr(typed, &if_stmt.cond, false, lid, chain, &mut found)
     rhs_scan_block(typed, &if_stmt.then_block, lid, chain, &mut found)
@@ -8271,24 +8846,24 @@ def rhs_scan_expr(typed: TypedProgram, expr: Expr, in_chain: Bool, lid: Int, cha
   when ExprKind::ExprComptime(block) then
     rhs_scan_block(typed, &block, lid, chain, &mut found)
   when ExprKind::ExprAwait(inner) then
-    rhs_scan_expr(typed, &inner, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, inner.into_inner(), false, lid, chain, &mut found)
   when ExprKind::ExprTry(inner) then
-    rhs_scan_expr(typed, &inner, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, inner.into_inner(), false, lid, chain, &mut found)
   when ExprKind::ExprRange(start, end_, _) then
     match start
-    when Option::Some(s) then rhs_scan_expr(typed, &s, false, lid, chain, &mut found)
+    when Option::Some(s) then rhs_scan_expr(typed, s.into_inner(), false, lid, chain, &mut found)
     when Option::None then ()
     end
     match end_
-    when Option::Some(e) then rhs_scan_expr(typed, &e, false, lid, chain, &mut found)
+    when Option::Some(e) then rhs_scan_expr(typed, e.into_inner(), false, lid, chain, &mut found)
     when Option::None then ()
     end
   when ExprKind::ExprAssign(target2, value2) then
-    rhs_scan_expr(typed, &target2, false, lid, chain, &mut found)
-    rhs_scan_expr(typed, &value2, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, target2.into_inner(), false, lid, chain, &mut found)
+    rhs_scan_expr(typed, value2.into_inner(), false, lid, chain, &mut found)
   when ExprKind::ExprPipe(lhs2, rhs2) then
-    rhs_scan_expr(typed, &lhs2, false, lid, chain, &mut found)
-    rhs_scan_expr(typed, &rhs2, false, lid, chain, &mut found)
+    rhs_scan_expr(typed, lhs2.into_inner(), false, lid, chain, &mut found)
+    rhs_scan_expr(typed, rhs2.into_inner(), false, lid, chain, &mut found)
   when _ then ()
   end  end
 end
@@ -8455,6 +9030,11 @@ def res_frame_forget(inout frame: ResFrame, id: tg_compiler::ids::LocalId) -> Un
   # The per-field lattice entry dies with the local (a forgotten root has
   # no drop site that could consult its chains).
   frame.place_moves.remove(id)
+  # The DMA lattice entry dies with the local. A pinned place that reaches
+  # this point already fails the scope boundary (exit_scope's pinned check)
+  # BEFORE the forget loop runs, so removal cannot silently drop a live
+  # device-owned state.
+  frame.dma.remove(id)
 end
 
 def res_frame_names_clone(frame: ResFrame) -> Vec[tg_compiler::ids::LocalId]
@@ -8483,6 +9063,11 @@ def res_frame_clone(frame: ResFrame) -> ResFrame
       ext.insert(ProjectionChain { keys: ch.keys.clone() }, st)
     end
     out.place_moves.insert(rid, ext)
+  end
+  # The DMA lattice travels with the frame (a pinned place must stay
+  # pinned across branch clones).
+  for (did, rec) in frame.dma do
+    out.dma.insert(did, DmaPlaceRecord { state: rec.state, op: rec.op.clone(), site: rec.site.clone() })
   end
   out
 end
@@ -8519,6 +9104,17 @@ def res_frame_equal(a: ResFrame, b: ResFrame) -> Bool
     when Option::None then return false
     end
   end
+  # The DMA lattice participates in frame equality through its STATE only
+  # (op/site are provenance metadata, the span rule): a pin/unpin
+  # divergence must re-merge like any other state divergence.
+  if a.dma.len() != b.dma.len() then return false end
+  for (did, rec) in a.dma do
+    match b.dma.get(did)
+    when Option::Some(rec_b) then
+      if !(rec.state == rec_b.state) then return false end
+    when Option::None then return false
+    end
+  end
   true
 end
 
@@ -8536,6 +9132,10 @@ def frame_assign(inout dst: ResFrame, src: ResFrame) -> Unit
       ext.insert(ProjectionChain { keys: ch.keys.clone() }, st)
     end
     dst.place_moves.insert(rid, ext)
+  end
+  dst.dma.clear()
+  for (did, rec) in src.dma do
+    dst.dma.insert(did, DmaPlaceRecord { state: rec.state, op: rec.op.clone(), site: rec.site.clone() })
   end
 end
 
@@ -8694,6 +9294,50 @@ def merge_frames(arms: Vec[ResFrame]) -> ResFrame
     end
     ri = ri + 1
   end
+  # (DMA ownership): the dma lattice join — the union of every arm's DMA
+  # keys; an arm without an entry contributes NotPinned. The merged state
+  # is the conservative resource_dma_state_join fold (any pinned arm keeps
+  # the place device-owned; two differently-pinned arms join to the
+  # read+write union). A NotPinned result stores nothing.
+  var dma_union: Vec[tg_compiler::ids::LocalId] = Vec::new()
+  mut a5 = 0
+  while a5 < arms.len() do
+    for (did5, _) in arms[a5].dma do
+      if !dma_union.contains(&did5) then
+        dma_union.push(did5)
+      end
+    end
+    a5 = a5 + 1
+  end
+  var di5 = 0
+  while di5 < dma_union.len() do
+    let did = dma_union[di5]
+    var merged = ResourceDmaState::NotPinned
+    var merged_op = ""
+    var merged_site = ""
+    mut a6 = 0
+    while a6 < arms.len() do
+      let st6 = res_frame_dma_get(&arms[a6], &did)
+      if st6 != ResourceDmaState::NotPinned then
+        if merged == ResourceDmaState::NotPinned then
+          # The first pinned arm's provenance metadata is authoritative
+          # (site/op are diagnostics-only, the span rule).
+          match arms[a6].dma.get(did)
+          when Option::Some(rec6) then
+            merged_op = rec6.op.clone()
+            merged_site = rec6.site.clone()
+          when Option::None then ()
+          end
+        end
+        merged = resource_dma_state_join(merged, st6)
+      end
+      a6 = a6 + 1
+    end
+    if merged != ResourceDmaState::NotPinned then
+      res_frame_dma_set(&mut out, did, merged, merged_op, merged_site)
+    end
+    di5 = di5 + 1
+  end
   out
 end
 
@@ -8786,11 +9430,11 @@ def expr_root_id(typed: TypedProgram, expr: Expr) -> Option[Int]
     when Option::Some(l) then Option::Some(l)
     when Option::None then Option::None
     end
-  when ExprKind::ExprFieldAccess(base, _) then expr_root_id(typed, &base)
-  when ExprKind::ExprIndex(base, _) then expr_root_id(typed, &base)
-  when ExprKind::ExprRawDeref(inner) then expr_root_id(typed, &inner)
-  when ExprKind::ExprAccess(inner) then expr_root_id(typed, &inner)
-  when ExprKind::ExprCast(inner, _) then expr_root_id(typed, &inner)
+  when ExprKind::ExprFieldAccess(base, _) then expr_root_id(typed, base.into_inner())
+  when ExprKind::ExprIndex(base, _) then expr_root_id(typed, base.into_inner())
+  when ExprKind::ExprRawDeref(inner) then expr_root_id(typed, inner.into_inner())
+  when ExprKind::ExprAccess(inner) then expr_root_id(typed, inner.into_inner())
+  when ExprKind::ExprCast(inner, _) then expr_root_id(typed, inner.into_inner())
   when _ then Option::None
   end  end
 end
@@ -8798,8 +9442,8 @@ end
 def expr_is_plain(expr: Expr) -> Bool
   match expr.kind
   when ExprKind::ExprIdent(_) then true
-  when ExprKind::ExprAccess(inner) then expr_is_plain(&inner)
-  when ExprKind::ExprCast(inner, _) then expr_is_plain(&inner)
+  when ExprKind::ExprAccess(inner) then expr_is_plain(inner.into_inner())
+  when ExprKind::ExprCast(inner, _) then expr_is_plain(inner.into_inner())
   when _ then false
   end  end
 end
@@ -9023,4 +9667,80 @@ def convention_effect(c: AccessConvention) -> AccessEffect
   when AccessConvention::Sink then AccessEffect::Consume
   when AccessConvention::Set then AccessEffect::Initialize
   end  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# (audit item 16, next tier) The DMA ownership lane check
+# ———————————————————————————————————————————————————————————————
+# Pure self-check of the domain's decisions that need no program
+# compilation: the canonical op table (module-qualified identity), the ONE
+# transition rule and the conservative flow join. The lane returns the
+# mismatches (empty = pass) — the mir_alias_facts_lane_check convention.
+
+def dma_lane_expect_transition(inout out: Vec[String], name: String, op: String, from: ResourceDmaState, commit: Bool, expected: String) -> Unit
+  match resource_dma_transition(op, from)
+  when DmaTransition::Commit(next) then
+    if !commit then
+      out.push(name + ": expected rejection " + expected + ", got commit " + resource_dma_state_word(next))
+    elsif resource_dma_state_word(next) != expected then
+      out.push(name + ": expected commit " + expected + ", got " + resource_dma_state_word(next))
+    end
+  when DmaTransition::Reject(reason) then
+    if commit then
+      out.push(name + ": expected commit " + expected + ", got rejection " + reason)
+    elsif reason != expected then
+      out.push(name + ": expected rejection " + expected + ", got " + reason)
+    end
+  end
+end
+
+def dma_lane_expect_state(inout out: Vec[String], name: String, got: ResourceDmaState, expected: ResourceDmaState) -> Unit
+  if got != expected then
+    out.push(name + ": expected " + resource_dma_state_word(expected) + ", got " + resource_dma_state_word(got))
+  end
+end
+
+def dma_lane_expect_word(inout out: Vec[String], name: String, op_name: String, expected: String) -> Unit
+  let got = resource_dma_op_of_qualified_name(op_name)
+  if got != expected then
+    out.push(name + ": expected op word `" + expected + "`, got `" + got + "`")
+  end
+end
+
+pub def dma_ownership_lane_check() -> Vec[String]
+  var out = Vec::new()
+  # The canonical op table: the module-qualified symbol identity only.
+  dma_lane_expect_word(&mut out, "qualified pin-read", "std::embedded::dma_pin_read", "dma-pin-read")
+  dma_lane_expect_word(&mut out, "qualified pin-write", "std::embedded::dma_pin_write", "dma-pin-write")
+  dma_lane_expect_word(&mut out, "qualified pin-read-write", "std::embedded::dma_pin_read_write", "dma-pin-read-write")
+  dma_lane_expect_word(&mut out, "qualified await", "std::embedded::dma_await", "dma-await")
+  dma_lane_expect_word(&mut out, "qualified unpin", "std::embedded::dma_unpin", "dma-unpin")
+  dma_lane_expect_word(&mut out, "foreign module pin", "user::embedded::dma_pin_read", "")
+  dma_lane_expect_word(&mut out, "lookalike suffix pin", "std::embedded::dma_pin_read_extra", "")
+  dma_lane_expect_word(&mut out, "lookalike prefix pin", "std::embedded::xdma_pin_read", "")
+  # The transition rule.
+  dma_lane_expect_transition(&mut out, "pin read from cpu-owned", "dma-pin-read", ResourceDmaState::NotPinned, true, "pinned-read")
+  dma_lane_expect_transition(&mut out, "pin write from cpu-owned", "dma-pin-write", ResourceDmaState::NotPinned, true, "pinned-write")
+  dma_lane_expect_transition(&mut out, "pin read-write from cpu-owned", "dma-pin-read-write", ResourceDmaState::NotPinned, true, "pinned-readwrite")
+  dma_lane_expect_transition(&mut out, "re-pin after await", "dma-pin-read", ResourceDmaState::Returns, true, "pinned-read")
+  dma_lane_expect_transition(&mut out, "double pin same direction", "dma-pin-read", ResourceDmaState::PinnedRead, false, "double-pin")
+  dma_lane_expect_transition(&mut out, "double pin cross direction", "dma-pin-read", ResourceDmaState::PinnedWrite, false, "double-pin")
+  dma_lane_expect_transition(&mut out, "double pin read-write", "dma-pin-write", ResourceDmaState::PinnedReadWrite, false, "double-pin")
+  dma_lane_expect_transition(&mut out, "await a pinned read", "dma-await", ResourceDmaState::PinnedRead, true, "returns")
+  dma_lane_expect_transition(&mut out, "await a pinned write", "dma-await", ResourceDmaState::PinnedWrite, true, "returns")
+  dma_lane_expect_transition(&mut out, "await a read-write pin", "dma-await", ResourceDmaState::PinnedReadWrite, true, "returns")
+  dma_lane_expect_transition(&mut out, "await without pin", "dma-await", ResourceDmaState::NotPinned, false, "await-without-pin")
+  dma_lane_expect_transition(&mut out, "double await", "dma-await", ResourceDmaState::Returns, false, "await-without-pin")
+  dma_lane_expect_transition(&mut out, "unpin a pinned read", "dma-unpin", ResourceDmaState::PinnedRead, true, "not-pinned")
+  dma_lane_expect_transition(&mut out, "unpin a returns place", "dma-unpin", ResourceDmaState::Returns, true, "not-pinned")
+  dma_lane_expect_transition(&mut out, "unpin without pin", "dma-unpin", ResourceDmaState::NotPinned, false, "unpin-without-pin")
+  # The conservative flow join.
+  dma_lane_expect_state(&mut out, "join cpu-owned + cpu-owned", resource_dma_state_join(ResourceDmaState::NotPinned, ResourceDmaState::NotPinned), ResourceDmaState::NotPinned)
+  dma_lane_expect_state(&mut out, "join cpu-owned + pinned-read", resource_dma_state_join(ResourceDmaState::NotPinned, ResourceDmaState::PinnedRead), ResourceDmaState::PinnedRead)
+  dma_lane_expect_state(&mut out, "join pinned-read + cpu-owned", resource_dma_state_join(ResourceDmaState::PinnedRead, ResourceDmaState::NotPinned), ResourceDmaState::PinnedRead)
+  dma_lane_expect_state(&mut out, "join pinned-read + pinned-write", resource_dma_state_join(ResourceDmaState::PinnedRead, ResourceDmaState::PinnedWrite), ResourceDmaState::PinnedReadWrite)
+  dma_lane_expect_state(&mut out, "join returns + cpu-owned", resource_dma_state_join(ResourceDmaState::Returns, ResourceDmaState::NotPinned), ResourceDmaState::Returns)
+  dma_lane_expect_state(&mut out, "join returns + pinned-read", resource_dma_state_join(ResourceDmaState::Returns, ResourceDmaState::PinnedRead), ResourceDmaState::PinnedRead)
+  dma_lane_expect_state(&mut out, "join same pinned", resource_dma_state_join(ResourceDmaState::PinnedRead, ResourceDmaState::PinnedRead), ResourceDmaState::PinnedRead)
+  out
 end

@@ -63,10 +63,10 @@
 use std::core::{Option}
 use std::collections::{Vec, Map}
 use tg_compiler::ids::{StableDigest, StableDefId, DefKind}
-use tg_compiler::stable_ids::{StableContractId, StableUnsafeSiteId, StableMirBlockId, StableMirEdgeId, StableEffectSiteId, StableMirNodeId, StableDeclId, StableTestId}
+use tg_compiler::stable_ids::{StableContractId, StableUnsafeSiteId, StableMirBlockId, StableMirEdgeId, StableEffectSiteId, StableMirNodeId, StableDeclId, StableTestId, StablePlaceId, StableMirStmtId}
 use tg_compiler::ast::{AccessConvention, AstContractKind}
 use tg_compiler::token::{Span}
-use tg_compiler::types::{EffectSummary, CapabilityId}
+use tg_compiler::types::{EffectSummary, CapabilityId, AllocSizeClass}
 
 # ———————————————————————————————————————————————————————————————
 # Target identity
@@ -142,6 +142,24 @@ impl Clone for StableTargetId
 end
 
 # ———————————————————————————————————————————————————————————————
+# SemanticTargetId — the typed ENTITY target (repair-candidate targets)
+# ———————————————————————————————————————————————————————————————
+# The typed subject id a semantic operation names: a declaration identity,
+# a place identity or a MIR statement identity. (repair-candidates-as-
+# semantic-operations closure) Unavailable is the TYPED MARKER for "the
+# target has no stable id on this surface yet": a repair candidate whose
+# target cannot be expressed as a stable id carries the marker with the
+# missing kind and the reason word — never a fabricated Decl/Place/MirStmt
+# key. The record lives here (below semantic_edit / repair_candidates) so
+# the repair engine and the §39 v2 protocol share ONE target union.
+pub enum SemanticTargetId
+  Decl(decl: StableDeclId)
+  Place(place: StablePlaceId)
+  MirStmt(stmt: StableMirStmtId)
+  Unavailable(kind: String, reason: String)
+end
+
+# ———————————————————————————————————————————————————————————————
 # SnapshotHeader — the compilation's identity/environment carrier
 # (fourth-audit P1-5a)
 # ———————————————————————————————————————————————————————————————
@@ -195,9 +213,12 @@ end
 # authoritative computed values; kept here so one header record carries
 # the whole digest set); concrete_types / drop_plans / allocation_sites /
 # features digest each new table's canonical sorted row text (the
-# features digest covers feature_set + semantic_options). The writer's
-# finalizer recomputes the record before the revision digest, so a table
-# edit moves both its domain digest and the revision.
+# features digest covers feature_set + semantic_options); the
+# resource_summaries digest (audit order item 8) covers the four
+# per-function resource-summary tables (allocation / stack / blocking /
+# code size) in their fixed family order. The writer's finalizer
+# recomputes the record before the revision digest, so a table edit moves
+# both its domain digest and the revision.
 struct SemanticDomainDigests
   public_api: StableDigest = semantic_digest_zero()
   abi: StableDigest = semantic_digest_zero()
@@ -206,6 +227,11 @@ struct SemanticDomainDigests
   drop_plans: StableDigest = semantic_digest_zero()
   allocation_sites: StableDigest = semantic_digest_zero()
   features: StableDigest = semantic_digest_zero()
+  # (audit order item 8) The per-function resource-summary tables' digest.
+  resource_summaries: StableDigest = semantic_digest_zero()
+  # (audit item 16, next tier) The DMA-ownership table's digest: the
+  # canonical sorted row text of DmaOwnershipFact.
+  dma_ownership: StableDigest = semantic_digest_zero()
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -350,6 +376,19 @@ struct SemanticSnapshot
   concrete_types: Vec[SemanticConcreteType] = Vec::new()
   # (fourth-audit P1-5c) One row per allocating MIR statement/terminator.
   allocation_sites: Vec[SemanticAllocationSite] = Vec::new()
+  # (audit order item 8) The per-function RESOURCE SUMMARIES the change
+  # budget's byte lanes consume: the transitive allocation-byte facts
+  # (AllocationSummary), the max-transitive-stack facts (StackSummary),
+  # the blocking facts (BlockingSummary) and the code-size facts
+  # (CodeSizeSummary), each keyed by the body's mir row key text with
+  # explicit per-fact ProofLevel fields. Populated at snapshot build from
+  # the EXISTING budget derivations (types.tg BudgetDerivations /
+  # mir.tg's mir_budget_derivations_of — never a duplicated analysis);
+  # defaulted empty so every pre-item-8 constructor stays valid.
+  allocation_summaries: Vec[AllocationSummary] = Vec::new()
+  stack_summaries: Vec[StackSummary] = Vec::new()
+  blocking_summaries: Vec[BlockingSummary] = Vec::new()
+  code_size_summaries: Vec[CodeSizeSummary] = Vec::new()
   # (fourth-audit P0-17) The PERSISTED typed drop-plan facts: one row per
   # materialized deinit site of the resource checker's finalize plan (the
   # exact-place masked drops included), keyed by the stable place/drop-site
@@ -359,6 +398,14 @@ struct SemanticSnapshot
   # digest preimage; the §31 delta diffs the table into typed
   # DropPlanDelta rows.
   drop_plans: Vec[DropPlanFact] = Vec::new()
+  # (audit item 16, next tier) The PERSISTED DMA-ownership facts: one row
+  # per committed canonical DMA op (pin/await/unpin) of every function
+  # body, keyed by the function owner key and the buffer's stable place
+  # text. Defaulted empty so every pre-DMA snapshot constructor stays
+  # valid; the writer sorts through semantic_dma_ownership_sort and emits
+  # the rows into the digest preimage; the ownership.dma_state query
+  # answers the per-place state from this table.
+  dma_ownership: Vec[DmaOwnershipFact] = Vec::new()
   # The PERSISTED typed dependency graph (third-audit item 18): the
   # per-family edge rows the builder emits from TYPED finalized state
   # (never from rendered canonical strings) and the extended affected
@@ -1024,6 +1071,111 @@ struct DropPlanFact
   drop_site: String
   conditional_paths: Vec[String] = Vec::new()
   kind: String
+end
+
+# ———————————————————————————————————————————————————————————————
+# DmaOwnershipFact — one per-place DMA-ownership fact (audit item 16,
+# next tier)
+# ———————————————————————————————————————————————————————————————
+# The DMA buffer-ownership domain's persisted row: one row per COMMITTED
+# canonical DMA op (std::embedded's dma_pin_read / dma_pin_write /
+# dma_pin_read_write / dma_await / dma_unpin) in a function body. The row
+# is keyed by the stable place-key TEXT within the subject function (the
+# OwnershipFact/DropPlanFact convention: places have no stable compiler id)
+# and by the function owner key text the resource checker emits. `state`
+# is the state word AFTER the commit; `op` the canonical op word; `site`
+# the commit site label.
+#
+#   not-pinned        — CPU-owned; ordinary CPU access is legal.
+#   pinned-read       — the engine reads the buffer.
+#   pinned-write      — the engine writes the buffer.
+#   pinned-readwrite  — bidirectional DMA owns the buffer.
+#   returns           — the awaited transfer completed; CPU access is
+#                       legal again; dma_unpin closes the bookkeeping.
+#
+# The table is populated from the resource checker's REAL lattice
+# transitions (the ResourceDmaFact rows — never re-inferred from source
+# text), sorted through semantic_dma_ownership_sort and emitted into the
+# snapshot's digest preimage. The ownership.dma_state query answers it
+# per place; ownership.explain renders it as the derivation children.
+struct DmaOwnershipFact
+  function: String      # the owning function's owner key (stable key text)
+  place: String         # canonical place binding text ("buf", "l<ordinal>")
+  state: DmaState       # the state after the committed op
+  op: String            # canonical op word ("dma-pin-read", "dma-await", ...)
+  site: String = ""     # commit site label "<file>:<start>" — provenance only
+end
+
+enum DmaState
+  NotPinned
+  PinnedRead
+  PinnedWrite
+  PinnedReadWrite
+  Returns
+end
+
+def dma_state_word(st: DmaState) -> String
+  match st
+  when DmaState::NotPinned then "not-pinned"
+  when DmaState::PinnedRead then "pinned-read"
+  when DmaState::PinnedWrite then "pinned-write"
+  when DmaState::PinnedReadWrite then "pinned-readwrite"
+  when DmaState::Returns then "returns"
+  end
+end
+
+# The strict word parser (the snapshot row reader): an unknown word is
+# rejected — the table never fabricates a state.
+def dma_state_of_word(w: String) -> Option[DmaState]
+  if w == "not-pinned" then
+    Option::Some(DmaState::NotPinned)
+  elsif w == "pinned-read" then
+    Option::Some(DmaState::PinnedRead)
+  elsif w == "pinned-write" then
+    Option::Some(DmaState::PinnedWrite)
+  elsif w == "pinned-readwrite" then
+    Option::Some(DmaState::PinnedReadWrite)
+  elsif w == "returns" then
+    Option::Some(DmaState::Returns)
+  else
+    Option::None
+  end
+end
+
+# The canonical row text: "<function>|dma|<place>|<state>|<op>|<site>" —
+# the site LAST, so a site containing '|' stays unambiguous (the
+# drop-plan row grammar convention).
+def semantic_dma_ownership_fact_text(f: DmaOwnershipFact) -> String
+  f.function.clone() + "|dma|" + f.place.clone() + "|" + dma_state_word(f.state) + "|" + f.op.clone() + "|" + f.site.clone()
+end
+
+# The canonical fact order: function, place, site, op, then state.
+def semantic_dma_ownership_fact_lt(a: DmaOwnershipFact, b: DmaOwnershipFact) -> Bool
+  if a.function != b.function then
+    a.function < b.function
+  elsif a.place != b.place then
+    a.place < b.place
+  elsif a.site != b.site then
+    a.site < b.site
+  elsif a.op != b.op then
+    a.op < b.op
+  else
+    dma_state_word(a.state) < dma_state_word(b.state)
+  end
+end
+
+def semantic_dma_ownership_sort(inout rows: Vec[DmaOwnershipFact]) -> Unit
+  var i = 1
+  while i < rows.len() do
+    let current = rows[i].clone()
+    var j = i
+    while j > 0 && semantic_dma_ownership_fact_lt(&rows[j - 1], &current) do
+      rows[j] = rows[j - 1].clone()
+      j = j - 1
+    end
+    rows[j] = current
+    i = i + 1
+  end
 end
 
 # The canonical kind WORD of an UnsafeKind (the snapshot/unsafe_text
@@ -2387,6 +2539,356 @@ def semantic_concrete_type_text(c: SemanticConcreteType) -> String
     "|" + c.layout_status.clone() + "|" + c.fields.join(";")
 end
 
+# ———————————————————————————————————————————————————————————————
+# (audit order item 8) THE PER-FUNCTION RESOURCE SUMMARIES — the
+# snapshot/delta carriers the change budget's allocation-byte lane
+# consumes
+# ———————————————————————————————————————————————————————————————
+# The §36 budget's byte lanes verify against ONE authority: the resource
+# facts the compiler's EXISTING budget derivation stack already computes
+# (types.tg AllocSizeClass / HeapSizeAggregate / MaxStackFact /
+# BudgetDerivations; mir.tg's mir_budget_derivations_of and the §11
+# effect scan). The snapshot persists those facts as four per-function
+# rows — never a re-derivation in the consumer, never a rendered string
+# to parse:
+#
+#   AllocationSummary — the transitive P1-7 allocation facts of one
+#     lowered body: max_dynamic_bytes is the finite static heap-byte
+#     bound (the Exact sum / UpperBound total over the reachable sites,
+#     per the four-way lattice), -1 when NO finite bound exists
+#     (Unbounded/Unknown aggregate); bounded_arena_bytes is the same
+#     finite bound restricted to the sites whose operation carries the
+#     §11 arena capability (MirOperationClass::ArenaAllocate — the
+#     typed predicate, never a name scan), -1 when the arena aggregate
+#     has no finite bound; site_count is the reachable allocating-site
+#     count; unbounded_sites lists the SITE KEYS (the P0-7 origin node
+#     keys of the persisted allocation_sites rows) of every reachable
+#     Unbounded/Unknown site, sorted. The byte values are PROOFS/BOUNDS
+#     only when the proof level says so.
+#
+#   StackSummary — frame_bytes (the body's own activation) and
+#     max_stack_bytes (frame + max over direct callees of callee
+#     max_stack + BUDGET_CALL_OVERHEAD_BYTES, the P1-8 max-transitive
+#     analysis); -1 max_stack_bytes when no finite static max-stack
+#     exists (a call cycle without a proven finite recursion bound, or a
+#     callee outside the frame table — fail closed). recursive is the
+#     call-graph cycle status.
+#
+#   BlockingSummary — the §11 Block class (may_block OR may_sleep) of the
+#     function's transitive summary, the direct evidence phrases of the
+#     blocking sites (first-wins per function, unioned over the
+#     reachable call graph), and the unbounded status (a fail-closed
+#     unknown/indirect operation is reachable, so the blocking fact
+#     cannot be refuted statically).
+#
+#   CodeSizeSummary — the emitted/estimated code size where available:
+#     code_size_bytes is the emitter's exact word byte count when
+#     available, else the §44 MIR estimate (2 x statements + 3 x
+#     terminators, x 4 bytes); exact marks the emitted form.
+#
+# PROOF LEVELS: every summary carries explicit ProofLevel fields
+# mirroring the §36 budget classification vocabulary exactly
+# (types.tg budget_classification_*): StaticProof ("static-proof" — the
+# derivation is exact and proves the fact), StaticBound ("static-bound"
+# — the derivation is a documented conservative bound), RuntimeMeasured
+# ("runtime-measured" — no static derivation; the generated frame
+# counter/clock decides), and the summary-only Unavailable
+# ("unavailable" — no producer data for the row; never rendered as a
+# bound). A consumer must NEVER treat a -1 byte field or a
+# RuntimeMeasured/Unavailable level as a finite bound: the change
+# budget's allocation-byte lane fails closed on exactly those.
+enum ProofLevel
+  StaticProof
+  StaticBound
+  RuntimeMeasured
+  Unavailable
+end
+
+# The canonical word of a proof level (the budget classification word
+# vocabulary + "unavailable").
+def semantic_proof_level_word(p: ProofLevel) -> String
+  match p
+  when ProofLevel::StaticProof then "static-proof"
+  when ProofLevel::StaticBound then "static-bound"
+  when ProofLevel::RuntimeMeasured then "runtime-measured"
+  when ProofLevel::Unavailable then "unavailable"
+  end
+end
+
+# The declaration-order discriminant of a proof level (sort/round-trip
+# tiebreaks).
+def semantic_proof_level_numeric(p: ProofLevel) -> Int
+  match p
+  when ProofLevel::StaticProof then 0
+  when ProofLevel::StaticBound then 1
+  when ProofLevel::RuntimeMeasured then 2
+  when ProofLevel::Unavailable then 3
+  end
+end
+
+# The proof level of one P1-7 size class: Exact -> static-proof,
+# UpperBound -> static-bound, Unbounded/Unknown -> runtime-measured (no
+# finite static bound exists; the generated counter decides).
+def semantic_proof_level_of_allocation_class(c: AllocSizeClass) -> ProofLevel
+  match c
+  when AllocSizeClass::Exact(_) then ProofLevel::StaticProof
+  when AllocSizeClass::UpperBound(_) then ProofLevel::StaticBound
+  when AllocSizeClass::Unbounded then ProofLevel::RuntimeMeasured
+  when AllocSizeClass::Unknown then ProofLevel::RuntimeMeasured
+  end
+end
+
+# The proof level of one P1-7 size-class WORD (heap_size_aggregate_class_word:
+# "exact" | "upper-bound" | "unbounded" | "unknown"); an unknown word is
+# Unavailable (fail closed — never silently a proof).
+def semantic_proof_level_of_allocation_class_word(w: String) -> ProofLevel
+  if w == "exact" then
+    ProofLevel::StaticProof
+  elsif w == "upper-bound" then
+    ProofLevel::StaticBound
+  elsif w == "unbounded" || w == "unknown" then
+    ProofLevel::RuntimeMeasured
+  else
+    ProofLevel::Unavailable
+  end
+end
+
+# The proof level of one budget classification word (the types.tg
+# budget_classification_* vocabulary); an unknown word is Unavailable
+# (fail closed — never silently a proof).
+def semantic_proof_level_of_classification_word(w: String) -> ProofLevel
+  if w == "static-proof" then
+    ProofLevel::StaticProof
+  elsif w == "static-bound" then
+    ProofLevel::StaticBound
+  elsif w == "runtime-measured" then
+    ProofLevel::RuntimeMeasured
+  else
+    ProofLevel::Unavailable
+  end
+end
+
+# The per-function transitive allocation facts (see the section doc).
+# function is the owning body's mir row key text — the SAME text the
+# mir_functions/allocation_sites/effect rows carry, so consumers join by
+# identity text.
+struct AllocationSummary
+  function: String
+  max_dynamic_bytes: Int = -1
+  bounded_arena_bytes: Int = -1
+  site_count: Int = 0
+  unbounded_sites: Vec[String] = Vec::new()
+  # The per-fact proof levels: bytes_level for max_dynamic_bytes,
+  # arena_bytes_level for bounded_arena_bytes, sites_level for
+  # site_count + unbounded_sites (one derivation feeds both facts).
+  bytes_level: ProofLevel = ProofLevel::Unavailable
+  arena_bytes_level: ProofLevel = ProofLevel::Unavailable
+  sites_level: ProofLevel = ProofLevel::Unavailable
+end
+
+# The per-function max-transitive-stack facts (see the section doc).
+struct StackSummary
+  function: String
+  frame_bytes: Int = 0
+  max_stack_bytes: Int = -1
+  recursive: Bool = false
+  frame_level: ProofLevel = ProofLevel::Unavailable
+  max_stack_level: ProofLevel = ProofLevel::Unavailable
+end
+
+# The per-function blocking facts (see the section doc).
+struct BlockingSummary
+  function: String
+  blocking: Bool = false
+  blocking_sites: Vec[String] = Vec::new()
+  unbounded: Bool = false
+  level: ProofLevel = ProofLevel::Unavailable
+end
+
+# The per-function code-size facts (see the section doc).
+struct CodeSizeSummary
+  function: String
+  code_size_bytes: Int = 0
+  exact: Bool = false
+  level: ProofLevel = ProofLevel::Unavailable
+end
+
+# The canonical text of one allocation summary — the per-domain digest
+# row grammar (unbounded site keys ';'-joined; node keys carry no ';'):
+# "<function>|<dynamic>|<arena>|<sites>|<bytes-level>|<arena-level>|<sites-level>|<unbounded-sites>".
+def semantic_allocation_summary_text(s: AllocationSummary) -> String
+  s.function.clone() + "|" + s.max_dynamic_bytes.to_string() + "|" +
+    s.bounded_arena_bytes.to_string() + "|" + s.site_count.to_string() + "|" +
+    semantic_proof_level_word(&s.bytes_level) + "|" +
+    semantic_proof_level_word(&s.arena_bytes_level) + "|" +
+    semantic_proof_level_word(&s.sites_level) + "|" +
+    s.unbounded_sites.join(";")
+end
+
+# The canonical text of one stack summary:
+# "<function>|<frame>|<max-stack>|<recursive>|<frame-level>|<max-stack-level>".
+def semantic_stack_summary_text(s: StackSummary) -> String
+  let recursive_word = if s.recursive then "true" else "false" end
+  s.function.clone() + "|" + s.frame_bytes.to_string() + "|" +
+    s.max_stack_bytes.to_string() + "|" + recursive_word + "|" +
+    semantic_proof_level_word(&s.frame_level) + "|" +
+    semantic_proof_level_word(&s.max_stack_level)
+end
+
+# The canonical text of one blocking summary:
+# "<function>|<blocking>|<unbounded>|<level>|<blocking-sites>".
+def semantic_blocking_summary_text(s: BlockingSummary) -> String
+  let blocking_word = if s.blocking then "true" else "false" end
+  let unbounded_word = if s.unbounded then "true" else "false" end
+  s.function.clone() + "|" + blocking_word + "|" + unbounded_word + "|" +
+    semantic_proof_level_word(&s.level) + "|" + s.blocking_sites.join(";")
+end
+
+# The canonical text of one code-size summary:
+# "<function>|<bytes>|<exact>|<level>".
+def semantic_code_size_summary_text(s: CodeSizeSummary) -> String
+  let exact_word = if s.exact then "true" else "false" end
+  s.function.clone() + "|" + s.code_size_bytes.to_string() + "|" +
+    exact_word + "|" + semantic_proof_level_word(&s.level)
+end
+
+# The combined digest text of the four resource-summary tables in their
+# fixed family order (allocation / stack / blocking / code size), each
+# verbatim in row order — the resource_summaries domain digest preimage.
+def semantic_resource_summaries_text(
+  allocation: Vec[AllocationSummary],
+  stack: Vec[StackSummary],
+  blocking: Vec[BlockingSummary],
+  code_size: Vec[CodeSizeSummary]
+) -> String
+  var text = "allocation-summaries:\n"
+  for a in allocation do
+    text = text + semantic_allocation_summary_text(&a) + "\n"
+  end
+  text = text + "stack-summaries:\n"
+  for s in stack do
+    text = text + semantic_stack_summary_text(&s) + "\n"
+  end
+  text = text + "blocking-summaries:\n"
+  for b in blocking do
+    text = text + semantic_blocking_summary_text(&b) + "\n"
+  end
+  text = text + "code-size-summaries:\n"
+  for c in code_size do
+    text = text + semantic_code_size_summary_text(&c) + "\n"
+  end
+  text
+end
+
+# The per-table orders: the function key text (unique per row by
+# construction), then the remaining fields so the order stays total
+# under a duplicate key.
+def semantic_allocation_summary_lt(a: AllocationSummary, b: AllocationSummary) -> Bool
+  if a.function != b.function then
+    a.function < b.function
+  elsif a.max_dynamic_bytes != b.max_dynamic_bytes then
+    a.max_dynamic_bytes < b.max_dynamic_bytes
+  elsif a.bounded_arena_bytes != b.bounded_arena_bytes then
+    a.bounded_arena_bytes < b.bounded_arena_bytes
+  elsif a.site_count != b.site_count then
+    a.site_count < b.site_count
+  elsif a.bytes_level != b.bytes_level then
+    semantic_proof_level_numeric(&a.bytes_level) < semantic_proof_level_numeric(&b.bytes_level)
+  else
+    a.unbounded_sites.join(";") < b.unbounded_sites.join(";")
+  end
+end
+
+def semantic_allocation_summaries_sort(inout rows: Vec[AllocationSummary]) -> Unit
+  var i = 1
+  while i < rows.len() do
+    let current = rows[i].clone()
+    var j = i
+    while j > 0 && semantic_allocation_summary_lt(&rows[j - 1], &current) do
+      rows[j] = rows[j - 1].clone()
+      j = j - 1
+    end
+    rows[j] = current
+    i = i + 1
+  end
+end
+
+def semantic_stack_summary_lt(a: StackSummary, b: StackSummary) -> Bool
+  if a.function != b.function then
+    a.function < b.function
+  elsif a.max_stack_bytes != b.max_stack_bytes then
+    a.max_stack_bytes < b.max_stack_bytes
+  elsif a.frame_bytes != b.frame_bytes then
+    a.frame_bytes < b.frame_bytes
+  else
+    a.recursive && !b.recursive
+  end
+end
+
+def semantic_stack_summaries_sort(inout rows: Vec[StackSummary]) -> Unit
+  var i = 1
+  while i < rows.len() do
+    let current = rows[i].clone()
+    var j = i
+    while j > 0 && semantic_stack_summary_lt(&rows[j - 1], &current) do
+      rows[j] = rows[j - 1].clone()
+      j = j - 1
+    end
+    rows[j] = current
+    i = i + 1
+  end
+end
+
+def semantic_blocking_summary_lt(a: BlockingSummary, b: BlockingSummary) -> Bool
+  if a.function != b.function then
+    a.function < b.function
+  elsif a.blocking != b.blocking then
+    a.blocking && !b.blocking
+  elsif a.unbounded != b.unbounded then
+    a.unbounded && !b.unbounded
+  else
+    a.blocking_sites.join(";") < b.blocking_sites.join(";")
+  end
+end
+
+def semantic_blocking_summaries_sort(inout rows: Vec[BlockingSummary]) -> Unit
+  var i = 1
+  while i < rows.len() do
+    let current = rows[i].clone()
+    var j = i
+    while j > 0 && semantic_blocking_summary_lt(&rows[j - 1], &current) do
+      rows[j] = rows[j - 1].clone()
+      j = j - 1
+    end
+    rows[j] = current
+    i = i + 1
+  end
+end
+
+def semantic_code_size_summary_lt(a: CodeSizeSummary, b: CodeSizeSummary) -> Bool
+  if a.function != b.function then
+    a.function < b.function
+  elsif a.code_size_bytes != b.code_size_bytes then
+    a.code_size_bytes < b.code_size_bytes
+  else
+    a.exact && !b.exact
+  end
+end
+
+def semantic_code_size_summaries_sort(inout rows: Vec[CodeSizeSummary]) -> Unit
+  var i = 1
+  while i < rows.len() do
+    let current = rows[i].clone()
+    var j = i
+    while j > 0 && semantic_code_size_summary_lt(&rows[j - 1], &current) do
+      rows[j] = rows[j - 1].clone()
+      j = j - 1
+    end
+    rows[j] = current
+    i = i + 1
+  end
+end
+
 
 # AbiSurfaceRow order: the surface id (the delta join key — unique per row
 # by construction), then the kind word, then the symbol key text (the
@@ -2935,6 +3437,216 @@ pub def completeness_class_word(class: CompletenessClass) -> String
   when CompletenessClass::Partial then "partial"
   when CompletenessClass::ArtifactGated then "artifact-gated"
   end
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE SHARED SLICE/QUERY COMPLETENESS MODEL (audit item 9)
+# ———————————————————————————————————————————————————————————————
+# ONE completeness model every semantic slice / query / affected-set
+# answer carries: semantic_slice.tg's SliceResult and MirSlice (+ the
+# mir_slice query envelope), semantic_delta.tg's AffectedResult and the §37
+# proof patch's analysis rows. The class words:
+#
+#   Complete             — the analysis is EXACT: the returned node/key set
+#                          is precisely the semantic answer and no cap
+#                          fired. Only "complete" may back a
+#                          ProofComplete request.
+#   ConservativeSuperset — the answer may contain EXTRA nodes: the engine's
+#                          documented approximation includes nodes a
+#                          path-sensitive analysis could exclude (the
+#                          path-insensitive predecessor/successor union of
+#                          the def-chain walks, the whole-place-family
+#                          match of the Ownership walk, the anchored def
+#                          chains of Failure/Effects/Path).
+#   ConservativeSubset   — a KNOWN analysis limitation may OMIT nodes: the
+#                          answer is a subset of the true one and
+#                          truncation_reason names the limitation (the
+#                          reaching-def self-loop residual: a def later in
+#                          a block reaching a lexically-earlier use through
+#                          a self-loop edge is not propagated, because the
+#                          fixpoint/walk rides the self-edge-free
+#                          ctx.preds/ctx.succs maps). An unavailable
+#                          relation family in an affected closure maps here
+#                          too — the closure omits every dependent the
+#                          family would contribute.
+#   Truncated            — a deterministic CAP fired: the worklist stopped
+#                          with unprocessed work. omitted_lower_bound is the
+#                          number of unprocessed work items (a LOWER bound
+#                          on the omitted nodes) and truncation_reason names
+#                          the cap.
+#
+# The chosen class is the WORST of the classes that apply, in the order
+# Truncated > ConservativeSubset > ConservativeSuperset > Complete (a
+# capped conservative superset reports Truncated).
+#
+# CompletenessInfo is the ONE carrier: the class, the reason text ("" =
+# none), the engine's visited/returned node counts, a lower bound on the
+# omitted nodes (0 when nothing is known omitted) and the analysis-model
+# word naming the EXACT analysis that produced the answer. The model word
+# is what a proof consumer keys its trust on (the same model word appears
+# for every result of one engine; the module-specific vocabulary lives at
+# the engines' own constants).
+pub enum SliceCompleteness
+  Complete
+  ConservativeSuperset
+  ConservativeSubset
+  Truncated
+end
+
+# The canonical class word.
+pub def slice_completeness_word(c: SliceCompleteness) -> String
+  match c
+  when SliceCompleteness::Complete then "complete"
+  when SliceCompleteness::ConservativeSuperset then "conservative-superset"
+  when SliceCompleteness::ConservativeSubset then "conservative-subset"
+  when SliceCompleteness::Truncated then "truncated"
+  end
+end
+
+# The class of a canonical word (Option::None outside the four).
+pub def slice_completeness_of_word(word: String) -> Option[SliceCompleteness]
+  if word == "complete" then
+    return Option::Some(SliceCompleteness::Complete)
+  end
+  if word == "conservative-superset" then
+    return Option::Some(SliceCompleteness::ConservativeSuperset)
+  end
+  if word == "conservative-subset" then
+    return Option::Some(SliceCompleteness::ConservativeSubset)
+  end
+  if word == "truncated" then
+    return Option::Some(SliceCompleteness::Truncated)
+  end
+  Option::None
+end
+
+# The ONLY class a ProofComplete request accepts.
+pub def slice_completeness_is_complete(c: SliceCompleteness) -> Bool
+  match c
+  when SliceCompleteness::Complete then true
+  when _ then false
+  end
+end
+
+# ONE completeness record (see the section doc). The constructors below are
+# the sanctioned builders; a record literal is equivalent but the builders
+# keep every engine's population uniform.
+pub struct CompletenessInfo
+  completeness: SliceCompleteness = SliceCompleteness::Complete
+  # The cap/limitation name ("" = none). For Truncated this names the cap
+  # AND the remaining-work count; for a conservative class it names the
+  # analysis limitation.
+  truncation_reason: String = ""
+  # The engine work items / nodes visited (the deterministic worklist count
+  # or the single-pass scan count).
+  visited_nodes: Int = 0
+  # The nodes the answer returned (statement/node rows, or entity keys for
+  # an affected closure).
+  returned_nodes: Int = 0
+  # The lower bound on the omitted nodes: the unprocessed work items for
+  # Truncated, the limitation's edge/family count for a known omission, 0
+  # when nothing is known omitted.
+  omitted_lower_bound: Int = 0
+  # The stable analysis-model word (the trust key; see the engines).
+  analysis_model: String = ""
+end
+
+# The registered Clone surface of the completeness record (audit item 9):
+# the payload is proof metadata that RIDES owning results (SliceResult /
+# MirSlice / the affected closure), so duplicating one must duplicate its
+# owned renders — the class copies, the reason and the model word
+# duplicate.  Registering it lets the owning records' derived clones
+# discharge the `info` component (SliceResult.info and siblings).
+impl Clone for CompletenessInfo
+  def clone(self: Self) -> CompletenessInfo
+    CompletenessInfo {
+      completeness: self.completeness,
+      truncation_reason: self.truncation_reason.clone(),
+      visited_nodes: self.visited_nodes,
+      returned_nodes: self.returned_nodes,
+      omitted_lower_bound: self.omitted_lower_bound,
+      analysis_model: self.analysis_model.clone()
+    }
+  end
+end
+
+pub def completeness_info_complete(analysis_model: String, visited: Int, returned: Int) -> CompletenessInfo
+  CompletenessInfo {
+    completeness: SliceCompleteness::Complete,
+    truncation_reason: "",
+    visited_nodes: visited,
+    returned_nodes: returned,
+    omitted_lower_bound: 0,
+    analysis_model: analysis_model
+  }
+end
+
+pub def completeness_info_superset(analysis_model: String, reason: String, visited: Int, returned: Int) -> CompletenessInfo
+  CompletenessInfo {
+    completeness: SliceCompleteness::ConservativeSuperset,
+    truncation_reason: reason,
+    visited_nodes: visited,
+    returned_nodes: returned,
+    omitted_lower_bound: 0,
+    analysis_model: analysis_model
+  }
+end
+
+pub def completeness_info_subset(analysis_model: String, reason: String, visited: Int, returned: Int, omitted: Int) -> CompletenessInfo
+  CompletenessInfo {
+    completeness: SliceCompleteness::ConservativeSubset,
+    truncation_reason: reason,
+    visited_nodes: visited,
+    returned_nodes: returned,
+    omitted_lower_bound: omitted,
+    analysis_model: analysis_model
+  }
+end
+
+pub def completeness_info_truncated(analysis_model: String, reason: String, visited: Int, returned: Int, omitted: Int) -> CompletenessInfo
+  CompletenessInfo {
+    completeness: SliceCompleteness::Truncated,
+    truncation_reason: reason,
+    visited_nodes: visited,
+    returned_nodes: returned,
+    omitted_lower_bound: omitted,
+    analysis_model: analysis_model
+  }
+end
+
+# The explicit-class builder (a carried class — e.g. a ProofComplete gate's
+# typed error payload — rebuilt into a record without re-deriving it).
+pub def completeness_info_with_class(completeness: SliceCompleteness, analysis_model: String, reason: String, visited: Int, returned: Int, omitted: Int) -> CompletenessInfo
+  CompletenessInfo {
+    completeness: completeness,
+    truncation_reason: reason,
+    visited_nodes: visited,
+    returned_nodes: returned,
+    omitted_lower_bound: omitted,
+    analysis_model: analysis_model
+  }
+end
+
+# Structural equality over the record (the wire round-trip / lane compare).
+pub def completeness_info_eq(a: CompletenessInfo, b: CompletenessInfo) -> Bool
+  a.completeness == b.completeness &&
+    a.truncation_reason == b.truncation_reason &&
+    a.visited_nodes == b.visited_nodes &&
+    a.returned_nodes == b.returned_nodes &&
+    a.omitted_lower_bound == b.omitted_lower_bound &&
+    a.analysis_model == b.analysis_model
+end
+
+# The canonical single-line render (the query/evidence row carrier):
+#   "<model>|<class word>|visited=<n>|returned=<n>|omitted=<n>|<reason>"
+# The reason is free text and rides LAST (the first five fields are fixed
+# columns a consumer splits on).
+pub def completeness_info_render(info: CompletenessInfo) -> String
+  info.analysis_model.clone() + "|" + slice_completeness_word(info.completeness.clone()) +
+    "|visited=" + info.visited_nodes.to_string() +
+    "|returned=" + info.returned_nodes.to_string() +
+    "|omitted=" + info.omitted_lower_bound.to_string() +
+    "|" + info.truncation_reason.clone()
 end
 
 pub struct CompletenessContract

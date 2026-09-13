@@ -31,6 +31,21 @@ cd "$ROOT"
 
 PINNED_TEST_INVENTORY=230
 
+# Harness timeout calibration (measured 2026-09-13 on the development host,
+# seed at commit 7e2f449): the FULL bootstrap-check closure measured 400.4 s
+# wall (6:40.37), tg_bootstrap_gate 364.9 s (6:04.93) and the tg_evidence
+# component 385.6 s (6:25.61). Each cap is the measurement x 2 rounded up to
+# the next 60 s (bootstrap-check: 400.4 x 2 = 800.8 -> 840 s; gate:
+# 364.9 x 2 = 729.9 -> 780 s; tg_evidence: 385.6 x 2 = 771.2 -> 780 s): the
+# host carries unrelated background load and a 1.4-1.6x contention factor
+# was observed on the calibration day (a 420 s tg_evidence cap and a 600 s
+# gate cap both tripped under it). A cap is a bound, never a skip: the full
+# check still runs under it, and the debt predicate is unchanged.
+# Re-measure when the closure grows materially.
+BOOTSTRAP_CHECK_TIMEOUT_S=840
+GATE_TIMEOUT_S=780
+EVIDENCE_TIMEOUT_S=780
+
 if [ -f scripts/check_ocaml_toolchain.sh ]; then
   scripts/check_ocaml_toolchain.sh
 fi
@@ -80,7 +95,14 @@ for name in $NAMES; do
   # leave the summary stale.
   SELFCHECK_TOTAL=$((SELFCHECK_TOTAL + 1))
   SELFCHECK_COUNT=$((SELFCHECK_COUNT + 1))
-  if ! timeout 420 "_build/default/selfcheck/${name}.exe" >"/tmp/ocaml_sc_${name}.out" 2>&1; then
+  # The generic component bound is 420 s; tg_evidence runs the full evidence
+  # phase (measured 385.6 s on 2026-09-13, above the generic bound under
+  # host contention), so it uses the calibrated evidence cap.
+  SC_TIMEOUT_S=420
+  if [ "$name" = "tg_evidence" ]; then
+    SC_TIMEOUT_S="$EVIDENCE_TIMEOUT_S"
+  fi
+  if ! timeout "$SC_TIMEOUT_S" "_build/default/selfcheck/${name}.exe" >"/tmp/ocaml_sc_${name}.out" 2>&1; then
     echo "check_ocaml_seed_health: FAIL — selfcheck ${name} exited non-zero"
     tail -10 "/tmp/ocaml_sc_${name}.out" || true
     SELFCHECK_FAIL=1
@@ -91,7 +113,7 @@ done
 # here — it is delegated to tg_bootstrap_gate, the single debt authority
 # (monotonic no-regression vs its checked baseline).
 set +e
-timeout 300 _build/default/bin/tg_stage0.exe bootstrap-check --repo-root .. >/tmp/ocaml_bootstrap_check.out 2>&1
+timeout "$BOOTSTRAP_CHECK_TIMEOUT_S" _build/default/bin/tg_stage0.exe bootstrap-check --repo-root .. >/tmp/ocaml_bootstrap_check.out 2>&1
 BC_STATUS=$?
 set -e
 if [ "$BC_STATUS" -ne 0 ] && [ "$BC_STATUS" -ne 1 ]; then
@@ -189,7 +211,7 @@ fi
 # FULL-COMPLETENESS gate: tg_bootstrap_gate — reported separately,
 # informational only; red by design while the subset is nonzero.
 set +e
-timeout 420 _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. >/tmp/ocaml_bootstrap_gate.out 2>&1
+timeout "$GATE_TIMEOUT_S" _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. >/tmp/ocaml_bootstrap_gate.out 2>&1
 GATE_STATUS=$?
 set -e
 SUBSET_N="$(grep -oE 'SUBSET_FIREWALL = (PASS|FAIL \([0-9]+ findings)' /tmp/ocaml_bootstrap_check.out 2>/dev/null | head -1 | grep -oE 'PASS|[0-9]+' | head -1 || true)"

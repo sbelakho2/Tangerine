@@ -158,10 +158,17 @@ use tg_compiler::ids::{StableDigest, stable_digest_of, DefKind, stable_def_id_di
 use tg_compiler::ast::{AstContractKind}
 use tg_compiler::types::{TypeEnv, TypedProgram}
 use tg_compiler::mir::{MirProgram}
-use tg_compiler::target_desc::{TargetDesc}
+use tg_compiler::target_desc::{TargetDesc, Arch}
+use tg_compiler::lir::{abi_verify_program_a64}
+use tg_compiler::backend_x86_64::{verify_abi_program_x86}
 use tg_compiler::parser::{Diagnostic}
 use tg_compiler::semantic_model::{
   SemanticSnapshot, SemanticResponsePayload, ContractFact, StableTargetId,
+  # (repair-candidates-as-semantic-operations closure) the typed entity
+  # target union: moved here from this module so the repair engine (below
+  # the server layer) shares ONE target vocabulary; the v2 protocol
+  # encoder/decoder below keeps its wire arms.
+  SemanticTargetId,
   semantic_digest_render, semantic_json_escape, semantic_contract_expr_text,
   # (audit item 4) the TYPED tool-schema model (StableToolId /
   # ProductSchema / SumSchema / CompletenessContract / ArtifactRequirements
@@ -172,6 +179,10 @@ use tg_compiler::semantic_model::{
   TextBoundary, FieldPresence, StableIdKind, CompletenessContract,
   CompletenessClass, ArtifactRequirements, Mutability, DeterminismClass,
   QueryCostClass, ToolStability, RecordFamily, semantic_tool_schema_render,
+  # (audit item 9) the shared completeness record the v2 MirSlice response
+  # carries + its structural equality.
+  CompletenessInfo, completeness_info_eq,
+  SliceCompleteness, slice_completeness_is_complete,
   # (audit order P0-15) the symbol row shape the transaction lane's fixture
   # snapshot carries.
   SemanticSymbol
@@ -205,8 +216,9 @@ use tg_compiler::semantic_query::{
   MirGraphRequest, query_mir_slice_typed, mir_graph_query_typed
 }
 # (fourth-audit P0-11) the §33 typed slice request/kind the v2 Slice request
-# variant carries.
-use tg_compiler::semantic_slice::{MirSliceRequest, MirSliceKind}
+# variant carries; (audit item 9) the requirement word vocabulary the wire
+# codec maps onto its stable codes.
+use tg_compiler::semantic_slice::{MirSliceRequest, MirSliceKind, SliceRequirement, slice_requirement_word, slice_requirement_of_word}
 # (third-audit items 23/24) the persistent diagnostic store the session
 # retains + the stable diagnostic id the add surface returns.
 # (fourth-audit P0-11) the typed ExplainNode tree the v2 Explain response
@@ -280,6 +292,16 @@ use tg_compiler::coverage_graph::{
   coverage_graph_of_snapshot, tests_covering_symbol, coverage_points_of_symbol,
   uncovered_paths, coverage_graph_has_rows
 }
+# (audit order item 6) the replay production bridge: the session-owned
+# decode/compare entry over the compiled executables' self-describing run
+# artifacts (the embedded event dictionary maps the compact runtime tokens
+# to exact stable ids; replay_run_compare answers the first divergence plus
+# its minimal causal slice, or the documented untracked result).
+use tg_compiler::replay_bridge::{
+  ReplayComparison, replay_run_compare, replay_comparison_rows,
+  replay_comparison_is_untracked, replay_comparison_untracked_reason,
+  replay_hex_decode
+}
 use tg_compiler::semantic_rationale::{
   RationaleKind, RationaleRecord, RationaleSubject, RationaleEvidence,
   RationaleDependency, RationaleStore, rationale_store_new, rationale_record_new,
@@ -290,6 +312,18 @@ use tg_compiler::semantic_rationale::{
 }
 use tg_compiler::stable_ids::{DeclLineageStore}
 use tg_compiler::types::{type_env_new}
+
+# (audit order item 7) the host-route ABI verifier dispatch of the
+# verified-edit transaction's pipeline: the finalized MIR is lowered +
+# allocated exactly as the host route's compile entries do (no emission)
+# and verified by the ONE post-lowering ABI checker. Empty = verified.
+def session_abi_verify_rows(program: MirProgram, desc: TargetDesc) -> Vec[String]
+  match desc.arch
+  when Arch::AArch64 then abi_verify_program_a64(program, desc)
+  when Arch::X86_64 then verify_abi_program_x86(program, desc)
+  when _ then Vec::from(["abi-verify: the host route has no ABI verifier for `" + desc.name + "` (aarch64/x86-64 only)"])
+  end
+end
 
 # ———————————————————————————————————————————————————————————————
 # The §39 protocol records — version, session, request, response
@@ -1474,10 +1508,18 @@ def session_verified_edit_full(
   tx.abi_changes = semantic_delta_rows_diff(&delta.abi_delta.before.rows,
     &delta.abi_delta.after.rows)
   tx.abi_status = VerificationStatus::Verified
+  # (audit order item 7) the REAL ABI-verify stage of THIS transaction's
+  # pipeline: the same post-lowering verifier the driver route runs over
+  # the finalized MIR on the host route (driver_abi_verify_rows). Its
+  # violation rows print on failure.
+  let abi_rows = session_abi_verify_rows(mir.clone(), target_desc.clone())
+  for abi_row in abi_rows do
+    eprintln(abi_row)
+  end
   # The REAL verification evidence of THIS transaction's pipeline: the
   # stages it captured are the driver route's (no post-mono verifier
-  # checkpoint and no ABI-verify stage exist), so those statuses stay
-  # Unavailable — never claimed.
+  # checkpoint exists — that status stays Unavailable; abi IS captured
+  # since audit order item 7 and carries the verifier's real result).
   let evidence = verified_compilation_evidence_stages(
     tx.new_revision.clone(),
     true,   # parse_ok — parse_source_program succeeded
@@ -1489,7 +1531,7 @@ def session_verified_edit_full(
     false,  # mono_verify_ok — no post-mono verifier checkpoint
     true,   # post_opt_mir_verify_ok — the final post-opt verify
     true,   # effect_verify_ok
-    false,  # abi_verify_ok — no ABI-verify stage exists
+    abi_rows.len() == 0,  # abi_verify_ok — the post-lowering ABI verifier's real result
     true,   # capability_contract_ok
     verification_stage_names_driver_route())
   # The source delta (the two source renders' content hashes).
@@ -1617,9 +1659,16 @@ pub def session_compile_source(
   var finalized = snapshot
   semantic_snapshot_finalize(&mut finalized)
   let index = build_semantic_index(&finalized)
+  # (audit order item 7) the REAL ABI-verify stage (same as the driver
+  # route and the verified-edit transaction): post-lowering verification
+  # of the finalized MIR on the host route.
+  let abi_rows = session_abi_verify_rows(mir.clone(), target_desc.clone())
+  for abi_row in abi_rows do
+    eprintln(abi_row)
+  end
   let evidence = verified_compilation_evidence_stages(
     semantic_digest_render(&finalized.revision),
-    true, true, true, true, true, true, false, true, true, false, true,
+    true, true, true, true, true, true, false, true, true, abi_rows.len() == 0, true,
     verification_stage_names_driver_route())
   Result::Ok(CompilerSession {
     revision: finalized.revision,
@@ -1981,6 +2030,88 @@ def session_revision_results(session: CompilerSession) -> QueryResults
 end
 
 # ———————————————————————————————————————————————————————————————
+# (audit order item 6) replay.compare — the session decode/compare op
+# ———————————————————————————————————————————————————————————————
+# The session-owned decode/compare entry over two self-describing run
+# artifacts (the compiled executables' --replay dumps). Each artifact
+# carries its embedded event dictionary, which maps the compact runtime
+# tokens to exact stable ids (StableMirNodeId call-site keys + the
+# containing declaration keys + the semantic operation word); the compare
+# rebuilds the replay.tg EventTraces, walks the first divergence and
+# materializes its minimal causal slice. Any decode failure, dictionary
+# mismatch, raw token or origin-less entry is the documented untracked
+# result — never a fabricated divergence or slice (replay_bridge.tg
+# documents the artifact grammar and the untracked reasons).
+pub def session_replay_run_compare(session: CompilerSession, run_a: Vec[u8], run_b: Vec[u8]) -> ReplayComparison
+  replay_run_compare(run_a, run_b)
+end
+
+struct ReplayComparePayload
+  run_a: Vec[u8] = Vec::new()
+  run_b: Vec[u8] = Vec::new()
+end
+
+def server_replay_compare_error(reason: String) -> QueryResults
+  QueryResults { kind: "replay.compare_error", keys: Vec::from(["reason=" + reason]) }
+end
+
+# Parse the replay.compare payload: two lines, "a:<hex>" and "b:<hex>"
+# (the lowercase-hex render of the run artifacts; either order accepted,
+# both required). A malformed payload / hex failure answers
+# replay.compare_error — never a silent empty comparison.
+def server_replay_compare_payload(arg: String) -> Result[ReplayComparePayload, String]
+  let lines = arg.lines()
+  var a_text = ""
+  var b_text = ""
+  var have_a = false
+  var have_b = false
+  for line in lines do
+    if line.starts_with("a:") then
+      a_text = line.slice(2, line.len())
+      have_a = true
+    elsif line.starts_with("b:") then
+      b_text = line.slice(2, line.len())
+      have_b = true
+    end
+  end
+  if !have_a || !have_b then
+    return Result::Err("expected two lines `a:<hex>` and `b:<hex>`".to_string())
+  end
+  let a = match replay_hex_decode(a_text)
+  when Result::Err(e) then return Result::Err("run-a:" + e)
+  when Result::Ok(v) then v
+  end
+  let b = match replay_hex_decode(b_text)
+  when Result::Err(e) then return Result::Err("run-b:" + e)
+  when Result::Ok(v) then v
+  end
+  Result::Ok(ReplayComparePayload { run_a: a, run_b: b })
+end
+
+# The replay.compare answer: the session revision row (context
+# attribution) followed by replay_bridge.tg's canonical comparison rows.
+# kind "replay.compare" for a compared pair, "replay.compare_untracked"
+# for the documented untracked result, "replay.compare_error" for a
+# malformed payload.
+pub def session_replay_compare_results(session: CompilerSession, arg: String) -> QueryResults
+  match server_replay_compare_payload(arg.clone())
+  when Result::Err(e) then server_replay_compare_error(e)
+  when Result::Ok(payload) then
+    let cmp = session_replay_run_compare(session, payload.run_a.clone(), payload.run_b.clone())
+    var rows: Vec[String] = Vec::new()
+    rows.push("revision=" + semantic_digest_render(&session.revision))
+    for row in replay_comparison_rows(cmp.clone()) do
+      rows.push(row)
+    end
+    if replay_comparison_is_untracked(cmp.clone()) then
+      QueryResults { kind: "replay.compare_untracked", keys: rows }
+    else
+      QueryResults { kind: "replay.compare", keys: rows }
+    end
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # The §39 operation registry (third-audit item 23)
 # ———————————————————————————————————————————————————————————————
 # ONE declared table of every op the service serves: name + the handler
@@ -2079,6 +2210,11 @@ pub def server_operations() -> Vec[ServerOperation]
     server_operation("verify.plan".to_string(), "plan".to_string()),
     server_operation("diagnostic.get".to_string(), "diagnostic".to_string()),
     server_operation("diagnostic.repair_context".to_string(), "diagnostic".to_string()),
+    # (repair-candidates-as-semantic-operations closure) the durable repair
+    # ops: typed candidates over the retained diagnostic store and the
+    # candidate -> SemanticEdit instantiation.
+    server_operation("repair.candidates".to_string(), "repair".to_string()),
+    server_operation("repair.instantiate".to_string(), "repair".to_string()),
     server_operation("replay.trace_rows".to_string(), "replay".to_string()),
     server_operation("replay.digest".to_string(), "replay".to_string()),
     server_operation("replay.writes_to".to_string(), "replay".to_string()),
@@ -2101,7 +2237,15 @@ pub def server_operations() -> Vec[ServerOperation]
     # included), so an external client discovers the whole protocol without
     # prior vocabulary. APPENDED at the end: the registry position is the v2
     # dense operation id, so appending keeps every existing dense id stable.
-    server_operation("service.describe".to_string(), "service".to_string())
+    server_operation("service.describe".to_string(), "service".to_string()),
+    # (audit order item 6) THE PRODUCTION-BRIDGE COMPARE op: the two
+    # compiled executables' --replay run artifacts (hex-encoded in the
+    # payload) in, the first divergence + minimal causal slice out. It is
+    # session-owned (the session attributes the comparison to its served
+    # revision) and its handler family is its own ("replay-compare"), so
+    # the trace-holding §38 facade route stays untouched. APPENDED after
+    # service.describe so every existing dense operation id stays stable.
+    server_operation("replay.compare".to_string(), "replay-compare".to_string())
   ])
 end
 
@@ -2161,6 +2305,10 @@ def session_query_results(session: CompilerSession, operation: String, arg: Stri
     # service. The op never mutates the served session value; an in-process
     # caller applies the transaction's new_session.
     when "edit-verified" then session_edit_verified_results(&session, arg.clone())
+    # (audit order item 6) the production-bridge replay compare: the two
+    # run artifacts ride the payload (hex), the session owns the decode +
+    # comparison and the revision attribution.
+    when "replay-compare" then session_replay_compare_results(&session, arg.clone())
     # ———— every other registered family: the §38 facade ————
     # index / explain / type / ownership / contract / symbol / snapshot /
     # plan / diagnostic / replay all answer through query() over the
@@ -2838,9 +2986,13 @@ const V2_RESP_REVISION: Int = 16
 const V2_RESP_STATUS: Int = 17
 
 # Typed id tags inside the Target id union / the MirGraph node option.
+# (repair-candidates-as-semantic-operations closure) V2_ID_UNAVAILABLE
+# encodes the typed target-unavailable marker (kind + reason words): it is
+# a marker, never a fabricated Decl/Place/MirStmt.
 const V2_ID_DECL: Int = 1
 const V2_ID_PLACE: Int = 2
 const V2_ID_MIR_STMT: Int = 3
+const V2_ID_UNAVAILABLE: Int = 4
 
 # ———— The typed operation id ————
 
@@ -3550,6 +3702,24 @@ pub def semantic_tool_schema_for(op: ServerOperation) -> Option[SemanticToolSche
       DeterminismClass::SessionRelative, QueryCostClass::LinearScan,
       schema_store_artifacts(),
       schema_gated("diagnostic.repair_context_unavailable".to_string()))
+  # (repair-candidates-as-semantic-operations closure) the durable repair
+  # ops: candidates answer from the record's retained typed payload; the
+  # instantiation answers the fail-closed envelope (kind/missing/reason/
+  # edit). Both are store-gated and session-relative.
+  when "repair.candidates" then
+    schema_text_op("repair.candidates".to_string(), "repair".to_string(),
+      "subject".to_string(), TextKind::CanonicalKeyText,
+      schema_result1("rows".to_string(), RecordFamily::Rows),
+      Vec::from([StableIdKind::Diagnostic]), ToolStability::Experimental,
+      DeterminismClass::SessionRelative, QueryCostClass::LinearScan,
+      schema_store_artifacts(), schema_kinded("repair.candidates_empty".to_string()))
+  when "repair.instantiate" then
+    schema_text_op("repair.instantiate".to_string(), "repair".to_string(),
+      "candidate".to_string(), TextKind::RowGrammar,
+      schema_result1("rows".to_string(), RecordFamily::Rows),
+      Vec::from([StableIdKind::Diagnostic]), ToolStability::Experimental,
+      DeterminismClass::SessionRelative, QueryCostClass::LinearScan,
+      schema_store_artifacts(), schema_kinded("repair.instantiate_unavailable".to_string()))
   when "replay.trace_rows" then
     schema_no_arg_op("replay.trace_rows".to_string(), "replay".to_string(),
       schema_result1("rows".to_string(), RecordFamily::Rows),
@@ -3623,6 +3793,17 @@ pub def semantic_tool_schema_for(op: ServerOperation) -> Option[SemanticToolSche
       DeterminismClass::Deterministic, QueryCostClass::EngineWalk,
       schema_artifacts(false, false, false, false, false, false, true, false),
       schema_gated("replay.diff_unavailable".to_string()))
+  when "replay.compare" then
+    # (audit order item 6) the production-bridge compare: the payload is
+    # the two-line hex run-artifact grammar (RowGrammar), the answer is the
+    # canonical comparison rows (status/digests/first-divergence/slice).
+    schema_text_op("replay.compare".to_string(), "replay".to_string(),
+      "runs".to_string(), TextKind::RowGrammar,
+      schema_result1("rows".to_string(), RecordFamily::Rows),
+      Vec::from([StableIdKind::MirNode, StableIdKind::Decl]), ToolStability::Experimental,
+      DeterminismClass::Deterministic, QueryCostClass::EngineWalk,
+      schema_artifacts(false, false, false, false, false, false, true, false),
+      schema_kinded("replay.compare_untracked".to_string()))
   when "revision" then
     schema_no_arg_op("revision".to_string(), "service".to_string(),
       schema_result1("revision".to_string(), RecordFamily::Revision),
@@ -3687,14 +3868,11 @@ end
 
 # ———— The typed v2 records ————
 
-# The typed subject id a Target request names: a declaration identity, a
-# place identity (the digest-words carrier: canonical place text + digest
-# words) or a MIR statement identity.
-pub enum SemanticTargetId
-  Decl(decl: StableDeclId)
-  Place(place: StablePlaceId)
-  MirStmt(stmt: StableMirStmtId)
-end
+# (repair-candidates-as-semantic-operations closure) The typed entity
+# target union (SemanticTargetId) now lives in semantic_model.tg — the
+# layer below the repair engine — so repair candidates and the v2
+# protocol share it. The v2 wire grammar below encodes/decodes the four
+# variants (Decl / Place / MirStmt / the typed Unavailable marker).
 
 pub enum SemanticRequestV2Payload
   Target(operation: SemanticOperationId, key: String, target: SemanticTargetId)
@@ -3711,11 +3889,16 @@ pub struct SemanticRequestV2
 end
 
 # The typed MirSlice answer (the QueryResults §33 payload lifted, plus the
-# §38 kind word so the unavailable/error answers stay typed).
+# §38 kind word so the unavailable/error answers stay typed). (audit item
+# 9) completeness is the shared CompletenessInfo the answer carries — the
+# v2 response projects QueryResults.completeness onto it, so a
+# proof-demanding v2 caller reads the class/reason/counts off the typed
+# record (never a rendered row).
 pub struct MirSliceResponse
   kind: String
   statements: Vec[String] = Vec::new()
   externals: Vec[String] = Vec::new()
+  completeness: CompletenessInfo = CompletenessInfo {}
 end
 
 # The typed row-list answer of the ops with no dedicated record family:
@@ -4238,6 +4421,10 @@ def v2_push_target(inout out: Vec[u8], target: SemanticTargetId) -> Unit
   when SemanticTargetId::MirStmt(stmt) then
     server_push_u32(out, V2_ID_MIR_STMT)
     v2_push_mir_stmt(out, stmt)
+  when SemanticTargetId::Unavailable(kind, reason) then
+    server_push_u32(out, V2_ID_UNAVAILABLE)
+    server_push_text(out, kind)
+    server_push_text(out, reason)
   end
 end
 
@@ -4259,6 +4446,16 @@ def v2_read_target(bytes: Vec[u8], inout at: Int) -> Option[SemanticTargetId]
       match v2_read_mir_stmt(&bytes, &mut at)
       when Option::None then Option::None
       when Option::Some(stmt) then Option::Some(SemanticTargetId::MirStmt(stmt))
+      end
+    elsif tag == V2_ID_UNAVAILABLE then
+      match server_read_text(&bytes, &mut at)
+      when Option::None then Option::None
+      when Option::Some(kind) then
+        match server_read_text(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(reason) then
+          Option::Some(SemanticTargetId::Unavailable(kind, reason))
+        end
       end
     else
       Option::None
@@ -4302,6 +4499,12 @@ def v2_push_slice_request(inout out: Vec[u8], request: MirSliceRequest) -> Unit
   server_push_text(out, request.function_key.clone())
   server_push_u32(out, v2_mir_slice_kind_code(request.kind.clone()))
   server_push_text(out, request.anchor.clone())
+  # (audit item 9) the requirement code: 0 = best-effort, 1 = proof-complete.
+  var req_code = 0
+  if request.require == SliceRequirement::ProofComplete then
+    req_code = 1
+  end
+  server_push_u32(out, req_code)
 end
 
 def v2_read_slice_request(bytes: Vec[u8], inout at: Int) -> Option[MirSliceRequest]
@@ -4317,11 +4520,20 @@ def v2_read_slice_request(bytes: Vec[u8], inout at: Int) -> Option[MirSliceReque
         match server_read_text(&bytes, &mut at)
         when Option::None then Option::None
         when Option::Some(anchor) then
-          Option::Some(MirSliceRequest {
-            function_key: function_key,
-            kind: kind,
-            anchor: anchor
-          })
+          match server_read_u32(&bytes, &mut at)
+          when Option::None then Option::None
+          when Option::Some(req_code) then
+            var require = SliceRequirement::BestEffort
+            if req_code == 1 then
+              require = SliceRequirement::ProofComplete
+            end
+            Option::Some(MirSliceRequest {
+              function_key: function_key,
+              kind: kind,
+              anchor: anchor,
+              require: require
+            })
+          end
         end
       end
     end
@@ -4598,6 +4810,14 @@ def v2_push_mir_slice(inout out: Vec[u8], record: MirSliceResponse) -> Unit
   server_push_text(out, record.kind.clone())
   v2_push_texts(out, record.statements.clone())
   v2_push_texts(out, record.externals.clone())
+  # (audit item 9) the shared completeness record: class word, reason,
+  # visited, returned, omitted, model — fixed field order.
+  server_push_text(out, slice_completeness_word(record.completeness.completeness.clone()))
+  server_push_text(out, record.completeness.truncation_reason.clone())
+  v2_push_i64(out, record.completeness.visited_nodes)
+  v2_push_i64(out, record.completeness.returned_nodes)
+  v2_push_i64(out, record.completeness.omitted_lower_bound)
+  server_push_text(out, record.completeness.analysis_model.clone())
 end
 
 def v2_read_mir_slice(bytes: Vec[u8], inout at: Int) -> Option[MirSliceResponse]
@@ -4610,11 +4830,50 @@ def v2_read_mir_slice(bytes: Vec[u8], inout at: Int) -> Option[MirSliceResponse]
       match v2_read_texts(&bytes, &mut at)
       when Option::None then Option::None
       when Option::Some(externals) then
-        Option::Some(MirSliceResponse {
-          kind: kind,
-          statements: statements,
-          externals: externals
-        })
+        match server_read_text(&bytes, &mut at)
+        when Option::None then Option::None
+        when Option::Some(class_word) then
+          match server_read_text(&bytes, &mut at)
+          when Option::None then Option::None
+          when Option::Some(reason) then
+            match v2_read_i64(&bytes, &mut at)
+            when Option::None then Option::None
+            when Option::Some(visited) then
+              match v2_read_i64(&bytes, &mut at)
+              when Option::None then Option::None
+              when Option::Some(returned) then
+                match v2_read_i64(&bytes, &mut at)
+                when Option::None then Option::None
+                when Option::Some(omitted) then
+                  match server_read_text(&bytes, &mut at)
+                  when Option::None then Option::None
+                  when Option::Some(model) then
+                    # an unknown class word is REFUSED (fail-closed): a
+                    # completeness the decoder cannot name must never
+                    # decode as Complete.
+                    match slice_completeness_of_word(class_word.clone())
+                    when Option::None then Option::None
+                    when Option::Some(class) then
+                      Option::Some(MirSliceResponse {
+                        kind: kind,
+                        statements: statements,
+                        externals: externals,
+                        completeness: CompletenessInfo {
+                          completeness: class,
+                          truncation_reason: reason,
+                          visited_nodes: visited,
+                          returned_nodes: returned,
+                          omitted_lower_bound: omitted,
+                          analysis_model: model
+                        }
+                      })
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
       end
     end
   end
@@ -5138,7 +5397,14 @@ end
 
 def server_v2_text_family_ok(handler_kind: String) -> Bool
   handler_kind == "snapshot" || handler_kind == "diagnostic" || handler_kind == "plan" ||
-  handler_kind == "replay" || handler_kind == "edit" || handler_kind == "edit-verified"
+  handler_kind == "replay" || handler_kind == "edit" || handler_kind == "edit-verified" ||
+  # (repair-candidates-as-semantic-operations closure) the durable repair
+  # family: the candidate subject is canonical key text and the
+  # instantiate payload is the candidate-id + parameter row grammar.
+  handler_kind == "repair" ||
+  # (audit order item 6) the production-bridge compare family (its payload
+  # is the two-line hex run-artifact grammar; the handler parses it ONCE).
+  handler_kind == "replay-compare"
 end
 
 # The typed dispatch of a decoded v2 request (audit item 4c). The v2 path
@@ -5372,7 +5638,8 @@ pub def semantic_response_v2_of_results(
     return SemanticResponseV2Payload::MirSlice(MirSliceResponse {
       kind: results.kind.clone(),
       statements: statements,
-      externals: externals
+      externals: externals,
+      completeness: results.completeness.clone()
     })
   end
   if operation == "revision" then
@@ -5537,6 +5804,12 @@ def semantic_target_id_eq(a: SemanticTargetId, b: SemanticTargetId) -> Bool
     when SemanticTargetId::MirStmt(bst) then semantic_mir_stmt_id_eq(ast, bst)
     when _ then false
     end
+  when SemanticTargetId::Unavailable(akind, areason) then
+    match b
+    when SemanticTargetId::Unavailable(bkind, breason) then
+      akind == bkind && areason == breason
+    when _ then false
+    end
   end
 end
 
@@ -5557,7 +5830,8 @@ end
 
 def semantic_slice_request_eq(a: MirSliceRequest, b: MirSliceRequest) -> Bool
   a.function_key == b.function_key && a.anchor == b.anchor &&
-    v2_mir_slice_kind_code(a.kind.clone()) == v2_mir_slice_kind_code(b.kind.clone())
+    v2_mir_slice_kind_code(a.kind.clone()) == v2_mir_slice_kind_code(b.kind.clone()) &&
+    slice_requirement_word(a.require.clone()) == slice_requirement_word(b.require.clone())
 end
 
 def semantic_request_v2_payload_eq(a: SemanticRequestV2Payload, b: SemanticRequestV2Payload) -> Bool
@@ -5669,7 +5943,8 @@ end
 
 def semantic_v2_mir_slice_eq(a: MirSliceResponse, b: MirSliceResponse) -> Bool
   a.kind == b.kind && semantic_v2_strings_eq(a.statements.clone(), b.statements.clone()) &&
-    semantic_v2_strings_eq(a.externals.clone(), b.externals.clone())
+    semantic_v2_strings_eq(a.externals.clone(), b.externals.clone()) &&
+    completeness_info_eq(a.completeness.clone(), b.completeness.clone())
 end
 
 def semantic_v2_rows_eq(a: RowsResponse, b: RowsResponse) -> Bool

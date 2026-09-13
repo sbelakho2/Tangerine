@@ -1,0 +1,654 @@
+# tests/abi_verify_test.tg — THE POST-LOWERING ABI VERIFIER (audit order
+# item 7) lane.
+#
+# What this suite pins:
+#   1. THE CLEAN ROWS (aarch64/x86-64/cm/riscv64): a correctly lowered +
+#      allocated function boundary passes verify_abi_fn (empty violation
+#      list, abi_verified true) — scalar/float/vector entry binds and
+#      returns match the classify_call_plan authority on every route.
+#   2. THE PRECISE FAILURES: a declared signature whose plan disagrees
+#      with the LIR locations reports the exact parameter and both
+#      placements (wrong register class, wrong position); an sret return
+#      whose LIR state does not match the plan reports the sret field;
+#      a frame that breaks the desc's stack alignment reports the
+#      alignment; a segment allocated to a fixed ABI register reports
+#      the class violation; a cc_used save without a segment reports the
+#      spurious save.
+#   3. VARIADICS: an x86-64 variadic call using SIMD&FP register
+#      positions reports the missing SysV AL = vector-register-count
+#      marshaller.
+#   4. EXTERN C: an extern aggregate boundary whose internal crossing
+#      (address-carried) differs from the C classification (register
+#      pair / HFA FP registers) reports both placements; the shared
+#      member scan classifies an HFA-eligible extern declaration clean
+#      and names the real C placement (d0,d1) when the lowered caller
+#      still crosses it in a general register (audit P1-13); an extern
+#      scalar boundary that agrees passes clean.
+#   5. EVIDENCE: the driver route now captures the real "abi" stage, so
+#      a false abi_verify_ok maps to Failed (never Unavailable) and a
+#      true flag maps to Verified.
+#
+# Run with: tg test tests/abi_verify_test.tg
+
+use std::core::{Option, Result, Unit, Bool, Int, panic}
+use std::collections::{Vec, Map, Set}
+use std::test::*
+use tg_compiler::ast::layout_attrs_plain
+use tg_compiler::ids::{TypeId, MirLocalId, MirBlockId}
+use tg_compiler::mir::{
+  MirFunction, MirLocal, MirBlock, MirStatement,
+  MirOperand, MirOperandKind, MirConstant, MirConstantKind,
+  MirTerminator, MirTerminatorKind, MirCallArg, MirCallValue,
+  MirTypeDef, MirTypeDefKind, MirFieldDef,
+  Place, place_local
+}
+use tg_compiler::token::span_dummy
+use tg_compiler::types::{Type, AccessEffect}
+use tg_compiler::target_desc::{
+  TargetDesc, aarch64_desc, x86_64_desc,
+  thumbv7em_cortex_m4f_desc, riscv64gc_desc
+}
+use tg_compiler::lir::{
+  LirFunction, LirAlloc, LirSeg, LirStmtKind, LirValue, LirTermKind,
+  LirVerifyRoute,
+  lower_mir_fn_to_lir_prog, lower_mir_fn_to_lir_mode_ty,
+  lower_mir_fn_to_lir_cm, lower_mir_fn_to_lir_rv64,
+  lir_alloc_registers_a64, lir_alloc_registers_cm, lir_alloc_registers,
+  AbiCalleeSig, AbiVerifyCtx, AbiVerifyFn, abi_verify_ctx,
+  verify_abi_fn, verify_abi, abi_verified
+}
+use tg_compiler::proof_patch::{
+  verified_compilation_evidence_stages, verification_stage_names_driver_route,
+  proof_evidence_status, evidence_stage_available, verification_status_is_verified,
+  VerifiedCompilationEvidence, VerificationStatus
+}
+use tg_compiler::backend_x86_64::{x86_alloc_registers}
+
+# ———————————————————————————————————————————————————————————————
+# Fixture helpers (the shapes the LIR suites already pin).
+# ———————————————————————————————————————————————————————————————
+
+def av_local(id: Int, name: String, ty: Type, is_mut: Bool) -> MirLocal
+  MirLocal { id: MirLocalId { id: id }, name: name, ty: ty, is_mut: is_mut, span: span_dummy() }
+end
+
+def av_block(bid: Int, stmts: Vec[MirStatement], term: MirTerminator) -> MirBlock
+  MirBlock { id: MirBlockId { id: bid }, statements: stmts, terminator: term }
+end
+
+def av_ret_term() -> MirTerminator
+  MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+end
+
+def av_place(id: Int) -> Place
+  place_local(MirLocalId { id: id })
+end
+
+def av_fn_item(name: String) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem(name),
+      ty: Type::Unit,
+      instance: Option::None
+    })
+  }
+end
+
+def av_call_term(dest: Place, callee: String, args: Vec[MirCallArg], success: Int) -> MirTerminator
+  MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: dest,
+      func: av_fn_item(callee),
+      args: args,
+      success: MirBlockId { id: success },
+      unwind: Option::None,
+      intrinsic: Option::None,
+      tail: false
+    },
+    span: span_dummy()
+  }
+end
+
+def av_place_arg(local: Int) -> MirCallArg
+  MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Place(av_place(local)) }
+end
+
+def av_value_arg(local: Int) -> MirCallArg
+  MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(MirOperand { kind: MirOperandKind::MirCopy(av_place(local)) }) }
+end
+
+def av_fn(name: String, params: Vec[MirLocal], ret: Type, locals: Vec[MirLocal], blocks: Vec[MirBlock]) -> MirFunction
+  MirFunction {
+    name: name,
+    params: params,
+    ret_type: ret,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+# An identity function `f(v: T) -> T` (the parameter local IS the return
+# place, locals[0]) — def-before-use clean without a move statement.
+def av_identity_fn(name: String, ty: Type) -> MirFunction
+  av_fn(name, Vec::from([av_local(0, "v", ty.clone(), false)]), ty.clone(),
+    Vec::from([av_local(0, "v", ty.clone(), false)]),
+    Vec::from([av_block(0, Vec::new(), av_ret_term())]))
+end
+
+# `f(a: Int, b: F64) -> Unit` — two scalar parameters of different files.
+def av_int_f64_fn(name: String, ret: Type) -> MirFunction
+  av_fn(name,
+    Vec::from([
+      av_local(1, "a", Type::Int, false),
+      av_local(2, "b", Type::F64, false)
+    ]),
+    ret.clone(),
+    Vec::from([
+      av_local(0, "ret", ret.clone(), false),
+      av_local(1, "a", Type::Int, false),
+      av_local(2, "b", Type::F64, false)
+    ]),
+    Vec::from([av_block(0, Vec::new(), av_ret_term())]))
+end
+
+def av_vec4_def() -> MirTypeDef
+  var fields: Vec[MirFieldDef] = Vec::new()
+  fields.push(MirFieldDef { name: "x".to_string(), ty: Type::F32 })
+  fields.push(MirFieldDef { name: "y".to_string(), ty: Type::F32 })
+  fields.push(MirFieldDef { name: "z".to_string(), ty: Type::F32 })
+  fields.push(MirFieldDef { name: "w".to_string(), ty: Type::F32 })
+  MirTypeDef {
+    id: TypeId { id: 400 },
+    name: "Vec4f".to_string(),
+    kind: MirTypeDefKind::Struct(fields),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def av_fat16_def() -> MirTypeDef
+  var fields: Vec[MirFieldDef] = Vec::new()
+  fields.push(MirFieldDef { name: "lo".to_string(), ty: Type::F64 })
+  fields.push(MirFieldDef { name: "hi".to_string(), ty: Type::F64 })
+  MirTypeDef {
+    id: TypeId { id: 401 },
+    name: "Fat16".to_string(),
+    kind: MirTypeDefKind::Struct(fields),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
+def av_defs() -> Map[Int, MirTypeDef]
+  var defs: Map[Int, MirTypeDef] = Map::new()
+  defs.insert(400, av_vec4_def())
+  defs.insert(401, av_fat16_def())
+  defs
+end
+
+def av_vec4_ty() -> Type
+  Type::Adt(TypeId { id: 400 }, Vec::from([Type::F32]))
+end
+
+def av_fat16_ty() -> Type
+  Type::Adt(TypeId { id: 401 }, Vec::from([Type::F64]))
+end
+
+def av_callee(name: String, params: Vec[Type], ret: Type, variadic: Bool, is_extern: Bool) -> AbiCalleeSig
+  AbiCalleeSig { name: name, params: params, ret: ret, variadic: variadic, is_extern: is_extern }
+end
+
+def av_no_callees() -> Map[String, AbiCalleeSig]
+  Map::new()
+end
+
+def av_sig_map(sig: AbiCalleeSig) -> Map[String, AbiCalleeSig]
+  var m: Map[String, AbiCalleeSig] = Map::new()
+  m.insert(sig.name.clone(), sig)
+  m
+end
+
+def av_lower_a64(f: MirFunction, defs: Map[Int, MirTypeDef]) -> LirFunction
+  match lower_mir_fn_to_lir_prog(f, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Err(e) then panic("ABI verifier lane lowering failed closed for " + f.name + ": " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def av_lower_x86(f: MirFunction, defs: Map[Int, MirTypeDef], desc: TargetDesc) -> LirFunction
+  match lower_mir_fn_to_lir_mode_ty(f, true, true, false, false, false, false, false, false, desc, true, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Err(e) then panic("ABI verifier lane x86 lowering failed closed for " + f.name + ": " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def av_lower_cm(f: MirFunction) -> LirFunction
+  match lower_mir_fn_to_lir_cm(f, Map::new())
+  when Result::Err(e) then panic("ABI verifier lane cm lowering failed closed for " + f.name + ": " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+def av_lower_rv64(f: MirFunction) -> LirFunction
+  match lower_mir_fn_to_lir_rv64(f, Map::new())
+  when Result::Err(e) then panic("ABI verifier lane rv lowering failed closed for " + f.name + ": " + e)
+  when Result::Ok(lf) then lf
+  end
+end
+
+# The verification input of ONE lowered+allocated function.
+def av_verify(desc: TargetDesc, route: LirVerifyRoute, defs: Map[Int, MirTypeDef], callees: Map[String, AbiCalleeSig],
+    name: String, params: Vec[Type], ret: Type, variadic: Bool, lf: LirFunction, alloc: LirAlloc) -> Vec[String]
+  let ctx = abi_verify_ctx(desc, route, defs, callees)
+  verify_abi_fn(ctx, AbiVerifyFn {
+    name: name,
+    params: params,
+    ret: ret,
+    variadic: variadic,
+    is_extern: false,
+    lir: lf,
+    alloc: alloc
+  })
+end
+
+def av_first(v: Vec[String]) -> String
+  if v.len() > 0 then v[0] else "" end
+end
+
+def av_any_contains(v: Vec[String], needle: String) -> Bool
+  var i = 0
+  while i < v.len() do
+    if v[i].contains(needle) then return true end
+    i = i + 1
+  end
+  false
+end
+
+# ———————————————————————————————————————————————————————————————
+# 1. The clean rows: every route's correct boundary passes.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_clean_scalar_and_float_boundary_aarch64() -> Unit
+  let defs = Map::new()
+  let lf = av_lower_a64(av_int_f64_fn("pair_clean".to_string(), Type::Unit), defs.clone())
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let rows = av_verify(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_no_callees(),
+    "pair_clean".to_string(), Vec::from([Type::Int, Type::F64]), Type::Unit, false, lf, alloc)
+  assert(rows.len() == 0, "the correct Int+F64 boundary must verify clean; first: " + av_first(rows))
+end
+
+@test
+def test_clean_return_boundary_aarch64() -> Unit
+  let defs = Map::new()
+  let lf = av_lower_a64(av_identity_fn("id_int".to_string(), Type::Int), defs.clone())
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let rows = av_verify(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_no_callees(),
+    "id_int".to_string(), Vec::from([Type::Int]), Type::Int, false, lf, alloc)
+  assert(rows.len() == 0, "the correct Int identity boundary must verify clean; first: " + av_first(rows))
+end
+
+@test
+def test_clean_mixed_float_vector_boundary_aarch64() -> Unit
+  let defs = av_defs()
+  # f(a: F64, b: v128, c: F32) -> Unit: the shared SIMD&FP stream d0/v1/d2.
+  let f = av_fn("mixed_clean".to_string(),
+    Vec::from([
+      av_local(1, "a", Type::F64, false),
+      av_local(2, "b", av_vec4_ty(), false),
+      av_local(3, "c", Type::F32, false)
+    ]),
+    Type::Unit,
+    Vec::from([
+      av_local(0, "ret", Type::Unit, false),
+      av_local(1, "a", Type::F64, false),
+      av_local(2, "b", av_vec4_ty(), false),
+      av_local(3, "c", Type::F32, false)
+    ]),
+    Vec::from([av_block(0, Vec::new(), av_ret_term())]))
+  let lf = av_lower_a64(f, defs.clone())
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let rows = av_verify(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_no_callees(),
+    "mixed_clean".to_string(), Vec::from([Type::F64, av_vec4_ty(), Type::F32]), Type::Unit, false, lf, alloc)
+  assert(rows.len() == 0, "the shared float/vector stream must verify clean; first: " + av_first(rows))
+end
+
+@test
+def test_clean_sret_boundary_aarch64() -> Unit
+  let defs = av_defs()
+  let lf = av_lower_a64(av_identity_fn("fat16_id".to_string(), av_fat16_ty()), defs.clone())
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  assert(lf.sret_words == 2 && lf.sret_bytes == 16, "the 16-byte aggregate return lowers through sret (2 words)")
+  assert(alloc.sret_slot >= 0, "the sret copy-out reserves the x8 save slot")
+  let rows = av_verify(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_no_callees(),
+    "fat16_id".to_string(), Vec::from([av_fat16_ty()]), av_fat16_ty(), false, lf, alloc)
+  assert(rows.len() == 0, "the correct sret boundary must verify clean; first: " + av_first(rows))
+end
+
+@test
+def test_clean_boundary_cortex_m() -> Unit
+  let lf = av_lower_cm(av_identity_fn("cm_id".to_string(), Type::Int))
+  let alloc = lir_alloc_registers_cm(lf.clone())
+  let rows = av_verify(thumbv7em_cortex_m4f_desc(), LirVerifyRoute::LirVerifyCm, Map::new(), av_no_callees(),
+    "cm_id".to_string(), Vec::from([Type::Int]), Type::Int, false, lf, alloc)
+  assert(rows.len() == 0, "the cortex-m Int boundary must verify clean; first: " + av_first(rows))
+end
+
+@test
+def test_clean_boundary_riscv64() -> Unit
+  let lf = av_lower_rv64(av_identity_fn("rv_id".to_string(), Type::Int))
+  let alloc = lir_alloc_registers(8, lf.clone())
+  let rows = av_verify(riscv64gc_desc(), LirVerifyRoute::LirVerifyRv64, Map::new(), av_no_callees(),
+    "rv_id".to_string(), Vec::from([Type::Int]), Type::Int, false, lf, alloc)
+  assert(rows.len() == 0, "the riscv64 Int boundary must verify clean; first: " + av_first(rows))
+end
+
+@test
+def test_clean_boundary_x86_64() -> Unit
+  let defs = Map::new()
+  let lf = av_lower_x86(av_identity_fn("x86_id".to_string(), Type::Int), defs.clone(), x86_64_desc())
+  let alloc = x86_alloc_registers(lf.clone())
+  let rows = av_verify(x86_64_desc(), LirVerifyRoute::LirVerifyX86_64, defs.clone(), av_no_callees(),
+    "x86_id".to_string(), Vec::from([Type::Int]), Type::Int, false, lf, alloc)
+  assert(rows.len() == 0, "the x86-64 Int boundary must verify clean; first: " + av_first(rows))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 2. The precise failures.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_wrong_register_class_is_reported() -> Unit
+  # The LIR was lowered for `f(a: Int)`; verifying it against the
+  # declared `f(a: F64)` signature proves the plan/LIR class mismatch.
+  let defs = Map::new()
+  let lf = av_lower_a64(av_identity_fn("class_probe".to_string(), Type::Int), defs.clone())
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let rows = av_verify(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_no_callees(),
+    "class_probe".to_string(), Vec::from([Type::F64]), Type::Unit, false, lf, alloc)
+  assert(rows.len() > 0, "the wrong declared class must be reported")
+  assert(av_any_contains(rows.clone(), "parameter 0"), "the row names parameter 0: " + av_first(rows))
+  assert(av_any_contains(rows.clone(), "SIMD&FP-register bind"), "the row names the expected SIMD&FP bind: " + av_first(rows))
+end
+
+@test
+def test_wrong_position_is_reported() -> Unit
+  # The LIR binds x0,d0 (lowered for Int,F64); the declared (F64,Int)
+  # plan assigns d0,x0 — the mismatch is positional and exact.
+  let defs = Map::new()
+  let lf = av_lower_a64(av_int_f64_fn("pos_probe".to_string(), Type::Unit), defs.clone())
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let rows = av_verify(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_no_callees(),
+    "pos_probe".to_string(), Vec::from([Type::F64, Type::Int]), Type::Unit, false, lf, alloc)
+  assert(rows.len() > 0, "the swapped declared order must be reported")
+  assert(av_any_contains(rows.clone(), "parameter 0"), "the first mismatch names parameter 0: " + av_first(rows))
+  assert(av_any_contains(rows.clone(), "d0") || av_any_contains(rows.clone(), "position 0"), "the row renders the expected FP position: " + av_first(rows))
+end
+
+@test
+def test_sret_state_mismatch_is_reported() -> Unit
+  let defs = av_defs()
+  let lf = av_lower_a64(av_identity_fn("sret_probe".to_string(), av_fat16_ty()), defs.clone())
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  # Declare a Unit return: the plan says VoidT while the LIR carries the
+  # sret copy-out state — exactly the mismatch the verifier owns.
+  let rows = av_verify(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_no_callees(),
+    "sret_probe".to_string(), Vec::from([av_fat16_ty()]), Type::Unit, false, lf, alloc)
+  assert(rows.len() > 0, "the sret/void divergence must be reported")
+  assert(av_any_contains(rows.clone(), "sret"), "the row names the sret state: " + av_first(rows))
+end
+
+@test
+def test_stack_alignment_violation_is_reported() -> Unit
+  let defs = Map::new()
+  let lf = av_lower_a64(av_identity_fn("align_probe".to_string(), Type::Int), defs.clone())
+  var alloc = lir_alloc_registers_a64(lf.clone())
+  alloc.frame_bytes = alloc.frame_bytes + 1
+  let rows = av_verify(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_no_callees(),
+    "align_probe".to_string(), Vec::from([Type::Int]), Type::Int, false, lf, alloc)
+  assert(rows.len() > 0, "the misaligned frame must be reported")
+  assert(av_any_contains(rows.clone(), "stack alignment"), "the row names the stack alignment: " + av_first(rows))
+end
+
+@test
+def test_fixed_abi_register_allocation_is_reported() -> Unit
+  let defs = Map::new()
+  let lf = av_lower_a64(av_identity_fn("fixed_reg_probe".to_string(), Type::Int), defs.clone())
+  var alloc = lir_alloc_registers_a64(lf.clone())
+  assert(lf.params.len() == 1, "the identity parameter has one vreg")
+  let pv = lf.params[0]
+  alloc.segs_of.insert(pv, Vec::from([LirSeg {
+    start: 0,
+    end: 10,
+    vreg: pv,
+    phys: 0,
+    slot: -1,
+    needs_reload: false
+  }]))
+  let rows = av_verify(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_no_callees(),
+    "fixed_reg_probe".to_string(), Vec::from([Type::Int]), Type::Int, false, lf, alloc)
+  assert(rows.len() > 0, "an allocation to the fixed x0 must be reported")
+  assert(av_any_contains(rows.clone(), "general pools"), "the row names the fixed-ABI-register isolation rule: " + av_first(rows))
+end
+
+@test
+def test_spurious_callee_saved_save_is_reported() -> Unit
+  let defs = Map::new()
+  let lf = av_lower_a64(av_identity_fn("cc_probe".to_string(), Type::Int), defs.clone())
+  var alloc = lir_alloc_registers_a64(lf.clone())
+  alloc.cc_used = Vec::from([19])
+  let rows = av_verify(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_no_callees(),
+    "cc_probe".to_string(), Vec::from([Type::Int]), Type::Int, false, lf, alloc)
+  assert(rows.len() > 0, "a callee-saved save without a segment must be reported")
+  assert(av_any_contains(rows.clone(), "spurious save/restore"), "the row names the spurious save: " + av_first(rows))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 3. Variadics (x86-64 SysV AL convention).
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_x86_variadic_vector_register_argument_is_reported() -> Unit
+  let defs = av_defs()
+  # caller(fmt: Ptr[Int], v: Vec4f) calls extern `printf(fmt, v)`: the
+  # extra vector crosses in a SIMD register position, so the SysV
+  # AL = vector-register-count convention is required and the route has
+  # no variadic marshaller.  (The x86-64 LIR route's fp gate is closed,
+  # so a vector is the reachable SIMD-register extra on this route.)
+  let f = av_fn("vararg_caller".to_string(),
+    Vec::from([
+      av_local(1, "fmt", Type::Ptr(Type::Int), false),
+      av_local(2, "v", av_vec4_ty(), false)
+    ]),
+    Type::Unit,
+    Vec::from([
+      av_local(0, "ret", Type::Unit, false),
+      av_local(1, "fmt", Type::Ptr(Type::Int), false),
+      av_local(2, "v", av_vec4_ty(), false),
+      av_local(3, "dest", Type::Unit, false)
+    ]),
+    Vec::from([
+      av_block(0, Vec::new(), av_call_term(av_place(3), "printf".to_string(), Vec::from([av_value_arg(1), av_place_arg(2)]), 1)),
+      av_block(1, Vec::new(), av_ret_term())
+    ]))
+  let lf = av_lower_x86(f, defs.clone(), x86_64_desc())
+  let alloc = x86_alloc_registers(lf.clone())
+  let sig = av_callee("printf".to_string(), Vec::from([Type::Ptr(Type::Int)]), Type::Unit, true, true)
+  let rows = av_verify(x86_64_desc(), LirVerifyRoute::LirVerifyX86_64, defs.clone(), av_sig_map(sig),
+    "vararg_caller".to_string(), Vec::from([Type::Ptr(Type::Int), av_vec4_ty()]), Type::Unit, false, lf, alloc)
+  assert(rows.len() > 0, "the variadic SIMD-register argument must be reported")
+  assert(av_any_contains(rows.clone(), "AL"), "the row names the SysV AL convention: " + av_first(rows))
+  assert(av_any_contains(rows.clone(), "variadic call to `printf`"), "the row names the callee: " + av_first(rows))
+end
+
+# ———————————————————————————————————————————————————————————————
+# 4. Extern C boundaries.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def test_extern_c_aggregate_mismatch_is_reported() -> Unit
+  let defs = av_defs()
+  # caller(s: Fat16 = {F64,F64}) calls extern `ext_fat(s)`: the internal
+  # convention crosses the 16-byte image by address (one GP slot), while
+  # the platform C ABI classifies it as the 2-member HFA in d0,d1 (audit
+  # P1-13) — the verifier reports the real C placement, which is the
+  # wrong-HFA-placement catch for the LIR route.
+  let f = av_fn("extern_fat_caller".to_string(),
+    Vec::from([av_local(1, "s", av_fat16_ty(), false)]),
+    Type::Unit,
+    Vec::from([
+      av_local(0, "ret", Type::Unit, false),
+      av_local(1, "s", av_fat16_ty(), false),
+      av_local(2, "dest", Type::Unit, false)
+    ]),
+    Vec::from([
+      av_block(0, Vec::new(), av_call_term(av_place(2), "ext_fat".to_string(), Vec::from([av_place_arg(1)]), 1)),
+      av_block(1, Vec::new(), av_ret_term())
+    ]))
+  let lf = av_lower_a64(f, defs.clone())
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let sig = av_callee("ext_fat".to_string(), Vec::from([av_fat16_ty()]), Type::Unit, false, true)
+  let rows = av_verify(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_sig_map(sig),
+    "extern_fat_caller".to_string(), Vec::from([av_fat16_ty()]), Type::Unit, false, lf, alloc)
+  assert(rows.len() > 0, "the extern C aggregate divergence must be reported")
+  assert(av_any_contains(rows.clone(), "extern C"), "the row names the extern C boundary: " + av_first(rows))
+  assert(av_any_contains(rows.clone(), "argument 0"), "the row names the argument: " + av_first(rows))
+  assert(av_any_contains(rows.clone(), "internal convention"), "the row names the internal crossing: " + av_first(rows))
+  # (audit P1-13) The C HFA placement is REAL now: the row names d0,d1
+  # (not a member-scan dependency).
+  assert(av_any_contains(rows.clone(), "d0,d1"), "the wrong HFA placement names the C registers d0,d1: " + av_first(rows))
+  assert(av_any_contains(rows.clone(), "platform C ABI"), "the row names the platform C classification: " + av_first(rows))
+  assert(!av_any_contains(rows.clone(), "member-type scan"), "the member-scan dependency wording must be gone")
+end
+
+@test
+def test_extern_c_hfa_declaration_passes() -> Unit
+  # (audit P1-13) An extern declaration whose parameter and return are
+  # HFA-eligible verifies clean: the member scan and the classifier share
+  # ONE rule, so the ExternC plan carries the FP-register class
+  # (PairFloat, d0,d1) and the verifier's consistency rows are empty.
+  let defs = av_defs()
+  let lf = av_lower_a64(av_identity_fn("hfa_decl_probe".to_string(), av_fat16_ty()), defs.clone())
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let ctx = abi_verify_ctx(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_no_callees())
+  let rows = verify_abi_fn(ctx, AbiVerifyFn {
+    name: "ext_hfa".to_string(),
+    params: Vec::from([av_fat16_ty()]),
+    ret: av_fat16_ty(),
+    variadic: false,
+    is_extern: true,
+    lir: lf,
+    alloc: alloc
+  })
+  assert(rows.len() == 0, "the HFA extern declaration must verify clean; first: " + av_first(rows))
+end
+
+@test
+def test_extern_c_hfa_scalar_fixture_passes() -> Unit
+  # (audit P1-13) The scalar extern fixture still passes clean alongside
+  # the new HFA rows (no member-scan row for a non-aggregate).
+  let defs = Map::new()
+  let lf = av_lower_a64(av_identity_fn("hfa_scalar_probe".to_string(), Type::F64), defs.clone())
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let ctx = abi_verify_ctx(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_no_callees())
+  let rows = verify_abi_fn(ctx, AbiVerifyFn {
+    name: "ext_f64".to_string(),
+    params: Vec::from([Type::F64]),
+    ret: Type::F64,
+    variadic: false,
+    is_extern: true,
+    lir: lf,
+    alloc: alloc
+  })
+  assert(rows.len() == 0, "the scalar extern declaration must verify clean; first: " + av_first(rows))
+end
+
+@test
+def test_extern_c_scalar_boundary_passes() -> Unit
+  let defs = Map::new()
+  # caller(p: Ptr[Int]) calls extern `puts(p)`: the scalar pointer
+  # crossing agrees between the internal and C classifications.
+  let f = av_fn("extern_scalar_caller".to_string(),
+    Vec::from([av_local(1, "p", Type::Ptr(Type::Int), false)]),
+    Type::Unit,
+    Vec::from([
+      av_local(0, "ret", Type::Unit, false),
+      av_local(1, "p", Type::Ptr(Type::Int), false),
+      av_local(2, "dest", Type::Unit, false)
+    ]),
+    Vec::from([
+      av_block(0, Vec::new(), av_call_term(av_place(2), "puts".to_string(), Vec::from([av_value_arg(1)]), 1)),
+      av_block(1, Vec::new(), av_ret_term())
+    ]))
+  let lf = av_lower_a64(f, defs.clone())
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let sig = av_callee("puts".to_string(), Vec::from([Type::Ptr(Type::Int)]), Type::Unit, false, true)
+  let rows = av_verify(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_sig_map(sig),
+    "extern_scalar_caller".to_string(), Vec::from([Type::Ptr(Type::Int)]), Type::Unit, false, lf, alloc)
+  assert(rows.len() == 0, "the agreeing extern scalar boundary must verify clean; first: " + av_first(rows))
+end
+
+@test
+def test_internal_call_boundary_passes_and_batch_forms() -> Unit
+  let defs = Map::new()
+  # callee(a: Int) and caller() calling it — the callee's plan drives the
+  # caller's pre-call move positions.
+  let callee = av_callee("takes_int".to_string(), Vec::from([Type::Int]), Type::Unit, false, false)
+  let f = av_fn("internal_caller".to_string(),
+    Vec::from([av_local(1, "x", Type::Int, false)]),
+    Type::Unit,
+    Vec::from([
+      av_local(0, "ret", Type::Unit, false),
+      av_local(1, "x", Type::Int, false),
+      av_local(2, "dest", Type::Unit, false)
+    ]),
+    Vec::from([
+      av_block(0, Vec::new(), av_call_term(av_place(2), "takes_int".to_string(), Vec::from([av_value_arg(1)]), 1)),
+      av_block(1, Vec::new(), av_ret_term())
+    ]))
+  let lf = av_lower_a64(f, defs.clone())
+  let alloc = lir_alloc_registers_a64(lf.clone())
+  let ctx = abi_verify_ctx(aarch64_desc(), LirVerifyRoute::LirVerifyA64, defs.clone(), av_sig_map(callee))
+  let vf = AbiVerifyFn {
+    name: "internal_caller".to_string(),
+    params: Vec::from([Type::Int]),
+    ret: Type::Unit,
+    variadic: false,
+    is_extern: false,
+    lir: lf,
+    alloc: alloc
+  }
+  assert(abi_verified(ctx.clone(), Vec::from([vf.clone()])), "the internal call boundary must verify")
+  assert(verify_abi(ctx, Vec::from([vf])).len() == 0, "verify_abi and abi_verified agree")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 5. Evidence: the driver route captures the real abi stage.
+# ———————————————————————————————————————————————————————————————
+
+def av_evidence(abi: Bool) -> VerifiedCompilationEvidence
+  verified_compilation_evidence_stages(
+    "rev-abi".to_string(),
+    true, true, true, true, true, true, false, true, true, abi, true,
+    verification_stage_names_driver_route())
+end
+
+@test
+def test_driver_route_captures_abi_stage_for_real() -> Unit
+  let ev = av_evidence(true)
+  assert(evidence_stage_available(ev.clone(), "abi".to_string()), "the driver route captures the abi stage")
+  assert(verification_status_is_verified(proof_evidence_status(ev, "abi".to_string(), true)), "a true abi flag is Verified")
+  let bad = av_evidence(false)
+  match proof_evidence_status(bad, "abi".to_string(), false)
+  when VerificationStatus::Failed then ()
+  when VerificationStatus::Unavailable then panic("a false abi flag on a CAPTURED stage must be Failed, never Unavailable")
+  when VerificationStatus::Verified then panic("a false abi flag can never be Verified")
+  end
+end

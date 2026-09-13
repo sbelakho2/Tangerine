@@ -160,11 +160,11 @@ use tg_compiler::ast::{AccessConvention, AstContractKind}
 use tg_compiler::types::{EffectSummary}
 use tg_compiler::stable_ids::{
   StableContractId, StableDeclId, StableSymbolId, StableEffectId, StableRowKey,
-  StableAbiSurfaceId, stable_abi_surface_of_key,
+  StableAbiSurfaceId, StableTestId, stable_abi_surface_of_key,
   stable_decl_of_key, stable_decl_eq, stable_row_key_digest_eq,
   stable_symbol_id_of_full_key, stable_symbol_of_key,
   stable_composite_row_key, stable_row_key_or_text, stable_effect_from_def,
-  stable_decl_reference_text
+  stable_decl_reference_text, stable_test_id_from_row, stable_decl_id_from_digest
 }
 use tg_compiler::semantic_model::{
   SemanticSnapshot, SemanticSymbol, SemanticType, SemanticTypeKind, StableTargetId,
@@ -176,6 +176,11 @@ use tg_compiler::semantic_model::{
   semantic_contract_expr_text, semantic_unsafe_kind_text, semantic_unsafe_fact_lt,
   semantic_abi_surface_row_text, semantic_dependency_edge_kind_numeric,
   semantic_drop_plan_fact_key,
+  # (audit item 9) the shared completeness model the AffectedResult maps
+  # its legacy word onto.
+  SliceCompleteness, CompletenessInfo,
+  slice_completeness_word, slice_completeness_is_complete,
+  completeness_info_complete, completeness_info_subset, completeness_info_truncated,
   SemanticDependencyGraph, TypeUseEdge, TraitImplEdge, TraitSelectionEdge,
   GenericInstantiationEdge, LayoutDependencyEdge, ConstEvalDependencyEdge,
   DerivedBodyEdge, ContractReferenceEdge, AbiDependencyEdge,
@@ -183,7 +188,12 @@ use tg_compiler::semantic_model::{
   # canonical text projections.
   SemanticParam, SemanticField, SemanticVariant, SemanticCallableSignature,
   SemanticTraitMethod, semantic_param_text, semantic_params_text,
-  semantic_variant_payload_text
+  semantic_variant_payload_text,
+  # (audit order item 8) the per-function resource summaries the typed
+  # delta rows carry (before/after) — the budget's allocation-byte lane
+  # consumes the AllocationSummaryDelta rows.
+  AllocationSummary, StackSummary, BlockingSummary, CodeSizeSummary,
+  ProofLevel, semantic_proof_level_numeric
 }
 use tg_compiler::semantic_index::{
   SemanticIndex, build_semantic_index, index_callers_of, index_tests_for_symbol
@@ -400,6 +410,40 @@ struct AbiDeltaView
   changed_surfaces: Vec[StableAbiSurfaceId] = Vec::new()
 end
 
+# ———— (audit order item 8) the resource-summary delta rows ————
+# ONE changed per-function resource summary row, typed per family: the
+# before/after AllocationSummary (etc.) projections of the snapshot tables;
+# None = the row did not exist on that side. Only CHANGED rows are carried
+# (equal before/after = no delta row). The allocation rows are the §36
+# budget's allocation-byte authority: a finite cap can pass only when every
+# changed after row carries a finite bound (bytes_level StaticProof /
+# StaticBound) and no unbounded sites; a RuntimeMeasured row fails closed
+# with the unbounded site list. function is the body's mir row key text
+# (the summary tables' join key).
+struct AllocationSummaryDelta
+  function: String
+  before: Option[AllocationSummary] = Option::None
+  after: Option[AllocationSummary] = Option::None
+end
+
+struct StackSummaryDelta
+  function: String
+  before: Option[StackSummary] = Option::None
+  after: Option[StackSummary] = Option::None
+end
+
+struct BlockingSummaryDelta
+  function: String
+  before: Option[BlockingSummary] = Option::None
+  after: Option[BlockingSummary] = Option::None
+end
+
+struct CodeSizeSummaryDelta
+  function: String
+  before: Option[CodeSizeSummary] = Option::None
+  after: Option[CodeSizeSummary] = Option::None
+end
+
 struct SemanticDelta
   created: Vec[String] = Vec::new()
   removed: Vec[String] = Vec::new()
@@ -425,6 +469,14 @@ struct SemanticDelta
   variant_delta: Vec[SemanticVariantDelta] = Vec::new()
   signature_delta: Vec[SemanticCallableSignatureDelta] = Vec::new()
   trait_method_delta: Vec[SemanticTraitMethodDelta] = Vec::new()
+  # (audit order item 8) The typed per-function resource-summary diffs: one
+  # row per function whose summary changed, with the typed before/after
+  # records. Defaulted empty (identical summary tables diff to no rows);
+  # the §36 allocation-byte lane reads allocation_summary_delta.
+  allocation_summary_delta: Vec[AllocationSummaryDelta] = Vec::new()
+  stack_summary_delta: Vec[StackSummaryDelta] = Vec::new()
+  blocking_summary_delta: Vec[BlockingSummaryDelta] = Vec::new()
+  code_size_summary_delta: Vec[CodeSizeSummaryDelta] = Vec::new()
   public_api_delta: AbiDeltaView
   abi_delta: AbiDeltaView
   affected: Vec[String] = Vec::new()
@@ -2514,6 +2566,220 @@ end
 
 # ———— THE DIFF CORE ————
 
+# ———————————————————————————————————————————————————————————————
+# (audit order item 8) The resource-summary diffs
+# ———————————————————————————————————————————————————————————————
+# One typed row per function whose resource summary changed, over the
+# union of both snapshots' summary-table keys (the function text). Equal
+# before/after rows are not emitted; a row present on one side only is
+# before/after = None. The §36 allocation-byte lane consumes these rows.
+def delta_allocation_summary_of(rows: Vec[AllocationSummary], key: String) -> Option[AllocationSummary]
+  for r in rows do
+    if r.function == key then
+      return Option::Some(r.clone())
+    end
+  end
+  Option::None
+end
+
+def delta_allocation_summary_same(a: AllocationSummary, b: AllocationSummary) -> Bool
+  a.function == b.function &&
+    a.max_dynamic_bytes == b.max_dynamic_bytes &&
+    a.bounded_arena_bytes == b.bounded_arena_bytes &&
+    a.site_count == b.site_count &&
+    a.unbounded_sites.join(";;") == b.unbounded_sites.join(";;") &&
+    semantic_proof_level_numeric(&a.bytes_level) == semantic_proof_level_numeric(&b.bytes_level) &&
+    semantic_proof_level_numeric(&a.arena_bytes_level) == semantic_proof_level_numeric(&b.arena_bytes_level) &&
+    semantic_proof_level_numeric(&a.sites_level) == semantic_proof_level_numeric(&b.sites_level)
+end
+
+pub def delta_allocation_summary_diffs(a: SemanticSnapshot, b: SemanticSnapshot) -> Vec[AllocationSummaryDelta]
+  var keys: Vec[String] = Vec::new()
+  for r in a.allocation_summaries do
+    if !keys.contains(&r.function) then
+      keys.push(r.function.clone())
+    end
+  end
+  for r2 in b.allocation_summaries do
+    if !keys.contains(&r2.function) then
+      keys.push(r2.function.clone())
+    end
+  end
+  semantic_strings_sort(&mut keys)
+  var out: Vec[AllocationSummaryDelta] = Vec::new()
+  for key in keys do
+    let before = delta_allocation_summary_of(a.allocation_summaries, key.clone())
+    let after = delta_allocation_summary_of(b.allocation_summaries, key.clone())
+    var changed = false
+    match before.clone()
+    when Option::None then
+      changed = after.is_some()
+    when Option::Some(bv) then
+      match after.clone()
+      when Option::None then changed = true
+      when Option::Some(av) then changed = !delta_allocation_summary_same(bv, av)
+      end
+    end
+    if changed then
+      out.push(AllocationSummaryDelta { function: key.clone(), before: before, after: after })
+    end
+  end
+  out
+end
+
+def delta_stack_summary_of(rows: Vec[StackSummary], key: String) -> Option[StackSummary]
+  for r in rows do
+    if r.function == key then
+      return Option::Some(r.clone())
+    end
+  end
+  Option::None
+end
+
+def delta_stack_summary_same(a: StackSummary, b: StackSummary) -> Bool
+  a.function == b.function &&
+    a.frame_bytes == b.frame_bytes &&
+    a.max_stack_bytes == b.max_stack_bytes &&
+    a.recursive == b.recursive &&
+    semantic_proof_level_numeric(&a.frame_level) == semantic_proof_level_numeric(&b.frame_level) &&
+    semantic_proof_level_numeric(&a.max_stack_level) == semantic_proof_level_numeric(&b.max_stack_level)
+end
+
+pub def delta_stack_summary_diffs(a: SemanticSnapshot, b: SemanticSnapshot) -> Vec[StackSummaryDelta]
+  var keys: Vec[String] = Vec::new()
+  for r in a.stack_summaries do
+    if !keys.contains(&r.function) then
+      keys.push(r.function.clone())
+    end
+  end
+  for r2 in b.stack_summaries do
+    if !keys.contains(&r2.function) then
+      keys.push(r2.function.clone())
+    end
+  end
+  semantic_strings_sort(&mut keys)
+  var out: Vec[StackSummaryDelta] = Vec::new()
+  for key in keys do
+    let before = delta_stack_summary_of(a.stack_summaries, key.clone())
+    let after = delta_stack_summary_of(b.stack_summaries, key.clone())
+    var changed = false
+    match before.clone()
+    when Option::None then
+      changed = after.is_some()
+    when Option::Some(bv) then
+      match after.clone()
+      when Option::None then changed = true
+      when Option::Some(av) then changed = !delta_stack_summary_same(bv, av)
+      end
+    end
+    if changed then
+      out.push(StackSummaryDelta { function: key.clone(), before: before, after: after })
+    end
+  end
+  out
+end
+
+def delta_blocking_summary_of(rows: Vec[BlockingSummary], key: String) -> Option[BlockingSummary]
+  for r in rows do
+    if r.function == key then
+      return Option::Some(r.clone())
+    end
+  end
+  Option::None
+end
+
+def delta_blocking_summary_same(a: BlockingSummary, b: BlockingSummary) -> Bool
+  a.function == b.function &&
+    a.blocking == b.blocking &&
+    a.unbounded == b.unbounded &&
+    a.blocking_sites.join(";;") == b.blocking_sites.join(";;") &&
+    semantic_proof_level_numeric(&a.level) == semantic_proof_level_numeric(&b.level)
+end
+
+pub def delta_blocking_summary_diffs(a: SemanticSnapshot, b: SemanticSnapshot) -> Vec[BlockingSummaryDelta]
+  var keys: Vec[String] = Vec::new()
+  for r in a.blocking_summaries do
+    if !keys.contains(&r.function) then
+      keys.push(r.function.clone())
+    end
+  end
+  for r2 in b.blocking_summaries do
+    if !keys.contains(&r2.function) then
+      keys.push(r2.function.clone())
+    end
+  end
+  semantic_strings_sort(&mut keys)
+  var out: Vec[BlockingSummaryDelta] = Vec::new()
+  for key in keys do
+    let before = delta_blocking_summary_of(a.blocking_summaries, key.clone())
+    let after = delta_blocking_summary_of(b.blocking_summaries, key.clone())
+    var changed = false
+    match before.clone()
+    when Option::None then
+      changed = after.is_some()
+    when Option::Some(bv) then
+      match after.clone()
+      when Option::None then changed = true
+      when Option::Some(av) then changed = !delta_blocking_summary_same(bv, av)
+      end
+    end
+    if changed then
+      out.push(BlockingSummaryDelta { function: key.clone(), before: before, after: after })
+    end
+  end
+  out
+end
+
+def delta_code_size_summary_of(rows: Vec[CodeSizeSummary], key: String) -> Option[CodeSizeSummary]
+  for r in rows do
+    if r.function == key then
+      return Option::Some(r.clone())
+    end
+  end
+  Option::None
+end
+
+def delta_code_size_summary_same(a: CodeSizeSummary, b: CodeSizeSummary) -> Bool
+  a.function == b.function &&
+    a.code_size_bytes == b.code_size_bytes &&
+    a.exact == b.exact &&
+    semantic_proof_level_numeric(&a.level) == semantic_proof_level_numeric(&b.level)
+end
+
+pub def delta_code_size_summary_diffs(a: SemanticSnapshot, b: SemanticSnapshot) -> Vec[CodeSizeSummaryDelta]
+  var keys: Vec[String] = Vec::new()
+  for r in a.code_size_summaries do
+    if !keys.contains(&r.function) then
+      keys.push(r.function.clone())
+    end
+  end
+  for r2 in b.code_size_summaries do
+    if !keys.contains(&r2.function) then
+      keys.push(r2.function.clone())
+    end
+  end
+  semantic_strings_sort(&mut keys)
+  var out: Vec[CodeSizeSummaryDelta] = Vec::new()
+  for key in keys do
+    let before = delta_code_size_summary_of(a.code_size_summaries, key.clone())
+    let after = delta_code_size_summary_of(b.code_size_summaries, key.clone())
+    var changed = false
+    match before.clone()
+    when Option::None then
+      changed = after.is_some()
+    when Option::Some(bv) then
+      match after.clone()
+      when Option::None then changed = true
+      when Option::Some(av) then changed = !delta_code_size_summary_same(bv, av)
+      end
+    end
+    if changed then
+      out.push(CodeSizeSummaryDelta { function: key.clone(), before: before, after: after })
+    end
+  end
+  out
+end
+
 pub def semantic_delta_of(a: SemanticSnapshot, b: SemanticSnapshot) -> SemanticDelta
   var result = semantic_delta_empty()
 
@@ -2729,6 +2995,12 @@ pub def semantic_delta_of(a: SemanticSnapshot, b: SemanticSnapshot) -> SemanticD
   result.variant_delta = delta_variant_diffs(&a, &b)
   result.signature_delta = delta_signature_diffs(&a, &b)
   result.trait_method_delta = delta_trait_method_diffs(&a, &b)
+  # (audit order item 8) the typed resource-summary diffs (before/after
+  # records from the persisted summary tables — never a render re-parse).
+  result.allocation_summary_delta = delta_allocation_summary_diffs(&a, &b)
+  result.stack_summary_delta = delta_stack_summary_diffs(&a, &b)
+  result.blocking_summary_delta = delta_blocking_summary_diffs(&a, &b)
+  result.code_size_summary_delta = delta_code_size_summary_diffs(&a, &b)
   # (fourth-audit P0-19) The TYPED changed members of the two surfaces,
   # populated here at build time (the budget's allowed_api / allowed_abi
   # membership compares only these; nothing is parsed at verification).
@@ -2910,7 +3182,13 @@ end
 # requested family was traversed (complete or partial) and at least one
 # family is incomplete; "unavailable" iff every requested kind was
 # unavailable (nothing was traversed). missing_relations lists the sorted,
-# deduped family names that are not complete.
+# deduped family names that are not complete. (audit item 9) The SAME
+# verdict in the shared semantic_model.tg completeness model — Complete /
+# ConservativeSubset / Truncated under the model word
+# "semantic-affected-closure" — rides AffectedResult.completeness_info via
+# affected_completeness_info below; every consumer (the §37 patch's
+# analysis rows, v2 answers) reads the shared record, never the legacy
+# word alone.
 #
 # ALGORITHM: seeds = the delta's created + removed + modified stable keys.
 # The closure is the least fixed point over the UNION of the requested
@@ -2932,10 +3210,21 @@ end
 #                       knowledge is not complete. A request whose family is
 #                       unavailable always names it here; a partial family
 #                       is named too. Empty for a fully complete answer.
+#   completeness_info — (audit item 9) the SAME verdict in the shared
+#                       semantic_model.tg completeness model:
+#                       "complete" -> Complete; "partial" and
+#                       "unavailable" -> ConservativeSubset (real rows
+#                       walked with named producer gaps may omit
+#                       dependents; an unavailable family is not consulted
+#                       at all, so the closure omits every dependent it
+#                       would contribute — NEVER Complete); a cap-held
+#                       worklist -> Truncated. The analysis model word is
+#                       "semantic-affected-closure".
 pub struct AffectedResult
   entities: Vec[String] = Vec::new()
   completeness: String = "complete"
   missing_relations: Vec[String] = Vec::new()
+  completeness_info: CompletenessInfo = CompletenessInfo {}
 end
 
 # The completeness status of one relation family: the persisted
@@ -3122,6 +3411,54 @@ def delta_closure_absorb(
   ()
 end
 
+# The audit-item-9 mapping of the AffectedResult's legacy completeness word
+# onto the shared model (semantic_model.tg):
+#   "complete"    -> Complete.
+#   "partial"     -> ConservativeSubset — the real rows were traversed, but
+#                    the named families' producers documented residual gaps,
+#                    so reachable dependents may be missing;
+#                    omitted_lower_bound = the incomplete-family count.
+#   "unavailable" -> ConservativeSubset — the traversal did NOT run for the
+#                    named families, so their dependents are omitted;
+#                    omitted_lower_bound = the unavailable-family count.
+#                    (The shared enum has no Unavailable class: an
+#                    unavailable relation still yields a SUBSET of the true
+#                    closure, and the reason names the families.)
+# An empty missing list with a non-complete word still maps to
+# ConservativeSubset (fail-closed; the reason records the bare status
+# word). A cap-held worklist maps to Truncated and wins over both.
+pub def affected_completeness_info(
+  completeness: String,
+  missing: Vec[String],
+  visited: Int,
+  returned: Int,
+  truncated: Bool,
+  omitted: Int
+) -> CompletenessInfo
+  if truncated then
+    return completeness_info_truncated("semantic-affected-closure",
+      "cap: the affected-closure worklist stopped after " + visited.to_string() +
+        " processed key(s); " + omitted.to_string() + " key(s) remain unprocessed",
+      visited, returned, omitted)
+  end
+  if completeness == "complete" then
+    return completeness_info_complete("semantic-affected-closure", visited, returned)
+  end
+  var reason = ""
+  if completeness == "partial" then
+    reason = "relation families with producer gaps: " + missing.join(",") +
+      " (dependents reachable only through the incomplete families may be omitted)"
+  else
+    reason = "relation families unavailable: " + missing.join(",") +
+      " (the closure omits every dependent these families would contribute)"
+  end
+  var omit = missing.len()
+  if omit <= 0 then
+    omit = 1
+  end
+  completeness_info_subset("semantic-affected-closure", reason, visited, returned, omit)
+end
+
 # The audit item-41 closure: the sorted keys reachable from the delta's
 # changed entities through EXACTLY the requested dependency edge kinds, with
 # the typed completeness verdict (fourth-audit P0-9). See the section doc
@@ -3195,11 +3532,15 @@ pub def affected_closure(
 
   if queue.len() == 0 then
     semantic_strings_sort(&mut queue)
-    return AffectedResult { entities: queue, completeness: completeness, missing_relations: missing_list }
+    return AffectedResult { entities: queue.clone(), completeness: completeness.clone(),
+      missing_relations: missing_list.clone(),
+      completeness_info: affected_completeness_info(completeness.clone(), missing_list.clone(), 0, queue.len(), false, 0) }
   end
   if kinds.len() == 0 then
     semantic_strings_sort(&mut queue)
-    return AffectedResult { entities: queue, completeness: completeness, missing_relations: missing_list }
+    return AffectedResult { entities: queue.clone(), completeness: completeness.clone(),
+      missing_relations: missing_list.clone(),
+      completeness_info: affected_completeness_info(completeness.clone(), missing_list.clone(), 0, queue.len(), false, 0) }
   end
 
   # 3. The per-kind edge maps, built once per requested class from the
@@ -3444,7 +3785,10 @@ pub def affected_closure(
     end
   end
   semantic_strings_sort(&mut queue)
-  AffectedResult { entities: queue, completeness: completeness, missing_relations: missing_list }
+  AffectedResult { entities: queue.clone(), completeness: completeness.clone(),
+    missing_relations: missing_list.clone(),
+    completeness_info: affected_completeness_info(completeness, missing_list, rounds, queue.len(),
+      head < queue.len(), queue.len() - head) }
 end
 
 # ———— The canonical delta text + the content-addressed delta digest ————
@@ -4244,6 +4588,12 @@ end
 # are self-checking helpers a behavior lane can call). Each row builds a
 # minimal snapshot/delta fixture — including HAND-BUILT rows of the typed
 # dependency graph (snapshot.dependencies) and the graph's
+# (audit item 9) The lane also asserts the shared-model mapping of every
+# row: Complete for "complete", ConservativeSubset for "partial" /
+# "unavailable" (model word "semantic-affected-closure", positive omitted
+# lower bound for the non-complete cases, the reason naming the incomplete
+# family), so the legacy word and the shared record can never diverge.
+#
 # dependency_completeness table where the family is under test — runs
 # affected_closure over one (or a union of) DependencyEdgeKind class(es)
 # and records a mismatch row when the AffectedResult (entities,
@@ -4365,8 +4715,20 @@ def delta_lane_row(inout out: Vec[String], name: String, got: Vec[String], expec
   ()
 end
 
+# The shared-model class the legacy word must map onto (audit item 9):
+# "complete" -> Complete; "partial" / "unavailable" -> ConservativeSubset.
+def delta_lane_expected_class(completeness: String) -> SliceCompleteness
+  if completeness == "complete" then
+    return SliceCompleteness::Complete
+  end
+  SliceCompleteness::ConservativeSubset
+end
+
 # One row over the FULL AffectedResult shape (fourth-audit P0-9): entities,
-# completeness word and the sorted missing-relation list must all match.
+# completeness word and the sorted missing-relation list must all match —
+# plus (audit item 9) the shared-model mapping: the CompletenessInfo class,
+# the "semantic-affected-closure" model word and a positive omitted lower
+# bound for every non-complete answer.
 def delta_lane_result_row(
   inout out: Vec[String],
   name: String,
@@ -4382,6 +4744,22 @@ def delta_lane_result_row(
       expected_entities.join(",") + "] missing [" + expected_missing.join(",") +
       "], got " + got.completeness.clone() + " [" + got.entities.join(",") +
       "] missing [" + got.missing_relations.join(",") + "]")
+    return ()
+  end
+  # (audit item 9) the shared-model mapping agreement.
+  let expected_class = delta_lane_expected_class(expected_completeness.clone())
+  if slice_completeness_word(got.completeness_info.completeness.clone()) !=
+     slice_completeness_word(expected_class) then
+    out.push(name + ": completeness mapping expected " + slice_completeness_word(expected_class) +
+      ", got " + slice_completeness_word(got.completeness_info.completeness.clone()))
+  end
+  if got.completeness_info.analysis_model != "semantic-affected-closure" then
+    out.push(name + ": completeness mapping model expected semantic-affected-closure, got " +
+      got.completeness_info.analysis_model.clone())
+  end
+  if expected_completeness != "complete" && got.completeness_info.omitted_lower_bound <= 0 then
+    out.push(name + ": completeness mapping expected omitted_lower_bound > 0 for " +
+      expected_completeness.clone())
   end
   ()
 end
@@ -4446,6 +4824,17 @@ pub def affected_closure_lane_check() -> Vec[String]
   delta_lane_result_row(&mut out, "closure-empty-derived-l1",
     delta_lane_closure(&b1, &idx1, &d1, DependencyEdgeKind::DerivedImpl),
     l1_seed.clone(), "unavailable".to_string(), Vec::from(["DerivedBody".to_string()]))
+
+  # (audit item 9) the SHARED completeness mapping of the unavailable case:
+  # ConservativeSubset (never Complete), the model word names the closure,
+  # the reason names the unavailable family and the omitted lower bound is
+  # positive. The row above already checks the class/model/omitted fields
+  # via delta_lane_result_row; this row pins the reason text's family name.
+  let l1_unavail = delta_lane_closure(&b1, &idx1, &d1, DependencyEdgeKind::GenericInstantiation)
+  if l1_unavail.completeness_info.truncation_reason.find("GenericInstantiation") < 0 then
+    out.push("closure-mapping-l1: unavailable reason does not name GenericInstantiation: " +
+      l1_unavail.completeness_info.truncation_reason.clone())
+  end
 
   # The propagation classes ride the call rows.
   delta_lane_result_row(&mut out, "closure-effect-prop-l1",
@@ -4633,6 +5022,10 @@ pub def affected_closure_lane_check() -> Vec[String]
   # ———— L5: test TE exercises fn B (TestReferences) ————
   let k_te5 = "m::TE#fn()->unit".to_string()
   let k_b5 = "m::B#fn()->unit".to_string()
+  # (audit order item 5) the test endpoint is a StableTestId: the canonical
+  # key text carries the owner key + test-kind + declared name; the target
+  # endpoint is the exercised declaration's StableDeclId.
+  let k_te5_test = k_te5.clone() + "|test@attr#TE"
   var b5 = delta_lane_snapshot()
   var b5_syms: Vec[SemanticSymbol] = Vec::new()
   b5_syms.push(delta_lane_fn_symbol(&k_te5, "TE", false))
@@ -4640,15 +5033,15 @@ pub def affected_closure_lane_check() -> Vec[String]
   b5.symbols = b5_syms
   var b5_tests: Vec[TestRelationship] = Vec::new()
   b5_tests.push(TestRelationship {
-    test: delta_lane_sid(&k_te5),
-    target: delta_lane_sid(&k_b5)
+    test: stable_test_id_from_row(k_te5_test.clone(), "attr".to_string(), "TE".to_string(), Vec::new(), 0x11, 0x22),
+    target: stable_decl_of_key(&k_b5)
   })
   b5.tests = b5_tests
   let idx5 = build_semantic_index(&b5)
   let d5 = delta_lane_seed_delta(Vec::from([k_b5.clone()]))
   delta_lane_result_row(&mut out, "closure-test-refs-l5",
     delta_lane_closure(&b5, &idx5, &d5, DependencyEdgeKind::TestReferences),
-    Vec::from([k_b5.clone(), k_te5.clone()]), "complete".to_string(), Vec::new())
+    Vec::from([k_b5.clone(), k_te5_test.clone()]), "complete".to_string(), Vec::new())
 
   # ———— L6a: a pub Function's ABI consumers are its callers ————
   var b6 = delta_lane_snapshot()
@@ -4925,6 +5318,132 @@ end
 # modified variant row, an added variant/method produces an after-only row
 # and a signature edit produces a before/after typed pair. Identical
 # tables emit nothing and the typed rows join the delta digest.
+# ———————————————————————————————————————————————————————————————
+# (audit order item 8) The resource-summary delta lane
+# ———————————————————————————————————————————————————————————————
+# The typed before/after resource-summary rows end-to-end through the REAL
+# semantic_delta_of: a created bounded allocation row, a created
+# runtime-sized row carrying its unbounded site key, and typed
+# stack/blocking/code-size rows all ride the delta; the identical-b snapshots
+# emit NO summary rows (typed equality; emit-nothing).
+pub def resource_summary_delta_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  var snap_a = delta_lane_snapshot()
+  var snap_b = delta_lane_snapshot()
+  let f_key = "m::bounded#fn()->unit".to_string()
+  let g_key = "m::runtime#fn(i64)->unit".to_string()
+  snap_b.allocation_summaries = Vec::from([
+    AllocationSummary {
+      function: f_key.clone(),
+      max_dynamic_bytes: 64,
+      bounded_arena_bytes: 0,
+      site_count: 1,
+      unbounded_sites: Vec::new(),
+      bytes_level: ProofLevel::StaticProof,
+      arena_bytes_level: ProofLevel::StaticProof,
+      sites_level: ProofLevel::StaticProof
+    },
+    AllocationSummary {
+      function: g_key.clone(),
+      max_dynamic_bytes: -1,
+      bounded_arena_bytes: -1,
+      site_count: 2,
+      unbounded_sites: Vec::from([g_key.clone() + "#B0#S1"]),
+      bytes_level: ProofLevel::RuntimeMeasured,
+      arena_bytes_level: ProofLevel::Unavailable,
+      sites_level: ProofLevel::RuntimeMeasured
+    }
+  ])
+  snap_b.stack_summaries = Vec::from([
+    StackSummary {
+      function: f_key.clone(),
+      frame_bytes: 16,
+      max_stack_bytes: 48,
+      recursive: false,
+      frame_level: ProofLevel::StaticProof,
+      max_stack_level: ProofLevel::StaticBound
+    }
+  ])
+  snap_b.blocking_summaries = Vec::from([
+    BlockingSummary {
+      function: g_key.clone(),
+      blocking: true,
+      blocking_sites: Vec::from(["mutex-lock@B1".to_string()]),
+      unbounded: true,
+      level: ProofLevel::RuntimeMeasured
+    }
+  ])
+  snap_b.code_size_summaries = Vec::from([
+    CodeSizeSummary {
+      function: f_key.clone(),
+      code_size_bytes: 48,
+      exact: false,
+      level: ProofLevel::StaticBound
+    }
+  ])
+  let delta = semantic_delta_of(&snap_a, &snap_b)
+  # The allocation rows: one per function, sorted by key text (f < g).
+  var alloc_rows_ok = delta.allocation_summary_delta.len() == 2
+  var bounded_row_ok = false
+  var runtime_row_ok = false
+  if alloc_rows_ok then
+    let r0 = delta.allocation_summary_delta[0]
+    let r1 = delta.allocation_summary_delta[1]
+    if r0.function == f_key && r0.before.is_none() then
+      match r0.after
+      when Option::Some(a0) then
+        bounded_row_ok = a0.max_dynamic_bytes == 64 &&
+          semantic_proof_level_numeric(&a0.bytes_level) == 0 &&
+          a0.unbounded_sites.len() == 0
+      when Option::None then ()
+      end
+    end
+    if r1.function == g_key && r1.before.is_none() then
+      match r1.after
+      when Option::Some(a1) then
+        runtime_row_ok = a1.max_dynamic_bytes == -1 &&
+          semantic_proof_level_numeric(&a1.bytes_level) == 2 &&
+          a1.unbounded_sites.len() == 1 &&
+          a1.unbounded_sites[0] == g_key.clone() + "#B0#S1"
+      when Option::None then ()
+      end
+    end
+  end
+  if !alloc_rows_ok || !bounded_row_ok || !runtime_row_ok then
+    out.push("resource-summary-delta: allocation rows mismatch")
+  end
+  if delta.stack_summary_delta.len() != 1 ||
+    delta.stack_summary_delta[0].function != f_key ||
+    delta.stack_summary_delta[0].after.is_none() then
+    out.push("resource-summary-delta: stack rows mismatch")
+  end
+  if delta.blocking_summary_delta.len() != 1 ||
+    delta.blocking_summary_delta[0].function != g_key ||
+    delta.blocking_summary_delta[0].after.is_none() then
+    out.push("resource-summary-delta: blocking rows mismatch")
+  end
+  if delta.code_size_summary_delta.len() != 1 ||
+    delta.code_size_summary_delta[0].function != f_key ||
+    delta.code_size_summary_delta[0].after.is_none() then
+    out.push("resource-summary-delta: code-size rows mismatch")
+  end
+  # The identical control: the same summary tables on both sides emit no
+  # summary rows at all (typed equality, emit-nothing).
+  var snap_c = delta_lane_snapshot()
+  snap_c.allocation_summaries = snap_b.allocation_summaries.clone()
+  snap_c.stack_summaries = snap_b.stack_summaries.clone()
+  snap_c.blocking_summaries = snap_b.blocking_summaries.clone()
+  snap_c.code_size_summaries = snap_b.code_size_summaries.clone()
+  let delta_same = semantic_delta_of(&snap_b, &snap_c)
+  if delta_same.allocation_summary_delta.len() != 0 ||
+    delta_same.stack_summary_delta.len() != 0 ||
+    delta_same.blocking_summary_delta.len() != 0 ||
+    delta_same.code_size_summary_delta.len() != 0 then
+    out.push("resource-summary-delta: identical tables must emit no rows")
+  end
+  out
+end
+
 pub def typed_table_delta_lane_check() -> Vec[String]
   var out: Vec[String] = Vec::new()
   let e_key = "m::E#enum{A(int),B(int)}".to_string()

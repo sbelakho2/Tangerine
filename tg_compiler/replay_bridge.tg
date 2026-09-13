@@ -51,31 +51,70 @@
 #     divergence and no slice.
 #
 # THE WIRED SOURCE SET (only REAL commit points are dictionary sites):
-#   time     — "__tg_clock_ns" (the runtime's clock_gettime helper;
-#              runtime.tg's emit_tg_clock_ns commits the note token);
+#   time     — "__tg_clock_ns" (the runtime's clock helper),
+#              "clock_gettime" (std/time's Instant extern binding — the
+#              runtime DEFINES the symbol, see runtime.tg's
+#              emit_posix_clock_gettime) and "_tg_wasi_clock_time_get"
+#              (routes through the clock_gettime symbol). The committed
+#              payload is the nanoseconds word (8 bytes little-endian) —
+#              the typed ReplayChoice::Time value.
 #   external — the runtime read helpers "_tg_posix_read",
-#              "_tg_read_vec_u8" and "_tg_read_file_to_string" (the
-#              posix_read body commits; the two wrappers route through it).
+#              "_tg_read_vec_u8", "_tg_read_file_to_string" and
+#              "_tg_wasi_fd_read" (the wrappers route through posix_read),
+#              the libc `read` binding ("read" / "libc_read" — the runtime
+#              aliases _tg_posix_read; std/rand's /dev/urandom entropy
+#              fallback is this path), and the inline kernel READ:
+#              "__intrinsic_syscall1..6" call sites whose canonical
+#              syscall-number argument resolves to 0 (read) through the
+#              constant-function walk below. The committed payload is the
+#              BYTES THE READ LANDED (up to the recorder's 64-byte cap per
+#              record) — the typed ReplayChoice::ExternalRead value. A
+#              wrapped or looping read records one event per landed chunk,
+#              all with the SAME site token (the per-call protocol).
+#   random   — "getrandom" (std/rand's OS entropy seed read; the runtime
+#              DEFINES the symbol: Linux getrandom / macOS getentropy, see
+#              runtime.tg's emit_posix_getrandom). The committed payload is
+#              the landed entropy bytes (short reads are zero-padded to the
+#              8-byte minimum); the typed ReplayChoice::Random projects the
+#              first 8 bytes little-endian (the seed word).
 # The runtime commits a note via the LIR-emitted note stores (lir.tg's
 # lir_emit_replay_note_a64 arms `_tg_replay_note_token` /
 # `_tg_replay_note_tag` immediately before the call; the runtime helper
-# reads + disarms them).
+# reads them). PROTOCOL — PER-CALL TOKEN: a commit never clears the note,
+# so every commit inside an armed call carries the SAME site token (a
+# looping `_tg_read_file_to_string` records each chunk); the LIR's
+# post-call disarm (lir_emit_replay_disarm_a64) is the single authority
+# that ends the arming window. The inline syscall-read commit
+# (`_tg_replay_commit_read`, emitted at the LIR syscall site) follows the
+# same protocol.
 #
 # DOCUMENTED EXCLUSIONS (typed operation words DEFINED but NOT wired —
 # no runtime commit point exists yet; replay_unwired_source_note names the
 # reason per callee):
-#   random    — std/rand's os entropy path calls the libc `getrandom`
-#               extern (and `open`/`read` on /dev/urandom) directly; those
-#               are NOT runtime helpers, so no note/commit pair can be
-#               emitted without a std-level recorder surface.
-#   scheduler — std/thread goes straight to pthread_create/pthread_join/
-#               sched_yield; the OS owns the choice. The runtime has no
-#               scheduler choice point to record (the typed kind stays
-#               defined for a future in-runtime scheduler).
-#   external — std/io's sys_read lowers the raw `__intrinsic_syscall3`
-#               kernel call inline (no runtime helper), and std/time's
-#               Instant goes through the `clock_gettime` libc extern; both
-#               stay typed-but-unwired for the same reason.
+#   scheduler — std/thread goes straight to the libc pthread surface
+#               (pthread_create / pthread_join / pthread_mutex_lock /
+#               pthread_mutex_trylock / pthread_cond_wait /
+#               pthread_barrier_wait / sched_yield and the sleep family).
+#               The OS owns the interleaving AND the guest-visible outcomes
+#               (a trylock's acquired/busy result, the barrier's serial
+#               thread, a timed wait's timeout); none of those callees is a
+#               runtime helper, so no note/commit pair can be emitted. The
+#               guest's own spawn/join ORDER is program order, not a choice
+#               point, and the inline atomic surface (std/sync's CAS/LSE
+#               intrinsics, lowered in user code) has no runtime commit
+#               pair either. The typed kind stays defined for a future
+#               runtime that wraps the pthread surface with a commit.
+#   random    — the sibling entropy externs "getentropy" / "arc4random" /
+#               "arc4random_buf" have no runtime binding (only
+#               "getrandom" does), so they stay typed-but-unwired.
+#   external  — "pread" has no runtime binding; the inline syscall family's
+#               non-read numbers and any syscall-number argument the
+#               constant walk cannot resolve (a dynamic number, a
+#               parameter) stay typed-but-unwired — only the canonical READ
+#               number 0 is a dictionary site.
+#   time      — "clock_getres" / "gettimeofday" / "time" have no runtime
+#               binding (the libc externs are not runtime helpers), so
+#               std/time's other clocks stay typed-but-unwired.
 #
 # DETERMINISM: the dictionary render is one header line
 # ("tg.replay.dict.v1") then one "site|<token>|<op>|<node key>|<decl key>"
@@ -83,21 +122,25 @@
 # stable_decl_key, stable_node_key) with the (fn_name, block id) locator as
 # the final tie-break, and tokens are assigned from 1 in that order, so two
 # builds of the same finalized MIR produce byte-identical dictionaries and
-# token assignments regardless of function iteration order.
+# token assignments regardless of function iteration order. The run
+# artifact grammar is UNCHANGED (version 1): the protocol fix and the new
+# sources only change which records are written, never the layout.
 
 use std::core::{Option, Result}
-use std::collections::{Vec}
+use std::collections::{Map, Vec}
 
 use tg_compiler::ids::{StableDigest, stable_digest_of}
 use tg_compiler::token::{span_dummy}
-use tg_compiler::types::{Type}
+use tg_compiler::types::{AccessEffect, Type}
 use tg_compiler::mir::{
   MirFunction, MirBlock, MirBlockId, MirLocal, MirLocalId, MirTerminator,
   MirTerminatorKind, MirOperand, MirOperandKind, MirConstant, MirConstantKind,
-  MirCallArg
+  MirCallArg, MirCallValue, MirStatement, Place, MirRvalue, MirRvalueKind,
+  MirStatementKind
 }
 use tg_compiler::stable_ids::{
-  UntrackedArtifact, untracked_artifact, stable_mir_node_key_of,
+  StableMirNodeId,
+  UntrackedArtifact, untracked_artifact, untracked_artifact_text, stable_mir_node_key_of,
   stable_mir_node_id_of_generated, stable_mir_block_id_of_node
 }
 use tg_compiler::replay::{
@@ -235,16 +278,211 @@ def replay_callee_name_of(func: MirOperand) -> Option[String]
   end
 end
 
+# ———— the inline syscall family (the read-number resolution) ————
+
+# The __intrinsic_syscall1..6 family classifier: the SAME name grammar the
+# LIR route's lir_syscall_nargs_of recognizes (the optional MIR method dot,
+# the __intrinsic_ prefix with its generic suffix, the bare router
+# spellings). Option::Some(nargs) = the family index (the user-argument
+# count; the call carries nargs + 1 words — the syscall number plus the
+# user args).
+pub def replay_syscall_nargs_of(name: String) -> Option[Int]
+  var bare = name
+  if bare.len() > 1 && bare.slice(0, 1) == "." then
+    bare = bare.slice(1, bare.len())
+  end
+  let prefix = "__intrinsic_"
+  if bare.starts_with(prefix) then
+    bare = bare.slice(prefix.len(), bare.len())
+    match bare.find("<")
+    when Option::Some(i) then bare = bare.slice(0, i)
+    when Option::None then ()
+    end
+  end
+  let family = "syscall"
+  if !bare.starts_with(family) then return Option::None end
+  let suffix = bare.slice(family.len(), bare.len())
+  match suffix
+  when "1" then Option::Some(1)
+  when "2" then Option::Some(2)
+  when "3" then Option::Some(3)
+  when "4" then Option::Some(4)
+  when "5" then Option::Some(5)
+  when "6" then Option::Some(6)
+  when _ then Option::None
+  end
+end
+
+# The function table of the finalized program (non-extern bodies by
+# emission name) — the lookup the constant-number walk resolves a callee
+# through. Built once per plan build; only a --replay build pays for it.
+pub def replay_function_table(functions: Vec[MirFunction]) -> Map[String, MirFunction]
+  var table: Map[String, MirFunction] = Map::new()
+  for f in functions do
+    if !f.is_extern then
+      table.insert(f.name.clone(), f.clone())
+    end
+  end
+  table
+end
+
+# The unique constant-Int definition of a bare local: a constant
+# assignment (`local = <int literal>`) or a call whose callee is a
+# constant-return function (the `SYS_READ()` shape). Option::None when the
+# local has zero or multiple definitions, a non-constant definition, or
+# the callee's return is not a single constant — the walk NEVER guesses a
+# syscall number.
+def replay_local_const_int(f: MirFunction, local: MirLocalId, table: Map[String, MirFunction], depth: Int) -> Option[Int]
+  if depth > 8 then
+    return Option::None
+  end
+  var count = 0
+  var have = false
+  var value = 0
+  for b in f.blocks do
+    for s in b.statements do
+      match s.kind
+      when MirStatementKind::MirAssign(p, rv) then
+        if p.local.id == local.id && p.projections.is_empty() then
+          match rv.kind
+          when MirRvalueKind::MirMove(op) then
+            match op.kind
+            when MirOperandKind::MirConstant(c) then
+              match c.kind
+              when MirConstantKind::MirInt(v) then
+                count = count + 1
+                have = true
+                value = v
+              when _ then ()
+              end
+            when _ then ()
+            end
+          when _ then ()
+          end
+        end
+      when _ then ()
+      end
+    end
+    match b.terminator.kind
+    when MirTerminatorKind::MirCall { dest, func, args: _, success: _, unwind: _, intrinsic: _, tail: _ } then
+      if dest.local.id == local.id && dest.projections.is_empty() then
+        match replay_callee_name_of(func.clone())
+        when Option::Some(callee) then
+          count = count + 1
+          match replay_function_returns_const(table.clone(), callee.clone(), depth + 1)
+          when Option::Some(v) then
+            have = true
+            value = v
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      end
+    when _ then ()
+    end
+  end
+  if count == 1 && have then Option::Some(value) else Option::None end
+end
+
+# The constant an entire function returns: every return terminator's
+# value (local 0) must resolve to the same constant, at least one return
+# must exist, and the callee chain is depth-bounded. This is the
+# `def SYS_READ() -> Int = 0` shape — the read-number fact the syscall
+# walk consumes.
+def replay_function_returns_const(table: Map[String, MirFunction], name: String, depth: Int) -> Option[Int]
+  if depth > 8 then
+    return Option::None
+  end
+  match table.get(name.clone())
+  when Option::None then Option::None
+  when Option::Some(g) then
+    var returns = 0
+    var have = false
+    var value = 0
+    for b in g.blocks do
+      match b.terminator.kind
+      when MirTerminatorKind::MirReturn then
+        returns = returns + 1
+        match replay_local_const_int(g.clone(), MirLocalId { id: 0 }, table.clone(), depth + 1)
+        when Option::None then
+          return Option::None
+        when Option::Some(v) then
+          if have && value != v then
+            return Option::None
+          end
+          have = true
+          value = v
+        end
+      when _ then ()
+      end
+    end
+    if returns > 0 && have then Option::Some(value) else Option::None end
+  end
+end
+
+# The constant canonical syscall number of a bare place (its unique
+# constant-Int definition).
+def replay_place_syscall_number(f: MirFunction, place: Place, table: Map[String, MirFunction], depth: Int) -> Option[Int]
+  if !place.projections.is_empty() then
+    return Option::None
+  end
+  replay_local_const_int(f.clone(), place.local.clone(), table.clone(), depth)
+end
+
+# The constant canonical syscall number of an operand.
+def replay_operand_syscall_number(f: MirFunction, op: MirOperand, table: Map[String, MirFunction], depth: Int) -> Option[Int]
+  match op.kind
+  when MirOperandKind::MirConstant(c) then
+    match c.kind
+    when MirConstantKind::MirInt(v) then Option::Some(v)
+    when _ then Option::None
+    end
+  when MirOperandKind::MirCopy(p) then replay_place_syscall_number(f.clone(), p.clone(), table.clone(), depth)
+  when MirOperandKind::MirRead(p) then replay_place_syscall_number(f.clone(), p.clone(), table.clone(), depth)
+  when MirOperandKind::MirMovePlace(p) then replay_place_syscall_number(f.clone(), p.clone(), table.clone(), depth)
+  when MirOperandKind::MirConsume(p) then replay_place_syscall_number(f.clone(), p.clone(), table.clone(), depth)
+  end
+end
+
+# The wired syscall-read classification: Option::Some("external") only
+# when the call's canonical syscall-number argument (the first word)
+# resolves to 0 — the READ number the runtime's inline kernel sequence
+# executes. Every other syscall (write/open/close, a dynamic number, a
+# parameter) is not a dictionary site; replay_unwired_source_note
+# documents the exclusion.
+pub def replay_syscall_read_commits(f: MirFunction, table: Map[String, MirFunction], args: Vec[MirCallArg]) -> Option[String]
+  if args.len() == 0 then
+    return Option::None
+  end
+  let number = match args[0].value
+  when MirCallValue::Value(op) then replay_operand_syscall_number(f.clone(), op.clone(), table.clone(), 0)
+  when MirCallValue::Place(p) then replay_place_syscall_number(f.clone(), p.clone(), table.clone(), 0)
+  end
+  match number
+  when Option::Some(v) then
+    if v == 0 then Option::Some(replay_op_external()) else Option::None end
+  when Option::None then Option::None
+  end
+end
+
 # The WIRED commit set: the callee names whose runtime body (or the body of
 # the helper it routes through) commits the armed note. Only these names
 # enter the dictionary — every other nondeterminism source is a documented
-# exclusion (replay_unwired_source_note).
+# exclusion (replay_unwired_source_note). The inline syscall family is
+# NOT in this name-only set: `__intrinsic_syscallN` sites commit only when
+# their constant syscall-number argument resolves to the canonical READ
+# number 0 (replay_syscall_read_commits), so the dictionary builder
+# classifies them separately.
 pub def replay_callee_commits(name: String) -> Option[String]
-  if name == "__tg_clock_ns" || name == "_tg_wasi_clock_time_get" then
+  if name == "__tg_clock_ns" || name == "_tg_wasi_clock_time_get" ||
+    name == "clock_gettime" then
     Option::Some(replay_op_time())
   elsif name == "_tg_posix_read" || name == "_tg_read_vec_u8" ||
-    name == "_tg_read_file_to_string" || name == "_tg_wasi_fd_read" then
+    name == "_tg_read_file_to_string" || name == "_tg_wasi_fd_read" ||
+    name == "read" || name == "libc_read" then
     Option::Some(replay_op_external())
+  elsif name == "getrandom" then
+    Option::Some(replay_op_random())
   else
     Option::None
   end
@@ -253,22 +491,32 @@ end
 # The FULL recognized-source classification (wired + unwired): the typed
 # operation word of a known nondeterminism callee, or None for an unrelated
 # call. This is the documentation/classification authority — the
-# DICTIONARY uses replay_callee_commits only.
+# DICTIONARY uses replay_callee_commits (plus the syscall-read walk) only.
 pub def replay_callee_operation_word(name: String) -> Option[String]
   match replay_callee_commits(name.clone())
   when Option::Some(op) then Option::Some(op)
   when Option::None then
-    if name == "clock_gettime" || name == "clock_getres" then
+    if name == "clock_getres" || name == "gettimeofday" || name == "time" then
       Option::Some(replay_op_time())
-    elsif name == "getrandom" || name == "getentropy" || name == "arc4random" then
+    elsif name == "getrandom" || name == "getentropy" ||
+      name == "arc4random" || name == "arc4random_buf" then
       Option::Some(replay_op_random())
     elsif name == "read" || name == "libc_read" || name == "pread" then
       Option::Some(replay_op_external())
     elsif name == "pthread_create" || name == "pthread_join" ||
-      name == "sched_yield" || name == "pthread_mutex_lock" then
+      name == "sched_yield" || name == "pthread_mutex_lock" ||
+      name == "pthread_mutex_trylock" || name == "pthread_cond_wait" ||
+      name == "pthread_cond_timedwait" || name == "pthread_barrier_wait" ||
+      name == "usleep" || name == "nanosleep" || name == "sleep" then
       Option::Some(replay_op_scheduler())
     else
-      Option::None
+      # The inline syscall family is a recognized external-read surface
+      # (the read-number instances are wired by the constant-number walk;
+      # non-read/dynamic numbers are the documented exclusion).
+      match replay_syscall_nargs_of(name.clone())
+      when Option::Some(_) then Option::Some(replay_op_external())
+      when Option::None then Option::None
+      end
     end
   end
 end
@@ -280,17 +528,24 @@ pub def replay_unwired_source_note(name: String) -> Option[String]
   match replay_callee_commits(name.clone())
   when Option::Some(_) then Option::None
   when Option::None then
-    if name == "getrandom" || name == "getentropy" || name == "arc4random" then
-      Option::Some("random: std/rand calls the libc extern directly — no runtime helper commits the note (leave the typed kind defined)")
+    if name == "getentropy" || name == "arc4random" || name == "arc4random_buf" then
+      Option::Some("random: the sibling entropy extern has no runtime binding — only `getrandom` is defined by the runtime (leave the typed kind defined)")
     elsif name == "pthread_create" || name == "pthread_join" ||
-      name == "sched_yield" || name == "pthread_mutex_lock" then
-      Option::Some("scheduler: std/thread goes straight to pthreads — the OS owns the choice; the runtime has no scheduler choice point")
-    elsif name == "clock_gettime" || name == "clock_getres" then
-      Option::Some("time: the libc extern is not a runtime helper — std/time's Instant bypasses __tg_clock_ns")
-    elsif name == "read" || name == "libc_read" || name == "pread" then
-      Option::Some("external: the libc extern is not a runtime helper — std/io's sys_read lowers __intrinsic_syscall3 inline")
+      name == "sched_yield" || name == "pthread_mutex_lock" ||
+      name == "pthread_mutex_trylock" || name == "pthread_cond_wait" ||
+      name == "pthread_cond_timedwait" || name == "pthread_barrier_wait" ||
+      name == "usleep" || name == "nanosleep" || name == "sleep" then
+      Option::Some("scheduler: std/thread goes straight to the libc pthread surface — the OS owns the interleaving and the guest-visible outcomes (trylock acquired/busy, the barrier serial thread, timed-wait timeouts); no runtime helper wraps those callees, so there is no commit point (spawn/join order is program order, not a choice)")
+    elsif name == "clock_getres" || name == "gettimeofday" || name == "time" then
+      Option::Some("time: the libc extern is not a runtime helper and has no runtime binding — only `clock_gettime` (std/time's Instant) and __tg_clock_ns commit")
+    elsif name == "pread" then
+      Option::Some("external: `pread` has no runtime binding — only `read`/`libc_read` and the inline canonical-read syscall commit")
     else
-      Option::None
+      match replay_syscall_nargs_of(name.clone())
+      when Option::Some(_) then
+        Option::Some("external: only the inline syscall family's canonical READ number (0) is wired — a dynamic or non-read syscall-number argument has no commit point")
+      when Option::None then Option::None
+      end
     end
   end
 end
@@ -303,6 +558,24 @@ struct ReplaySiteCandidate
   decl_key: String
   operation_word: String
 end
+
+# Deterministic insertion sort of the candidate sites (the bootstrap
+# subset has no closure expressions; the sort is small and stable).
+def replay_candidates_sort(inout cands: Vec[ReplaySiteCandidate]) -> Unit
+  var i = 1
+  while i < cands.len() do
+    let cur = cands[i].clone()
+    var j = i
+    while j > 0 && replay_candidate_lt(cur.clone(), cands[j - 1].clone()) do
+      cands[j] = cands[j - 1].clone()
+      j = j - 1
+    end
+    cands[j] = cur.clone()
+    i = i + 1
+  end
+  ()
+end
+
 
 def replay_candidate_lt(a: ReplaySiteCandidate, b: ReplaySiteCandidate) -> Bool
   if a.operation_word != b.operation_word then
@@ -364,7 +637,8 @@ end
 
 # The 128-bit content digest of the rendered dictionary.
 pub def replay_dictionary_digest(dict: ReplayEventDictionary) -> StableDigest
-  stable_digest_of(&replay_dictionary_render(dict.clone()))
+  let rendered = replay_dictionary_render(dict.clone())
+  stable_digest_of(&rendered)
 end
 
 # Parse a rendered dictionary text; Err carries the fail-closed reason.
@@ -388,7 +662,8 @@ pub def replay_dictionary_parse(text: String) -> Result[ReplayEventDictionary, S
       if parts.len() < 5 || parts[0] != "site" then
         return Result::Err("replay-dictionary: malformed site line at " + li.to_string())
       end
-      match parts[1].parse_int()
+      let token_text = parts[1].clone()
+      match token_text.parse_int()
       when Result::Err(_) then
         return Result::Err("replay-dictionary: malformed token at " + li.to_string())
       when Result::Ok(token) then
@@ -451,18 +726,41 @@ end
 # the finalized MIR becomes a dictionary entry (sorted, deduped by
 # (operation word, stable node key), tokens from 1) plus one arming row per
 # (function, block). An origin-less wired call site returns the documented
-# UntrackedArtifact result, so the --replay compile fails closed.
+# UntrackedArtifact result, so the --replay compile fails closed. The
+# inline syscall family is classified through the constant-number walk:
+# only a call whose syscall-number argument resolves to the canonical READ
+# number 0 is a site (replay_syscall_read_commits).
 pub def replay_emission_plan_of_functions(functions: Vec[MirFunction], out_path: String) -> Result[ReplayEmissionPlan, UntrackedArtifact]
+  # The constant-function lookup the inline syscall-read walk resolves
+  # through. Built LAZILY on the first syscall-family call site, so a
+  # program with no inline kernel call never pays for the table.
+  var table: Map[String, MirFunction] = Map::new()
+  var table_ready = false
   var cands: Vec[ReplaySiteCandidate] = Vec::new()
-  for f in functions do
+  var fi = 0
+  while fi < functions.len() do
+    let f = functions[fi].clone()
     if !f.is_extern then
       for b in f.blocks do
         match b.terminator.kind
-        when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic, tail: _ } then
+        when MirTerminatorKind::MirCall { dest: _, func, args, success: _, unwind: _, intrinsic: _, tail: _ } then
           match replay_callee_name_of(func.clone())
           when Option::Some(name) then
-            match replay_callee_commits(&name)
-            when Option::Some(op) then
+            let op = match replay_callee_commits(&name)
+            when Option::Some(op) then Option::Some(op)
+            when Option::None then
+              match replay_syscall_nargs_of(name.clone())
+              when Option::Some(_) then
+                if !table_ready then
+                  table = replay_function_table(functions.clone())
+                  table_ready = true
+                end
+                replay_syscall_read_commits(f.clone(), table.clone(), args.clone())
+              when Option::None then Option::None
+              end
+            end
+            match op
+            when Option::Some(op_word) then
               match b.terminator.origin.clone()
               when Option::None then
                 return Result::Err(untracked_artifact("replay-dictionary",
@@ -474,7 +772,7 @@ pub def replay_emission_plan_of_functions(functions: Vec[MirFunction], out_path:
                   block_id: b.id.id,
                   node_key: stable_mir_node_key_of(node),
                   decl_key: f.name.clone(),
-                  operation_word: op.clone()
+                  operation_word: op_word.clone()
                 })
               end
             when Option::None then ()
@@ -485,8 +783,9 @@ pub def replay_emission_plan_of_functions(functions: Vec[MirFunction], out_path:
         end
       end
     end
+    fi = fi + 1
   end
-  cands.sort_by(|a, b| replay_candidate_lt(a.clone(), b.clone()))
+  replay_candidates_sort(&mut cands)
   var dict = ReplayEventDictionary {}
   var sites: Vec[ReplaySitePlan] = Vec::new()
   for c in cands do
@@ -604,12 +903,17 @@ def replay_push_u32(inout out: Vec[u8], v: Int) -> Unit
   out.push((v & 0xFF) as u8)
 end
 
+# The 8 little-endian bytes of a u64 (constant shifts; the runtime writes
+# the same little-endian word order through its str instructions).
 def replay_push_u64(inout out: Vec[u8], v: UInt) -> Unit
-  var i = 0
-  while i < 8 do
-    out.push((((v >> (i * 8)) & 0xFF)) as u8)
-    i = i + 1
-  end
+  out.push(((v >> 0) & 0xFF) as u8)
+  out.push(((v >> 8) & 0xFF) as u8)
+  out.push(((v >> 16) & 0xFF) as u8)
+  out.push(((v >> 24) & 0xFF) as u8)
+  out.push(((v >> 32) & 0xFF) as u8)
+  out.push(((v >> 40) & 0xFF) as u8)
+  out.push(((v >> 48) & 0xFF) as u8)
+  out.push(((v >> 56) & 0xFF) as u8)
 end
 
 def replay_read_u32(bytes: Vec[u8], at: Int) -> Int
@@ -618,13 +922,10 @@ def replay_read_u32(bytes: Vec[u8], at: Int) -> Int
 end
 
 def replay_read_u64(bytes: Vec[u8], at: Int) -> UInt
-  var v: UInt = 0
-  var i = 0
-  while i < 8 do
-    v = v | ((bytes[at + i] as UInt) << (i * 8))
-    i = i + 1
-  end
-  v
+  (bytes[at] as UInt) | ((bytes[at + 1] as UInt) << 8) |
+    ((bytes[at + 2] as UInt) << 16) | ((bytes[at + 3] as UInt) << 24) |
+    ((bytes[at + 4] as UInt) << 32) | ((bytes[at + 5] as UInt) << 40) |
+    ((bytes[at + 6] as UInt) << 48) | ((bytes[at + 7] as UInt) << 56)
 end
 
 # Encode one run artifact from the rendered dictionary and the records —
@@ -910,15 +1211,12 @@ pub struct ReplayComparison
   slice: Vec[ReplayEventId] = Vec::new()
 end
 
-def replay_run_digest_of(data: ReplayRunData) -> StableDigest
-  stable_digest_of(&replay_dictionary_render(data.dictionary.clone()))
-end
-
 # The raw-byte digest of a run artifact (the run identity the comparison
 # reports). The bytes are rendered as their hex text before digesting so
 # the digest is a pure function of the artifact.
 pub def replay_run_bytes_digest(bytes: Vec[u8]) -> StableDigest
-  stable_digest_of(&replay_hex_encode(bytes))
+  let rendered = replay_hex_encode(bytes)
+  stable_digest_of(&rendered)
 end
 
 # Compare two run artifacts: decode both, require the SAME embedded
@@ -1009,9 +1307,9 @@ pub def replay_comparison_rows(c: ReplayComparison) -> Vec[String]
   else
     rows.push("status=compared")
   end
-  rows.push("dictionary=" + semantic_digest_words(c.dictionary_digest))
-  rows.push("run-a=" + semantic_digest_words(c.run_a_digest))
-  rows.push("run-b=" + semantic_digest_words(c.run_b_digest))
+  rows.push("dictionary=" + semantic_digest_words(c.dictionary_digest.hi, c.dictionary_digest.lo))
+  rows.push("run-a=" + semantic_digest_words(c.run_a_digest.hi, c.run_a_digest.lo))
+  rows.push("run-b=" + semantic_digest_words(c.run_b_digest.hi, c.run_b_digest.lo))
   match c.first_divergence.clone()
   when Option::Some(id) then
     rows.push("first-divergence=" + replay_bridge_id_row(id))
@@ -1031,8 +1329,8 @@ pub def replay_comparison_rows(c: ReplayComparison) -> Vec[String]
   rows
 end
 
-def semantic_digest_words(d: StableDigest) -> String
-  d.hi.to_string() + "-" + d.lo.to_string()
+def semantic_digest_words(hi: UInt, lo: UInt) -> String
+  hi.to_string() + "-" + lo.to_string()
 end
 
 # The sync-aware comparison variant: same decode/mapping, but the slice
@@ -1071,10 +1369,107 @@ end
 # §RB.4 - the self-checking lane
 # -----------------------------------------------------------------------
 
-struct ReplayBridgeFixture
-  plan: ReplayEmissionPlan
-  fn_a: MirFunction
-  fn_b: MirFunction
+# ———— explicit Clone impls ————
+# (the seed's typechecker derives a struct's Clone only from registered
+# field impls; every bridge record that is cloned carries its impl here,
+# mirroring stable_ids.tg / coverage_graph.tg.)
+
+impl Clone for ReplayEventSite
+  def clone(self: Self) -> ReplayEventSite
+    ReplayEventSite {
+      token: self.token,
+      stable_node_key: self.stable_node_key.clone(),
+      stable_decl_key: self.stable_decl_key.clone(),
+      operation_word: self.operation_word.clone()
+    }
+  end
+end
+
+impl Clone for ReplayEventDictionary
+  def clone(self: Self) -> ReplayEventDictionary
+    ReplayEventDictionary { entries: self.entries.clone() }
+  end
+end
+
+impl Clone for ReplaySitePlan
+  def clone(self: Self) -> ReplaySitePlan
+    ReplaySitePlan {
+      fn_name: self.fn_name.clone(),
+      block_id: self.block_id,
+      token: self.token,
+      tag: self.tag
+    }
+  end
+end
+
+impl Clone for ReplayEmissionPlan
+  def clone(self: Self) -> ReplayEmissionPlan
+    ReplayEmissionPlan {
+      enabled: self.enabled,
+      out_path: self.out_path.clone(),
+      dictionary: self.dictionary.clone(),
+      dictionary_text: self.dictionary_text.clone(),
+      digest_hi: self.digest_hi,
+      digest_lo: self.digest_lo,
+      sites: self.sites.clone(),
+      buffer_bytes: self.buffer_bytes
+    }
+  end
+end
+
+impl Clone for ReplaySiteCandidate
+  def clone(self: Self) -> ReplaySiteCandidate
+    ReplaySiteCandidate {
+      fn_name: self.fn_name.clone(),
+      block_id: self.block_id,
+      node_key: self.node_key.clone(),
+      decl_key: self.decl_key.clone(),
+      operation_word: self.operation_word.clone()
+    }
+  end
+end
+
+impl Clone for ReplayRawChoice
+  def clone(self: Self) -> ReplayRawChoice
+    ReplayRawChoice {
+      token: self.token,
+      tag: self.tag,
+      payload: self.payload.clone()
+    }
+  end
+end
+
+impl Clone for ReplayRunData
+  def clone(self: Self) -> ReplayRunData
+    ReplayRunData {
+      dictionary: self.dictionary.clone(),
+      records: self.records.clone()
+    }
+  end
+end
+
+impl Clone for ReplayComparisonStatus
+  def clone(self: Self) -> ReplayComparisonStatus
+    match self
+    when ReplayComparisonStatus::Compared then ReplayComparisonStatus::Compared
+    when ReplayComparisonStatus::Untracked(reason) then
+      ReplayComparisonStatus::Untracked(reason.clone())
+    end
+  end
+end
+
+impl Clone for ReplayComparison
+  def clone(self: Self) -> ReplayComparison
+    ReplayComparison {
+      status: self.status.clone(),
+      run_a_digest: StableDigest { hi: self.run_a_digest.hi, lo: self.run_a_digest.lo },
+      run_b_digest: StableDigest { hi: self.run_b_digest.hi, lo: self.run_b_digest.lo },
+      dictionary_digest: StableDigest { hi: self.dictionary_digest.hi, lo: self.dictionary_digest.lo },
+      first_divergence: self.first_divergence.clone(),
+      first_semantic_divergence: self.first_semantic_divergence.clone(),
+      slice: self.slice.clone()
+    }
+  end
 end
 
 # A minimal origin-stamped function carrying one wired call terminator in
@@ -1091,11 +1486,16 @@ def replay_bridge_mir_fn(fn_key: String, callee: String, node_seq: Int) -> MirFu
   var call_args: Vec[MirCallArg] = Vec::new()
   let call_term = MirTerminator {
     kind: MirTerminatorKind::MirCall {
-      dest: Option::None,
-      func: MirConstant {
-        kind: MirConstantKind::MirFnItem(callee.clone()),
-        ty: Type::Unit,
-        instance: Option::None
+      dest: Place {
+        local: MirLocalId { id: 0 },
+        projections: Vec::new()
+      },
+      func: MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirFnItem(callee.clone()),
+          ty: Type::Unit,
+          instance: Option::None
+        })
       },
       args: call_args,
       success: MirBlockId { id: 1 },
@@ -1147,6 +1547,300 @@ def replay_bridge_mir_fn(fn_key: String, callee: String, node_seq: Int) -> MirFu
   }
 end
 
+# A fixture function `def <fn_key>() -> Int = <value>` — the constant
+# function shape the syscall-number walk resolves (std's `SYS_READ()`): the
+# Int return local is defined by a constant assignment and returned.
+pub def replay_bridge_const_fn(fn_key: String, value: Int, node_seq: Int) -> MirFunction
+  let ret_origin = stable_mir_node_id_of_generated(fn_key.clone(),
+    fn_key.clone(), "lower".to_string(), "return".to_string(), node_seq)
+  var stmts: Vec[MirStatement] = Vec::new()
+  stmts.push(MirStatement {
+    kind: MirStatementKind::MirAssign(
+      Place { local: MirLocalId { id: 0 }, projections: Vec::new() },
+      MirRvalue {
+        kind: MirRvalueKind::MirMove(MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirInt(value),
+            ty: Type::Int,
+            instance: Option::None
+          })
+        })
+      }
+    ),
+    span: span_dummy(),
+    origin: Option::Some(ret_origin.clone())
+  })
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: stmts,
+    terminator: MirTerminator {
+      kind: MirTerminatorKind::MirReturn,
+      span: span_dummy(),
+      origin: Option::Some(ret_origin.clone())
+    },
+    origin: Option::Some(stable_mir_block_id_of_node(ret_origin.clone()))
+  })
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(MirLocal {
+    id: MirLocalId { id: 0 },
+    name: "_ret".to_string(),
+    ty: Type::Int,
+    is_mut: false,
+    span: span_dummy()
+  })
+  MirFunction {
+    name: fn_key,
+    params: Vec::new(),
+    ret_type: Type::Int,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "",
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def replay_bridge_callee_op(callee: String) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFnItem(callee.clone()),
+      ty: Type::Int,
+      instance: Option::None
+    })
+  }
+end
+
+def replay_bridge_arg_copy(local: Int) -> MirCallArg
+  MirCallArg {
+    effect: AccessEffect::Read,
+    value: MirCallValue::Value(MirOperand {
+      kind: MirOperandKind::MirCopy(Place {
+        local: MirLocalId { id: local },
+        projections: Vec::new()
+      })
+    })
+  }
+end
+
+def replay_bridge_arg_const(value: Int) -> MirCallArg
+  MirCallArg {
+    effect: AccessEffect::Read,
+    value: MirCallValue::Value(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirInt(value),
+        ty: Type::Int,
+        instance: Option::None
+      })
+    })
+  }
+end
+
+def replay_bridge_call_term(dest_local: Int, callee: String, args: Vec[MirCallArg], success: Int, origin: StableMirNodeId) -> MirTerminator
+  MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: Place { local: MirLocalId { id: dest_local }, projections: Vec::new() },
+      func: replay_bridge_callee_op(callee.clone()),
+      args: args,
+      success: MirBlockId { id: success },
+      unwind: Option::None,
+      intrinsic: Option::None,
+      tail: false
+    },
+    span: span_dummy(),
+    origin: Option::Some(origin.clone())
+  }
+end
+
+def replay_bridge_ret_term(origin: StableMirNodeId) -> MirTerminator
+  MirTerminator {
+    kind: MirTerminatorKind::MirReturn,
+    span: span_dummy(),
+    origin: Option::Some(origin.clone())
+  }
+end
+
+# `def <fn_key>() -> Unit { <number>; <callee>(<number>, 0, 0, 0) }` — the
+# number local is defined by a constant assignment (the post-fold read
+# shape). The syscall call terminator carries the site origin.
+pub def replay_bridge_syscall_const_fn(fn_key: String, callee: String, number: Int, node_seq: Int) -> MirFunction
+  let call_origin = stable_mir_node_id_of_generated(fn_key.clone(),
+    fn_key.clone(), "lower".to_string(), "call".to_string(), node_seq)
+  let ret_origin = stable_mir_node_id_of_generated(fn_key.clone(),
+    fn_key.clone(), "lower".to_string(), "return".to_string(), node_seq + 1)
+  var stmts: Vec[MirStatement] = Vec::new()
+  stmts.push(MirStatement {
+    kind: MirStatementKind::MirAssign(
+      Place { local: MirLocalId { id: 1 }, projections: Vec::new() },
+      MirRvalue {
+        kind: MirRvalueKind::MirMove(MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirInt(number),
+            ty: Type::Int,
+            instance: Option::None
+          })
+        })
+      }
+    ),
+    span: span_dummy(),
+    origin: Option::Some(call_origin.clone())
+  })
+  var args: Vec[MirCallArg] = Vec::new()
+  args.push(replay_bridge_arg_copy(1))
+  args.push(replay_bridge_arg_const(0))
+  args.push(replay_bridge_arg_const(0))
+  args.push(replay_bridge_arg_const(0))
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: stmts,
+    terminator: replay_bridge_call_term(0, callee.clone(), args.clone(), 1, call_origin.clone()),
+    origin: Option::Some(stable_mir_block_id_of_node(call_origin.clone()))
+  })
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 1 },
+    statements: Vec::new(),
+    terminator: replay_bridge_ret_term(ret_origin.clone()),
+    origin: Option::Some(stable_mir_block_id_of_node(ret_origin.clone()))
+  })
+  replay_bridge_syscall_fn_of(fn_key.clone(), blocks)
+end
+
+# `def <fn_key>() -> Unit { let n = <number_callee>(); <callee>(n, 0, 0, 0) }`
+# — the unoptimized `SYS_READ()` shape (the number local is defined by a
+# call terminator to a constant function).
+pub def replay_bridge_syscall_call_fn(fn_key: String, callee: String, number_callee: String, node_seq: Int) -> MirFunction
+  let num_origin = stable_mir_node_id_of_generated(fn_key.clone(),
+    fn_key.clone(), "lower".to_string(), "num".to_string(), node_seq)
+  let call_origin = stable_mir_node_id_of_generated(fn_key.clone(),
+    fn_key.clone(), "lower".to_string(), "call".to_string(), node_seq + 1)
+  let ret_origin = stable_mir_node_id_of_generated(fn_key.clone(),
+    fn_key.clone(), "lower".to_string(), "return".to_string(), node_seq + 2)
+  var num_args: Vec[MirCallArg] = Vec::new()
+  var args: Vec[MirCallArg] = Vec::new()
+  args.push(replay_bridge_arg_copy(1))
+  args.push(replay_bridge_arg_const(0))
+  args.push(replay_bridge_arg_const(0))
+  args.push(replay_bridge_arg_const(0))
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: Vec::new(),
+    terminator: replay_bridge_call_term(1, number_callee.clone(), num_args.clone(), 1, num_origin.clone()),
+    origin: Option::Some(stable_mir_block_id_of_node(num_origin.clone()))
+  })
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 1 },
+    statements: Vec::new(),
+    terminator: replay_bridge_call_term(0, callee.clone(), args.clone(), 2, call_origin.clone()),
+    origin: Option::Some(stable_mir_block_id_of_node(call_origin.clone()))
+  })
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 2 },
+    statements: Vec::new(),
+    terminator: replay_bridge_ret_term(ret_origin.clone()),
+    origin: Option::Some(stable_mir_block_id_of_node(ret_origin.clone()))
+  })
+  replay_bridge_syscall_fn_of(fn_key.clone(), blocks)
+end
+
+# `def <fn_key>(n: Int) -> Unit { <callee>(n, 0, 0, 0) }` — a dynamic
+# syscall-number argument (a parameter: no constant definition). The walk
+# must leave this site UNWIRED.
+pub def replay_bridge_syscall_dynamic_fn(fn_key: String, callee: String, node_seq: Int) -> MirFunction
+  let call_origin = stable_mir_node_id_of_generated(fn_key.clone(),
+    fn_key.clone(), "lower".to_string(), "call".to_string(), node_seq)
+  let ret_origin = stable_mir_node_id_of_generated(fn_key.clone(),
+    fn_key.clone(), "lower".to_string(), "return".to_string(), node_seq + 1)
+  var args: Vec[MirCallArg] = Vec::new()
+  args.push(replay_bridge_arg_copy(1))
+  args.push(replay_bridge_arg_const(0))
+  args.push(replay_bridge_arg_const(0))
+  args.push(replay_bridge_arg_const(0))
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: Vec::new(),
+    terminator: replay_bridge_call_term(0, callee.clone(), args.clone(), 1, call_origin.clone()),
+    origin: Option::Some(stable_mir_block_id_of_node(call_origin.clone()))
+  })
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 1 },
+    statements: Vec::new(),
+    terminator: replay_bridge_ret_term(ret_origin.clone()),
+    origin: Option::Some(stable_mir_block_id_of_node(ret_origin.clone()))
+  })
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(MirLocal {
+    id: MirLocalId { id: 0 },
+    name: "_ret".to_string(),
+    ty: Type::Unit,
+    is_mut: false,
+    span: span_dummy()
+  })
+  locals.push(MirLocal {
+    id: MirLocalId { id: 1 },
+    name: "n".to_string(),
+    ty: Type::Int,
+    is_mut: false,
+    span: span_dummy()
+  })
+  var params: Vec[MirLocal] = Vec::new()
+  params.push(locals[1].clone())
+  MirFunction {
+    name: fn_key,
+    params: params,
+    ret_type: Type::Unit,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "",
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+# The common tail of the syscall fixtures: the _ret local + the function
+# record (the fixture builders above supply the blocks).
+def replay_bridge_syscall_fn_of(fn_key: String, blocks: Vec[MirBlock]) -> MirFunction
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(MirLocal {
+    id: MirLocalId { id: 0 },
+    name: "_ret".to_string(),
+    ty: Type::Unit,
+    is_mut: false,
+    span: span_dummy()
+  })
+  locals.push(MirLocal {
+    id: MirLocalId { id: 1 },
+    name: "_num".to_string(),
+    ty: Type::Int,
+    is_mut: false,
+    span: span_dummy()
+  })
+  MirFunction {
+    name: fn_key,
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "",
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
 def replay_bridge_lane_str(inout out: Vec[String], name: String, got: String, want: String) -> Unit
   if got != want then
     out.push(name + ": expected [" + want + "], got [" + got + "]")
@@ -1169,8 +1863,10 @@ def replay_bridge_lane_bool(inout out: Vec[String], name: String, got: Bool, wan
 end
 
 # The lane: dictionary determinism/sort, token round-trip, artifact codec
-# round-trip, compare first-divergence + slice, and the documented untracked
-# results. Empty = the lane verifies.
+# round-trip, compare first-divergence + slice, the documented untracked
+# results, the documented exclusion notes, the inline syscall-read
+# constant-number resolution, the clock_gettime/getrandom/read wiring, and
+# the repeated-record (per-call token) shape. Empty = the lane verifies.
 pub def replay_bridge_lane_check() -> Vec[String]
   var out: Vec[String] = Vec::new()
 
@@ -1180,13 +1876,13 @@ pub def replay_bridge_lane_check() -> Vec[String]
   let plan_ab = match replay_emission_plan_of_functions(Vec::from([fn_a.clone(), fn_b.clone()]), "/tmp/tg.replay.trace".to_string())
   when Result::Ok(p) then p
   when Result::Err(u) then
-    out.push("B1-plan-untracked: unexpected " + untracked_artifact_report(u))
+    out.push("B1-plan-untracked: unexpected " + untracked_artifact_text(u))
     replay_plan_disabled()
   end
   let plan_ba = match replay_emission_plan_of_functions(Vec::from([fn_b.clone(), fn_a.clone()]), "/tmp/tg.replay.trace".to_string())
   when Result::Ok(p) then p
   when Result::Err(u) then
-    out.push("B1-plan-order-untracked: unexpected " + untracked_artifact_report(u))
+    out.push("B1-plan-order-untracked: unexpected " + untracked_artifact_text(u))
     replay_plan_disabled()
   end
   replay_bridge_lane_bool(&mut out, "B1-enabled", plan_ab.enabled, true)
@@ -1316,7 +2012,7 @@ pub def replay_bridge_lane_check() -> Vec[String]
   replay_bridge_lane_bool(&mut out, "B5-raw-reason",
     replay_comparison_untracked_reason(raw_cmp.clone()).contains("raw-token"), true)
   replay_bridge_lane_int(&mut out, "B5-raw-no-slice", raw_cmp.slice.len(), 0)
-  var bad_records: Vec<ReplayRawChoice> = Vec::new()
+  var bad_records: Vec[ReplayRawChoice] = Vec::new()
   bad_records.push(ReplayRawChoice { token: 99, tag: replay_tag_time(), payload: replay_i64_bytes(1) })
   let bad_run = replay_run_encode(plan_ab.dictionary_text.clone(), bad_records.clone())
   let bad_cmp = replay_run_compare(bad_run, run_a.clone())
@@ -1339,19 +2035,194 @@ pub def replay_bridge_lane_check() -> Vec[String]
   replay_bridge_lane_bool(&mut out, "B5-origin-less-untracked", replay_comparison_is_untracked(erased_cmp.clone()), true)
 
   # ———— B6: the documented exclusion notes ————
+  # The entropy seed, the clock_gettime binding and the libc read binding
+  # are WIRED (no exclusion note); the siblings without a runtime binding
+  # and the OS-owned scheduler surface keep their notes.
   match replay_unwired_source_note("getrandom".to_string())
+  when Option::Some(_) then out.push("B6-getrandom-wired-note: expected None, got Some")
+  when Option::None then ()
+  end
+  match replay_unwired_source_note("clock_gettime".to_string())
+  when Option::Some(_) then out.push("B6-clock-wired-note: expected None, got Some")
+  when Option::None then ()
+  end
+  match replay_unwired_source_note("read".to_string())
+  when Option::Some(_) then out.push("B6-read-wired-note: expected None, got Some")
+  when Option::None then ()
+  end
+  match replay_unwired_source_note("__tg_clock_ns".to_string())
+  when Option::Some(_) then out.push("B6-wired-note: expected None, got Some")
+  when Option::None then ()
+  end
+  match replay_unwired_source_note("getentropy".to_string())
   when Option::Some(note) then
-    replay_bridge_lane_bool(&mut out, "B6-random-note", note.starts_with("random:"), true)
-  when Option::None then out.push("B6-random-note: expected Some, got None")
+    replay_bridge_lane_bool(&mut out, "B6-getentropy-note", note.starts_with("random:"), true)
+  when Option::None then out.push("B6-getentropy-note: expected Some, got None")
   end
   match replay_unwired_source_note("pthread_join".to_string())
   when Option::Some(note) then
     replay_bridge_lane_bool(&mut out, "B6-scheduler-note", note.starts_with("scheduler:"), true)
   when Option::None then out.push("B6-scheduler-note: expected Some, got None")
   end
-  match replay_unwired_source_note("__tg_clock_ns".to_string())
-  when Option::Some(_) then out.push("B6-wired-note: expected None, got Some")
-  when Option::None then ()
+  match replay_unwired_source_note("pthread_mutex_trylock".to_string())
+  when Option::Some(note) then
+    replay_bridge_lane_bool(&mut out, "B6-trylock-note", note.starts_with("scheduler:"), true)
+  when Option::None then out.push("B6-trylock-note: expected Some, got None")
+  end
+  match replay_unwired_source_note("__intrinsic_syscall3".to_string())
+  when Option::Some(note) then
+    replay_bridge_lane_bool(&mut out, "B6-syscall-note", note.starts_with("external:"), true)
+  when Option::None then out.push("B6-syscall-note: expected Some, got None")
+  end
+
+  # ———— B7: the inline syscall-read resolution (the constant-number walk) ————
+  # A `SYS_READ()`-shaped constant function + a syscall call whose number
+  # argument is that call's result: the site is wired as an external read.
+  let sys_read_const = replay_bridge_const_fn("m::SYS_READ#fn()->int".to_string(), 0, 0)
+  let sys_read_fn = replay_bridge_syscall_call_fn("m::sysread#fn()->unit".to_string(),
+    "__intrinsic_syscall3".to_string(), "m::SYS_READ#fn()->int".to_string(), 0)
+  let plan_sysread = match replay_emission_plan_of_functions(
+      Vec::from([sys_read_const.clone(), sys_read_fn.clone()]), "/tmp/tg.replay.sysread".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(u) then
+    out.push("B7-plan-untracked: unexpected " + untracked_artifact_text(u))
+    replay_plan_disabled()
+  end
+  replay_bridge_lane_int(&mut out, "B7-read-dict-size", plan_sysread.dictionary.entries.len(), 1)
+  if plan_sysread.dictionary.entries.len() == 1 then
+    replay_bridge_lane_str(&mut out, "B7-read-op",
+      plan_sysread.dictionary.entries[0].operation_word.clone(), "external")
+  end
+  replay_bridge_lane_int(&mut out, "B7-read-token",
+    replay_plan_token_of(plan_sysread.clone(), "m::sysread#fn()->unit".to_string(), 1), 1)
+  replay_bridge_lane_int(&mut out, "B7-read-tag",
+    replay_plan_tag_of(plan_sysread.clone(), "m::sysread#fn()->unit".to_string(), 1), replay_tag_external())
+  match replay_callee_operation_word("__intrinsic_syscall3".to_string())
+  when Option::Some(op) then replay_bridge_lane_str(&mut out, "B7-family-word", op, "external")
+  when Option::None then out.push("B7-family-word: expected Some, got None")
+  end
+  # The post-fold constant-local shape (the number assigned inline).
+  let sys_const_fn = replay_bridge_syscall_const_fn("m::sysconst#fn()->unit".to_string(),
+    "__intrinsic_syscall3".to_string(), 0, 0)
+  let plan_sysconst = match replay_emission_plan_of_functions(
+      Vec::from([sys_const_fn.clone()]), "/tmp/tg.replay.sysconst".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(_) then replay_plan_disabled()
+  end
+  replay_bridge_lane_int(&mut out, "B7-const-local-sites",
+    replay_plan_site_count(plan_sysconst.clone()), 1)
+  # A WRITE number (1) and a dynamic number (a parameter) are NOT sites.
+  let sys_write_const = replay_bridge_const_fn("m::SYS_WRITE#fn()->int".to_string(), 1, 0)
+  let sys_write_fn = replay_bridge_syscall_call_fn("m::syswrite#fn()->unit".to_string(),
+    "__intrinsic_syscall3".to_string(), "m::SYS_WRITE#fn()->int".to_string(), 0)
+  let plan_syswrite = match replay_emission_plan_of_functions(
+      Vec::from([sys_write_const.clone(), sys_write_fn.clone()]), "/tmp/tg.replay.syswrite".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(_) then replay_plan_disabled()
+  end
+  replay_bridge_lane_int(&mut out, "B7-write-sites",
+    replay_plan_site_count(plan_syswrite.clone()), 0)
+  let sys_dyn_fn = replay_bridge_syscall_dynamic_fn("m::sysdyn#fn()->unit".to_string(),
+    "__intrinsic_syscall3".to_string(), 0)
+  let plan_sysdyn = match replay_emission_plan_of_functions(
+      Vec::from([sys_dyn_fn.clone()]), "/tmp/tg.replay.sysdyn".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(_) then replay_plan_disabled()
+  end
+  replay_bridge_lane_int(&mut out, "B7-dynamic-sites",
+    replay_plan_site_count(plan_sysdyn.clone()), 0)
+
+  # ———— B8: the newly wired runtime-symbol sources (clock/random/read) ————
+  let fn_clk = replay_bridge_mir_fn("m::clk#fn()->unit".to_string(), "clock_gettime".to_string(), 0)
+  let fn_rnd = replay_bridge_mir_fn("m::rnd#fn()->unit".to_string(), "getrandom".to_string(), 0)
+  let fn_rd = replay_bridge_mir_fn("m::rd#fn()->unit".to_string(), "read".to_string(), 0)
+  let plan_srcs = match replay_emission_plan_of_functions(
+      Vec::from([fn_clk.clone(), fn_rnd.clone(), fn_rd.clone()]), "/tmp/tg.replay.srcs".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(u) then
+    out.push("B8-plan-untracked: unexpected " + untracked_artifact_text(u))
+    replay_plan_disabled()
+  end
+  replay_bridge_lane_int(&mut out, "B8-dict-size", plan_srcs.dictionary.entries.len(), 3)
+  if plan_srcs.dictionary.entries.len() == 3 then
+    # canonical op order: external (read) < random (getrandom) < time
+    replay_bridge_lane_str(&mut out, "B8-op-1", plan_srcs.dictionary.entries[0].operation_word.clone(), "external")
+    replay_bridge_lane_str(&mut out, "B8-op-2", plan_srcs.dictionary.entries[1].operation_word.clone(), "random")
+    replay_bridge_lane_str(&mut out, "B8-op-3", plan_srcs.dictionary.entries[2].operation_word.clone(), "time")
+    replay_bridge_lane_int(&mut out, "B8-tag-2", plan_srcs.dictionary.entries[1].token, 2)
+    # the typed random mapping: an 8-byte payload projects the seed word
+    let site_rnd = plan_srcs.dictionary.entries[1].clone()
+    let rec_rnd = ReplayRawChoice {
+      token: site_rnd.token,
+      tag: replay_tag_random(),
+      payload: replay_i64_bytes(77)
+    }
+    match replay_raw_choice_of(site_rnd.clone(), rec_rnd.clone())
+    when Option::Some(choice) then
+      replay_bridge_lane_str(&mut out, "B8-random-choice", replay_choice_token(choice), "random:77")
+    when Option::None then out.push("B8-random-choice: expected Some, got None")
+    end
+  end
+  replay_bridge_lane_int(&mut out, "B8-clk-tag",
+    replay_plan_tag_of(plan_srcs.clone(), "m::clk#fn()->unit".to_string(), 0), replay_tag_time())
+  replay_bridge_lane_int(&mut out, "B8-rnd-tag",
+    replay_plan_tag_of(plan_srcs.clone(), "m::rnd#fn()->unit".to_string(), 0), replay_tag_random())
+  replay_bridge_lane_int(&mut out, "B8-read-tag",
+    replay_plan_tag_of(plan_srcs.clone(), "m::rd#fn()->unit".to_string(), 0), replay_tag_external())
+
+  # ———— B9: repeated records at ONE site (the per-call token protocol) ————
+  # The single-shot fix means a looping read records EVERY chunk with the
+  # same site token. The artifact/model accepts and compares the repeated
+  # token shape; a differing chunk diverges at its own sequence.
+  let plan_rd_only = match replay_emission_plan_of_functions(
+      Vec::from([fn_rd.clone()]), "/tmp/tg.replay.rdonly".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(_) then replay_plan_disabled()
+  end
+  var chunk_a: Vec[ReplayRawChoice] = Vec::new()
+  chunk_a.push(ReplayRawChoice { token: 1, tag: replay_tag_external(), payload: Vec::from([7 as u8]) })
+  chunk_a.push(ReplayRawChoice { token: 1, tag: replay_tag_external(), payload: Vec::from([8 as u8, 9 as u8]) })
+  var chunk_b: Vec[ReplayRawChoice] = Vec::new()
+  chunk_b.push(ReplayRawChoice { token: 1, tag: replay_tag_external(), payload: Vec::from([7 as u8]) })
+  chunk_b.push(ReplayRawChoice { token: 1, tag: replay_tag_external(), payload: Vec::from([1 as u8]) })
+  let run_chunk_a = replay_run_encode(plan_rd_only.dictionary_text.clone(), chunk_a.clone())
+  let run_chunk_b = replay_run_encode(plan_rd_only.dictionary_text.clone(), chunk_b.clone())
+  let decoded_chunks = match replay_run_decode(run_chunk_a.clone())
+  when Result::Ok(d) then d
+  when Result::Err(e) then
+    out.push("B9-decode: " + e)
+    ReplayRunData { dictionary: ReplayEventDictionary {} }
+  end
+  match replay_trace_of_run(decoded_chunks.clone())
+  when Result::Ok(trace) then
+    replay_bridge_lane_int(&mut out, "B9-chunk-events", trace.events.len(), 2)
+    if trace.events.len() == 2 then
+      replay_bridge_lane_str(&mut out, "B9-chunk-sites-agree",
+        trace.events[0].id.stmt_key.clone(), trace.events[1].id.stmt_key.clone())
+      if plan_rd_only.dictionary.entries.len() == 1 then
+        replay_bridge_lane_str(&mut out, "B9-chunk-site",
+          trace.events[1].id.stmt_key.clone(),
+          plan_rd_only.dictionary.entries[0].stable_node_key.clone())
+      end
+    end
+  when Result::Err(e) then out.push("B9-trace: " + e)
+  end
+  let cmp_chunks = replay_run_compare(run_chunk_a.clone(), run_chunk_b.clone())
+  match cmp_chunks.first_divergence.clone()
+  when Option::Some(id) then
+    replay_bridge_lane_int(&mut out, "B9-chunk-divergence-seq", id.sequence, 1)
+  when Option::None then out.push("B9-chunk-divergence: expected Some, got None")
+  end
+  # A run that stopped after the first chunk diverges on the missing second
+  # record (the length-difference rule).
+  var one_chunk: Vec[ReplayRawChoice] = Vec::new()
+  one_chunk.push(chunk_a[0].clone())
+  let run_one = replay_run_encode(plan_rd_only.dictionary_text.clone(), one_chunk.clone())
+  let cmp_len = replay_run_compare(run_one, run_chunk_a.clone())
+  match cmp_len.first_divergence.clone()
+  when Option::Some(id) then
+    replay_bridge_lane_int(&mut out, "B9-chunk-length-seq", id.sequence, 1)
+  when Option::None then out.push("B9-chunk-length: expected Some, got None")
   end
 
   out
@@ -1364,8 +2235,3 @@ def replay_i64_bytes(v: Int) -> Vec[u8]
   out
 end
 
-# The canonical untracked-artifact text helper (the lane's failure row and
-# the driver's fail-closed message).
-pub def untracked_artifact_report(u: UntrackedArtifact) -> String
-  "untracked-artifact:" + u.api.clone() + ":" + u.detail.clone()
-end

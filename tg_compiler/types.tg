@@ -11,7 +11,7 @@ use std::collections::{Vec, Map, Set}
 use std::fs::{read_file}
 use tg_compiler::token::{Span, span_dummy, ParsedIntegerLiteral, ParsedFloatLiteral, parsed_int_to_host, parsed_int_fits_host, parsed_int_decimal, parsed_int_is_zero, parsed_float_f32_overflow, parsed_float_f64_overflow}
 use tg_compiler::lexer::{tokenize}
-use tg_compiler::parser::{parse, DiagnosticSemanticData, TypeMismatchData, TraitFailureData}
+use tg_compiler::parser::{parse, DiagnosticSemanticData, TypeMismatchData, TraitFailureData, CapabilityDiagnosticData}
 use tg_compiler::resolver::{ResolvedNames, def_id_of_item, def_kind_of, module_qualified_key}
 use tg_compiler::ids::{
   DefId, DefKind, FieldId, ModuleId, TypeId, TraitId, GenericParamId, GenericParamTable,
@@ -697,11 +697,27 @@ end
 # handler must never create or schedule tasks, so the class rides the
 # same class machinery (summary flags, fixed-point evidence slots,
 # E0232 with the effect_trace path) as the three spellable classes.
+#
+# (audit order item 8) THE FULL §11 CLASS VOCABULARY: the enum carries
+# ONE variant per §11 dirty-word class (the seven flags of EffectSummary,
+# in declaration order: allocate=1, block=2, io=4, spawn=8, sleep=16,
+# panic=32, unsafe=64). Sleep / Panic / Unsafe are first-class CLASS
+# identities for consumers whose class domain is the §11 dirty word —
+# the §36 change budget's typed allowed_effects membership is the
+# consumer that made them explicit (AllowedEffect.class: EffectClass,
+# never a class-word String). The annotation-claim machinery keeps the
+# documented class VIEW: @no_block still folds Sleep into Block
+# (effect_summary_has_class(Block) = may_block OR may_sleep), and no
+# attribute spells Sleep / Panic / Unsafe (they are not forbidden
+# classes). The evidence-slot indices stay positional in this order.
 enum EffectClass
   Alloc
   Block
   Io
   Spawn
+  Sleep
+  Panic
+  Unsafe
 end
 
 enum EffectAnnotation
@@ -3180,6 +3196,19 @@ struct TypeProperties
   is_transferable: Bool
   is_shareable: Bool
   is_deferred: Bool
+  # (audit order item 8) THE COMPILER-OWNED VECTOR/SIMD TYPE PROPERTY: TRUE
+  # when the CONCRETE type identity is a std::simd wrapper instantiation
+  # (Vec2/Vec4/Vec8/Vec16 of a SIMD lane type) — the REAL vector type the
+  # layout engine lays out with the VECTOR ROW (16/32/64 bytes, alignment =
+  # the vector width). vector_lanes is the lane count (0 when not a
+  # vector). The property is derived from the registered DEFINITION and the
+  # concrete substitutions (simd_vector_lanes_of_def) — never from a bare
+  # name match at a consumer. A user struct merely named "Vec4-like" (not
+  # the registered std family), or a family-named def whose concrete lanes
+  # do not form a 16/32/64-byte vector, is NOT a vector (false/0).
+  # perf_report queries THIS property instead of sniffing type names.
+  is_vector_type: Bool = false
+  vector_lanes: Int = 0
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -9321,6 +9350,22 @@ def add_error_with_code(inout env: TypeEnv, msg: String, span: Span, code: Strin
   env.errors.push(TypeError { message: msg, span: span, code: Option::Some(code) })
 end
 
+# (universal-typed-derivation closure) the typed sibling: a semantic
+# diagnostic emitter that carries its required DiagnosticSemanticData
+# payload. The effect/trait contract rejections below are the sites this
+# exists for — they are semantic categories, so they can no longer be
+# emitted payload-less.
+def add_error_semantic(
+  inout env: TypeEnv, msg: String, span: Span, code: String, data: DiagnosticSemanticData
+) -> Unit
+  env.errors.push(TypeError {
+    message: msg,
+    span: span,
+    code: Option::Some(code),
+    semantic_data: Option::Some(data)
+  })
+end
+
 # Stable error codes for type checking:
 #   E0200 — Type mismatch
 #   E0201 — Cannot unify types (occurs check failed)
@@ -10739,7 +10784,11 @@ def effect_class_claims_of(inout env: TypeEnv, attrs: Vec[Attribute]) -> Vec[Eff
   for attr in attrs do
     if attr.name == "effects" then
       if attr.args.len() == 0 then
-        add_error_with_code(env, "@effects() must name at least one class — use @effects(no_alloc, no_block, no_io) or the arg-less @no_alloc / @no_block / @no_io / @irq_safe / @interrupt attributes", attr.span, "E0233")
+        add_error_semantic(env, "@effects() must name at least one class — use @effects(no_alloc, no_block, no_io) or the arg-less @no_alloc / @no_block / @no_io / @irq_safe / @interrupt attributes", attr.span, "E0233",
+          DiagnosticSemanticData::EffectViolation(EffectViolationData {
+            effect: "@effects".to_string(),
+            path: Vec::new()
+          }))
       else
         # The full as-written form the diagnostics echo.
         var form = "effects(".to_string()
@@ -10757,7 +10806,11 @@ def effect_class_claims_of(inout env: TypeEnv, attrs: Vec[Attribute]) -> Vec[Eff
               out.push(EffectClassClaim { anno: anno, span: attr.span, attr_form: form.clone() })
             end
           when Option::None then
-            add_error_with_code(env, "unrecognized @effects class `" + arg.clone() + "` — @effects supports no_alloc, no_block and no_io only", attr.span, "E0233")
+            add_error_semantic(env, "unrecognized @effects class `" + arg.clone() + "` — @effects supports no_alloc, no_block and no_io only", attr.span, "E0233",
+              DiagnosticSemanticData::EffectViolation(EffectViolationData {
+                effect: arg.clone(),
+                path: Vec::new()
+              }))
           end
         end
       end
@@ -10813,36 +10866,51 @@ def effect_class_forbidden_classes(anno: EffectAnnotation) -> Vec[EffectClass]
 end
 
 # The class word for messages ("allocation" / "blocking" / "I/O" /
-# "spawning").
+# "spawning" / "sleeping" / "panic" / "unsafe operation"). The last
+# three are reachable only through the widened §11 class vocabulary
+# (audit order item 8) — no annotation claim renders them.
 def effect_class_word(c: EffectClass) -> String
   match c
   when EffectClass::Alloc then "allocation"
   when EffectClass::Block then "blocking"
   when EffectClass::Io then "I/O"
   when EffectClass::Spawn then "spawning"
+  when EffectClass::Sleep then "sleeping"
+  when EffectClass::Panic then "panic"
+  when EffectClass::Unsafe then "unsafe operation"
   end
 end
 
 # The violation phrase ("may heap-allocate" / "may block" / "may
-# perform I/O" / "may spawn").
+# perform I/O" / "may spawn" / "may sleep" / "may panic" / "may perform
+# an unsafe operation").
 def effect_class_phrase(c: EffectClass) -> String
   match c
   when EffectClass::Alloc then "may heap-allocate"
   when EffectClass::Block then "may block"
   when EffectClass::Io then "may perform I/O"
   when EffectClass::Spawn then "may spawn"
+  when EffectClass::Sleep then "may sleep"
+  when EffectClass::Panic then "may panic"
+  when EffectClass::Unsafe then "may perform an unsafe operation"
   end
 end
 
-# The evidence-slot index of a class (the MIR pass's per-function
-# evidence vectors are positional: [0]=Alloc [1]=Block [2]=Io
-# [3]=Spawn).
+# The evidence-slot index of a class — the declaration-order position of
+# the §11 dirty-word class ([0]=Alloc [1]=Block [2]=Io [3]=Spawn
+# [4]=Sleep [5]=Panic [6]=Unsafe). The annotation claims' first-wins
+# evidence vectors only ever carry the four behavioral slots (0..3);
+# mir_effect_ev_set pads to the requested slot, so the widened
+# vocabulary can never index out of bounds.
 def effect_class_slot_index(c: EffectClass) -> Int
   match c
   when EffectClass::Alloc then 0
   when EffectClass::Block then 1
   when EffectClass::Io then 2
   when EffectClass::Spawn then 3
+  when EffectClass::Sleep then 4
+  when EffectClass::Panic then 5
+  when EffectClass::Unsafe then 6
   end
 end
 
@@ -10924,10 +10992,25 @@ def capability_id_mmio() -> CapabilityId
   CapabilityId { id: 2 }
 end
 
+# (audit item 16, next tier) The DMA capability: a direct-memory-access
+# engine accessing a buffer is a HARDWARE effect distinct from an OS I/O
+# operation (std::embedded's canonical dma_pin_*/dma_await/dma_unpin
+# wrappers route through the `_tg_dma_*` extern family, whose records
+# carry this capability with may_io=false — mirroring the MMIO
+# hardware-register capability above). The capability is the typed
+# "this operation hands buffer storage to a DMA engine" fact the effect
+# summaries record; the PER-PLACE pinned-state domain (the resource
+# checker's DmaState lattice) is the ownership-side authority that
+# answers "is this buffer legally owned by DMA right now?".
+def capability_id_dma() -> CapabilityId
+  CapabilityId { id: 3 }
+end
+
 # The display name of a capability id (diagnostics).
 def capability_id_name(cap: CapabilityId) -> String
   if cap.id == 1 then return "arena" end
   if cap.id == 2 then return "mmio" end
+  if cap.id == 3 then return "dma" end
   "unknown"
 end
 
@@ -11026,13 +11109,18 @@ end
 # Whether a summary violates a class claim — the class view over the
 # record: Alloc = may_allocate; Block = may_block OR may_sleep (a sleep
 # suspends the caller — the Block class of the annotation semantics);
-# Io = may_io; Spawn = may_spawn (the @interrupt-only class).
+# Io = may_io; Spawn = may_spawn (the @interrupt-only class). The
+# widened §11 classes (audit order item 8) read their exact flag:
+# Sleep = may_sleep, Panic = may_panic, Unsafe = may_unsafe.
 def effect_summary_has_class(summary: EffectSummary, c: EffectClass) -> Bool
   match c
   when EffectClass::Alloc then summary.may_allocate
   when EffectClass::Block then summary.may_block || summary.may_sleep
   when EffectClass::Io then summary.may_io
   when EffectClass::Spawn then summary.may_spawn
+  when EffectClass::Sleep then summary.may_sleep
+  when EffectClass::Panic then summary.may_panic
+  when EffectClass::Unsafe then summary.may_unsafe
   end
 end
 
@@ -11176,6 +11264,19 @@ def effect_summary_of_extern_name(name: String) -> Option[EffectSummary]
     # so the @interrupt / @irq_safe proofs permit exactly that
     # capability and nothing else of the Io class.
     return Option::Some(effect_summary_with_capability(EffectSummary {}, capability_id_mmio()))
+  end
+  if name.starts_with("_tg_dma") then
+    # (audit item 16, next tier) The DMA engine hand-off intrinsics
+    # (_tg_dma_pin_read/_write/_read_write, _tg_dma_await, _tg_dma_unpin):
+    # the compiler-recognized canonical pin/await/unpin surface's
+    # implementation channel. Pinning hands buffer storage to a hardware
+    # DMA engine — a memory/hardware effect, never an OS I/O operation
+    # (may_io=false) and never a scheduler block (the await is a
+    # completion poll, may_block=false). The record carries the DMA
+    # capability; the per-place ownership consequence (the buffer leaves
+    # CPU ownership) is enforced by the resource checker's DmaState
+    # lattice, never by an effect class.
+    return Option::Some(effect_summary_with_capability(EffectSummary {}, capability_id_dma()))
   end
   if name.starts_with("_tg_hash") || name.starts_with("_tg_eq") then
     # Pure key hashing/equality helpers.
@@ -12183,8 +12284,17 @@ def check_impl_method_conformance(inout env: TypeEnv, contract: TraitContract, c
   end
 
   # (k) the impl method must not require effects beyond the trait's set.
+  # (universal-typed-derivation closure) the four contract-conformance
+  # failures below are SEMANTIC trait diagnostics: each carries the typed
+  # TraitFailureData obligation "<trait> for <receiver>" the solver's
+  # obligation render uses — never a payload-less E0230.
+  let contract_obligation = trait_name.clone() + " for " + type_tag(env, &self_type)
   if !effect_ids_equal(&im_sig.declared_effects, &cm.declared_effects) then
-    add_error_with_code(env, "effect mismatch: method `" + cm.name + "` of trait `" + trait_name + "` requires effects beyond the trait contract", m.span, "E0230")
+    add_error_semantic(env, "effect mismatch: method `" + cm.name + "` of trait `" + trait_name + "` requires effects beyond the trait contract", m.span, "E0230",
+      DiagnosticSemanticData::TraitFailure(TraitFailureData {
+        obligation: contract_obligation.clone(),
+        rejected_candidates: Vec::new()
+      }))
     valid = false
   end
 
@@ -12192,16 +12302,28 @@ def check_impl_method_conformance(inout env: TypeEnv, contract: TraitContract, c
   # not declare.
   match im_sig.declared_budget
   when Option::Some(_) then
-    add_error_with_code(env, "budget annotation beyond the trait contract: method `" + cm.name + "` of trait `" + trait_name + "`", m.span, "E0230")
+    add_error_semantic(env, "budget annotation beyond the trait contract: method `" + cm.name + "` of trait `" + trait_name + "`", m.span, "E0230",
+      DiagnosticSemanticData::TraitFailure(TraitFailureData {
+        obligation: contract_obligation.clone(),
+        rejected_candidates: Vec::new()
+      }))
     valid = false
   when Option::None then ()
   end
   if m.required_caps.len() > 0 then
-    add_error_with_code(env, "required capabilities beyond the trait contract: method `" + cm.name + "` of trait `" + trait_name + "`", m.span, "E0230")
+    add_error_semantic(env, "required capabilities beyond the trait contract: method `" + cm.name + "` of trait `" + trait_name + "`", m.span, "E0230",
+      DiagnosticSemanticData::TraitFailure(TraitFailureData {
+        obligation: contract_obligation.clone(),
+        rejected_candidates: Vec::new()
+      }))
     valid = false
   end
   if m.contracts.len() > 0 then
-    add_error_with_code(env, "contract clauses beyond the trait contract: method `" + cm.name + "` of trait `" + trait_name + "`", m.span, "E0230")
+    add_error_semantic(env, "contract clauses beyond the trait contract: method `" + cm.name + "` of trait `" + trait_name + "`", m.span, "E0230",
+      DiagnosticSemanticData::TraitFailure(TraitFailureData {
+        obligation: contract_obligation.clone(),
+        rejected_candidates: Vec::new()
+      }))
     valid = false
   end
 
@@ -17836,7 +17958,7 @@ def type_has_registered_drop(env: TypeEnv, tid: TypeId) -> Bool
   var i = 0
   while i < env.impls.len() do
     let imp = env.impls[i]
- # the Drop identity is the LangItems TraitId — never the name.
+  # the Drop identity is the LangItems TraitId — never the name.
     if imp.trait_id.id == env.lang_items.drop_trait then
       match imp.for_type
       when Type::Adt(imp_tid, _) then
@@ -17850,6 +17972,79 @@ def type_has_registered_drop(env: TypeEnv, tid: TypeId) -> Bool
   end
   false
 end
+
+# ———————————————————————————————————————————————————————————————
+# The vector/SIMD type property (audit order item 8)
+# ———————————————————————————————————————————————————————————————
+# THE std SIMD wrapper family — the ONLY registered definitions the vector
+# property recognizes (std/simd.tg's Vec2[T]/Vec4[T]/Vec8[T]/Vec16[T]).
+# The family vocabulary is shared with the layout engine's VECTOR ROW
+# (layout_engine.is_simd_vector_type_name delegates here), so the property
+# engine and the layout authority can never disagree on what "the family"
+# means.
+pub def simd_vector_family_name(name: String) -> Bool
+  name == "Vec2" || name == "Vec4" || name == "Vec8" || name == "Vec16"
+end
+
+# The SIMD lane size of a concrete type: the element width of the supported
+# lane types (1/2/4/8 bytes); 0 for anything else (the layout engine's
+# simd_lane_size_of_type mirror).
+def simd_vector_lane_size(ty: Type) -> Int
+  match ty
+  when Type::I8 | Type::U8 then 1
+  when Type::I16 | Type::U16 then 2
+  when Type::I32 | Type::U32 | Type::F32 then 4
+  when Type::I64 | Type::U64 | Type::F64 then 8
+  when _ then 0
+  end
+end
+
+# THE vector-type gate (the TypeProperties engine's authority; the layout
+# engine's is_simd_vector_type computes the same row from the same facts):
+# a registered STRUCT of the std SIMD family whose SUBSTITUTED fields are
+# all SIMD lanes of ONE width and whose total width is a vector width
+# (16/32/64 bytes). The lane count is the field count of the REAL
+# definition; the width comes from the CONCRETE substitutions. Everything
+# else — a bare generic form, a family-named def with a non-lane field or a
+# non-vector width, or a definition outside the family (a user struct named
+# "Vec4Like") — is NOT a vector type (0).
+pub def simd_vector_lanes_of_def(td: TypeDef, args: Vec[Type]) -> Int
+  if !simd_vector_family_name(td.name.clone()) then
+    return 0
+  end
+  # The layout engine's VECTOR ROW admits only a CONCRETE instantiation
+  # (args non-empty); mirror that exactly so the property and the layout
+  # can never disagree.
+  if args.is_empty() then
+    return 0
+  end
+  match td.def_kind
+  when TypeDefKind::Struct(fields) then
+    if fields.is_empty() then
+      return 0
+    end
+    var lane = -1
+    var fi = 0
+    while fi < fields.len() do
+      let f_ty = subst_type_args(&fields[fi].ty, &td.generic_params, args.clone())
+      let lane_size = simd_vector_lane_size(f_ty)
+      if lane_size <= 0 then
+        return 0
+      end
+      if lane == -1 then
+        lane = lane_size
+      elsif lane_size != lane then
+        return 0
+      end
+      fi = fi + 1
+    end
+    let lanes = fields.len()
+    let width = lane * lanes
+    if width == 16 || width == 32 || width == 64 then lanes else 0 end
+  when _ then 0
+  end
+end
+
 
 # Named-type property computation: built-in names decide directly (their
 # registered shapes must NOT be walked — Vec's shape is { ptr: Ptr[T],... }
@@ -17993,6 +18188,16 @@ def type_named_props(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout vis
       props.owns_state = true
       props.requires_drop_glue = true
     else
+      # (audit order item 8) THE COMPILER-OWNED VECTOR PROPERTY: the
+      # concrete type identity is a std SIMD wrapper instantiation of the
+      # registered family with lane-uniform, 16/32/64-byte storage. Derived
+      # from the REAL definition + substitutions (simd_vector_lanes_of_def);
+      # a consumer (perf_report) reads this property, never a bare name.
+      let v_lanes = simd_vector_lanes_of_def(td.clone(), args.clone())
+      if v_lanes > 0 then
+        props.is_vector_type = true
+        props.vector_lanes = v_lanes
+      end
       match td.def_kind
       when TypeDefKind::Struct(fields) then
         var i = 0
@@ -26371,7 +26576,16 @@ def check_transferable_bound(inout env: TypeEnv, ty: Type, span: Span, context: 
       primary_symbol: Option::Some(ty_render.clone()),
       semantic_site: Option::Some("Transferable bound check"),
       capability_trace: rows,
-      related_symbols: Vec::from([ty_render])
+      related_symbols: Vec::from([ty_render.clone()]),
+      # (universal-typed-derivation closure) the capability category is
+      # always typed: the failed structural derivation rides the payload.
+      semantic_data: Option::Some(DiagnosticSemanticData::Capability(CapabilityDiagnosticData {
+        capability: "Transferable".to_string(),
+        subject: ty_render.clone(),
+        operation: "transfer".to_string(),
+        state_before: "not-satisfied".to_string(),
+        fact: "the structural Transferable derivation failed for `" + ty_render.clone() + "`"
+      }))
     })
   end
 end
@@ -26392,7 +26606,14 @@ def check_shareable_bound(inout env: TypeEnv, ty: Type, span: Span, context: Str
       primary_symbol: Option::Some(ty_render2.clone()),
       semantic_site: Option::Some("Shareable bound check"),
       capability_trace: rows2,
-      related_symbols: Vec::from([ty_render2])
+      related_symbols: Vec::from([ty_render2.clone()]),
+      semantic_data: Option::Some(DiagnosticSemanticData::Capability(CapabilityDiagnosticData {
+        capability: "Shareable".to_string(),
+        subject: ty_render2.clone(),
+        operation: "share".to_string(),
+        state_before: "not-satisfied".to_string(),
+        fact: "the structural Shareable derivation failed for `" + ty_render2.clone() + "`"
+      }))
     })
   end
 end
