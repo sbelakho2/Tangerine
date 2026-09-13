@@ -1,0 +1,139 @@
+# .woodpecker/bootstrap.yaml — from-source macOS/AArch64 bootstrap fixed point.
+#
+# Migrated from the former GitHub Actions workflow (job `bootstrap`):
+#   stage0 (OCaml seed) -> stage1 -> stage2 -> stage3, stage2 == stage3.
+# Produces the validated Mach-O stage3 artifact consumed by every lane.
+#
+# Agent requirements (see docs/current/ci.md):
+#   * Darwin/arm64 host agent, LOCAL backend (the stages are Mach-O/aarch64
+#     binaries executed natively — no Linux container can run them):
+#       labels: platform=darwin/arm64, backend=local
+#   * host `aws` CLI (S3-compatible artifact store access)
+#   * opam with the pinned OCaml 5.4.0 switch (bootstrap/ocaml-toolchain.lock);
+#     the step installs dune 3.21.1 into it.
+#
+# Operator configuration: adjust TG_S3_BUCKET / TG_S3_ENDPOINT / region in
+# the &tg_s3_env anchor below; provide repository secrets `s3_access_key`
+# and `s3_secret_key` (expose them to pull_request events for PR runs).
+
+labels:
+  platform: darwin/arm64
+  backend: local
+
+concurrency:
+  limit: 1
+  group: tg-opam
+
+when:
+  - event: push
+    branch: [main, dev]
+  - event: pull_request
+    branch: [main, "release/**"]
+
+steps:
+  - name: cache-restore
+    image: bash
+    failure: ignore
+    environment: &tg_s3_env
+      AWS_ACCESS_KEY_ID:
+        from_secret: s3_access_key
+      AWS_SECRET_ACCESS_KEY:
+        from_secret: s3_secret_key
+      AWS_DEFAULT_REGION: us-east-1
+      TG_S3_BUCKET: tangerine-ci
+      TG_S3_ENDPOINT: http://127.0.0.1:9000
+    commands:
+      - mkdir -p "$HOME/.opam/download-cache" "$HOME/.cache/dune"
+      - LOCK_SHA="$(shasum -a 256 bootstrap/ocaml-toolchain.lock | cut -d' ' -f1)"
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp "s3://$TG_S3_BUCKET/$CI_REPO/cache/opam-dune-$LOCK_SHA.tar.gz" /tmp/opam-dune-cache.tar.gz --no-progress || true
+      - tar -xzf /tmp/opam-dune-cache.tar.gz -C "$HOME" 2>/dev/null || true
+
+  - name: bootstrap
+    image: bash
+    depends_on: [cache-restore]
+    commands:
+      - |
+        set -euo pipefail
+        command -v opam >/dev/null 2>&1 || { echo "operator: opam is not on PATH (see docs/current/ci.md)"; exit 1; }
+        if ! opam switch list --short 2>/dev/null | grep -qx "5.4.0"; then
+          echo "operator: the pinned switch is missing; create it once with:"
+          echo "  opam switch create 5.4.0 ocaml-base-compiler.5.4.0"
+          exit 1
+        fi
+        eval "$(opam env --switch=5.4.0 --set-switch)"
+        opam install -y dune.3.21.1
+        scripts/check_ocaml_toolchain.sh
+        TG_BOOTSTRAP_TRACE=1 bash ./run_bootstrap.sh
+
+  - name: cache-save
+    image: bash
+    depends_on: [bootstrap]
+    failure: ignore
+    environment: *tg_s3_env
+    commands:
+      - |
+        set -euo pipefail
+        LOCK_SHA="$(shasum -a 256 bootstrap/ocaml-toolchain.lock | cut -d' ' -f1)"
+        tar -czf /tmp/opam-dune-cache.tar.gz -C "$HOME" .opam/download-cache .cache/dune 2>/dev/null || true
+        if [ -s /tmp/opam-dune-cache.tar.gz ]; then
+          aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp /tmp/opam-dune-cache.tar.gz "s3://$TG_S3_BUCKET/$CI_REPO/cache/opam-dune-$LOCK_SHA.tar.gz" --no-progress
+        fi
+
+  - name: upload-bootstrap-logs
+    image: bash
+    depends_on: [bootstrap]
+    environment: *tg_s3_env
+    when:
+      - event: [push, pull_request]
+        status: [success, failure]
+    commands:
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive build/bootstrap "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/bootstrap-logs" --no-progress
+
+  - name: upload-bootstrap-fingerprints
+    image: bash
+    depends_on: [bootstrap]
+    environment: *tg_s3_env
+    when:
+      - event: [push, pull_request]
+        status: [success, failure]
+    commands:
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive build/.fingerprints "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/bootstrap-fingerprints" --no-progress
+
+  - name: upload-bootstrap-native-tests
+    image: bash
+    depends_on: [bootstrap]
+    environment: *tg_s3_env
+    when:
+      - event: [push, pull_request]
+        status: [success, failure]
+    commands:
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive build/.native_tests "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/bootstrap-native-tests" --no-progress
+
+  - name: upload-tg-stages
+    image: bash
+    depends_on: [bootstrap]
+    environment: *tg_s3_env
+    commands:
+      - |
+        set -euo pipefail
+        for s in 1 2 3; do
+          aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp "build/tg_stage$s" "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/tg-stages-macos-arm64/tg_stage$s" --no-progress
+        done
+        if [ -f build/tg ]; then
+          aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp build/tg "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/tg-stages-macos-arm64/tg" --no-progress
+        fi
+        echo "✓ tg_stage1/tg_stage2/tg_stage3 (+ build/tg when produced) uploaded (tg-stages-macos-arm64)"
+
+  - name: job-results
+    image: bash
+    depends_on: [bootstrap]
+    commands:
+      - mkdir -p build/.ci_results
+      - printf 'success\n' > build/.ci_results/bootstrap
+
+  - name: upload-job-results
+    image: bash
+    depends_on: [job-results]
+    environment: *tg_s3_env
+    commands:
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive build/.ci_results "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/ci-results" --no-progress

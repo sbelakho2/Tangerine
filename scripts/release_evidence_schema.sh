@@ -90,14 +90,28 @@ RELEASE_NATIVE_TLS_JOB=stdlib-integration
 # stage2 == stage3 equality is the equality of the actual stage binaries'
 # hashes, and the semantic-phase equality is the equality of the actual
 # stage2/stage3 fingerprint records. The workflow run identity is read from
-# the GITHUB_* environment. The compatibility key artifact_hashes carries
+# the CI environment (Woodpecker CI_WORKFLOW_NAME/CI_STEP_NAME/
+# CI_PIPELINE_NUMBER; the GitHub Actions GITHUB_* names are a fallback).
+# The compatibility key artifact_hashes carries
 # the same per-file hashes as a flat "sha256  path" list (the feature
 # registry consumes it as the run-evidence existence check).
 # ────────────────────────────────────────────────────────────────────────────
 build_release_evidence() {
   local ev_dir="$1" outfile="$2" sha="$3" jobs_file="$4" gated="$5" stamp="$6"
-  local wf_name="${GITHUB_WORKFLOW:-}" wf_job="${GITHUB_JOB:-}"
-  local wf_run="${GITHUB_RUN_ID:-}" wf_attempt="${GITHUB_RUN_ATTEMPT:-}"
+  # The workflow run identity: Woodpecker (CI_*) first, GitHub Actions
+  # (GITHUB_*) as fallback. The validator only requires a non-empty
+  # workflow name + run id, so either system satisfies the schema.
+  local wf_name="${CI_WORKFLOW_NAME:-${GITHUB_WORKFLOW:-}}"
+  local wf_job="${CI_STEP_NAME:-${GITHUB_JOB:-}}"
+  local wf_run="${CI_PIPELINE_NUMBER:-${GITHUB_RUN_ID:-}}"
+  local wf_attempt="${GITHUB_RUN_ATTEMPT:-}"
+  if [ -n "${CI_PIPELINE_RERUNS:-}" ]; then
+    wf_attempt=$((CI_PIPELINE_RERUNS + 1))
+  fi
+  [ -n "$wf_attempt" ] || wf_attempt="1"
+  local wf_system="${CI:-}"
+  [ -n "$wf_system" ] || wf_system="${GITHUB_ACTIONS:+github-actions}"
+  [ -n "$wf_name" ] || wf_name="${wf_system:-local}"
   RELEASE_SCHEMA_VERSION="$RELEASE_EVIDENCE_SCHEMA_VERSION" \
   RELEASE_SCHEMA_ARTIFACTS="${RELEASE_REQUIRED_ARTIFACTS[*]}" \
   RELEASE_SCHEMA_STAGES="${RELEASE_STAGE_BINARIES[*]}" \

@@ -46,7 +46,7 @@ This document provides a comprehensive reference for all modules in the Tangerin
    (`Option<u32>`, `Option[u32>` — the grammar's generics are `[...]`
    only), and zero `Box[dyn Any]` erased results. The gate
    `tests/run_stdlib_e106_sweep.sh` is a **required CI job**
-   (`stdlib-e106-sweep` in `.github/workflows/ci.yml`) and enforces this
+   (`stdlib-e106-sweep` in `.woodpecker/verify-core.yaml`) and enforces this
    in two layers: (1) `tg check` on every std/*.tg module must succeed
    with zero diagnostics (E106/E100/E1100 and any syntax error fail the
    module), and (2) a grep backstop re-scans every module for the
@@ -122,7 +122,7 @@ documented `__intrinsic_` extern-ABI exception. The sweep gate
 `tests/run_stdlib_e106_sweep.sh` asserts every shipped module (the
 computed `std/*.tg` count — currently 134) checks clean AND passes the
 forbidden-syntax grep backstop; the gate is a **required CI job**
-(`stdlib-e106-sweep` in `.github/workflows/ci.yml`).
+(`stdlib-e106-sweep` in `.woodpecker/verify-core.yaml`).
 
 ---
 

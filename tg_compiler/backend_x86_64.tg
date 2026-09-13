@@ -137,9 +137,15 @@
 #     layouts, sub-word fields sharing or straddling a word, and
 #     payloaded-enum crossings to extern symbols
 #     (lir_check_extern_enum_calls);
-#   - MirDeinit/drop glue: the x86 lowering entry passes empty
-#     deinit/finalizer/glue tables, so programs with drops fail closed
-#     at the shape gate (the deinit slice is not wired on this route);
+#   - MirDeinit/drop glue (NO LONGER fail-closed on this route —
+#     WIRED for the whole-program route): the
+#     x86 lowering entry receives the same program deinit/finalizer/
+#     glue tables the aarch64 route carries (MirProgram.deinit_plans /
+#     method_names_by_def / drop_glue_fns, built in
+#     x86_64_compile_object), so structural cleanup, user finalizers,
+#     the String destructor and the generated drop-glue bodies lower
+#     here exactly as on aarch64 (only the instruction emission
+#     differs; the old fail-closed drop rule is gone on this route);
 #   - extern calls DO lower: `call rel32` plus an R_X86_64_PLT32
 #     relocation (kind 4, addend -4) against the undefined symbol, so
 #     the linker resolves them. Intra-object calls to defined program
@@ -148,14 +154,16 @@
 #   DIVISION is in scope: the marked LirBinop emits cqo+idiv (signed) /
 #   xor edx,edx+div (unsigned) with the quotient in rax, behind the
 #   language-edge guard (audit item 30): divisor zero and the signed
-#   INT64_MIN/-1 pair TRAP (ud2) on both targets/routes instead of the
-#   aarch64 architectural 0/MIN.
+#   INT64_MIN/-1 pair ABORT through a call to the runtime's whitelisted
+#   __intrinsic_abort symbol on both targets/routes (never the aarch64
+#   architectural 0/MIN, never an inline ud2 in a user function).
 #   @cold is ADVISORY and NOT specialized here: every body is emitted in
 #   program order into one .text (the hint changes nothing).
 
 use std::core::{Option, Result, panic}
 use std::collections::{Vec, Set}
 use tg_compiler::mir::{MirProgram, MirFunction, MirStatic, MirTypeDef}
+use tg_compiler::types::{DeinitPlan}
 use tg_compiler::lir::{
   LirFunction, LirAlloc, LirStmt, LirStmtKind, LirTermKind, LirValue,
   LirCond, LirBinOp, LirUnOp, LirDivOp,
@@ -165,7 +173,7 @@ use tg_compiler::lir::{
   lir_validate_callees, lir_first_alloc_vreg, lir_check_extern_enum_calls,
   lir_check_fn_enum_abi_export,
   lir_fn_export_binding,
-  lir_is_fixed_fp_id, lir_fixed_fp_base, lir_fp_width_of,
+  lir_is_fixed_fp_id, lir_fixed_fp_base,
   lir_alloc_fp_width_of, lir_seg_at, lir_reload_at, lir_block_label,
   lir_slot_offset, lir_simd_lane_of_vector_lane, lir_vector_lane_name,
   lir_vector_elem_bits, lir_vector_elem_is_float,
@@ -3390,13 +3398,16 @@ end
 # TRAP deterministically — the divisor is compared against zero (both
 # the signed and unsigned kinds) and, for the SIGNED kind, the
 # INT64_MIN/-1 hardware edge is compared before the idiv. The x86
-# idiv/div #DE would trap on both edges anyway, but the explicit UD2
-# guard makes x86 produce the SAME deterministic trap as the aarch64
-# emitter's UDF (and the remainder's shared quotient edge), independent
-# of the host's #DE signal mapping. RAX holds the dividend when this
-# runs and RDX is free (an RDX-resident divisor was parked in the
-# scratch slot by x86_emit_div), so the guard clobbers neither. R11 is
-# NOT used: the INT64_MIN compare materializes into RDX (the scratch
+# idiv/div #DE would trap on both edges anyway, but the explicit guard
+# routes to the SAME abort the aarch64 emitter's guard uses: a CALL to
+# the runtime's whitelisted __intrinsic_abort symbol (the single abort
+# funnel — no inline ud2 in a user function, so the trap instruction is
+# attributed to the whitelisted abort symbol by the trap-stub gate).
+# The remainder's shared quotient edge is covered by the same guard,
+# independent of the host's #DE signal mapping. RAX holds the dividend
+# when this runs and RDX is free (an RDX-resident divisor was parked in
+# the scratch slot by x86_emit_div), so the guard clobbers neither. R11
+# is NOT used: the INT64_MIN compare materializes into RDX (the scratch
 # slot may already hold the parked divisor).
 def x86_emit_div_guard(inout xe: X86Emit, op: LirDivOp, den_is_mem: Bool, den_disp: Int, den_reg: X64) -> Unit
   let lbl_nz = x86_fresh_label(xe, "div_nz")
@@ -3406,7 +3417,7 @@ def x86_emit_div_guard(inout xe: X86Emit, op: LirDivOp, den_is_mem: Bool, den_di
     x86_emit(&mut xe.buf, x86_alu_rr(0x85, den_reg, den_reg))
   end
   x86_emit_jcc_label(xe, LirCond::LirNe, lbl_nz)
-  x86_emit(&mut xe.buf, x86_ud2())
+  x86_emit_call_remote(xe, "__intrinsic_abort")
   def_label(&mut xe.buf, lbl_nz)
   match op
   when LirDivOp::LirSdiv then
@@ -3420,7 +3431,7 @@ def x86_emit_div_guard(inout xe: X86Emit, op: LirDivOp, den_is_mem: Bool, den_di
     x86_emit(&mut xe.buf, x86_mov_ri64(X64::RDX, -9223372036854775808 as i64))
     x86_emit(&mut xe.buf, x86_alu_rr(0x39, X64::RAX, X64::RDX))
     x86_emit_jcc_label(xe, LirCond::LirNe, lbl_edge)
-    x86_emit(&mut xe.buf, x86_ud2())
+    x86_emit_call_remote(xe, "__intrinsic_abort")
     def_label(&mut xe.buf, lbl_edge)
   when LirDivOp::LirUdiv then ()
   end
@@ -5304,7 +5315,12 @@ def x86_emit_term(inout xe: X86Emit, alloc: LirAlloc, fn_name: String, kind: Lir
     x86_emit_epilogue(xe, alloc)
     Result::Ok(())
   when LirTermKind::LirTrap then
-    x86_emit(&mut xe.buf, x86_ud2())
+    # THE ABORT FUNNEL: a trap terminator (MirUnreachable/MirAbort, the
+    # synthetic assert-failure block) terminates through a CALL to the
+    # runtime's whitelisted __intrinsic_abort symbol — the same abort the
+    # std panic surface and the aarch64 LIR/direct emitters use, never an
+    # inline ud2 in the emitting user function.
+    x86_emit_call_remote(xe, "__intrinsic_abort")
     Result::Ok(())
   when LirTermKind::LirCall(target, args, stack_args, dest, success) then
     # stack_args counts 16-byte caller-slot units; only the vector
@@ -6147,11 +6163,16 @@ end
 # The program-level lowering entry (slice 2): the full width model and
 # the aggregate/vector admissions over the x86_64 description (see
 # lir.tg's lower_mir_fn_to_lir_prog_x86), fed the program's type-def
-# table and static label table. The legacy two-flag wrapper
-# (lower_mir_fn_to_lir_mode) stays available but is no longer the
-# route's entry.
-def x86_lower_mir_fn(f: MirFunction, type_defs: Map[Int, MirTypeDef], static_labels: Map[String, String]) -> Result[LirFunction, String]
-  lower_mir_fn_to_lir_prog_x86(f, type_defs, static_labels)
+# table, the whole-program static label table and the SAME deinit
+# tables the aarch64 route carries (deinit_plans — the concrete
+# MirProgram.deinit_plans; finalizer_names — method_names_by_def;
+# glue_names — the generated drop-glue name set; drop_glue_fns — the
+# glue identity table): the MirDeinit slice's plan consumer resolves
+# destruction terms through them exactly as on aarch64. The legacy
+# two-flag wrapper (lower_mir_fn_to_lir_mode) stays available but is
+# no longer the route's entry.
+def x86_lower_mir_fn(f: MirFunction, type_defs: Map[Int, MirTypeDef], deinit_plans: Map[String, DeinitPlan], finalizer_names: Map[Int, String], glue_names: Set[String], static_labels: Map[String, String], drop_glue_fns: Map[Int, String]) -> Result[LirFunction, String]
+  lower_mir_fn_to_lir_prog_x86(f, type_defs, deinit_plans, finalizer_names, glue_names, static_labels, drop_glue_fns)
 end
 
 # Compile the whole program to an ELF64 x86-64 relocatable object.
@@ -6203,6 +6224,27 @@ def x86_64_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u
     type_defs.insert(program.types[tdi].id.id, program.types[tdi].clone())
     tdi = tdi + 1
   end
+  # The program's deinit tables — built EXACTLY like the aarch64
+  # driver's lir_compile_object_cov (the MirDeinit slice's authority;
+  # the plans and the generated glue bodies are target-independent):
+  # the CONCRETE deinit plans (mir_type_identity_key -> DeinitPlan — the
+  # same table codegen.tg's ctx.deinit_plans consumes), the finalizer
+  # identity table (def_id_numeric -> the mangled emission name of every
+  # registered finalizer — MirProgram.method_names_by_def), the
+  # generated drop-glue name set (the values of MirProgram.drop_glue_fns
+  # — the (ptr: Ptr[T], mask: Int) glue bodies the generated drop-glue
+  # admission of lir_check_fn_shape admits and lir_resolve_glue_head_bind
+  # turns into the machine-level entry bind) and the glue IDENTITY
+  # table itself (the plan consumer resolves MirDeinit payload
+  # identities through it and decides whether a function being lowered
+  # is itself a glue body).
+  let deinit_plans = program.deinit_plans.clone()
+  let finalizer_names = program.method_names_by_def.clone()
+  var glue_names: Set[String] = Set::new()
+  for (_, glue_nm) in program.drop_glue_fns do
+    glue_names.insert(glue_nm.clone())
+  end
+  let drop_glue_fns = program.drop_glue_fns.clone()
   # (fourth-audit P0-20) The program-wide enum-ABI version state, the
   # uniformity check and the object-metadata note are deleted: every
   # route crosses the canonical TaggedPtr value word.
@@ -6228,7 +6270,7 @@ def x86_64_compile_object(program: MirProgram, desc: TargetDesc) -> Result[Vec[u
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
       end
-      let lir_fn = match x86_lower_mir_fn(f, type_defs, static_labels)
+      let lir_fn = match x86_lower_mir_fn(f, type_defs, deinit_plans, finalizer_names, glue_names, static_labels, drop_glue_fns)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(lf) then lf
       end

@@ -123,6 +123,16 @@ SHA="$(git -C "$ROOT" rev-parse HEAD)"
 DATE="$(date +%Y-%m-%d)"
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+# Portable sha-256: macOS ships `shasum` (perl); Debian containers ship
+# `sha256sum`. Either may be the only one present on a given CI lane.
+sha256_hex() { # sha256_hex [file...] ; reads stdin when no file is given
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$@"
+  else
+    sha256sum "$@"
+  fi
+}
+
 # ── harness constants (single source: bootstrap_helpers.sh) ───────────────
 POS="$(sed -n 's/^CANARY_SUITE_POSITIVE_COUNT=\([0-9]*\)/\1/p' "$ROOT/scripts/bootstrap_helpers.sh" | head -1)"
 NEG="$(sed -n 's/^CANARY_SUITE_NEGATIVE_COUNT=\([0-9]*\)/\1/p' "$ROOT/scripts/bootstrap_helpers.sh" | head -1)"
@@ -165,8 +175,8 @@ refresh_manifest() { # refresh_manifest <manifest>
   list="$(grep -vE '^#|^$' "$manifest" | cut -f1 | sort)"
   count="$(printf '%s\n' "$list" | grep -c . || true)"
   local mh lh
-  mh="$(printf '%s\n' "$body" | shasum -a 256 | cut -d' ' -f1)"
-  lh="$(printf '%s\n' "$list" | shasum -a 256 | cut -d' ' -f1)"
+  mh="$(printf '%s\n' "$body" | sha256_hex | cut -d' ' -f1)"
+  lh="$(printf '%s\n' "$list" | sha256_hex | cut -d' ' -f1)"
   # Rewrite in place: drop the old generated lines, then insert the new
   # ones immediately after the FIRST manifest comment block start marker
   # (the header comment) — the harness greps the FIRST '# count:' line.
@@ -289,7 +299,7 @@ fact "stdlib sweep backstop (forbidden-syntax grep)" \
 fact "stdlib sweep covers every shipped module (the item-32 enumeration)" \
   'run_stdlib_completeness_gate' "$ROOT/tests/run_stdlib_e106_sweep.sh"
 fact "stdlib-e106-sweep is a required CI job" \
-  'stdlib-e106-sweep' "$ROOT/.github/workflows/ci.yml"
+  'stdlib-e106-sweep' "$ROOT/.woodpecker/verify-core.yaml"
 
 # Test-runner integrity (P0): tg test must distinguish pass / fail /
 # zero-tests / parse-error / implicit-skip.
@@ -345,7 +355,7 @@ fact "doctest gate script (forbidden-form scan + compile_fail verification)" \
 fact "doctest gate script covers the six documents" \
   'feature_registry.md' "$ROOT/scripts/check_doctests.sh"
 fact "doctest gate wired into CI (doctests job)" \
-  'doctests' "$ROOT/.github/workflows/ci.yml"
+  'doctests' "$ROOT/.woodpecker/verify-core.yaml"
 
 # @cfg strictness + the cross-target matrix: the elimination is FINAL (an
 # eliminated item never resurrects), and the matrix drives the pass with
@@ -426,16 +436,16 @@ fact "@test per-test dispatch main" \
 fact "@test dispatch is the canonical per-test main" \
   'per-test dispatch main' "$ROOT/tg_compiler/driver.tg"
 fact "stdlib verify lane restored (CI job)" \
-  'stdlib-new-modules' "$ROOT/.github/workflows/ci.yml"
+  'stdlib-new-modules' "$ROOT/.woodpecker/verify-stdlib.yaml"
 fact "gfx-ui lanes restored (CI jobs)" \
-  'gfx-ui-visual' "$ROOT/.github/workflows/ci.yml"
+  'gfx-ui-visual' "$ROOT/.woodpecker/verify-gfx.yaml"
 
 # Crypto KAT: the known-answer suite over the std/crypto.tg primitives is
 # a required CI job.
 fact "crypto KAT suite (known-answer vectors)" \
   'test_crypto_rigor' "$ROOT/tests/unit/test_crypto_rigor.tg"
 fact "crypto KAT CI job" \
-  'crypto-kat' "$ROOT/.github/workflows/ci.yml"
+  'crypto-kat' "$ROOT/.woodpecker/verify-core.yaml"
 
 # ── round-11 facts ─────────────────────────────────────────────────────────
 # Arc rework (std/sync.tg): the UNIQUE-ONLY mutable access (get_mut returns
@@ -476,11 +486,11 @@ fact "mysql statement run path (mysql_stmt_run)" \
 fact "TLS consuming builders (sink self: TlsConfig)" \
   'sink self: TlsConfig' "$ROOT/std/tls.tg"
 fact "TLS shim source committed (native/tls_shims.c)" \
-  'tls_shims' "$ROOT/.github/workflows/ci.yml"
+  'tls_shims' "$ROOT/.woodpecker/verify-stdlib.yaml"
 fact "TLS shim lane builds libtg_tls_shims.dylib" \
-  'libtg_tls_shims.dylib' "$ROOT/.github/workflows/ci.yml"
+  'libtg_tls_shims.dylib' "$ROOT/.woodpecker/verify-stdlib.yaml"
 fact "TLS shim preloaded into the test processes" \
-  'DYLD_INSERT_LIBRARIES' "$ROOT/.github/workflows/ci.yml"
+  'DYLD_INSERT_LIBRARIES' "$ROOT/.woodpecker/verify-stdlib.yaml"
 
 # Extern ABI return normalization: a C `int` return arrives in the LOW 32
 # bits of the return register (eax/w0) with unspecified upper bits —
@@ -649,10 +659,10 @@ if [ -n "$ARTIFACT_DIRS" ]; then
     [ -n "$d" ] || continue
     if [ -d "$d" ]; then
       find "$d" -type f -print0 | sort -z | while IFS= read -r -d '' f; do
-        shasum -a 256 "$f" 2>/dev/null | sed "s#  $d/#  #"
+        sha256_hex "$f" 2>/dev/null | sed "s#  $d/#  #"
       done
     elif [ -f "$d" ]; then
-      shasum -a 256 "$d" 2>/dev/null
+      sha256_hex "$d" 2>/dev/null
     else
       echo "  (missing artifact path: $d)" >&2
     fi
@@ -660,13 +670,15 @@ if [ -n "$ARTIFACT_DIRS" ]; then
 fi
 
 # ── the SHA-tied status artifact name (CI-run-provided) ────────────────────
-# The status job uploads the snapshot under `status-snapshot-<tested-sha>`:
-# the artifact NAME carries the tested SHA (GITHUB_SHA), so an artifact can
-# never be mistaken for a different commit's snapshot. Locally (no
-# GITHUB_SHA) the name is `status-snapshot-local`.
+# The status workflow uploads the snapshot under `status-snapshot-<sha>`:
+# the artifact NAME carries the tested SHA (Woodpecker CI_COMMIT_SHA; the
+# GitHub GITHUB_SHA fallback keeps the script usable on either system), so
+# an artifact can never be mistaken for a different commit's snapshot.
+# Locally (neither set) the name is `status-snapshot-local`.
 STATUS_ARTIFACT_NAME="status-snapshot-local"
-if [ -n "${GITHUB_SHA:-}" ]; then
-  STATUS_ARTIFACT_NAME="status-snapshot-${GITHUB_SHA}"
+CI_SHA="${CI_COMMIT_SHA:-${GITHUB_SHA:-}}"
+if [ -n "$CI_SHA" ]; then
+  STATUS_ARTIFACT_NAME="status-snapshot-${CI_SHA}"
 fi
 
 # ── stage hashes / phase fingerprints (CI-RUN-PROVIDED, parsed) ────────────
@@ -700,10 +712,20 @@ fi
 # Repository identity.
 SHA_SHORT="$(printf '%s' "$SHA" | cut -c1-12)"
 
-# Timestamp + workflow identity (CI-run-provided when present).
-WORKFLOW_IDENTITY="local run (no workflow identity — GITHUB_WORKFLOW/GITHUB_JOB/GITHUB_RUN_ID unset)"
-if [ -n "${GITHUB_WORKFLOW:-}" ]; then
-  WORKFLOW_IDENTITY="${GITHUB_WORKFLOW:-} / ${GITHUB_JOB:-} / run ${GITHUB_RUN_ID:-} (attempt ${GITHUB_RUN_ATTEMPT:-1})"
+# Timestamp + workflow identity (CI-run-provided when present:
+# Woodpecker CI_WORKFLOW_NAME/CI_STEP_NAME/CI_PIPELINE_NUMBER, with the
+# GitHub Actions GITHUB_* names as a fallback for either system).
+WF_NAME="${CI_WORKFLOW_NAME:-${GITHUB_WORKFLOW:-}}"
+WF_JOB="${CI_STEP_NAME:-${GITHUB_JOB:-}}"
+WF_RUN="${CI_PIPELINE_NUMBER:-${GITHUB_RUN_ID:-}}"
+WF_ATTEMPT="${GITHUB_RUN_ATTEMPT:-}"
+if [ -n "${CI_PIPELINE_RERUNS:-}" ]; then
+  WF_ATTEMPT=$((CI_PIPELINE_RERUNS + 1))
+fi
+[ -n "$WF_ATTEMPT" ] || WF_ATTEMPT="1"
+WORKFLOW_IDENTITY="local run (no workflow identity — CI_WORKFLOW_NAME/CI_STEP_NAME/CI_PIPELINE_NUMBER unset)"
+if [ -n "$WF_NAME" ]; then
+  WORKFLOW_IDENTITY="${WF_NAME} / ${WF_JOB} / run ${WF_RUN} (attempt ${WF_ATTEMPT})"
 fi
 
 # Std-module counts: every shipped std/*.tg and the kernel closure.
@@ -1083,7 +1105,7 @@ CURRENT STATE (structural, verified against the tested tree):
   parse-clean, enforced by the two-layer gate
   (tests/run_stdlib_e106_sweep.sh: \`tg check\` zero-diagnostics per module
   + the forbidden-syntax grep backstop), a REQUIRED CI job
-  (stdlib-e106-sweep in .github/workflows/ci.yml). The ONLY remaining
+  (stdlib-e106-sweep in the Woodpecker lane .woodpecker/verify-core.yaml). The ONLY remaining
   reference type positions are the five __intrinsic_map_visit_* /
   __intrinsic_set_visit_* record-visit extern signatures in
   std/collections.tg — the documented extern-ABI exception, not a
@@ -1231,8 +1253,8 @@ EOF
   cat <<EOF
 
 TO REGENERATE THIS FILE (generated-by instructions):
-  1. CI: the \`status\` job (in .github/workflows/ci.yml) runs after the
-     test jobs, checks out the TESTED SHA, downloads the test artifacts
+  1. CI: the \`status\` Woodpecker workflow (.woodpecker/status.yaml) runs after the
+     test workflows, checks out the TESTED SHA, downloads the test artifacts
      (bootstrap fingerprints + native-tests, cross-lane binaries, the
      linux-fingerprints + linux-native-tests artifacts), and generates
      this snapshot:

@@ -575,7 +575,7 @@ pipeline, not in a config bit); no config bit claims any of them:
 
 | Former bit (deleted) | Behavior (pending unless marked IMPLEMENTED) |
 |----------------------|------------------|
-| `enforce_effects` | effect lowering + effect-log runtime — `MirEffectRecord` is never constructed from source; the `__tg_effect_record` runtime body is a trap stub (runtime.tg) |
+| `enforce_effects` | effect lowering + effect-log runtime — `MirEffectRecord` is never constructed from source; the native effect log does not exist (the former `__tg_effect_record` trap stub was removed; the non-budget codegen arm fails closed as a lowering defect) |
 | `enforce_budgets` | IMPLEMENTED OUTSIDE THE BIT — budget constraints are lowered (`MirBudgetConsume`) and enforced: `check_budget_annotations_mir` (mir.tg) classifies every recognized resource and fails the compile (E0235) when a `static-proof` / `static-bound` derivation exceeds its limit; the `runtime-measured` frame counters / clock (native codegen's budget slots and the wasm backend's budget locals) trap at run time. No config bit gates it |
 | `enforce_coverage` | a coverage gate in the pipeline — `coverage.tg` exists but is not invoked by any compile/check path |
 | `gate_on_score` | a CQS gate in the pipeline — the compiler-query-server IS invoked by the canonical pipeline: the driver's check path (driver_cqs_query_pass) and the library API (analyze_source_cqs) run the typed-info / symbols / diagnostics queries over the analyzed program + the lowered MIR, and the mode matrix's gated failures are reported as Error-level diagnostics and FAIL the check (Production/Hardened); the Dev matrix enforces nothing |

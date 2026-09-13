@@ -2,7 +2,7 @@
 # check_ocaml_stage0.sh — thin wrapper over the two split gates (audit
 # P1 item 3): seed development health (pinned debt) and bootstrap
 # completeness (zero semantic debt, full closure).  CI does not
-# reference this script (checked .github/workflows/ci.yml), so it is
+# reference this script (checked .woodpecker/), so it is
 # kept only as the familiar entry point.
 #
 # Usage: scripts/check_ocaml_stage0.sh [repo-root]

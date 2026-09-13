@@ -243,11 +243,18 @@ make abi-layout-check
 
 ### 6.2 CI Setup
 
-The CI pipeline is defined in `.github/workflows/ci.yml`. Key jobs:
-- `gfx-ui`: Unit + integration + ABI tests, cross-platform matrix.
-- `gfx-ui-visual`: Golden + determinism + fuzz tests with artifact upload.
-- `gfx-ui-gate`: Required merge gate.
-- `release-freeze`: Blocks non-conformance PRs on release branches.
+The CI pipeline is defined in the `.woodpecker/` directory (one workflow
+file per lane group; see [`ci.md`](ci.md) for the full layout, agent
+labels, secrets and local execution). Key workflows:
+- `bootstrap`: the macOS/aarch64 stage0 -> stage1 -> stage2 -> stage3
+  fixed point that produces the validated stage3 artifact.
+- `verify-gfx`: `gfx-ui` (unit + integration + ABI tests),
+  `gfx-ui-visual` (golden + determinism + fuzz tests with artifact
+  upload) and `gfx-ui-gate` (required aggregate).
+- `verify-core`: the compiler/runtime lanes (lint, conformance,
+  mutation, verifier-stress, ...).
+- `release-freeze`: blocks non-conformance PRs on release branches.
+- `gate`: the single aggregate release gate.
 
 ### 6.3 Release Engineering
 

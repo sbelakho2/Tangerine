@@ -13,7 +13,21 @@
 # step, no Swift binary path, and no fallback seed.
 #
 # Stages are produced into build/tg_stage{1,2,3}, with logs under
-# build/bootstrap/. CI uploads these artifacts and logs (see ci.yml).
+# build/bootstrap/. After stage3 validates, the harness materializes the FULL
+# compiler — the driver CLI (fmt/lint/test/bench/doc/agent/...) that the
+# tg-consuming CI jobs invoke — into build/tg by compiling tg_compiler/
+# driver.tg with stage3. The ladder stages themselves carry only the KERNEL
+# entry (bootstrap_main.tg: the compile/check commands), because driver.tg is
+# intentionally NOT a member of the kernel manifest. CI publishes build/tg
+# together with the stage artifacts and logs (see .woodpecker/bootstrap.yaml).
+#
+# Closure scoping (compiler_core.tg is_kernel_entry_path): the manifest-closed
+# self-host mode (merge_imported_deps, include_compiler_lib) is keyed on the
+# KERNEL ENTRY root bootstrap_main.tg — every ladder stage build is therefore
+# strictly manifest-closed and hard-fails on any out-of-manifest import. The
+# full-driver materialization below is NOT such a build: driver.tg is the
+# out-of-manifest tooling root, so its imports load from the repo through the
+# same canonical loader (prelude + recursive resolution), no flag needed.
 #
 # DELEGATION: the stage0 -> stage1 -> stage2 -> stage3 closure is driven by
 # scripts/check_ocaml_bootstrap_complete.sh (the OCaml seed's completeness
@@ -126,6 +140,13 @@ export TARGET_TRIPLE
 # Compiler bootstrap entry source used as the bootstrap unit.
 DRIVER_SRC="tg_compiler/bootstrap_main.tg"
 
+# Full compiler driver source and its materialization output. driver.tg is the
+# full CLI (fmt/lint/test/bench/doc/agent/...); it is intentionally NOT in the
+# kernel manifest, so after stage3 validates this source is compiled with
+# stage3 into TG_FULL and published with the stage artifacts.
+DRIVER_FULL_SRC="tg_compiler/driver.tg"
+TG_FULL="$BUILD_DIR/tg"
+
 # ———————————————————————————————————————————————————————————————
 # Argument parsing
 # ———————————————————————————————————————————————————————————————
@@ -165,6 +186,15 @@ Stage 0 (the OCaml seed):
   OCaml-seed completeness gate), which drives the same closure through
   tg_bootstrap_gate. While the seed's typecheck debt is nonzero the
   delegation exits nonzero and prints exactly what remains.
+
+Full compiler materialization:
+  After stage3 validates, the harness compiles the full driver with stage3:
+    build/tg_stage3 compile --strict-resolution tg_compiler/driver.tg \
+      -o build/tg --target <host>
+  build/tg is the full CLI (fmt/lint/test/bench/doc/agent/...) that the
+  tg-consuming CI jobs invoke; the ladder stages carry only the kernel entry
+  (compile/check). The materialized build/tg is validated like every stage and
+  published together with build/tg_stage{1,2,3}.
 
 Release gate:
   With trace active (the CI configuration) the phase-equality gate is the
@@ -327,6 +357,39 @@ if ! validate_stage tg_stage3 "$STAGE3"; then
   exit 1
 fi
 
+# ── materialize: stage3 compiles the FULL driver (tg_compiler/driver.tg) into
+# build/tg. The ladder stages carry only the KERNEL entry (bootstrap_main.tg:
+# the compile/check commands); the full driver is intentionally NOT a member
+# of the kernel manifest, so the full CLI the tg-consuming CI jobs invoke
+# (fmt/lint/test/bench/doc/agent/...) is produced here from the validated
+# stage3 with the same CLI shape the self-host stages use:
+#   build/tg_stage3 compile --strict-resolution tg_compiler/driver.tg \
+#     -o build/tg --target <host>
+# CLOSURE SCOPE: the manifest-closed gate is keyed on the kernel entry
+# (compiler_core.tg is_kernel_entry_path — bootstrap_main.tg), so the ladder
+# builds above stay strictly manifest-closed while this tooling root loads
+# its imports from the repo via the canonical loader. No flag is required:
+# driver.tg is the sanctioned out-of-manifest tooling root by design.
+# The materialized build/tg is validated like every stage and published with
+# the stage artifacts (the CI artifact set carries build/tg, and the
+# tg-consuming jobs keep it instead of re-copying the kernel stage3).
+bh_log "== Full compiler materialization: $DRIVER_FULL_SRC via stage3 =="
+if ! run_logged materialize_full \
+     "$STAGE3" compile --strict-resolution "$DRIVER_FULL_SRC" -o "$TG_FULL" --target "$TARGET_TRIPLE"; then
+  bh_err "full compiler materialization failed (stage3 could not compile $DRIVER_FULL_SRC)"
+  exit 1
+fi
+chmod +x "$TG_FULL"
+if [ ! -x "$TG_FULL" ]; then
+  bh_err "full compiler not produced: $TG_FULL"
+  exit 1
+fi
+if ! validate_stage tg "$TG_FULL" "$DRIVER_FULL_SRC"; then
+  bh_err "materialized full compiler failed validation"
+  exit 1
+fi
+bh_log "full compiler ready: $TG_FULL (published with the stage artifacts)"
+
 # Critical canaries under stage1: prove stage1's runtime can compile the
 # compiler before spending a full self-host cycle.
 if [ "$RUN_NATIVE_TESTS" = "1" ]; then
@@ -427,6 +490,7 @@ bh_log "stage0:  $STAGE0_BIN (OCaml seed)"
 bh_log "stage1:  $STAGE1"
 bh_log "stage2:  $STAGE2"
 bh_log "stage3:  $STAGE3"
+bh_log "tg:      $TG_FULL (full compiler materialized from $DRIVER_FULL_SRC via stage3)"
 bh_log "logs:    $BOOT_LOG_DIR"
 bh_log "bootstrap OK"
 

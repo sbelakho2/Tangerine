@@ -45,10 +45,12 @@ JOB_RESULTS="$SCRATCH/job_results.json"
 TESTED_SHA="0123456789abcdef0123456789abcdef01234567"
 
 # The workflow run identity the writer records (the schema requires it).
-export GITHUB_WORKFLOW="CI"
-export GITHUB_JOB="status"
-export GITHUB_RUN_ID="4242"
-export GITHUB_RUN_ATTEMPT="1"
+# Woodpecker (CI_*) — the release evidence writer reads those first and
+# falls back to the GitHub Actions GITHUB_* names.
+export CI_WORKFLOW_NAME="status"
+export CI_STEP_NAME="status"
+export CI_PIPELINE_NUMBER="4242"
+export CI_PIPELINE_RERUNS="0"
 
 make_valid_dir() { # make_valid_dir <dir> ; builds the COMPLETE artifact set
   local d="$1"

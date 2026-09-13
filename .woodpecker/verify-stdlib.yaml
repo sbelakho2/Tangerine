@@ -1,0 +1,241 @@
+# .woodpecker/verify-stdlib.yaml — stdlib integration lanes.
+#
+# Migrated from GitHub Actions jobs (each is a STEP named after the job):
+#   stdlib-integration (net/db/tls/sync/async + native shims),
+#   db-integration-postgres (native Homebrew postgresql@16),
+#   db-integration-mysql (native Homebrew mysql + mysql shim),
+#   stdlib-new-modules (integrity gates + module smoke suites).
+#
+# Darwin/arm64 local-backend agent: the lanes execute the macOS/aarch64
+# stage3 `tg` binary and preload Mach-O dylibs (DYLD_INSERT_LIBRARIES).
+# Host requirements: Homebrew (openssl@3, libpq, postgresql@16, mysql).
+# The two DB servers use fixed ports (5432/3306); the workflow is
+# serialized with `concurrency: 1` so two pipelines never race them.
+
+labels:
+  platform: darwin/arm64
+  backend: local
+
+concurrency: 1
+
+when:
+  - event: push
+    branch: [main, dev]
+  - event: pull_request
+    branch: [main, "release/**"]
+
+steps:
+  - name: restore-stage3
+    image: bash
+    environment: &tg_s3_env
+      AWS_ACCESS_KEY_ID:
+        from_secret: s3_access_key
+      AWS_SECRET_ACCESS_KEY:
+        from_secret: s3_secret_key
+      AWS_DEFAULT_REGION: us-east-1
+      TG_S3_BUCKET: tangerine-ci
+      TG_S3_ENDPOINT: http://127.0.0.1:9000
+    commands:
+      - mkdir -p build
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/tg-stages-macos-arm64" build/ --no-progress
+
+  - name: materialize-tg
+    image: bash
+    depends_on: [restore-stage3]
+    commands:
+      - |
+        set -euo pipefail
+        if [ -f build/tg ]; then
+          chmod +x build/tg
+        else
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
+        fi
+
+  - name: prepare-host
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - |
+        set -euo pipefail
+        brew install openssl@3 libpq postgresql@16 mysql
+        echo "openssl: $(brew --prefix openssl@3)"
+        echo "libpq:   $(brew --prefix libpq)/lib/libpq.dylib"
+        echo "mysql:   $(brew --prefix mysql)/lib/libmysqlclient.dylib"
+
+  - name: stdlib-integration
+    image: bash
+    depends_on: [prepare-host]
+    commands:
+      - |
+        set -euo pipefail
+        mkdir -p build
+        if [ -d "$(brew --prefix openssl@3 2>/dev/null || true)/include/openssl" ]; then
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+          cc -fPIC -shared -o build/libtg_tls_shims.dylib native/tls_shims.c \
+            -I"$OPENSSL_PREFIX/include" -L"$OPENSSL_PREFIX/lib" -lssl -lcrypto
+        else
+          cc -fPIC -shared -o build/libtg_tls_shims.dylib native/tls_shims.c -lssl -lcrypto
+        fi
+        for sym in \
+          tls_ssl_new tls_ssl_free tls_ssl_set_min_version tls_ssl_set_max_version \
+          tls_ssl_set_hostname tls_ssl_set_certificate tls_ssl_set_private_key \
+          tls_ssl_set_verify tls_ssl_connect tls_ssl_accept tls_ssl_read \
+          tls_ssl_write tls_ssl_shutdown \
+          tls_ssl_set_default_verify_paths tls_ssl_add_ca_cert \
+          tls_ssl_set_alpn_protos tls_ssl_set_alpn_select tls_ssl_get_alpn \
+          tls_ssl_set_cipher_list tls_ssl_set_cipher_suites \
+          tls_x509_from_pem tls_x509_free tls_x509_to_der \
+          tls_x509_get_subject_cn tls_x509_is_expired \
+          tls_pkey_from_pem tls_pkey_free tls_pkey_to_der tls_load_file; do
+          nm -gU build/libtg_tls_shims.dylib | grep -q " _$sym$" \
+            || { echo "error: TLS shim missing export: $sym"; exit 1; }
+        done
+        echo "✓ libtg_tls_shims.dylib built with all 29 std::tls extern exports"
+      - |
+        set -euo pipefail
+        cc -fPIC -shared -o build/libtg_epoll_shims.dylib native/epoll_shims.c
+        for sym in tg_epoll_create1 tg_epoll_ctl tg_epoll_wait tg_errno_is_eagain; do
+          nm -gU build/libtg_epoll_shims.dylib | grep -q " _$sym$" \
+            || { echo "error: epoll shim missing export: $sym"; exit 1; }
+        done
+        echo "✓ libtg_epoll_shims.dylib built with all 4 std::async epoll exports"
+      - |
+        set -euo pipefail
+        ./build/tg test tests/net_loopback_test.tg tests/net_negative_abi_test.tg tests/db_integration_test.tg tests/db_lifecycle_test.tg tests/db_async_pool_test.tg tests/db_postgres_lexer_test.tg tests/sync_contention_test.tg tests/task_scope_test.tg tests/cancellation_token_test.tg tests/reactor_readiness_test.tg
+        echo "✓ Net loopback / negative-return ABI / db / sync / task-scope / cancellation-token / reactor-readiness integration suites passed"
+      - |
+        set -euo pipefail
+        DYLD_INSERT_LIBRARIES="$PWD/build/libtg_tls_shims.dylib" \
+        DYLD_FORCE_FLAT_NAMESPACE=1 \
+          ./build/tg test tests/tls_interop_test.tg tests/tls_handshake_test.tg
+        echo "✓ TLS interop + handshake suites passed"
+
+  - name: db-integration-postgres
+    image: bash
+    depends_on: [prepare-host]
+    commands:
+      - |
+        set -euo pipefail
+        PGBIN="$(brew --prefix postgresql@16)/bin"
+        PGDATA="$PWD/build/.pgdata"
+        rm -rf "$PGDATA"
+        "$PGBIN/initdb" -D "$PGDATA" -U postgres --auth=trust >/dev/null
+        "$PGBIN/pg_ctl" -D "$PGDATA" -l "$PWD/build/postgres.log" -o "-p 5432" start
+        for _ in $(seq 1 30); do
+          if "$PGBIN/pg_isready" -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1; then
+            break
+          fi
+          sleep 1
+        done
+        "$PGBIN/pg_isready" -h 127.0.0.1 -p 5432 -U postgres
+      - |
+        set -euo pipefail
+        DYLD_INSERT_LIBRARIES="$(brew --prefix libpq)/lib/libpq.dylib:$(brew --prefix openssl@3)/lib/libssl.3.dylib:$(brew --prefix openssl@3)/lib/libcrypto.3.dylib" \
+        DYLD_FORCE_FLAT_NAMESPACE=1 \
+          ./build/tg test tests/db_postgres_integration_test.tg
+        echo "✓ DB Postgres lane passed (native Homebrew server)"
+
+  - name: stop-postgres
+    image: bash
+    depends_on: [db-integration-postgres]
+    when:
+      - event: [push, pull_request]
+        status: [success, failure]
+    commands:
+      - '"$(brew --prefix postgresql@16)/bin/pg_ctl" -D "$PWD/build/.pgdata" stop -m fast || true'
+
+  - name: db-integration-mysql
+    image: bash
+    depends_on: [prepare-host]
+    commands:
+      - |
+        set -euo pipefail
+        MYSQL_BIN="$(brew --prefix mysql)/bin"
+        MYSQL_DATADIR="$PWD/build/.mysql-data"
+        rm -rf "$MYSQL_DATADIR"
+        mkdir -p "$MYSQL_DATADIR"
+        "$MYSQL_BIN/mysqld" --initialize-insecure --datadir="$MYSQL_DATADIR" --log-error="$PWD/build/mysql-init.log"
+        "$MYSQL_BIN/mysqld" --daemonize --datadir="$MYSQL_DATADIR" --port=3306 \
+          --socket="$PWD/build/mysql.sock" --log-error="$PWD/build/mysql.log"
+        for _ in $(seq 1 30); do
+          if "$MYSQL_BIN/mysqladmin" ping -h 127.0.0.1 -uroot >/dev/null 2>&1; then
+            break
+          fi
+          sleep 1
+        done
+        "$MYSQL_BIN/mysqladmin" ping -h 127.0.0.1 -uroot
+        "$MYSQL_BIN/mysql" -h 127.0.0.1 -uroot -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'root'; CREATE DATABASE IF NOT EXISTS test;"
+      - |
+        set -euo pipefail
+        mkdir -p build
+        MYSQL_PREFIX="$(brew --prefix mysql)"
+        cc -fPIC -shared -o build/libtg_mysql_shims.dylib native/mysql_shims.c \
+          -I"$MYSQL_PREFIX/include/mysql" -L"$MYSQL_PREFIX/lib" -lmysqlclient
+        for sym in tg_mysql_stmt_bind_and_execute tg_mysql_stmt_bind_result \
+                   tg_mysql_stmt_fetch_column tg_mysql_layout_probe; do
+          nm -gU build/libtg_mysql_shims.dylib | grep -q " _$sym$" \
+            || { echo "error: MySQL shim missing export: $sym"; exit 1; }
+        done
+        echo "✓ libtg_mysql_shims.dylib built with all 4 std::db tg_mysql_* extern exports"
+      - |
+        set -euo pipefail
+        DYLD_INSERT_LIBRARIES="$PWD/build/libtg_mysql_shims.dylib:$(brew --prefix mysql)/lib/libmysqlclient.dylib:$(brew --prefix openssl@3)/lib/libssl.3.dylib:$(brew --prefix openssl@3)/lib/libcrypto.3.dylib" \
+        DYLD_FORCE_FLAT_NAMESPACE=1 \
+          ./build/tg test tests/db_mysql_integration_test.tg tests/db_mysql_layout_probe_test.tg tests/db_mysql_large_result_test.tg
+        echo "✓ DB MySQL lane passed (shim + native Homebrew server)"
+
+  - name: stop-mysql
+    image: bash
+    depends_on: [db-integration-mysql]
+    when:
+      - event: [push, pull_request]
+        status: [success, failure]
+    commands:
+      - '"$(brew --prefix mysql)/bin/mysqladmin" shutdown -h 127.0.0.1 -uroot -proot || true'
+
+  - name: stdlib-new-modules
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - bash tests/run_test_runner_integrity.sh ./build/tg
+      - bash tests/run_bench_runner_integrity.sh ./build/tg
+      - |
+        set -euo pipefail
+        mkdir -p build/.stdlib_verify
+        for m in simd embedded mmap gpu; do
+          echo "=== std/$m.tg ==="
+          ./build/tg check "std/$m.tg"
+          ./build/tg compile -c -o "build/.stdlib_verify/std_${m}.o" "std/$m.tg"
+          printf 'use std::%s\n\ndef main() -> Int\n  0\nend\n' "$m" > "build/.stdlib_verify/std_${m}_smoke.tg"
+          ./build/tg compile -o "build/.stdlib_verify/std_${m}_smoke" "build/.stdlib_verify/std_${m}_smoke.tg"
+          ./build/.stdlib_verify/std_${m}_smoke
+        done
+        echo "✓ simd/embedded/mmap/gpu: check + object + link/import smoke passed"
+      - |
+        set -euo pipefail
+        mkdir -p build/.stdlib_verify
+        for m in linalg float_control validation web_ext opentelemetry wasm_js; do
+          echo "=== std/$m.tg ==="
+          ./build/tg check "std/$m.tg"
+          ./build/tg compile -c -o "build/.stdlib_verify/std_${m}.o" "std/$m.tg"
+          printf 'use std::%s\n\ndef main() -> Int\n  0\nend\n' "$m" > "build/.stdlib_verify/std_${m}_smoke.tg"
+          ./build/tg compile -o "build/.stdlib_verify/std_${m}_smoke" "build/.stdlib_verify/std_${m}_smoke.tg"
+          ./build/.stdlib_verify/std_${m}_smoke
+          ./build/tg test "std/$m.tg"
+        done
+        echo "✓ linalg/float_control/validation/web_ext/opentelemetry/wasm_js: check + object + link/import smoke + @test suites passed"
+
+  - name: job-results
+    image: bash
+    depends_on: [stdlib-integration, db-integration-postgres, db-integration-mysql, stdlib-new-modules]
+    commands:
+      - mkdir -p build/.ci_results
+      - for j in stdlib-integration db-integration-postgres db-integration-mysql stdlib-new-modules; do printf 'success\n' > "build/.ci_results/$j"; done
+
+  - name: upload-job-results
+    image: bash
+    depends_on: [job-results]
+    environment: *tg_s3_env
+    commands:
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive build/.ci_results "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/ci-results" --no-progress

@@ -1102,24 +1102,67 @@ run_native_tests() {
 # The gate is SYMBOL-AWARE: every trap instruction (ud2 on x86-64; udf/brk on
 # arm64) is attributed to the function symbol that contains it (the nearest
 # preceding non-local label in the otool -tv disassembly) and is then either
-# ALLOWED (the symbol is in the deliberate abort/panic whitelist) or BANNED.
-# A banned trap — a trap-only implementation or OS-fallback trap in the
-# supported map/set/string/array runtime families, or any trap in user code —
-# fails the gate. A binary whose ONLY traps sit in the whitelisted abort/
-# panic/unreachable machinery passes.
+# ALLOWED (the instruction is the identifiable vec-push sanity trap, or the
+# symbol is in the deliberate abort/OOM whitelist) or BANNED. A banned trap —
+# a trap-only implementation or fabricated-default trap in any runtime family,
+# or any trap in user code — fails the gate.
 #
-# The whitelist (enumerated from the runtime's documented traps):
-#   __intrinsic_abort     "Abort execution with trap" (runtime.tg) — the
-#                         deliberate abort implementation
-#   panic, panic_unwind,  std::core panic/unreachable machinery (std/core.tg):
-#   begin_unwind,         panic entry, the unwind entry that performs the
-#   resume_unwind,        abort, re-panic, unreachable(msg) -> panic(msg),
-#   unreachable, assert   and assert -> panic
-# Allowed exception (arm64 only, independent of the whitelist): the runtime's
-# vec-push sanity trap `brk #0xbeef` (runtime.tg __tg_vec_push) — a
-# deliberate defensive trap for corrupt vec pointers.
+# THE FINAL RULE:
+#   1. `brk #0xbeef` is allowed by IMMEDIATE (arm64 only): the vec-push
+#      sanity trap in _tg_array_push — a deliberate defensive trap for a
+#      corrupt vec pointer (runtime.tg).
+#   2. Every other allowed trap must sit inside one of the symbols listed
+#      below. The list is SYMBOL-SCOPED — no wildcards, no family prefixes —
+#      and every entry is either the abort/panic machinery or a runtime
+#      fatal-abort body:
+#        - the abort machinery: __intrinsic_abort (the deliberate abort),
+#          plus the std::core panic/unreachable machinery (panic /
+#          panic_unwind / begin_unwind / resume_unwind / unreachable /
+#          assert — std/core.tg);
+#        - the runtime's fatal OOM/host-failure aborts, which fail closed
+#          with brk/ud2 instead of fabricating an empty value:
+#            String: _tg_string_new, _tg_string_from_bytes (allocation
+#              failed), _tg_string_reserve / _tg_string_wrap /
+#              _tg_string_slice (reallocation failed), the ASCII case-map
+#              (_tg_string_tolower / _tg_string_toupper) and
+#              _tg_string_replace;
+#            Map: _tg_map_insert_full, _tg_map_remove_full,
+#              _tg_map_remove_key_full, _tg_map_entries;
+#            other: _tg_str_chars (chars buffer), _tg_read_file_to_string,
+#              _tg_bump_alloc (mmap MAP_FAILED).
+#      These traps are RUNTIME-REACHABLE on the supported darwin/linux
+#      targets (allocation/mapping failure), not compile-time fallbacks.
+#   3. `udf` is ALWAYS banned (arm64): the codebase's `unreachable`-style
+#      encoding, never a deliberate runtime abort.
+#   4. Compile-time OS-conditional arms (`match ctx.target.os when _ then
+#      trap`) are deliberately NOT whitelisted — they are absent from the
+#      Mach-O canaries this gate disassembles, so listing them would only
+#      create a future blind spot. Their symbols: __tg_clock_ns,
+#      _tg_array_destroy, _tg_array_grow, _tg_map_new, _tg_map_destroy,
+#      _tg_posix_read, _tg_posix_write, waitpid, clock_gettime. (A trap in
+#      one of those symbols on a SUPPORTED target must fail the gate.)
+#   5. The dead __tg_effect_record trap-only stub was removed from the
+#      runtime (no lowering constructs a non-budget MirEffectRecord); a
+#      non-budget record now fails closed inside the emitting function, so
+#      its trap is user-code-scoped and banned. A reintroduced trap-only
+#      runtime stub therefore fails the gate instead of shipping.
+#
+# RECORDED RESIDUAL (not part of the rule above; the honest state): the
+# compiler ALSO emits panic-class traps INLINE in user functions — the
+# signed-overflow / division-edge MirAsserts, bounds checks, unwrap panics,
+# contract checks and budget-exhaustion checks (the LIR route's synthetic
+# trap block and LirTrap terminator, and the direct emitter's emit_trap /
+# MirAssert / MirAbort arms). Those instructions are attributed to USER
+# symbols and are BANNED by rule 2, so a full-manifest canary run is NOT
+# green yet (the @budget canaries and any canary doing signed arithmetic or
+# indexing trip it). Making the manifest green requires routing those
+# aborts through the whitelisted __intrinsic_abort symbol (a call, not an
+# inline trap), or an explicit policy decision to exempt compiler-inserted
+# panic-class aborts; neither is part of this change.
 # Usage: bh_assert_no_trap_stubs <binary> <triple>
-TRAP_GATE_WHITELIST=" __intrinsic_abort panic panic_unwind begin_unwind resume_unwind unreachable assert "
+TRAP_GATE_WHITELIST=" __intrinsic_abort panic panic_unwind begin_unwind resume_unwind unreachable assert \
+_tg_string_new _tg_string_from_bytes _tg_string_reserve _tg_string_wrap _tg_string_slice _tg_string_tolower _tg_string_toupper _tg_string_replace \
+_tg_map_insert_full _tg_map_remove_full _tg_map_remove_key_full _tg_map_entries _tg_str_chars _tg_read_file_to_string _tg_bump_alloc "
 
 # Symbol-aware trap scan: attribute each trap instruction of a disassembly to
 # the containing function symbol (otool -tv label lines; local labels start
@@ -1209,7 +1252,9 @@ bh_assert_no_trap_stubs() {
 # triple ("target lane"). Native lane: execute directly. Cross lanes: execute
 # under Rosetta (arch -x86_64) or an emulator (qemu-<arch>) when available;
 # when no executor exists the mandatory minimum is the trap-stub gate — the
-# emitted object must contain zero trap stubs. Used by the CI cross lane.
+# emitted object must contain zero BANNED trap stubs (only the documented
+# abort/OOM symbols of TRAP_GATE_WHITELIST may trap). Used by the CI cross
+# lane.
 #
 # Usage: run_target_lane_canaries <compiler> <outdir> [triple|arch-alias]
 #   triple omitted            -> bh_boot_target (native lane)
@@ -1402,26 +1447,29 @@ check_two_clean_dirs() {
     return 1
   fi
 
-  # NEGATIVE self-host manifest gate: the same self-host compile WITHOUT
-  # bootstrap/compiler_kernel.manifest must FAIL. Self-host mode
-  # (include_compiler_lib=true — the driver path) is manifest-closed: there
-  # is NO prelude_files() fallback, so the compile must die with the manifest
-  # error instead of silently compiling a different dependency closure.
+  # NEGATIVE manifest-closure gate: the KERNEL-ENTRY self-host compile
+  # (bootstrap_main.tg) WITHOUT bootstrap/compiler_kernel.manifest must FAIL.
+  # The manifest-closed self-host mode is keyed on the kernel-entry ROOT
+  # (compiler_core.tg is_kernel_entry_path): there is NO prelude_files()
+  # fallback there, so the compile must die with the manifest error instead
+  # of silently compiling a different dependency closure. driver.tg is NOT
+  # the right probe any more: the full tooling driver is intentionally
+  # out-of-manifest and loads its imports from the repo (repo-closure build).
   local dir_c="$outdir/determinism/C"
   rm -rf "$dir_c"
   mkdir -p "$dir_c/tg_compiler"
-  cp "$repo/tg_compiler/driver.tg" "$dir_c/tg_compiler/driver.tg"
-  bh_log "$stage determinism: negative self-host manifest gate (root=$dir_c, no bootstrap/compiler_kernel.manifest)"
+  cp "$repo/tg_compiler/bootstrap_main.tg" "$dir_c/tg_compiler/bootstrap_main.tg"
+  bh_log "$stage determinism: negative kernel-entry manifest gate (root=$dir_c, no bootstrap/compiler_kernel.manifest)"
   local manifest_gate_out
-  if manifest_gate_out="$( cd "$dir_c" && "$compiler" compile --strict-resolution tg_compiler/driver.tg -o "$outdir/${stage}_c" --target "$(bh_boot_target)" 2>&1 )"; then
-    bh_err "$stage determinism: self-host compile WITHOUT bootstrap/compiler_kernel.manifest SUCCEEDED — the self-host path (include_compiler_lib=true) must fail without the manifest (no prelude_files fallback in self-host mode)"
+  if manifest_gate_out="$( cd "$dir_c" && "$compiler" compile --strict-resolution tg_compiler/bootstrap_main.tg -o "$outdir/${stage}_c" --target "$(bh_boot_target)" 2>&1 )"; then
+    bh_err "$stage determinism: kernel-entry compile WITHOUT bootstrap/compiler_kernel.manifest SUCCEEDED — the manifest-closed path (is_kernel_entry_path -> include_compiler_lib) must fail without the manifest (no prelude_files fallback in manifest-closed mode)"
     return 1
   fi
   if ! printf '%s' "$manifest_gate_out" | grep -q "compiler_kernel.manifest"; then
-    bh_err "$stage determinism: self-host compile without the manifest failed for the WRONG reason (expected the compiler_kernel.manifest gate): $manifest_gate_out"
+    bh_err "$stage determinism: kernel-entry compile without the manifest failed for the WRONG reason (expected the compiler_kernel.manifest gate): $manifest_gate_out"
     return 1
   fi
-  bh_log "$stage determinism: self-host manifest gate OK (compile without the manifest failed with the manifest error)"
+  bh_log "$stage determinism: kernel-entry manifest gate OK (compile without the manifest failed with the manifest error)"
 
   bh_log "$stage determinism OK (byte-identical across two clean trees)"
   return 0

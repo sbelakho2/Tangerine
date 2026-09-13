@@ -1738,6 +1738,319 @@ let check_nested_set_ownership () =
        pass
          "nested Vec[Vec[Owned]]: set(1, [R4]) drops the displaced inner vec's R3 exactly once; the retained inner vec ([R1,R2]) and the sink [R4] stay owned")
 
+(* ── (h) the unwind pair (__intrinsic_try_invoke / __intrinsic_longjmp) ──
+
+   std/core.tg's experimental protocol: try_invoke[T](f: fn() -> T) runs
+   the guest function and yields Option[T] — Some(value) on a normal
+   return, None when the callee traps or unwinds.  The trap text travels
+   through the guest's own `_current_panic` payload static (the channel
+   catch_unwind reads after None); a __intrinsic_longjmp is delivered to
+   the INNERMOST active try_invoke (begin_unwind always selects the top
+   catch frame) and never clobbers a payload begin_unwind already stored;
+   a longjmp with no active handler stays the precise deterministic host
+   error. *)
+
+let unwind_intrinsic (name : string) : Seed_mir.callee =
+  collection_intrinsic name
+
+let panic_static_ty = Type_repr.Named (Ids.Type_id.make 9001, [||])
+
+let constant_fn (name : string) (inst : Instance_id.t) (value : int) : Seed_mir.function_ =
+  {
+    Seed_mir.name;
+    instance = inst;
+    params = [||];
+    locals = [| i64 |];
+    blocks =
+      [|
+        { id = 0;
+          statements =
+            [ Seed_mir.Assign (local 0, Seed_mir.Use (int_op value)) ];
+          terminator = Seed_mir.Ret };
+      |];
+    entry = 0;
+  }
+
+let div_zero_fn (name : string) (inst : Instance_id.t) : Seed_mir.function_ =
+  {
+    Seed_mir.name;
+    instance = inst;
+    params = [||];
+    locals = [| i64 |];
+    blocks =
+      [|
+        { id = 0;
+          statements =
+            [
+              Seed_mir.Assign
+                ( local 0,
+                  Seed_mir.BinaryOp (Seed_mir.Div, int_op 1, int_op 0) );
+            ];
+          terminator = Seed_mir.Ret };
+      |];
+    entry = 0;
+  }
+
+let longjmp_fn (name : string) (inst : Instance_id.t) : Seed_mir.function_ =
+  {
+    Seed_mir.name;
+    instance = inst;
+    params = [||];
+    locals = [| Type_repr.Unit |];
+    blocks =
+      [|
+        { id = 0;
+          statements = [];
+          terminator =
+            Seed_mir.Call
+              ( local 0,
+                unwind_intrinsic "__intrinsic_longjmp",
+                [|
+                  { Seed_mir.effect_ = Access_effect.Read;
+                    value = Seed_mir.Constant (int_value 0L) };
+                |],
+                1,
+                None ) };
+        { id = 1; statements = []; terminator = Seed_mir.Ret };
+      |];
+    entry = 0;
+  }
+
+(* A function that itself calls try_invoke(longjmp_fn): the inner handler
+   must catch the unwind, so the outer try_invoke sees a normal return. *)
+let nested_handler_fn (name : string) (inst : Instance_id.t)
+    (inner : Instance_id.t) : Seed_mir.function_ =
+  {
+    Seed_mir.name;
+    instance = inst;
+    params = [||];
+    locals = [| Type_repr.Unit; Type_repr.Function ([||], Type_repr.Unit); i64 |];
+    blocks =
+      [|
+        { id = 0;
+          statements =
+            [
+              Seed_mir.Assign
+                ( local 1,
+                  Seed_mir.Use (Seed_mir.Constant (Seed_mir.Function inner)) );
+            ];
+          terminator =
+            Seed_mir.Call
+              ( local 2,
+                unwind_intrinsic "__intrinsic_try_invoke",
+                [| read_arg 1 |],
+                1,
+                None ) };
+        { id = 1; statements = []; terminator = Seed_mir.Ret };
+      |];
+    entry = 0;
+  }
+
+let unwind_prog (payload_init : Seed_mir.constant option)
+    (extra_fns : Seed_mir.function_ array) (main_locals : Type_repr.t array)
+    (main_blocks : Seed_mir.block array) : Seed_mir.program =
+  {
+    Seed_mir.functions =
+      Array.append
+        [|
+          { Seed_mir.name = "main";
+            instance = instance 0;
+            params = [||];
+            locals = main_locals;
+            blocks = main_blocks;
+            entry = 0 };
+        |]
+        extra_fns;
+    statics = [| ("std::core::_current_panic", panic_static_ty, true, payload_init) |];
+    types = [||];
+  }
+
+(* main: _1 = f; _2 = __intrinsic_try_invoke(_1) *)
+let try_invoke_main (f : Instance_id.t) : Seed_mir.block array =
+  [|
+    { id = 0;
+      statements =
+        [
+          Seed_mir.Assign
+            (local 1, Seed_mir.Use (Seed_mir.Constant (Seed_mir.Function f)));
+        ];
+      terminator =
+        Seed_mir.Call
+          ( local 2,
+            unwind_intrinsic "__intrinsic_try_invoke",
+            [| read_arg 1 |],
+            1,
+            None ) };
+    { id = 1; statements = []; terminator = Seed_mir.Ret };
+  |]
+
+let is_option_none (v : Vm_value.t) : bool =
+  match v with Vm_value.Enum (1, a) -> Array.length a = 0 | _ -> false
+
+let option_some (v : Vm_value.t) : Vm_value.t option =
+  match v with Vm_value.Enum (0, [| x |]) -> Some x | _ -> None
+
+let payload_text (v : Vm_value.slot) : string option =
+  match v with
+  | Vm_value.Live (Vm_value.Enum (0, [| Vm_value.Enum (0, [| Vm_value.String s |]) |]))
+    ->
+      Some s
+  | _ -> None
+
+let check_unwind_pair () =
+  let main_locals = [| Type_repr.Unit; Type_repr.Function ([||], i64); i64 |] in
+  (* (1) normal return -> Option::Some(7) *)
+  (match
+     seeded_run
+       (unwind_prog None [| constant_fn "ok" (instance 1) 7 |] main_locals
+          (try_invoke_main (instance 1)))
+       (fun _ _ _ -> ())
+       0
+   with
+   | Setup_error m -> fail "try_invoke success: entry setup: %s" m
+   | Ran_error (m, _) -> fail "try_invoke success: unexpected trap: %s" m
+   | Ran_ok run -> (
+       match run.sframe.locals.(2) with
+       | Vm_value.Live v when option_some v = Some (int64_value 7L) ->
+           pass
+             "try_invoke(fn returning 7) -> Option::Some(7) through the VM invocation channel"
+       | other -> fail "try_invoke success: wrong result shape %s" (Vm_value.slot_state other)));
+  (* (2) guest trap -> Option::None with the trap text in _current_panic *)
+  (match
+     seeded_run
+       (unwind_prog None [| div_zero_fn "trap" (instance 1) |] main_locals
+          (try_invoke_main (instance 1)))
+       (fun _ _ _ -> ())
+       0
+   with
+   | Setup_error m -> fail "try_invoke trap: entry setup: %s" m
+   | Ran_error (m, _) -> fail "try_invoke trap: the trap escaped the handler: %s" m
+   | Ran_ok run ->
+       (match run.sframe.locals.(2) with
+       | Vm_value.Live v when is_option_none v ->
+           pass "try_invoke(fn dividing by zero) -> Option::None (the trap is caught)"
+       | other ->
+           fail "try_invoke trap: expected Option::None, got %s" (Vm_value.slot_state other));
+       (match payload_text run.sframe.statics.(0) with
+       | Some msg when contains msg "division by zero" ->
+           pass
+             "try_invoke trap: the trapped text is recorded in the guest's _current_panic payload (contains \"division by zero\")"
+       | Some msg ->
+           fail "try_invoke trap: _current_panic carries the wrong text: %s" msg
+       | None ->
+           fail "try_invoke trap: _current_panic was not populated (slot %s)"
+             (Vm_value.slot_state run.sframe.statics.(0))));
+  (* (3) guest unwind -> Option::None, and an already-stored payload is
+     preserved (begin_unwind wrote it before longjmping).  The preset is
+     the VM's materialization of the Option::Some enum constant — a
+     distinguishable shape that the trap path would overwrite. *)
+  let preset = Some (Seed_mir.Enum (Ids.Variant_index.make 0, panic_static_ty)) in
+  (match
+     seeded_run
+       (unwind_prog preset [| longjmp_fn "unwind" (instance 1) |] main_locals
+          (try_invoke_main (instance 1)))
+       (fun _ _ _ -> ())
+       0
+   with
+   | Setup_error m -> fail "try_invoke unwind: entry setup: %s" m
+   | Ran_error (m, _) -> fail "try_invoke unwind: the unwind escaped the handler: %s" m
+   | Ran_ok run ->
+       (match run.sframe.locals.(2) with
+       | Vm_value.Live v when is_option_none v ->
+           pass
+             "__intrinsic_longjmp inside the invoked function -> Option::None at the active try_invoke"
+       | other ->
+           fail "try_invoke unwind: expected Option::None, got %s"
+             (Vm_value.slot_state other));
+       (match run.sframe.statics.(0) with
+       | Vm_value.Live (Vm_value.Enum (0, a)) when Array.length a = 0 ->
+           pass
+             "try_invoke unwind: the payload already stored in _current_panic is not clobbered by the delivery"
+       | other ->
+           fail "try_invoke unwind: _current_panic changed: %s" (Vm_value.slot_state other)));
+  (* (4) nesting: the INNERMOST handler catches the longjmp; the outer
+     try_invoke sees a normal return *)
+  (match
+     seeded_run
+       (unwind_prog None
+          [| longjmp_fn "unwind" (instance 1);
+             nested_handler_fn "outer" (instance 2) (instance 1) |]
+          main_locals
+          (try_invoke_main (instance 2)))
+       (fun _ _ _ -> ())
+       0
+   with
+   | Setup_error m -> fail "try_invoke nesting: entry setup: %s" m
+   | Ran_error (m, _) -> fail "try_invoke nesting: unexpected trap: %s" m
+   | Ran_ok run -> (
+       match run.sframe.locals.(2) with
+       | Vm_value.Live v when option_some v = Some Vm_value.Unit ->
+           pass
+             "a nested longjmp is delivered to the innermost try_invoke; the outer invocation returns Some(())"
+       | other ->
+           fail "try_invoke nesting: wrong outer result shape %s" (Vm_value.slot_state other)));
+  (* (5) longjmp with no active handler stays a precise deterministic trap *)
+  let no_handler_main : Seed_mir.block array =
+    [|
+      { id = 0;
+        statements = [];
+        terminator =
+          Seed_mir.Call
+            ( local 0,
+              unwind_intrinsic "__intrinsic_longjmp",
+              [|
+                { Seed_mir.effect_ = Access_effect.Read;
+                  value = Seed_mir.Constant (int_value 0L) };
+              |],
+              1,
+              None ) };
+      { id = 1; statements = []; terminator = Seed_mir.Ret };
+    |]
+  in
+  (match
+     seeded_run
+       (unwind_prog None [||] [| Type_repr.Unit |] no_handler_main)
+       (fun _ _ _ -> ())
+       0
+   with
+   | Setup_error m -> fail "longjmp without handler: entry setup: %s" m
+   | Ran_ok _ -> fail "longjmp without handler: the run returned instead of trapping"
+   | Ran_error (m, _) ->
+       if contains m "no active try frame" then
+         pass
+           "longjmp with no active try_invoke stays the precise deterministic host error"
+       else fail "longjmp without handler: wrong trap text: %s" m);
+  (* (6) a non-function argument fails closed instead of fabricating a value *)
+  let non_fn_main : Seed_mir.block array =
+    [|
+      { id = 0;
+        statements = [];
+        terminator =
+          Seed_mir.Call
+            ( local 2,
+              unwind_intrinsic "__intrinsic_try_invoke",
+              [|
+                { Seed_mir.effect_ = Access_effect.Read;
+                  value = Seed_mir.Constant (int_value 5L) };
+              |],
+              1,
+              None ) };
+      { id = 1; statements = []; terminator = Seed_mir.Ret };
+    |]
+  in
+  match
+    seeded_run
+      (unwind_prog None [||] main_locals non_fn_main)
+      (fun _ _ _ -> ())
+      0
+  with
+  | Setup_error m -> fail "try_invoke non-function: entry setup: %s" m
+  | Ran_ok _ -> fail "try_invoke non-function: returned instead of trapping"
+  | Ran_error (m, _) ->
+      if contains m "not a function value" then
+        pass "try_invoke rejects a non-function argument (deterministic VM trap)"
+      else fail "try_invoke non-function: wrong trap text: %s" m
+
 let () =
   Printf.printf "Seed VM kernel-closure primitive self-check\n";
   check_dyn_index ();
@@ -1754,6 +2067,7 @@ let () =
   check_set_remove_ownership ();
   check_map_insert_ownership ();
   check_nested_set_ownership ();
+  check_unwind_pair ();
   if !failures = 0 then begin
     Printf.printf "ALL PASS\n";
     exit 0

@@ -19,7 +19,7 @@ The generator verifies each row's evidence before it renders:
   **suite manifest** (`tests/canary/MANIFEST`, `tests/canary_neg/MANIFEST`,
   `tests/arm64/MANIFEST`) must contain the listed file — a listed artifact
   that does not exist fails the generation;
-- every named **CI gate** must be a job in `.github/workflows/ci.yml`;
+- every named **CI gate** must be a Woodpecker step in a `.woodpecker/*.yaml` workflow;
 - `implemented` derives to **implemented + test-covered** (committed test
   artifacts exist) or **implemented + unverified** (no committed test
   artifact), never to run-verified.

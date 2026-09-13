@@ -1,0 +1,337 @@
+# .woodpecker/linux-native.yaml — Native Linux x86-64 self-host evidence.
+#
+# Migrated from GitHub Actions job `linux-x86-64-native` (ubuntu-22.04):
+#   (a) the stage0 OCaml seed is built NATIVELY on Linux,
+#   (b) the ladder runs natively (stage0 -> stage1 -> stage2 -> stage3,
+#       x86_64-unknown-linux-gnu, ELF64 + --version + cmp fixed point),
+#   (c) the native canary manifest, the trap-stub gate (objdump), and the
+#       epoll/pthread/net/DB/TLS suites run against the Linux stage3.
+# RUNTIME ONLY — this lane uses Linux containers exclusively.
+#
+# NOTE: the Linux stage3 exists only in this lane; the release-evidence
+# schema therefore records this step's `success` conclusion (see
+# scripts/release_evidence_schema.sh) and the status workflow waits for
+# it. It is deliberately NOT a member of the release gate
+# (.woodpecker/release_required_jobs.txt) — evidence, not a merge gate.
+#
+# Agent: linux/amd64 Docker backend. Image: pinned ocaml/opam with the
+# OCaml 5.4 family; the step creates the EXACT 5.4.0 switch and installs
+# the pinned dune 3.21.1, satisfying bootstrap/ocaml-toolchain.lock.
+
+labels:
+  platform: linux/amd64
+  backend: docker
+
+concurrency: 1
+
+when:
+  - event: push
+    branch: [main, dev]
+  - event: pull_request
+    branch: [main, "release/**"]
+
+steps:
+  - name: cache-restore
+    image: amazon/aws-cli:2.36.44
+    entrypoint: ["/bin/bash", "-c"]
+    failure: ignore
+    environment: &tg_s3_env
+      AWS_ACCESS_KEY_ID:
+        from_secret: s3_access_key
+      AWS_SECRET_ACCESS_KEY:
+        from_secret: s3_secret_key
+      AWS_DEFAULT_REGION: us-east-1
+      TG_S3_BUCKET: tangerine-ci
+      TG_S3_ENDPOINT: http://127.0.0.1:9000
+    commands:
+      - LOCK_SHA="$(sha256sum bootstrap/ocaml-toolchain.lock | cut -d' ' -f1)"
+      - aws configure set default.s3.addressing_style path
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp "s3://$TG_S3_BUCKET/$CI_REPO/cache/linux-opam-$LOCK_SHA.tar.gz" /tmp/linux-opam-cache.tar.gz --no-progress || true
+      - tar -xzf /tmp/linux-opam-cache.tar.gz -C "$HOME" 2>/dev/null || true
+
+  - name: prepare
+    image: ocaml/opam:debian-12-ocaml-5.4
+    depends_on: [cache-restore]
+    entrypoint: ["/bin/bash", "-c"]
+    commands:
+      - |
+        set -euo pipefail
+        SUDO=""
+        command -v sudo >/dev/null 2>&1 && SUDO=sudo
+        $SUDO apt-get update -qq
+        $SUDO apt-get install -y -qq build-essential binutils libssl-dev libsqlite3-0 ca-certificates curl
+        gcc --version | head -1
+        objdump --version | head -1
+
+  - name: bootstrap-kernel-manifest
+    image: ocaml/opam:debian-12-ocaml-5.4
+    depends_on: [prepare]
+    entrypoint: ["/bin/bash", "-c"]
+    commands:
+      - bash ./scripts/gen_bootstrap_input.sh --write
+      - echo "✓ bootstrap kernel manifest closure valid (imports closed, entry roots listed)"
+
+  - name: linux-x86-64-native
+    image: ocaml/opam:debian-12-ocaml-5.4
+    depends_on: [bootstrap-kernel-manifest]
+    entrypoint: ["/bin/bash", "-c"]
+    environment:
+      TG_BOOTSTRAP_TARGET: x86_64-unknown-linux-gnu
+      TG_TARGET: x86_64-unknown-linux-gnu
+    commands:
+      - |
+        set -euo pipefail
+        eval "$(opam env 2>/dev/null || true)"
+        if ! opam switch list --short 2>/dev/null | grep -qx "5.4.0"; then
+          opam switch create 5.4.0 ocaml-base-compiler.5.4.0 -y
+        fi
+        eval "$(opam env --switch=5.4.0 --set-switch)"
+        opam install -y dune.3.21.1
+        scripts/check_ocaml_toolchain.sh
+        bash ./run_bootstrap.sh
+
+  - name: linux-fingerprints
+    image: ocaml/opam:debian-12-ocaml-5.4
+    depends_on: [linux-x86-64-native]
+    entrypoint: ["/bin/bash", "-c"]
+    commands:
+      - |
+        set -euo pipefail
+        mkdir -p build/.linux_fingerprints
+        for s in 1 2 3; do
+          printf 'FINGERPRINT tg_stage%s link-image %s\n' "$s" "$(sha256sum "build/tg_stage$s" | cut -d' ' -f1)"
+        done > build/.linux_fingerprints/tg_stages.fingerprints
+        cat build/.linux_fingerprints/tg_stages.fingerprints
+
+  - name: linux-native-canaries
+    image: ocaml/opam:debian-12-ocaml-5.4
+    depends_on: [linux-fingerprints]
+    entrypoint: ["/bin/bash", "-c"]
+    environment:
+      TG_TARGET: x86_64-unknown-linux-gnu
+    commands:
+      - |
+        set -euo pipefail
+        mkdir -p build/.linux_native
+        failures=0; total=0
+        while IFS= read -r line || [ -n "$line" ]; do
+          case "$line" in
+            ''|\#*) continue ;;
+          esac
+          src="tests/canary/$line"
+          [ -f "$src" ] || { echo "error: linux canary missing: $src"; exit 1; }
+          bin="build/.linux_native/${line%.tg}"
+          total=$((total + 1))
+          if ! ./build/tg compile "$src" -o "$bin" --target "$TG_TARGET" >/dev/null 2>&1; then
+            echo "error: linux canary failed to compile: $src"
+            failures=$((failures + 1)); continue
+          fi
+          if [ "$(od -An -tx1 -N4 "$bin" | tr -d ' \n')" != "7f454c46" ]; then
+            echo "error: linux canary output is not ELF64: $src"
+            failures=$((failures + 1)); continue
+          fi
+          chmod +x "$bin"
+          if ! "$bin" >/dev/null 2>&1; then
+            echo "error: linux canary exited nonzero: $src"
+            failures=$((failures + 1)); continue
+          fi
+        done < tests/canary/MANIFEST
+        if [ "$total" -eq 0 ]; then
+          echo "error: zero canaries discovered (a zero suite is fatal)"
+          exit 1
+        fi
+        echo "linux native canaries: $((total - failures))/$total passed (ELF64, executed natively)"
+        [ "$failures" -eq 0 ]
+
+  - name: trap-stub-gate
+    image: ocaml/opam:debian-12-ocaml-5.4
+    depends_on: [linux-native-canaries]
+    entrypoint: ["/bin/bash", "-c"]
+    commands:
+      - |
+        set -euo pipefail
+        # Mirrors TRAP_GATE_WHITELIST in scripts/bootstrap_helpers.sh: the
+        # deliberate abort/panic machinery + the runtime's documented fatal
+        # OOM/allocation aborts (runtime.tg). Symbol-scoped only.
+        WHITELIST=" __intrinsic_abort panic panic_unwind begin_unwind resume_unwind unreachable assert \
+        _tg_string_new _tg_string_from_bytes _tg_string_reserve _tg_string_wrap _tg_string_slice _tg_string_tolower _tg_string_toupper _tg_string_replace \
+        _tg_map_insert_full _tg_map_remove_full _tg_map_remove_key_full _tg_map_entries _tg_str_chars _tg_read_file_to_string _tg_bump_alloc "
+        failures=0
+        for bin in build/.linux_native/*; do
+          [ -f "$bin" ] || continue
+          cur=""; banned=0
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              *"<"*">:")
+                cur="${line##*<}"; cur="${cur%%>*}" ;;
+              *)
+                if [[ "$line" == *ud2* ]]; then
+                  ok=0
+                  for w in "$cur" "${cur#_}"; do
+                    if [[ "$WHITELIST" == *" $w "* ]]; then ok=1; break; fi
+                  done
+                  [ "$ok" -eq 1 ] || banned=$((banned + 1))
+                fi
+                ;;
+            esac
+          done < <(objdump -d "$bin" 2>/dev/null || true)
+          if [ "$banned" -ne 0 ]; then
+            echo "error: trap-stub gate: $bin contains $banned banned ud2 trap(s) outside the documented abort/OOM whitelist"
+            failures=$((failures + 1))
+          fi
+        done
+        [ "$failures" -eq 0 ]
+        echo "✓ trap-stub gate OK on $(ls build/.linux_native | wc -l | tr -d ' ') linux canary binaries"
+
+  - name: epoll-shim
+    image: ocaml/opam:debian-12-ocaml-5.4
+    depends_on: [trap-stub-gate]
+    entrypoint: ["/bin/bash", "-c"]
+    commands:
+      - |
+        set -euo pipefail
+        cc -fPIC -shared -o build/libtg_epoll_shims.so native/epoll_shims.c
+        for sym in tg_epoll_create1 tg_epoll_ctl tg_epoll_wait tg_errno_is_eagain; do
+          nm -D --defined-only build/libtg_epoll_shims.so | grep -qE " $sym$" \
+            || { echo "error: linux epoll shim missing export: $sym"; exit 1; }
+        done
+        echo "✓ libtg_epoll_shims.so built with all 4 std::async epoll exports"
+
+  - name: native-suites
+    image: ocaml/opam:debian-12-ocaml-5.4
+    depends_on: [epoll-shim]
+    entrypoint: ["/bin/bash", "-c"]
+    commands:
+      - |
+        set -euo pipefail
+        ./build/tg test tests/pthread_abi_test.tg tests/syscall_translation_test.tg tests/thread_spawn_failure_test.tg tests/net_loopback_test.tg tests/net_negative_abi_test.tg
+        ./build/tg test tests/allocator_churn_test.tg tests/allocator_reuse_test.tg tests/allocator_large_test.tg tests/allocator_oom_test.tg tests/allocator_threaded_test.tg tests/allocator_alignment_test.tg tests/arc_lifecycle_test.tg
+        ./build/tg test tests/atomic_litmus_sb_test.tg tests/atomic_litmus_mp_test.tg tests/atomic_litmus_wrc_test.tg tests/atomic_litmus_acqrel_test.tg tests/atomic_litmus_cas_pub_test.tg tests/atomic_litmus_cas_fail_test.tg
+        ./build/tg test tests/sync_contention_test.tg tests/condvar_waiter_queue_test.tg tests/once_cas_test.tg tests/thread_channel_ownership_test.tg tests/thread_local_drop_test.tg tests/thread_result_cell_test.tg
+        ./build/tg test tests/unit/test_crypto_rigor.tg tests/verifier_projection_tests.tg golden/compiler_module_tests.tg
+        echo "✓ pthread/ABI/net/sync/allocator/atomic/crypto/verifier suites passed on native Linux x86-64"
+
+  - name: async-suites
+    image: ocaml/opam:debian-12-ocaml-5.4
+    depends_on: [native-suites]
+    entrypoint: ["/bin/bash", "-c"]
+    commands:
+      - |
+        set -euo pipefail
+        LD_PRELOAD="$PWD/build/libtg_epoll_shims.so" \
+          ./build/tg test tests/task_scope_test.tg tests/cancellation_token_test.tg tests/reactor_readiness_test.tg tests/async_mutex_waiter_test.tg tests/join_cancel_test.tg tests/executor_clock_test.tg tests/exec_conservation_test.tg
+        echo "✓ async/exec suites passed on the Linux epoll reactor"
+
+  - name: db-suites
+    image: ocaml/opam:debian-12-ocaml-5.4
+    depends_on: [async-suites]
+    entrypoint: ["/bin/bash", "-c"]
+    commands:
+      - |
+        set -euo pipefail
+        SQLITE_SO="$(dpkg -L libsqlite3-0 | grep -E 'libsqlite3\.so\.' | head -1)"
+        test -n "$SQLITE_SO" && test -f "$SQLITE_SO"
+        echo "preloading: $SQLITE_SO"
+        LD_PRELOAD="$SQLITE_SO" \
+          ./build/tg test tests/db_integration_test.tg tests/db_lifecycle_test.tg tests/db_async_pool_test.tg tests/db_postgres_lexer_test.tg
+        echo "✓ DB suites passed (SQLite in-process; the Postgres/MySQL native-server lanes remain the macOS lanes — documented limitation)"
+
+  - name: tls-suites
+    image: ocaml/opam:debian-12-ocaml-5.4
+    depends_on: [db-suites]
+    entrypoint: ["/bin/bash", "-c"]
+    commands:
+      - |
+        set -euo pipefail
+        cc -fPIC -shared -o build/libtg_tls_shims.so native/tls_shims.c -lssl -lcrypto
+        for sym in \
+          tls_ssl_new tls_ssl_free tls_ssl_set_min_version tls_ssl_set_max_version \
+          tls_ssl_set_hostname tls_ssl_set_certificate tls_ssl_set_private_key \
+          tls_ssl_set_verify tls_ssl_connect tls_ssl_accept tls_ssl_read \
+          tls_ssl_write tls_ssl_shutdown \
+          tls_ssl_set_default_verify_paths tls_ssl_add_ca_cert \
+          tls_ssl_set_alpn_protos tls_ssl_set_alpn_select tls_ssl_get_alpn \
+          tls_ssl_set_cipher_list tls_ssl_set_cipher_suites \
+          tls_x509_from_pem tls_x509_free tls_x509_to_der \
+          tls_x509_get_subject_cn tls_x509_is_expired \
+          tls_pkey_from_pem tls_pkey_free tls_pkey_to_der tls_load_file; do
+          nm -D --defined-only build/libtg_tls_shims.so | grep -qE " $sym$" \
+            || { echo "error: linux TLS shim missing export: $sym"; exit 1; }
+        done
+        LD_PRELOAD="$PWD/build/libtg_tls_shims.so" \
+          ./build/tg test tests/tls_interop_test.tg tests/tls_handshake_test.tg
+        echo "✓ libtg_tls_shims.so built (all 29 std::tls extern exports) + TLS suites passed on native Linux x86-64"
+
+  - name: cache-save
+    image: amazon/aws-cli:2.36.44
+    entrypoint: ["/bin/bash", "-c"]
+    depends_on: [tls-suites]
+    failure: ignore
+    environment: *tg_s3_env
+    commands:
+      - |
+        set -euo pipefail
+        LOCK_SHA="$(sha256sum bootstrap/ocaml-toolchain.lock | cut -d' ' -f1)"
+        tar -czf /tmp/linux-opam-cache.tar.gz -C "$HOME" .opam 2>/dev/null || true
+        if [ -s /tmp/linux-opam-cache.tar.gz ]; then
+          aws configure set default.s3.addressing_style path
+          aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp /tmp/linux-opam-cache.tar.gz "s3://$TG_S3_BUCKET/$CI_REPO/cache/linux-opam-$LOCK_SHA.tar.gz" --no-progress
+        fi
+
+  - name: upload-linux-stage-artifacts
+    image: amazon/aws-cli:2.36.44
+    entrypoint: ["/bin/bash", "-c"]
+    depends_on: [tls-suites]
+    environment: *tg_s3_env
+    when:
+      - event: [push, pull_request]
+        status: [success, failure]
+    commands:
+      - |
+        set -euo pipefail
+        aws configure set default.s3.addressing_style path
+        for s in 1 2 3; do
+          [ -f "build/tg_stage$s" ] || continue
+          aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp "build/tg_stage$s" "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/linux-stage-artifacts/tg_stage$s" --no-progress
+        done
+
+  - name: upload-linux-native-tests
+    image: amazon/aws-cli:2.36.44
+    entrypoint: ["/bin/bash", "-c"]
+    depends_on: [tls-suites]
+    environment: *tg_s3_env
+    when:
+      - event: [push, pull_request]
+        status: [success, failure]
+    commands:
+      - aws configure set default.s3.addressing_style path
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive build/.linux_native "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/linux-native-tests" --no-progress
+
+  - name: upload-linux-fingerprints
+    image: amazon/aws-cli:2.36.44
+    entrypoint: ["/bin/bash", "-c"]
+    depends_on: [tls-suites]
+    environment: *tg_s3_env
+    when:
+      - event: [push, pull_request]
+        status: [success, failure]
+    commands:
+      - aws configure set default.s3.addressing_style path
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive build/.linux_fingerprints "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/linux-fingerprints" --no-progress
+
+  - name: job-results
+    image: ocaml/opam:debian-12-ocaml-5.4
+    depends_on: [linux-x86-64-native]
+    entrypoint: ["/bin/bash", "-c"]
+    commands:
+      - mkdir -p build/.ci_results
+      - printf 'success\n' > build/.ci_results/linux-x86-64-native
+
+  - name: upload-job-results
+    image: amazon/aws-cli:2.36.44
+    entrypoint: ["/bin/bash", "-c"]
+    depends_on: [job-results]
+    environment: *tg_s3_env
+    commands:
+      - aws configure set default.s3.addressing_style path
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive build/.ci_results "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/ci-results" --no-progress

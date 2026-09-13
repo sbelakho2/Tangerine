@@ -19,7 +19,7 @@ Reports are welcome for:
 
 - Compiler and language tooling (`tg_compiler/`)
 - Standard library modules (`std/`)
-- Build and release workflows (`.github/workflows/`)
+- Build and release workflows (`.woodpecker/`)
 - VS Code extension (`tangerine-vscode/`)
 
 ## Disclosure Process

@@ -1,0 +1,285 @@
+# .woodpecker/verify-core.yaml — the core compiler/runtime verification lanes.
+#
+# Migrated from GitHub Actions jobs (each is a STEP named after the job):
+#   lint, conformance, crypto-kat, verifier-projection, allocator,
+#   abi-platform, atomic-litmus, cfg-matrix, stdlib-e106-sweep, doctests,
+#   mutation-tests, verifier-stress.
+# The `verifier-stress` step keeps the mutation-tests dependency (step
+# DAG), so a mutation finding still fails the required verifier-stress
+# lane — the same transitive wiring as the former GitHub `needs:` list.
+#
+# All lanes run the validated macOS/aarch64 stage3 artifact: Darwin/arm64
+# local-backend agent + host `aws` CLI. The stage3 artifact is restored
+# from the S3-compatible store produced by `.woodpecker/bootstrap.yaml`.
+
+labels:
+  platform: darwin/arm64
+  backend: local
+
+concurrency: 1
+
+when:
+  - event: push
+    branch: [main, dev]
+  - event: pull_request
+    branch: [main, "release/**"]
+
+steps:
+  - name: restore-stage3
+    image: bash
+    environment: &tg_s3_env
+      AWS_ACCESS_KEY_ID:
+        from_secret: s3_access_key
+      AWS_SECRET_ACCESS_KEY:
+        from_secret: s3_secret_key
+      AWS_DEFAULT_REGION: us-east-1
+      TG_S3_BUCKET: tangerine-ci
+      TG_S3_ENDPOINT: http://127.0.0.1:9000
+    commands:
+      - mkdir -p build
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/tg-stages-macos-arm64" build/ --no-progress
+
+  - name: materialize-tg
+    image: bash
+    depends_on: [restore-stage3]
+    commands:
+      - |
+        set -euo pipefail
+        if [ -f build/tg ]; then
+          chmod +x build/tg
+        else
+          cp build/tg_stage3 build/tg
+          chmod +x build/tg
+        fi
+
+  - name: lint
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - |
+        set -euo pipefail
+        ./build/tg fmt --check tg_compiler/*.tg std/*.tg
+        echo "✓ All files formatted correctly"
+      # The encoding / control-flow style gates from the former GitHub lint
+      # job, restored: check_encoding.py (valid UTF-8 + no BOM; the
+      # tests/differential/negative/not_utf8.tg INV-PARSE-002 fixture is the
+      # single documented exception) and check_tg_control_flow_forms.py
+      # (no Rust-style brace headers; `next` is canonical, `continue` is the
+      # rejected legacy alias).
+      - python3 scripts/check_encoding.py
+      - python3 scripts/check_tg_control_flow_forms.py
+      - ./build/tg lint tg_compiler/*.tg std/*.tg --deny all
+      - ./build/tg check --unsafe-report tg_compiler/*.tg std/*.tg
+
+  - name: conformance
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - |
+        set -euo pipefail
+        for f in golden/frontend_*.tg; do
+          echo "Testing $f..."
+          ./build/tg check "$f" || exit 1
+        done
+        echo "✓ Parser conformance passed"
+      - |
+        set -euo pipefail
+        for f in golden/types_*.tg; do
+          echo "Testing $f..."
+          ./build/tg check "$f" || exit 1
+        done
+        echo "✓ Type-check conformance passed"
+      - bash tests/run_conformance_canaries.sh ./build/tg
+      - |
+        set -euo pipefail
+        for f in golden/borrow_01.tg golden/borrow_02.tg; do
+          echo "Testing $f..."
+          ./build/tg check "$f" || exit 1
+        done
+        echo "✓ Historical borrow-era tests passed"
+      - |
+        set -euo pipefail
+        for f in golden/mir_*.tg golden/ssa_*.tg; do
+          echo "Testing $f..."
+          ./build/tg check "$f" || exit 1
+        done
+        echo "✓ MIR/SSA conformance passed"
+      - |
+        set -euo pipefail
+        ./build/tg build golden/smoke_test.tg
+        echo "✓ Smoke test passed"
+      - |
+        set -euo pipefail
+        echo "Testing golden/diagnostics_quality.tg..."
+        ./build/tg check golden/diagnostics_quality.tg 2>&1 | tee diag_output.txt
+        echo "✓ Diagnostics quality tests executed"
+      - |
+        set -euo pipefail
+        ./build/tg agent audit . | tee audit_report.txt
+        echo "✓ Agentic audit completed"
+      - |
+        set -euo pipefail
+        ./build/tg test golden/stdlib_tests.tg
+        echo "✓ Stdlib tests passed"
+      - |
+        set -euo pipefail
+        echo "Measuring compiler memory usage..."
+        ./build/tg build --verbose golden/smoke_test.tg 2>&1 | tee memory_report.txt
+        echo "✓ Memory usage tracked"
+
+  - name: crypto-kat
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - |
+        set -euo pipefail
+        ./build/tg test tests/unit/test_crypto_rigor.tg
+        echo "✓ Crypto KAT suite passed"
+
+  - name: verifier-projection
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - |
+        set -euo pipefail
+        ./build/tg test tests/verifier_projection_tests.tg tests/verifier_repeat_count_tests.tg
+        echo "✓ Verifier projection tests passed"
+
+  - name: allocator
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - |
+        set -euo pipefail
+        ./build/tg test tests/allocator_churn_test.tg tests/allocator_reuse_test.tg tests/allocator_large_test.tg tests/allocator_oom_test.tg tests/allocator_threaded_test.tg tests/allocator_alignment_test.tg tests/arc_lifecycle_test.tg
+        echo "✓ Allocator + Arc lifecycle suites passed"
+
+  - name: abi-platform
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - |
+        set -euo pipefail
+        ./build/tg test tests/pthread_abi_test.tg tests/syscall_translation_test.tg tests/target_lse_contract_test.tg tests/target_atomic_authority_test.tg tests/target_vector_authority_test.tg tests/target_desc_of_triple_test.tg tests/codegen_route_test.tg tests/lir_vector_model_test.tg tests/x86_64_lir_rows_test.tg tests/thumb_float_residual_rows_test.tg tests/thumb_variadic_float_rows_test.tg tests/riscv_variadic_float_rows_test.tg tests/thumb_fp_fpu_variant_rows_test.tg tests/thread_spawn_failure_test.tg
+        echo "✓ ABI / platform contract suites passed"
+
+  - name: atomic-litmus
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - |
+        set -euo pipefail
+        ./build/tg test tests/atomic_litmus_*.tg
+        echo "✓ Atomic litmus suites passed"
+
+  - name: cfg-matrix
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - |
+        set -euo pipefail
+        bash tests/run_cfg_matrix_tests.sh ./build/tg
+        echo "✓ CFG cross-target matrix passed (all 6 canaries)"
+
+  - name: stdlib-e106-sweep
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - |
+        set -euo pipefail
+        bash tests/run_stdlib_e106_sweep.sh ./build/tg
+        echo "✓ Stdlib E106 sweep passed (all std/*.tg modules pass the full semantic pipeline and the forbidden-syntax grep backstop)"
+
+  - name: upload-stdlib-e106-sweep-diagnostics
+    image: bash
+    depends_on: [stdlib-e106-sweep]
+    environment: *tg_s3_env
+    when:
+      - event: [push, pull_request]
+        status: [failure]
+    commands:
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive build/.stdlib_e106_sweep "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/stdlib-e106-sweep-diagnostics" --no-progress
+
+  - name: doctests
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - |
+        set -euo pipefail
+        bash scripts/check_doctests.sh ./build/tg
+        echo "✓ Every fenced Tangerine example in the doctested documents is canonical-form or a verified compile_fail"
+
+  - name: mutation-tests
+    image: bash
+    depends_on: [materialize-tg]
+    commands:
+      - |
+        set -euo pipefail
+        bash scripts/run_mutation_tests.sh --binary ./build/tg_stage3 --gate --out build/mutation_report.txt
+
+  - name: upload-mutation-report
+    image: bash
+    depends_on: [mutation-tests]
+    environment: *tg_s3_env
+    when:
+      - event: [push, pull_request]
+        status: [success, failure]
+    commands:
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp build/mutation_report.txt "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/mutation-report/mutation_report.txt" --no-progress
+
+  - name: verifier-stress
+    image: bash
+    depends_on: [materialize-tg, mutation-tests]
+    commands:
+      - |
+        set -euo pipefail
+        mkdir -p build/.verifier_stress
+        while IFS= read -r line || [ -n "$line" ]; do
+          case "$line" in
+            \#*|"") continue ;;
+          esac
+          name="${line%.tg}"
+          ./build/tg compile --mode dev -O2 -o "build/.verifier_stress/${name}" "tests/canary/${line}"
+          "build/.verifier_stress/${name}" >/dev/null
+          echo "✓ verifier-stress canary: ${name}"
+        done < tests/canary/MANIFEST
+        echo "✓ All $(grep -vc '^#' tests/canary/MANIFEST) canaries compiled (verify-everything, -O2) and executed"
+      - |
+        set -euo pipefail
+        failures=0
+        while IFS= read -r line || [ -n "$line" ]; do
+          case "$line" in
+            \#*|"") continue ;;
+          esac
+          if ./build/tg compile --mode dev -O2 -o "build/.verifier_stress/neg_${line%.tg}" "tests/canary_neg/${line}" >/dev/null 2>&1; then
+            echo "error: verifier-stress: canary_neg compiled successfully but must fail: ${line}"
+            failures=$((failures + 1))
+          fi
+        done < tests/canary_neg/MANIFEST
+        if [ "$failures" -ne 0 ]; then
+          echo "error: verifier-stress: $failures canary_neg file(s) compiled but must fail"
+          exit 1
+        fi
+        echo "✓ All canary_neg rejected through the verify-everything pipeline"
+      - |
+        set -euo pipefail
+        ./build/tg test tests/verifier_projection_tests.tg golden/compiler_module_tests.tg
+        echo "✓ Verifier projection + compiler module tests passed through the verify-everything pipeline"
+      - |
+        set -euo pipefail
+        ./build/tg test tests/unit/test_geom.tg tests/unit/test_events.tg tests/unit/test_paint.tg tests/unit/test_text.tg tests/unit/test_capability.tg tests/unit/test_slice_copy_resource_drop_count.tg tests/unit/test_slice_noncopy_clone_drop.tg tests/unit/test_slice_sub_oob.tg tests/unit/test_slice_sub_overflow.tg tests/unit/test_fixed_decimal.tg tests/integration/test_pipelines.tg tests/abi/test_abi_conformance.tg tests/consistency/test_consistency.tg tests/golden/test_visual_regression.tg tests/determinism/test_replay.tg tests/fuzz/test_fuzz.tg
+        echo "✓ Unit/integration suites passed through the verify-everything pipeline"
+
+  - name: job-results
+    image: bash
+    depends_on: [lint, conformance, crypto-kat, verifier-projection, allocator, abi-platform, atomic-litmus, cfg-matrix, stdlib-e106-sweep, doctests, mutation-tests, verifier-stress]
+    commands:
+      - mkdir -p build/.ci_results
+      - for j in lint conformance crypto-kat verifier-projection allocator abi-platform atomic-litmus cfg-matrix stdlib-e106-sweep doctests mutation-tests verifier-stress; do printf 'success\n' > "build/.ci_results/$j"; done
+
+  - name: upload-job-results
+    image: bash
+    depends_on: [job-results]
+    environment: *tg_s3_env
+    commands:
+      - aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive build/.ci_results "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/ci-results" --no-progress

@@ -38,7 +38,7 @@ merged into `std/db.tg`, and `std/hash_tests.tg`, removed) is parse-clean
 under the current grammar, enforced by the two-layer gate
 (`tests/run_stdlib_e106_sweep.sh` — `tg check` zero-diagnostics + the
 forbidden-syntax grep backstop), a **required CI job** (`stdlib-e106-sweep`
-in `.github/workflows/ci.yml`); the item-32 completeness model
+in `.woodpecker/verify-core.yaml`); the item-32 completeness model
 ([`stdlib_completeness.md`](stdlib_completeness.md)) assigns every module
 to a verification family with a minimum proof, and its enumeration gate
 fails on any un-contracted module. The item-33 stable-subset policy flags

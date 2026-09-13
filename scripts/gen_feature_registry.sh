@@ -10,10 +10,11 @@
 #   - The statuses are DERIVED MECHANICALLY from the test-file existence
 #     and the suite membership — the generator verifies that every listed
 #     test path exists in the tree, that every named suite manifest
-#     contains the listed file, and that every named CI job exists in
-#     .github/workflows/ci.yml. Any drift FAILS the generation (exit
-#     non-zero), so the registry can never claim an artifact that does
-#     not exist.
+#     contains the listed file, and that every named CI job exists as a
+#     step in a .woodpecker/ workflow (the Woodpecker CI config; the
+#     former .github/workflows/ci.yml is gone). Any drift FAILS the
+#     generation (exit non-zero), so the registry can never claim an
+#     artifact that does not exist.
 #   - The item-36 STATUS LADDER is CALCULATED (never typed in
 #     features.toml): DECLARED -> IMPLEMENTED -> SEMANTICALLY_CHECKED ->
 #     NATIVE_TESTED -> ADVERSARIAL_TESTED -> TARGET_COMPLETE ->
@@ -58,7 +59,7 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TOML="$ROOT/features.toml"
-WORKFLOW="$ROOT/.github/workflows/ci.yml"
+WORKFLOW="$ROOT/.woodpecker"
 OUT="${1:-$ROOT/docs/current/feature_registry.md}"
 LADDER_JSON="${2:-}"
 
@@ -161,7 +162,15 @@ if not features:
     print("gen_feature_registry: no [feature.*] tables in features.toml", file=sys.stderr)
     sys.exit(1)
 
-workflow_text = open(workflow_path, "r", encoding="utf-8").read() if os.path.exists(workflow_path) else ""
+workflow_text = ""
+if os.path.isdir(workflow_path):
+    import glob as _glob
+    for _p in sorted(_glob.glob(os.path.join(workflow_path, "*.yaml")) +
+                     _glob.glob(os.path.join(workflow_path, "*.yml"))):
+        with open(_p, "r", encoding="utf-8") as _fh:
+            workflow_text += _fh.read() + "\n"
+elif os.path.exists(workflow_path):
+    workflow_text = open(workflow_path, "r", encoding="utf-8").read()
 
 def suite_manifest(suite):
     return os.path.join(os.path.dirname(toml_path), "tests", suite, "MANIFEST")
@@ -181,7 +190,7 @@ def in_manifest(suite, relpath):
     return False
 
 def job_exists(job):
-    return re.search(r"^  " + re.escape(job) + r":\s*$", workflow_text, re.M) is not None
+    return re.search(r"^\s*-\s*name:\s*" + re.escape(job) + r"\s*$", workflow_text, re.M) is not None
 
 failures = []
 derived = {}
@@ -224,7 +233,7 @@ for fid, f in features.items():
                         % (fid, t, s))
     for j in jobs:
         if not job_exists(j):
-            failures.append("feature '%s': ci_job '%s' is not a job in .github/workflows/ci.yml" % (fid, j))
+            failures.append("feature '%s': ci_job '%s' is not a Woodpecker step in .woodpecker/" % (fid, j))
 
     # status derivation (the declared status stays the input; the
     # item-36 LADDER is calculated below from the artifact existence).
@@ -329,7 +338,7 @@ lines.append("- every **test reference** must exist in the tree, and every named
 lines.append("  **suite manifest** (`tests/canary/MANIFEST`, `tests/canary_neg/MANIFEST`,")
 lines.append("  `tests/arm64/MANIFEST`) must contain the listed file — a listed artifact")
 lines.append("  that does not exist fails the generation;")
-lines.append("- every named **CI gate** must be a job in `.github/workflows/ci.yml`;")
+lines.append("- every named **CI gate** must be a Woodpecker step in a `.woodpecker/*.yaml` workflow;")
 lines.append("- `implemented` derives to **implemented + test-covered** (committed test")
 lines.append("  artifacts exist) or **implemented + unverified** (no committed test")
 lines.append("  artifact), never to run-verified.")

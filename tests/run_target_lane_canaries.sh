@@ -8,12 +8,14 @@
 #     (arch -x86_64) when available, else under qemu-x86_64, else the
 #     disassembly gate alone
 # In EVERY case the emitted object is checked by the SYMBOL-AWARE trap-stub
-# gate: every trap instruction is attributed to its containing function
-# symbol, and only the deliberate abort/panic/unreachable machinery
-# (__intrinsic_abort + the std::core panic helpers) is whitelisted. A trap
-# in any other symbol — in particular a trap-only implementation or
-# OS-fallback trap in the map/set/string/array runtime families — fails the
-# gate. The arm64 vec-push sanity trap 'brk #0xbeef' remains allowed.
+# gate (scripts/bootstrap_helpers.sh): every trap instruction is attributed
+# to its containing function symbol, and only the deliberate abort/panic
+# machinery plus the runtime's documented fatal OOM/allocation aborts
+# (String constructors/reserve/wrap/slice/case-map/replace, Map
+# insert/remove/entries, str_chars, read_file_to_string, bump_alloc) are
+# whitelisted. A trap anywhere else — a trap-only implementation or a
+# fabricated-default trap in any runtime family — fails the gate. The arm64
+# vec-push sanity trap 'brk #0xbeef' remains allowed by immediate.
 #
 # Usage: tests/run_target_lane_canaries.sh <compiler> <outdir> [triple|arch-alias]
 #   triple omitted            -> bh_boot_target (native lane)

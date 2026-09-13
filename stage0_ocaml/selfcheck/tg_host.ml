@@ -545,6 +545,262 @@ let check_exit_adapter () =
       | Unix.WEXITED n -> fail "_exit self-check: child exited %d (expected 42)" n
       | _ -> fail "_exit self-check: child did not exit normally")
 
+(* ── syscall completion (mmap / getcwd / getdents / ioctl / dup) ─────
+   The five raw-syscall numbers the path audit left unmapped.  No kernel
+   closure path reaches them (the audit's path table names each as "not
+   in the closure call graph"), so these checks pin the honest host
+   semantics the seed now provides: arena-backed anonymous mmap and
+   file-backed mappings, the VIRTUAL getcwd, the audited macOS
+   getdirentries layout (plus the Linux getdents64 layout), ENOTTY
+   ioctl, and dup over the guest descriptor table. *)
+
+let s64 (n : int64) : Vm_value.t =
+  Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true n)
+
+let addr_value (p : Vm_memory.pointer) : Vm_value.t =
+  s64 (Vm_memory.pointer_to_int64 p)
+
+(* Invoke a __intrinsic_syscallN binding and return the integer result. *)
+let syscall (name : string) (host : Host.t) (args : Vm_value.t array) : int =
+  let b = manifest_binding name in
+  match b.Host.invoke host args with
+  | Error e -> fail "syscall %s: invoke failed: %s" name e
+  | Ok res -> (
+      match res.Host.value with
+      | Vm_value.Int i -> Int64.to_int (Int_value.to_int64 i)
+      | _ -> fail "syscall %s: returned a non-integer" name)
+
+let check_getcwd () =
+  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let call_cwd (p : Vm_memory.pointer) (size : int) : int =
+    syscall "__intrinsic_syscall2" host
+      [| s64 310L; addr_value p; s64 (Int64.of_int size) |]
+  in
+  (* the virtual root is the initial cwd (Host_fs.cwd = []) *)
+  (match Host.arena_alloc host 64 1 with
+  | Error e -> fail "getcwd: arena_alloc failed: %s" e
+  | Ok p ->
+      let r = call_cwd p 64 in
+      if r <= 0 then fail "getcwd: expected the buffer address, got %d" r;
+      (match Host.arena_load host p 3 with
+      | Error e -> fail "getcwd: arena_load failed: %s" e
+      | Ok b ->
+          if Bytes.sub_string b 0 3 <> "/\x00\x00" then
+            fail "getcwd: expected \"/\", got %S" (Bytes.to_string b)));
+  (* a guest chdir moves the VIRTUAL cwd, and getcwd reports it *)
+  Host_fs.set_cwd host.Host.fs [ "a"; "b" ];
+  (match Host.arena_alloc host 64 1 with
+  | Error e -> fail "getcwd: arena_alloc failed: %s" e
+  | Ok p ->
+      ignore (call_cwd p 64);
+      (match Host.arena_load host p 6 with
+      | Error e -> fail "getcwd: arena_load failed: %s" e
+      | Ok b ->
+          if Bytes.sub_string b 0 5 <> "/a/b\x00" then
+            fail "getcwd: expected \"/a/b\", got %S" (Bytes.to_string b)));
+  (* ERANGE when the buffer cannot hold the path plus NUL *)
+  (match Host.arena_alloc host 2 1 with
+  | Error e -> fail "getcwd: arena_alloc failed: %s" e
+  | Ok p ->
+      let r = call_cwd p 2 in
+      if r <> -34 then fail "getcwd: undersized buffer returned %d (expected -ERANGE)" r);
+  pass "getcwd writes the VIRTUAL cwd as a NUL-terminated string and reports ERANGE"
+
+let check_dup () =
+  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let r, w = Unix.pipe ~cloexec:false () in
+  let gr = Host.register_guest_fd r in
+  ignore (Unix.write w (Bytes.of_string "x") 0 1);
+  let gd = syscall "__intrinsic_syscall1" host [| s64 32L; s64 (Int64.of_int gr) |] in
+  if gd <= 2 then fail "dup: expected a fresh guest descriptor, got %d" gd;
+  (match Host.arena_alloc host 4 1 with
+  | Error e -> fail "dup: arena_alloc failed: %s" e
+  | Ok p ->
+      let n = Host.host_read_into host gd p 1 in
+      if n <> 1 then fail "dup: reading through the duplicate returned %d" n;
+      (match Host.arena_load host p 1 with
+      | Ok b when Bytes.get b 0 = 'x' -> ()
+      | _ -> fail "dup: the duplicate did not share the pipe stream"));
+  let missing = syscall "__intrinsic_syscall1" host [| s64 32L; s64 999999L |] in
+  if missing <> -9 then fail "dup: unknown fd returned %d (expected -EBADF)" missing;
+  ignore (Host.unregister_guest_fd gd);
+  ignore (Host.unregister_guest_fd gr);
+  Unix.close w;
+  pass "dup duplicates a guest descriptor (shared stream) and reports EBADF for an unknown fd"
+
+let check_mmap () =
+  let host = Host.create ~repo_root:"." ~argv:[||] in
+  (* anonymous: fd = -1 -> a zeroed Raw region of the requested length *)
+  let a =
+    syscall "__intrinsic_syscall6" host
+      [| s64 194L; s64 0L; s64 64L; s64 3L; s64 0x1002L; s64 (-1L); s64 0L |]
+  in
+  if a <= 0 then fail "mmap: anonymous mapping returned %d" a;
+  let p = Vm_memory.pointer_of_int64 (Int64.of_int a) in
+  (match Vm_memory.region_of host.Host.memory p with
+  | Error e -> fail "mmap: mapped region missing: %s" (Vm_memory.mem_error_string e)
+  | Ok _ -> ());
+  (match Host.arena_load host p 64 with
+  | Ok b when Bytes.to_string b = String.make 64 '\000' -> ()
+  | Ok _ -> fail "mmap: the anonymous mapping is not zeroed"
+  | Error e -> fail "mmap: %s" e);
+  (* file-backed: the region carries the file's bytes at the offset, and
+     the descriptor offset is unchanged (mmap never moves it) *)
+  let path = Filename.temp_file "tg_host_mmap" ".bin" in
+  let oc = open_out_bin path in
+  output_string oc "hello";
+  close_out oc;
+  let fd = Host.host_open host path 0 0 in
+  if fd < 0 then fail "mmap: host_open failed: %d" fd;
+  let a2 =
+    syscall "__intrinsic_syscall6" host
+      [| s64 197L; s64 0L; s64 5L; s64 3L; s64 2L; s64 (Int64.of_int fd); s64 0L |]
+  in
+  if a2 <= 0 then fail "mmap: file-backed mapping returned %d" a2;
+  let p2 = Vm_memory.pointer_of_int64 (Int64.of_int a2) in
+  (match Host.arena_load host p2 5 with
+  | Ok b when Bytes.to_string b = "hello" -> ()
+  | Ok b -> fail "mmap: file-backed bytes are %S (expected \"hello\")" (Bytes.to_string b)
+  | Error e -> fail "mmap: %s" e);
+  if Host.host_lseek fd 0L 1 <> 0L then
+    fail "mmap: the file-backed mapping moved the descriptor offset";
+  ignore (Host.host_close_fd fd);
+  Sys.remove path;
+  (* a descriptor that is not a regular file has no mapping (ENODEV) *)
+  let r, w = Unix.pipe ~cloexec:false () in
+  let gr = Host.register_guest_fd r in
+  let a3 =
+    syscall "__intrinsic_syscall6" host
+      [| s64 197L; s64 0L; s64 8L; s64 3L; s64 2L; s64 (Int64.of_int gr); s64 0L |]
+  in
+  if a3 <> -19 then fail "mmap: a pipe descriptor returned %d (expected -ENODEV)" a3;
+  ignore (Host.unregister_guest_fd gr);
+  Unix.close w;
+  pass "mmap allocates a zeroed arena region anonymously and fills file-backed mappings from the offset without moving the descriptor"
+
+let check_ioctl () =
+  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let r, w = Unix.pipe ~cloexec:false () in
+  let gr = Host.register_guest_fd r in
+  (match Host.arena_alloc host 8 1 with
+  | Error e -> fail "ioctl: arena_alloc failed: %s" e
+  | Ok p ->
+      (* the std TIOCGWINSZ request has no OCaml host primitive: ENOTTY,
+         exactly the input the std/cli.tg (80, 24) fallback handles *)
+      let rc =
+        syscall "__intrinsic_syscall3" host
+          [| s64 16L; s64 (Int64.of_int gr); s64 0x40087468L; addr_value p |]
+      in
+      if rc <> -25 then fail "ioctl: TIOCGWINSZ returned %d (expected -ENOTTY)" rc);
+  let missing =
+    syscall "__intrinsic_syscall3" host [| s64 16L; s64 999999L; s64 0L; s64 0L |]
+  in
+  if missing <> -9 then fail "ioctl: unknown fd returned %d (expected -EBADF)" missing;
+  ignore (Host.unregister_guest_fd gr);
+  Unix.close w;
+  pass "ioctl reports ENOTTY for a known descriptor (the std fallback input) and EBADF for an unknown one"
+
+(* Walk a getdirentries result buffer: BSD records are u32 d_ino, u16
+   d_reclen, u8 d_type, u8 d_namlen, name at 8, padded to 4. *)
+let parse_bsd_dirents (b : Bytes.t) (n : int) : string list =
+  let names = ref [] in
+  let pos = ref 0 in
+  while !pos < n do
+    let reclen = Int64.to_int (Raw_memory.u64_le b (!pos + 4) 2) in
+    if reclen <= 0 then fail "getdirentries: zero d_reclen at %d" !pos;
+    let namlen = Char.code (Bytes.get b (!pos + 7)) in
+    names := Bytes.sub_string b (!pos + 8) namlen :: !names;
+    pos := !pos + reclen
+  done;
+  List.rev !names
+
+(* Walk a getdents64 result buffer: u64 d_ino, u64 d_off, u16 d_reclen,
+   u8 d_type, NUL-terminated name at 19, padded to 8. *)
+let parse_linux_dirents (b : Bytes.t) (n : int) : string list =
+  let names = ref [] in
+  let pos = ref 0 in
+  while !pos < n do
+    let reclen = Int64.to_int (Raw_memory.u64_le b (!pos + 16) 2) in
+    if reclen <= 0 then fail "getdents64: zero d_reclen at %d" !pos;
+    let end_ = ref (!pos + 19) in
+    while !end_ < !pos + reclen && Bytes.get b !end_ <> '\000' do incr end_ done;
+    names := Bytes.sub_string b (!pos + 19) (!end_ - (!pos + 19)) :: !names;
+    pos := !pos + reclen
+  done;
+  List.rev !names
+
+let check_getdents () =
+  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let dir = Filename.temp_dir "tg_host_dents" "" in
+  let touch name =
+    let oc = open_out (Filename.concat dir name) in
+    output_string oc "x";
+    close_out oc
+  in
+  touch "b.txt";
+  touch "a.txt";
+  Unix.mkdir (Filename.concat dir "d") 0o755;
+  let fd = Host.host_open host dir 0 0 in
+  if fd < 0 then fail "getdents: host_open failed: %d" fd;
+  (match (Host.arena_alloc host 4096 1, Host.arena_alloc host 8 1) with
+  | Ok buf, Ok basep ->
+      (* the audited macOS branch: getdirentries(fd, buf, nbytes, basep) *)
+      let call () =
+        syscall "__intrinsic_syscall4" host
+          [|
+            s64 193L; s64 (Int64.of_int fd); addr_value buf; s64 4096L;
+            addr_value basep;
+          |]
+      in
+      let n = call () in
+      if n <= 0 then fail "getdirentries: nread %d" n;
+      (match Host.arena_load host buf n with
+      | Ok b ->
+          let names = parse_bsd_dirents b n in
+          if names <> [ "a.txt"; "b.txt"; "d" ] then
+            fail "getdirentries: entries [%s]" (String.concat ", " names)
+      | Error e -> fail "getdirentries: %s" e);
+      (match Host.arena_load host basep 8 with
+      | Ok b when Int64.to_int (Raw_memory.u64_le b 0 8) = 3 -> ()
+      | Ok b ->
+          fail "getdirentries: basep = %Ld (expected the next entry index 3)"
+            (Raw_memory.u64_le b 0 8)
+      | Error e -> fail "getdirentries: basep: %s" e);
+      if call () <> 0 then fail "getdirentries: the exhausted directory did not return 0";
+      (* the Linux branch: getdents64 over a fresh descriptor *)
+      let fd2 = Host.host_open host dir 0 0 in
+      let n2 =
+        syscall "__intrinsic_syscall3" host
+          [| s64 217L; s64 (Int64.of_int fd2); addr_value buf; s64 4096L |]
+      in
+      if n2 <= 0 then fail "getdents64: nread %d" n2;
+      (match Host.arena_load host buf n2 with
+      | Ok b ->
+          let names = parse_linux_dirents b n2 in
+          if names <> [ "a.txt"; "b.txt"; "d" ] then
+            fail "getdents64: entries [%s]" (String.concat ", " names)
+      | Error e -> fail "getdents64: %s" e);
+      ignore (Host.host_close_fd fd2);
+      (* a descriptor that is not a directory fails like the native call *)
+      let r, w = Unix.pipe ~cloexec:false () in
+      let gr = Host.register_guest_fd r in
+      let bad =
+        syscall "__intrinsic_syscall4" host
+          [|
+            s64 193L; s64 (Int64.of_int gr); addr_value buf; s64 4096L;
+            addr_value basep;
+          |]
+      in
+      if bad <> -9 then fail "getdirentries: a pipe descriptor returned %d" bad;
+      ignore (Host.unregister_guest_fd gr);
+      Unix.close w
+  | _ -> fail "getdents: arena allocation failed");
+  ignore (Host.host_close_fd fd);
+  List.iter (fun n -> Sys.remove (Filename.concat dir n)) [ "a.txt"; "b.txt" ];
+  Unix.rmdir (Filename.concat dir "d");
+  Unix.rmdir dir;
+  pass "getdirentries (BSD layout) and getdents64 (Linux layout) emit the directory's sorted entries with the basep cursor"
+
 let () =
   Printf.printf "host closure self-check\n";
   check_declared_unbound ();
@@ -554,6 +810,11 @@ let () =
   check_reachable_closure_boundary ();
   check_poll_adapter ();
   check_exit_adapter ();
+  check_getcwd ();
+  check_dup ();
+  check_mmap ();
+  check_ioctl ();
+  check_getdents ();
   (* Informational: the default manifest host is fail-closed (the Ruby C
      API / map-set / dl* symbols are declared without bindings). *)
   let host = Host.create ~repo_root:"." ~argv:[||] in

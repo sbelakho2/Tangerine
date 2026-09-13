@@ -23,6 +23,17 @@ type host_id =
   | Intrinsic of Intrinsic_registry.Id.t
   | Extern of Extern_registry.Id.t
 
+(* The guest-unwind control transfer the `__intrinsic_longjmp` adapter
+   raises while a `__intrinsic_try_invoke` handler is active.  It is NOT
+   a VM trap (not Failure): it unwinds the OCaml stack past every guest
+   frame without the per-frame trap decoration, and the innermost
+   try_invoke invocation catches it and returns Option::None.  The
+   integer is the guest's own CatchFrame id (std/core.tg's frame.id); the
+   seed host delivers the unwind to the innermost active handler — the
+   only frame `begin_unwind` ever selects — so the id is carried for
+   diagnostics, not equality-matched. *)
+exception Unwind of int
+
 (* One binding table for the whole host surface. A symbol WITHOUT an
    `invoke` is not implemented — the record type requires the function, so
    "bound" and "has an executable invoke" are the same predicate. *)
@@ -130,6 +141,20 @@ and t = {
      guest's own Vec value observes the C-ABI write (the seed value model
      has no addressable Vec storage; the link is the materialization). *)
   array_links : (int, Vm_value.t array) Hashtbl.t;
+  (* The guest-function invocation channel: a host adapter cannot execute
+     guest code by itself, so the VM installs this callback before running
+     (Vm.entry_frame_of_li for the inspect path, Vm.run_li for the run
+     path).  `__intrinsic_try_invoke` hands the guest fn value to it and
+     receives the callee's value, or the trap/unwind text the VM caught.
+     None on a host that was never attached to a running VM — the adapter
+     then fails closed instead of fabricating a result. *)
+  mutable invoke_guest : (Vm_value.t -> (Vm_value.t, string) result) option;
+  (* The active-handler depth: the number of `__intrinsic_try_invoke`
+     invocations currently on the VM stack.  `__intrinsic_longjmp` is
+     delivered only at depth > 0; a guest unwind with no enclosing
+     try_invoke has no target frame and stays the precise deterministic
+     host error. *)
+  mutable unwind_depth : int;
   (* True in an OS child process created by the guest's own c_fork.  The
      direct kernel's `_exit` terminates the process; the seed host may
      perform exactly that in a guest-created child (the child is the VM
@@ -279,12 +304,13 @@ let adapter_raw_wb (params : (Access_effect.t * Type_repr.t) list) (ret : Type_r
   { signature = mk_sig params ret; invoke }
 
 (* The remaining deterministic traps are written inline at their
-   adapters (a direct `Error`): the unwind/function-value intrinsics
-   (__intrinsic_try_invoke, __intrinsic_longjmp), panic/abort, the
-   Option::expect None case and the checked-access errors (out-of-bounds
-   array/region access, invalid free).  They fire only on guest misuse or
-   on the program's own abort semantics — never on a valid host call the
-   executable closure reaches. *)
+   adapters (a direct `Error`): panic/abort, the Option::expect None case
+   and the checked-access errors (out-of-bounds array/region access,
+   invalid free).  They fire only on guest misuse or on the program's own
+   abort semantics — never on a valid host call the executable closure
+   reaches.  The unwind pair (__intrinsic_try_invoke / __intrinsic_longjmp)
+   is NOT in this class: both carry real semantics below (the VM's
+   invocation channel and the handler-frame protocol). *)
 let adapter_ret_unit (f : t -> unit) : adapter =
   {
     signature = mk_sig [] Type_repr.Unit;
@@ -638,8 +664,15 @@ let array_link_register (t : t) (p : Vm_memory.pointer) (elems : Vm_value.t arra
 
 (* ── The host descriptor table ──────────────────────────────────────
    Open descriptors the guest created through libc_open/pipe/dup2 live
-   here under stable guest numbers (0..2 are the process standards). *)
+   here under stable guest numbers (0..2 are the process standards).
+   A descriptor opened on a DIRECTORY also records the real path and the
+   lazily-read entry list, because the guest's getdirentries has no OCaml
+   Unix counterpart: the seed reads the directory through Sys.readdir on
+   the recorded path. *)
 let fd_table : (int, Unix.file_descr) Hashtbl.t = Hashtbl.create 16
+let dir_paths : (int, string) Hashtbl.t = Hashtbl.create 8
+let dir_cache : (int, string array) Hashtbl.t = Hashtbl.create 8
+let dir_cursors : (int, int) Hashtbl.t = Hashtbl.create 8
 let next_guest_fd = ref 3
 
 let guest_fd (fd : int) : Unix.file_descr option =
@@ -658,6 +691,9 @@ let unregister_guest_fd (fd : int) : bool =
   | None -> false
   | Some d ->
       Hashtbl.remove fd_table fd;
+      Hashtbl.remove dir_paths fd;
+      Hashtbl.remove dir_cache fd;
+      Hashtbl.remove dir_cursors fd;
       (try Unix.close d with _ -> ());
       true
 
@@ -815,7 +851,13 @@ let host_open (t : t) (path : string) (flags : int) (mode : int) : int =
   let create_bit = if host_is_darwin then 0x200 else 0x40 in
   let for_create = flags land create_bit <> 0 in
   let real = host_real_path t path ~for_create in
-  try register_guest_fd (Unix.openfile real (open_flags_of_raw flags) mode)
+  try
+    let fd = register_guest_fd (Unix.openfile real (open_flags_of_raw flags) mode) in
+    (try
+       if (Unix.stat real).Unix.st_kind = Unix.S_DIR then
+         Hashtbl.replace dir_paths fd real
+     with Unix.Unix_error _ -> ());
+    fd
   with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e
 
 let host_close_fd (fd : int) : int =
@@ -857,6 +899,22 @@ let host_dup2 (oldfd : int) (newfd : int) : int =
              Hashtbl.replace fd_table newfd nd;
              newfd
            with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e))
+
+(* dup(2) over the guest descriptor table: a fresh guest number bound to
+   a Unix.dup of the host descriptor the guest fd resolves to.  The dup
+   shares the open file description, so the duplicated guest fd observes
+   the same offset and stream — the observable POSIX contract.  A guest
+   fd with no host descriptor has nothing to duplicate (EBADF).  A dup
+   of standard output duplicates the OS descriptor of fd 1, so writes
+   through the duplicate go to the process standard stream rather than
+   Host.stdout's capture buffer — the direct kernel's own dup semantics
+   (fd 1 is the real process descriptor there). *)
+let host_dup (fd : int) : int =
+  match guest_fd fd with
+  | None -> -errno_badf
+  | Some d -> (
+      try register_guest_fd (Unix.dup ~cloexec:false d)
+      with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e)
 
 let host_chmod (t : t) (path : string) (mode : int) : int =
   let real = host_real_path t path ~for_create:false in
@@ -1010,6 +1068,241 @@ let host_fstat (fd : int) : (Unix.LargeFile.stats, int) result =
       try Ok (Unix.LargeFile.fstat d)
       with Unix.Unix_error (e, _, _) -> Error (-errno_of_unix_error e))
 
+(* ── The remaining raw-syscall operations ─────────────────────────────
+   mmap, getcwd, getdirentries/getdents64, ioctl and dup complete the
+   audited syscall set.  None of the five has a call site in the kernel's
+   reachable closure (the audit's path table), so each is exercised only
+   by focused checks; the semantics below are the honest host-side
+   contract each number would carry, and the boundary notes name what the
+   seed model cannot provide. *)
+
+let errno_eio = 5
+let errno_nomem = 12
+let errno_nodev = 19
+let errno_inval = 22
+let errno_notty = 25
+let errno_erange = 34
+
+(* getcwd(buf, size): the guest's current directory is the VIRTUAL cwd —
+   the syscall chdir above moves Host_fs.cwd, never the seed process's
+   own directory — so the seed writes that virtual absolute path (a
+   leading "/" plus the root-relative segments) as a NUL-terminated
+   string and returns the buffer address, exactly the getcwd(2) return
+   contract.  ERANGE when the buffer cannot hold path + NUL. *)
+let host_getcwd (t : t) (p : Vm_memory.pointer) (size : int) : int =
+  let virt = "/" ^ String.concat "/" (Host_fs.cwd t.fs) in
+  let need = String.length virt + 1 in
+  if size <= 0 then -errno_inval
+  else if need > size then -errno_erange
+  else
+    match arena_store t p (Bytes.of_string (virt ^ "\000")) with
+    | Ok () -> Int64.to_int (Vm_memory.pointer_to_int64 p)
+    | Error _ -> -errno_fault
+
+(* mmap: an anonymous mapping (fd < 0, the MAP_ANON spelling) allocates a
+   zeroed Raw arena region of the requested length — the seed memory
+   model's mapping is exactly that region, and the returned value is its
+   address in the Ptr-as-Int codec.  A file-backed mapping (fd >= 0)
+   fills the region from the file at the requested offset; mmap(2) does
+   not move the descriptor offset, so the host saves and restores it.  A
+   descriptor that does not name a regular file has no mapping to make
+   (ENODEV); an unknown guest fd is EBADF.  Protection bits and the
+   address hint have no representation in the region table and are
+   accepted but carry no effect; munmap is not part of the audited set,
+   so a mapping stays live for the life of the arena (the region-table
+   owner frees it at teardown). *)
+let host_mmap (t : t) (length : int) (fd : int) (offset : int) : int =
+  if length <= 0 then -errno_inval
+  else
+    match Vm_memory.alloc ~kind:Vm_memory.Raw t.memory length 4096 with
+    | Error _ -> -errno_nomem
+    | Ok p -> (
+        let addr () = Int64.to_int (Vm_memory.pointer_to_int64 p) in
+        let release code =
+          ignore (Vm_memory.free t.memory p);
+          code
+        in
+        if fd < 0 then addr ()
+        else
+          match guest_fd fd with
+          | None -> release (-errno_badf)
+          | Some d -> (
+              let kind_outcome =
+                try Ok (Unix.LargeFile.fstat d).Unix.LargeFile.st_kind
+                with Unix.Unix_error (e, _, _) -> Error (-errno_of_unix_error e)
+              in
+              match kind_outcome with
+              | Error code -> release code
+              | Ok k when k <> Unix.S_REG -> release (-errno_nodev)
+              | Ok _ ->
+                  let saved =
+                    try Some (Unix.LargeFile.lseek d 0L Unix.SEEK_CUR)
+                    with Unix.Unix_error _ -> None
+                  in
+                  let buf = Bytes.create length in
+                  let outcome =
+                    try
+                      ignore (Unix.LargeFile.lseek d (Int64.of_int offset) Unix.SEEK_SET);
+                      let rec read_from pos =
+                        if pos >= length then Ok ()
+                        else
+                          let n = Unix.read d buf pos (length - pos) in
+                          if n = 0 then Ok () else read_from (pos + n)
+                      in
+                      read_from 0
+                    with Unix.Unix_error (e, _, _) -> Error (-errno_of_unix_error e)
+                  in
+                  (match saved with
+                  | Some off -> (
+                      try ignore (Unix.LargeFile.lseek d off Unix.SEEK_SET)
+                      with Unix.Unix_error _ -> ())
+                  | None -> ());
+                  match outcome with
+                  | Error code -> release code
+                  | Ok () -> (
+                      match arena_store t p buf with
+                      | Ok () -> addr ()
+                      | Error _ -> release (-errno_fault))))
+
+(* ioctl: the OCaml Unix binding exposes no ioctl primitive, so the seed
+   host cannot issue even the one request the std carries (std/cli.tg's
+   TIOCGWINSZ terminal-size probe, whose fallback is the (80, 24)
+   default).  Every request on a known descriptor therefore reports
+   ENOTTY — the errno a non-terminal produces, and exactly the input the
+   std fallback path already handles; an unknown descriptor is EBADF.
+   The request value is read but has no implementable effect. *)
+let host_ioctl (t : t) (fd : int) (request : int) : int =
+  ignore t;
+  ignore request;
+  match guest_fd fd with None -> -errno_badf | Some _ -> -errno_notty
+
+(* Directory entries for the std read_dir wrapper.
+
+   std/fs.tg opens the directory through the raw open syscall and then
+   calls, on the macOS branch the seed target selects, the classic BSD
+   getdirentries(fd, buf, nbytes, basep) — record: u32 d_ino, u16
+   d_reclen, u8 d_type, u8 d_namlen, NUL-terminated name, records padded
+   to 4 bytes.  The Linux branch reads linux_dirent64 — u64 d_ino, u64
+   d_off, u16 d_reclen, u8 d_type, NUL-terminated name, records padded to
+   8 bytes.  The OCaml Unix API has no directory-read-by-descriptor call,
+   so the seed records the path host_open opened and reads its entries
+   through Sys.readdir, emitting them in SORTED order (deterministic;
+   the native call's OS order is not).  basep receives the next entry
+   index so the guest can resume; nread 0 marks the end.  A descriptor
+   that is not an open directory is EBADF, mirroring the native call's
+   failure on a non-directory description. *)
+
+let dirent_type_of_kind (k : Unix.file_kind) : int =
+  match k with
+  | Unix.S_FIFO -> 1
+  | Unix.S_CHR -> 2
+  | Unix.S_DIR -> 4
+  | Unix.S_BLK -> 6
+  | Unix.S_REG -> 8
+  | Unix.S_LNK -> 10
+  | Unix.S_SOCK -> 12
+
+(* The directory's sorted entry list, cached per guest descriptor. *)
+let host_dir_entries (fd : int) : (string array, int) result =
+  match Hashtbl.find_opt dir_cache fd with
+  | Some entries -> Ok entries
+  | None -> (
+      match Hashtbl.find_opt dir_paths fd with
+      | None -> Error (-errno_badf)
+      | Some path -> (
+          try
+            let entries =
+              Array.of_list (List.sort compare (Array.to_list (Sys.readdir path)))
+            in
+            Hashtbl.replace dir_cache fd entries;
+            Ok entries
+          with Sys_error _ -> Error (-errno_eio)))
+
+let host_getdirentries (t : t) (fd : int) (p : Vm_memory.pointer) (count : int)
+    (basep : Vm_memory.pointer option) : int =
+  if count <= 0 then -errno_inval
+  else
+    match (host_dir_entries fd, Hashtbl.find_opt dir_paths fd) with
+    | Error code, _ -> code
+    | Ok _, None -> -errno_badf
+    | Ok entries, Some path ->
+        let cursor =
+          match Hashtbl.find_opt dir_cursors fd with Some c -> c | None -> 0
+        in
+        let b = Buffer.create (min count 4096) in
+        let i = ref cursor in
+        let reclen_of name = (8 + min (String.length name) 255 + 1 + 3) land lnot 3 in
+        while !i < Array.length entries && Buffer.length b + reclen_of entries.(!i) <= count do
+          let name = entries.(!i) in
+          let namlen = min (String.length name) 255 in
+          let reclen = reclen_of name in
+          let rec_ = Bytes.make reclen '\000' in
+          let ino, dtype =
+            try
+              let st = Unix.LargeFile.lstat (Filename.concat path name) in
+              (st.Unix.LargeFile.st_ino, dirent_type_of_kind st.Unix.LargeFile.st_kind)
+            with Unix.Unix_error _ -> (0, 0) (* DT_UNKNOWN *)
+          in
+          Raw_memory.put_u64_le rec_ 0 4 (Int64.of_int ino);
+          Raw_memory.put_u64_le rec_ 4 2 (Int64.of_int reclen);
+          Bytes.set rec_ 6 (Char.chr dtype);
+          Bytes.set rec_ 7 (Char.chr namlen);
+          Bytes.blit_string name 0 rec_ 8 namlen;
+          Buffer.add_bytes b rec_;
+          incr i
+        done;
+        let nread = Buffer.length b in
+        (match arena_store t p (Buffer.to_bytes b) with
+        | Error _ -> -errno_fault
+        | Ok () ->
+            Hashtbl.replace dir_cursors fd !i;
+            (match basep with
+            | Some bp ->
+                let bb = Bytes.create 8 in
+                Raw_memory.put_u64_le bb 0 8 (Int64.of_int !i);
+                ignore (arena_store t bp bb)
+            | None -> ());
+            nread)
+
+let host_getdents64 (t : t) (fd : int) (p : Vm_memory.pointer) (count : int) : int =
+  if count <= 0 then -errno_inval
+  else
+    match (host_dir_entries fd, Hashtbl.find_opt dir_paths fd) with
+    | Error code, _ -> code
+    | Ok _, None -> -errno_badf
+    | Ok entries, Some path ->
+        let cursor =
+          match Hashtbl.find_opt dir_cursors fd with Some c -> c | None -> 0
+        in
+        let b = Buffer.create (min count 4096) in
+        let i = ref cursor in
+        let reclen_of name = (19 + min (String.length name) 255 + 1 + 7) land lnot 7 in
+        while !i < Array.length entries && Buffer.length b + reclen_of entries.(!i) <= count do
+          let name = entries.(!i) in
+          let namlen = min (String.length name) 255 in
+          let reclen = reclen_of name in
+          let rec_ = Bytes.make reclen '\000' in
+          let ino, dtype =
+            try
+              let st = Unix.LargeFile.lstat (Filename.concat path name) in
+              (st.Unix.LargeFile.st_ino, dirent_type_of_kind st.Unix.LargeFile.st_kind)
+            with Unix.Unix_error _ -> (0, 0) (* DT_UNKNOWN *)
+          in
+          Raw_memory.put_u64_le rec_ 0 8 (Int64.of_int ino);
+          Raw_memory.put_u64_le rec_ 8 8 (Int64.of_int (!i + 1));
+          Raw_memory.put_u64_le rec_ 16 2 (Int64.of_int reclen);
+          Bytes.set rec_ 18 (Char.chr dtype);
+          Bytes.blit_string name 0 rec_ 19 namlen;
+          Buffer.add_bytes b rec_;
+          incr i
+        done;
+        let nread = Buffer.length b in
+        (match arena_store t p (Buffer.to_bytes b) with
+        | Error _ -> -errno_fault
+        | Ok () ->
+            Hashtbl.replace dir_cursors fd !i;
+            nread)
+
 (* The raw syscall surface (__intrinsic_syscall1..6) ────────────────
    The direct kernel passes the standard library's canonical numbers to
    the target ABI (codegen adds 3 on macOS: read 0->3, write 1->4, open
@@ -1065,6 +1358,15 @@ let host_syscall (t : t) (n : int) (args : int array) : (int, string) result =
       match path_at 0 with
       | Error e -> Error e
       | Ok path -> Ok (host_chmod t path (arg 1)))
+  | 19 ->
+      (* ioctl(fd, request, argp) — the kernel/std TIOCGWINSZ case has no
+         implementable host primitive; the documented ENOTTY result is
+         the std fallback's input (see host_ioctl) *)
+      Ok (host_ioctl t (arg 0) (arg 1))
+  | 35 ->
+      (* dup(fd) — the audited raw number on both std branches (canonical
+         32 and the macOS constant 32) *)
+      Ok (host_dup (arg 0))
   | 57 -> (
       match (path_at 0, path_at 1) with
       | Error e, _ | _, Error e -> Error e
@@ -1130,6 +1432,24 @@ let host_syscall (t : t) (n : int) (args : int array) : (int, string) result =
                 match arena_store t (ptr 1) (host_stat_bytes st) with
                 | Ok () -> Ok 0
                 | Error _ -> Ok (-errno_fault))))
+  | 196 ->
+      (* getdirentries(fd, buf, nbytes, basep) — the macOS read_dir
+         branch's call (std/fs.tg passes 193) *)
+      let basep = if arg 3 = 0 then None else Some (ptr 3) in
+      Ok (host_getdirentries t (arg 0) (ptr 1) (arg 2) basep)
+  | 197 | 200 ->
+      (* mmap(addr, length, prot, flags, fd, offset) — the translated
+         number covers the pre-adjusted Darwin constant (194 -> 197) and
+         a target-native direct pass (197 -> 200); see host_mmap *)
+      Ok (host_mmap t (arg 1) (arg 4) (arg 5))
+  | 220 ->
+      (* getdents64(fd, buf, count) — the Linux read_dir branch's call
+         (std/fs.tg passes 217) *)
+      Ok (host_getdents64 t (arg 0) (ptr 1) (arg 2))
+  | 313 ->
+      (* getcwd(buf, size) — std/fs.tg's current_dir passes the macOS
+         constant 310 on this target branch *)
+      Ok (host_getcwd t (ptr 0) (arg 1))
   | 199 -> Ok (Int64.to_int (host_lseek (arg 0) (Int64.of_int (arg (1))) (arg 2)))
   | _ ->
       Error
@@ -2180,15 +2500,16 @@ let binding_manifest : binding list =
                  Error "argument mismatch: argv index out of range"
                else Ok (Vm_value.String t.argv.(n))
            | _ -> arg_mismatch "Int"));
-    (* ── The called kernel wrapper surface (audit §70; std/core.tg,
-       std/alloc.tg, std/collections.tg, std/taint.tg declarations).
-       Every wrapper below carries a REAL executable adapter on the
-       seed's value model, implementing the same observable semantics as
-       the native runtime helpers (_tg_string_* / _tg_str_* /
-       _tg_regex_match / _tg_float_to_str); where the seed host has no
-       executable semantics (raw memory, raw syscalls, VM function-value
-       invocation, unwinding) the adapter is the honest deterministic
-       trap — never a fabricated value. *)
+     (* ── The called kernel wrapper surface (audit §70; std/core.tg,
+        std/alloc.tg, std/collections.tg, std/taint.tg declarations).
+        Every wrapper below carries a REAL executable adapter on the
+        seed's value model, implementing the same observable semantics as
+        the native runtime helpers (_tg_string_* / _tg_str_* /
+        _tg_regex_match / _tg_float_to_str); where the seed host has no
+        executable semantics (raw memory, raw syscalls) the adapter is
+        the honest deterministic trap — never a fabricated value.  The
+        unwind pair and the guest-function invocation channel are
+        implemented above (the VM owns calls and traps). *)
 
     (* the borrowed `str` view (str and String are the ONE String value
        on the seed's value model). *)
@@ -2678,10 +2999,10 @@ let binding_manifest : binding list =
                | Some (x :: _) -> Ok (vm_option_some x)
                | Some [] | None -> Ok vm_option_none)
            | _ -> arg_mismatch "(Set, item)"));
-    (* ── raw memory / syscalls / control flow.  The arena makes the raw
-       memory surface executable; the control-flow wrappers that the
-       value model genuinely cannot host (function-value invocation, the
-       unwinder) stay deterministic traps. *)
+     (* ── raw memory / syscalls / control flow.  The arena makes the raw
+        memory surface executable; the unwind pair and guest-function
+        invocation are executable through the VM's invocation channel
+        (see the unwind bindings above). *)
     intrinsic_binding "__intrinsic_mem_alloc"
       (adapter_raw (lets [ Intrinsic_registry.ty_uint ]) (ptr_named Intrinsic_registry.ty_u8)
          (fun t args ->
@@ -2783,14 +3104,67 @@ let binding_manifest : binding list =
                 | Ok r -> Ok (vm_int r)
                 | Error e -> Error e)
            | _ -> arg_mismatch "(Int, Int, Int, Int, Int, Int, Int)"));
-    intrinsic_binding "__intrinsic_try_invoke"
-      (adapter_raw (lets [ fn0 p0 ]) (option_of p0) (fun _ _ ->
-           Error
-             "__intrinsic_try_invoke: function-value invocation is not available at the \
-              seed host boundary"));
-    intrinsic_binding "__intrinsic_longjmp"
-      (adapter_raw (lets [ ty_int ]) Type_repr.Unit (fun _ _ ->
-           Error "__intrinsic_longjmp: no active try frame in the seed host"));
+     (* ── The unwind pair (std/core.tg, EXPERIMENTAL) ─────────────────
+        __intrinsic_try_invoke[T](f: fn() -> T) -> Option[T]
+
+        The direct kernel's runtime implements the low-level C-style
+        primitives (tg_compiler/runtime.tg: __intrinsic_setjmp saving
+        callee-saved registers + SP + return address into a jmp_buf, and
+        __intrinsic_longjmp restoring them), and std/core.tg defines the
+        frame-id protocol on top: catch_unwind pushes a CatchFrame with
+        the id it computed, begin_unwind stores the payload in
+        `_current_panic` and longjmps to the top active frame's id.  The
+        direct compiler has no lowering for the std-level pair, so the
+        seed host defines its executable semantics at the VM boundary:
+        the host cannot run guest code itself, so it hands the fn value
+        to the VM's invocation channel (t.invoke_guest, installed by
+        Vm.run_li / Vm.entry_frame_of_li) and converts the outcome to the
+        language shape — Option::Some(value) on a normal return,
+        Option::None on any guest trap or guest unwind.  The trap text
+        stays observable: the VM records it in the guest's own
+        `_current_panic` payload static (the channel catch_unwind reads),
+        exactly the payload begin_unwind would have stored. *)
+     intrinsic_binding "__intrinsic_try_invoke"
+       (adapter_raw (lets [ fn0 p0 ]) (option_of p0) (fun t args ->
+            match args with
+            | [| (Vm_value.Function _ | Vm_value.Closure _) as fv |] -> (
+                match t.invoke_guest with
+                | None ->
+                    Error
+                      "__intrinsic_try_invoke: no running VM is attached to this host \
+                       (the guest-function invocation channel is installed by Vm.run)"
+                | Some invoke -> (
+                    match invoke fv with
+                    | Ok v -> Ok (Vm_value.Enum (0, [| v |]))
+                    | Error _ -> Ok (Vm_value.Enum (1, [||]))))
+            | [| _ |] ->
+                Error
+                  "__intrinsic_try_invoke: argument is not a function value (expected a \
+                   fn() -> T value)"
+            | _ -> arg_mismatch "(fn() -> T)"));
+
+     (* __intrinsic_longjmp(frame_id: Int) -> Unit
+
+        The seed host delivers the guest's unwind to the innermost active
+        try_invoke invocation by raising Host.Unwind (the VM catches it in
+        invoke_guest_value and returns Option::None).  The guest-supplied
+        frame id is not equality-matched: the VM cannot read the guest's
+        own `_catch_frame_stack` static, and std/core.tg's begin_unwind
+        always selects the TOP frame, so the innermost active handler IS
+        the target by construction.  With no active handler there is no
+        frame to restore, and the longjmp stays the precise deterministic
+        host error (a guest program reaching it has not installed the
+        corresponding try_invoke). *)
+     intrinsic_binding "__intrinsic_longjmp"
+       (adapter_raw (lets [ ty_int ]) Type_repr.Unit (fun t args ->
+            match args with
+            | [| Vm_value.Int id |] ->
+                if t.unwind_depth <= 0 then
+                  Error
+                    "__intrinsic_longjmp: no active try frame (the seed host delivers an \
+                     unwind only into an enclosing __intrinsic_try_invoke invocation)"
+                else raise (Unwind (Int64.to_int (Int_value.to_int64 id)))
+            | _ -> arg_mismatch "Int"));
     intrinsic_binding "__intrinsic_regex_match"
       (adapter_raw (lets [ Type_repr.String; Type_repr.String ]) ty_bool
          (fun _ args ->
@@ -3527,6 +3901,8 @@ let create_with ~repo_root ~(argv : string array) ~(intrinsics : Intrinsic_regis
     stderr = Buffer.create 4096;
     memory = Vm_memory.create ();
     array_links = Hashtbl.create 16;
+    invoke_guest = None;
+    unwind_depth = 0;
     in_fork_child = false;
   }
 

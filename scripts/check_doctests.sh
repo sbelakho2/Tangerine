@@ -153,6 +153,7 @@ EXCLUDED_DOCS=(
   "registry_policy.md	no fenced Tangerine examples"
   "security.md	no fenced Tangerine examples"
   "supply_chain.md	no fenced Tangerine examples"
+  "ci.md	CI setup document (Woodpecker workflows; fenced blocks are YAML/bash, not Tangerine examples)"
 )
 
 # ── known parse-stage diagnostic phrases (the compiler's texts) ────────────

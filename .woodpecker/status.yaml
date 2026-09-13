@@ -1,0 +1,113 @@
+# .woodpecker/status.yaml — Status snapshot (tested SHA + artifact hashes +
+# the release evidence).
+#
+# Migrated from GitHub Actions job `status`:
+#   * downloads every run artifact into build/.status_artifacts/<name>/
+#     (one directory per artifact name — the release-evidence schema
+#     requires exactly one subdirectory per required artifact);
+#   * records the ACTUAL job conclusions: this port collects the
+#     `build/.ci_results/<job>` success markers the producing workflows
+#     publish to ci-results/ (the Woodpecker replacement for GitHub's
+#     toJSON(needs) — a marker exists only when the step actually
+#     succeeded);
+#   * runs scripts/gen_status.sh --release-evidence from the TESTED SHA
+#     and uploads `status-snapshot-<tested-sha>`.
+#
+# A failing release gate writes NO evidence file and FAILS this workflow
+# (the honest state); `release-proof` then fails its gate (PENDING
+# categories). This workflow is deliberately NOT in the release gate.
+#
+# Linux/amd64 container lane (pure shell + python3 + artifact hashing).
+
+labels:
+  platform: linux/amd64
+  backend: docker
+
+when:
+  - event: push
+    branch: [main, dev]
+  - event: pull_request
+    branch: [main, "release/**"]
+
+depends_on:
+  - bootstrap
+  - verify-core
+  - verify-stdlib
+  - verify-gfx
+  - verify-cross
+  - evidence-gate
+  - linux-native
+
+steps:
+  - name: restore-artifacts
+    image: amazon/aws-cli:2.36.44
+    entrypoint: ["/bin/bash", "-c"]
+    environment: &tg_s3_env
+      AWS_ACCESS_KEY_ID:
+        from_secret: s3_access_key
+      AWS_SECRET_ACCESS_KEY:
+        from_secret: s3_secret_key
+      AWS_DEFAULT_REGION: us-east-1
+      TG_S3_BUCKET: tangerine-ci
+      TG_S3_ENDPOINT: http://127.0.0.1:9000
+    commands:
+      - |
+        set -euo pipefail
+        aws configure set default.s3.addressing_style path
+        mkdir -p build/.status_artifacts build/.ci_results
+        BASE="s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER"
+        for a in tg-stages-macos-arm64 bootstrap-fingerprints bootstrap-native-tests cross-lane-binaries linux-fingerprints linux-native-tests; do
+          mkdir -p "build/.status_artifacts/$a"
+          aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive "$BASE/$a" "build/.status_artifacts/$a" --no-progress
+        done
+        aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive "$BASE/ci-results" build/.ci_results --no-progress
+
+  - name: build-job-results
+    image: python:3.12-bookworm
+    entrypoint: ["/bin/bash", "-c"]
+    depends_on: [restore-artifacts]
+    commands:
+      - |
+        set -euo pipefail
+        mkdir -p build/.status_generated
+        python3 - build/.ci_results build/.status_generated/job_results.json <<'PY'
+        import json, os, sys
+        src, out = sys.argv[1], sys.argv[2]
+        results = {}
+        if os.path.isdir(src):
+            for name in sorted(os.listdir(src)):
+                p = os.path.join(src, name)
+                if os.path.isfile(p):
+                    results[name] = {"result": open(p, encoding="utf-8").read().strip() or "unobserved"}
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(results, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        print("recorded job conclusions: %d" % len(results))
+        PY
+
+  - name: status
+    image: python:3.12-bookworm
+    entrypoint: ["/bin/bash", "-c"]
+    depends_on: [build-job-results]
+    commands:
+      - |
+        set -euo pipefail
+        ./scripts/gen_status.sh \
+          --artifacts build/.status_artifacts/ \
+          --release-evidence build/.status_artifacts \
+          --job-results build/.status_generated/job_results.json \
+          build/.status_generated/STATUS.txt
+        cp build/release_evidence.json build/.status_generated/ 2>/dev/null || true
+        echo "SHA=$(git rev-parse HEAD)" | tee -a build/.status_generated/SHA.txt
+
+  - name: upload-status-snapshot
+    image: amazon/aws-cli:2.36.44
+    entrypoint: ["/bin/bash", "-c"]
+    depends_on: [status]
+    environment: *tg_s3_env
+    commands:
+      - |
+        set -euo pipefail
+        aws configure set default.s3.addressing_style path
+        aws --endpoint-url "$TG_S3_ENDPOINT" s3 cp --recursive build/.status_generated "s3://$TG_S3_BUCKET/$CI_REPO/$CI_PIPELINE_NUMBER/status-snapshot-$CI_COMMIT_SHA" --no-progress
+        echo "✓ status snapshot uploaded (status-snapshot-$CI_COMMIT_SHA)"

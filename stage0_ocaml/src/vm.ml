@@ -2016,6 +2016,157 @@ and value_kind (v : Vm_value.t) : string =
   | Vm_value.Null -> "null"
   | Vm_value.MovedOut -> "moved-out-hole"
 
+(* ── The guest-function invocation channel (__intrinsic_try_invoke) ──
+
+   The host adapter for try_invoke hands the guest fn value here: the VM
+   owns call execution and trap handling, so it runs the value through
+   the SAME user-call machinery as a FnValue call terminator (function
+   lookup, one-time frame-shape validation, capture binding, return-slot
+   extraction) and converts the outcome for the adapter:
+
+     - normal return        -> Ok value   (adapter builds Option::Some);
+     - guest trap (Failure) -> Error text (adapter builds Option::None)
+       with the text stored in the guest's own `_current_panic` static —
+       the payload channel std/core.tg's catch_unwind reads after
+       try_invoke returns None;
+     - guest unwind (Host.Unwind, raised by __intrinsic_longjmp) ->
+       Error (adapter builds Option::None); the unwinding guest already
+       stored its payload in `_current_panic` (begin_unwind writes it
+       before longjmping), so this path never clobbers it.
+
+   The VM stack state (frames/depth) and the host's active-handler count
+   are restored on every exit, so a caught trap or unwind leaves the VM
+   exactly as it was before the invocation.  The unwind path does not run
+   per-frame resource cleanup — the same documented contract as the
+   direct kernel's experimental unwind machinery (std/core.tg: generated
+   deinit chains run only on normal control flow). *)
+
+and invoke_guest_value (vm : t) (statics : Vm_value.slot array) (fv : Vm_value.t) :
+    (Vm_value.t, string) result =
+  match fv with
+  | Vm_value.Function _ | Vm_value.Closure _ -> (
+      let inst, caps =
+        match fv with
+        | Vm_value.Function inst -> (inst, [||])
+        | Vm_value.Closure (inst, caps) -> (inst, caps)
+        | _ -> assert false
+      in
+      match find_fn vm inst with
+      | None ->
+          Error
+            (Printf.sprintf "fn-value call: unknown instance %s"
+               (Seed_mir.print_instance inst))
+      | Some fn_idx ->
+          let fn = vm.program.Seed_mir.functions.(fn_idx) in
+          let nparams = Array.length fn.Seed_mir.params in
+          if Array.length caps <> nparams then
+            Error
+              (Printf.sprintf
+                 "fn-value call: %s declares %d parameter(s) but the function value \
+                  carries %d capture(s)"
+                 fn.Seed_mir.name nparams (Array.length caps))
+          else begin
+            let saved_frames = vm.frames and saved_depth = vm.depth in
+            let restore () =
+              vm.frames <- saved_frames;
+              vm.depth <- saved_depth;
+              vm.host.Host.unwind_depth <- vm.host.Host.unwind_depth - 1
+            in
+            vm.host.Host.unwind_depth <- vm.host.Host.unwind_depth + 1;
+            try
+              if not vm.shape_checked.(fn_idx) then begin
+                check_fn_shape vm fn_idx;
+                vm.shape_checked.(fn_idx) <- true
+              end;
+              vm.depth <- vm.depth + 1;
+              if vm.depth > vm.limits.max_depth then
+                raise (Failure "call depth exceeded");
+              let callee_frame =
+                {
+                  fn = fn_idx;
+                  locals =
+                    Array.make (Array.length fn.Seed_mir.locals) Vm_value.Uninitialized;
+                  statics;
+                  block = fn.Seed_mir.entry;
+                  stmt = 0;
+                }
+              in
+              Array.iteri
+                (fun i v ->
+                  if i + 1 < Array.length callee_frame.locals then
+                    callee_frame.locals.(i + 1) <- Vm_value.Live v)
+                caps;
+              (try run_frame vm callee_frame with Exit -> ());
+              let ret =
+                match callee_frame.locals.(0) with
+                | Vm_value.Live v -> v
+                | Vm_value.Uninitialized ->
+                    if fn.Seed_mir.locals.(0) = Type_repr.Unit then Vm_value.Unit
+                    else
+                      raise
+                        (Failure
+                           (Printf.sprintf
+                              "callee %s returned with an uninitialized return slot (declared \
+                               return type %s is not unit)"
+                              fn.Seed_mir.name
+                              (Seed_mir.print_type fn.Seed_mir.locals.(0))))
+                | Vm_value.Moved | Vm_value.Dropped ->
+                    raise
+                      (Failure
+                         (Printf.sprintf "callee %s returned with a non-live return slot"
+                            fn.Seed_mir.name))
+              in
+              restore ();
+              Ok ret
+            with
+            | Failure msg ->
+                (* a guest trap: record its text in the guest's payload
+                   static so catch_unwind can observe it *)
+                set_unwind_payload vm statics msg;
+                restore ();
+                Error msg
+            | Host.Unwind _ ->
+                restore ();
+                Error "__intrinsic_try_invoke: guest unwind"
+            | exn ->
+                restore ();
+                raise exn
+          end)
+  | _ ->
+      Error
+        "__intrinsic_try_invoke: argument is not a function value (expected a fn() -> T \
+         value)"
+
+(* Record a caught trap's text in the guest's `_current_panic` static —
+   the ONE channel std/core.tg's catch_unwind reads after try_invoke
+   returns Option::None.  The value is Option::Some(PanicPayload::Message(
+   text)): Option::Some is variant 0, PanicPayload::Message is variant 0
+   (std/core.tg declaration order).  A program without that static (a
+   hand-built MIR program, or a closure that does not carry std::core's
+   panic state) has no payload channel; the text then stays the VM
+   diagnostic returned to the adapter.  The name is matched on its bare
+   component, since the statics table keys declarations by their
+   module-qualified name. *)
+and set_unwind_payload (vm : t) (statics : Vm_value.slot array) (msg : string) : unit =
+  let bare name =
+    match String.rindex_opt name ':' with
+    | Some k when k + 1 < String.length name ->
+        String.sub name (k + 1) (String.length name - k - 1)
+    | _ -> name
+  in
+  let n = Array.length vm.program.Seed_mir.statics in
+  let rec go i =
+    if i < n then begin
+      let name, _ty, mutable_, _init = vm.program.Seed_mir.statics.(i) in
+      if mutable_ && bare name = "_current_panic" then
+        statics.(i) <-
+          Vm_value.Live
+            (Vm_value.Enum (0, [| Vm_value.Enum (0, [| Vm_value.String msg |]) |]))
+      else go (i + 1)
+    end
+  in
+  go 0
+
 (* ── the GLOBAL storage ──────────────────────────────── *)
 let statics_initial_values (program : Seed_mir.program) : Vm_value.slot array =
   Array.map
@@ -2124,6 +2275,13 @@ let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
              if i < Array.length entry_frame.locals then
                entry_frame.locals.(i) <- Vm_value.Live (Vm_value.String s))
            argv;
+         (* Install the guest-function invocation channel used by
+            __intrinsic_try_invoke: the callback runs through the entry
+            frame's STORAGE array, which every callee shares, so a panic
+            payload the invoked function stores becomes visible to the
+            caller's catch_unwind. *)
+         vm.host.Host.invoke_guest <-
+           Some (fun fv -> invoke_guest_value vm entry_frame.statics fv);
          Ok (vm, entry_frame)
        with
       | Failure msg -> Error msg)
@@ -2146,6 +2304,13 @@ let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
          libc buffers) and VM-created computed refs share the address
          space. *)
       vm.memory <- host.Host.memory;
+      (* Attach the invocation channel to the caller-supplied host (the
+         host record is reused across runs; the callback always names the
+         run that just started).  unwind_depth starts at zero: no
+         try_invoke handler is active until the guest calls one. *)
+      host.Host.invoke_guest <-
+        Some (fun fv -> invoke_guest_value vm entry_frame.statics fv);
+      host.Host.unwind_depth <- 0;
       (try
          run_frame vm entry_frame;
          (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
