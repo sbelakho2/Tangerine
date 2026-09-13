@@ -87,6 +87,12 @@ type table = {
   by_id : (Ids.Type_id.t, plan) Hashtbl.t;
   types : Seed_mir.type_def array; (* the def table the plans are derived from *)
   lang_items : Lang_items.t;       (* the compilation's LangItems record *)
+  (* the materialized instances of the owning Box nominal: their def
+     shape ({ ptr: Ptr[T] }) is a raw-pointer struct structurally, so the
+     property engine must classify these ids as owning direct properties
+     — the ownership classification of a genuine Box instance, never
+     an identity reconciliation (Box[T] != T). *)
+  box_instances : Ids.Type_id.t list;
 }
 
 (* ── Plan construction (per program, once) ─────────────────────────
@@ -107,8 +113,13 @@ let find_def (tbl : table) (tid : Ids.Type_id.t) : Seed_mir.type_def option =
    builtin-id knowledge, no fake tuple shapes. *)
 let engine_resolve (tbl : table) : Type_properties.def_resolver =
   Type_properties.with_lang_items (Some tbl.lang_items)
-    (Type_properties.structural_resolver (fun tid ->
-       Option.map Seed_mir.def_repr (find_def tbl tid)))
+    (fun tid ->
+      if List.exists (fun b -> Ids.Type_id.compare b tid = 0) tbl.box_instances then
+        Type_properties.Direct_properties Type_properties.owning_handle
+      else
+        Type_properties.structural_resolver (fun tid ->
+          Option.map Seed_mir.def_repr (find_def tbl tid))
+          tid)
 
 let needs_drop_of (tbl : table) (cache : Type_properties.cache) (ty : Type_repr.t) : bool =
   let p = Type_properties.of_type_cached cache (Some (engine_resolve tbl)) ty in
@@ -202,9 +213,9 @@ let plan_of_def (tbl : table) (cache : Type_properties.cache) (tid : Ids.Type_id
       }
 
 let of_program ?(lang_items : Lang_items.t = Lang_items.seed_defaults)
-    (prog : Seed_mir.program) : table =
+    ?(box_instances : Ids.Type_id.t list = []) (prog : Seed_mir.program) : table =
   let tbl =
-    { by_id = Hashtbl.create 256; types = prog.Seed_mir.types; lang_items }
+    { by_id = Hashtbl.create 256; types = prog.Seed_mir.types; lang_items; box_instances }
   in
   let cache = Type_properties.create_cache () in
   Array.iter

@@ -57,7 +57,6 @@ let check_src (tag : string) (src : string) : string =
               in
               (match
                 Mir_verify.require_valid_template
-                  ~box_tid:(env.Typecheck.state.box_tid)
                   ~generic_types:(Driver.closure_generic_types env)
                   ~query_sigs:(Driver.closure_query_sigs ~lowered:(Some prog_mir) env)
                   prog_mir

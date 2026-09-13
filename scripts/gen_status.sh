@@ -827,12 +827,30 @@ d = json.load(open(sys.argv[1], encoding="utf-8"))
 print(len(d.get("artifact_hashes", [])))
 PY
 )"
+      EVIDENCE_INV_DIGEST="$(python3 - "$ROOT/build/release_evidence.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+ie = d.get("invariant_evidence") or {}
+print(ie.get("registry_digest") or "MISSING (no invariants-evidence artifact)")
+PY
+)"
+      EVIDENCE_INV_SHA="$(python3 - "$ROOT/build/release_evidence.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+ie = d.get("invariant_evidence") or {}
+print(ie.get("tested_commit_sha") or "unknown")
+PY
+)"
       RELEASE_EVIDENCE_TEXT="  release evidence WRITTEN: build/release_evidence.json
     tested_sha:      $SHA
     release-gated:   $(printf '%s' "$RELEASE_GATED_LIST" | wc -w | tr -d ' ') feature(s)
     artifact set:    $EVIDENCE_ARTIFACT_COUNT artifact(s) recorded with
                      $EVIDENCE_HASH_LINE_COUNT per-file sha-256 line(s) read
                      from the ACTUAL files (the \"present\" shorthand is gone)
+    invariant evid:  registry_digest $EVIDENCE_INV_DIGEST
+                     (tested_commit_sha $EVIDENCE_INV_SHA; the validator
+                     recomputes the digest from the tested tree's
+                     invariants.toml — the old committed-SHA scheme is gone)
     job conclusions: $(if [ -n "$JOB_RESULTS" ] && [ -f "$JOB_RESULTS" ]; then echo "recorded from $JOB_RESULTS (the ACTUAL observed results)"; else echo "NOT RECORDED (no --job-results file — the fail-closed validation will fail the categories)"; fi)
     verdicts:        stage2 == stage3, the semantic-fingerprint equality
                      (tokens/ast/hir/mir/mir-mono), and the linux fixed

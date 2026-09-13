@@ -12,6 +12,20 @@
 #   5. an extra unlisted artifact           -> INVALID -> the categories FAIL
 #   6. no evidence file                     -> the categories PENDING-UNTIL-LADDER
 #   7. stale evidence (tested_sha mismatch) -> the categories PENDING-UNTIL-LADDER
+#   8. a missing invariants-evidence artifact  -> INVALID -> FAIL
+#   9. an invariants-evidence registry_digest that contradicts the tested
+#      tree's invariants.toml                  -> INVALID -> FAIL
+#
+# Cases 8/9 are what the new invariant-attestation model requires: the
+# old committed last_verified_sha scheme is gone (a committed file cannot
+# know its own commit SHA), so the portable evidence is the external
+# invariants-evidence artifact — tested_commit_sha + registry_digest (the
+# CONTENT digest of the registry definitions, recomputed from the tested
+# tree by the shared canonical codec scripts/invariant_registry.py) +
+# compiler_digest + checks + test_evidence + build identity. The release
+# validator therefore REQUIRES the artifact and the digest to match the
+# tested tree; the tests build the matching digest with the same codec,
+# which is the only justified change to the previous expectations.
 #
 # The evidence itself is FAKE (scratch files); the validation is the REAL
 # scripts/release_evidence_schema.sh — pure bash + python3, no ladder.
@@ -56,7 +70,8 @@ make_valid_dir() { # make_valid_dir <dir> ; builds the COMPLETE artifact set
   local d="$1"
   rm -rf "$d"
   for a in tg-stages-macos-arm64 bootstrap-fingerprints bootstrap-native-tests \
-           cross-lane-binaries linux-fingerprints linux-native-tests; do
+           cross-lane-binaries linux-fingerprints linux-native-tests \
+           invariants-evidence; do
     mkdir -p "$d/$a"
   done
   # The stage binaries (stage2 == stage3 byte-identical).
@@ -112,6 +127,35 @@ make_valid_dir() { # make_valid_dir <dir> ; builds the COMPLETE artifact set
   mkdir -p "$d/cross-lane-binaries/.cross_lane_x86_64"
   printf 'x86_64 cross-lane binary\n' > "$d/cross-lane-binaries/.cross_lane_x86_64/bin"
   printf 'linux native canary\n' > "$d/linux-native-tests/lnx_canary"
+  # The invariant-registry attestation. The registry_digest and the
+  # invariant count are RECOMPUTED from the tested tree's invariants.toml
+  # with the shared canonical codec (the same definition the generator and
+  # the validator use) — a fake digest would be rejected, which is the
+  # point of cases 8/9.
+  python3 - "$ROOT" "$TESTED_SHA" "$d/invariants-evidence/invariants-evidence.json" <<'PY'
+import json, os, sys
+root, sha, out = sys.argv[1:4]
+sys.path.insert(0, os.path.join(root, "scripts"))
+import invariant_registry as ir
+with open(os.path.join(root, "invariants.toml"), encoding="utf-8") as fh:
+    doc = ir.parse_toml(fh.read())
+evidence = {
+    "schema_version": 1,
+    "generated_by": "tests/run_release_evidence_schema_tests.sh (fake artifact; real digest)",
+    "timestamp_utc": "2026-08-22T00:00:00Z",
+    "tested_commit_sha": sha,
+    "registry_digest": ir.registry_digest(doc),
+    "compiler_digest": "sha256:" + "0" * 64,
+    "checks": {"passed": True},
+    "test_evidence": {
+        "totals": {"invariants": len(ir.definitions(doc))},
+        "matched_files_digest": "sha256:" + "1" * 64,
+    },
+}
+with open(out, "w", encoding="utf-8") as fh:
+    json.dump(evidence, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
 }
 
 write_valid_job_results() { # write_valid_job_results <file>
@@ -252,6 +296,28 @@ EV7="$SCRATCH/evidence_stale"
 make_valid_dir "$EV7"
 build_release_evidence "$EV7" "$EV7/release_evidence.json" "feedfacefeedfacefeedfacefeedfacefeedface" "$JOB_RESULTS" "" "2026-08-22T00:00:00Z"
 expect_rows_state "the stale evidence (a matching-SHA test alone is never a proof) stays PENDING-UNTIL-LADDER" "$EV7/release_evidence.json" "$TESTED_SHA" "PENDING-UNTIL-LADDER"
+
+echo "=== case 8: a missing invariants-evidence artifact -> INVALID -> the categories FAIL ==="
+EV8="$SCRATCH/evidence_missing_invariants"
+make_valid_dir "$EV8"
+rm -rf "$EV8/invariants-evidence"
+build_release_evidence "$EV8" "$EV8/release_evidence.json" "$TESTED_SHA" "$JOB_RESULTS" "" "2026-08-22T00:00:00Z"
+expect_rows_state "the missing invariant-registry attestation fails the categories" "$EV8/release_evidence.json" "$TESTED_SHA" "FAIL"
+
+echo "=== case 9: an invariants-evidence digest contradicting the tested tree -> INVALID -> the categories FAIL ==="
+EV9="$SCRATCH/evidence_wrong_invariant_digest"
+make_valid_dir "$EV9"
+python3 - "$EV9/invariants-evidence/invariants-evidence.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+doc = json.load(open(path, encoding="utf-8"))
+doc["registry_digest"] = "sha256:" + "f" * 64
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(doc, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+build_release_evidence "$EV9" "$EV9/release_evidence.json" "$TESTED_SHA" "$JOB_RESULTS" "" "2026-08-22T00:00:00Z"
+expect_rows_state "the registry digest that does not match the tested tree's invariants.toml fails the categories" "$EV9/release_evidence.json" "$TESTED_SHA" "FAIL"
 
 echo ""
 echo "release-evidence schema tests: $PASS passed, $FAIL failed"

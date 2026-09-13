@@ -53,10 +53,12 @@ use tg_compiler::types::{
 }
 use tg_compiler::ids::{
   FieldId, VariantId, DefId, DefKind, CallableId, InstanceId, ModuleId,
-  GenericParamId, GenericParamTable, generic_param_table_new, fresh_synthetic_owner,
+  GenericParamId, GenericParamTable, GenericArg,
+  generic_param_table_new, fresh_synthetic_owner,
   intern_generic_param, generic_param_id_numeric,
   generic_param_name_from, def_id_numeric, LocalId, NodeId, ClosureId, IntrinsicId,
-  FinalizerKind, EffectId
+  FinalizerKind, EffectId,
+  generic_args_of_types, generic_arg_type_view
 }
 use tg_compiler::resolver::{module_path_of_item_resolver, def_kind_of, ResolvedNames, stable_id_map_new, module_qualified_key}
 use tg_compiler::resource_check::{AnalyzedProgram, IterationPlan, TypedIteration, TypedCFG, CleanupAction, CfgEdgeKind, engine_env_empty}
@@ -78,7 +80,9 @@ use tg_compiler::stable_ids::{
   stable_mir_block_id_of_control_generated,
   stable_mir_semantic_edge_id, stable_mir_semantic_edge_of_key,
   stable_structural_call_id, stable_structural_call_of_key,
-  stable_callable_instance_id_of
+  stable_callable_instance_id_of,
+  UntrackedArtifact, untracked_artifact, untracked_artifact_text,
+  untracked_artifact_error
 }
 
 # ———————————————————————————————————————————————————————————————
@@ -1849,12 +1853,13 @@ struct MirBuilder
   # carries the semantic callable identity instead of re-resolving by name.
   call_def_ids: Map[Int, DefId]
  # (final): call expr node id -> the type checker's SOLVED generic
-  # substitution (the callee's generic args in the callee's parameter
-  # order), paired with call_def_ids. The solved substitutions from the
-  # type checker are the AUTHORITY; the monomorphizer's inference is the
-  # FALLBACK for synthesized/unsolved calls — mir_call_instance fills the
-  # instance's substs from this map; absent entries keep empty substs.
-  call_instances: Map[Int, Vec[Type]]
+  # substitution (the callee's generic arguments in declared binder order,
+  # as the typed GenericArg union — P0-5), paired with call_def_ids. The
+  # solved substitutions from the type checker are the AUTHORITY; the
+  # monomorphizer's inference is not part of the model for
+  # synthesized/unsolved calls — mir_call_instance fills the instance's
+  # args from this map; absent entries keep empty args.
+  call_instances: Map[Int, Vec[GenericArg]]
  # (IntrinsicId through MirCall): the checker's per-call semantic
   # intrinsic classification (TypedProgram.typed_intrinsics — call expr
   # node id -> IntrinsicId, attached at call-recording time). The lowering
@@ -2642,7 +2647,7 @@ end
 # template form).
 def mir_verified_deinit_call(b: MirBuilder, callable: CallableId, args: Vec[Type]) -> DeinitPlan
   if mir_deinit_callable_is_registered(b, callable) then
-    DeinitPlan::Call(InstanceId { def: callable.clone(), substs: args.clone() })
+    DeinitPlan::Call(InstanceId { def: callable.clone(), args: generic_args_of_types(args.clone()) })
   else
     panic("internal error: invalid finalizer identity at MIR plan construction (every DeinitPlan payload is a verified registered drop-glue identity)")
   end
@@ -2653,7 +2658,7 @@ end
 # the finalizer identity that later emits as a MirDeinit).
 def mir_verified_deinit_finalizer(b: MirBuilder, callable: CallableId, args: Vec[Type], fields_plan: DeinitPlan) -> DeinitPlan
   if mir_deinit_callable_is_registered(b, callable) then
-    DeinitPlan::UserFinalizer(InstanceId { def: callable.clone(), substs: args.clone() }, fields_plan)
+    DeinitPlan::UserFinalizer(InstanceId { def: callable.clone(), args: generic_args_of_types(args.clone()) }, fields_plan)
   else
     panic("internal error: invalid finalizer identity at MIR plan construction (every DeinitPlan payload is a verified registered drop-glue identity)")
   end
@@ -3457,7 +3462,7 @@ def mir_string_drop_instance(inout b: MirBuilder) -> InstanceId
   end
   let sd_def = DefId { module: ModuleId { id: -2 }, index: b.drop_glue_counter as UInt }
   b.drop_glue_counter = b.drop_glue_counter + 1
-  let sd_inst = InstanceId { def: CallableId { def: sd_def }, substs: Vec::new() }
+  let sd_inst = InstanceId { def: CallableId { def: sd_def }, args: Vec::new() }
   b.drop_glue_instances.insert("StringDrop".to_string(), sd_inst.clone())
   b.drop_glue_fns.insert(def_id_numeric(&sd_def), "_tg_string_drop".to_string())
   sd_inst  end
@@ -3480,7 +3485,7 @@ def mir_glue_instance_for_type(inout b: MirBuilder, ty: Type) -> InstanceId
   let glue_def = DefId { module: ModuleId { id: -2 }, index: b.drop_glue_counter as UInt }
   b.drop_glue_counter = b.drop_glue_counter + 1
   let callable = CallableId { def: glue_def }
-  let inst = InstanceId { def: callable, substs: Vec::new() }
+  let inst = InstanceId { def: callable, args: Vec::new() }
   let name = mir_drop_glue_name(ty)
   b.drop_glue_instances.insert(key.clone(), inst.clone())
   b.drop_glue_names.insert(key.clone(), name.clone())
@@ -9582,7 +9587,7 @@ def lower_vec_like_from_array_call(inout b: MirBuilder, path: AstPath, elems: Ve
   # type); the name-only form is kept only when the DefId is absent.
   let new_callee = norm_owner.clone() + "__new"
   let new_instance = match b.method_def_ids.get(&new_callee)
-  when Option::Some(did) then Option::Some(InstanceId { def: CallableId { def: did.clone() }, substs: vec![elem_ty.clone()] })
+  when Option::Some(did) then Option::Some(InstanceId { def: CallableId { def: did.clone() }, args: generic_args_of_types(Vec::from([elem_ty.clone()])) })
   when Option::None then Option::None
   end
 
@@ -9606,7 +9611,7 @@ def lower_vec_like_from_array_call(inout b: MirBuilder, path: AstPath, elems: Ve
 
   let push_callee = norm_owner.clone() + "__push"
   let push_instance = match b.method_def_ids.get(&push_callee)
-  when Option::Some(did) then Option::Some(InstanceId { def: CallableId { def: did.clone() }, substs: vec![elem_ty.clone()] })
+  when Option::Some(did) then Option::Some(InstanceId { def: CallableId { def: did.clone() }, args: generic_args_of_types(Vec::from([elem_ty.clone()])) })
   when Option::None then Option::None
   end
 
@@ -10574,10 +10579,10 @@ def mir_call_instance(b: MirBuilder, call_node_id: Int) -> Option[InstanceId]
   when Option::Some(did_v) then
  # the ids.tg InstanceId shape — the def field
     # is the CallableId newtype wrapping the call target's DefId
-    # (InstanceId { def: CallableId { def: did }, substs }).
+    # (InstanceId { def: CallableId { def: did }, args }).
     match b.call_instances.get(call_node_id)
-    when Option::Some(substs) then Option::Some(InstanceId { def: CallableId { def: did_v }, substs: substs.clone() })
-    when Option::None then Option::Some(InstanceId { def: CallableId { def: did_v }, substs: Vec::new() })
+    when Option::Some(args) then Option::Some(InstanceId { def: CallableId { def: did_v }, args: args.clone() })
+    when Option::None then Option::Some(InstanceId { def: CallableId { def: did_v }, args: Vec::new() })
     end
   when Option::None then Option::None
   end
@@ -15305,7 +15310,7 @@ def lower_for_projected(inout b: MirBuilder, pat: Pattern, iter: Expr, body: Blo
   # monomorphizer's fail-closed check then reports it).
   let len_instance = match b.method_def_ids.get(&len_callee)
   when Option::Some(did) then
-    Option::Some(InstanceId { def: CallableId { def: did.clone() }, substs: vec![elem_ty.clone()] })
+    Option::Some(InstanceId { def: CallableId { def: did.clone() }, args: generic_args_of_types(Vec::from([elem_ty.clone()])) })
   when Option::None then Option::None
   end
   let len_ret = add_temp(b, Type::Int, span)
@@ -17546,6 +17551,12 @@ def optimize_mir_impl(inout program: MirProgram, opt_level: Int, verify_everythi
   # recovery origin; every preserved origin is untouched.
   if program.origins_enforced then
     mir_origins_recover(program)
+    # (audit order item 1 closeout) FAIL CLOSED at the post-optimization
+    # boundary: every optimizer-synthesized node must carry its generated
+    # origin by construction; a surviving origin-less node panics with the
+    # precise node context (the fail-closed checkpoint — a locator is never
+    # substituted downstream).
+    mir_origins_checkpoint(program.clone(), "post-optimization".to_string())
   end
 end
 
@@ -23346,6 +23357,38 @@ def mir_origin_lane_program(functions: Vec[MirFunction]) -> MirProgram
   }
 end
 
+# (audit order item 1 closeout) The lane artifact constructor: a minimal
+# compiled-shape MirProgram over `functions`, exported so the persistent
+# consumer lanes (semantic snapshot / coverage / PGO / replay) feed the
+# SAME hand-built MIR into their untracked-detection entries.
+pub def mir_origin_lane_program_artifact(functions: Vec[MirFunction]) -> MirProgram
+  mir_origin_lane_program(functions)
+end
+
+# (audit order item 1 closeout) A minimal ORIGIN-LESS hand-built function
+# (one empty return block, no origins anywhere): the documented untracked
+# artifact the persistent lanes reject.
+pub def mir_origin_lane_originless_function() -> MirFunction
+  MirFunction {
+    name: "lane_originless".to_string(),
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: Vec::new(),
+    blocks: Vec::from([MirBlock {
+      id: MirBlockId { id: 0 },
+      statements: Vec::new(),
+      terminator: MirTerminator { kind: MirTerminatorKind::MirReturn, span: span_dummy() }
+    }]),
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "".to_string(),
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
 def mir_origin_lane_source(fn_key: String, seq: Int, role: String) -> StableMirNodeId
   stable_mir_node_id_of_source(fn_key.clone(), stable_hir_node_id_of(stable_decl_of_key(&fn_key), seq), role)
 end
@@ -23512,6 +23555,56 @@ pub def mir_origin_identity_lane_check() -> Vec[String]
   let marked = mark_tail_calls_in_function(caller_t, fm_t, plans_t, false, &mut rows_t)
   mir_alias_lane_expect(&mut out, "O4-tail-structural-rename", marked && mir_opt_next_lane_call_tail(caller_t.blocks[0].terminator.clone()))
 
+  # ——— O5: the finalized-MIR origin invariant (audit order item 1) ———
+  # The origin-tracked lane program passes the boundary check.
+  mir_alias_lane_expect(&mut out, "O5-check-clean",
+    match mir_origins_check(&program_o, "lane".to_string())
+    when Result::Ok(_) then true
+    when Result::Err(_) then false
+    end)
+  # An origin-less FINALIZED node fails closed with the stage + node
+  # context (never a locator fallback).
+  var f_bad = f_o.clone()
+  var bad_blocks: Vec[MirBlock] = Vec::new()
+  for b in f_bad.blocks do
+    var nb = b.clone()
+    if nb.id.id == 0 then
+      nb.origin = Option::None
+    end
+    bad_blocks.push(nb)
+  end
+  f_bad.blocks = bad_blocks
+  let bad_program = mir_origin_lane_program(Vec::from([f_bad.clone()]))
+  match mir_origins_check(&bad_program, "post-optimization".to_string())
+  when Result::Err(e) then
+    mir_alias_lane_expect(&mut out, "O5-originless-check-fails", e.contains("post-optimization"))
+    mir_alias_lane_expect(&mut out, "O5-originless-check-context", e.contains("bb0") && e.contains("control-origin"))
+  when Result::Ok(_) then
+    out.push("O5-originless-check: expected Err, got Ok")
+  end
+  # The untracked-artifact detector names the first origin-less node.
+  match mir_untracked_artifact("lane-api".to_string(), &bad_program)
+  when Option::Some(u) then
+    mir_alias_lane_expect(&mut out, "O5-untracked-api", u.api == "lane-api".to_string())
+    mir_alias_lane_expect(&mut out, "O5-untracked-detail", u.detail.contains("bb0"))
+  when Option::None then
+    out.push("O5-untracked: expected Some, got None")
+  end
+  # A tracked program reports no untracked artifact.
+  mir_alias_lane_expect(&mut out, "O5-tracked-none",
+    match mir_untracked_artifact("lane-api".to_string(), &program_o)
+    when Option::None then true
+    when Option::Some(_) then false
+    end)
+  # The PGO writer fails closed on origin-less MIR (never locator counters).
+  var bad_pgo = mir_origin_lane_program(Vec::from([f_bad.clone()]))
+  match instrument_for_pgo(&mut bad_pgo)
+  when Result::Err(u2) then
+    mir_alias_lane_expect(&mut out, "O5-pgo-instrument-untracked", u2.api == "pgo-instrument".to_string())
+  when Result::Ok(_) then
+    out.push("O5-pgo-instrument: expected Err, got Ok")
+  end
+
   out
 end
 
@@ -23600,7 +23693,7 @@ def mir_opt_next_lane_deinit_term(place_lid: Int, target: Int) -> MirTerminator
       place: place_local(MirLocalId { id: place_lid }),
       deinit_fn: InstanceId {
         def: CallableId { def: DefId { module: ModuleId { id: 0 }, index: 0 } },
-        substs: Vec::new()
+        args: Vec::new()
       },
       target: MirBlockId { id: target },
       unwind: Option::None
@@ -29928,12 +30021,13 @@ def mir_block_by_id(f: MirFunction, block_id: Int) -> Option[MirBlock]
 end
 
 # The SEMANTIC key of a block: its control-origin StableMirBlockId.stable_key
-# (the P0-7 identity). Origin-less hand-built IR falls back to the locator —
-# the documented legacy/display path (the enforced verifier reports it).
-def mir_semantic_block_key(fn_key: String, block: MirBlock) -> String
+# (the P0-7 identity). Option::None for an origin-less hand-built block —
+# the persistent consumers report the artifact UNTRACKED (audit order item
+# 1 closeout) and NEVER fall back to the locator.
+pub def mir_semantic_block_key(fn_key: String, block: MirBlock) -> Option[String]
   match block.origin
-  when Option::Some(bid) then bid.stable_key.clone()
-  when Option::None then stable_mir_block_key(fn_key, block.id.id)
+  when Option::Some(bid) then Option::Some(bid.stable_key.clone())
+  when Option::None then Option::None
   end
 end
 
@@ -30242,7 +30336,7 @@ pub def pgo_convert_v2_row(row: PgoRow, mir: MirProgram) -> Result[PgoRow, Strin
         when Option::Some(block) then
           match block.origin
           when Option::None then
-            return Result::Err("v2 PGO block row cannot be mapped: the current build's block carries no P0-7 origin: " + row.key.clone())
+            return Result::Err(untracked_artifact_error("pgo-convert".to_string(), "v2 PGO block row cannot be mapped: the current build's block carries no persistent control-origin: " + row.key.clone()))
           when Option::Some(sem) then
             return Result::Ok(PgoRow { kind: "blk".to_string(), key: sem.stable_key.clone(), value: row.value })
           end
@@ -30284,11 +30378,11 @@ pub def pgo_convert_v2_row(row: PgoRow, mir: MirProgram) -> Result[PgoRow, Strin
           when Option::Some(to_block) then
             match from_block.origin
             when Option::None then
-              return Result::Err("v2 PGO edge row cannot be mapped: the source block carries no P0-7 origin: " + row.key.clone())
+              return Result::Err(untracked_artifact_error("pgo-convert".to_string(), "v2 PGO edge row cannot be mapped: the source block carries no persistent control-origin: " + row.key.clone()))
             when Option::Some(from_sem) then
               match to_block.origin
               when Option::None then
-                return Result::Err("v2 PGO edge row cannot be mapped: the successor block carries no P0-7 origin: " + row.key.clone())
+                return Result::Err(untracked_artifact_error("pgo-convert".to_string(), "v2 PGO edge row cannot be mapped: the successor block carries no persistent control-origin: " + row.key.clone()))
               when Option::Some(to_sem) then
                 let key = stable_mir_semantic_edge_id(from_sem.stable_key.clone(), to_sem.stable_key.clone(), kind)
                 return Result::Ok(PgoRow { kind: "edge".to_string(), key: key, value: row.value })
@@ -30314,7 +30408,7 @@ pub def pgo_convert_v2_row(row: PgoRow, mir: MirProgram) -> Result[PgoRow, Strin
         when Option::Some(block) then
           match mir_semantic_call_key(block.terminator.clone())
           when Option::None then
-            return Result::Err("v2 PGO call row cannot be mapped: the call terminator carries no P0-7 origin or no direct callee: " + row.key.clone())
+            return Result::Err(untracked_artifact_error("pgo-convert".to_string(), "v2 PGO call row cannot be mapped: the call terminator carries no persistent origin or no direct callee: " + row.key.clone()))
           when Option::Some(key) then
             return Result::Ok(PgoRow { kind: "call".to_string(), key: key, value: row.value })
           end
@@ -30340,7 +30434,7 @@ pub def pgo_convert_v2_row(row: PgoRow, mir: MirProgram) -> Result[PgoRow, Strin
           if stmt_idx < 0 then
             match mir_semantic_term_key(block.terminator.clone())
             when Option::None then
-              return Result::Err("v2 PGO alloc row cannot be mapped: the allocating terminator carries no P0-7 origin: " + row.key.clone())
+              return Result::Err(untracked_artifact_error("pgo-convert".to_string(), "v2 PGO alloc row cannot be mapped: the allocating terminator carries no persistent origin: " + row.key.clone()))
             when Option::Some(key) then
               return Result::Ok(PgoRow { kind: "alloc".to_string(), key: key, value: row.value })
             end
@@ -30350,7 +30444,7 @@ pub def pgo_convert_v2_row(row: PgoRow, mir: MirProgram) -> Result[PgoRow, Strin
             end
             match mir_semantic_stmt_key(block.statements[stmt_idx].clone())
             when Option::None then
-              return Result::Err("v2 PGO alloc row cannot be mapped: the allocating statement carries no P0-7 origin: " + row.key.clone())
+              return Result::Err(untracked_artifact_error("pgo-convert".to_string(), "v2 PGO alloc row cannot be mapped: the allocating statement carries no persistent origin: " + row.key.clone()))
             when Option::Some(key) then
               return Result::Ok(PgoRow { kind: "alloc".to_string(), key: key, value: row.value })
             end
@@ -30537,19 +30631,18 @@ pub def pgo_allocation_frequency(profile: PgoProfile, alloc_key: String) -> Opti
   pgo_row_value(profile, "alloc".to_string(), alloc_key)
 end
 
-def instrument_for_pgo(inout program: MirProgram) -> Unit
-  # Insert counter records at the start of every basic block. (item 39;
-  # fourth-audit P0-8 re-key) Each counter's identity is the block's
-  # SEMANTIC StableMirBlockId (its control-origin key — never the dense
-  # block ordinal; the locator remains the documented fallback only for
-  # origin-less hand-built IR), so a collected row is a canonical v3
-  # "blk|exec" row with no dense side table. PREREQUISITE (also recorded in
-  # the PGO format doc): the runtime writer that would flush these records
-  # into a v3 file is not implemented — codegen's non-budget
-  # MirEffectRecord arm fails closed with a lowering-defect trap (the
-  # former __tg_effect_record stub was removed); the format/load/save API
-  # is complete.
-
+# (audit order item 1 closeout) The PGO WRITER: instrument with per-block
+# counter records. Each counter's identity is the block's SEMANTIC
+# StableMirBlockId (its control-origin key — NEVER the dense block ordinal;
+# origin-less hand-built IR returns the documented UntrackedArtifact result
+# instead of a locator-keyed counter), so a collected row is a canonical v3
+# "blk|exec" row with no dense side table. PREREQUISITE (also recorded in
+# the PGO format doc): the runtime writer that would flush these records
+# into a v3 file is not implemented — codegen's non-budget MirEffectRecord
+# arm fails closed with a lowering-defect trap (the former
+# __tg_effect_record stub was removed); the format/load/save API is
+# complete.
+pub def instrument_for_pgo(inout program: MirProgram) -> Result[Unit, UntrackedArtifact]
   for func in program.functions do
     if func.is_extern then next end
     # The function's emission/instance key TEXT (its stable-key column);
@@ -30558,6 +30651,14 @@ def instrument_for_pgo(inout program: MirProgram) -> Unit
     let fn_key = func.name.clone()
 
     for block in func.blocks do
+      let block_key = match mir_semantic_block_key(&fn_key, block.clone())
+      when Option::Some(k) then k
+      when Option::None then
+        # (audit order item 1 closeout) UNTRACKED: no locator fallback.
+        return Result::Err(untracked_artifact("pgo-instrument".to_string(),
+          "function '" + fn_key.clone() + "' block bb" + block.id.id.to_string() +
+            " carries no persistent control-origin — the PGO counter identity is never a locator"))
+      end
       # Prepend: the semantic-keyed counter record.
       let increment = MirOperand {
         kind: MirOperandKind::MirConstant(MirConstant {
@@ -30567,7 +30668,7 @@ def instrument_for_pgo(inout program: MirProgram) -> Unit
         })
       }
       let counter_stmt = MirStatement {
-        kind: MirStatementKind::MirEffectRecord("__pgo_counter_" + mir_semantic_block_key(&fn_key, block), increment),
+        kind: MirStatementKind::MirEffectRecord("__pgo_counter_" + block_key, increment),
         span: block.terminator.span,
         origin: Option::Some(stable_mir_node_id_of_generated(
           fn_key.clone(), fn_key.clone(), "pgo-instrument".to_string(),
@@ -30582,6 +30683,7 @@ def instrument_for_pgo(inout program: MirProgram) -> Unit
       block.statements = new_stmts
     end
   end
+  Result::Ok(())
 end
 
 def apply_pgo_optimizations(inout program: MirProgram) -> Unit
@@ -30596,11 +30698,15 @@ def apply_pgo_optimizations(inout program: MirProgram) -> Unit
 end
 
 # The SEMANTIC block count of one block: the "blk|exec" row of the block's
-# P0-7 control-origin stable key, 0 when the profile records none (the
-# unroller's documented missing-row default).
+# P0-7 control-origin stable key. An origin-less block is UNTRACKED: it has
+# no profile row (0 — never a locator lookup; audit order item 1 closeout).
 def pgo_block_count_of_block(profile: PgoProfile, fn_key: String, block: MirBlock) -> UInt
-  match pgo_block_count(profile, mir_semantic_block_key(fn_key, block))
-  when Option::Some(c) then c
+  match mir_semantic_block_key(fn_key, block)
+  when Option::Some(key) then
+    match pgo_block_count(profile, key)
+    when Option::Some(c) then c
+    when Option::None then 0
+    end
   when Option::None then 0
   end
 end
@@ -30691,6 +30797,31 @@ def apply_pgo_to_function(inout f: MirFunction, profile: PgoProfile) -> Unit
         # Clone this block with new ID
         var new_block = block.clone()
         new_block.id = MirBlockId { id: block.id.id + id_offset }
+        # (audit order item 1 closeout) the duplicated blocks/statements/
+        # terminator are GENERATED nodes: each clone carries its own
+        # deterministic generated origin (transform-id "pgo-unroll") so a
+        # duplicated body never re-uses the source node's persistent
+        # identity (a PGO/coverage key collision).
+        let clone_block_key = stable_mir_block_id_of_control_generated(
+          f.name.clone(), f.name.clone(), "pgo-unroll".to_string(),
+          "block-clone".to_string(), new_block.id.id).stable_key.clone()
+        new_block.origin = Option::Some(stable_mir_block_id_of_control_generated(
+          f.name.clone(), f.name.clone(), "pgo-unroll".to_string(),
+          "block-clone".to_string(), new_block.id.id))
+        var clone_stmts: Vec[MirStatement] = Vec::new()
+        var clone_si = 0
+        for s in new_block.statements do
+          var ns = s.clone()
+          ns.origin = Option::Some(stable_mir_node_id_of_generated(
+            f.name.clone(), clone_block_key.clone(), "pgo-unroll".to_string(),
+            mir_origin_role_of_stmt(s.kind.clone()), clone_si))
+          clone_stmts.push(ns)
+          clone_si = clone_si + 1
+        end
+        new_block.statements = clone_stmts
+        new_block.terminator.origin = Option::Some(stable_mir_node_id_of_generated(
+          f.name.clone(), clone_block_key.clone(), "pgo-unroll".to_string(),
+          mir_origin_role_of_term(new_block.terminator.kind.clone()), -1))
         
         # Update terminator targets
         match new_block.terminator.kind
@@ -31085,7 +31216,14 @@ def insert_phi_nodes(inout f: MirFunction, dom_info: DomInfo) -> Unit
           ),
           span: if block.statements.len() > 0 then block.statements[0].span.clone()
           else block.terminator.span
-          end
+          end,
+          # (audit order item 1 closeout) the SSA conversion's synthesized
+          # phi nodes carry their deterministic generated origin (the
+          # documented generated-node rule: origin-set = the owning
+          # function, transform-id "ssa-phi", role "phi", seq = the local).
+          origin: Option::Some(stable_mir_node_id_of_generated(
+            f.name.clone(), f.name.clone(), "ssa-phi".to_string(),
+            "phi".to_string(), local_id))
         })
       end
       # Prepend phis to existing statements
@@ -31334,9 +31472,17 @@ def lower_to_mir(program: Program, analyzed: AnalyzedProgram) -> Result[MirProgr
   when Result::Ok(result) then
     # (fourth-audit P0-7): the lowered program enforces the persistent
     # origin invariant; the recovery closes any synthesized site that did
-    # not stamp an origin (the documented generated fallback).
+    # not stamp an origin (the documented deterministic generated origin).
     mir_origins_recover(&mut result)
     result.origins_enforced = true
+    # (audit order item 1 closeout) FAIL CLOSED at the lowering boundary:
+    # even after recovery a node without a persistent origin is a compiler
+    # defect — the caller receives the precise stage context, never a
+    # locator-identified artifact.
+    match mir_origins_check(&result, "lowering".to_string())
+    when Result::Ok(()) then ()
+    when Result::Err(e) then return Result::Err(e)
+    end
     Result::Ok(result)
   end
 end
@@ -31356,24 +31502,11 @@ pub def mir_origins_recover(inout mir: MirProgram) -> Unit
     var bi = 0
     while bi < f.blocks.len() do
       var b = f.blocks[bi]
-      var si = 0
-      while si < b.statements.len() do
-        match b.statements[si].origin
-        when Option::Some(_) then ()
-        when Option::None then
-          let role = mir_origin_role_of_stmt(b.statements[si].kind.clone())
-          b.statements[si].origin = Option::Some(stable_mir_node_id_of_generated(
-            f.name.clone(), f.name.clone(), "origin-recovery".to_string(), role, si))
-        end
-        si = si + 1
-      end
-      match b.terminator.origin
-      when Option::Some(_) then ()
-      when Option::None then
-        let term_role = mir_origin_role_of_term(b.terminator.kind.clone())
-        b.terminator.origin = Option::Some(stable_mir_node_id_of_generated(
-          f.name.clone(), f.name.clone(), "origin-recovery".to_string(), term_role, -1))
-      end
+      # The block's own control-origin is recovered FIRST: it is the
+      # origin-set of the nodes the block contains, so a statement (or
+      # terminator) at the same index/role in two different blocks never
+      # shares an identity (audit order item 1 — the generated origins are
+      # deterministic AND collision-free across blocks).
       match b.origin
       when Option::Some(_) then ()
       when Option::None then
@@ -31384,6 +31517,28 @@ pub def mir_origins_recover(inout mir: MirProgram) -> Unit
           b.origin = Option::Some(stable_mir_block_id_of_control_generated(
             f.name.clone(), f.name.clone(), "origin-recovery".to_string(), "block".to_string(), b.id.id))
         end
+      end
+      let block_origin_key = match b.origin.clone()
+      when Option::Some(bid) then bid.stable_key.clone()
+      when Option::None then f.name.clone()
+      end
+      var si = 0
+      while si < b.statements.len() do
+        match b.statements[si].origin
+        when Option::Some(_) then ()
+        when Option::None then
+          let role = mir_origin_role_of_stmt(b.statements[si].kind.clone())
+          b.statements[si].origin = Option::Some(stable_mir_node_id_of_generated(
+            f.name.clone(), block_origin_key.clone(), "origin-recovery".to_string(), role, si))
+        end
+        si = si + 1
+      end
+      match b.terminator.origin
+      when Option::Some(_) then ()
+      when Option::None then
+        let term_role = mir_origin_role_of_term(b.terminator.kind.clone())
+        b.terminator.origin = Option::Some(stable_mir_node_id_of_generated(
+          f.name.clone(), block_origin_key.clone(), "origin-recovery".to_string(), term_role, -1))
       end
       f.blocks[bi] = b
       bi = bi + 1
@@ -31428,6 +31583,76 @@ pub def verify_mir_origins(mir: MirProgram) -> Vec[String]
     fi = fi + 1
   end
   errors
+end
+
+# (audit order item 1 closeout) The FINALIZED-MIR origin check: every
+# block/statement/terminator of a compiler-produced program must carry its
+# persistent origin. `stage` names the production boundary ("lowering" /
+# "monomorphization" / "post-optimization"); the Result::Err text carries
+# the stage plus EVERY precise violation line (fail closed — the pipeline
+# never proceeds with a locator identity substituted for an origin).
+pub def mir_origins_check(mir: MirProgram, stage: String) -> Result[Unit, String]
+  let errs = verify_mir_origins(mir)
+  if errs.is_empty() then
+    Result::Ok(())
+  else
+    var msg = "finalized MIR at stage '" + stage.clone() + "' carries origin-less nodes:"
+    for e in errs do
+      msg = msg + "\n  " + e
+    end
+    Result::Err(msg)
+  end
+end
+
+# The fail-closed checkpoint form (the optimizer's Unit-returning entry):
+# a violation panics with the full diagnostic list — no artifact is ever
+# produced from origin-less finalized MIR.
+pub def mir_origins_checkpoint(mir: MirProgram, stage: String) -> Unit
+  match mir_origins_check(mir, stage.clone())
+  when Result::Ok(()) then ()
+  when Result::Err(e) then panic(e)
+  end
+end
+
+# The first untracked (origin-less) node of a MIR program as the documented
+# UntrackedArtifact result — Option::None when every block / statement /
+# terminator carries its persistent origin. The persistent consumers
+# (semantic snapshot / coverage / PGO / replay) use this predicate instead
+# of substituting a locator: an origin-less artifact is reported untracked.
+pub def mir_untracked_artifact(api: String, mir: MirProgram) -> Option[UntrackedArtifact]
+  var fi = 0
+  while fi < mir.functions.len() do
+    let f = mir.functions[fi]
+    var bi = 0
+    while bi < f.blocks.len() do
+      let b = f.blocks[bi]
+      match b.origin
+      when Option::None then
+        return Option::Some(untracked_artifact(api.clone(),
+          "function '" + f.name.clone() + "' block bb" + b.id.id.to_string() + " carries no persistent control-origin"))
+      when Option::Some(_) then ()
+      end
+      var si = 0
+      while si < b.statements.len() do
+        match b.statements[si].origin
+        when Option::None then
+          return Option::Some(untracked_artifact(api.clone(),
+            "function '" + f.name.clone() + "' node " + stable_mir_stmt_key(f.name.clone(), b.id.id, si) + " carries no persistent origin"))
+        when Option::Some(_) then ()
+        end
+        si = si + 1
+      end
+      match b.terminator.origin
+      when Option::None then
+        return Option::Some(untracked_artifact(api.clone(),
+          "function '" + f.name.clone() + "' node " + stable_mir_term_key(f.name.clone(), b.id.id) + " carries no persistent origin"))
+      when Option::Some(_) then ()
+      end
+      bi = bi + 1
+    end
+    fi = fi + 1
+  end
+  Option::None
 end
 
 # The origin-preservation fingerprint of one function: the ordered
@@ -33192,15 +33417,15 @@ def verifier_check_operand_embedded_types(plans: Map[String, DeinitPlan], type_i
     # (Type::Closure/FnPtr), the value types of the primitive constants.
     let cst_what = ctx.clone() + " constant type"
     verifier_check_type_concreteness(plans, type_index, param_names, &cst_what, &cst.ty, allow_param, errors)
-    # The InstanceId substitutions of a MirFnItem — the call signatures and
-    # the deinit/drop instance payloads: every substitution must be
-    # concrete.
+    # The InstanceId generic arguments of a MirFnItem — the call signatures
+    # and the deinit/drop instance payloads: every Type row (and every
+    # const row's type view) must be concrete.
     match cst.instance
     when Option::Some(inst) then
       var si = 0
-      while si < inst.substs.len() do
+      while si < inst.args.len() do
         let subst_what = ctx.clone() + " instance substitution " + si.to_string()
-        verifier_check_type_concreteness(plans, type_index, param_names, &subst_what, &inst.substs[si], allow_param, errors)
+        verifier_check_type_concreteness(plans, type_index, param_names, &subst_what, &generic_arg_type_view(inst.args[si].clone()), allow_param, errors)
         si = si + 1
       end
     when Option::None then ()
@@ -33228,9 +33453,9 @@ def verifier_check_static_embedded_types(plans: Map[String, DeinitPlan], type_in
     match cst.instance
     when Option::Some(inst) then
       var si = 0
-      while si < inst.substs.len() do
+      while si < inst.args.len() do
         let subst_what = ctx.clone() + " static init instance substitution " + si.to_string()
-        verifier_check_type_concreteness(plans, type_index, param_names, &subst_what, &inst.substs[si], false, errors)
+        verifier_check_type_concreteness(plans, type_index, param_names, &subst_what, &generic_arg_type_view(inst.args[si].clone()), false, errors)
         si = si + 1
       end
     when Option::None then ()

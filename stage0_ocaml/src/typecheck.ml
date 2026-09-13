@@ -384,11 +384,13 @@ type state = {
   mutable next_callable_id : int;
   mutable next_impl_index : int;
   (* the Box LangItem identity of THIS compilation (re-audit P0 #2): the
-     kernel's strict Box[T] wrapper is transparent in unify and field
-     access, and the Box nominal's tid is registered when the source
-     declaration processes.  Per-compilation state — a fresh compilation
-     starts with None and can never see another compilation's Box
-     identity. *)
+     Box nominal's tid is registered when the source declaration
+     processes.  Identity is NOMINAL — Box[T] is never unified with T
+     and never deref'd implicitly; consumers use this tid only to
+     recognize the owning handle (LangItems) and to resolve the Box
+     nominal's own field/method surface.  Per-compilation state — a
+     fresh compilation starts with None and can never see another
+     compilation's Box identity. *)
   mutable box_tid : Ids.Type_id.t option;
   mutable current_item : string;
   mutable current_item_params : Ids.Generic_param_id.t list;
@@ -788,14 +790,16 @@ let fresh_infer_var (st : state) : Type_repr.t =
   st.next_var_id <- id + 1;
   Type_repr.Infer_var id
 
-(* the kernel's strict Box[T] wrapper is transparent: Box[T] unifies
-   with T in both directions and derefs on field/method access (the
-   full compiler's Box coercions). The Box nominal's tid is registered
-   when the source declaration processes; the identity lives in the
-   per-compilation `state` record (state.box_tid), never a module
-   global, so one compilation cannot leak its Box into another. *)
-let is_box (bt : Ids.Type_id.t option) (id : Ids.Type_id.t) : bool =
-  match bt with Some b -> Ids.Type_id.compare b id = 0 | None -> false
+(* NOMINAL IDENTITY IS EXACT (Box-transparency regression fix): Box[T]
+   is its own type — `Box[T] { ptr: Ptr[T] }` — with its own
+   representation, layout, ownership and Drop/Clone impls.  It is NEVER
+   unified with T, never deref'd implicitly, and `.clone()` resolves the
+   Box nominal's own `impl[T: Clone] Clone for Box[T]` (std/alloc.tg).
+   Explicit pointee access goes through the box's own field/method
+   surface (`b.ptr`, `b.get()`, `b.into_inner()`).  The Box nominal's
+   tid is registered when the source declaration processes; the identity
+   lives in the per-compilation `state` record (state.box_tid), never a
+   module global, so one compilation cannot leak its Box into another. *)
 
 (* The inference-variable solution journal.  The seed's Infer_var is an
    immutable int with a PER-CALL substitution: a generic value's vars are
@@ -2464,8 +2468,6 @@ let rec unify (box_tid : Ids.Type_id.t option) (subst : (Type_repr.generic_key *
             (match !current_item_global with Some s -> s | None -> "?")
             (String.concat "::" !current_mod_global);
         Error "integer kind mismatch")
-  | Type_repr.Named (id, [| t |]), u when is_box box_tid id -> unify box_tid subst t u
-  | u, Type_repr.Named (id, [| t |]) when is_box box_tid id -> unify box_tid subst u t
   | Type_repr.Infer_var v, _ ->
       if occurs_key (Type_repr.KVar v) b' then Error "recursive type"
       else begin
@@ -6624,23 +6626,6 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
                (Printf.sprintf "cannot project `.%s` from %s" fname (type_to_string base.te_type))))
   | _ -> (
       match base.te_type with
-      | Type_repr.Named (id, [| inner |]) when is_box env.state.box_tid id -> (
-          (* a field on a Box derefs the boxed value (`expr.kind` on a
-             Box[Expr]) UNLESS the Box declares the field itself
-             (`self.ptr` inside impl Box) *)
-          match nominal_by_name env "Box" with
-          | Some nom when List.mem_assoc fname nom.nom_fields -> (
-              match List.assoc_opt fname nom.nom_fields with
-              | Some ft ->
-                  Ok
-                    {
-                      te_type = substitute_fixpoint [ (Type_repr.KParam (snd (List.hd nom.nom_params)), inner) ] ft;
-                      te_effects = [||];
-                      te_span = span;
-                      te_flow = normal_flow (substitute_fixpoint [ (Type_repr.KParam (snd (List.hd nom.nom_params)), inner) ] ft);
-                    }
-              | None -> check_field env _scope span { base with te_type = inner } fname)
-          | _ -> check_field env _scope span { base with te_type = inner } fname)
       | Type_repr.Named (id, [| inner |])
         when Ids.Type_id.compare id b_ptr = 0 || Ids.Type_id.compare id b_ptrmut = 0 -> (
           (* the source Ptr struct's own fields first (`self.address`
@@ -7618,14 +7603,6 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   let owner_ty =
     match owner_ty_raw with
     | Type_repr.Ref_internal (_, t) -> t
-    | Type_repr.Named (id, [| inner |])
-      when mname = "clone" && is_box env.state.box_tid id ->
-        (* transparent-Box clone: the seed value model carries the boxed
-           CONTENT in a Box-typed slot (the parser's implicit boxing and
-           `Box::new` are transparent), so `boxed.clone()` resolves the
-           CONTENT's own Clone — the Box wrapper's own `clone` body is
-           only reachable through qualified `Box::clone(...)` calls. *)
-        inner
     | _ -> owner_ty_raw
   in
   let owner_name =

@@ -15,11 +15,12 @@ use tg_compiler::parser::{parse, DiagnosticSemanticData, TypeMismatchData, Trait
 use tg_compiler::resolver::{ResolvedNames, def_id_of_item, def_kind_of, module_qualified_key}
 use tg_compiler::ids::{
   DefId, DefKind, FieldId, ModuleId, TypeId, TraitId, GenericParamId, GenericParamTable,
-  CallableId, InstanceId, VariantId, LocalId, AccessRoot, ClosureId, EffectId, EffectRegistry,
+  CallableId, InstanceId, GenericArg, ConstValue, VariantId, LocalId, AccessRoot, ClosureId, EffectId, EffectRegistry,
   IntrinsicId, FinalizerKind,
   generic_param_table_new, generic_param_id_numeric, generic_param_id_eq,
   fresh_synthetic_owner, intern_generic_param, generic_param_name_of,
   generic_param_name_from, def_id_numeric,
+  generic_args_of_types, generic_arg_type_view,
   effect_registry_new, intern_module_effect,
   effect_id_eq, effect_name_of_id,
   EFFECT_IO, EFFECT_FILE, EFFECT_ASYNC,
@@ -2158,7 +2159,10 @@ def effect_op_reference_of(expr: Expr) -> Option[(String, String)]
       Option::None
     end
   when ExprKind::ExprFieldAccess(base, field) then
-    match base.kind
+    # The base is an owned Box[Expr] payload: unbox it explicitly (it is
+    # consumed once — the caller never aliases the AST child).
+    let base_expr = base.into_inner()
+    match base_expr.kind
     when ExprKind::ExprIdent(eff_name) then Option::Some((eff_name.clone(), field.clone()))
     when _ then Option::None
     end
@@ -2391,9 +2395,9 @@ def effect_expr_has_control_flow(expr: Expr) -> Bool
     end
     false
   when ExprKind::ExprUnsafe(_, block) then effect_arm_body_has_control_flow(&block)
-  when ExprKind::ExprClosure(_, _, body) then effect_expr_has_control_flow(&body)
+  when ExprKind::ExprClosure(_, _, body) then effect_expr_has_control_flow(body.into_inner())
   when ExprKind::ExprAsync(block) then effect_arm_body_has_control_flow(&block)
-  when ExprKind::ExprTry(inner) then effect_expr_has_control_flow(&inner)
+  when ExprKind::ExprTry(inner) then effect_expr_has_control_flow(inner.into_inner())
   when _ then false
   end  end
 end
@@ -2442,7 +2446,7 @@ end
 # recurse so Option[R], Array[R], Map[K,R], tuples etc. get real cleanup.
 #
 # CALLABLE IDENTITIES: the finalizer payloads are SEMANTIC identities
-# — InstanceId { def: CallableId, substs } — NEVER strings. The chosen
+# — InstanceId { def: CallableId, args } — NEVER strings. The chosen
 # finalizer is attached to its type by the checker's Drop-impl / deinit
 # registration (typed.deinit_targets: TypeId -> CallableId — the resolver's
 # DefId, the same identity the MIR records for the mangled "Type__drop" /
@@ -2635,7 +2639,7 @@ end
 # template form).
 def verified_deinit_call(typed: TypedProgram, callable: CallableId, args: Vec[Type], inout errors: Vec[TypeError]) -> DeinitPlan
   if deinit_callable_is_registered(typed, callable) then
-    DeinitPlan::Call(InstanceId { def: callable.clone(), substs: args.clone() })
+    DeinitPlan::Call(InstanceId { def: callable.clone(), args: generic_args_of_types(args.clone()) })
   else
     errors.push(TypeError {
       message: "invalid finalizer identity (not a registered Drop/deinit callable)",
@@ -2652,7 +2656,7 @@ end
 # unregistered identity records a TypeError and fails CLOSED with PlanLimit.
 def verified_deinit_finalizer(typed: TypedProgram, callable: CallableId, args: Vec[Type], fields_plan: DeinitPlan, inout errors: Vec[TypeError]) -> DeinitPlan
   if deinit_callable_is_registered(typed, callable) then
-    DeinitPlan::UserFinalizer(InstanceId { def: callable.clone(), substs: args.clone() }, fields_plan)
+    DeinitPlan::UserFinalizer(InstanceId { def: callable.clone(), args: generic_args_of_types(args.clone()) }, fields_plan)
   else
     errors.push(TypeError {
       message: "invalid finalizer identity (not a registered Drop/deinit callable)",
@@ -3545,16 +3549,19 @@ struct TypeEnv
   # Default empty keeps every TypeEnv construction site unchanged.
   variadic_extern_dids: Set[Int] = Set::new()
  # (final): call expr node id -> the type checker's SOLVED generic
-  # substitution for a generic call (the callee's generic args in the
-  # callee's parameter order). Populated at the generic-call sites ONLY
+  # substitution for a generic call (the callee's generic arguments in
+  # the callee's DECLARED binder order, as the typed GenericArg union —
+  # P0-5: the checker classifies each solved argument by its declared
+  # parameter kind, so const-vs-type is never re-derived from a render
+  # downstream). Populated at the generic-call sites ONLY
   # when the callee is generic and EVERY generic parameter is solved; an
   # unsolved parameter (e.g. a return-type-only parameter the caller
   # context never constrained) leaves the call unrecorded and is reported
   # by resolve_pending_call_instances. The solved substitutions from the
   # type checker are the AUTHORITY — ZERO-INFERENCE: the monomorphizer
   # performs no call-site inference (fail-closed). MIR pairs this with
-  # typed_call_targets to fill the call instance's substs.
-  typed_call_instances: Map[Int, Vec[Type]]
+  # typed_call_targets to fill the call instance's args.
+  typed_call_instances: Map[Int, Vec[GenericArg]]
   typed_field_targets: Map[Int, FieldId]
   typed_local_bindings: Map[Int, LocalBinding]
   typed_ident_resolutions: Map[Int, Int]
@@ -5302,7 +5309,11 @@ end
 # recorded access effect or typed node) — the missing-metadata rule
 # the construction never silently defaults the callee
 # or an argument effect; the caller records an ICE-class TypeError.
-def typed_call_for(env: TypeEnv, expr: Expr, args: Vec[Expr], receiver_node: Option[Box[Expr]]) -> Option[TypedCall]
+# The receiver is identified by its AST NODE ID (the typed tables are
+# keyed by node id): the caller carries the receiver's payload expression
+# explicitly and passes its node id — a Box[Expr] receiver is never
+# treated as an Expr (nominal identity).
+def typed_call_for(env: TypeEnv, expr: Expr, args: Vec[Expr], receiver_node_id: Option[Int]) -> Option[TypedCall]
   var callee = TypedCallee::Closure
   var has_target = false
   match env.typed_call_targets.get(expr.node_id)
@@ -5312,7 +5323,7 @@ def typed_call_for(env: TypeEnv, expr: Expr, args: Vec[Expr], receiver_node: Opt
   when Option::None then ()
   end
   if !has_target then
-    match receiver_node
+    match receiver_node_id
     when Option::Some(_) then ()
     when Option::None then
       # A plain call with no recorded target is not a call shape at all —
@@ -5324,13 +5335,14 @@ def typed_call_for(env: TypeEnv, expr: Expr, args: Vec[Expr], receiver_node: Opt
   end
   var receiver_effect: Option[AccessEffect] = Option::None
   var receiver_te: Option[TypedExpr] = Option::None
-  match receiver_node
-  when Option::Some(rn) then
-    match env.typed_access_effects.get(rn.node_id)
+  match receiver_node_id
+  when Option::Some(rn_id) then
+    if rn_id == 0 then return Option::None end
+    match env.typed_access_effects.get(rn_id)
     when Option::Some(eff) then receiver_effect = Option::Some(eff)
     when Option::None then return Option::None
     end
-    match typed_child_of(env, &rn)
+    match env.typed_exprs.get(rn_id)
     when Option::Some(rt) then receiver_te = Option::Some(rt)
     when Option::None then return Option::None
     end
@@ -5361,17 +5373,19 @@ end
 # same per-arg effect records as a DefId call). Option::None when a
 # required effect or typed child is missing — the missing-metadata rule
 # the construction never silently defaults an argument
-# effect; the caller records an ICE-class TypeError.
-def typed_closure_call_for(env: TypeEnv, args: Vec[Expr], receiver_node: Option[Box[Expr]]) -> Option[TypedCall]
+# effect; the caller records an ICE-class TypeError. The receiver is
+# identified by its AST node id (see typed_call_for).
+def typed_closure_call_for(env: TypeEnv, args: Vec[Expr], receiver_node_id: Option[Int]) -> Option[TypedCall]
   var receiver_effect: Option[AccessEffect] = Option::None
   var receiver_te: Option[TypedExpr] = Option::None
-  match receiver_node
-  when Option::Some(rn) then
-    match env.typed_access_effects.get(rn.node_id)
+  match receiver_node_id
+  when Option::Some(rn_id) then
+    if rn_id == 0 then return Option::None end
+    match env.typed_access_effects.get(rn_id)
     when Option::Some(eff) then receiver_effect = Option::Some(eff)
     when Option::None then return Option::None
     end
-    match typed_child_of(env, &rn)
+    match env.typed_exprs.get(rn_id)
     when Option::Some(rt) then receiver_te = Option::Some(rt)
     when Option::None then return Option::None
     end
@@ -5397,11 +5411,11 @@ end
 # The closure-call shape gate: a callee (or method-call receiver) whose
 # recorded type is Type::Closure — a closure VALUE — takes the
 # closure-call path instead of the missing-target ICE.
-def closure_call_shape(env: TypeEnv, callee: Expr, args: Vec[Expr], receiver_node: Option[Box[Expr]]) -> Option[TypedCall]
+def closure_call_shape(env: TypeEnv, callee: Expr, args: Vec[Expr], receiver_node_id: Option[Int]) -> Option[TypedCall]
   match env.typed_expr_types.get(callee.node_id)
   when Option::Some(callee_ty) then
     match callee_ty
-    when Type::FnPtr(_, _, _) | Type::Closure(_, _, _, _, _) then typed_closure_call_for(env, args, receiver_node)
+    when Type::FnPtr(_, _, _) | Type::Closure(_, _, _, _, _) then typed_closure_call_for(env, args, receiver_node_id)
     when _ then Option::None
     end
   when Option::None then Option::None
@@ -5618,7 +5632,7 @@ def typed_place_of(env: TypeEnv, expr: Expr) -> Option[TypedPlace]
   when ExprKind::ExprSelfRef then
     Option::Some(TypedPlace { root: AccessRoot::SelfValue, root_name: "self".to_string(), projections: Vec::new() })
   when ExprKind::ExprFieldAccess(base, field) then
-    match typed_place_of(env, &base)
+    match typed_place_of(env, base.into_inner())
     when Option::Some(tp) then
       match env.typed_exprs.get(expr.node_id)
       when Option::Some(te) then
@@ -5638,7 +5652,7 @@ def typed_place_of(env: TypeEnv, expr: Expr) -> Option[TypedPlace]
     when Option::None then Option::None
     end
   when ExprKind::ExprIndex(base, _) then
-    match typed_place_of(env, &base)
+    match typed_place_of(env, base.into_inner())
     when Option::Some(tp) then
       var projs3 = tp.projections.clone()
       projs3.push(TypedPlaceProj::Index)
@@ -5646,14 +5660,14 @@ def typed_place_of(env: TypeEnv, expr: Expr) -> Option[TypedPlace]
     when Option::None then Option::None
     end
   when ExprKind::ExprRawDeref(inner) then
-    match typed_place_of(env, &inner)
+    match typed_place_of(env, inner.into_inner())
     when Option::Some(tp) then
       var projs4 = tp.projections.clone()
       projs4.push(TypedPlaceProj::Deref)
       Option::Some(TypedPlace { root: tp.root, root_name: tp.root_name.clone(), projections: projs4 })
     when Option::None then Option::None
     end
-  when ExprKind::ExprAccess(inner) then typed_place_of(env, &inner)
+  when ExprKind::ExprAccess(inner) then typed_place_of(env, inner.into_inner())
   when _ then Option::None
   end  end
 end
@@ -5715,44 +5729,44 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
   when ExprKind::ExprPath(path) then
     Option::Some(TypedExprKind::Path(if path.segments.len() > 0 then path.segments.join("::") else "" end))
   when ExprKind::ExprBinaryOp(op, left, right) then
-    match typed_children_2(env, &left, &right)
+    match typed_children_2(env, left.into_inner(), right.into_inner())
     when Option::Some((lt, rt)) then Option::Some(TypedExprKind::BinaryOp { op: op, left: Box::new(lt), right: Box::new(rt) })
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprUnaryOp(op, inner) then
-    match typed_child_of(env, &inner)
+    match typed_child_of(env, inner.into_inner())
     when Option::Some(it) then Option::Some(TypedExprKind::UnaryOp { op: op, operand: Box::new(it) })
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprIndex(base, index) then
-    match typed_children_2(env, &base, &index)
+    match typed_children_2(env, base.into_inner(), index.into_inner())
     when Option::Some((bt, it)) then Option::Some(TypedExprKind::Index { base: Box::new(bt), index: Box::new(it) })
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprCast(inner, ty_expr) then
-    match typed_child_of(env, &inner)
+    match typed_child_of(env, inner.into_inner())
     when Option::Some(it) then Option::Some(TypedExprKind::Cast { value: Box::new(it), target: resolve_type_expr(env, &ty_expr) })
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprTypeCheck(inner, ty_expr) then
-    match typed_child_of(env, &inner)
+    match typed_child_of(env, inner.into_inner())
     when Option::Some(it) then Option::Some(TypedExprKind::TypeCheck { value: Box::new(it), target: resolve_type_expr(env, &ty_expr) })
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprRawDeref(inner) then
-    match typed_child_of(env, &inner)
+    match typed_child_of(env, inner.into_inner())
     when Option::Some(it) then Option::Some(TypedExprKind::RawDeref(Box::new(it)))
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprAccess(inner) then
-    match typed_child_of(env, &inner)
+    match typed_child_of(env, inner.into_inner())
     when Option::Some(it) then Option::Some(TypedExprKind::Access(Box::new(it)))
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprRange(start, end_, inclusive) then
     let start_typed = match start
     when Option::Some(s) then
-      match typed_child_of(env, &s)
+      match typed_child_of(env, s.into_inner())
       when Option::Some(st) then Option::Some(Box::new(st))
       when Option::None then return missing_typed_hir_child(env, expr)
       end
@@ -5760,7 +5774,7 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
     end
     let end_typed = match end_
     when Option::Some(e) then
-      match typed_child_of(env, &e)
+      match typed_child_of(env, e.into_inner())
       when Option::Some(et) then Option::Some(Box::new(et))
       when Option::None then return missing_typed_hir_child(env, expr)
       end
@@ -5768,22 +5782,22 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
     end
     Option::Some(TypedExprKind::Range { start: start_typed, end_: end_typed, inclusive: inclusive })
   when ExprKind::ExprAwait(inner) then
-    match typed_child_of(env, &inner)
+    match typed_child_of(env, inner.into_inner())
     when Option::Some(it) then Option::Some(TypedExprKind::Await(Box::new(it)))
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprTry(inner) then
-    match typed_child_of(env, &inner)
+    match typed_child_of(env, inner.into_inner())
     when Option::Some(it) then Option::Some(TypedExprKind::Try(Box::new(it)))
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprPipe(lhs, rhs) then
-    match typed_children_2(env, &lhs, &rhs)
+    match typed_children_2(env, lhs.into_inner(), rhs.into_inner())
     when Option::Some((lt, rt)) then Option::Some(TypedExprKind::Pipe { lhs: Box::new(lt), rhs: Box::new(rt) })
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprAssign(target, value) then
-    match typed_children_2(env, &target, &value)
+    match typed_children_2(env, target.into_inner(), value.into_inner())
     when Option::Some((tt, vt)) then Option::Some(TypedExprKind::Assign { target: Box::new(tt), value: Box::new(vt) })
     when Option::None then missing_typed_hir_child(env, expr)
     end
@@ -5793,7 +5807,7 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
     when Option::None then missing_typed_hir_child(env, expr)
     end
   when ExprKind::ExprArrayRepeat(elem, count) then
-    match typed_children_2(env, &elem, &count)
+    match typed_children_2(env, elem.into_inner(), count.into_inner())
     when Option::Some((et, ct)) then Option::Some(TypedExprKind::ArrayRepeat(Box::new(et), Box::new(ct)))
     when Option::None then missing_typed_hir_child(env, expr)
     end
@@ -5827,12 +5841,15 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
     end
     Option::Some(TypedExprKind::MapLit(entries_typed))
   when ExprKind::ExprCall(func, args) then
+    # The callee is an owned Box[Expr]: unbox it explicitly for the shape
+    # tests and the typed-child lookups (nominal Box identity).
+    let func_expr = func.into_inner()
     # The operation-call surface: a resolved std::effects::perform call
     # assembles the EffectPerform callee (the semantic EffectId + the op's
     # declaration index + name) — never the DefId form (the callee's
     # declared generic signature is a resolution seed, not the call's
     # typing).
-    if effect_perform_callee_path(&func) then
+    if effect_perform_callee_path(&func_expr) then
       match typed_effect_perform_call_for(env, expr, &args)
       when Option::Some(tc_perform) then Option::Some(TypedExprKind::Call(tc_perform))
       when Option::None then
@@ -5849,7 +5866,7 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
       # effects instead of the ICE. Only a Type::Closure callee takes this
       # path; an unresolvable non-closure callee stays an ICE (the
       # missing-metadata rule: never silently default the callee).
-      match closure_call_shape(env, &func, &args, Option::None)
+      match closure_call_shape(env, &func_expr, &args, Option::None)
       when Option::Some(tc2) then Option::Some(TypedExprKind::Call(tc2))
       when Option::None then
         add_error_with_code(env, "internal error: cannot assemble the typed HIR call node (node " + expr.node_id.to_string() + "): missing typed call target or argument access effect", expr.span, "ICE")
@@ -5858,14 +5875,17 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
     end
     end
   when ExprKind::ExprMethodCall(recv, _, _, args) then
-    match typed_call_for(env, expr, &args, Option::Some(recv))
+    # The receiver is an owned Box[Expr]: unbox it explicitly; the typed
+    # call assembly is keyed by the receiver's AST node id.
+    let recv_expr = recv.into_inner()
+    match typed_call_for(env, expr, &args, Option::Some(recv_expr.node_id))
     when Option::Some(tc) then Option::Some(TypedExprKind::Call(tc))
     when Option::None then
       # The closure-call shape for a method call: the target has no DefId
       # and the RECEIVER is a closure value (Type::Closure) — recorded
       # with the closure-call marker, the receiver's effect and the args'
       # effects instead of the ICE.
-      match closure_call_shape(env, &recv, &args, Option::Some(recv))
+      match closure_call_shape(env, &recv_expr, &args, Option::Some(recv_expr.node_id))
       when Option::Some(tc2) then Option::Some(TypedExprKind::Call(tc2))
       when Option::None then
         add_error_with_code(env, "internal error: cannot assemble the typed HIR call node (node " + expr.node_id.to_string() + "): missing typed call target or argument access effect", expr.span, "ICE")
@@ -5873,7 +5893,7 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
       end
     end
   when ExprKind::ExprFieldAccess(recv, field) then
-    match typed_child_of(env, &recv)
+    match typed_child_of(env, recv.into_inner())
     when Option::Some(rt) then
       # Field only when field_targets recorded a FieldId (a struct field);
       # the non-id access forms (tuple indices, String/Slice/Array
@@ -5942,7 +5962,7 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
       when Option::None then return missing_typed_hir_child(env, expr)
       end
     end
-    match typed_child_of(env, &body)
+    match typed_child_of(env, body.into_inner())
     when Option::Some(bt) then Option::Some(TypedExprKind::Closure { params: typed_params, body: Box::new(bt) })
     when Option::None then missing_typed_hir_child(env, expr)
     end
@@ -6115,15 +6135,17 @@ struct TypedProgram
   expr_types: Map[Int, Type]
   call_targets: Map[Int, DefId]
  # (final): call expr node id -> the type checker's SOLVED generic
-  # substitution for that call (the callee's generic args in the callee's
-  # parameter order). Populated at the generic-call sites ONLY when the
+  # substitution for that call (the callee's generic arguments in the
+  # callee's DECLARED binder order, as the typed GenericArg union — P0-5;
+  # const-vs-type is decided by the checker, never re-derived downstream).
+  # Populated at the generic-call sites ONLY when the
   # callee is generic and EVERY generic parameter is solved; absent for
   # synthesized/unsolved calls (a call a context never solves is reported
   # by resolve_pending_call_instances). The solved substitutions from the
   # type checker are the AUTHORITY — ZERO-INFERENCE: the monomorphizer
   # performs no call-site inference (fail-closed). MIR pairs this with
-  # call_targets to fill the call instance's substs.
-  call_instances: Map[Int, Vec[Type]]
+  # call_targets to fill the call instance's args.
+  call_instances: Map[Int, Vec[GenericArg]]
   field_targets: Map[Int, FieldId]
   access_effects: Map[Int, AccessEffect]
  # (, phase 2): the Typed HIR — per expression node
@@ -6410,8 +6432,16 @@ def type_env_new() -> TypeEnv
   register_builtin_generic_named(&mut env, "Ptr", ptr_ids, TypeDefKind::Opaque)
   let ptrmut_ids = begin_builtin_generic(&mut env, Vec::from(["T".to_string()]))
   register_builtin_generic_named(&mut env, "PtrMut", ptrmut_ids, TypeDefKind::Opaque)
+  # The Box nominal — the owning heap wrapper. Registered with its REAL
+  # `{ ptr: Ptr[T] }` shape (mirroring the std declaration in
+  # std/alloc.tg and the Stage0 nominal identity): field resolution and
+  # field targeting must see the Box's own field, never the pointee's.
+  # The std re-declaration is the identical re-registration and keeps
+  # this TypeId/shape (store_type_def's identical-acceptance).
   let box_ids = begin_builtin_generic(&mut env, Vec::from(["T".to_string()]))
-  register_builtin_generic_named(&mut env, "Box", box_ids, TypeDefKind::Opaque)
+  register_builtin_generic_named(&mut env, "Box", box_ids.clone(), TypeDefKind::Struct([
+    FieldInfo { name: "ptr", ty: Type::Ptr(Type::Param(box_ids[0].clone())), is_public: true }
+  ]))
   let rc_ids = begin_builtin_generic(&mut env, Vec::from(["T".to_string()]))
   register_builtin_generic_named(&mut env, "Rc", rc_ids, TypeDefKind::Opaque)
   
@@ -8503,13 +8533,13 @@ def unify_named_fn_callable(inout env: TypeEnv, id1: TypeId, args1: Vec[Type], p
       end
     else
       let mismatch_lhs = Type::Adt(id1.clone(), args1.clone())
-      let mismatch_rhs = Type::FnPtr(params2.clone(), Box::new(ret2.clone()), Vec::new())
+      let mismatch_rhs = Type::FnPtr(params2.clone(), ret2.clone(), Vec::new())
       type_mismatch_error(env, &mismatch_lhs, &mismatch_rhs, span)
       false
     end
   when Option::None then
     let mismatch_lhs2 = Type::Adt(id1.clone(), args1.clone())
-    let mismatch_rhs2 = Type::FnPtr(params2.clone(), Box::new(ret2.clone()), Vec::new())
+    let mismatch_rhs2 = Type::FnPtr(params2.clone(), ret2.clone(), Vec::new())
     type_mismatch_error(env, &mismatch_lhs2, &mismatch_rhs2, span)
     false
   end  end
@@ -11721,18 +11751,21 @@ def wcet_cost_expr(env: TypeEnv, e: Expr) -> Int
   when ExprKind::ExprStringLit(_) then 1
   when ExprKind::ExprBoolLit(_) then 1
   when ExprKind::ExprIdent(_) | ExprKind::ExprPath(_) then 1
-  when ExprKind::ExprUnaryOp(_, inner) then wcet_cost_expr(env, &inner) + 1
-  when ExprKind::ExprBinaryOp(_, a, b) then wcet_cost_expr(env, &a) + wcet_cost_expr(env, &b) + 1
-  when ExprKind::ExprIndex(base, idx) then wcet_cost_expr(env, &base) + wcet_cost_expr(env, &idx) + 1
-  when ExprKind::ExprFieldAccess(base, _) then wcet_cost_expr(env, &base) + 1
+  when ExprKind::ExprUnaryOp(_, inner) then wcet_cost_expr(env, inner.into_inner()) + 1
+  when ExprKind::ExprBinaryOp(_, a, b) then wcet_cost_expr(env, a.into_inner()) + wcet_cost_expr(env, b.into_inner()) + 1
+  when ExprKind::ExprIndex(base, idx) then wcet_cost_expr(env, base.into_inner()) + wcet_cost_expr(env, idx.into_inner()) + 1
+  when ExprKind::ExprFieldAccess(base, _) then wcet_cost_expr(env, base.into_inner()) + 1
   when ExprKind::ExprCall(callee, args) then
-    var total = wcet_cost_expr(env, &callee)
+    # The callee is an owned Box[Expr]: unbox it explicitly for the
+    # recursive cost walk and the declared-bound lookup.
+    let callee_expr = callee.into_inner()
+    var total = wcet_cost_expr(env, &callee_expr)
     for a in args do
       total = total + wcet_cost_expr(env, &a)
     end
     # the callee's declared bound when available (the transitive cost),
     # else the default 20.
-    match callee.kind
+    match callee_expr.kind
     when ExprKind::ExprPath(p) then
       if p.segments.len() > 0 then
         let callee_name = p.segments[p.segments.len() - 1].clone()
@@ -12876,10 +12909,10 @@ def expr_root_local_id(env: TypeEnv, expr: Expr) -> Option[Int]
     else
       Option::None
     end
-  when ExprKind::ExprFieldAccess(base, _) then expr_root_local_id(env, &base)
-  when ExprKind::ExprIndex(base, _) then expr_root_local_id(env, &base)
-  when ExprKind::ExprCast(inner, _) then expr_root_local_id(env, &inner)
-  when ExprKind::ExprAccess(inner) then expr_root_local_id(env, &inner)
+  when ExprKind::ExprFieldAccess(base, _) then expr_root_local_id(env, base.into_inner())
+  when ExprKind::ExprIndex(base, _) then expr_root_local_id(env, base.into_inner())
+  when ExprKind::ExprCast(inner, _) then expr_root_local_id(env, inner.into_inner())
+  when ExprKind::ExprAccess(inner) then expr_root_local_id(env, inner.into_inner())
   when _ then Option::None
   end  end
 end
@@ -12934,7 +12967,10 @@ def map_accessor_name_of(env: TypeEnv, expr: Expr) -> String
   match expr.kind
   when ExprKind::ExprMethodCall(recv, name, _, args) then
     if (name == "get_read" || name == "get_modify") && args.len() >= 1 then
-      match env.typed_expr_types.get(recv.node_id)
+      # The receiver is an owned Box[Expr]: unbox it for the node-id keyed
+      # lookup.
+      let recv_expr = recv.into_inner()
+      match env.typed_expr_types.get(recv_expr.node_id)
       when Option::Some(rt) then
         let rty = resolve_type_var(env, rt)
         if type_bare_name_of(env, &rty) == "Map" then name.clone() else "" end
@@ -12963,7 +12999,10 @@ def check_scoped_access_store_target(inout env: TypeEnv, target: Expr, span: Spa
     let whole_store = match target.kind
     when ExprKind::ExprIdent(_) then true
     when ExprKind::ExprAccess(inner) then
-      match inner.kind
+      # The access marker wraps an owned Box[Expr]: unbox it to inspect
+      # the wrapped place shape.
+      let inner_expr = inner.into_inner()
+      match inner_expr.kind
       when ExprKind::ExprIdent(_) then true
       when _ then false
       end
@@ -13067,7 +13106,7 @@ def scoped_access_chain_of(inout env: TypeEnv, expr: Expr) -> (Int, Vec[ScopedPl
     when Option::None then (-1, Vec::new())
     end
   when ExprKind::ExprFieldAccess(base, _) then
-    let deeper = scoped_access_chain_of(env, &base)
+    let deeper = scoped_access_chain_of(env, base.into_inner())
     let root = deeper.0
     mut segs = deeper.1
     var fseg = ScopedPlaceSeg::F(-1)
@@ -13078,18 +13117,19 @@ def scoped_access_chain_of(inout env: TypeEnv, expr: Expr) -> (Int, Vec[ScopedPl
     segs.push(fseg)
     (root, segs)
   when ExprKind::ExprIndex(base, idx) then
-    let deeper2 = scoped_access_chain_of(env, &base)
+    let deeper2 = scoped_access_chain_of(env, base.into_inner())
     let root2 = deeper2.0
     mut segs2 = deeper2.1
     var iseg = ScopedPlaceSeg::I(-1)
-    match idx.kind
+    let idx_expr = idx.into_inner()
+    match idx_expr.kind
     when ExprKind::ExprIntLit(n) then iseg = ScopedPlaceSeg::I(parsed_int_to_host(&n))
     when _ then ()
     end
     segs2.push(iseg)
     (root2, segs2)
-  when ExprKind::ExprAccess(inner) then scoped_access_chain_of(env, &inner)
-  when ExprKind::ExprCast(inner, _) then scoped_access_chain_of(env, &inner)
+  when ExprKind::ExprAccess(inner) then scoped_access_chain_of(env, inner.into_inner())
+  when ExprKind::ExprCast(inner, _) then scoped_access_chain_of(env, inner.into_inner())
   when _ then (-1, Vec::new())
   end  end
 end
@@ -13214,11 +13254,11 @@ end
 # every other expression.
 def const_param_read_root(env: TypeEnv, expr: Expr) -> Option[Int]
   match expr.kind
-  when ExprKind::ExprAccess(inner) then const_param_read_root(env, &inner)
-  when ExprKind::ExprFieldAccess(base, _) then const_param_read_root(env, &base)
-  when ExprKind::ExprIndex(base, _) then const_param_read_root(env, &base)
-  when ExprKind::ExprCast(inner, _) then const_param_read_root(env, &inner)
-  when ExprKind::ExprRawDeref(inner) then const_param_read_root(env, &inner)
+  when ExprKind::ExprAccess(inner) then const_param_read_root(env, inner.into_inner())
+  when ExprKind::ExprFieldAccess(base, _) then const_param_read_root(env, base.into_inner())
+  when ExprKind::ExprIndex(base, _) then const_param_read_root(env, base.into_inner())
+  when ExprKind::ExprCast(inner, _) then const_param_read_root(env, inner.into_inner())
+  when ExprKind::ExprRawDeref(inner) then const_param_read_root(env, inner.into_inner())
   when ExprKind::ExprIdent(_) then
     match env.const_param_reads.get(expr.node_id)
     when Option::Some(n) then Option::Some(n)
@@ -13812,7 +13852,7 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
       src_segs = chain.1
       match expr.kind
       when ExprKind::ExprIndex(base, _) then
-        let pchain = scoped_access_chain_of(env, &base)
+        let pchain = scoped_access_chain_of(env, base.into_inner())
         parent_root = pchain.0
         parent_segs = pchain.1
       when _ then ()
@@ -13821,7 +13861,8 @@ def check_stmt(inout env: TypeEnv, stmt: Stmt) -> FlowResult
     if accessor_name != "" then
       match expr.kind
       when ExprKind::ExprMethodCall(recv, _, _, _) then
-        match expr_root_local_id(env, &recv)
+        let recv_expr = recv.into_inner()
+        match expr_root_local_id(env, &recv_expr)
         when Option::Some(mid) then src_root = mid
         when Option::None then ()
         end
@@ -14318,10 +14359,11 @@ end
 # variants — consult the source spelling, and they live HERE, never in
 # check_pattern.
 def resolve_pattern_variants(inout env: TypeEnv, pat: Pattern, expected: Type) -> Unit
+  # Patterns match through BORROWS only; a Box scrutinee keeps its own
+  # nominal identity (a `Box { ptr }` pattern descends the Box's own
+  # field, never a variant of the pointee).
   let expected_base = match expected
   when Type::RefInternal(inner, _) then inner
-  when Type::Adt(tid, args) then
-    if tid.id == env.lang_items.box_ && args.len() >= 1 then args[0].clone() else expected.clone() end
   when _ then expected
   end
   match pat.kind
@@ -14573,11 +14615,10 @@ end
 
 def check_pattern(inout env: TypeEnv, pat: Pattern, expected: Type, source_place: TypedPlace) -> Unit
   # Patterns match through references (e.g. `let (a, b) = &pair` where the
-  # scrutinee is a reference to a tuple).
+  # scrutinee is a reference to a tuple). Box is NOT transparent: a Box
+  # scrutinee binds/descends the Box nominal itself.
   let expected_base = match expected
   when Type::RefInternal(inner, _) then inner
-  when Type::Adt(tid, args) then
-    if tid.id == env.lang_items.box_ && args.len() >= 1 then args[0].clone() else expected.clone() end
   when _ then expected
   end
   match pat.kind
@@ -14591,12 +14632,12 @@ def check_pattern(inout env: TypeEnv, pat: Pattern, expected: Type, source_place
  # record the binding action — a plain binding READS its source;
       # a binding of an owning type MOVES the value out of the source place
       # (the resource checker's projected-move rules consume this data).
-      # Binding through a reference/box (`let (a, b) = &pair`) is a READ —
-      # no ownership transfers out of the source.
+      # Binding through a BORROW is a READ — no ownership transfers out
+      # of the source. An owned Box bound by value is an OWNING wrapper,
+      # not a borrow: its binding is a MOVE (Consume) exactly like any
+      # other owned resource.
       let bind_is_ref = match expected
       when Type::RefInternal(_, _) then true
-      when Type::Adt(tid, args) then
-        if tid.id == env.lang_items.box_ && args.len() >= 1 then true else false end
       when _ then false
       end
       let action = if !bind_is_ref && type_has_resource_kind(env, &expected_base) then AccessEffect::Consume else AccessEffect::Read end
@@ -15000,7 +15041,11 @@ def record_arg_effect(inout env: TypeEnv, arg: Expr, c: AccessConvention) -> Uni
   let effect = convention_to_effect(c)
   env.typed_access_effects.insert(arg.node_id, effect)
   match arg.kind
-  when ExprKind::ExprAccess(inner) then env.typed_access_effects.insert(inner.node_id, effect)
+  when ExprKind::ExprAccess(inner) then
+    # The access marker wraps an owned Box[Expr]: unbox it for the inner
+    # node's effect record.
+    let inner_expr = inner.into_inner()
+    env.typed_access_effects.insert(inner_expr.node_id, effect)
   when _ then ()
   end
   # (audit §12): the with-scoped-access argument/receiver gate — a
@@ -15040,10 +15085,10 @@ def check_borrowed_access_not_sunk(inout env: TypeEnv, arg: Expr, c: AccessConve
 end
 
 def resolved_receiver_base(env: TypeEnv, recv_type: Type) -> Type
+  # Borrows deref; Box does NOT (nominal identity — the resolver's method
+  # key for a Box receiver is the Box nominal's own key).
   let base = match recv_type
   when Type::RefInternal(inner, _) then inner
-  when Type::Adt(tid, args) then
-    if tid.id == env.lang_items.box_ && args.len() >= 1 then args[0].clone() else recv_type end
   when _ then recv_type
   end
   match base
@@ -15824,15 +15869,16 @@ end
 # Whether the receiver of a method call is a BUILTIN container (the
 # primitive String or a LangItems compound) — the receiver gate for the
 # checker's intrinsic attachment (a user method on a user type never
-# classifies as an intrinsic).
+# classifies as an intrinsic). The smart-pointer wrappers (Box/Rc) are
+# NOT containers: their `get`/`clone` surface is compiled impl identity,
+# never an array/map intrinsic, so they are excluded from this gate.
 def receiver_is_builtin_container(env: TypeEnv, ty: Type) -> Bool
   match ty
   when Type::String then true
   when Type::Adt(tid, _) then
     tid.id == env.lang_items.array || tid.id == env.lang_items.map ||
     tid.id == env.lang_items.set || tid.id == env.lang_items.option ||
-    tid.id == env.lang_items.result || tid.id == env.lang_items.slice ||
-    tid.id == env.lang_items.box_ || tid.id == env.lang_items.rc
+    tid.id == env.lang_items.result || tid.id == env.lang_items.slice
   when _ then false
   end  end
 end
@@ -18128,10 +18174,11 @@ def find_method_expected_args(inout env: TypeEnv, recv_type: Type, method: Strin
 end
 
 def field_target_of(env: TypeEnv, recv_type: Type, field: String) -> Option[FieldId]
+  # Auto-deref through BORROWS only. A Box receiver resolves its OWN
+  # fields (`b.ptr` is the wrapper's field; nominal identity — Box[T] is
+  # never unwrapped to T).
   let base = match recv_type
   when Type::RefInternal(inner, _) then inner
-  when Type::Adt(tid, args) then
-    if tid.id == env.lang_items.box_ && args.len() >= 1 then args[0].clone() else recv_type end
   when _ then recv_type
   end
   match base
@@ -18162,10 +18209,10 @@ end
 # field identity (the same id recorded in typed_field_targets / field_targets);
 # the field NAME is used only for diagnostics.
 def field_type_by_id(inout env: TypeEnv, recv_type: Type, owner: TypeId, index: Int, field: String, span: Span) -> Type
+  # Auto-deref through BORROWS only (Box keeps its nominal identity: the
+  # field id's owner IS the Box, never its pointee).
   let base = match recv_type
   when Type::RefInternal(inner, _) then inner
-  when Type::Adt(tid, args) then
-    if tid.id == env.lang_items.box_ && args.len() >= 1 then args[0].clone() else recv_type end
   when _ then recv_type
   end
   match base
@@ -18228,8 +18275,8 @@ def typed_callee_target_node(callee: Expr) -> Int
   match callee.kind
   when ExprKind::ExprIdent(_) then callee.node_id
   when ExprKind::ExprPath(_) then callee.node_id
-  when ExprKind::ExprAccess(inner) then typed_callee_target_node(&inner)
-  when ExprKind::ExprIndex(base, _) then typed_callee_target_node(&base)
+  when ExprKind::ExprAccess(inner) then typed_callee_target_node(inner.into_inner())
+  when ExprKind::ExprIndex(base, _) then typed_callee_target_node(base.into_inner())
   when _ then -1
   end  end
 end
@@ -18425,11 +18472,11 @@ end
 def scan_root_ident(expr: Expr) -> Option[String]
   match expr.kind
   when ExprKind::ExprIdent(n) then Option::Some(n.clone())
-  when ExprKind::ExprAccess(inner) then scan_root_ident(&inner)
-  when ExprKind::ExprFieldAccess(base, _) then scan_root_ident(&base)
-  when ExprKind::ExprIndex(base, _) then scan_root_ident(&base)
-  when ExprKind::ExprRawDeref(inner) then scan_root_ident(&inner)
-  when ExprKind::ExprCast(inner, _) then scan_root_ident(&inner)
+  when ExprKind::ExprAccess(inner) then scan_root_ident(inner.into_inner())
+  when ExprKind::ExprFieldAccess(base, _) then scan_root_ident(base.into_inner())
+  when ExprKind::ExprIndex(base, _) then scan_root_ident(base.into_inner())
+  when ExprKind::ExprRawDeref(inner) then scan_root_ident(inner.into_inner())
+  when ExprKind::ExprCast(inner, _) then scan_root_ident(inner.into_inner())
   when _ then Option::None
   end  end
 end
@@ -18656,8 +18703,8 @@ def scan_expr(env: TypeEnv, inout scan: CaptureScan, expr: Expr) -> Unit
       i = i + 1
     end
   when ExprKind::ExprArrayRepeat(elem, count) then
-    scan_expr(env, scan, &elem)
-    scan_expr(env, scan, &count)
+    scan_expr(env, scan, elem.into_inner())
+    scan_expr(env, scan, count.into_inner())
   when ExprKind::ExprTupleLit(elems) then
     var i = 0
     while i < elems.len() do
@@ -18690,22 +18737,22 @@ def scan_expr(env: TypeEnv, inout scan: CaptureScan, expr: Expr) -> Unit
       i = i + 1
     end
   when ExprKind::ExprBinaryOp(_, lhs, rhs) then
-    scan_expr(env, scan, &lhs)
-    scan_expr(env, scan, &rhs)
-  when ExprKind::ExprUnaryOp(_, operand) then scan_expr(env, scan, &operand)
-  when ExprKind::ExprFieldAccess(base, _) then scan_expr(env, scan, &base)
+    scan_expr(env, scan, lhs.into_inner())
+    scan_expr(env, scan, rhs.into_inner())
+  when ExprKind::ExprUnaryOp(_, operand) then scan_expr(env, scan, operand.into_inner())
+  when ExprKind::ExprFieldAccess(base, _) then scan_expr(env, scan, base.into_inner())
   when ExprKind::ExprMethodCall(recv, _, _, args) then
-    scan_operand(env, scan, &recv)
+    scan_operand(env, scan, recv.into_inner())
     var i = 0
     while i < args.len() do
       scan_operand(env, scan, &args[i])
       i = i + 1
     end
   when ExprKind::ExprIndex(base, index) then
-    scan_expr(env, scan, &base)
-    scan_expr(env, scan, &index)
+    scan_expr(env, scan, base.into_inner())
+    scan_expr(env, scan, index.into_inner())
   when ExprKind::ExprCall(func, args) then
-    scan_expr(env, scan, &func)
+    scan_expr(env, scan, func.into_inner())
     var i = 0
     while i < args.len() do
       scan_operand(env, scan, &args[i])
@@ -18717,27 +18764,27 @@ def scan_expr(env: TypeEnv, inout scan: CaptureScan, expr: Expr) -> Unit
       scan_pattern_bind(env, scan, &params[i].pat)
       i = i + 1
     end
-    scan_expr(env, scan, &body)
-  when ExprKind::ExprAccess(inner) then scan_expr(env, scan, &inner)
-  when ExprKind::ExprRawDeref(inner) then scan_expr(env, scan, &inner)
+    scan_expr(env, scan, body.into_inner())
+  when ExprKind::ExprAccess(inner) then scan_expr(env, scan, inner.into_inner())
+  when ExprKind::ExprRawDeref(inner) then scan_expr(env, scan, inner.into_inner())
   when ExprKind::ExprIf(if_stmt) then scan_if_stmt(env, scan, &if_stmt)
   when ExprKind::ExprMatch(m) then scan_match_expr(env, scan, &m)
   when ExprKind::ExprBlock(block) then scan_block(env, scan, &block)
   when ExprKind::ExprUnsafe(_, block) then scan_block(env, scan, &block)
   when ExprKind::ExprAsync(block) then scan_block(env, scan, &block)
-  when ExprKind::ExprAwait(inner) then scan_expr(env, scan, &inner)
-  when ExprKind::ExprTry(inner) then scan_expr(env, scan, &inner)
+  when ExprKind::ExprAwait(inner) then scan_expr(env, scan, inner.into_inner())
+  when ExprKind::ExprTry(inner) then scan_expr(env, scan, inner.into_inner())
   when ExprKind::ExprRange(start, end_, _) then
     match start
-    when Option::Some(s) then scan_expr(env, scan, &s)
+    when Option::Some(s) then scan_expr(env, scan, s.into_inner())
     when Option::None then ()
     end
     match end_
-    when Option::Some(e) then scan_expr(env, scan, &e)
+    when Option::Some(e) then scan_expr(env, scan, e.into_inner())
     when Option::None then ()
     end
-  when ExprKind::ExprCast(inner, _) then scan_expr(env, scan, &inner)
-  when ExprKind::ExprTypeCheck(inner, _) then scan_expr(env, scan, &inner)
+  when ExprKind::ExprCast(inner, _) then scan_expr(env, scan, inner.into_inner())
+  when ExprKind::ExprTypeCheck(inner, _) then scan_expr(env, scan, inner.into_inner())
   when ExprKind::ExprComptime(block) then scan_block(env, scan, &block)
   when ExprKind::ExprEnumVariant(_, _, args) then
     var i = 0
@@ -18746,15 +18793,16 @@ def scan_expr(env: TypeEnv, inout scan: CaptureScan, expr: Expr) -> Unit
       i = i + 1
     end
   when ExprKind::ExprAssign(target, value) then
-    match scan_root_ident(&target)
+    let target_expr = target.into_inner()
+    match scan_root_ident(&target_expr)
     when Option::Some(name) then scan_capture_record(env, scan, expr.node_id, name, AccessEffect::Modify)
     when Option::None then ()
     end
-    scan_expr(env, scan, &target)
-    scan_expr(env, scan, &value)
+    scan_expr(env, scan, &target_expr)
+    scan_expr(env, scan, value.into_inner())
   when ExprKind::ExprPipe(lhs, rhs) then
-    scan_expr(env, scan, &lhs)
-    scan_expr(env, scan, &rhs)
+    scan_expr(env, scan, lhs.into_inner())
+    scan_expr(env, scan, rhs.into_inner())
   when ExprKind::ExprMacroCall(_, args) then
     var i = 0
     while i < args.len() do
@@ -19131,7 +19179,7 @@ end
 def literal_bottom_of_neg_chain(expr: Expr) -> Option[Int]
   match expr.kind
   when ExprKind::ExprIntLit(_) then Option::Some(expr.node_id)
-  when ExprKind::ExprUnaryOp(UnOp::Neg, inner) then literal_bottom_of_neg_chain(inner)
+  when ExprKind::ExprUnaryOp(UnOp::Neg, inner) then literal_bottom_of_neg_chain(inner.into_inner())
   when _ then Option::None
   end  end
 end
@@ -19298,18 +19346,22 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     when Option::None then Type::Error
     end
   when ExprKind::ExprBinaryOp(op, left, right) then
-    check_binary_op(env, op, &left, &right, expr.span)
+    check_binary_op(env, op, left.into_inner(), right.into_inner(), expr.span)
   when ExprKind::ExprUnaryOp(op, inner) then
-    check_unary_op(env, op, &inner, expr.span)
+    check_unary_op(env, op, inner.into_inner(), expr.span)
   when ExprKind::ExprCall(func, args) then
+    # The callee is an owned Box[Expr]: unbox it explicitly — the call
+    # shape, the resolver bridge and the intrinsic naming all read the
+    # same expression (nominal Box identity; the box is never an Expr).
+    let func_expr = func.into_inner()
     # The operation-call surface: a std::effects::perform(EFFECT.op, ...)
     # call is typed against the declared effect's op table (the semantic
     # EffectId-keyed records) — the payload args unify with the op's
     # parameter types and the call's type is the op's return type.
-    match check_effect_perform_call(env, expr, &func, &args)
+    match check_effect_perform_call(env, expr, &func_expr, &args)
     when Option::Some(perform_ty) then perform_ty
     when Option::None then
-    var func_type = check_expr(env, &func)
+    var func_type = check_expr(env, &func_expr)
  # (FnPtr/Closure split): the call-shape analysis below keys on the
     # FnPtr signature form; a Closure callee NORMALIZES to it (the
     # signature is identical — the call-shape semantics are the same for a
@@ -19338,8 +19390,8 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     # runtime symbol surface) from the synthetic runtime-intrinsic
     # registrations (DefKind::Intrinsic — the names the runtime does NOT
     # provide, the gate's target).
-    record_typed_call_target(env, &func, expr.node_id)
-    match callee_ident_name(&func)
+    record_typed_call_target(env, &func_expr, expr.node_id)
+    match callee_ident_name(&func_expr)
     when Option::Some(cname) then
       let call_recv = if arg_types.len() > 0 then arg_types[0].clone() else Type::Unit end
       let call_needle = if arg_types.len() > 1 then arg_types[1].clone() else Type::Unit end
@@ -19617,7 +19669,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
           dsi = dsi + 1
         end
         var all_solved = true
-        var solved_args = Vec::new()
+        var solved_types: Vec[Type] = Vec::new()
         var decl_vars = Vec::new()
         var dvi = 0
         while dvi < decl_names.len() do
@@ -19629,7 +19681,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
             let solved = resolve_type_var(env, v.clone())
             match solved
             when Type::Var(_) then all_solved = false
-            when _ then solved_args.push(solved)
+            when _ then solved_types.push(solved)
             end
           when Option::None then ()
           end
@@ -19643,7 +19695,12 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
           dvi = dvi + 1
         end
         if all_solved then
-          env.typed_call_instances.insert(expr.node_id, solved_args)
+          # (P0-5): the solved positional vector is classified into the
+          # typed GenericArg union by each parameter's DECLARED kind
+          # before it is recorded — the const-vs-type decision made here
+          # is the only one the consumers ever see.
+          let typed_args = typed_args_of_solved(env, decl_names.clone(), solved_types, expr.span)
+          env.typed_call_instances.insert(expr.node_id, typed_args)
         elsif decl_names.len() > 0 then
           env.pending_call_instances.insert(expr.node_id, (decl_names.clone(), decl_vars, expr.span))
         end
@@ -19653,7 +19710,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       # resource-duplication hole as the get() methods. Reject them for
       # resource-containing element types (the intrinsic's first argument is
       # the container, so its element type decides).
-      match callee_ident_name(&func)
+      match callee_ident_name(&func_expr)
       when Option::Some(cname) then
         # Copy-producing intrinsics are compiler-internal building blocks; a
         # DIRECT call on resource-containing element types is rejected here
@@ -19723,7 +19780,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         ri = ri + 1
       end
     end
-    match callee_ident_name(&func)
+    match callee_ident_name(&func_expr)
     when Option::Some(cname) then
       if is_async_marker(&cname) then
         var ai = 0
@@ -19744,8 +19801,12 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     end
     end
   when ExprKind::ExprMethodCall(recv, method, type_args, args) then
+    # The receiver is an owned Box[Expr]: unbox it explicitly — the
+    # receiver type, its argument effect and its capture/call records all
+    # read the receiver expression (nominal Box identity).
+    let recv_expr = recv.into_inner()
     env.access_marker_depth = env.access_marker_depth + 1
-    let recv_type = check_expr(env, &recv)
+    let recv_type = check_expr(env, &recv_expr)
     var arg_types = Vec::new()
     var i = 0
     while i < args.len() do
@@ -19790,9 +19851,9 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     match mparams
     when Option::Some(params) then
       if params.len() >= 1 then
-        record_arg_effect(env, &recv, params[0].convention)
+        record_arg_effect(env, &recv_expr, params[0].convention)
       else
-        record_arg_effect(env, &recv, AccessConvention::Let)
+        record_arg_effect(env, &recv_expr, AccessConvention::Let)
       end
       # Enforce exact arity for method calls: the expected argument count is
       # the declared params minus the receiver (self), or the full param list
@@ -19828,7 +19889,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         ai = ai + 1
       end
     when Option::None then
-      record_arg_effect(env, &recv, AccessConvention::Let)
+      record_arg_effect(env, &recv_expr, AccessConvention::Let)
       var ai2 = 0
       while ai2 < args.len() do
         record_arg_effect(env, &args[ai2], AccessConvention::Let)
@@ -19836,7 +19897,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       end
     end
     if is_async_marker(&method) then
-      check_async_closure_captures(env, recv.node_id, recv.span)
+      check_async_closure_captures(env, recv_expr.node_id, recv_expr.span)
       var mai = 0
       while mai < args.len() do
         check_async_closure_captures(env, args[mai].node_id, args[mai].span)
@@ -19845,7 +19906,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     end
     ret
   when ExprKind::ExprFieldAccess(recv, field) then
-    let recv_type = check_expr(env, &recv)
+    let recv_type = check_expr(env, recv.into_inner())
     let fdid = field_target_of(env, &recv_type, field)
     # The FieldId (owner TypeId + index) is the semantic field identity: it is
     # recorded in typed_field_targets (Map[Int, FieldId]) and the field's type
@@ -19860,8 +19921,12 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       resolve_field_type(env, &recv_type, field, expr.span)
     end
   when ExprKind::ExprIndex(recv, index) then
-    let recv_type = check_expr(env, &recv)
-    let index_type = check_expr(env, &index)
+    # Both children are owned Box[Expr] payloads: unbox them explicitly
+    # (the index's span is read in every arm below).
+    let recv_expr = recv.into_inner()
+    let index_expr = index.into_inner()
+    let recv_type = check_expr(env, &recv_expr)
+    let index_type = check_expr(env, &index_expr)
     # Indexing is an inherently SHARED read that returns the element by
     # value; extracting a resource element this way would create a second
     # owned resource while the container remains live. Resource elements
@@ -19869,7 +19934,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     # take).
     match recv_type
     when Type::String then
-      unify(env, index_type, Type::Int, index.span)
+      unify(env, index_type, Type::Int, index_expr.span)
       Type::Char
     when Type::FixedArray(elem, _) then
       # Fixed-array indexing: Int index, element result (the count lives in
@@ -19877,7 +19942,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       if type_has_resource_kind(env, &elem) then
         type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
       end
-      unify(env, index_type, Type::Int, index.span)
+      unify(env, index_type, Type::Int, index_expr.span)
       elem.clone()
     when Type::FixedArraySym(elem, _) then
       # (§20 slice 1): a symbolic-size array indexes exactly like the
@@ -19886,7 +19951,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       if type_has_resource_kind(env, &elem) then
         type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
       end
-      unify(env, index_type, Type::Int, index.span)
+      unify(env, index_type, Type::Int, index_expr.span)
       elem.clone()
     when Type::Adt(tid, args) then
       # Map[K, V] indexing: key type K, result V. Array and the raw view
@@ -19899,13 +19964,13 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         if type_has_resource_kind(env, &args[1]) then
           type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
         end
-        unify(env, index_type, args[0].clone(), index.span)
+        unify(env, index_type, args[0].clone(), index_expr.span)
         args[1].clone()
       elsif (tid.id == env.lang_items.array || tid.id == env.lang_items.slice) && args.len() >= 1 then
         if type_has_resource_kind(env, &args[0]) then
           type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
         end
-        unify(env, index_type, Type::Int, index.span)
+        unify(env, index_type, Type::Int, index_expr.span)
         args[0].clone()
       elsif type_bare_name_of(env, &Type::Adt(tid, args)) == "Slice" && args.len() >= 1 then
         # The SAFE source-spelled Slice — the std-declared SHARED struct:
@@ -19915,17 +19980,17 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         if type_has_resource_kind(env, &args[0]) then
           type_add_error(env, "cannot extract resource element from shared container; use an inout/consuming access", expr.span)
         end
-        unify(env, index_type, Type::Int, index.span)
+        unify(env, index_type, Type::Int, index_expr.span)
         args[0].clone()
       elsif tid.id == env.lang_items.set && args.len() >= 1 then
-        unify(env, index_type, args[0].clone(), index.span)
+        unify(env, index_type, args[0].clone(), index_expr.span)
         Type::Bool
       else
-        unify(env, index_type, Type::Int, index.span)
+        unify(env, index_type, Type::Int, index_expr.span)
         fresh_type_var(env)
       end
     when _ then
-      unify(env, index_type, Type::Int, index.span)
+      unify(env, index_type, Type::Int, index_expr.span)
       fresh_type_var(env)
     end
   when ExprKind::ExprAccess(inner) then
@@ -19933,11 +19998,14 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       type_add_error(env, "access marker '&' is only valid as a call argument", expr.span)
       Type::Error
     else
-      check_expr(env, &inner)
+      check_expr(env, inner.into_inner())
     end
   when ExprKind::ExprRawDeref(inner) then
-    let inner_type = check_expr(env, &inner)
-    match inner.kind
+    # The operand is an owned Box[Expr]: unbox it explicitly (the shape
+    # match and the type check both read the operand expression).
+    let inner_expr = inner.into_inner()
+    let inner_type = check_expr(env, &inner_expr)
+    match inner_expr.kind
     when ExprKind::ExprIdent(_) then
       match inner_type
       when Type::Ptr(t) then t
@@ -20046,6 +20114,11 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       Type::Adt(TypeId { id: env.lang_items.array }, [elem_type])
     end
   when ExprKind::ExprArrayRepeat(elem, count) then
+    # Both children are owned Box[Expr] payloads: unbox them explicitly
+    # (the element is checked/consumed as an expression; the count is read
+    # for its constant form).
+    let elem_expr = elem.into_inner()
+    let count_expr = count.into_inner()
     # The [elem; count] repeat-array literal — the VALUE-position mirror of
     # the [T; N] fixed-array annotation: ONE element expression repeated
     # `count` times. The element is checked on the ordinary expression path
@@ -20065,16 +20138,16 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     if expr.node_id != 0 then
       env.typed_aggregate_ownership.insert(expr.node_id, Vec::from([true]))
     end
-    let elem_type = check_expr(env, &elem)
+    let elem_type = check_expr(env, &elem_expr)
     # (partial moves): the owned element is a transfer into the array (the
     # checker's transfer_consume mirror over the aggregate children).
-    check_scoped_access_value_escape(env, &elem, "store", elem.span)
-    record_projected_consume(env, &elem)
+    check_scoped_access_value_escape(env, &elem_expr, "store", elem_expr.span)
+    record_projected_consume(env, &elem_expr)
     # (channel b): an array repeat whose element type is (or contains) the
     # RAW Slice view (UnsafeSlice) stores the raw view in a container —
     # rejected (the array-literal arm's rule).
     check_no_escaping_slice(env, &elem_type, expr.span, "stored in a container (array repeat element)")
-    let _count_type = check_expr(env, &count)
+    let _count_type = check_expr(env, &count_expr)
     # (audit item 50 — the repeat-array ownership semantics): the rule for
     # [expr; count] is the Rust-style Copy rule — the element EXPRESSION's
     # type must be Copy — except the compiler-recognized zero-payload
@@ -20111,21 +20184,21 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     # parameter -> symbolic) and selects the element-gate wording below. The
     # count is restricted to the two forms the MIR can lower as a constant
     # count operand.
-    match repeat_count_form(env, &count)
+    match repeat_count_form(env, &count_expr)
     when RepeatCountForm::Literal(n) then
       if n < 0 then
-        type_add_error(env, "array repeat count must not be negative (got " + n.to_string() + ")", count.span)
+        type_add_error(env, "array repeat count must not be negative (got " + n.to_string() + ")", count_expr.span)
       elsif n > MAX_FIXED_ARRAY_ELEMS() then
-        type_add_error(env, "array repeat count " + n.to_string() + " exceeds the maximum supported length " + MAX_FIXED_ARRAY_ELEMS().to_string(), count.span)
+        type_add_error(env, "array repeat count " + n.to_string() + " exceeds the maximum supported length " + MAX_FIXED_ARRAY_ELEMS().to_string(), count_expr.span)
       end
       # (audit item 50(b) — the N == 1 single-element decision): a literal
       # count of ONE is the single-element store. The Copy gate below is
       # applied UNIFORMLY — the N == 1 wording states the concrete rule.
-      if !repeat_elem_image_safe(env, &elem, &elem_type) then
+      if !repeat_elem_image_safe(env, &elem_expr, &elem_type) then
         if n == 1 then
-          type_add_error(env, "array repeat requires Copy elements: [elem; 1] stores the element's image into the single slot, and an owning/affine element (a String, a Box, a container, a resource) would need an ownership-correct one-element MOVE — not expressible by the MirRepeat single-image store in this slice (no source-invalidation move path; the per-slot store carries only a register image) — so count 1 rejects owning elements exactly like every larger count (the accepted elements are scalar values and payload-less enum variant values such as Option::None)", elem.span)
+          type_add_error(env, "array repeat requires Copy elements: [elem; 1] stores the element's image into the single slot, and an owning/affine element (a String, a Box, a container, a resource) would need an ownership-correct one-element MOVE — not expressible by the MirRepeat single-image store in this slice (no source-invalidation move path; the per-slot store carries only a register image) — so count 1 rejects owning elements exactly like every larger count (the accepted elements are scalar values and payload-less enum variant values such as Option::None)", elem_expr.span)
         else
-          type_add_error(env, "array repeat requires Copy elements: the element expression's value is duplicated into every slot (the MIR fill writes one element image per slot), so an owning/affine element (a String, a Box, a container, a resource — never Copy) cannot be repeated; the accepted elements are scalar values (a multi-word Copy aggregate — a struct, tuple, or fixed array wider than a machine word — is outside the expressible image class of the single-register fill) and payload-less enum variant values such as Option::None, whose repeated image is the tag word", elem.span)
+          type_add_error(env, "array repeat requires Copy elements: the element expression's value is duplicated into every slot (the MIR fill writes one element image per slot), so an owning/affine element (a String, a Box, a container, a resource — never Copy) cannot be repeated; the accepted elements are scalar values (a multi-word Copy aggregate — a struct, tuple, or fixed array wider than a machine word — is outside the expressible image class of the single-register fill) and payload-less enum variant values such as Option::None, whose repeated image is the tag word", elem_expr.span)
         end
       end
       Type::FixedArray(elem_type, n)
@@ -20135,12 +20208,12 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       # form. The template cannot know the instance count (it instantiates
       # to any value >= 0, including 1), so the element gate is the SAME
       # uniform Copy rule as the literal arms.
-      if !repeat_elem_image_safe(env, &elem, &elem_type) then
-        type_add_error(env, "array repeat requires Copy elements: the element expression's value is duplicated into every slot of the symbolic-size array (the MIR fill writes one element image per slot, and the instance count N is unknown at template time — it can be 1 or larger), so an owning/affine element (a String, a Box, a container, a resource — never Copy) cannot be repeated; the accepted elements are scalar values (a multi-word Copy aggregate is outside the expressible image class of the single-register fill) and payload-less enum variant values such as Option::None, whose repeated image is the tag word", elem.span)
+      if !repeat_elem_image_safe(env, &elem_expr, &elem_type) then
+        type_add_error(env, "array repeat requires Copy elements: the element expression's value is duplicated into every slot of the symbolic-size array (the MIR fill writes one element image per slot, and the instance count N is unknown at template time — it can be 1 or larger), so an owning/affine element (a String, a Box, a container, a resource — never Copy) cannot be repeated; the accepted elements are scalar values (a multi-word Copy aggregate is outside the expressible image class of the single-register fill) and payload-less enum variant values such as Option::None, whose repeated image is the tag word", elem_expr.span)
       end
       Type::FixedArraySym(elem_type, gpid)
     when RepeatCountForm::Other then
-      type_add_error(env, "array repeat count must be an integer literal or an in-scope const generic parameter (constant arithmetic and const references are not yet supported as repeat counts)", count.span)
+      type_add_error(env, "array repeat count must be an integer literal or an in-scope const generic parameter (constant arithmetic and const references are not yet supported as repeat counts)", count_expr.span)
       Type::Error
     end
   when ExprKind::ExprTupleLit(elems) then
@@ -20293,6 +20366,9 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     end
     lit_result
   when ExprKind::ExprClosure(params, ret_ty, body) then
+    # The body is an owned Box[Expr]: unbox it explicitly (it is checked,
+    # unified and capture-scanned as an expression).
+    let body_expr = body.into_inner()
     push_scope(env)
     # (§20 slice 3): a closure body is its own LOWERING UNIT — a closure
     # lowers as its own non-generic synthesized function with NO
@@ -20344,16 +20420,16 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     env.current_closure_node = expr.node_id
  # (channel a): a closure annotated with (or returning) a Slice
     # view would let the view escape with the closure value — rejected.
-    check_no_escaping_slice(env, &closure_ret, body.span, "returned from a closure")
-    let body_type = check_expr(env, &body)
-    unify(env, body_type, closure_ret.clone(), body.span)
+    check_no_escaping_slice(env, &closure_ret, body_expr.span, "returned from a closure")
+    let body_type = check_expr(env, &body_expr)
+    unify(env, body_type, closure_ret.clone(), body_expr.span)
     env.expected_return = saved_expected_return
     env.current_closure_node = saved_closure_node
     # The capture scan runs AFTER the body check, so the body's recorded
     # call-argument effects (typed_access_effects) feed the Consume/Modify
     # capture records (scan_operand). uses = captured local id -> effect
     # (the closure_captures record); nodes = capture-node id -> effect.
-    let scan = scan_closure_captures(env, &params, &body)
+    let scan = scan_closure_captures(env, &params, &body_expr)
  # (channel c): a captured local whose type is (or contains) the
     # The RAW Slice view must not be captured into the closure — the
     # closure env would hold the raw view past its backing buffer's
@@ -20365,7 +20441,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
       match env.typed_local_bindings.get(cap_entries[cei].0)
       when Option::Some(cap_lb) then
         if type_contains_slice_view(env, &cap_lb.ty) then
-          type_add_error(env, "cannot capture a raw Slice view (UnsafeSlice[T]) into a closure: the raw {ptr,len} view is unsafe/FFI-only and must not outlive its backing buffer (capture the shared/pinned form — Vec::as_slice / String::as_str_view — or the owned clone instead)", body.span)
+          type_add_error(env, "cannot capture a raw Slice view (UnsafeSlice[T]) into a closure: the raw {ptr,len} view is unsafe/FFI-only and must not outlive its backing buffer (capture the shared/pinned form — Vec::as_slice / String::as_str_view — or the owned clone instead)", body_expr.span)
         end
       when Option::None then ()
       end
@@ -20387,7 +20463,7 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
         end
       end
       if captured_access_name != "" then
-        type_add_error(env, "cannot capture the with-scoped access value `" + captured_access_name + "` into a closure: a block-bound access value is not first-class and must not escape its block (read a Copy value out of the access instead)", body.span)
+        type_add_error(env, "cannot capture the with-scoped access value `" + captured_access_name + "` into a closure: a block-bound access value is not first-class and must not escape its block (read a Copy value out of the access instead)", body_expr.span)
       end
       cei = cei + 1
     end
@@ -20472,14 +20548,17 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     let inner = check_block(env, &block, true).normal
     inner  # In full impl, would wrap in Future/Async
   when ExprKind::ExprAwait(inner) then
-    let inner_type = check_expr(env, &inner)
-    if closure_has_inout_capture(env, inner.node_id) then
-      type_add_error(env, "inout capture cannot cross await", inner.span)
+    # The operand is an owned Box[Expr]: unbox it explicitly.
+    let inner_expr = inner.into_inner()
+    let inner_type = check_expr(env, &inner_expr)
+    if closure_has_inout_capture(env, inner_expr.node_id) then
+      type_add_error(env, "inout capture cannot cross await", inner_expr.span)
     else
-      match inner.kind
+      match inner_expr.kind
       when ExprKind::ExprAccess(inner2) then
-        if closure_has_inout_capture(env, inner2.node_id) then
-          type_add_error(env, "inout capture cannot cross await", inner2.span)
+        let inner2_expr = inner2.into_inner()
+        if closure_has_inout_capture(env, inner2_expr.node_id) then
+          type_add_error(env, "inout capture cannot cross await", inner2_expr.span)
         end
       when _ then ()
       end
@@ -20496,17 +20575,17 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     # handle/with, with) are REJECTED in check_stmt above; `?` must keep
     # type-checking because the compiler kernel itself uses it (e.g.
     # `parse_toml(s)?`).
-    let inner_type = check_expr(env, &inner)
+    let inner_type = check_expr(env, inner.into_inner())
     fresh_type_var(env)
   when ExprKind::ExprCast(inner, ty) then
-    check_expr(env, &inner)
+    check_expr(env, inner.into_inner())
     resolve_type_expr(env, &ty)
   when ExprKind::ExprTypeCheck(inner, ty) then
-    check_expr(env, &inner)
+    check_expr(env, inner.into_inner())
     Type::Bool
   when ExprKind::ExprPipe(left, right) then
-    check_expr(env, &left)
-    check_expr(env, &right)
+    check_expr(env, left.into_inner())
+    check_expr(env, right.into_inner())
   when ExprKind::ExprRange(start, end_, _) then
     # The range expression (the `for i in lo..hi` iterable and value-range
     # positions): an Int-typed value; the bounds are checked and unified
@@ -20515,14 +20594,16 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     # IterationPlan classifies the range form (source kind 3).
     match start
     when Option::Some(s) then
-      let st = check_expr(env, &s)
-      unify(env, st, Type::Int, s.span)
+      let s_expr = s.into_inner()
+      let st = check_expr(env, &s_expr)
+      unify(env, st, Type::Int, s_expr.span)
     when Option::None then ()
     end
     match end_
     when Option::Some(e) then
-      let et = check_expr(env, &e)
-      unify(env, et, Type::Int, e.span)
+      let e_expr = e.into_inner()
+      let et = check_expr(env, &e_expr)
+      unify(env, et, Type::Int, e_expr.span)
     when Option::None then ()
     end
     Type::Int
@@ -20544,14 +20625,17 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
     # Assignment EXPRESSIONS share the statement-assignment semantics
     # (drop old -> store new; the MIR keys the drop chain on the
     # expression's node id); the expression's value is the stored value.
-    let target_type = check_expr(env, &target)
-    let value_type = check_expr(env, &value)
-    unify(env, target_type, value_type, value.span)
+    # Both children are owned Box[Expr] payloads: unbox them explicitly.
+    let target_expr = target.into_inner()
+    let value_expr = value.into_inner()
+    let target_type = check_expr(env, &target_expr)
+    let value_type = check_expr(env, &value_expr)
+    unify(env, target_type, value_type, value_expr.span)
     # (partial moves): the assignment's projected records (see the
     # StmtAssign arm — the target chain re-lives, a projected OWNING value
     # moves out of its root).
-    record_projected_assign(env, &target)
-    record_projected_consume(env, &value)
+    record_projected_assign(env, &target_expr)
+    record_projected_consume(env, &value_expr)
     value_type
   when ExprKind::ExprMacroCall(name, args) then
     if name == "vec" then
@@ -20959,7 +21043,8 @@ def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, 
                             # (§20 const generics, slice 4): positional range
                             # check of the solved associated-call substitution.
                             validate_const_arg_ranges(env, sp_names.clone(), sp_solved.clone(), expr.span)
-                            env.typed_call_instances.insert(expr.node_id, sp_solved)
+                            let sp_typed = typed_args_of_solved(env, sp_names.clone(), sp_solved, expr.span)
+                            env.typed_call_instances.insert(expr.node_id, sp_typed)
                           elsif sp_names.len() > 0 then
                             env.pending_call_instances.insert(expr.node_id, (sp_names.clone(), sp_vars, expr.span))
                           end
@@ -21014,11 +21099,10 @@ def resolve_field_type(inout env: TypeEnv, recv_type: Type, field: String, span:
   when _ then ()
   end
 
-  # Auto-deref through references
+  # Auto-deref through BORROWS only (RefInternal). Box is NOT deref-
+  # transparent: `b.ptr` is resolved on the Box nominal itself.
   let base = match recv_type
   when Type::RefInternal(inner, _) then inner
-  when Type::Adt(tid, args) then
-    if tid.id == env.lang_items.box_ && args.len() >= 1 then args[0].clone() else recv_type end
   when _ then recv_type
   end
 
@@ -21309,7 +21393,8 @@ def instantiate_param_for_type_method(
     # range check (a concrete const argument outside its parameter's
     # declared range is the diagnostic at the call site).
     validate_const_arg_ranges(env, all_names.clone(), solved_args.clone(), span)
-    env.typed_call_instances.insert(call_node_id, solved_args)
+    let typed_args = typed_args_of_solved(env, all_names.clone(), solved_args, span)
+    env.typed_call_instances.insert(call_node_id, typed_args)
   elsif all_names.len() > 0 then
     env.pending_call_instances.insert(call_node_id, (all_names.clone(), all_vars, span))
   end
@@ -21472,7 +21557,8 @@ def instantiate_param_bound_method(
     # range check (a concrete const argument outside its parameter's
     # declared range is the diagnostic at the call site).
     validate_const_arg_ranges(env, all_names.clone(), solved_args.clone(), span)
-    env.typed_call_instances.insert(call_node_id, solved_args)
+    let typed_args = typed_args_of_solved(env, all_names.clone(), solved_args, span)
+    env.typed_call_instances.insert(call_node_id, typed_args)
   elsif all_names.len() > 0 then
     env.pending_call_instances.insert(call_node_id, (all_names.clone(), all_vars, span))
   end
@@ -21992,7 +22078,8 @@ def instantiate_method_type(inout env: TypeEnv, imp: ImplInfo, m: MethodInfo, re
       # range check (explicit method const arguments and values the
       # receiver/head unification fixed).
       validate_const_arg_ranges(env, all_names.clone(), solved_args.clone(), span)
-      env.typed_call_instances.insert(call_node_id, solved_args.clone())
+      let typed_args = typed_args_of_solved(env, all_names.clone(), solved_args.clone(), span)
+      env.typed_call_instances.insert(call_node_id, typed_args)
       # (§20 slice 4): the SOLVED bind map folds every const-parameter leaf
       # this call fixed — the implicit method-level form (`other:
       # Decimal128[S2]` binding S2 through the argument unification) leaves
@@ -22098,7 +22185,7 @@ def solve_builtin_method_u(inout env: TypeEnv, recv_args: Vec[Type], arg_types: 
     end
     if ok then
       substs.push(solved.clone())
-      env.typed_call_instances.insert(call_node_id, substs)
+      env.typed_call_instances.insert(call_node_id, generic_args_of_types(substs))
     end
   end
   solved
@@ -22142,11 +22229,12 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
   # for_type tags of the cand_rows rows) — the typed payload of the
   # bound-failure TraitFailureData.
   var cand_impl_rows: Vec[String] = Vec::new()
-  # Auto-deref through references
+  # Auto-deref through BORROWS only (RefInternal). Box is NOT deref-
+  # transparent: methods resolve on the Box nominal (`b.get()`,
+  # `b.get_mut()`, `b.into_inner()`, `b.clone()` through the std
+  # `impl[T: Clone] Box[T]`) — never on the pointee.
   let base = match recv_type
   when Type::RefInternal(inner, _) then inner
-  when Type::Adt(tid, args) then
-    if tid.id == env.lang_items.box_ && args.len() >= 1 then args[0].clone() else recv_type end
   when _ then recv_type
   end
 
@@ -22293,21 +22381,19 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
     # the resolved builtin name so `.clone()`/`.as_ref()` don't fall into
     # the trait-by-name search. The builtin compounds' method tables are the
     # Adt twins of the dropped canonical arms (Slice/Option/Result/Map/Set/
-    # Box/Rc), selected by the builtin's name (Arc/UniquePtr etc. have no
+    # Rc), selected by the builtin's name (Arc/UniquePtr etc. have no
     # LangItems entries and stay name-selected). Method RESULTS are produced
     # in the Adt form via builtin_adt (the LangItems ids).
+    # Box is NOT in this table: the Box nominal's own surface is the std
+    # `impl[T] Box[T]` (get/get_mut/into_inner) plus its bounds-gated
+    # `impl[T: Clone] Box[T]` clone — resolved by impl identity above,
+    # never by a transparent builtin table (no as_ref/as_mut/deref and no
+    # un-gated clone on the wrapper).
     let _nn = match get_type_by_id_ref(env, tid)
     when Option::Some(td) then td.name.clone()
     when Option::None then ""
     end
-    if _nn == "Box" then
-      let inner = if args.len() >= 1 then args[0].clone() else fresh_type_var(env) end
-      if method == "as_ref" then return inner end
-      if method == "as_mut" then return inner end
-      if method == "clone" then return builtin_adt(env, "Box".to_string(), [inner]) end
-      if method == "deref" then return inner end
-      if method == "is_null" then return Type::Bool end
-    elsif _nn == "Rc" || _nn == "Arc" then
+    if _nn == "Rc" || _nn == "Arc" then
       let inner = if args.len() >= 1 then args[0].clone() else fresh_type_var(env) end
       if method == "as_ref" then return inner end
       if method == "clone" then return Type::Adt(tid.clone(), args.clone()) end
@@ -22840,9 +22926,9 @@ def eval_const_size_expr(env: TypeEnv, expr: Expr) -> Option[Int]
       end
     end
   when ExprKind::ExprBinaryOp(op, lhs, rhs) then
-    match eval_const_size_expr(env, &lhs)
+    match eval_const_size_expr(env, lhs.into_inner())
     when Option::Some(a) then
-      match eval_const_size_expr(env, &rhs)
+      match eval_const_size_expr(env, rhs.into_inner())
       when Option::Some(b) then
         match op
         when BinOp::Add then
@@ -22865,7 +22951,7 @@ def eval_const_size_expr(env: TypeEnv, expr: Expr) -> Option[Int]
     when Option::None then Option::None
     end
   when ExprKind::ExprUnaryOp(UnOp::Neg, operand) then
-    match eval_const_size_expr(env, &operand)
+    match eval_const_size_expr(env, operand.into_inner())
     when Option::Some(n) then Option::Some(-n)
     when Option::None then Option::None
     end
@@ -22908,9 +22994,9 @@ def eval_const_arg_expr(env: TypeEnv, expr: Expr) -> Option[Int]
       end
     end
   when ExprKind::ExprBinaryOp(op, lhs, rhs) then
-    match eval_const_arg_expr(env, &lhs)
+    match eval_const_arg_expr(env, lhs.into_inner())
     when Option::Some(a) then
-      match eval_const_arg_expr(env, &rhs)
+      match eval_const_arg_expr(env, rhs.into_inner())
       when Option::Some(b) then
         match op
         when BinOp::Add then
@@ -22954,7 +23040,7 @@ def eval_const_arg_expr(env: TypeEnv, expr: Expr) -> Option[Int]
     when Option::None then Option::None
     end
   when ExprKind::ExprUnaryOp(UnOp::Neg, operand) then
-    match eval_const_arg_expr(env, &operand)
+    match eval_const_arg_expr(env, operand.into_inner())
     when Option::Some(n) then
       if n == (-9223372036854775807 - 1) then Option::None else Option::Some(0 - n) end
     when Option::None then Option::None
@@ -23026,9 +23112,9 @@ def const_sym_tree_build(env: TypeEnv, expr: Expr) -> Option[ConstExprT]
       end
     end
   when ExprKind::ExprBinaryOp(op, lhs, rhs) then
-    match const_sym_tree_build(env, &lhs)
+    match const_sym_tree_build(env, lhs.into_inner())
     when Option::Some(l) then
-      match const_sym_tree_build(env, &rhs)
+      match const_sym_tree_build(env, rhs.into_inner())
       when Option::Some(r) then
         # A division/modulo by a FULLY-CONCRETE zero divisor is rejected at
         # resolve (the same fail-closed rule as the value evaluator — a
@@ -23072,7 +23158,7 @@ def const_sym_tree_build(env: TypeEnv, expr: Expr) -> Option[ConstExprT]
     when Option::None then Option::None
     end
   when ExprKind::ExprUnaryOp(UnOp::Neg, operand) then
-    match const_sym_tree_build(env, &operand)
+    match const_sym_tree_build(env, operand.into_inner())
     when Option::Some(o) then Option::Some(ConstExprT::ConstNeg(o))
     when Option::None then Option::None
     end
@@ -23595,6 +23681,47 @@ def validate_const_arg_value(inout env: TypeEnv, gpid_num: Int, v: Int, span: Sp
   end
 end
 
+# (P0-5): classify ONE solved generic argument into the typed GenericArg
+# union by its DECLARED parameter kind (env.const_param_decl_types — the
+# declaration's const slots, keyed by the numeric GenericParamId; an
+# absent id is a type parameter). The const classification inspects the
+# solved TYPE constructors (Const/ConstParam/ConstSym) — never a render.
+# A const slot solved to a non-const non-error type is a checker-internal
+# contract break: it records the precise internal diagnostic (the
+# argument would otherwise reach the monomorphizer mis-typed) and keeps
+# the Type row so the existing post-check scans still see the offending
+# type.
+def generic_arg_of_solved(inout env: TypeEnv, gpid: GenericParamId, solved: Type, span: Span) -> GenericArg
+  match env.const_param_decl_types.get(generic_param_id_numeric(&gpid))
+  when Option::Some(_) then
+    match solved.clone()
+    when Type::Const(v) then GenericArg::Const(ConstValue::Value(v))
+    when Type::ConstParam(inner) then GenericArg::Const(ConstValue::Param(inner))
+    when Type::ConstSym(tree) then GenericArg::Const(ConstValue::Sym(tree))
+    when Type::Error then GenericArg::Type(solved)
+    when _ then
+      let pname = generic_param_name_of(&env.generic_param_table, &gpid)
+      type_add_error(env, "internal error: const parameter `" + pname + "` was solved to a non-const generic argument (" + type_tag(env, &solved) + ") — the call instance cannot record a typed const argument", span)
+      GenericArg::Type(solved)
+    end
+  when Option::None then
+    GenericArg::Type(solved)
+  end
+end
+
+# The typed-argument vector of a fully solved positional substitution:
+# one generic_arg_of_solved classification per (declared parameter id,
+# solved type), preserving the declared binder order (P0-5).
+def typed_args_of_solved(inout env: TypeEnv, names: Vec[GenericParamId], solved: Vec[Type], span: Span) -> Vec[GenericArg]
+  var args: Vec[GenericArg] = Vec::new()
+  var i = 0
+  while i < names.len() && i < solved.len() do
+    args.push(generic_arg_of_solved(env, names[i].clone(), solved[i].clone(), span))
+    i = i + 1
+  end
+  args
+end
+
 # (§20 const generics, slice 4): positional range validation of a SOLVED
 # generic substitution — the (parameter id, solved argument) vectors
 # recorded at call sites (plain calls, method/associated calls and the
@@ -23810,7 +23937,9 @@ def repeat_count_form(env: TypeEnv, count: Expr) -> RepeatCountForm
   match count.kind
   when ExprKind::ExprIntLit(n) then RepeatCountForm::Literal(parsed_int_to_host(&n))
   when ExprKind::ExprUnaryOp(UnOp::Neg, operand) then
-    match operand.kind
+    # The operand is an owned Box[Expr]: unbox it explicitly.
+    let operand_expr = operand.into_inner()
+    match operand_expr.kind
     when ExprKind::ExprIntLit(n) then RepeatCountForm::Literal(0 - parsed_int_to_host(&n))
     when _ then RepeatCountForm::Other
     end
@@ -24559,7 +24688,13 @@ def resolve_pending_int_literals(inout env: TypeEnv) -> Unit
   for (node_id, args) in env.typed_call_instances do
     var new_args = Vec::new()
     for a in args do
-      new_args.push(default_int_literal_type(env, &a))
+      # The recorded substitution is the P0-5 GenericArg union: the
+      # IntLiteral defaulting applies to the Type payloads; the Const
+      # payloads are values (nothing to default).
+      match a
+      when GenericArg::Type(t) then new_args.push(GenericArg::Type(default_int_literal_type(env, &t)))
+      when GenericArg::Const(cv) then new_args.push(GenericArg::Const(cv))
+      end
     end
     new_instances.insert(node_id, new_args)
   end
@@ -24740,7 +24875,17 @@ def verify_codegen_readiness(inout env: TypeEnv) -> Unit
       var he = false
       var hv = false
       var hp = false
-      scan_codegen_type(env, &inst_args[ai], &mut he, &mut hv, &mut hp, false)
+      match inst_args[ai].clone()
+      when GenericArg::Type(ty) then
+        scan_codegen_type(env, &ty, &mut he, &mut hv, &mut hp, false)
+      when GenericArg::Const(cv) then
+        match cv
+        when ConstValue::Value(_) then ()
+        when ConstValue::Param(_) then hp = true
+        when ConstValue::Sym(tree) then
+          if const_sym_tree_has_param(&tree) then hp = true end
+        end
+      end
       if he then
         type_add_error(env, "unresolved Type::Error in the solved generic-call substitution of node " + inst_node.to_string() + " would reach MIR/codegen", Span { file: "", start: 0, end_pos: 0 })
       end
@@ -24760,9 +24905,9 @@ def scan_deinit_plan_types(env: TypeEnv, plan: DeinitPlan, inout has_error: Bool
   match plan
   when DeinitPlan::Trivial then ()
   when DeinitPlan::Call(inst) then
-    for t in inst.substs do scan_codegen_type(env, &t, has_error, has_var, false, true) end
+    for a in inst.args do scan_codegen_type(env, &generic_arg_type_view(a), has_error, has_var, false, true) end
   when DeinitPlan::UserFinalizer(inst, inner) then
-    for t in inst.substs do scan_codegen_type(env, &t, has_error, has_var, false, true) end
+    for a in inst.args do scan_codegen_type(env, &generic_arg_type_view(a), has_error, has_var, false, true) end
     scan_deinit_plan_types(env, inner, has_error, has_var)
   when DeinitPlan::Aggregate(plans) then
     for p in plans do scan_deinit_plan_types(env, p, has_error, has_var) end
@@ -24911,38 +25056,38 @@ def oracle_walk_typed_expr(inout env: TypeEnv, typed: TypedProgram, te: TypedExp
   when TypedExprKind::Literal(_) then ()
   when TypedExprKind::Path(_) then ()
   when TypedExprKind::BinaryOp(_, left, right) then
-    oracle_walk_typed_expr(env, typed, &left, findings)
-    oracle_walk_typed_expr(env, typed, &right, findings)
-  when TypedExprKind::UnaryOp(_, operand) then oracle_walk_typed_expr(env, typed, &operand, findings)
+    oracle_walk_typed_expr(env, typed, left.into_inner(), findings)
+    oracle_walk_typed_expr(env, typed, right.into_inner(), findings)
+  when TypedExprKind::UnaryOp(_, operand) then oracle_walk_typed_expr(env, typed, operand.into_inner(), findings)
   when TypedExprKind::Index(base, index) then
-    oracle_walk_typed_expr(env, typed, &base, findings)
-    oracle_walk_typed_expr(env, typed, &index, findings)
-  when TypedExprKind::Cast(value, _) then oracle_walk_typed_expr(env, typed, &value, findings)
-  when TypedExprKind::TypeCheck(value, _) then oracle_walk_typed_expr(env, typed, &value, findings)
-  when TypedExprKind::RawDeref(inner) then oracle_walk_typed_expr(env, typed, &inner, findings)
-  when TypedExprKind::Access(inner) then oracle_walk_typed_expr(env, typed, &inner, findings)
+    oracle_walk_typed_expr(env, typed, base.into_inner(), findings)
+    oracle_walk_typed_expr(env, typed, index.into_inner(), findings)
+  when TypedExprKind::Cast(value, _) then oracle_walk_typed_expr(env, typed, value.into_inner(), findings)
+  when TypedExprKind::TypeCheck(value, _) then oracle_walk_typed_expr(env, typed, value.into_inner(), findings)
+  when TypedExprKind::RawDeref(inner) then oracle_walk_typed_expr(env, typed, inner.into_inner(), findings)
+  when TypedExprKind::Access(inner) then oracle_walk_typed_expr(env, typed, inner.into_inner(), findings)
   when TypedExprKind::Range(start_opt, end_opt, _) then
     match start_opt
-    when Option::Some(s) then oracle_walk_typed_expr(env, typed, &s, findings)
+    when Option::Some(s) then oracle_walk_typed_expr(env, typed, s.into_inner(), findings)
     when Option::None then ()
     end
     match end_opt
-    when Option::Some(e) then oracle_walk_typed_expr(env, typed, &e, findings)
+    when Option::Some(e) then oracle_walk_typed_expr(env, typed, e.into_inner(), findings)
     when Option::None then ()
     end
-  when TypedExprKind::Await(inner) then oracle_walk_typed_expr(env, typed, &inner, findings)
-  when TypedExprKind::Try(inner) then oracle_walk_typed_expr(env, typed, &inner, findings)
+  when TypedExprKind::Await(inner) then oracle_walk_typed_expr(env, typed, inner.into_inner(), findings)
+  when TypedExprKind::Try(inner) then oracle_walk_typed_expr(env, typed, inner.into_inner(), findings)
   when TypedExprKind::Pipe(lhs, rhs) then
-    oracle_walk_typed_expr(env, typed, &lhs, findings)
-    oracle_walk_typed_expr(env, typed, &rhs, findings)
+    oracle_walk_typed_expr(env, typed, lhs.into_inner(), findings)
+    oracle_walk_typed_expr(env, typed, rhs.into_inner(), findings)
   when TypedExprKind::Assign(target, value) then
-    oracle_walk_typed_expr(env, typed, &target, findings)
-    oracle_walk_typed_expr(env, typed, &value, findings)
+    oracle_walk_typed_expr(env, typed, target.into_inner(), findings)
+    oracle_walk_typed_expr(env, typed, value.into_inner(), findings)
   when TypedExprKind::ArrayLit(elems) then
     for e in elems do oracle_walk_typed_expr(env, typed, &e, findings) end
   when TypedExprKind::ArrayRepeat(elem, count) then
-    oracle_walk_typed_expr(env, typed, &elem, findings)
-    oracle_walk_typed_expr(env, typed, &count, findings)
+    oracle_walk_typed_expr(env, typed, elem.into_inner(), findings)
+    oracle_walk_typed_expr(env, typed, count.into_inner(), findings)
   when TypedExprKind::TupleLit(elems) then
     for e in elems do oracle_walk_typed_expr(env, typed, &e, findings) end
   when TypedExprKind::StructLit(_, fields) then
@@ -24998,7 +25143,7 @@ def oracle_walk_typed_expr(inout env: TypeEnv, typed: TypedProgram, te: TypedExp
   when TypedExprKind::Field(tf) then
     oracle_check_field_id(typed, &tf.field, "field access of node " + te.id.to_string(), findings)
     oracle_walk_typed_expr(env, typed, &tf.base, findings)
-  when TypedExprKind::TupleIndex(base, _, _) then oracle_walk_typed_expr(env, typed, &base, findings)
+  when TypedExprKind::TupleIndex(base, _, _) then oracle_walk_typed_expr(env, typed, base.into_inner(), findings)
   when TypedExprKind::Variant(tv) then
     oracle_check_variant_id(typed, &tv.variant, "variant construction of node " + te.id.to_string(), findings)
     for a in tv.args do oracle_walk_typed_expr(env, typed, &a, findings) end
@@ -25007,9 +25152,9 @@ def oracle_walk_typed_expr(inout env: TypeEnv, typed: TypedProgram, te: TypedExp
   when TypedExprKind::MacroCall(_, args) then
     for a in args do oracle_walk_typed_expr(env, typed, &a, findings) end
   when TypedExprKind::Closure(_, body) then
-    oracle_walk_typed_expr(env, typed, &body, findings)
+    oracle_walk_typed_expr(env, typed, body.into_inner(), findings)
   when TypedExprKind::If(cond, then_block, elsif_branches, else_block) then
-    oracle_walk_typed_expr(env, typed, &cond, findings)
+    oracle_walk_typed_expr(env, typed, cond.into_inner(), findings)
     for s in then_block do oracle_walk_typed_stmt(env, typed, s, findings) end
     for (econd, eblock) in elsif_branches do
       oracle_walk_typed_expr(env, typed, &econd, findings)
@@ -25021,7 +25166,7 @@ def oracle_walk_typed_expr(inout env: TypeEnv, typed: TypedProgram, te: TypedExp
     when Option::None then ()
     end
   when TypedExprKind::Match(scrutinee, arms) then
-    oracle_walk_typed_expr(env, typed, &scrutinee, findings)
+    oracle_walk_typed_expr(env, typed, scrutinee.into_inner(), findings)
     for arm in arms do
       oracle_walk_typed_pattern(typed, arm.pattern, findings)
       match arm.guard_expr
@@ -25299,7 +25444,8 @@ def resolve_pending_call_instances(inout env: TypeEnv) -> Unit
       # positional range check — a parked constant the caller's context
       # solved out of range fails here, at the same call site.
       validate_const_arg_ranges(env, rec_names.clone(), solved_args.clone(), rec_span)
-      env.typed_call_instances.insert(node_id, solved_args)
+      let typed_args = typed_args_of_solved(env, rec_names.clone(), solved_args, rec_span)
+      env.typed_call_instances.insert(node_id, typed_args)
     else
       # Genuinely unconstrained: no context (arguments, annotation, dest)
       # ever solved the parameter — record the annotation error per

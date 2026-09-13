@@ -1,0 +1,1371 @@
+# Tangerine Compiler - Replay production bridge (audit order item 6)
+#
+# THE PRODUCTION BRIDGE fills the documented gap between replay.tg's
+# compiler-lane analysis model and a REAL compiled executable:
+#
+#   * THE EVENT DICTIONARY: a compact per-executable table of nondeterminism
+#     EVENT SITES. One entry is
+#         { token: Int, stable_node_key: String, stable_decl_key: String,
+#           operation_word: String }
+#     where
+#       token            = the compact runtime token (1-based; 0 = the RAW /
+#                          untracked token the runtime writes when no site
+#                          was armed). Tokens are assigned in the canonical
+#                          sorted order below, so they are deterministic and
+#                          stable under MIR iteration order.
+#       stable_node_key  = the call-site node's StableMirNodeId canonical
+#                          key text ("<fn key>#N@<hi>-<lo>", P0-7). The
+#                          dictionary builder renders it from the FINALIZED
+#                          MIR terminator origin; an origin-less call site
+#                          is the documented UntrackedArtifact result and
+#                          fails the replay build closed (never a locator).
+#       stable_decl_key  = the §29 stable def key TEXT of the containing
+#                          function (the emission name IS the canonical def
+#                          key text in the compiler's emission domain — the
+#                          same text face replay.tg's symbol_key uses).
+#       operation_word   = the semantic operation class, one of the closed
+#                          four-source vocabulary replay.tg's ReplayChoice
+#                          projects: "time" / "random" / "external" /
+#                          "scheduler".
+#
+#   * THE RECORDED TRACE: a self-describing binary run artifact — a fixed
+#     48-byte header (magic + version + dictionary digest words +
+#     dictionary length + record byte count + reserved), the rendered
+#     dictionary text, then one record per nondeterminism observation:
+#         { u32 token, u32 tag, u32 payload_len, u8 payload[payload_len] }.
+#     The runtime recorder writes this exact layout (see runtime.tg's
+#     emit_tg_replay_support / _tg_replay_dump and lir.tg's
+#     lir_emit_replay_data_a64); this module's encoder/decoder is the
+#     Tangerine-side authority for the format and the lane's round-trip
+#     oracle.
+#
+#   * THE COMPARISON: replay_run_compare decodes two run artifacts, maps
+#     every record's token through ITS EMBEDDED dictionary (exact stable
+#     ids — the dictionary digest of the two runs must agree, so records
+#     from two different executables never compare), rebuilds replay.tg
+#     EventTraces with the mapped semantic identities and the typed
+#     ReplayChoice payloads, and answers the first divergence plus its
+#     minimal causal slice. A raw/unknown/origin-less token or a malformed
+#     artifact is the DOCUMENTED UNTRACKED RESULT: status
+#     ReplayComparisonStatus::Untracked(reason) with no fabricated
+#     divergence and no slice.
+#
+# THE WIRED SOURCE SET (only REAL commit points are dictionary sites):
+#   time     — "__tg_clock_ns" (the runtime's clock_gettime helper;
+#              runtime.tg's emit_tg_clock_ns commits the note token);
+#   external — the runtime read helpers "_tg_posix_read",
+#              "_tg_read_vec_u8" and "_tg_read_file_to_string" (the
+#              posix_read body commits; the two wrappers route through it).
+# The runtime commits a note via the LIR-emitted note stores (lir.tg's
+# lir_emit_replay_note_a64 arms `_tg_replay_note_token` /
+# `_tg_replay_note_tag` immediately before the call; the runtime helper
+# reads + disarms them).
+#
+# DOCUMENTED EXCLUSIONS (typed operation words DEFINED but NOT wired —
+# no runtime commit point exists yet; replay_unwired_source_note names the
+# reason per callee):
+#   random    — std/rand's os entropy path calls the libc `getrandom`
+#               extern (and `open`/`read` on /dev/urandom) directly; those
+#               are NOT runtime helpers, so no note/commit pair can be
+#               emitted without a std-level recorder surface.
+#   scheduler — std/thread goes straight to pthread_create/pthread_join/
+#               sched_yield; the OS owns the choice. The runtime has no
+#               scheduler choice point to record (the typed kind stays
+#               defined for a future in-runtime scheduler).
+#   external — std/io's sys_read lowers the raw `__intrinsic_syscall3`
+#               kernel call inline (no runtime helper), and std/time's
+#               Instant goes through the `clock_gettime` libc extern; both
+#               stay typed-but-unwired for the same reason.
+#
+# DETERMINISM: the dictionary render is one header line
+# ("tg.replay.dict.v1") then one "site|<token>|<op>|<node key>|<decl key>"
+# line per entry in token order; entries are sorted by (operation_word,
+# stable_decl_key, stable_node_key) with the (fn_name, block id) locator as
+# the final tie-break, and tokens are assigned from 1 in that order, so two
+# builds of the same finalized MIR produce byte-identical dictionaries and
+# token assignments regardless of function iteration order.
+
+use std::core::{Option, Result}
+use std::collections::{Vec}
+
+use tg_compiler::ids::{StableDigest, stable_digest_of}
+use tg_compiler::token::{span_dummy}
+use tg_compiler::types::{Type}
+use tg_compiler::mir::{
+  MirFunction, MirBlock, MirBlockId, MirLocal, MirLocalId, MirTerminator,
+  MirTerminatorKind, MirOperand, MirOperandKind, MirConstant, MirConstantKind,
+  MirCallArg
+}
+use tg_compiler::stable_ids::{
+  UntrackedArtifact, untracked_artifact, stable_mir_node_key_of,
+  stable_mir_node_id_of_generated, stable_mir_block_id_of_node
+}
+use tg_compiler::replay::{
+  EventTrace, ReplayChoice, ReplayEventId, SyncEdge,
+  replay_builder_new, replay_builder_append_choice, replay_builder_finish,
+  replay_compare, first_divergence, minimal_causal_slice, replay_slice,
+  replay_trace_is_typed
+}
+
+# -----------------------------------------------------------------------
+# §RB.1 - The event dictionary
+# -----------------------------------------------------------------------
+
+# One event site: the compact runtime token ↔ the exact stable ids of the
+# call site + its containing declaration + the semantic operation class.
+pub struct ReplayEventSite
+  token: Int
+  stable_node_key: String
+  stable_decl_key: String
+  operation_word: String
+end
+
+# The per-executable dictionary: the token-ordered, sorted site table.
+pub struct ReplayEventDictionary
+  entries: Vec[ReplayEventSite] = Vec::new()
+end
+
+# One (function, block) locator -> token/tag row: the LIR route arms the
+# runtime note at exactly this block's call terminator. A block never
+# carries two wired calls (a call IS the terminator), so the locator is the
+# key.
+pub struct ReplaySitePlan
+  fn_name: String
+  block_id: Int
+  token: Int
+  tag: Int
+end
+
+# The compile-time emission plan the LIR replay producer consumes: the
+# dictionary (rendered text + digest), the per-block arming table, the dump
+# path and the recorder buffer size. The disabled plan carries nothing.
+pub struct ReplayEmissionPlan
+  enabled: Bool = false
+  out_path: String = ""
+  dictionary: ReplayEventDictionary = ReplayEventDictionary {}
+  dictionary_text: String = ""
+  digest_hi: UInt = 0
+  digest_lo: UInt = 0
+  sites: Vec[ReplaySitePlan] = Vec::new()
+  buffer_bytes: Int = 65536
+end
+
+pub def replay_plan_disabled() -> ReplayEmissionPlan
+  ReplayEmissionPlan {}
+end
+
+# The default recorder buffer (64 KiB — roughly 2700 fixed records or
+# fewer, larger external-read payloads; the runtime sets its overflow flag
+# and stops appending when full, never a corrupt partial record).
+pub def replay_buffer_default() -> Int
+  65536
+end
+
+# The RAW / untracked token (the runtime writes it when no site was armed).
+pub def replay_token_raw() -> Int
+  0
+end
+
+# ———— the operation vocabulary (the closed four-source classes) ————
+
+pub def replay_op_time() -> String
+  "time"
+end
+
+pub def replay_op_random() -> String
+  "random"
+end
+
+pub def replay_op_external() -> String
+  "external"
+end
+
+pub def replay_op_scheduler() -> String
+  "scheduler"
+end
+
+# The tag values of the recorded payloads (the runtime's u32 tag word).
+pub def replay_tag_time() -> Int
+  0
+end
+
+pub def replay_tag_random() -> Int
+  1
+end
+
+pub def replay_tag_external() -> Int
+  2
+end
+
+pub def replay_tag_scheduler() -> Int
+  3
+end
+
+# The tag of an operation word (-1 outside the closed set).
+pub def replay_tag_of_word(word: String) -> Int
+  if word == "time" then replay_tag_time()
+  elsif word == "random" then replay_tag_random()
+  elsif word == "external" then replay_tag_external()
+  elsif word == "scheduler" then replay_tag_scheduler()
+  else -1
+  end
+end
+
+# The operation word of a tag ("" outside the closed set).
+pub def replay_word_of_tag(tag: Int) -> String
+  if tag == replay_tag_time() then replay_op_time()
+  elsif tag == replay_tag_random() then replay_op_random()
+  elsif tag == replay_tag_external() then replay_op_external()
+  elsif tag == replay_tag_scheduler() then replay_op_scheduler()
+  else "".to_string()
+  end
+end
+
+# ———— the wired/recognized callee classification ————
+
+# The callee name of a call operand (Option::None for an indirect target).
+def replay_callee_name_of(func: MirOperand) -> Option[String]
+  match func.kind
+  when MirOperandKind::MirConstant(c) then
+    match c.kind
+    when MirConstantKind::MirFnItem(name) then Option::Some(name.clone())
+    when _ then Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+# The WIRED commit set: the callee names whose runtime body (or the body of
+# the helper it routes through) commits the armed note. Only these names
+# enter the dictionary — every other nondeterminism source is a documented
+# exclusion (replay_unwired_source_note).
+pub def replay_callee_commits(name: String) -> Option[String]
+  if name == "__tg_clock_ns" || name == "_tg_wasi_clock_time_get" then
+    Option::Some(replay_op_time())
+  elsif name == "_tg_posix_read" || name == "_tg_read_vec_u8" ||
+    name == "_tg_read_file_to_string" || name == "_tg_wasi_fd_read" then
+    Option::Some(replay_op_external())
+  else
+    Option::None
+  end
+end
+
+# The FULL recognized-source classification (wired + unwired): the typed
+# operation word of a known nondeterminism callee, or None for an unrelated
+# call. This is the documentation/classification authority — the
+# DICTIONARY uses replay_callee_commits only.
+pub def replay_callee_operation_word(name: String) -> Option[String]
+  match replay_callee_commits(name.clone())
+  when Option::Some(op) then Option::Some(op)
+  when Option::None then
+    if name == "clock_gettime" || name == "clock_getres" then
+      Option::Some(replay_op_time())
+    elsif name == "getrandom" || name == "getentropy" || name == "arc4random" then
+      Option::Some(replay_op_random())
+    elsif name == "read" || name == "libc_read" || name == "pread" then
+      Option::Some(replay_op_external())
+    elsif name == "pthread_create" || name == "pthread_join" ||
+      name == "sched_yield" || name == "pthread_mutex_lock" then
+      Option::Some(replay_op_scheduler())
+    else
+      Option::None
+    end
+  end
+end
+
+# The documented exclusion note of a recognized-but-unwired source (None
+# for a wired source or an unrecognized name): the typed kind is defined,
+# no runtime commit point exists yet.
+pub def replay_unwired_source_note(name: String) -> Option[String]
+  match replay_callee_commits(name.clone())
+  when Option::Some(_) then Option::None
+  when Option::None then
+    if name == "getrandom" || name == "getentropy" || name == "arc4random" then
+      Option::Some("random: std/rand calls the libc extern directly — no runtime helper commits the note (leave the typed kind defined)")
+    elsif name == "pthread_create" || name == "pthread_join" ||
+      name == "sched_yield" || name == "pthread_mutex_lock" then
+      Option::Some("scheduler: std/thread goes straight to pthreads — the OS owns the choice; the runtime has no scheduler choice point")
+    elsif name == "clock_gettime" || name == "clock_getres" then
+      Option::Some("time: the libc extern is not a runtime helper — std/time's Instant bypasses __tg_clock_ns")
+    elsif name == "read" || name == "libc_read" || name == "pread" then
+      Option::Some("external: the libc extern is not a runtime helper — std/io's sys_read lowers __intrinsic_syscall3 inline")
+    else
+      Option::None
+    end
+  end
+end
+
+# One candidate site collected from the MIR walk (the sort/dedup input).
+struct ReplaySiteCandidate
+  fn_name: String
+  block_id: Int
+  node_key: String
+  decl_key: String
+  operation_word: String
+end
+
+def replay_candidate_lt(a: ReplaySiteCandidate, b: ReplaySiteCandidate) -> Bool
+  if a.operation_word != b.operation_word then
+    a.operation_word < b.operation_word
+  elsif a.decl_key != b.decl_key then
+    a.decl_key < b.decl_key
+  elsif a.node_key != b.node_key then
+    a.node_key < b.node_key
+  elsif a.fn_name != b.fn_name then
+    a.fn_name < b.fn_name
+  else
+    a.block_id < b.block_id
+  end
+end
+
+# Whether the dictionary is in canonical (token-ascending, sorted) order.
+pub def replay_dictionary_is_sorted(dict: ReplayEventDictionary) -> Bool
+  var i = 0
+  while i < dict.entries.len() do
+    let e = dict.entries[i]
+    if e.token != i + 1 then
+      return false
+    end
+    if i > 0 then
+      let p = dict.entries[i - 1]
+      var ok = false
+      if p.operation_word != e.operation_word then
+        ok = p.operation_word < e.operation_word
+      elsif p.stable_decl_key != e.stable_decl_key then
+        ok = p.stable_decl_key < e.stable_decl_key
+      else
+        ok = p.stable_node_key < e.stable_node_key
+      end
+      if !ok then
+        return false
+      end
+    end
+    i = i + 1
+  end
+  true
+end
+
+# The rendered dictionary text (the embedded rodata artifact and the run
+# header's dictionary section):
+#   tg.replay.dict.v1
+#   site|<token>|<op>|<stable node key>|<stable decl key>
+# in token order. The decl key is the LAST field so a '|' inside it (never
+# produced by the emission-name grammar today, but not guaranteed) does not
+# break the parse.
+pub def replay_dictionary_render(dict: ReplayEventDictionary) -> String
+  var lines: Vec[String] = Vec::new()
+  lines.push("tg.replay.dict.v1")
+  for e in dict.entries do
+    lines.push("site|" + e.token.to_string() + "|" + e.operation_word.clone() + "|" +
+      e.stable_node_key.clone() + "|" + e.stable_decl_key.clone())
+  end
+  lines.join("\n")
+end
+
+# The 128-bit content digest of the rendered dictionary.
+pub def replay_dictionary_digest(dict: ReplayEventDictionary) -> StableDigest
+  stable_digest_of(&replay_dictionary_render(dict.clone()))
+end
+
+# Parse a rendered dictionary text; Err carries the fail-closed reason.
+pub def replay_dictionary_parse(text: String) -> Result[ReplayEventDictionary, String]
+  let lines = text.lines()
+  if lines.len() == 0 || lines[0] != "tg.replay.dict.v1" then
+    return Result::Err("replay-dictionary: missing tg.replay.dict.v1 header".to_string())
+  end
+  var dict = ReplayEventDictionary {}
+  var li = 1
+  while li < lines.len() do
+    let line = lines[li].clone()
+    if line.len() == 0 then
+      # the runtime dump may carry a trailing newline; an empty tail line
+      # is skipped, an empty line in the middle is malformed.
+      if li + 1 < lines.len() then
+        return Result::Err("replay-dictionary: empty line at " + li.to_string())
+      end
+    else
+      let parts = line.split("|")
+      if parts.len() < 5 || parts[0] != "site" then
+        return Result::Err("replay-dictionary: malformed site line at " + li.to_string())
+      end
+      match parts[1].parse_int()
+      when Result::Err(_) then
+        return Result::Err("replay-dictionary: malformed token at " + li.to_string())
+      when Result::Ok(token) then
+        if token != dict.entries.len() + 1 then
+          return Result::Err("replay-dictionary: token " + token.to_string() + " out of canonical order at " + li.to_string())
+        end
+        let op = parts[2].clone()
+        if replay_tag_of_word(op.clone()) < 0 then
+          return Result::Err("replay-dictionary: unknown operation word `" + op + "` at " + li.to_string())
+        end
+        let node_key = parts[3].clone()
+        if node_key.len() == 0 then
+          return Result::Err("replay-dictionary: origin-less node key at " + li.to_string())
+        end
+        var decl_key = ""
+        var pi = 4
+        while pi < parts.len() do
+          if pi > 4 then
+            decl_key = decl_key + "|"
+          end
+          decl_key = decl_key + parts[pi].clone()
+          pi = pi + 1
+        end
+        if decl_key.len() == 0 then
+          return Result::Err("replay-dictionary: origin-less decl key at " + li.to_string())
+        end
+        dict.entries.push(ReplayEventSite {
+          token: token,
+          stable_node_key: node_key,
+          stable_decl_key: decl_key,
+          operation_word: op
+        })
+      end
+    end
+    li = li + 1
+  end
+  if !replay_dictionary_is_sorted(dict.clone()) then
+    return Result::Err("replay-dictionary: entries are not in canonical sorted order".to_string())
+  end
+  Result::Ok(dict)
+end
+
+# The entry of a token; None for the RAW token / an unknown token (the
+# documented untracked anchor).
+pub def replay_dictionary_site_of_token(dict: ReplayEventDictionary, token: Int) -> Option[ReplayEventSite]
+  if token <= 0 then
+    return Option::None
+  end
+  for e in dict.entries do
+    if e.token == token then
+      return Option::Some(e.clone())
+    end
+  end
+  Option::None
+end
+
+# ———— the finalized-MIR dictionary builder ————
+
+# Build the whole-program replay emission plan: every wired call site in
+# the finalized MIR becomes a dictionary entry (sorted, deduped by
+# (operation word, stable node key), tokens from 1) plus one arming row per
+# (function, block). An origin-less wired call site returns the documented
+# UntrackedArtifact result, so the --replay compile fails closed.
+pub def replay_emission_plan_of_functions(functions: Vec[MirFunction], out_path: String) -> Result[ReplayEmissionPlan, UntrackedArtifact]
+  var cands: Vec[ReplaySiteCandidate] = Vec::new()
+  for f in functions do
+    if !f.is_extern then
+      for b in f.blocks do
+        match b.terminator.kind
+        when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic, tail: _ } then
+          match replay_callee_name_of(func.clone())
+          when Option::Some(name) then
+            match replay_callee_commits(&name)
+            when Option::Some(op) then
+              match b.terminator.origin.clone()
+              when Option::None then
+                return Result::Err(untracked_artifact("replay-dictionary",
+                  "function '" + f.name.clone() + "' block bb" + b.id.id.to_string() +
+                  " call `" + name + "` carries no persistent call-origin — the dictionary never promotes a locator"))
+              when Option::Some(node) then
+                cands.push(ReplaySiteCandidate {
+                  fn_name: f.name.clone(),
+                  block_id: b.id.id,
+                  node_key: stable_mir_node_key_of(node),
+                  decl_key: f.name.clone(),
+                  operation_word: op.clone()
+                })
+              end
+            when Option::None then ()
+            end
+          when Option::None then ()
+          end
+        when _ then ()
+        end
+      end
+    end
+  end
+  cands.sort_by(|a, b| replay_candidate_lt(a.clone(), b.clone()))
+  var dict = ReplayEventDictionary {}
+  var sites: Vec[ReplaySitePlan] = Vec::new()
+  for c in cands do
+    var token = -1
+    for e in dict.entries do
+      if e.operation_word == c.operation_word && e.stable_node_key == c.node_key then
+        token = e.token
+      end
+    end
+    if token < 0 then
+      dict.entries.push(ReplayEventSite {
+        token: dict.entries.len() + 1,
+        stable_node_key: c.node_key.clone(),
+        stable_decl_key: c.decl_key.clone(),
+        operation_word: c.operation_word.clone()
+      })
+      token = dict.entries.len()
+    end
+    sites.push(ReplaySitePlan {
+      fn_name: c.fn_name.clone(),
+      block_id: c.block_id,
+      token: token,
+      tag: replay_tag_of_word(c.operation_word.clone())
+    })
+  end
+  let text = replay_dictionary_render(dict.clone())
+  let digest = stable_digest_of(&text)
+  Result::Ok(ReplayEmissionPlan {
+    enabled: true,
+    out_path: out_path,
+    dictionary: dict,
+    dictionary_text: text,
+    digest_hi: digest.hi,
+    digest_lo: digest.lo,
+    sites: sites,
+    buffer_bytes: replay_buffer_default()
+  })
+end
+
+# The arming row of a (function, block) call site (-1 token: not a wired
+# site / the disabled plan).
+pub def replay_plan_token_of(plan: ReplayEmissionPlan, fn_name: String, block_id: Int) -> Int
+  if !plan.enabled then
+    return -1
+  end
+  for s in plan.sites do
+    if s.fn_name == fn_name && s.block_id == block_id then
+      return s.token
+    end
+  end
+  -1
+end
+
+# The tag word of a (function, block) call site (-1 when unwired).
+pub def replay_plan_tag_of(plan: ReplayEmissionPlan, fn_name: String, block_id: Int) -> Int
+  if !plan.enabled then
+    return -1
+  end
+  for s in plan.sites do
+    if s.fn_name == fn_name && s.block_id == block_id then
+      return s.tag
+    end
+  end
+  -1
+end
+
+# The wired-site count of the plan (the lane's determinism anchor).
+pub def replay_plan_site_count(plan: ReplayEmissionPlan) -> Int
+  plan.sites.len()
+end
+
+# -----------------------------------------------------------------------
+# §RB.2 - The run artifact codec (the runtime dump format)
+# -----------------------------------------------------------------------
+
+# The 4-byte magic ("TGRP" little-endian) + the format version (1).
+pub def replay_run_magic() -> Int
+  0x50524754
+end
+
+pub def replay_run_version() -> Int
+  1
+end
+
+# The fixed header size (magic u32, version u32, dict hi u64, dict lo u64,
+# dict length u64, record bytes u64, reserved u64).
+pub def replay_run_header_bytes() -> Int
+  48
+end
+
+# The runtime payload cap (the recorder truncates a longer value payload;
+# the record's len field carries the truncated length).
+pub def replay_run_payload_cap() -> Int
+  64
+end
+
+# One decoded record: the compact token, the source tag and the raw
+# value-bytes payload.
+pub struct ReplayRawChoice
+  token: Int
+  tag: Int
+  payload: Vec[u8] = Vec::new()
+end
+
+# One decoded run artifact: the embedded dictionary + the ordered records.
+pub struct ReplayRunData
+  dictionary: ReplayEventDictionary
+  records: Vec[ReplayRawChoice] = Vec::new()
+end
+
+def replay_push_u32(inout out: Vec[u8], v: Int) -> Unit
+  out.push(((v >> 24) & 0xFF) as u8)
+  out.push(((v >> 16) & 0xFF) as u8)
+  out.push(((v >> 8) & 0xFF) as u8)
+  out.push((v & 0xFF) as u8)
+end
+
+def replay_push_u64(inout out: Vec[u8], v: UInt) -> Unit
+  var i = 0
+  while i < 8 do
+    out.push((((v >> (i * 8)) & 0xFF)) as u8)
+    i = i + 1
+  end
+end
+
+def replay_read_u32(bytes: Vec[u8], at: Int) -> Int
+  (bytes[at] as Int) | ((bytes[at + 1] as Int) << 8) |
+    ((bytes[at + 2] as Int) << 16) | ((bytes[at + 3] as Int) << 24)
+end
+
+def replay_read_u64(bytes: Vec[u8], at: Int) -> UInt
+  var v: UInt = 0
+  var i = 0
+  while i < 8 do
+    v = v | ((bytes[at + i] as UInt) << (i * 8))
+    i = i + 1
+  end
+  v
+end
+
+# Encode one run artifact from the rendered dictionary and the records —
+# the exact byte layout the runtime dump writes. The lane round-trips this
+# through replay_run_decode; the runtime's data emitter (lir.tg) and the
+# recorder (runtime.tg) mirror the same fixed grammar.
+pub def replay_run_encode(dictionary_text: String, records: Vec[ReplayRawChoice]) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  let digest = stable_digest_of(&dictionary_text)
+  replay_push_u32(&mut out, replay_run_magic())
+  replay_push_u32(&mut out, replay_run_version())
+  replay_push_u64(&mut out, digest.hi)
+  replay_push_u64(&mut out, digest.lo)
+  replay_push_u64(&mut out, dictionary_text.len() as UInt)
+  var records_len = 0
+  for r in records do
+    var plen = r.payload.len()
+    if plen > replay_run_payload_cap() then
+      plen = replay_run_payload_cap()
+    end
+    records_len = records_len + 12 + plen
+  end
+  replay_push_u64(&mut out, records_len as UInt)
+  replay_push_u64(&mut out, 0 as UInt)
+  for b in dictionary_text.bytes() do
+    out.push(b)
+  end
+  for r in records do
+    var plen = r.payload.len()
+    if plen > replay_run_payload_cap() then
+      plen = replay_run_payload_cap()
+    end
+    replay_push_u32(&mut out, r.token)
+    replay_push_u32(&mut out, r.tag)
+    replay_push_u32(&mut out, plen)
+    var i = 0
+    while i < plen do
+      out.push(r.payload[i])
+      i = i + 1
+    end
+  end
+  out
+end
+
+# Decode a run artifact. Err carries the fail-closed reason (a truncated
+# artifact, a bad magic/version, a malformed embedded dictionary, or a
+# truncated record) — the caller turns it into the documented untracked
+# result.
+pub def replay_run_decode(bytes: Vec[u8]) -> Result[ReplayRunData, String]
+  if bytes.len() < replay_run_header_bytes() then
+    return Result::Err("replay-run: truncated header (" + bytes.len().to_string() + " bytes)".to_string())
+  end
+  if replay_read_u32(bytes.clone(), 0) != replay_run_magic() then
+    return Result::Err("replay-run: bad magic (not a TgRePly artifact)".to_string())
+  end
+  if replay_read_u32(bytes.clone(), 4) != replay_run_version() then
+    return Result::Err("replay-run: unsupported format version".to_string())
+  end
+  let dict_len = replay_read_u64(bytes.clone(), 24) as Int
+  let records_len = replay_read_u64(bytes.clone(), 32) as Int
+  if dict_len < 0 || records_len < 0 then
+    return Result::Err("replay-run: negative section length".to_string())
+  end
+  let body = replay_run_header_bytes()
+  if body + dict_len + records_len > bytes.len() then
+    return Result::Err("replay-run: truncated body".to_string())
+  end
+  let dict_text = String::from_bytes(bytes.slice(body, body + dict_len))
+  let dict = match replay_dictionary_parse(dict_text)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(d) then d
+  end
+  let expected = stable_digest_of(&replay_dictionary_render(dict.clone()))
+  if expected.hi != replay_read_u64(bytes.clone(), 8) || expected.lo != replay_read_u64(bytes.clone(), 16) then
+    return Result::Err("replay-run: embedded dictionary digest mismatch".to_string())
+  end
+  var records: Vec[ReplayRawChoice] = Vec::new()
+  var at = body + dict_len
+  let end = at + records_len
+  while at < end do
+    if at + 12 > end then
+      return Result::Err("replay-run: truncated record header".to_string())
+    end
+    let token = replay_read_u32(bytes.clone(), at)
+    let tag = replay_read_u32(bytes.clone(), at + 4)
+    let plen = replay_read_u32(bytes.clone(), at + 8)
+    at = at + 12
+    if plen < 0 || plen > replay_run_payload_cap() || at + plen > end then
+      return Result::Err("replay-run: truncated record payload".to_string())
+    end
+    var payload: Vec[u8] = Vec::new()
+    var i = 0
+    while i < plen do
+      payload.push(bytes[at + i])
+      i = i + 1
+    end
+    at = at + plen
+    records.push(ReplayRawChoice { token: token, tag: tag, payload: payload })
+  end
+  Result::Ok(ReplayRunData { dictionary: dict, records: records })
+end
+
+# ———— payload value rendering (for the typed choice + the answer rows) ————
+
+# The Int value of an 8-byte little-endian payload (the time/random/
+# scheduler payloads); 0 when shorter than 8 bytes.
+def replay_payload_u64(payload: Vec[u8]) -> UInt
+  if payload.len() < 8 then
+    return 0
+  end
+  replay_read_u64(payload, 0)
+end
+
+# The Int64 view of an 8-byte payload (two's complement).
+def replay_payload_i64(payload: Vec[u8]) -> Int
+  replay_payload_u64(payload) as Int
+end
+
+# The lowercase-hex render of a byte payload (the external-read value text;
+# injective over the bytes).
+pub def replay_hex_encode(bytes: Vec[u8]) -> String
+  let chars = "0123456789abcdef"
+  var out = ""
+  for b in bytes do
+    out = out + chars.slice((b as Int) >> 4, ((b as Int) >> 4) + 1) +
+      chars.slice((b as Int) & 0x0F, ((b as Int) & 0x0F) + 1)
+  end
+  out
+end
+
+# Parse a lowercase/uppercase hex text; Err on an odd length or a
+# non-hex character.
+pub def replay_hex_decode(text: String) -> Result[Vec[u8], String]
+  if text.len() % 2 != 0 then
+    return Result::Err("replay-hex: odd length".to_string())
+  end
+  var out: Vec[u8] = Vec::new()
+  var i = 0
+  while i < text.len() do
+    let hi = replay_hex_digit(text.slice(i, i + 1))
+    let lo = replay_hex_digit(text.slice(i + 1, i + 2))
+    if hi < 0 || lo < 0 then
+      return Result::Err("replay-hex: non-hex character at " + i.to_string())
+    end
+    out.push(((hi * 16 + lo) & 0xFF) as u8)
+    i = i + 2
+  end
+  Result::Ok(out)
+end
+
+def replay_hex_digit(ch: String) -> Int
+  if ch == "0" then
+    0
+  elsif ch == "1" then
+    1
+  elsif ch == "2" then
+    2
+  elsif ch == "3" then
+    3
+  elsif ch == "4" then
+    4
+  elsif ch == "5" then
+    5
+  elsif ch == "6" then
+    6
+  elsif ch == "7" then
+    7
+  elsif ch == "8" then
+    8
+  elsif ch == "9" then
+    9
+  elsif ch == "a" || ch == "A" then
+    10
+  elsif ch == "b" || ch == "B" then
+    11
+  elsif ch == "c" || ch == "C" then
+    12
+  elsif ch == "d" || ch == "D" then
+    13
+  elsif ch == "e" || ch == "E" then
+    14
+  elsif ch == "f" || ch == "F" then
+    15
+  else
+    -1
+  end
+end
+
+# The typed ReplayChoice of a decoded record (None for an unknown tag —
+# the caller treats that as untracked).
+pub def replay_raw_choice_of(site: ReplayEventSite, rec: ReplayRawChoice) -> Option[ReplayChoice]
+  if rec.tag == replay_tag_time() then
+    Option::Some(ReplayChoice::Time(replay_payload_i64(rec.payload.clone())))
+  elsif rec.tag == replay_tag_random() then
+    Option::Some(ReplayChoice::Random(replay_payload_i64(rec.payload.clone())))
+  elsif rec.tag == replay_tag_scheduler() then
+    Option::Some(ReplayChoice::Scheduler(replay_payload_i64(rec.payload.clone())))
+  elsif rec.tag == replay_tag_external() then
+    Option::Some(ReplayChoice::ExternalRead(
+      site.stable_node_key.clone(),
+      replay_hex_encode(rec.payload.clone())))
+  else
+    Option::None
+  end
+end
+
+# ———— run -> EventTrace (the token mapping: exact stable ids) ————
+
+# Map one decoded run to the replay.tg EventTrace model: every record's
+# token resolves through the EMBEDDED dictionary; the event's semantic
+# identity is (stable_decl_key, stable_node_key, operation_word) and the
+# typed choice rides the event. Err (the documented untracked result) for
+# the RAW token, an unknown token, an origin-less entry, an unknown tag, or
+# a value-less time/random/scheduler payload.
+pub def replay_trace_of_run(data: ReplayRunData) -> Result[EventTrace, String]
+  var b = replay_builder_new("run")
+  var i = 0
+  while i < data.records.len() do
+    let rec = data.records[i]
+    if rec.token == replay_token_raw() then
+      return Result::Err("untracked-raw-token at record " + i.to_string())
+    end
+    let site = match replay_dictionary_site_of_token(data.dictionary.clone(), rec.token)
+    when Option::None then
+      return Result::Err("untracked-token:" + rec.token.to_string() + " at record " + i.to_string())
+    when Option::Some(s) then s
+    end
+    if site.stable_node_key.len() == 0 || site.stable_decl_key.len() == 0 then
+      return Result::Err("untracked-origin-less-token:" + rec.token.to_string())
+    end
+    if rec.tag == replay_tag_time() || rec.tag == replay_tag_random() || rec.tag == replay_tag_scheduler() then
+      if rec.payload.len() < 8 then
+        return Result::Err("untracked-payload:" + rec.token.to_string() + " (tag " + rec.tag.to_string() + " needs 8 bytes)")
+      end
+    end
+    let choice = match replay_raw_choice_of(site.clone(), rec.clone())
+    when Option::None then
+      return Result::Err("untracked-tag:" + rec.tag.to_string() + " at record " + i.to_string())
+    when Option::Some(c) then c
+    end
+    replay_builder_append_choice(&mut b, site.stable_decl_key.clone(),
+      site.stable_decl_key.clone(), site.stable_node_key.clone(), 0,
+      site.operation_word.clone(), Option::None, choice)
+    i = i + 1
+  end
+  Result::Ok(replay_builder_finish(b))
+end
+
+# Whether a decoded run is fully typed (every token tracked) — the
+# harness's gate before replaying.
+pub def replay_run_is_tracked(data: ReplayRunData) -> Bool
+  match replay_trace_of_run(data)
+  when Result::Ok(_) then true
+  when Result::Err(_) then false
+  end
+end
+
+# -----------------------------------------------------------------------
+# §RB.3 - replay_run_compare: first divergence + minimal causal slice
+# -----------------------------------------------------------------------
+
+# The comparison status: Compared (both runs decoded and mapped) or the
+# documented UNTRACKED result (decode failure / dictionary mismatch /
+# raw/unknown/origin-less token).
+pub enum ReplayComparisonStatus
+  Compared
+  Untracked(reason: String)
+end
+
+# The comparison answer. first_divergence is the token-inclusive first
+# divergence of the two choice streams (a differing recorded choice IS a
+# divergence — replay.tg's stricter relation); first_semantic_divergence is
+# the semantic-only compare (a differing choice alone is NOT semantic); the
+# slice is the divergence's minimal causal slice over the diverging side.
+# Untracked carries no divergence and no slice.
+pub struct ReplayComparison
+  status: ReplayComparisonStatus
+  run_a_digest: StableDigest
+  run_b_digest: StableDigest
+  dictionary_digest: StableDigest
+  first_divergence: Option[ReplayEventId] = Option::None
+  first_semantic_divergence: Option[ReplayEventId] = Option::None
+  slice: Vec[ReplayEventId] = Vec::new()
+end
+
+def replay_run_digest_of(data: ReplayRunData) -> StableDigest
+  stable_digest_of(&replay_dictionary_render(data.dictionary.clone()))
+end
+
+# The raw-byte digest of a run artifact (the run identity the comparison
+# reports). The bytes are rendered as their hex text before digesting so
+# the digest is a pure function of the artifact.
+pub def replay_run_bytes_digest(bytes: Vec[u8]) -> StableDigest
+  stable_digest_of(&replay_hex_encode(bytes))
+end
+
+# Compare two run artifacts: decode both, require the SAME embedded
+# dictionary digest (exact stable ids — records from two different
+# executables never compare), map both through the dictionary, and answer
+# the first divergence + minimal causal slice. Any decode/mapping failure
+# is the documented untracked result.
+pub def replay_run_compare(run_a: Vec[u8], run_b: Vec[u8]) -> ReplayComparison
+  let da = match replay_run_decode(run_a.clone())
+  when Result::Err(e) then
+    return replay_comparison_untracked("decode-a:" + e)
+  when Result::Ok(d) then d
+  end
+  let db = match replay_run_decode(run_b.clone())
+  when Result::Err(e) then
+    return replay_comparison_untracked("decode-b:" + e)
+  when Result::Ok(d) then d
+  end
+  let dict_a = replay_dictionary_digest(da.dictionary.clone())
+  let dict_b = replay_dictionary_digest(db.dictionary.clone())
+  if dict_a.hi != dict_b.hi || dict_a.lo != dict_b.lo then
+    return replay_comparison_untracked("dictionary-mismatch: the runs were produced by different executables")
+  end
+  let trace_a = match replay_trace_of_run(da.clone())
+  when Result::Err(e) then return replay_comparison_untracked("run-a:" + e)
+  when Result::Ok(t) then t
+  end
+  let trace_b = match replay_trace_of_run(db.clone())
+  when Result::Err(e) then return replay_comparison_untracked("run-b:" + e)
+  when Result::Ok(t) then t
+  end
+  let first = first_divergence(&trace_a, &trace_b)
+  let semantic = replay_compare(&trace_a, &trace_b)
+  var slice: Vec[ReplayEventId] = Vec::new()
+  match first.clone()
+  when Option::Some(_) then
+    slice = minimal_causal_slice(&trace_a, &trace_b)
+  when Option::None then ()
+  end
+  ReplayComparison {
+    status: ReplayComparisonStatus::Compared,
+    run_a_digest: replay_run_bytes_digest(run_a.clone()),
+    run_b_digest: replay_run_bytes_digest(run_b.clone()),
+    dictionary_digest: dict_a,
+    first_divergence: first,
+    first_semantic_divergence: semantic,
+    slice: slice
+  }
+end
+
+# The untracked answer (no divergence, no slice — never a fabricated one).
+def replay_comparison_untracked(reason: String) -> ReplayComparison
+  ReplayComparison {
+    status: ReplayComparisonStatus::Untracked(reason: reason),
+    run_a_digest: stable_digest_of(&"untracked".to_string()),
+    run_b_digest: stable_digest_of(&"untracked".to_string()),
+    dictionary_digest: stable_digest_of(&"untracked".to_string())
+  }
+end
+
+pub def replay_comparison_is_untracked(c: ReplayComparison) -> Bool
+  match c.status
+  when ReplayComparisonStatus::Untracked(_) then true
+  when ReplayComparisonStatus::Compared then false
+  end
+end
+
+pub def replay_comparison_untracked_reason(c: ReplayComparison) -> String
+  match c.status
+  when ReplayComparisonStatus::Untracked(reason) then reason.clone()
+  when ReplayComparisonStatus::Compared then "".to_string()
+  end
+end
+
+# The canonical event-id row (the semantic_query replay_id_render grammar).
+pub def replay_bridge_id_row(id: ReplayEventId) -> String
+  "seq:" + id.sequence.to_string() + "|" + id.function_key.clone() + "|" +
+    id.stmt_key.clone() + "|" + id.thread_id.to_string()
+end
+
+# The canonical answer rows of a comparison (the replay.compare op's keys;
+# status first, then the digests, then the divergence/slice rows).
+pub def replay_comparison_rows(c: ReplayComparison) -> Vec[String]
+  var rows: Vec[String] = Vec::new()
+  if replay_comparison_is_untracked(c.clone()) then
+    rows.push("status=untracked")
+    rows.push("reason=" + replay_comparison_untracked_reason(c.clone()))
+  else
+    rows.push("status=compared")
+  end
+  rows.push("dictionary=" + semantic_digest_words(c.dictionary_digest))
+  rows.push("run-a=" + semantic_digest_words(c.run_a_digest))
+  rows.push("run-b=" + semantic_digest_words(c.run_b_digest))
+  match c.first_divergence.clone()
+  when Option::Some(id) then
+    rows.push("first-divergence=" + replay_bridge_id_row(id))
+  when Option::None then
+    rows.push("first-divergence=none")
+  end
+  match c.first_semantic_divergence.clone()
+  when Option::Some(id) then
+    rows.push("first-semantic-divergence=" + replay_bridge_id_row(id))
+  when Option::None then
+    rows.push("first-semantic-divergence=none")
+  end
+  rows.push("slice-count=" + c.slice.len().to_string())
+  for id in c.slice do
+    rows.push("slice=" + replay_bridge_id_row(id))
+  end
+  rows
+end
+
+def semantic_digest_words(d: StableDigest) -> String
+  d.hi.to_string() + "-" + d.lo.to_string()
+end
+
+# The sync-aware comparison variant: same decode/mapping, but the slice
+# walks the supplied explicit synchronization edges (empty edges keep the
+# last-writer causal fallback). The divergence itself is unchanged.
+pub def replay_run_compare_with_sync(
+  run_a: Vec[u8],
+  run_b: Vec[u8],
+  edges: Vec[SyncEdge]
+) -> ReplayComparison
+  var c = replay_run_compare(run_a.clone(), run_b.clone())
+  if replay_comparison_is_untracked(c.clone()) then
+    return c
+  end
+  let da = match replay_run_decode(run_a.clone())
+  when Result::Err(_) then return c
+  when Result::Ok(d) then d
+  end
+  let db = match replay_run_decode(run_b.clone())
+  when Result::Err(_) then return c
+  when Result::Ok(d) then d
+  end
+  let trace_a = match replay_trace_of_run(da)
+  when Result::Err(_) then return c
+  when Result::Ok(t) then t
+  end
+  let trace_b = match replay_trace_of_run(db)
+  when Result::Err(_) then return c
+  when Result::Ok(t) then t
+  end
+  c.slice = replay_slice(&trace_a, &trace_b, edges.clone())
+  c
+end
+
+# -----------------------------------------------------------------------
+# §RB.4 - the self-checking lane
+# -----------------------------------------------------------------------
+
+struct ReplayBridgeFixture
+  plan: ReplayEmissionPlan
+  fn_a: MirFunction
+  fn_b: MirFunction
+end
+
+# A minimal origin-stamped function carrying one wired call terminator in
+# block 0 (a call terminator to `callee`, then... the call IS the
+# terminator, so the function is one block: Call(success) where success is
+# the same block is illegal; use two blocks: block 0 calls into block 1
+# (return)). The call terminator's origin is a GENERATED node identity, so
+# the fixture is origin-stamped without a HIR environment.
+def replay_bridge_mir_fn(fn_key: String, callee: String, node_seq: Int) -> MirFunction
+  let origin = stable_mir_node_id_of_generated(fn_key.clone(),
+    fn_key.clone(), "lower".to_string(), "call".to_string(), node_seq)
+  let ret_origin = stable_mir_node_id_of_generated(fn_key.clone(),
+    fn_key.clone(), "lower".to_string(), "return".to_string(), node_seq + 1)
+  var call_args: Vec[MirCallArg] = Vec::new()
+  let call_term = MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: Option::None,
+      func: MirConstant {
+        kind: MirConstantKind::MirFnItem(callee.clone()),
+        ty: Type::Unit,
+        instance: Option::None
+      },
+      args: call_args,
+      success: MirBlockId { id: 1 },
+      unwind: Option::None,
+      intrinsic: Option::None,
+      tail: false
+    },
+    span: span_dummy(),
+    origin: Option::Some(origin.clone())
+  }
+  var blocks: Vec[MirBlock] = Vec::new()
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 0 },
+    statements: Vec::new(),
+    terminator: call_term,
+    origin: Option::Some(stable_mir_block_id_of_node(origin.clone()))
+  })
+  blocks.push(MirBlock {
+    id: MirBlockId { id: 1 },
+    statements: Vec::new(),
+    terminator: MirTerminator {
+      kind: MirTerminatorKind::MirReturn,
+      span: span_dummy(),
+      origin: Option::Some(ret_origin.clone())
+    },
+    origin: Option::Some(stable_mir_block_id_of_node(ret_origin.clone()))
+  })
+  var locals: Vec[MirLocal] = Vec::new()
+  locals.push(MirLocal {
+    id: MirLocalId { id: 0 },
+    name: "_ret".to_string(),
+    ty: Type::Unit,
+    is_mut: false,
+    span: span_dummy()
+  })
+  MirFunction {
+    name: fn_key,
+    params: Vec::new(),
+    ret_type: Type::Unit,
+    locals: locals,
+    blocks: blocks,
+    entry_block: MirBlockId { id: 0 },
+    is_async: false,
+    is_unsafe: false,
+    is_extern: false,
+    extern_abi: "",
+    contracts: Vec::new(),
+    span: span_dummy()
+  }
+end
+
+def replay_bridge_lane_str(inout out: Vec[String], name: String, got: String, want: String) -> Unit
+  if got != want then
+    out.push(name + ": expected [" + want + "], got [" + got + "]")
+  end
+  ()
+end
+
+def replay_bridge_lane_int(inout out: Vec[String], name: String, got: Int, want: Int) -> Unit
+  if got != want then
+    out.push(name + ": expected " + want.to_string() + ", got " + got.to_string())
+  end
+  ()
+end
+
+def replay_bridge_lane_bool(inout out: Vec[String], name: String, got: Bool, want: Bool) -> Unit
+  if got != want then
+    out.push(name + ": expected " + want.to_string() + ", got " + got.to_string())
+  end
+  ()
+end
+
+# The lane: dictionary determinism/sort, token round-trip, artifact codec
+# round-trip, compare first-divergence + slice, and the documented untracked
+# results. Empty = the lane verifies.
+pub def replay_bridge_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # ———— B1: the dictionary is sorted, 1-based and deterministic ————
+  let fn_a = replay_bridge_mir_fn("m::a#fn()->unit".to_string(), "__tg_clock_ns".to_string(), 0)
+  let fn_b = replay_bridge_mir_fn("m::b#fn()->unit".to_string(), "_tg_read_vec_u8".to_string(), 0)
+  let plan_ab = match replay_emission_plan_of_functions(Vec::from([fn_a.clone(), fn_b.clone()]), "/tmp/tg.replay.trace".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(u) then
+    out.push("B1-plan-untracked: unexpected " + untracked_artifact_report(u))
+    replay_plan_disabled()
+  end
+  let plan_ba = match replay_emission_plan_of_functions(Vec::from([fn_b.clone(), fn_a.clone()]), "/tmp/tg.replay.trace".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(u) then
+    out.push("B1-plan-order-untracked: unexpected " + untracked_artifact_report(u))
+    replay_plan_disabled()
+  end
+  replay_bridge_lane_bool(&mut out, "B1-enabled", plan_ab.enabled, true)
+  replay_bridge_lane_int(&mut out, "B1-dict-size", plan_ab.dictionary.entries.len(), 2)
+  replay_bridge_lane_int(&mut out, "B1-site-count", replay_plan_site_count(plan_ab.clone()), 2)
+  replay_bridge_lane_bool(&mut out, "B1-sorted", replay_dictionary_is_sorted(plan_ab.dictionary.clone()), true)
+  replay_bridge_lane_str(&mut out, "B1-order-independent",
+    plan_ab.dictionary_text.clone(), plan_ba.dictionary_text.clone())
+  # sorted by operation word: external before time; tokens 1-based
+  if plan_ab.dictionary.entries.len() == 2 then
+    replay_bridge_lane_int(&mut out, "B1-token-1", plan_ab.dictionary.entries[0].token, 1)
+    replay_bridge_lane_str(&mut out, "B1-op-1", plan_ab.dictionary.entries[0].operation_word.clone(), "external")
+    replay_bridge_lane_int(&mut out, "B1-token-2", plan_ab.dictionary.entries[1].token, 2)
+    replay_bridge_lane_str(&mut out, "B1-op-2", plan_ab.dictionary.entries[1].operation_word.clone(), "time")
+    replay_bridge_lane_bool(&mut out, "B1-node-key-shape",
+      plan_ab.dictionary.entries[1].stable_node_key.contains("#N@"), true)
+  end
+  replay_bridge_lane_int(&mut out, "B1-clock-site-token",
+    replay_plan_token_of(plan_ab.clone(), "m::a#fn()->unit".to_string(), 0), 2)
+  replay_bridge_lane_int(&mut out, "B1-read-site-token",
+    replay_plan_token_of(plan_ab.clone(), "m::b#fn()->unit".to_string(), 0), 1)
+  replay_bridge_lane_int(&mut out, "B1-unwired-site",
+    replay_plan_token_of(plan_ab.clone(), "m::missing#fn()->unit".to_string(), 0), -1)
+  replay_bridge_lane_bool(&mut out, "B1-render-header",
+    plan_ab.dictionary_text.starts_with("tg.replay.dict.v1\n"), true)
+
+  # ———— B2: dictionary render/parse round trip + digest ————
+  let parsed = match replay_dictionary_parse(plan_ab.dictionary_text.clone())
+  when Result::Ok(d) then d
+  when Result::Err(e) then
+    out.push("B2-parse: " + e)
+    ReplayEventDictionary {}
+  end
+  replay_bridge_lane_str(&mut out, "B2-parse-roundtrip",
+    replay_dictionary_render(parsed.clone()), plan_ab.dictionary_text.clone())
+  let dig = replay_dictionary_digest(plan_ab.dictionary.clone())
+  replay_bridge_lane_bool(&mut out, "B2-digest-agrees",
+    dig.hi == plan_ab.digest_hi && dig.lo == plan_ab.digest_lo, true)
+  match replay_dictionary_site_of_token(parsed.clone(), 1)
+  when Option::Some(s) then
+    replay_bridge_lane_str(&mut out, "B2-token-1-op", s.operation_word.clone(), "external")
+  when Option::None then
+    out.push("B2-token-1: expected Some, got None")
+  end
+  match replay_dictionary_site_of_token(parsed.clone(), 0)
+  when Option::None then ()
+  when Option::Some(_) then out.push("B2-raw-token: expected None, got Some")
+  end
+
+  # ———— B3: the artifact codec round trip ————
+  var records: Vec[ReplayRawChoice] = Vec::new()
+  records.push(ReplayRawChoice { token: 2, tag: replay_tag_time(), payload: replay_i64_bytes(42) })
+  records.push(ReplayRawChoice { token: 1, tag: replay_tag_external(), payload: Vec::from([1 as u8, 2 as u8, 3 as u8]) })
+  let bytes = replay_run_encode(plan_ab.dictionary_text.clone(), records.clone())
+  let decoded = match replay_run_decode(bytes.clone())
+  when Result::Ok(d) then d
+  when Result::Err(e) then
+    out.push("B3-decode: " + e)
+    ReplayRunData { dictionary: ReplayEventDictionary {} }
+  end
+  replay_bridge_lane_int(&mut out, "B3-record-count", decoded.records.len(), 2)
+  if decoded.records.len() == 2 then
+    replay_bridge_lane_int(&mut out, "B3-rec0-token", decoded.records[0].token, 2)
+    replay_bridge_lane_int(&mut out, "B3-rec0-tag", decoded.records[0].tag, replay_tag_time())
+    replay_bridge_lane_int(&mut out, "B3-rec0-value", replay_payload_i64(decoded.records[0].payload.clone()), 42)
+    replay_bridge_lane_str(&mut out, "B3-rec1-payload",
+      replay_hex_encode(decoded.records[1].payload.clone()), "010203")
+  end
+  let trace = match replay_trace_of_run(decoded.clone())
+  when Result::Ok(t) then t
+  when Result::Err(e) then
+    out.push("B3-trace: " + e)
+    replay_builder_finish(replay_builder_new("empty".to_string()))
+  end
+  replay_bridge_lane_int(&mut out, "B3-trace-events", trace.events.len(), 2)
+  replay_bridge_lane_bool(&mut out, "B3-trace-typed", replay_trace_is_typed(&trace), true)
+  if trace.events.len() == 2 then
+    replay_bridge_lane_str(&mut out, "B3-trace-sem",
+      trace.events[0].id.semantic_op_key.clone(),
+      "m::a#fn()->unit#time")
+    match trace.events[0].choice.clone()
+    when Option::Some(choice) then
+      replay_bridge_lane_str(&mut out, "B3-trace-choice",
+        replay_choice_token(choice), "time:42")
+    when Option::None then
+      out.push("B3-trace-choice: expected Some, got None")
+    end
+  end
+
+  # ———— B4: compare — first divergence + minimal causal slice ————
+  var records_a1: Vec[ReplayRawChoice] = Vec::new()
+  records_a1.push(ReplayRawChoice { token: 2, tag: replay_tag_time(), payload: replay_i64_bytes(1000) })
+  var records_b1: Vec[ReplayRawChoice] = Vec::new()
+  records_b1.push(ReplayRawChoice { token: 2, tag: replay_tag_time(), payload: replay_i64_bytes(2000) })
+  let run_a = replay_run_encode(plan_ab.dictionary_text.clone(), records_a1.clone())
+  let run_b = replay_run_encode(plan_ab.dictionary_text.clone(), records_b1.clone())
+  let cmp = replay_run_compare(run_a.clone(), run_b.clone())
+  replay_bridge_lane_bool(&mut out, "B4-compared", !replay_comparison_is_untracked(cmp.clone()), true)
+  match cmp.first_divergence.clone()
+  when Option::Some(id) then
+    replay_bridge_lane_int(&mut out, "B4-first-seq", id.sequence, 0)
+    replay_bridge_lane_str(&mut out, "B4-first-stmt", id.stmt_key.clone(),
+      plan_ab.dictionary.entries[1].stable_node_key.clone())
+  when Option::None then
+    out.push("B4-first: expected Some, got None")
+  end
+  # a differing choice alone is NOT a semantic divergence
+  match cmp.first_semantic_divergence.clone()
+  when Option::None then ()
+  when Option::Some(_) then out.push("B4-semantic: expected None, got Some")
+  end
+  replay_bridge_lane_int(&mut out, "B4-slice-len", cmp.slice.len(), 1)
+  # identical runs -> no divergence, empty slice
+  let cmp_same = replay_run_compare(run_a.clone(), run_a.clone())
+  match cmp_same.first_divergence.clone()
+  when Option::None then ()
+  when Option::Some(_) then out.push("B4-same: expected None, got Some")
+  end
+  replay_bridge_lane_int(&mut out, "B4-same-slice", cmp_same.slice.len(), 0)
+
+  # ———— B5: the documented UNTRACKED results ————
+  var raw_records: Vec[ReplayRawChoice] = Vec::new()
+  raw_records.push(ReplayRawChoice { token: replay_token_raw(), tag: replay_tag_time(), payload: replay_i64_bytes(1) })
+  let raw_run = replay_run_encode(plan_ab.dictionary_text.clone(), raw_records.clone())
+  let raw_cmp = replay_run_compare(raw_run.clone(), run_a.clone())
+  replay_bridge_lane_bool(&mut out, "B5-raw-untracked", replay_comparison_is_untracked(raw_cmp.clone()), true)
+  replay_bridge_lane_bool(&mut out, "B5-raw-reason",
+    replay_comparison_untracked_reason(raw_cmp.clone()).contains("raw-token"), true)
+  replay_bridge_lane_int(&mut out, "B5-raw-no-slice", raw_cmp.slice.len(), 0)
+  var bad_records: Vec<ReplayRawChoice> = Vec::new()
+  bad_records.push(ReplayRawChoice { token: 99, tag: replay_tag_time(), payload: replay_i64_bytes(1) })
+  let bad_run = replay_run_encode(plan_ab.dictionary_text.clone(), bad_records.clone())
+  let bad_cmp = replay_run_compare(bad_run, run_a.clone())
+  replay_bridge_lane_bool(&mut out, "B5-unknown-untracked", replay_comparison_is_untracked(bad_cmp.clone()), true)
+  # a truncated artifact
+  let short_cmp = replay_run_compare(Vec::from([84 as u8, 71 as u8]), run_a.clone())
+  replay_bridge_lane_bool(&mut out, "B5-truncated-untracked", replay_comparison_is_untracked(short_cmp.clone()), true)
+  # two different dictionaries never compare
+  let plan_b_only = match replay_emission_plan_of_functions(Vec::from([fn_b.clone()]), "/tmp/tg.replay.other".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(u) then replay_plan_disabled()
+  end
+  let other_run = replay_run_encode(plan_b_only.dictionary_text.clone(), Vec::new())
+  let mismatch_cmp = replay_run_compare(other_run, run_a.clone())
+  replay_bridge_lane_bool(&mut out, "B5-dict-mismatch-untracked", replay_comparison_is_untracked(mismatch_cmp.clone()), true)
+  # an origin-less embedded dictionary entry
+  let erased_text = "tg.replay.dict.v1\nsite|1|time||m::x#fn()->unit"
+  let erased_run = replay_run_encode(erased_text, records_a1.clone())
+  let erased_cmp = replay_run_compare(erased_run, erased_run)
+  replay_bridge_lane_bool(&mut out, "B5-origin-less-untracked", replay_comparison_is_untracked(erased_cmp.clone()), true)
+
+  # ———— B6: the documented exclusion notes ————
+  match replay_unwired_source_note("getrandom".to_string())
+  when Option::Some(note) then
+    replay_bridge_lane_bool(&mut out, "B6-random-note", note.starts_with("random:"), true)
+  when Option::None then out.push("B6-random-note: expected Some, got None")
+  end
+  match replay_unwired_source_note("pthread_join".to_string())
+  when Option::Some(note) then
+    replay_bridge_lane_bool(&mut out, "B6-scheduler-note", note.starts_with("scheduler:"), true)
+  when Option::None then out.push("B6-scheduler-note: expected Some, got None")
+  end
+  match replay_unwired_source_note("__tg_clock_ns".to_string())
+  when Option::Some(_) then out.push("B6-wired-note: expected None, got Some")
+  when Option::None then ()
+  end
+
+  out
+end
+
+# The 8-byte little-endian payload of an Int (the runtime's word payload).
+def replay_i64_bytes(v: Int) -> Vec[u8]
+  var out: Vec[u8] = Vec::new()
+  replay_push_u64(&mut out, v as UInt)
+  out
+end
+
+# The canonical untracked-artifact text helper (the lane's failure row and
+# the driver's fail-closed message).
+pub def untracked_artifact_report(u: UntrackedArtifact) -> String
+  "untracked-artifact:" + u.api.clone() + ":" + u.detail.clone()
+end

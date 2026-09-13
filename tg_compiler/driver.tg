@@ -46,7 +46,8 @@ use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_cont
 use tg_compiler::mir::{MirProgram, optimize_mir, opt_decisions_of_mir, verify_mir, check_effect_class_annotations_mir, check_purity_annotations_mir, check_budget_annotations_mir}
 use tg_compiler::codegen::{detect_host_target, stamp_tail_abi_plans, stamp_slp_vector_facility_desc}
 use tg_compiler::lir::{
-  lir_compile_object_cov, lir_compile_executable_cov, lir_target_desc
+  lir_compile_object_cov, lir_compile_executable_cov, lir_target_desc,
+  LirReplayPlan, LirReplaySite, lir_replay_plan_disabled
 }
 use tg_compiler::backend_thumb::{thumb_compile_object, thumb_compile_executable}
 use tg_compiler::backend_rv::{rv_compile_object, rv_compile_executable}
@@ -92,7 +93,7 @@ use tg_compiler::compiler_core::{
   emitter_new, emitter_new_json, driver_lower_to_mir, analyze_program,
   Diagnostic, DiagLevel, json_escape, parse_source_program, join_diagnostics,
   emit_diagnostic, type_errors_to_diags, merge_imported_deps,
-  CodegenRoute, parse_codegen_route, resolve_coverage_out,
+  CodegenRoute, parse_codegen_route, resolve_coverage_out, resolve_replay_out,
   codegen_route_gap_hint
 }
 # (third-audit item 34 — the runtime producer): the coverage emission plan
@@ -100,6 +101,15 @@ use tg_compiler::compiler_core::{
 # it from the finalized MIR when --coverage is on and hands it to the
 # plan-aware LIR entries.
 use tg_compiler::coverage_graph::{coverage_emission_plan_of_functions, coverage_emission_plan_disabled}
+# (audit order item 6 — the replay production bridge): the event-dictionary
+# / run-artifact builder the LIR replay producer consumes. The driver
+# renders the dictionary from the finalized MIR when --replay is on,
+# converts it to the kernel-side LirReplayPlan and hands that to the
+# plan-aware LIR entries.
+use tg_compiler::replay_bridge::{
+  ReplayEmissionPlan, replay_emission_plan_of_functions, replay_plan_disabled,
+  untracked_artifact_report
+}
 # The §30 semantic snapshot route (audit §30; default-off): the driver
 # house of the env-gated artifact gates (shared with the driver-level LIR
 # route gates) — the snapshot builder is full-library-only and the
@@ -124,7 +134,8 @@ use tg_compiler::semantic_snapshot::{
 # accumulate lineage history.
 use tg_compiler::stable_ids::{
   stable_lineage_store_new, stable_lineage_store_load,
-  stable_lineage_store_save_atomic
+  stable_lineage_store_save_atomic,
+  untracked_artifact_text
 }
 use tg_compiler::semantic_model::{semantic_digest_zero, semantic_digest_render}
 use tg_compiler::semantic_index::{build_semantic_index}
@@ -309,6 +320,107 @@ def coverage_flag_in_args(argv: Vec[String]) -> Bool
   false
 end
 
+# The --replay route gate (audit order item 6): the compact event
+# dictionary, the runtime recorder and the exit-time run dump exist on the
+# aarch64 host LIR route only (the same envelope as --coverage: the direct
+# emitter, the wasm backend and the desc'd LIR backends have no recorder
+# emission, and the embedded/bare-metal images have no host OS surface for
+# the dump).
+def replay_route_supported(opts: CompilerOptions) -> Bool
+  if opts.codegen != CodegenRoute::Lir then
+    return false
+  end
+  if is_wasm_target(opts) then
+    return false
+  end
+  match opts.target_triple
+  when Option::Some(t) then
+    if is_embedded_route_triple(t) then
+      return false
+    end
+  when Option::None then ()
+  end
+  true
+end
+
+def replay_route_message() -> String
+  "--replay is implemented on the aarch64 host LIR route only: use the host LIR route (the default; --codegen=lir also selects it) with no cross --target to instrument a host build (the direct emitter and the desc'd/wasm backends have no recorder emission); --replay-out=<path> selects the dump path (default /tmp/tg.replay.trace, \"-\" = stdout)"
+end
+
+# The BARE-METAL replay refusal (the aarch64-unknown-none image): the
+# recorder's exit-time dump (_tg_replay_dump) writes through the host OS
+# file surface, which the bare-metal image does not carry.
+def replay_bare_metal_message() -> String
+  "--replay is not supported on the bare-metal `aarch64-unknown-none` image: the LIR recorder's exit-time dump (_tg_replay_dump) writes through the host OS file surface (open/write at the resolved --replay-out path), which the bare-metal image does not carry — instrument a host build (--codegen=lir --replay without --target), or drop --replay for the bare-metal build"
+end
+
+def replay_route_refusal(opts: CompilerOptions) -> String
+  match opts.target_triple
+  when Option::Some(t) then
+    if t == "aarch64-unknown-none" then
+      replay_bare_metal_message()
+    else
+      replay_route_message()
+    end
+  when Option::None then replay_route_message()
+  end
+end
+
+# The --replay-out=<path> value extraction (the --coverage-out idiom).
+def parse_replay_out_flag(arg: String) -> Result[String, String]
+  if !arg.starts_with("--replay-out=") then
+    return Result::Err("Missing value for --replay-out (expected --replay-out=<path>, \"-\" for stdout)")
+  end
+  let path = arg.slice(13, arg.len())
+  if path.len() == 0 then
+    return Result::Err("Missing value for --replay-out (expected --replay-out=<path>, \"-\" for stdout)")
+  end
+  Result::Ok(path)
+end
+
+# The raw-argv replay probe for the direct-only subcommands (the
+# coverage_flag_in_args mirror): True when --replay or --replay-out=...
+# appears before the parsed option surface exists.
+def replay_flag_in_args(argv: Vec[String]) -> Bool
+  var i = 0
+  while i < argv.len() do
+    let a = argv[i].clone()
+    if a == "--replay" || a.starts_with("--replay-out=") then
+      return true
+    end
+    i = i + 1
+  end
+  false
+end
+
+# Convert the bridge plan (replay_bridge.tg — the dictionary semantics) to
+# the kernel-side LirReplayPlan (lir.tg — its own byte-exact emitter). The
+# conversion is a pure field copy: the bridge module owns the dictionary,
+# the kernel module only carries what its emitter needs.
+def lir_replay_plan_of_bridge(plan: ReplayEmissionPlan) -> LirReplayPlan
+  if !plan.enabled then
+    return lir_replay_plan_disabled()
+  end
+  var sites: Vec[LirReplaySite] = Vec::new()
+  for s in plan.sites do
+    sites.push(LirReplaySite {
+      fn_name: s.fn_name.clone(),
+      block_id: s.block_id,
+      token: s.token,
+      tag: s.tag
+    })
+  end
+  LirReplayPlan {
+    enabled: true,
+    out_path: plan.out_path.clone(),
+    dict_text: plan.dictionary_text.clone(),
+    dict_hi: plan.digest_hi,
+    dict_lo: plan.digest_lo,
+    sites: sites,
+    buffer_bytes: plan.buffer_bytes
+  }
+end
+
 # The deprecated-alias fallback (audit item 31): TANGERINE_LIR=1 is the
 # legacy spelling of --codegen=lir and is consulted ONLY when the CLI
 # carried no explicit --codegen flag. Since the fourth-audit P0-21 flip
@@ -447,6 +559,18 @@ def parse_args(argv: Vec[String]) -> Result[CompilerOptions, String]
       end
       opts.coverage = true
       opts.coverage_out = Option::Some(cov_path)
+    elsif arg == "--replay" then
+      # (audit order item 6) replay recording: the LIR route emits the
+      # event dictionary + trace buffer + recorder and dumps the run at
+      # exit; the route gate runs at the compile entry.
+      opts.replay = true
+    elsif arg.starts_with("--replay-out=") then
+      let rep_path = match parse_replay_out_flag(arg.clone())
+      when Result::Ok(p) then p
+      when Result::Err(e) then return Result::Err(e)
+      end
+      opts.replay = true
+      opts.replay_out = Option::Some(rep_path)
     elsif arg == "--panic-strategy" then
       # STATE A (abort-only): panic=abort is the ONLY stable panic
       # strategy. The unwind/catch machinery is experimental and carries
@@ -627,6 +751,16 @@ def parse_startup_compile_args(skip_subcommand: Bool) -> Result[CompilerOptions,
       end
       opts.coverage = true
       opts.coverage_out = Option::Some(cov_path2)
+    elsif arg == "--replay" then
+      # (audit order item 6) the same replay option surface as parse_args.
+      opts.replay = true
+    elsif arg.starts_with("--replay-out=") then
+      let rep_path2 = match parse_replay_out_flag(arg.clone())
+      when Result::Ok(p) then p
+      when Result::Err(e) then return Result::Err(e)
+      end
+      opts.replay = true
+      opts.replay_out = Option::Some(rep_path2)
     elsif arg == "--no-std" then
       # The no_std flag: accepted here (the compile route reads it from the
       # raw argv — CompilerOptions carries no dedicated field). A no_std
@@ -726,6 +860,9 @@ def print_help() -> Unit
   println("                     tg.cov.trace.v1 trace at exit; requires the LIR route")
   println("                     (the default route; --codegen=lir also selects it)")
   println("  --coverage-out=PATH  Coverage dump path (default /tmp/tg.cov.trace; \"-\" = stdout)")
+  println("  --replay             Record nondeterminism choices (time/external reads; aarch64 LIR")
+  println("                     route) + dump the run artifact at exit; requires the LIR route")
+  println("  --replay-out=PATH    Replay dump path (default /tmp/tg.replay.trace; \"-\" = stdout)")
   println("  --panic-strategy <S>  abort (the ONLY stable strategy; unwind is rejected —")
   println("                     the unwind/catch machinery is experimental and never selectable)")
   println("  --pgo-gen[=PATH]     Instrument binary for profile generation")
@@ -984,6 +1121,10 @@ def cmd_build(argv: Vec[String]) -> Int
       eprintln("--coverage is not supported by project builds: the project route compiles through the direct emitter — compile a file with `tg compile --codegen=lir --coverage <file>` to produce the tg.cov.trace.v1 trace")
       return 1
     end
+    if replay_flag_in_args(argv) then
+      eprintln("--replay is not supported by project builds: the project route compiles through the direct emitter — compile a file with `tg compile --codegen=lir --replay <file>` to produce the replay run artifact")
+      return 1
+    end
     # Merge CLI options with project config
     let opts = match parse_args(argv)
     when Result::Ok(o) then o
@@ -1051,6 +1192,10 @@ def cmd_run(argv: Vec[String]) -> Int
   # silently ignore the flag.
   if coverage_flag_in_args(argv) then
     eprintln("--coverage is not supported by `tg run`: the run route compiles through the direct emitter (no counter emission) — use `tg compile --codegen=lir --coverage <file>` and run the produced binary")
+    return 1
+  end
+  if replay_flag_in_args(argv) then
+    eprintln("--replay is not supported by `tg run`: the run route compiles through the direct emitter (no recorder emission) — use `tg compile --codegen=lir --replay <file>` and run the produced binary")
     return 1
   end
   # Compile to a temp executable, then run it
@@ -1123,6 +1268,10 @@ def cmd_test(argv: Vec[String]) -> Int
   #   tg compile --codegen=lir --coverage prog.tg && ./prog <test key>
   if coverage_flag_in_args(argv) then
     eprintln("--coverage is not supported by `tg test`: the test route compiles through the direct emitter (no counter emission) — compile the program with `tg compile --codegen=lir --coverage <file>` and run the produced binary to write the tg.cov.trace.v1 trace")
+    return 1
+  end
+  if replay_flag_in_args(argv) then
+    eprintln("--replay is not supported by `tg test`: the test route compiles through the direct emitter (no recorder emission) — compile the program with `tg compile --codegen=lir --replay <file>` and run the produced binary to write the replay run artifact")
     return 1
   end
   # Discover test sources: from project or CLI args. Explicitly named FILES
@@ -3392,6 +3541,10 @@ def compile_lir_route_thumb(mir: MirProgram, opts: CompilerOptions, out_path: St
   if opts.coverage then
     return Result::Err(coverage_route_message())
   end
+  # (audit order item 6) the replay recorder has the same envelope.
+  if opts.replay then
+    return Result::Err(replay_route_message())
+  end
   # The gate consults the route's CANONICAL ARMv7-M description — the
   # single source of target data (the same fail-closed shape check the
   # aarch64 arm runs against lir_target_desc).
@@ -3439,6 +3592,10 @@ def compile_lir_route_rv(mir: MirProgram, opts: CompilerOptions, out_path: Strin
   # (third-audit item 34) no counter emission on the riscv backend.
   if opts.coverage then
     return Result::Err(coverage_route_message())
+  end
+  # (audit order item 6) no recorder emission on the riscv backend.
+  if opts.replay then
+    return Result::Err(replay_route_message())
   end
   let xlen = tdesc.pointer_width
   if xlen != 4 && xlen != 8 then
@@ -3493,6 +3650,10 @@ def compile_lir_route_x86(mir: MirProgram, opts: CompilerOptions, out_path: Stri
   # (third-audit item 34) no counter emission on the x86_64 backend.
   if opts.coverage then
     return Result::Err(coverage_route_message())
+  end
+  # (audit order item 6) no recorder emission on the x86_64 backend.
+  if opts.replay then
+    return Result::Err(replay_route_message())
   end
   if tdesc.pointer_width != 8 || tdesc.stack_alignment != 16 || tdesc.arch != Arch::X86_64 then
     return Result::Err("internal error: the x86_64 LIR route was given the `" + tdesc.name + "` description (" + tdesc.pointer_width.to_string() + "-byte pointers, stack align " + tdesc.stack_alignment.to_string() + ") — the item-30 route compiles for the 8-byte-pointer, 16-aligned x86_64 System V description (the --target triple or the legacy alias must select an x86_64 desc)")
@@ -3775,13 +3936,18 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
     return Result::Err("the LIR host route does not support --target overrides (" + tt + "); use --codegen=direct for the direct emitter")
   when Option::None then ()
   end
-  # (third-audit item 34) the coverage emission plan: built from the
-  # FINALIZED MIR (program order, one counter table per non-extern
-  # function, global bases) and handed to the plan-aware LIR entries; a
-  # compile without --coverage uses the disabled plan and emits the
-  # byte-identical pre-coverage object.
+  # (third-audit item 34; audit order item 1 closeout) the coverage emission
+  # plan: built from the FINALIZED MIR (program order, one counter table per
+  # non-extern function, global bases) and handed to the plan-aware LIR
+  # entries; a compile without --coverage uses the disabled plan and emits
+  # the byte-identical pre-coverage object. Origin-less MIR is an untracked
+  # artifact: the plan builder returns the documented result and the
+  # --coverage compile fails closed (never locator-keyed counters).
   let cov_plan = if opts.coverage then
-    coverage_emission_plan_of_functions(mir.functions.clone(), resolve_coverage_out(opts.clone()))
+    match coverage_emission_plan_of_functions(mir.functions.clone(), resolve_coverage_out(opts.clone()))
+    when Result::Ok(p) then p
+    when Result::Err(u) then return Result::Err(untracked_artifact_text(u))
+    end
   else
     coverage_emission_plan_disabled()
   end
@@ -3839,6 +4005,11 @@ def compile_lir_route_aarch64(mir: MirProgram, opts: CompilerOptions, out_path: 
   end
   if opts.coverage then
     return Result::Err(coverage_bare_metal_message())
+  end
+  # (audit order item 6) the recorder's exit-time dump has the same
+  # bare-metal restriction.
+  if opts.replay then
+    return Result::Err(replay_bare_metal_message())
   end
   let target = asm_target(Arch::AArch64, OsAbi::Linux)
   match opts.emit
@@ -3943,19 +4114,20 @@ end
 # stable_lineage_store_save; a v1 legacy body is still read). At build
 # start the file is loaded when present (stable_lineage_store_load) and a
 # fresh empty store is used otherwise; the store is threaded through the
-# snapshot builder's def walk (stable_decl_stamp — an existing name keeps
-# its number; the conservative rule transfers a number only for an
-# explicit continuation or a unique same-kind/same-signature candidate
-# seen in the immediately preceding revision) and written back after a
-# successful build through stable_lineage_store_save_atomic (write
+# snapshot builder's def walk (stable_decl_stamp_or_continue — an exact
+# structural key keeps its number, an explicit DeclContinuation recorded
+# by the semantic edit engine's Rename/Move claims its recorded number,
+# and every other first sight is a FRESH number: P0-3 removed the
+# same-kind/same-signature/prev-revision transfer) and written back after
+# a successful build through stable_lineage_store_save_atomic (write
 # "<path>.tmp" + rename — the linker's transactional publication pattern;
 # std::fs::rename is the atomic-replace primitive, so a failed write never
 # destroys the last good store). Repeated route (and TANGERINE_SERVER)
 # runs thus accumulate lineage history keyed by the snapshot path. The v2
-# format persists the signature digest words and the structural
-# fingerprint, so rename/move matching works after a restart exactly as
-# in-process; a loaded v1 store re-signs on its first build (sig digests
-# 0/0 = unknown) and matches from the next revision on.
+# format persists the signature digest words, the structural fingerprint
+# and the explicit continuations, so rename/move continuations survive a
+# restart exactly as in-process; a loaded v1 store re-signs on its first
+# build (sig digests 0/0 = unknown).
 #
 # AUDIT ITEM 21 (the server carrying finalized state): this route is the
 # successful final compiler boundary. When TANGERINE_SERVER=1 is set
@@ -3998,6 +4170,8 @@ def snapshot_error_text(e: SnapshotError) -> String
   when SnapshotError::UnstableBlockIdentity then "unstable block identity"
   when SnapshotError::UnstableInstanceDisplay then "unstable instance display"
   when SnapshotError::UnstableTarget then "unstable target"
+  when SnapshotError::UntrackedOrigin(api, detail) then
+    "untracked-artifact: " + api + ": " + detail
   end
 end
 
@@ -4033,15 +4207,15 @@ def lir_gate_applies(opts: CompilerOptions) -> Bool
     return true
   end
   if opts.print_ast || opts.print_tokens || opts.emit_mir || opts.json_diagnostics then
-    # --coverage is a LIR-route feature (the driver gate above already
-    # resolved the route): it wins over the inspection carve-out.
-    if !opts.coverage then
+    # --coverage / --replay are LIR-route features (the driver gate above
+    # already resolved the route): they win over the inspection carve-out.
+    if !opts.coverage && !opts.replay then
       return false
     end
   end
   match opts.dump_phase
   when Option::Some(_) then
-    if !opts.coverage then
+    if !opts.coverage && !opts.replay then
       return false
     end
   when Option::None then ()
@@ -4319,6 +4493,11 @@ def compile_snapshot_serve_route(
   when Result::Ok(s) then s
   when Result::Err(e) then return Result::Err("failed to read " + file.clone() + ": " + e)
   end
+  # (audit order P0-15) the verified-edit transaction's source input: the
+  # parse below consumes `source`, so this clone carries the ORIGINAL text
+  # (plus its file name and the route's opt level) onto the served
+  # session; session_apply_verified_edit rewrites and recompiles it.
+  let session_source = source.clone()
   var ast = match parse_source_program(source, file.clone())
   when Result::Ok(p) then p
   when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
@@ -4490,7 +4669,10 @@ def compile_snapshot_serve_route(
   # "<path>.tmp" and renamed over the store, so a failed write never
   # destroys the last good store. Skipped when no store path was resolved.
   if lineage_path.len() > 0 then
-    match stable_lineage_store_save_atomic(lineage_path.clone(), lineage_store)
+    # (audit order P0-15) the clone lets the post-save session carry the
+    # SAME mutated store (the transaction builds the next snapshot through
+    # it); the saved artifact and the session's numbers stay identical.
+    match stable_lineage_store_save_atomic(lineage_path.clone(), lineage_store.clone())
     when Result::Ok(_) then
       if !opts.quiet && have_snapshot_path then
         println("Semantic lineages: " + lineage_path.clone())
@@ -4584,9 +4766,17 @@ def compile_snapshot_serve_route(
       false,  # abi_verify_ok — no ABI-verify stage exists yet
       true,   # capability_contract_ok — the checker's contract + capability surface
       verification_stage_names_driver_route())
+    # (audit order P0-15) the boundary carries the verified-edit
+    # transaction's inputs: the original source text + file name, the
+    # route's REAL options record, the post-build lineage store and the
+    # rationale history (optimizer decisions appended above). A client can
+    # then send edit.apply_verified and the session recompiles the edited
+    # source through this SAME pipeline.
     let session = compiler_session_from_finalized(
       snapshot.revision, &target_desc, &env, &typed.typed, &mir, &snapshot, &index,
-      Option::Some(route_evidence))
+      Option::Some(route_evidence), Vec::new(),
+      session_source, file.clone(), opts.clone(),
+      lineage_store, rationale_store)
     let served = session_serve_loop(&session)
     if !opts.quiet then
       println("Semantic server: served " + served.to_string() + " request(s)")

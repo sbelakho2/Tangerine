@@ -133,7 +133,14 @@ downloaded test artifacts; the run FAILS (and writes NO
 
 When every gate passes, the run writes `build/release_evidence.json`
 (`tested_sha` + `artifact_hashes` + `release_gated_features` — every
-feature whose calculated ladder reached TARGET_COMPLETE). The feature
+feature whose calculated ladder reached TARGET_COMPLETE — plus the
+invariant-registry attestation projected from the `invariants-evidence`
+artifact: the generator's `invariants-evidence.json` records the tested
+commit, the registry content digest of `invariants.toml`'s definitions,
+the compiler/seed kernel digest, the mechanical check results and the
+matched test files; the release-evidence validator recomputes the digest
+from the tested tree and fails closed on a mismatch — there is no
+committed `last_verified_sha` anywhere). The feature
 registry generator reads this file: **EXACT_SHA_VERIFIED and
 RELEASE_GATED are never derived from source** — a feature holds those
 ladder positions only when the release-run evidence file names it. The

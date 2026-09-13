@@ -170,7 +170,9 @@ fi
 
 # ———————————————————————————————————————————————————————————————
 # R3 — the manifest/registry generations (feature registry + public-API
-#      manifest + the invariant verification)
+#      manifest + the invariant verification + the invariant registry
+#      validation: definitions, tree references, registry content digest,
+#      and the committed catalog rendering — no self-referential SHA)
 # ———————————————————————————————————————————————————————————————
 R3_STATE="FAIL"
 R3_DETAIL=""
@@ -184,9 +186,20 @@ elif ! bash "$ROOT/scripts/gen_api_manifest.sh" "$SCRATCH/public_api_manifest.js
 elif ! bash "$ROOT/scripts/verify_invariants.sh" >"$SCRATCH/r3_invariants.log" 2>&1; then
   GENERATION_OK=0
   R3_DETAIL="the invariant verification FAILED (see: $(grep -E 'RESULT|FAIL' "$SCRATCH/r3_invariants.log" | tail -2 | tr '\n' ' '))"
+elif ! bash "$ROOT/scripts/gen_invariants.sh" --validate-tree >"$SCRATCH/r3_invariants_registry.log" 2>&1; then
+  GENERATION_OK=0
+  R3_DETAIL="the invariant REGISTRY validation FAILED (see: $(grep -E 'FAIL' "$SCRATCH/r3_invariants_registry.log" | sed 's/^gen_invariants: //' | tail -2 | tr '\n' ' '))"
 else
   INV_SUMMARY="$(grep -E '^  assertions:' "$SCRATCH/r3_invariants.log" | tail -1 | sed 's/^  //')"
-  R3_DETAIL="feature registry + public-API manifest generated; invariants: ${INV_SUMMARY:-see log}"
+  INV_REGISTRY_DIGEST="$(python3 - "$ROOT/invariants.toml" <<'PY'
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "scripts"))
+import invariant_registry as ir
+with open(sys.argv[1], encoding="utf-8") as fh:
+    print(ir.registry_digest(ir.parse_toml(fh.read())))
+PY
+)"
+  R3_DETAIL="feature registry + public-API manifest generated; invariants: ${INV_SUMMARY:-see log}; invariant registry validated (digest ${INV_REGISTRY_DIGEST:-unknown})"
 fi
 [ "$GENERATION_OK" -eq 1 ] && R3_STATE="PASS"
 
@@ -209,9 +222,10 @@ fi
 # STALE evidence -> R5/R6/R7 = PENDING-UNTIL-LADDER; INVALID evidence
 # (a missing required artifact, an extra unlisted artifact, a failed/
 # skipped job, a mismatched hash, a missing fingerprint, an absent
-# equality proof) -> R5/R6/R7 = FAIL; VALID evidence -> R5/R6/R7 = PASS
-# (each category rests on its OWN recorded artifacts + conclusions).
-# The matching-SHA test alone can never promote a category to PASS.
+# equality proof, a missing/mismatched invariant-registry attestation)
+# -> R5/R6/R7 = FAIL; VALID evidence -> R5/R6/R7 = PASS (each category
+# rests on its OWN recorded artifacts + conclusions). The matching-SHA
+# test alone can never promote a category to PASS.
 # ———————————————————————————————————————————————————————————————
 EVIDENCE_STATE="ABSENT (no ladder evidence: build/release_evidence.json was not found — the ladder has not produced evidence at this SHA)"
 R5_STATE="PENDING-UNTIL-LADDER"
@@ -323,7 +337,7 @@ mkdir -p "$(dirname "$OUT")"
   echo "|-----|-------|---------|--------|"
   echo "| R1 | the inventory (completeness enumeration + canary-manifest self-description) | $R1_STATE | $R1_DETAIL |"
   echo "| R2 | the semantic checks (the self-host grammar gate; the compiler check where a binary exists) | $R2_STATE | $R2_DETAIL |"
-  echo "| R3 | the manifest/registry generations (feature registry + public-API manifest + invariants) | $R3_STATE | $R3_DETAIL |"
+  echo "| R3 | the manifest/registry generations (feature registry + public-API manifest + invariants + the invariant registry digest) | $R3_STATE | $R3_DETAIL |"
   echo "| R4 | the API manifest's release-check | $R4_STATE | $R4_DETAIL |"
   echo "| R5 | the self-host fixed point (stage2 == stage3 byte-identical) | $R5_STATE | $R5_DETAIL |"
   echo "| R6 | the cross-stage ladder (stage0 -> stage1 -> stage2 -> stage3) | $R6_STATE | $R6_DETAIL |"

@@ -147,12 +147,6 @@ type ctx = {
   (* the checker's type-query special forms (size_of[T]()/align_of[T]()
      — compile-time queries with no lowered MIR function); used in
      Template_mode only *)
-  (* the checker's registered Box nominal tid (its transparent-Box
-     convention — Box[T] unifies with T in both directions, so the
-     verifier's compatibility and projection rules erase the wrapper
-     exactly where the checker does; None when the compilation has no
-     Box declaration) *)
-  box_tid : Ids.Type_id.t option;
   (* The compilation's LangItems record (audit P0-2): every builtin-
      nominal identity decision (the owned-container direct properties,
      the pointer class, the def-less Option/Result fallbacks, the Vec
@@ -172,21 +166,23 @@ type ctx = {
      registered callee's return.  Identity in Template_mode. *)
   post_rewrite : Type_repr.t -> Type_repr.t;
   (* Concrete_mode post-mono: logical identity between two canonical
-     specialized TypeIds.  The materializer's canonical key folds only
-     the 64-bit aliases and literal defaults, so two flavors of one
-     checker-transparent type (`Option[Expr]` vs `Option[Box[Expr]]` —
-     the checker's ctor unify erases the wrapper) keep separate defs;
-     the SAME cache's same_instance predicate recovers their identity
-     (keys equal under transparent erasure) so the exact-id nominal rule
-     below still sees one type.  The default is exact equality. *)
+     specialized TypeIds.  The materializer's canonical key folds the
+     64-bit aliases and literal defaults; the SAME cache's same_instance
+     predicate additionally adopts an out-of-default-range Int_literal
+     key against the concrete integer kind whose range represents it.
+     Nominal identity is EXACT: Box[T] and T, `Option[Expr]` and
+     `Option[Box[Expr]]` are never reconciled.  The default is exact
+     equality. *)
   same_canonical_instance : Ids.Type_id.t -> Ids.Type_id.t -> bool;
   (* Concrete_mode post-mono: the canonical specialized TypeIds the
-     materializer minted for the checker's transparent Box nominal
-     instances (the cache's (box_tid, args) entries).  Box[T] unifies
-     with T in both directions (types_compatible, deref pointee,
-     projection chains), and a materialized Box[T] mention — Named
-     (fresh, [T]) — must stay transparent exactly like the
-     original-tid mention. *)
+     materializer minted for the Box nominal's instances.  Box[T] is an
+     OWNING nominal ({ copy = false; drop = true }): a materialized
+     instance def's structural shape ({ ptr: Ptr[T] }) must not be read
+     as a Copy pointer struct, so the property resolver classifies these
+     ids as owning handles.  This is an OWNERSHIP classification of
+     genuine Box instances — it is NOT type-identity transparency:
+     compatibility, deref and projection treat every Box instance as the
+     distinct nominal it is. *)
   box_instances : Ids.Type_id.t list;
   (* The P1-25 copyability cache: the Type_properties engine memoizes
      its answers per canonical (TypeId, args) instance; the cache is
@@ -200,13 +196,11 @@ type ctx = {
   drop_plans : Drop_plan.table;
 }
 
-(* Whether a TypeId is the checker's transparent Box nominal — the
-   original tid OR a materialized instance def the driver minted for
-   it (both are transparent over their single type argument). *)
-let is_box_tid (ctx : ctx) (tid : Ids.Type_id.t) : bool =
-  List.exists
-    (fun b -> Ids.Type_id.compare b tid = 0)
-    (match ctx.box_tid with Some b -> b :: ctx.box_instances | None -> ctx.box_instances)
+(* Whether a TypeId is a MATERIALIZED Box instance — used ONLY for the
+   owning-handle property classification (see ctx.box_instances).  The
+   original template id is classified by the LangItems record itself. *)
+let is_materialized_box_instance (ctx : ctx) (tid : Ids.Type_id.t) : bool =
+  List.exists (fun b -> Ids.Type_id.compare b tid = 0) ctx.box_instances
 
 (* ── LangItems selection helpers (audit P0-2) ──────────────────────
    Every builtin-nominal identity decision routes through the ctx's
@@ -390,13 +384,13 @@ let resolve_or_self (ctx : ctx) (ty : Type_repr.t) : Type_repr.t =
 (* The nominal property resolver (P1-25 / P0-2): the LangItems overlay
    (owning LangItems answer their DIRECT properties — an owning LangItem
    (Vec/Map/Set/Box/...) is move + clone, never bit-Copy; Ptr/PtrMut are
-   the Copy address handles), then the transparent Box wrapper (the
-   original nominal AND its materialized instances own memory), then the
-   def table.  No fake tuple shapes. *)
+   the Copy address handles), then the materialized Box instances (their
+   def's single Ptr field must not read as a Copy pointer struct), then
+   the def table.  No fake tuple shapes. *)
 let nominal_resolver (ctx : ctx) : Type_properties.def_resolver =
   Type_properties.with_lang_items (Some ctx.lang_items)
     (fun tid ->
-      if is_box_tid ctx tid then
+      if is_materialized_box_instance ctx tid then
         Type_properties.Direct_properties Type_properties.owning_handle
       else Type_properties.structural_resolver (find_type ctx) tid)
 
@@ -443,16 +437,6 @@ let rec types_compatible (ctx : ctx) (a : Type_repr.t) (b : Type_repr.t) : bool 
          declaration binder (template bodies legitimately compare their
          own params against themselves — locals, aggregates, casts) *)
       Ids.Generic_param_id.compare pa pb = 0
-  | Type_repr.Named (ta, [| t |]), u when is_box_tid ctx ta ->
-      (* the checker's transparent-Box unify (typecheck's is_box rule):
-         Box[T] erases to T in both directions — a Box-wrapped value
-         passes where its content is expected and vice versa (`&lhs`
-         with lhs: Box[Expr] at an `expr: Expr` parameter, an Option
-         payload that the checker recorded erased), so the lowered MIR
-         compares through the wrapper exactly where the checker did *)
-      types_compatible ctx t u
-  | u, Type_repr.Named (ta, [| t |]) when is_box_tid ctx ta ->
-      types_compatible ctx u t
   | Type_repr.Fixed_array (t, _), Type_repr.Named (id, [| e |])
     when is_vec_langitem ctx id ->
       (* the checker's fixed-array→Vec element rule (typecheck's method
@@ -770,20 +754,16 @@ let ptr_handle_pointee (li : Lang_items.t) (ty : Type_repr.t) : Type_repr.t opti
 let project_type (ctx : ctx) (ty : Type_repr.t) (proj : projection) : Type_repr.t option =
   match proj with
   | Deref -> (
-      (* deref over the reference/raw-pointer kinds, the Ptr/PtrMut
-         handle nominals (the seed's pointer values) AND the checker's
-         transparent Box nominal (its deref-on-field/place rule — the
-         Box wrapper derefs to its single type argument, the kernel's
-         `*expr` over a Box[Expr] binding) *)
+      (* deref over the reference/raw-pointer kinds and the Ptr/PtrMut
+         handle nominals (the seed's pointer values).  Box is a NOMINAL
+         wrapper here: `*box` is not a projection — access the pointee
+         through the box's own pointer field (`*b.ptr`) *)
       match ptr_handle_pointee ctx.lang_items ty with
       | Some t -> Some t
       | None -> (
-          match ty with
-          | Type_repr.Named (id, [| t |]) when is_box_tid ctx id -> Some t
-          | _ -> (
-              match resolve_or_self ctx ty with
-              | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> Some t
-              | _ -> None)))
+          match resolve_or_self ctx ty with
+          | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> Some t
+          | _ -> None))
   | Field fid -> (
       match ty with
       | Type_repr.Named (tid, args) -> struct_field_ty ctx tid args fid
@@ -1405,21 +1385,19 @@ let check_projection_owners (ctx : ctx) (fn : function_) (bb_ctx : string)
     | proj :: rest -> (
         match proj with
         | Deref -> (
-            (* deref over the reference/raw-pointer kinds, the Ptr/PtrMut
-               handle nominals AND the transparent Box nominal (mirror
-               of project_type) *)
+            (* deref over the reference/raw-pointer kinds and the
+               Ptr/PtrMut handle nominals (mirror of project_type).
+               Box is nominal: the wrapper's own field access is a
+               Field projection through its def, never a bare Deref. *)
             match ptr_handle_pointee ctx.lang_items ty with
             | Some t -> go t rest
             | None -> (
-                match ty with
-                | Type_repr.Named (id, [| t |]) when is_box_tid ctx id -> go t rest
-                | _ -> (
-                    match resolve_or_self ctx ty with
-                    | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> go t rest
-                    | _ ->
-                        add_err ctx
-                          (Printf.sprintf "%s: deref projection on non-pointer type %s" bb_ctx
-                             (Seed_mir.print_type ty)))))
+                match resolve_or_self ctx ty with
+                | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> go t rest
+                | _ ->
+                    add_err ctx
+                      (Printf.sprintf "%s: deref projection on non-pointer type %s" bb_ctx
+                         (Seed_mir.print_type ty))))
         | Field fid -> (
             (* the native owner-identity invariant: the projected
                FieldId must belong to the projected base's OWN struct
@@ -2796,15 +2774,16 @@ let check_call (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
                           while its args are still Type params — re-run
                           the materializer rewrite with the ACTUAL args
                           substituted; a match is the same logical
-                          instance, then bind the parameters.
-                          `same_canonical_instance` extends the id
-                          equality over the checker's transparent Box
-                          wrapper (the same reconciliation
-                          types_compatible applies).  Template_mode keeps
-                          the strict exact-id path byte-identical — the
-                          post_rewrite identity has no canonical cache to
-                          reconcile against (the sibling mode gates the
-                          declared-id mapping the same way). *)
+                           instance, then bind the parameters.
+                           `same_canonical_instance` reconciles only
+                           GENUINE canonical spellings of one instance
+                           (the 64-bit aliases and the literal-adoption
+                           relation); nominal wrappers are never
+                           erased.  Template_mode keeps
+                           the strict exact-id path byte-identical — the
+                           post_rewrite identity has no canonical cache to
+                           reconcile against (the sibling mode gates the
+                           declared-id mapping the same way). *)
                        let same =
                          Ids.Type_id.compare id1' id2 = 0
                          ||
@@ -3772,7 +3751,7 @@ let verify_all (ctx : ctx) (prog : program) : (unit, string list) result =
   | errs -> Error (List.rev errs)
 
 let require_valid_template ?(generic_types : Mono.generic_def array = [||])
-    ?(query_sigs : query_sig list = []) ?(box_tid : Ids.Type_id.t option = None)
+    ?(query_sigs : query_sig list = [])
     ?(lang_items : Lang_items.t = Lang_items.seed_defaults)
     (prog : program) : (unit, string list) result =
   verify_all
@@ -3782,7 +3761,6 @@ let require_valid_template ?(generic_types : Mono.generic_def array = [||])
       mode = Template_mode;
       generic_types;
       query_sigs;
-      box_tid;
       lang_items;
       post_rewrite = (fun ty -> ty);
       same_canonical_instance = (fun a b -> Ids.Type_id.compare a b = 0);
@@ -3797,7 +3775,6 @@ let require_valid_concrete ?(query_sigs : query_sig list = [])
     ?(same_canonical_instance : Ids.Type_id.t -> Ids.Type_id.t -> bool =
       fun a b -> Ids.Type_id.compare a b = 0)
     ?(box_instances : Ids.Type_id.t list = [])
-    ?(box_tid : Ids.Type_id.t option = None)
     ?(lang_items : Lang_items.t = Lang_items.seed_defaults)
     (prog : program) : (unit, string list) result =
   verify_all
@@ -3807,13 +3784,12 @@ let require_valid_concrete ?(query_sigs : query_sig list = [])
       mode = Concrete_mode;
       generic_types = [||];
       query_sigs;
-      box_tid;
       lang_items;
       post_rewrite;
       same_canonical_instance;
       box_instances;
       copy_cache = Type_properties.create_cache ();
-      drop_plans = Drop_plan.of_program ~lang_items prog;
+      drop_plans = Drop_plan.of_program ~lang_items ~box_instances prog;
     }
     prog
 

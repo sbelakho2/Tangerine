@@ -73,6 +73,11 @@ SUITES=(
   # (byte-identity over a hand-built full snapshot), the malformed-row
   # fail-closed probes and the loaded-artifact session query.
   "tests/semantic_snapshot_parse_test.tg"
+  # audit order P0-15: the authoritative verified-edit transaction — the
+  # pure lane rows (authoritative projection, exact unexpected effect/ABI
+  # rejection, the partial levels, proof gating, render/hash) plus the
+  # full-pipeline rename whose VerifiedFull record is pinned end to end.
+  "tests/semantic_verified_edit_test.tg"
   # audit item 49: the structured generic-instance keys (StructuralInstanceId
   # / MonoCache.instances re-key + the P0-5 cross-kind order + the P0-6
   # insertion-stability lane + the documented const-fold model).

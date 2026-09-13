@@ -52,6 +52,15 @@ struct RuntimeEmitCtx
   text: CodeBuffer
   target: AsmTarget
   lbl_counter: Int
+  # (audit order item 6) the replay-record build flag: when true the runtime
+  # emitter instruments its own nondeterminism helpers (__tg_clock_ns,
+  # _tg_posix_read) with the replay note/commit sequence and the support
+  # helpers (__tg_replay_record, _tg_replay_dump) are merged into the
+  # object. The data symbols the instrumentation references are emitted by
+  # the LIR replay data emitter (lir.tg's lir_emit_replay_data_a64) only in
+  # record builds, so a non-replay build emits the byte-identical
+  # pre-replay runtime stream.
+  replay_enabled: Bool = false
 end
 
 def runtime_ctx_new(target: AsmTarget) -> RuntimeEmitCtx
@@ -102,6 +111,12 @@ def emit_all_runtime(inout ctx: RuntimeEmitCtx) -> Unit
   emit_wasi_host_runtime(ctx)
   emit_bump_alloc_runtime(ctx)
   emit_tg_clock_ns(ctx)
+  # (audit order item 6) the replay recorder/dump exists only in a record
+  # build: its data symbols (emitted by lir.tg's lir_emit_replay_data_a64)
+  # and the instrumented helpers above reference it.
+  if ctx.replay_enabled then
+    emit_tg_replay_support(ctx)
+  end
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -273,6 +288,216 @@ def cov_a64_addr(inout ctx: RuntimeEmitCtx, reg: A64, sym: String) -> Unit
   emit32_le(&mut ctx.text, 0x90000000 | a64_code(reg))
   add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, sym.clone(), 0)
   a64_add_rri(&mut ctx.text, reg, reg, 0)
+end
+
+# ———————————————————————————————————————————————————————————————
+# The replay recorder (audit order item 6 — the production bridge)
+# ———————————————————————————————————————————————————————————————
+# The recorder is emitted into a --replay build only (the LIR replay data
+# emitter writes the data symbols it references — see lir.tg's
+# lir_emit_replay_data_a64):
+#   _tg_replay_records            the .bss byte buffer
+#   _tg_replay_records_len        the current byte length (u64)
+#   _tg_replay_records_capacity   the buffer size (u64; the overflow guard)
+#   _tg_replay_overflow           set to 1 when a record did not fit
+#   _tg_replay_enabled            the record switch (u64)
+#   _tg_replay_note_token/_tag    the ARMED call-site token/tag the LIR
+#                                 note stores write immediately before an
+#                                 instrumented call (0 = unarmed; real
+#                                 tokens are 1-based — replay_bridge.tg's
+#                                 token grammar)
+# The record layout is replay_bridge.tg's §RB.2 grammar:
+#   { u64 token, u64 tag, u64 payload_len, u8 payload[payload_len] }
+# with payload_len capped at 64 and a whole record only written when it
+# fits. __tg_replay_record takes (x0 = token, x1 = tag, x2 = payload ptr,
+# x3 = payload len) and preserves x19-x24 (AAPCS); x0-x18 clobbered.
+def emit_tg_replay_support(inout ctx: RuntimeEmitCtx) -> Unit
+  emit_tg_replay_record(ctx)
+  emit_tg_replay_dump(ctx)
+end
+
+def emit_tg_replay_record(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "__tg_replay_record")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    let loop_lbl = fresh_label(ctx, ".Lreplay_copy")
+    let copy_done_lbl = fresh_label(ctx, ".Lreplay_copy_done")
+    let overflow_lbl = fresh_label(ctx, ".Lreplay_overflow")
+    let done_lbl = fresh_label(ctx, ".Lreplay_done")
+
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    # x19 = token, x20 = tag, x21 = payload ptr, x22 = capped payload len.
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)
+    a64_mov_rr(&mut ctx.text, A64::X20, A64::X1)
+    a64_mov_rr(&mut ctx.text, A64::X21, A64::X2)
+    a64_mov_rr(&mut ctx.text, A64::X22, A64::X3)
+    a64_mov_ri(&mut ctx.text, A64::X9, 64)
+    a64_cmp_rr(&mut ctx.text, A64::X22, A64::X9)
+    a64_csel(&mut ctx.text, A64::X22, A64::X22, A64::X9, a64_cc_le())
+    # x23 = the current byte length.
+    cov_a64_addr(ctx, A64::X23, "_tg_replay_records_len".to_string())
+    a64_ldr(&mut ctx.text, A64::X23, A64::X23, 0)
+    # total = x23 + 24 + x22; the whole record must fit.
+    a64_add_rri(&mut ctx.text, A64::X9, A64::X23, 24)
+    a64_add_rrr(&mut ctx.text, A64::X9, A64::X9, A64::X22)
+    cov_a64_addr(ctx, A64::X10, "_tg_replay_records_capacity".to_string())
+    a64_ldr(&mut ctx.text, A64::X10, A64::X10, 0)
+    a64_cmp_rr(&mut ctx.text, A64::X9, A64::X10)
+    a64_bcond(&mut ctx.text, a64_cc_gt(), overflow_lbl.clone())
+    # The record slot base.
+    cov_a64_addr(ctx, A64::X10, "_tg_replay_records".to_string())
+    a64_add_rrr(&mut ctx.text, A64::X10, A64::X10, A64::X23)
+    a64_str(&mut ctx.text, A64::X19, A64::X10, 0)
+    a64_str(&mut ctx.text, A64::X20, A64::X10, 8)
+    a64_str(&mut ctx.text, A64::X22, A64::X10, 16)
+    # The payload byte copy (ldrb/add/strb register addressing).
+    a64_mov_ri(&mut ctx.text, A64::X11, 0)
+    def_label(&mut ctx.text, loop_lbl.clone())
+    a64_cmp_rr(&mut ctx.text, A64::X11, A64::X22)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), copy_done_lbl.clone())
+    a64_add_rrr(&mut ctx.text, A64::X13, A64::X21, A64::X11)
+    a64_ldrb(&mut ctx.text, A64::X12, A64::X13, 0)
+    a64_add_rri(&mut ctx.text, A64::X14, A64::X10, 24)
+    a64_add_rrr(&mut ctx.text, A64::X14, A64::X14, A64::X11)
+    a64_strb(&mut ctx.text, A64::X12, A64::X14, 0)
+    a64_add_rri(&mut ctx.text, A64::X11, A64::X11, 1)
+    a64_b(&mut ctx.text, loop_lbl.clone())
+    def_label(&mut ctx.text, copy_done_lbl.clone())
+    # Publish the new length.
+    cov_a64_addr(ctx, A64::X10, "_tg_replay_records_len".to_string())
+    a64_str(&mut ctx.text, A64::X9, A64::X10, 0)
+    a64_b(&mut ctx.text, done_lbl.clone())
+    def_label(&mut ctx.text, overflow_lbl.clone())
+    cov_a64_addr(ctx, A64::X10, "_tg_replay_overflow".to_string())
+    a64_mov_ri(&mut ctx.text, A64::X9, 1)
+    a64_str(&mut ctx.text, A64::X9, A64::X10, 0)
+    def_label(&mut ctx.text, done_lbl.clone())
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    # The x86-64 LIR route does not carry the replay data symbols (the
+    # driver's --replay gate rejects it before emission); a defensive
+    # empty body keeps the arch match total.
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# Write one fixed-length section of the replay artifact (fd in X19; the
+# symbol address in X1 and the byte count in X2 via the ADRP/ADD pair).
+def replay_a64_write_sym(inout ctx: RuntimeEmitCtx, sym: String, len: Int) -> Unit
+  a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+  cov_a64_addr(ctx, A64::X1, sym)
+  a64_mov_ri(&mut ctx.text, A64::X2, len as i64)
+  a64_bl(&mut ctx.text, "_tg_posix_write")
+end
+
+def emit_tg_replay_dump(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "_tg_replay_dump")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    let open_lbl = fresh_label(ctx, ".Lreplay_open")
+    let have_fd_lbl = fresh_label(ctx, ".Lreplay_have_fd")
+    let done_lbl = fresh_label(ctx, ".Lreplay_dump_done")
+    let no_close_lbl = fresh_label(ctx, ".Lreplay_no_close")
+
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+
+    # "-" selects stdout (fd 1) without opening a file.
+    cov_a64_addr(ctx, A64::X9, "_tg_replay_path_len".to_string())
+    a64_ldr(&mut ctx.text, A64::X9, A64::X9, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 1)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), open_lbl.clone())
+    cov_a64_addr(ctx, A64::X9, "_tg_replay_path_text".to_string())
+    a64_ldrb(&mut ctx.text, A64::X10, A64::X9, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X10, 45)   # '-'
+    a64_bcond(&mut ctx.text, a64_cc_ne(), open_lbl.clone())
+    a64_mov_ri(&mut ctx.text, A64::X19, 1)
+    a64_b(&mut ctx.text, have_fd_lbl.clone())
+
+    def_label(&mut ctx.text, open_lbl.clone())
+    cov_a64_addr(ctx, A64::X0, "_tg_replay_path_text".to_string())
+    a64_mov_ri(&mut ctx.text, A64::X1, 577)   # O_WRONLY|O_CREAT|O_TRUNC
+    a64_mov_ri(&mut ctx.text, A64::X2, 420)   # 0644
+    a64_bl(&mut ctx.text, "libc_open")
+    a64_cmp_ri(&mut ctx.text, A64::X0, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), have_fd_lbl.clone())
+    a64_mov_ri(&mut ctx.text, A64::X19, 0)    # no fd: the dump is skipped
+    a64_b(&mut ctx.text, done_lbl.clone())
+    def_label(&mut ctx.text, have_fd_lbl.clone())
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)
+
+    # The 48-byte header: magic+version, dictionary digest words, the
+    # dictionary byte count, the record byte count, the reserved word.
+    replay_a64_write_sym(ctx, "_tg_replay_magic".to_string(), 8)
+    replay_a64_write_sym(ctx, "_tg_replay_dict_hi".to_string(), 8)
+    replay_a64_write_sym(ctx, "_tg_replay_dict_lo".to_string(), 8)
+    replay_a64_write_sym(ctx, "_tg_replay_dict_len".to_string(), 8)
+    replay_a64_write_sym(ctx, "_tg_replay_records_len".to_string(), 8)
+    replay_a64_write_sym(ctx, "_tg_replay_reserved".to_string(), 8)
+    # The rendered dictionary text (its byte count is the header field).
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+    cov_a64_addr(ctx, A64::X1, "_tg_replay_dict_text".to_string())
+    cov_a64_addr(ctx, A64::X2, "_tg_replay_dict_len".to_string())
+    a64_ldr(&mut ctx.text, A64::X2, A64::X2, 0)
+    a64_bl(&mut ctx.text, "_tg_posix_write")
+    # The record buffer (its byte count is the header field).
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+    cov_a64_addr(ctx, A64::X1, "_tg_replay_records".to_string())
+    cov_a64_addr(ctx, A64::X2, "_tg_replay_records_len".to_string())
+    a64_ldr(&mut ctx.text, A64::X2, A64::X2, 0)
+    a64_bl(&mut ctx.text, "_tg_posix_write")
+
+    def_label(&mut ctx.text, done_lbl.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X19, 2)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), no_close_lbl.clone())
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X19)
+    a64_bl(&mut ctx.text, "_tg_posix_close")
+    def_label(&mut ctx.text, no_close_lbl.clone())
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# The note-commit sequence shared by the instrumented runtime helpers: the
+# caller stores the 8-byte value at [SP + 16], then this sequence records
+# it with the armed note's (token, tag) and disarms the note. Emits a
+# forward branch to `skip_lbl` when the replay switch is off / no note is
+# armed / (positive_only) the stored value is <= 0; the caller restores X0
+# from [SP + 16] after the label.
+def replay_a64_commit_slot(inout ctx: RuntimeEmitCtx, skip_lbl: String, positive_only: Bool) -> Unit
+  cov_a64_addr(ctx, A64::X9, "_tg_replay_enabled".to_string())
+  a64_ldr(&mut ctx.text, A64::X9, A64::X9, 0)
+  a64_cbz(&mut ctx.text, A64::X9, skip_lbl.clone())
+  cov_a64_addr(ctx, A64::X0, "_tg_replay_note_token".to_string())
+  a64_ldr(&mut ctx.text, A64::X0, A64::X0, 0)
+  a64_cbz(&mut ctx.text, A64::X0, skip_lbl.clone())
+  if positive_only then
+    a64_ldur(&mut ctx.text, A64::X9, A64::SP, 16)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 0)
+    a64_bcond(&mut ctx.text, a64_cc_le(), skip_lbl.clone())
+    a64_mov_rr(&mut ctx.text, A64::X3, A64::X9)
+  else
+    a64_mov_ri(&mut ctx.text, A64::X3, 8)
+  end
+  cov_a64_addr(ctx, A64::X1, "_tg_replay_note_tag".to_string())
+  a64_ldr(&mut ctx.text, A64::X1, A64::X1, 0)
+  a64_add_rri(&mut ctx.text, A64::X2, A64::SP, 16)
+  a64_bl(&mut ctx.text, "__tg_replay_record")
+  cov_a64_addr(ctx, A64::X9, "_tg_replay_note_token".to_string())
+  a64_mov_ri(&mut ctx.text, A64::X10, 0)
+  a64_str(&mut ctx.text, A64::X10, A64::X9, 0)
+  def_label(&mut ctx.text, skip_lbl.clone())
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -1367,6 +1592,7 @@ def emit_tg_clock_ns(inout ctx: RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "__tg_clock_ns")
   match ctx.target.arch
   when Arch::AArch64 then
+    let replay_skip = fresh_label(ctx, ".Lclock_replay_skip")
     a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -32)
     a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
     # X0 = CLOCK_MONOTONIC (1), X1 = &timespec ([SP])
@@ -1387,6 +1613,14 @@ def emit_tg_clock_ns(inout ctx: RuntimeEmitCtx) -> Unit
     a64_mul_rrr(&mut ctx.text, A64::X9, A64::X9, A64::X10)
     a64_ldur(&mut ctx.text, A64::X10, A64::SP, 8)
     a64_add_rrr(&mut ctx.text, A64::X0, A64::X9, A64::X10)
+    # (audit order item 6) the replay time-commit: a --replay build stores
+    # the nanos word at [SP+16] and records it with the note armed by the
+    # call site (the LIR note stores); a non-replay build emits nothing.
+    if ctx.replay_enabled then
+      a64_stur(&mut ctx.text, A64::X0, A64::SP, 16)
+      replay_a64_commit_slot(ctx, replay_skip.clone(), false)
+      a64_ldur(&mut ctx.text, A64::X0, A64::SP, 16)
+    end
     a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 32)
     a64_ret(&mut ctx.text)
   when Arch::X86_64 then
@@ -12829,8 +13063,16 @@ end
 def emit_posix_read(inout ctx: RuntimeEmitCtx) -> Unit
   def_runtime_fn(ctx, "_tg_posix_read")
   let ok_label = fresh_label(ctx, ".Lposix_read_ok")
+  let replay_skip = fresh_label(ctx, ".Lposix_read_replay_skip")
   match ctx.target.arch
   when Arch::AArch64 then
+    # (audit order item 6) a --replay build frames the read with a fixed
+    # 32-byte scratch area and records the bytes read (the x0 result) with
+    # the armed note after the syscall; a non-replay build stays the leaf.
+    if ctx.replay_enabled then
+      a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -32)
+      a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    end
     match ctx.target.os
     when OsAbi::MacOS then
       a64_mov_ri(&mut ctx.text, A64::X16, 3)
@@ -12844,6 +13086,12 @@ def emit_posix_read(inout ctx: RuntimeEmitCtx) -> Unit
       # fail closed: the Windows AArch64 ReadFile path is not implemented —
       # a zero byte-count would be a fabricated success, so trap instead.
       a64_brk(&mut ctx.text, 1)
+    end
+    if ctx.replay_enabled then
+      a64_stur(&mut ctx.text, A64::X0, A64::SP, 16)
+      replay_a64_commit_slot(ctx, replay_skip.clone(), true)
+      a64_ldur(&mut ctx.text, A64::X0, A64::SP, 16)
+      a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 32)
     end
     a64_ret(&mut ctx.text)
   when Arch::X86_64 then

@@ -1047,7 +1047,6 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
   in
   match
          Mir_verify.require_valid_template ~generic_types:(closure_generic_types env)
-               ~box_tid:(env.Typecheck.state.box_tid)
                     ~lang_items:(Typecheck.lang_items_of_env env)
            ~query_sigs:(closure_query_sigs ~lowered:(Some prog) env) prog
        with
@@ -1065,7 +1064,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
       | None -> 0
       | Some main ->
           let host = Host.create ~repo_root:"." ~argv:[||] in
-          (match Vm.run_li ~limits:Vm.default_limits ~box_instances:[] ~lang_items:(Typecheck.lang_items_of_env env) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] ~host with
+          (match Vm.run_li ~limits:Vm.default_limits ~lang_items:(Typecheck.lang_items_of_env env) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] ~host with
            | Ok _ -> Printf.printf "// VM: exit 0\n"; 0
            | Error e -> Printf.printf "// VM: %s\n" e.Vm.message; 1))
 
@@ -1181,7 +1180,6 @@ let cmd_interpret (args : string list) : int =
               in
               (match
                  Mir_verify.require_valid_template
-                     ~box_tid:(env.Typecheck.state.box_tid)
                     ~lang_items:(Typecheck.lang_items_of_env env)
                      ~generic_types:(closure_generic_types env)
                      ~query_sigs:(closure_query_sigs env)
@@ -1197,7 +1195,7 @@ let cmd_interpret (args : string list) : int =
                    with
                    | None -> die "no `main` function to interpret"
                    | Some main -> (
-                       match Vm.entry_frame_of_li ~limits:Vm.default_limits ~box_instances:[] ~lang_items:(Typecheck.lang_items_of_env env) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] with
+                       match Vm.entry_frame_of_li ~limits:Vm.default_limits ~lang_items:(Typecheck.lang_items_of_env env) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] with
                        | Error m -> die "interpret: %s" m
                        | Ok (vm, entry_frame) -> (
                            match Vm.run_inspect vm entry_frame with
@@ -3325,13 +3323,17 @@ let bootstrap_vm_limits : Vm.limits =
    `Call (dest, TypeQuery (k, [ty]), [], next)` with a constant
    assignment and `Goto next` (Layout_fold); mo_program itself stays
    untouched — the concrete verify, the CFG dataflow, the reachable-host
-   scan and every evidence row inspect the pre-fold program. *)
+   scan and every evidence row inspect the pre-fold program.  The fold
+   program is the mono'd program AS IS: Box[T] is a real nominal value
+   (its `box_new` body allocates and returns the wrapper), so there is no
+   transparent-Box promotion — the executed representation matches the
+   identity, layout and drop plan of every Box instance. *)
 let vm_program_with_folded_queries (ctx : closure_ctx) (mo : mono_outcome) :
     Seed_mir.program =
   Layout_fold.fold_program
     ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
     ~name_of:(fun tid -> List.assoc_opt tid !Typecheck.type_names_global)
-    (Layout_fold.promote_box_constructors mo.mo_program)
+    mo.mo_program
 
 (* ── Post-mono type materialization (re-audit finding: "generic nominal
       type definitions disappear before MIR") ───────────────────────
@@ -4418,19 +4420,15 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
      mono queue, the materializer and the post-mono concrete verifier.
      Its mint starts above the largest TypeId the program can see, so a
      canonical specialized id can never alias an existing identity; the
-     ids are minted in first-discovery order (deterministic).  The
-     checker's transparent Box nominal is the cache's transparent
-     wrapper: Box[T] denotes T (its unify erases the wrapper in both
-     directions), so `Option[Box[Expr]]` and `Option[Expr]` intern under
-     ONE canonical specialized id and the mention rewrite is idempotent
-     through the verifier's registered-sig post_rewrite. *)
+     ids are minted in first-discovery order (deterministic).  Nominal
+     identity is EXACT: Box[T] and T are distinct instances, so
+     `Option[Box[Expr]]` and `Option[Expr]` intern under distinct
+     canonical ids and the mention rewrite never reconciles through a
+     wrapper; only the genuine canonical spellings (the 64-bit alias
+     pairs and literal defaulting) share a key. *)
   let canonical =
     Canonical_type_instance.create
       ~mint_from:(program_max_type_id ~generic_types prog + 1)
-      ~transparent:(fun tid ->
-        match box_tid with
-        | Some b -> Ids.Type_id.compare b tid = 0
-        | None -> false)
       ()
   in
   (* the body-less callable surface: callable -> declared-parameter
@@ -4667,12 +4665,18 @@ let run_mono_phase ~(entry_name : string) ~(entry : Instance_id.t)
                       if Ids.Type_id.compare t bt = 0 then Some ntid else None)
                     mat_map
             in
+            (* box_instances is the OWNERSHIP classification of the
+               materialized Box instances (their { ptr: Ptr[T] } shape
+               must not read as a Copy pointer struct) — never a
+               type-identity reconciliation: the verify's nominal
+               compatibility and projection rules treat every Box
+               instance as the distinct nominal it is. *)
              (match
-                Mir_verify.require_valid_concrete ~box_tid ~box_instances ~lang_items
-                  ~post_rewrite:(rewrite_ty canonical) ~query_sigs:final_query_sigs
-                  ~same_canonical_instance:
-                    (Canonical_type_instance.same_instance canonical)
-                  final_prog
+                 Mir_verify.require_valid_concrete ~box_instances ~lang_items
+                   ~post_rewrite:(rewrite_ty canonical) ~query_sigs:final_query_sigs
+                   ~same_canonical_instance:
+                     (Canonical_type_instance.same_instance canonical)
+                   final_prog
              with
             | Error errs ->
                 Printf.printf "  MONO_MIR_STRUCTURAL_GATE = FAIL\n";
@@ -5333,7 +5337,6 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
         let tpl_ok =
           match
             Mir_verify.require_valid_template
-                ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                           ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
@@ -5425,7 +5428,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                           bs_oracle_incomplete = oracle_incomplete;
                         }
                   | Ok report -> (
-                      match Vm.run_li ~limits:bootstrap_vm_limits ~box_instances:mo.mo_box_instances ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:(vm_program_with_folded_queries ctx mo) ~entry:mo.mo_entry ~argv ~host with
+                      match Vm.run_li ~limits:bootstrap_vm_limits ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:(vm_program_with_folded_queries ctx mo) ~entry:mo.mo_entry ~argv ~host with
                       | Error _ ->
                           Ok
                             {
@@ -5531,7 +5534,6 @@ let cmd_bootstrap_check (args : string list) : int =
          | Ok prog ->
          (match
             Mir_verify.require_valid_template
-                ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                           ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
@@ -5719,12 +5721,10 @@ let cmd_bootstrap_check (args : string list) : int =
                          let concrete_ok =
                           match
                              Mir_verify.require_valid_concrete
-                              ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                            ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                               ~query_sigs:mo.mo_query_sigs
                               ~post_rewrite:mo.mo_post_rewrite
                               ~same_canonical_instance:mo.mo_same_canonical_instance
-                              ~box_instances:mo.mo_box_instances
                               mo.mo_program
                          with
                          | Ok () -> true
@@ -5784,7 +5784,7 @@ let cmd_bootstrap_check (args : string list) : int =
                                 (List.length reachable) report.Host.declared report.Host.implemented;
                                Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
                                 (match
-                                   Vm.run_li ~limits:bootstrap_vm_limits ~box_instances:mo.mo_box_instances ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
+                                   Vm.run_li ~limits:bootstrap_vm_limits ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                                     ~program:(vm_program_with_folded_queries ctx mo)
                                     ~entry:mo.mo_entry ~argv ~host
                                 with
@@ -5881,7 +5881,6 @@ let cmd_compile (args : string list) : int =
          let prog = lower_closure ctx in
          (match
             Mir_verify.require_valid_template
-                ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                           ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
@@ -5935,7 +5934,7 @@ let cmd_compile (args : string list) : int =
                         let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
                         Printf.printf "  compile: kernel argv: %s\n" (String.concat " " (Array.to_list argv));
                         let host = Host.create ~repo_root:opts.repo_root ~argv in
-                        (match Vm.run_li ~limits:bootstrap_vm_limits ~box_instances:mo.mo_box_instances ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:(vm_program_with_folded_queries ctx mo) ~entry:mo.mo_entry ~argv ~host with
+                        (match Vm.run_li ~limits:bootstrap_vm_limits ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:(vm_program_with_folded_queries ctx mo) ~entry:mo.mo_entry ~argv ~host with
                          | Error e ->
                              Printf.printf "compile: VM bootstrap run TRAPPED: %s\n" e.Vm.message;
                              let out = Host.stdout_contents host in

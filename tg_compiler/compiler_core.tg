@@ -24,6 +24,7 @@ use tg_compiler::layout_engine::{layout_engine_new, layout_engine_register_types
 use tg_compiler::codegen::{generate_executable, generate_object_file, detect_host_target, stamp_slp_vector_facility}
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi}
 use tg_compiler::mono::{monomorphize_program, mono_cache_new}
+use tg_compiler::stable_ids::{untracked_artifact_text}
 use tg_compiler::mode::{Mode, ModeConfig, config_for_mode}
 
 extern def libc_write(fd: Int, buf: Ptr[u8], count: UInt) -> Int
@@ -128,6 +129,19 @@ pub struct CompilerOptions
   # is given; resolve_coverage_out supplies the conventional default.
   coverage: Bool
   coverage_out: Option[String]
+
+  # Replay-recording instrumentation (audit order item 6 — the production
+  # bridge): --replay makes the LIR route build the per-executable event
+  # dictionary from the finalized MIR, emit the compact trace buffer + the
+  # recorder helpers + the per-site note stores (the runtime records the
+  # time/external-read choices at their real commit points), and dump the
+  # self-describing run artifact to replay_out at exit. The direct emitter
+  # and the non-aarch64-host LIR backends have no recorder emission, so
+  # --replay is accepted only on the aarch64 host LIR route (the driver
+  # fails closed otherwise). replay_out is Option::None until
+  # --replay-out=<path> is given; resolve_replay_out supplies the default.
+  replay: Bool
+  replay_out: Option[String]
 
   # PGO
   pgo_gen: Option[String]    # --pgo-gen=<path> : instrument and write profile
@@ -540,6 +554,8 @@ pub def default_options() -> CompilerOptions
     target_triple: Option::None,
     coverage: false,
     coverage_out: Option::None,
+    replay: false,
+    replay_out: Option::None,
     pgo_gen: Option::None,
     pgo_use: Option::None,
     mode: Mode::Dev,
@@ -624,6 +640,23 @@ pub def resolve_coverage_out(opts: CompilerOptions) -> String
   match opts.coverage_out
   when Option::Some(p) then p.clone()
   when Option::None then coverage_default_out()
+  end
+end
+
+# The conventional replay dump path (audit order item 6): used when
+# --replay is given without --replay-out=<path>. The runtime dump
+# creates/truncates it at process exit; "-" selects stdout.
+pub def replay_default_out() -> String
+  "/tmp/tg.replay.trace".to_string()
+end
+
+# The replay dump path of a compile: the explicit --replay-out value or the
+# conventional default. Read by the LIR route when it builds the replay
+# emission plan (the plan's path is embedded in the object).
+pub def resolve_replay_out(opts: CompilerOptions) -> String
+  match opts.replay_out
+  when Option::Some(p) then p.clone()
+  when Option::None then replay_default_out()
   end
 end
 
@@ -2114,7 +2147,13 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   # PGO instrumentation: if --pgo-gen, instrument before optimization
   match opts.pgo_gen
   when Option::Some(_) then
-    instrument_for_pgo(&mut mir)
+    match instrument_for_pgo(&mut mir)
+    when Result::Err(u) then
+      # (audit order item 1 closeout) origin-less MIR cannot be PGO-
+      # instrumented: the API returns the documented untracked artifact.
+      return Result::Err(untracked_artifact_text(u))
+    when Result::Ok(_) then ()
+    end
     # The instrumentation pass rewrites the program — verify it under the
     # verify-everything policy.
     if verify_everything then
@@ -2610,7 +2649,12 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
   end
   match opts.pgo_gen
   when Option::Some(_) then
-    instrument_for_pgo(&mut mir)
+    match instrument_for_pgo(&mut mir)
+    when Result::Err(u) then
+      println("PGO instrumentation failed: " + untracked_artifact_text(u))
+      return 1
+    when Result::Ok(_) then ()
+    end
     if verify_everything then
       let post_pgo_instr_errs = verify_mir(&mir)
       if !post_pgo_instr_errs.is_empty() then
@@ -3653,11 +3697,11 @@ def residual_macro_calls_in_expr(expr: Expr, inout out: Vec[Expr]) -> Unit
   match expr.kind
   when ExprKind::ExprMacroCall(_, _) then out.push(expr.clone())
   when ExprKind::ExprCall(callee, args) then
-    residual_macro_calls_in_expr(&callee, out)
+    residual_macro_calls_in_expr(callee.into_inner(), out)
     for a in args do residual_macro_calls_in_expr(&a, out) end
   when ExprKind::ExprBlock(block) then residual_macro_calls_in_block(block, out)
   when ExprKind::ExprMethodCall(receiver, _, _, args) then
-    residual_macro_calls_in_expr(&receiver, out)
+    residual_macro_calls_in_expr(receiver.into_inner(), out)
     for a in args do residual_macro_calls_in_expr(&a, out) end
   when ExprKind::ExprIf(if_expr) then
     residual_macro_calls_in_expr(&if_expr.cond, out)
@@ -3676,25 +3720,25 @@ def residual_macro_calls_in_expr(expr: Expr, inout out: Vec[Expr]) -> Unit
       end
       residual_macro_calls_in_block(&arm.body, out)
     end
-  when ExprKind::ExprClosure(_, _, body) then residual_macro_calls_in_expr(&body, out)
+  when ExprKind::ExprClosure(_, _, body) then residual_macro_calls_in_expr(body.into_inner(), out)
   when ExprKind::ExprUnsafe(_, block) then residual_macro_calls_in_block(block, out)
   when ExprKind::ExprAsync(block) then residual_macro_calls_in_block(block, out)
   when ExprKind::ExprComptime(block) then residual_macro_calls_in_block(block, out)
   when ExprKind::ExprEnumVariant(_, _, args) then
     for a in args do residual_macro_calls_in_expr(&a, out) end
   when ExprKind::ExprBinaryOp(_, lhs, rhs) then
-    residual_macro_calls_in_expr(&lhs, out)
-    residual_macro_calls_in_expr(&rhs, out)
-  when ExprKind::ExprUnaryOp(_, operand) then residual_macro_calls_in_expr(&operand, out)
-  when ExprKind::ExprFieldAccess(obj, _) then residual_macro_calls_in_expr(&obj, out)
+    residual_macro_calls_in_expr(lhs.into_inner(), out)
+    residual_macro_calls_in_expr(rhs.into_inner(), out)
+  when ExprKind::ExprUnaryOp(_, operand) then residual_macro_calls_in_expr(operand.into_inner(), out)
+  when ExprKind::ExprFieldAccess(obj, _) then residual_macro_calls_in_expr(obj.into_inner(), out)
   when ExprKind::ExprIndex(obj, idx) then
-    residual_macro_calls_in_expr(&obj, out)
-    residual_macro_calls_in_expr(&idx, out)
+    residual_macro_calls_in_expr(obj.into_inner(), out)
+    residual_macro_calls_in_expr(idx.into_inner(), out)
   when ExprKind::ExprArrayLit(elems) then
     for e in elems do residual_macro_calls_in_expr(&e, out) end
   when ExprKind::ExprArrayRepeat(elem, count) then
-    residual_macro_calls_in_expr(&elem, out)
-    residual_macro_calls_in_expr(&count, out)
+    residual_macro_calls_in_expr(elem.into_inner(), out)
+    residual_macro_calls_in_expr(count.into_inner(), out)
   when ExprKind::ExprTupleLit(elems) then
     for e in elems do residual_macro_calls_in_expr(&e, out) end
   when ExprKind::ExprStructLit(_, fields) then
@@ -3704,27 +3748,27 @@ def residual_macro_calls_in_expr(expr: Expr, inout out: Vec[Expr]) -> Unit
       residual_macro_calls_in_expr(&k, out)
       residual_macro_calls_in_expr(&v, out)
     end
-  when ExprKind::ExprAccess(inner) then residual_macro_calls_in_expr(&inner, out)
-  when ExprKind::ExprRawDeref(inner) then residual_macro_calls_in_expr(&inner, out)
-  when ExprKind::ExprAwait(inner) then residual_macro_calls_in_expr(&inner, out)
-  when ExprKind::ExprTry(inner) then residual_macro_calls_in_expr(&inner, out)
+  when ExprKind::ExprAccess(inner) then residual_macro_calls_in_expr(inner.into_inner(), out)
+  when ExprKind::ExprRawDeref(inner) then residual_macro_calls_in_expr(inner.into_inner(), out)
+  when ExprKind::ExprAwait(inner) then residual_macro_calls_in_expr(inner.into_inner(), out)
+  when ExprKind::ExprTry(inner) then residual_macro_calls_in_expr(inner.into_inner(), out)
   when ExprKind::ExprRange(start_e, end_e, _) then
     match start_e
-    when Option::Some(s) then residual_macro_calls_in_expr(&s, out)
+    when Option::Some(s) then residual_macro_calls_in_expr(s.into_inner(), out)
     when Option::None then ()
     end
     match end_e
-    when Option::Some(e) then residual_macro_calls_in_expr(&e, out)
+    when Option::Some(e) then residual_macro_calls_in_expr(e.into_inner(), out)
     when Option::None then ()
     end
-  when ExprKind::ExprCast(inner, _) then residual_macro_calls_in_expr(&inner, out)
-  when ExprKind::ExprTypeCheck(inner, _) then residual_macro_calls_in_expr(&inner, out)
+  when ExprKind::ExprCast(inner, _) then residual_macro_calls_in_expr(inner.into_inner(), out)
+  when ExprKind::ExprTypeCheck(inner, _) then residual_macro_calls_in_expr(inner.into_inner(), out)
   when ExprKind::ExprAssign(target, value) then
-    residual_macro_calls_in_expr(&target, out)
-    residual_macro_calls_in_expr(&value, out)
+    residual_macro_calls_in_expr(target.into_inner(), out)
+    residual_macro_calls_in_expr(value.into_inner(), out)
   when ExprKind::ExprPipe(lhs, rhs) then
-    residual_macro_calls_in_expr(&lhs, out)
-    residual_macro_calls_in_expr(&rhs, out)
+    residual_macro_calls_in_expr(lhs.into_inner(), out)
+    residual_macro_calls_in_expr(rhs.into_inner(), out)
   when _ then ()
   end  end
 end
@@ -4187,8 +4231,14 @@ end
 pub def expand_expr(env: MacroEnv, expr: Expr, ctx_stack: Vec[Int]) -> ExpandedExpr
   match expr.kind
   when ExprKind::ExprCall(callee, args) then
+    ## The callee is an OWNED Box[Expr] payload: unbox it explicitly and
+    ## match the unboxed expression (Box is the wrapper, never transparent
+    ## to the Expr it holds). The fallback arms rebuild the path callee
+    ## from the bound path + the preserved span, so the macro arm can
+    ## consume the path binding.
+    let callee_expr = callee.into_inner()
     ## Check if callee is a path that matches a macro name
-    match callee.kind
+    match callee_expr.kind
     when ExprKind::ExprPath(path) then
       let ea = expand_exprs(env, &args, ctx_stack)
       if is_vec_like_from_path(&path) && ea.args.len() == 1 then
@@ -4236,7 +4286,7 @@ pub def expand_expr(env: MacroEnv, expr: Expr, ctx_stack: Vec[Int]) -> ExpandedE
           end
         when Option::None then
           ## Not a macro  expand arguments recursively
-          let ec = expand_expr(env, &callee, ctx_stack)
+          let ec = expand_expr(env, Expr { kind: ExprKind::ExprPath(path), span: callee_expr.span, node_id: 0 }, ctx_stack)
           ExpandedExpr {
             expr: Expr { kind: ExprKind::ExprCall(Box::new(ec.expr), ea.args), span: expr.span, node_id: 0 },
             did_expand: ec.did_expand || ea.did_expand
@@ -4244,7 +4294,7 @@ pub def expand_expr(env: MacroEnv, expr: Expr, ctx_stack: Vec[Int]) -> ExpandedE
         end
       when Option::None then
         ## Not a macro  expand arguments recursively
-        let ec = expand_expr(env, &callee, ctx_stack)
+        let ec = expand_expr(env, Expr { kind: ExprKind::ExprPath(path), span: callee_expr.span, node_id: 0 }, ctx_stack)
         ExpandedExpr {
           expr: Expr { kind: ExprKind::ExprCall(Box::new(ec.expr), ea.args), span: expr.span, node_id: 0 },
           did_expand: ec.did_expand || ea.did_expand
@@ -4252,7 +4302,7 @@ pub def expand_expr(env: MacroEnv, expr: Expr, ctx_stack: Vec[Int]) -> ExpandedE
       end
     when _ then
       let ea = expand_exprs(env, &args, ctx_stack)
-      let ec = expand_expr(env, &callee, ctx_stack)
+      let ec = expand_expr(env, callee_expr, ctx_stack)
       ExpandedExpr {
         expr: Expr { kind: ExprKind::ExprCall(Box::new(ec.expr), ea.args), span: expr.span, node_id: 0 },
         did_expand: ec.did_expand || ea.did_expand
@@ -4351,34 +4401,34 @@ pub def expand_expr(env: MacroEnv, expr: Expr, ctx_stack: Vec[Int]) -> ExpandedE
     }
     ExpandedExpr { expr: Expr { kind: ExprKind::ExprIf(new_if), span: expr.span, node_id: 0 }, did_expand: expanded }
   when ExprKind::ExprBinaryOp(op, lhs, rhs) then
-    let el = expand_expr(env, &lhs, ctx_stack)
-    let er = expand_expr(env, &rhs, ctx_stack)
+    let el = expand_expr(env, lhs.into_inner(), ctx_stack)
+    let er = expand_expr(env, rhs.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprBinaryOp(op, Box::new(el.expr), Box::new(er.expr)), span: expr.span, node_id: 0 },
       did_expand: el.did_expand || er.did_expand
     }
   when ExprKind::ExprUnaryOp(op, operand) then
-    let eo = expand_expr(env, &operand, ctx_stack)
+    let eo = expand_expr(env, operand.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprUnaryOp(op, Box::new(eo.expr)), span: expr.span, node_id: 0 },
       did_expand: eo.did_expand
     }
   when ExprKind::ExprMethodCall(receiver, method, targs, args) then
-    let er = expand_expr(env, &receiver, ctx_stack)
+    let er = expand_expr(env, receiver.into_inner(), ctx_stack)
     let ea = expand_exprs(env, &args, ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprMethodCall(Box::new(er.expr), method.clone(), targs.clone(), ea.args), span: expr.span, node_id: 0 },
       did_expand: er.did_expand || ea.did_expand
     }
   when ExprKind::ExprFieldAccess(obj, field) then
-    let eo = expand_expr(env, &obj, ctx_stack)
+    let eo = expand_expr(env, obj.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprFieldAccess(Box::new(eo.expr), field.clone()), span: expr.span, node_id: 0 },
       did_expand: eo.did_expand
     }
   when ExprKind::ExprIndex(obj, idx) then
-    let eo = expand_expr(env, &obj, ctx_stack)
-    let ei = expand_expr(env, &idx, ctx_stack)
+    let eo = expand_expr(env, obj.into_inner(), ctx_stack)
+    let ei = expand_expr(env, idx.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprIndex(Box::new(eo.expr), Box::new(ei.expr)), span: expr.span, node_id: 0 },
       did_expand: eo.did_expand || ei.did_expand
@@ -4390,8 +4440,8 @@ pub def expand_expr(env: MacroEnv, expr: Expr, ctx_stack: Vec[Int]) -> ExpandedE
       did_expand: ea.did_expand
     }
   when ExprKind::ExprArrayRepeat(elem, count) then
-    let ee = expand_expr(env, &elem, ctx_stack)
-    let ce = expand_expr(env, &count, ctx_stack)
+    let ee = expand_expr(env, elem.into_inner(), ctx_stack)
+    let ce = expand_expr(env, count.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprArrayRepeat(Box::new(ee.expr), Box::new(ce.expr)), span: expr.span, node_id: 0 },
       did_expand: ee.did_expand || ce.did_expand
@@ -4428,19 +4478,19 @@ pub def expand_expr(env: MacroEnv, expr: Expr, ctx_stack: Vec[Int]) -> ExpandedE
       did_expand
     }
   when ExprKind::ExprAccess(inner) then
-    let ei = expand_expr(env, &inner, ctx_stack)
+    let ei = expand_expr(env, inner.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprAccess(Box::new(ei.expr)), span: expr.span, node_id: 0 },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprRawDeref(inner) then
-    let ei = expand_expr(env, &inner, ctx_stack)
+    let ei = expand_expr(env, inner.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprRawDeref(Box::new(ei.expr)), span: expr.span, node_id: 0 },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprClosure(params, ret_ty, body) then
-    let eb = expand_expr(env, &body, ctx_stack)
+    let eb = expand_expr(env, body.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprClosure(params.clone(), ret_ty.clone(), Box::new(eb.expr)), span: expr.span, node_id: 0 },
       did_expand: eb.did_expand
@@ -4482,13 +4532,13 @@ pub def expand_expr(env: MacroEnv, expr: Expr, ctx_stack: Vec[Int]) -> ExpandedE
       did_expand: eb.did_expand
     }
   when ExprKind::ExprAwait(inner) then
-    let ei = expand_expr(env, &inner, ctx_stack)
+    let ei = expand_expr(env, inner.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprAwait(Box::new(ei.expr)), span: expr.span, node_id: 0 },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprTry(inner) then
-    let ei = expand_expr(env, &inner, ctx_stack)
+    let ei = expand_expr(env, inner.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprTry(Box::new(ei.expr)), span: expr.span, node_id: 0 },
       did_expand: ei.did_expand
@@ -4496,14 +4546,14 @@ pub def expand_expr(env: MacroEnv, expr: Expr, ctx_stack: Vec[Int]) -> ExpandedE
   when ExprKind::ExprRange(start_expr, end_expr, inclusive) then
     let new_start = match start_expr
     when Option::Some(start) then
-      let es = expand_expr(env, &start, ctx_stack)
+      let es = expand_expr(env, start.into_inner(), ctx_stack)
       Option::Some(Box::new(es.expr))
     when Option::None then
       Option::None
     end
     let new_end = match end_expr
     when Option::Some(end_expr_inner) then
-      let ee = expand_expr(env, &end_expr_inner, ctx_stack)
+      let ee = expand_expr(env, end_expr_inner.into_inner(), ctx_stack)
       Option::Some(Box::new(ee.expr))
     when Option::None then
       Option::None
@@ -4513,27 +4563,27 @@ pub def expand_expr(env: MacroEnv, expr: Expr, ctx_stack: Vec[Int]) -> ExpandedE
       did_expand: false
     }
   when ExprKind::ExprAssign(target, value) then
-    let et = expand_expr(env, &target, ctx_stack)
-    let ev = expand_expr(env, &value, ctx_stack)
+    let et = expand_expr(env, target.into_inner(), ctx_stack)
+    let ev = expand_expr(env, value.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprAssign(Box::new(et.expr), Box::new(ev.expr)), span: expr.span, node_id: 0 },
       did_expand: et.did_expand || ev.did_expand
     }
   when ExprKind::ExprPipe(lhs, rhs) then
-    let el = expand_expr(env, &lhs, ctx_stack)
-    let er = expand_expr(env, &rhs, ctx_stack)
+    let el = expand_expr(env, lhs.into_inner(), ctx_stack)
+    let er = expand_expr(env, rhs.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprPipe(Box::new(el.expr), Box::new(er.expr)), span: expr.span, node_id: 0 },
       did_expand: el.did_expand || er.did_expand
     }
   when ExprKind::ExprCast(inner, ty) then
-    let ei = expand_expr(env, &inner, ctx_stack)
+    let ei = expand_expr(env, inner.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprCast(Box::new(ei.expr), ty.clone()), span: expr.span, node_id: 0 },
       did_expand: ei.did_expand
     }
   when ExprKind::ExprTypeCheck(inner, ty) then
-    let ei = expand_expr(env, &inner, ctx_stack)
+    let ei = expand_expr(env, inner.into_inner(), ctx_stack)
     ExpandedExpr {
       expr: Expr { kind: ExprKind::ExprTypeCheck(Box::new(ei.expr), ty.clone()), span: expr.span, node_id: 0 },
       did_expand: ei.did_expand
@@ -4852,7 +4902,7 @@ pub def substitute_expr(subst: Map[String, Expr], ctx_stack: Vec[Int], frames: V
       end
     end
   when ExprKind::ExprCall(callee, args) then
-    let new_callee = substitute_expr(subst, ctx_stack, frames, &callee)
+    let new_callee = substitute_expr(subst, ctx_stack, frames, callee.into_inner())
     var new_args = Vec::new()
     var i = 0
     while i < args.len() do
@@ -4861,13 +4911,13 @@ pub def substitute_expr(subst: Map[String, Expr], ctx_stack: Vec[Int], frames: V
     end
     Expr { kind: ExprKind::ExprCall(Box::new(new_callee), new_args), span: expr.span, node_id: 0 }
   when ExprKind::ExprBinaryOp(op, lhs, rhs) then
-    Expr { kind: ExprKind::ExprBinaryOp(op, Box::new(substitute_expr(subst, ctx_stack, frames, &lhs)), Box::new(substitute_expr(subst, ctx_stack, frames, &rhs))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprBinaryOp(op, Box::new(substitute_expr(subst, ctx_stack, frames, lhs.into_inner())), Box::new(substitute_expr(subst, ctx_stack, frames, rhs.into_inner()))), span: expr.span, node_id: 0 }
   when ExprKind::ExprUnaryOp(op, operand) then
-    Expr { kind: ExprKind::ExprUnaryOp(op, Box::new(substitute_expr(subst, ctx_stack, frames, &operand))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprUnaryOp(op, Box::new(substitute_expr(subst, ctx_stack, frames, operand.into_inner()))), span: expr.span, node_id: 0 }
   when ExprKind::ExprBlock(block) then
     Expr { kind: ExprKind::ExprBlock(substitute_block(subst, ctx_stack, frames, &block)), span: expr.span, node_id: 0 }
   when ExprKind::ExprMethodCall(receiver, method, targs, args) then
-    let new_recv = substitute_expr(subst, ctx_stack, frames, &receiver)
+    let new_recv = substitute_expr(subst, ctx_stack, frames, receiver.into_inner())
     var new_args = Vec::new()
     var i = 0
     while i < args.len() do
@@ -4882,16 +4932,16 @@ pub def substitute_expr(subst: Map[String, Expr], ctx_stack: Vec[Int], frames: V
     end
     Expr { kind: ExprKind::ExprEnumVariant(path.clone(), path_type_args.clone(), new_args), span: expr.span, node_id: 0 }
   when ExprKind::ExprFieldAccess(obj, field) then
-    Expr { kind: ExprKind::ExprFieldAccess(Box::new(substitute_expr(subst, ctx_stack, frames, &obj)), field.clone()), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprFieldAccess(Box::new(substitute_expr(subst, ctx_stack, frames, obj.into_inner())), field.clone()), span: expr.span, node_id: 0 }
   when ExprKind::ExprIndex(obj, idx) then
-    Expr { kind: ExprKind::ExprIndex(Box::new(substitute_expr(subst, ctx_stack, frames, &obj)), Box::new(substitute_expr(subst, ctx_stack, frames, &idx))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprIndex(Box::new(substitute_expr(subst, ctx_stack, frames, obj.into_inner())), Box::new(substitute_expr(subst, ctx_stack, frames, idx.into_inner()))), span: expr.span, node_id: 0 }
   when ExprKind::ExprArrayLit(elems) then
     var new_elems = Vec::new()
     for e in elems do new_elems.push(substitute_expr(subst, ctx_stack, frames, &e)) end
     Expr { kind: ExprKind::ExprArrayLit(new_elems), span: expr.span, node_id: 0 }
   when ExprKind::ExprArrayRepeat(elem, count) then
-    let new_elem = substitute_expr(subst, ctx_stack, frames, &elem)
-    let new_count = substitute_expr(subst, ctx_stack, frames, &count)
+    let new_elem = substitute_expr(subst, ctx_stack, frames, elem.into_inner())
+    let new_count = substitute_expr(subst, ctx_stack, frames, count.into_inner())
     Expr { kind: ExprKind::ExprArrayRepeat(Box::new(new_elem), Box::new(new_count)), span: expr.span, node_id: 0 }
   when ExprKind::ExprTupleLit(elems) then
     var new_elems = Vec::new()
@@ -4910,31 +4960,31 @@ pub def substitute_expr(subst: Map[String, Expr], ctx_stack: Vec[Int], frames: V
     end
     Expr { kind: ExprKind::ExprMapLit(new_entries), span: expr.span, node_id: 0 }
   when ExprKind::ExprAccess(inner) then
-    Expr { kind: ExprKind::ExprAccess(Box::new(substitute_expr(subst, ctx_stack, frames, &inner))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprAccess(Box::new(substitute_expr(subst, ctx_stack, frames, inner.into_inner()))), span: expr.span, node_id: 0 }
   when ExprKind::ExprRawDeref(inner) then
-    Expr { kind: ExprKind::ExprRawDeref(Box::new(substitute_expr(subst, ctx_stack, frames, &inner))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprRawDeref(Box::new(substitute_expr(subst, ctx_stack, frames, inner.into_inner()))), span: expr.span, node_id: 0 }
   when ExprKind::ExprAwait(inner) then
-    Expr { kind: ExprKind::ExprAwait(Box::new(substitute_expr(subst, ctx_stack, frames, &inner))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprAwait(Box::new(substitute_expr(subst, ctx_stack, frames, inner.into_inner()))), span: expr.span, node_id: 0 }
   when ExprKind::ExprTry(inner) then
-    Expr { kind: ExprKind::ExprTry(Box::new(substitute_expr(subst, ctx_stack, frames, &inner))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprTry(Box::new(substitute_expr(subst, ctx_stack, frames, inner.into_inner()))), span: expr.span, node_id: 0 }
   when ExprKind::ExprRange(start_expr, end_expr, inclusive) then
     let new_start = match start_expr
-    when Option::Some(start) then Option::Some(Box::new(substitute_expr(subst, ctx_stack, frames, &start)))
+    when Option::Some(start) then Option::Some(Box::new(substitute_expr(subst, ctx_stack, frames, start.into_inner())))
     when Option::None then Option::None
     end
     let new_end = match end_expr
-    when Option::Some(end_expr_inner) then Option::Some(Box::new(substitute_expr(subst, ctx_stack, frames, &end_expr_inner)))
+    when Option::Some(end_expr_inner) then Option::Some(Box::new(substitute_expr(subst, ctx_stack, frames, end_expr_inner.into_inner())))
     when Option::None then Option::None
     end
     Expr { kind: ExprKind::ExprRange(new_start, new_end, inclusive), span: expr.span, node_id: 0 }
   when ExprKind::ExprCast(inner, ty) then
-    Expr { kind: ExprKind::ExprCast(Box::new(substitute_expr(subst, ctx_stack, frames, &inner)), ty.clone()), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprCast(Box::new(substitute_expr(subst, ctx_stack, frames, inner.into_inner())), ty.clone()), span: expr.span, node_id: 0 }
   when ExprKind::ExprTypeCheck(inner, ty) then
-    Expr { kind: ExprKind::ExprTypeCheck(Box::new(substitute_expr(subst, ctx_stack, frames, &inner)), ty.clone()), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprTypeCheck(Box::new(substitute_expr(subst, ctx_stack, frames, inner.into_inner())), ty.clone()), span: expr.span, node_id: 0 }
   when ExprKind::ExprAssign(target, value) then
-    Expr { kind: ExprKind::ExprAssign(Box::new(substitute_expr(subst, ctx_stack, frames, &target)), Box::new(substitute_expr(subst, ctx_stack, frames, &value))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprAssign(Box::new(substitute_expr(subst, ctx_stack, frames, target.into_inner())), Box::new(substitute_expr(subst, ctx_stack, frames, value.into_inner()))), span: expr.span, node_id: 0 }
   when ExprKind::ExprPipe(lhs, rhs) then
-    Expr { kind: ExprKind::ExprPipe(Box::new(substitute_expr(subst, ctx_stack, frames, &lhs)), Box::new(substitute_expr(subst, ctx_stack, frames, &rhs))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprPipe(Box::new(substitute_expr(subst, ctx_stack, frames, lhs.into_inner())), Box::new(substitute_expr(subst, ctx_stack, frames, rhs.into_inner()))), span: expr.span, node_id: 0 }
   when ExprKind::ExprIf(if_expr) then
     let new_cond = substitute_expr(subst, ctx_stack, frames, &if_expr.cond)
     let new_then = substitute_block(subst, ctx_stack, frames, &if_expr.then_block)
@@ -4982,7 +5032,7 @@ pub def substitute_expr(subst: Map[String, Expr], ctx_stack: Vec[Int], frames: V
       pi = pi + 1
     end
     let closure_frames = hygiene_push_shadow_frame(frames, &param_names)
-    Expr { kind: ExprKind::ExprClosure(params.clone(), ret_ty.clone(), Box::new(substitute_expr(subst, ctx_stack, &closure_frames, &body))), span: expr.span, node_id: 0 }
+    Expr { kind: ExprKind::ExprClosure(params.clone(), ret_ty.clone(), Box::new(substitute_expr(subst, ctx_stack, &closure_frames, body.into_inner()))), span: expr.span, node_id: 0 }
   when _ then expr.clone()
   end  end
 end
@@ -5244,7 +5294,12 @@ pub def compile_multiple_files(opts: CompilerOptions, files: Vec[String], output
   end
   match opts.pgo_gen
   when Option::Some(_) then
-    instrument_for_pgo(&mut mir)
+    match instrument_for_pgo(&mut mir)
+    when Result::Err(u) then
+      println("PGO instrumentation failed: " + untracked_artifact_text(u))
+      return 1
+    when Result::Ok(_) then ()
+    end
     if verify_everything then
       let post_pgo_instr_errs = verify_mir(&mir)
       if !post_pgo_instr_errs.is_empty() then

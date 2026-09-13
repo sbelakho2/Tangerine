@@ -34,20 +34,20 @@
        Map/Set are heap headers — all pointer-sized 8/8 at the value
        level; String is the 8-byte handle.
 
-   ERASED-INDIRECTION CYCLES.  The seed's mono type defs erase the Box
-   wrapper (the checker's transparent-Box convention) and the direct
-   kernel's pointer variants of the self-describing `Type` enum
-   (`Type::Ptr(Type)` / `PtrMut` / `RefInternal`) record their payload as
-   the enum type itself.  In the direct pipeline those edges are
-   indirections (a pointer/Box slot, and `promote_heap_to_stack` removes
-   the box entirely); the seed def carries no wrapper to classify.  The
-   fold therefore treats a re-entrant edge of an in-progress type as the
-   direct kernel's pointer storage (8/8) — the only finite interpretation
-   of an erased indirection, and exactly the storage the erased wrapper
-   (`Box[T]` = { ptr: Ptr[T] }, or the Ptr variant payload) occupies.  A
-   field type outside that class that still carries a type parameter, an
-   inference variable or no registered def is a hard failure (fail
-   closed, never a guessed word). *)
+   ERASED-INDIRECTION CYCLES.  The direct kernel's self-describing
+   `Type` enum records its pointer variants' payload as the enum type
+   itself (`Type::Ptr(Type)` / `PtrMut` / `RefInternal`); those edges are
+   indirections (a pointer slot).  The seed def carries no wrapper for
+   them, and a re-entrant inline edge of any other nominal is an
+   infinitely sized type.  The fold treats a re-entrant edge of an
+   in-progress type as the direct kernel's pointer storage (8/8) — the
+   only finite interpretation of an erased indirection, and exactly the
+   storage the erased pointer wrapper occupies.  A field type outside
+   that class that still carries a type parameter, an inference variable
+   or no registered def is a hard failure (fail closed, never a guessed
+   word).  Box[T] is NOT part of this erased class: it is a materialized
+   nominal def (`{ ptr: Ptr[T] }`), so its layout resolves through its
+   own def and its pointer field — never by identity erasure. *)
 
 let pointer_size = 8
 let pointer_align = 8
@@ -389,50 +389,10 @@ let fold_program ~(lang_items : Lang_items.t)
   let functions = Array.map (fold_function ctx) program.Seed_mir.functions in
   { program with Seed_mir.functions }
 
-(* ── the transparent Box promotion (the VM-side program only) ────────
-   The seed's value model carries the boxed CONTENT in Box-typed slots —
-   the checker's transparent-Box convention, and the assumption mir_derive
-   records for derived clone and the deref-on-field transparency.  The
-   direct kernel reaches the same shape through its
-   promote_heap_to_stack pass (`_X = Box::new(v)` -> `_X = v`).  This
-   rewrite applies the same promotion to the VM-side program: the
-   registered `box_new` instances become `dest = Move(value); Ret` (the
-   emitted CALLS stay in the MIR — the typed-vs-emitted evidence rows and
-   the concrete verifier keep inspecting the original program — only the
-   executed body is transparent).  A `box_new` instance whose shape does
-   not match the registered constructor (one param, return slot local _0,
-   value local _1) is left untouched and fails closed at the layout/VM
-   boundary instead of being mis-promoted. *)
-let is_box_ctor_name (name : string) : bool =
-  let s = "box_new" in
-  let n = String.length name and m = String.length s in
-  n >= m && String.sub name (n - m) m = s
-
-let promote_box_constructors (program : Seed_mir.program) : Seed_mir.program =
-  let functions =
-    Array.map
-      (fun (fn : Seed_mir.function_) ->
-        if
-          is_box_ctor_name fn.Seed_mir.name
-          && Array.length fn.Seed_mir.params = 1
-          && Array.length fn.Seed_mir.locals >= 2
-        then
-          let dest = { Seed_mir.root = Seed_mir.Local 0; projections = [] } in
-          let src = { Seed_mir.root = Seed_mir.Local 1; projections = [] } in
-          {
-            fn with
-            Seed_mir.entry = 0;
-            Seed_mir.blocks =
-              [|
-                {
-                  Seed_mir.id = 0;
-                  statements =
-                    [ Seed_mir.Assign (dest, Seed_mir.Use (Seed_mir.Move src)) ];
-                  terminator = Seed_mir.Ret;
-                };
-              |];
-          }
-        else fn)
-      program.Seed_mir.functions
-  in
-  { program with Seed_mir.functions }
+(* ── Box representation (nominal) ────────────────────────────────────
+   Box[T] is a REAL nominal value: `box_new` allocates the pointee and
+   returns the `{ ptr: Ptr[T] }` wrapper, so the executed program is the
+   mono'd program as-is.  The former transparent-Box promotion
+   (`_X = Box::new(v)` -> `_X = v`, the checker-era erasure) is REMOVED:
+   it made the runtime slot hold the content while identity/layout/drop
+   said wrapper, the split this pass's removal repairs. *)

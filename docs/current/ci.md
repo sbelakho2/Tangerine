@@ -20,7 +20,7 @@ Everything below is operator-facing.
 | `.woodpecker/verify-cross.yaml` | arm64 + x86_64 cross-target canary lanes |
 | `.woodpecker/bench.yaml` | benchmarks (push to `main` only) |
 | `.woodpecker/docs.yaml` | API doc generation + pages-branch publish (push to `main` only) |
-| `.woodpecker/evidence-gate.yaml` | generate-then-diff evidence + release-required-jobs set check |
+| `.woodpecker/evidence-gate.yaml` | generate-then-diff evidence (incl. the invariant registry digest + catalog + `invariants-evidence.json`) + release-required-jobs set check |
 | `.woodpecker/status.yaml` | tested-SHA status snapshot + release evidence |
 | `.woodpecker/release-proof.yaml` | TANGERINE RELEASE PROOF (`--gate`) |
 | `.woodpecker/workflow-lint.yaml` | `woodpecker-cli lint` over every workflow file |
@@ -147,12 +147,17 @@ GitHub artifact upload/download maps to S3-compatible object storage:
 Artifact names mirror the former GitHub artifacts exactly
 (`tg-stages-macos-arm64`, `bootstrap-fingerprints`,
 `bootstrap-native-tests`, `cross-lane-binaries`, `linux-fingerprints`,
-`linux-native-tests`, `mutation-report`, `bench-results`,
-`status-snapshot-<sha>`, `release-proof-<sha>`, ...), because
-`scripts/release_evidence_schema.sh` validates the artifact set by name.
-The `tg-stages-macos-arm64` artifact also carries `build/tg` when
-`run_bootstrap.sh` materializes the full driver; the consuming workflows
-prefer that binary and fall back to copying `tg_stage3`.
+`linux-native-tests`, `invariants-evidence`, `mutation-report`,
+`bench-results`, `status-snapshot-<sha>`, `release-proof-<sha>`, ...),
+because `scripts/release_evidence_schema.sh` validates the artifact set by
+name. The `invariants-evidence` artifact carries the generator's
+`invariants-evidence.json` (tested commit + registry content digest +
+compiler/seed digest + mechanical checks + matched test files + build
+identity); the status workflow's release-evidence validation recomputes
+the registry digest from the tested tree's `invariants.toml` and fails
+closed on any mismatch. The `tg-stages-macos-arm64` artifact also carries
+`build/tg` when `run_bootstrap.sh` materializes the full driver; the
+consuming workflows prefer that binary and fall back to copying `tg_stage3`.
 
 Job conclusions (the former `toJSON(needs)`) are replaced by success
 markers: each workflow publishes `build/.ci_results/<job>` to
@@ -209,6 +214,8 @@ The evidence gates are runnable standalone too:
 bash scripts/gen_status.sh --refresh-manifests && git diff --exit-code -- tests/canary/MANIFEST
 bash scripts/gen_feature_registry.sh && git diff --exit-code -- features.toml docs/current/feature_registry.md
 bash scripts/gen_spec_docs.sh && git diff --exit-code -- docs/current
+bash scripts/gen_invariants.sh --validate-tree           # definitions + tree + digest + catalog, no self-referential SHA
+bash scripts/gen_invariants.sh && git diff --exit-code -- invariants.toml docs/current/invariants.md
 bash scripts/check_doctests.sh
 bash tests/run_release_evidence_schema_tests.sh
 ```
@@ -226,7 +233,7 @@ bash tests/run_release_evidence_schema_tests.sh
 | gfx-ui | `verify-gfx.yaml` | `gfx-ui` | local Darwin | `make` targets missing (pre-existing) |
 | gfx-ui-visual | `verify-gfx.yaml` | `gfx-ui-visual` | local Darwin | visual diffs uploaded on failure |
 | gfx-ui-gate | `verify-gfx.yaml` | `gfx-ui-gate` | local Darwin | final aggregate step |
-| evidence-gate | `evidence-gate.yaml` | `evidence-gate` | docker linux, `python:3.12-bookworm` | item-35 check rewritten for Woodpecker |
+| evidence-gate | `evidence-gate.yaml` | `evidence-gate` | docker linux, `python:3.12-bookworm` | item-35 check rewritten for Woodpecker; also regenerates/validates the invariant registry digest + catalog and uploads `invariants-evidence.json` |
 | status | `status.yaml` | `status` | docker linux, `python:3.12-bookworm` | markers replace `toJSON(needs)` |
 | release-proof | `release-proof.yaml` | `release-proof` | docker linux, `python:3.12-bookworm` | runs on failure too (optional status dependency) |
 | crypto-kat | `verify-core.yaml` | `crypto-kat` | local Darwin | |

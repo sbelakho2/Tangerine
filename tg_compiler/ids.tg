@@ -24,7 +24,10 @@
 #   GenericParamId  a generic parameter's identity: owner DefId + param index.
 #   CallableId      newtype over DefId: every callable's identity.
 #   InstanceId      a monomorphized callee's identity: CallableId + the
-#                   concrete type substitutions. Moved here from
+#                   concrete generic arguments in declared binder order
+#                   (typed GenericArg union — P0-5; const-vs-type is
+#                   carried by the payload, never re-derived from a
+#                   rendering). Moved here from
 #                   trait_resolve.tg — the shared semantic identity domain.
 #   ClosureId       a closure's identity.
 # EffectId a declared effect's identity (— the interning table
@@ -70,7 +73,7 @@
 # def_kinds entries (the bare-name first-wins tables).
 
 use std::collections::{Vec, Map}
-use tg_compiler::types::{Type}
+use tg_compiler::types::{Type, ConstExprT}
 
 # The definition-kind METADATA set (DefId carries no kind — the kind is
 # the resolver's metadata map, consulted by def_kind_of). Trait is the
@@ -212,8 +215,9 @@ end
 # parameter index. The index IS the parameter's DECLARATION ORDER within
 # the owner — the interning table below allocates indices in
 # declaration order at registration, so GenericParamId order and the
-# substs-order contract (the InstanceId.substs Vec aligns positionally with
-# the declaration order) are the same thing by construction.
+# declared-binder-order contract (the InstanceId.args Vec aligns
+# positionally with the declaration order) are the same thing by
+# construction.
 struct GenericParamId
   owner: DefId
   index: UInt
@@ -709,24 +713,126 @@ impl Clone for StableDefId
   end
 end
 
-# a monomorphized callee's identity — the callable's DefId (via
-# CallableId) plus the concrete type substitutions. Moved from
-# trait_resolve.tg into the shared semantic identity domain. The instance
-# payload is the ONLY authority for type arguments at the monomorphizer
-# (zero-inference: the monomorphizer never fills them from a call site).
-struct InstanceId
-  def: CallableId
-  substs: Vec[Type]
+# ONE const generic argument of a monomorphized instance (fourth-audit
+# P0-5). The TYPE CHECKER produces this typed form in declared binder
+# order at the call/instantiation sites; identity/mangling consumers
+# NEVER re-classify a rendered string:
+#   Value(v) — a concrete const value (the host-Int value domain; the
+#              declared scalar type is slot metadata, never part of the
+#              value identity);
+#   Param(g) — a forwarded const generic parameter reference (identity is
+#              the GenericParamId);
+#   Sym(t)   — a still-symbolic const-expression tree (identity is the
+#              order-sensitive structural tree, exactly ConstExprT's
+#              documented model).
+enum ConstValue
+  Value(Int)
+  Param(GenericParamId)
+  Sym(ConstExprT)
 end
 
-# The InstanceId clone: the callable identity is an immediate, the concrete
-# type-argument vector duplicates elementwise through the registered Type
-# Clone. Registered as the MirConstant.instance payload's Clone.
+# The ConstValue clone: Value/Param are immediates; Sym discharges the
+# tree through the registered ConstExprT Clone.
+impl Clone for ConstValue
+  def clone(self: Self) -> ConstValue
+    match self
+    when ConstValue::Value(v) then ConstValue::Value(v)
+    when ConstValue::Param(gpid) then ConstValue::Param(gpid)
+    when ConstValue::Sym(tree) then ConstValue::Sym(tree.clone())
+    end
+  end
+end
+
+# ONE generic argument of an instance in DECLARED BINDER ORDER
+# (fourth-audit P0-5): a TYPE argument and a CONST argument are distinct
+# variants, so [Type A, Const 3] and [Const 3, Type A] never conflate and
+# the const-vs-type decision is carried by the payload, never recovered
+# from a rendering. The cross-kind order lives in ONE vector — the
+# declared declaration-order position is the index, never a regrouped
+# types-then-consts layout.
+enum GenericArg
+  Type(Type)
+  Const(ConstValue)
+end
+
+# The GenericArg clone: the Type payload clones through the registered
+# Type Clone, the Const payload through the ConstValue Clone.
+impl Clone for GenericArg
+  def clone(self: Self) -> GenericArg
+    match self
+    when GenericArg::Type(ty) then GenericArg::Type(ty.clone())
+    when GenericArg::Const(cv) then GenericArg::Const(cv.clone())
+    end
+  end
+end
+
+# The Type VIEW of a typed generic argument — the read-only projection the
+# legacy type-level consumers need (substitution maps, concreteness
+# scans, ABI type renders). The view is derived from the typed payload
+# (never a parse): Const rows map to their canonical Type::Const /
+# Type::ConstParam / Type::ConstSym constructor forms.
+pub def const_value_type_view(cv: ConstValue) -> Type
+  match cv
+  when ConstValue::Value(v) then Type::Const(v)
+  when ConstValue::Param(gpid) then Type::ConstParam(gpid)
+  when ConstValue::Sym(tree) then Type::ConstSym(tree)
+  end
+end
+
+pub def generic_arg_type_view(arg: GenericArg) -> Type
+  match arg
+  when GenericArg::Type(ty) then ty.clone()
+  when GenericArg::Const(cv) then const_value_type_view(cv)
+  end
+end
+
+# The typed-generic-argument form of a TYPE-carrying vector — the
+# explicit adapter for call sites that hold only the legacy type view
+# (the name-based mono API, the DeinitPlan finalizer arguments). The
+# classification inspects the TYPED constructors (Type::Const /
+# ConstParam / ConstSym are const rows) — it never renders or parses
+# text. Every argument of a checker-produced vector is already typed;
+# this adapter is for the boundaries that never had the checker's
+# declared-kind channel.
+pub def generic_arg_of_type_view(ty: Type) -> GenericArg
+  match ty
+  when Type::Const(v) then GenericArg::Const(ConstValue::Value(v))
+  when Type::ConstParam(gpid) then GenericArg::Const(ConstValue::Param(gpid))
+  when Type::ConstSym(tree) then GenericArg::Const(ConstValue::Sym(tree))
+  when _ then GenericArg::Type(ty.clone())
+  end
+end
+
+pub def generic_args_of_types(types: Vec[Type]) -> Vec[GenericArg]
+  var args: Vec[GenericArg] = Vec::new()
+  for ty in types do
+    args.push(generic_arg_of_type_view(ty))
+  end
+  args
+end
+
+# a monomorphized callee's identity — the callable's DefId (via
+# CallableId) plus the concrete generic arguments in DECLARED BINDER
+# ORDER (P0-5: the typed GenericArg union — types and consts interleaved
+# by declared position; const-vs-type is NEVER reconstructed from a
+# rendering). Moved from trait_resolve.tg into the shared semantic
+# identity domain. The instance payload is the ONLY authority for type
+# arguments at the monomorphizer (zero-inference: the monomorphizer never
+# fills them from a call site).
+struct InstanceId
+  def: CallableId
+  args: Vec[GenericArg]
+end
+
+# The InstanceId clone: the callable identity is an immediate, the
+# argument vector duplicates elementwise through the registered
+# GenericArg Clone. Registered as the MirConstant.instance payload's
+# Clone.
 impl Clone for InstanceId
   def clone(self: Self) -> InstanceId
     InstanceId {
       def: self.def.clone(),
-      substs: self.substs.clone()
+      args: self.args.clone()
     }
   end
 end

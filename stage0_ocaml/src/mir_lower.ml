@@ -554,11 +554,6 @@ let materialize_place (st : lower_state) (op : Seed_mir.operand) : Seed_mir.plac
    to a dynamic Seed_mir.Index projection, which the verifier only
    admits on Fixed_array bases).  The nominal identities route through
    the env's LangItems record (audit P0-2). *)
-(* The Box nominal's tid — the LangItems box identity of this
-   compilation (audit P0-2), built from the checker's declaration. *)
-let box_tid_of (env : func_env) : Ids.Type_id.t option =
-  env.lang_items.Lang_items.box_
-
 (* ── LangItems selection helpers (audit P0-2) ──────────────────────
    Every builtin-nominal identity decision in lowering routes through
    the env's LangItems record — never numeric TypeId knowledge. *)
@@ -574,20 +569,18 @@ let is_set_langitem (env : func_env) (tid : Ids.Type_id.t) : bool =
 let is_option_langitem (env : func_env) (tid : Ids.Type_id.t) : bool =
   Lang_items.tid_eq env.lang_items.Lang_items.option tid
 
-(* The transparent deref-on-field nominals (the checker's check_field
-   deref rule — typecheck's b_ptr/b_ptrmut transparency and the Box
-   wrapper's deref-on-field rule): the raw-pointer LangItems and the
-   Box nominal. *)
+(* The raw-pointer deref-on-field nominals (the checker's check_field
+   deref rule — typecheck's b_ptr/b_ptrmut transparency): Ptr/PtrMut
+   ONLY.  Box is deliberately NOT here: the Box nominal derefs on
+   nothing — explicit pointee access goes through its own field/method
+   surface (`b.ptr`, `b.get()`). *)
 let is_deref_transparent_nominal (env : func_env) (tid : Ids.Type_id.t) : bool =
   Lang_items.is_raw_pointer env.lang_items tid
-  || Lang_items.tid_eq env.lang_items.Lang_items.box_ tid
 
 (* The display descriptor of a transparent nominal (diagnostics only —
    the identity itself is the record membership above). *)
 let transparent_desc (env : func_env) (tid : Ids.Type_id.t) : string =
-  if Lang_items.tid_eq env.lang_items.Lang_items.box_ tid then "Box"
-  else if Lang_items.tid_eq env.lang_items.Lang_items.ptr tid then "Ptr"
-  else "PtrMut"
+  if Lang_items.tid_eq env.lang_items.Lang_items.ptr tid then "Ptr" else "PtrMut"
 
 (* The explicit RefToRawPtr coercion's TARGET test (the checker's
    ref_to_raw_ptr call-boundary adaptation): a parameter whose declared
@@ -719,12 +712,7 @@ let rec owned_ty (env : func_env) (t : Type_repr.t) : bool =
 (* The arm-join store rule mirrors the VERIFIER's type compatibility
    (types_compatible's leading clauses), not a raw Type_repr.compare: a
    checker-accepted join can pair arm value types that differ only in
-   the forms the checker unifies transparently —
-     - Box[T] vs T (the checker's transparent-Box unify — an
-       ExprMethodCall arm's recv payload is Box[Expr] while the
-       wildcard arm's `value` is Expr: the join slot takes the first
-       arm's type and the second arm's store was dropped, leaving the
-       slot uninitialized on the wildcard path);
+   the genuine integer-literal adoption relation —
      - Int_literal vs a concrete integer kind whose range fits (the
        `Option::None`-vs-`Option::Some(8)` arm kinds: the None ctor's
        resolved type stays Option[int-literal] while the Some arms
@@ -735,7 +723,10 @@ let rec owned_ty (env : func_env) (t : Type_repr.t) : bool =
        (`(Int, T)`) reconciles with a checker join that kept the
        unadopted literal (`(int-literal, T)`) exactly as the checker's
        unify does, and conversely.  Concrete-kind-vs-concrete-kind
-       leaves stay strict (the checker's Int k1/Int k2 clause).
+       leaves stay strict (the checker's Int k1/Int k2 clause), and a
+       nominal wrapper (Box[T] vs T) is NEVER reconciled: the checker no
+       longer unifies through Box, so a mixed arm is a typing error, not
+       a join the lowerer must accept.
    The verifier accepts the resulting store (the same rules), so a
    compatible-but-not-identical arm value must STORE — dropping it is
    the possibly-uninitialized-join class.  Types the verifier rejects
@@ -766,12 +757,7 @@ let rec int_literal_fits_kind (k : Type_repr.int_kind) (m : Big_nat.t) : bool =
   if signed then Literal.fits_signed p width else Literal.fits_unsigned p width
 
 and join_types_compatible (env : func_env) (a : Type_repr.t) (b : Type_repr.t) : bool =
-  let is_box tid =
-    match box_tid_of env with Some bt -> Ids.Type_id.compare tid bt = 0 | None -> false
-  in
   match a, b with
-  | Type_repr.Named (ta, [| t |]), u when is_box ta -> join_types_compatible env t u
-  | u, Type_repr.Named (ta, [| t |]) when is_box ta -> join_types_compatible env u t
   | Type_repr.Named (ta, aargs), Type_repr.Named (tb, bargs)
     when Ids.Type_id.compare ta tb = 0 && Array.length aargs = Array.length bargs ->
       let ok = ref true in
@@ -4875,6 +4861,33 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
     (node_id : Ids.Node_id.t) (callee : Ast.expr) (args : Ast.call_arg list) :
     Seed_mir.operand * Type_repr.t =
   match callee with
+  | Ast.Name (_, _, _)
+    when (match typed_node_of st node_id with
+          | Some { tn_call = Some (Typecheck.TC_type_query _); _ } -> true
+          | _ -> false) -> (
+      (* the compile-time type queries `size_of[T]()` / `align_of[T]()`
+         (the checker's query special form): no runtime callee exists —
+         the query signature is registered only in the checker's
+         query_sigs table, never as a lowering-env callable.  The typed
+         channel carries the resolved class (TC_type_query) with the
+         SOLVED type arguments; emit the first-class TypeQuery call the
+         layout fold resolves (driver: vm_program_with_folded_queries)
+         and the concrete verifier checks against the registered query
+         signature.  Without this branch the query reached the
+         name-based intrinsic/extern fallback and failed closed as an
+         unknown callee (the pre-existing gap that blocked every body
+         carrying a query — including the real `box_new`). *)
+      match typed_node_of st node_id with
+      | Some { tn_call = Some (Typecheck.TC_type_query (k, targs)); tn_type = ret; _ } ->
+          let ty = call_result_ty st node_id ret in
+          let id = fresh_local st ty in
+          let next_b = new_block st in
+          set_terminator_to st
+            (Seed_mir.Call
+               (cur_place st id, Seed_mir.TypeQuery (k, targs), [||], next_b, None))
+            next_b;
+          (copy_place st (cur_place st id), ty)
+      | _ -> assert false)
   | Ast.Name (_, n, _) -> (
       match ctor_of st.variants n with
       | Some (enum_name, vname) ->

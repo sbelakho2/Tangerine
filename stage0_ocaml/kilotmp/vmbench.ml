@@ -228,12 +228,9 @@ let () =
    | None -> ());
   let prog = if !mode = "fields" then fields_program () else arith_program () in
   let limits : Vm.limits = { Vm.default_limits with max_steps = max_int } in
-  let box_instances =
-    Array.to_list (Array.init !boxes (fun i -> Ids.Type_id.make (6000 + i)))
-  in
   match
-    Vm.entry_frame_of_li ~limits ~lang_items:Lang_items.seed_defaults ~box_instances
-      ~program:prog ~entry:(instance 0) ~argv:[||]
+    Vm.entry_frame_of_li ~limits ~lang_items:Lang_items.seed_defaults ~program:prog
+      ~entry:(instance 0) ~argv:[||]
   with
   | Error m -> Printf.printf "setup error: %s\n" m; exit 1
   | Ok (vm, frame) ->

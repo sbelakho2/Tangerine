@@ -16,7 +16,15 @@
 #                                      evidence must record each (the
 #                                      per-file sha-256 read from the ACTUAL
 #                                      files), and nothing unlisted — an
-#                                      extra unlisted artifact is a violation
+#                                      extra unlisted artifact is a violation.
+#                                      `invariants-evidence` carries the
+#                                      generator's invariants-evidence.json
+#                                      (tested_commit_sha + registry_digest +
+#                                      compiler_digest + checks +
+#                                      test_evidence + build identity), the
+#                                      attestation artifact for the invariant
+#                                      registry content digest (the old
+#                                      committed-SHA scheme is gone).
 #   RELEASE_STAGE_BINARIES           — the stage binaries stage1/stage2/
 #                                      stage3 with their hashes
 #   RELEASE_SEMANTIC_PHASES          — the tokens/AST/HIR/MIR/post-mono
@@ -28,16 +36,22 @@
 #                                      conclusions
 #
 # The evidence file records the per-artifact hash + the per-job conclusion
-# + the per-verdict proof (the equality checks' actual results). The
-# matching-SHA test alone is never a proof: the proof generator validates
-# the evidence against this schema, and a category is PASS only when its
-# OWN artifacts and conclusions are recorded and proven.
+# + the per-verdict proof (the equality checks' actual results) + the
+# invariant registry attestation (the invariants-evidence artifact's
+# projected fields). The matching-SHA test alone is never a proof: the
+# proof generator validates the evidence against this schema, and a
+# category is PASS only when its OWN artifacts and conclusions are
+# recorded and proven.
 #
 # This file is a LIBRARY: it defines the schema constants and three
 # functions — build_release_evidence (the writer), validate_release_evidence
 # (the fail-closed validator), release_evidence_rows (the per-category
 # verdicts) — and emits nothing when sourced.
 set -u
+
+# The repository root (for the invariant-registry digest recomputation in
+# the validator — the canonical codec is scripts/invariant_registry.py).
+RELEASE_EVIDENCE_SCHEMA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 RELEASE_EVIDENCE_SCHEMA_VERSION=1
 
@@ -64,7 +78,18 @@ RELEASE_REQUIRED_ARTIFACTS=(
   cross-lane-binaries
   linux-fingerprints
   linux-native-tests
+  invariants-evidence
 )
+
+# The invariant-registry attestation artifact (written by
+# scripts/gen_invariants.sh in the evidence-gate workflow and uploaded with
+# the run artifacts). The validator requires the artifact, the projected
+# record's tested_commit_sha to be the tested SHA, checks.passed to be true,
+# and the registry_digest to match the digest RECOMPUTED from the tested
+# tree's invariants.toml (the registry content digest — never a commit SHA).
+RELEASE_INVARIANT_EVIDENCE_ARTIFACT=invariants-evidence
+RELEASE_INVARIANT_EVIDENCE_FILE=invariants-evidence.json
+RELEASE_INVARIANT_EVIDENCE_SCHEMA_VERSION=1
 
 # The stage binaries (recorded with their sha-256 from the actual files of
 # the tg-stages-macos-arm64 artifact).
@@ -89,12 +114,15 @@ RELEASE_NATIVE_TLS_JOB=stdlib-integration
 # FILES. The verdicts are computed from the actual artifacts: the
 # stage2 == stage3 equality is the equality of the actual stage binaries'
 # hashes, and the semantic-phase equality is the equality of the actual
-# stage2/stage3 fingerprint records. The workflow run identity is read from
-# the CI environment (Woodpecker CI_WORKFLOW_NAME/CI_STEP_NAME/
-# CI_PIPELINE_NUMBER; the GitHub Actions GITHUB_* names are a fallback).
-# The compatibility key artifact_hashes carries
-# the same per-file hashes as a flat "sha256  path" list (the feature
-# registry consumes it as the run-evidence existence check).
+# stage2/stage3 fingerprint records. The invariant attestation is the
+# PROJECTED record of the invariants-evidence artifact's
+# invariants-evidence.json (the validator recomputes the registry digest
+# from the tested tree and requires them to agree). The workflow run
+# identity is read from the CI environment (Woodpecker CI_WORKFLOW_NAME/
+# CI_STEP_NAME/CI_PIPELINE_NUMBER; the GitHub Actions GITHUB_* names are a
+# fallback). The compatibility key artifact_hashes carries the same
+# per-file hashes as a flat "sha256  path" list (the feature registry
+# consumes it as the run-evidence existence check).
 # ────────────────────────────────────────────────────────────────────────────
 build_release_evidence() {
   local ev_dir="$1" outfile="$2" sha="$3" jobs_file="$4" gated="$5" stamp="$6"
@@ -120,6 +148,9 @@ build_release_evidence() {
   RELEASE_SCHEMA_LITMUS_JOB="$RELEASE_NATIVE_LITMUS_JOB" \
   RELEASE_SCHEMA_ALLOC_JOB="$RELEASE_NATIVE_ALLOCATOR_JOB" \
   RELEASE_SCHEMA_TLS_JOB="$RELEASE_NATIVE_TLS_JOB" \
+  RELEASE_SCHEMA_INVARIANT_ARTIFACT="$RELEASE_INVARIANT_EVIDENCE_ARTIFACT" \
+  RELEASE_SCHEMA_INVARIANT_FILE="$RELEASE_INVARIANT_EVIDENCE_FILE" \
+  RELEASE_SCHEMA_INVARIANT_VERSION="$RELEASE_INVARIANT_EVIDENCE_SCHEMA_VERSION" \
   python3 - "$ev_dir" "$outfile" "$sha" "$jobs_file" "$gated" "$stamp" \
     "$wf_name" "$wf_job" "$wf_run" "$wf_attempt" <<'PY'
 import hashlib, json, os, re, sys
@@ -134,6 +165,8 @@ DB_JOBS = os.environ["RELEASE_SCHEMA_DB_JOBS"].split()
 LITMUS_JOB = os.environ["RELEASE_SCHEMA_LITMUS_JOB"]
 ALLOC_JOB = os.environ["RELEASE_SCHEMA_ALLOC_JOB"]
 TLS_JOB = os.environ["RELEASE_SCHEMA_TLS_JOB"]
+INVARIANT_ARTIFACT = os.environ["RELEASE_SCHEMA_INVARIANT_ARTIFACT"]
+INVARIANT_FILE = os.environ["RELEASE_SCHEMA_INVARIANT_FILE"]
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -271,6 +304,36 @@ native_outputs = {
     "tls": {"job": TLS_JOB, "conclusion": jobs.get(TLS_JOB, "unobserved")},
 }
 
+# ── the invariant-registry attestation (the invariants-evidence artifact's
+#    projected record; the validator recomputes the registry digest from
+#    the tested tree's invariants.toml and requires agreement) ──────────────
+invariant_evidence = {"present": False,
+                      "path": "%s/%s" % (INVARIANT_ARTIFACT, INVARIANT_FILE)}
+inv_path = os.path.join(ev_dir, INVARIANT_ARTIFACT, INVARIANT_FILE)
+if os.path.isfile(inv_path):
+    try:
+        with open(inv_path, encoding="utf-8") as fh:
+            inv = json.load(fh)
+        te = inv.get("test_evidence") or {}
+        invariant_evidence = {
+            "present": True,
+            "path": "%s/%s" % (INVARIANT_ARTIFACT, INVARIANT_FILE),
+            "schema_version": inv.get("schema_version"),
+            "tested_commit_sha": inv.get("tested_commit_sha"),
+            "registry_digest": inv.get("registry_digest"),
+            "compiler_digest": inv.get("compiler_digest"),
+            "timestamp_utc": inv.get("timestamp_utc"),
+            "checks_passed": bool((inv.get("checks") or {}).get("passed")),
+            "test_evidence": {
+                "totals": te.get("totals"),
+                "matched_files_digest": te.get("matched_files_digest"),
+            },
+        }
+    except Exception as exc:
+        invariant_evidence = {"present": True,
+                              "path": "%s/%s" % (INVARIANT_ARTIFACT, INVARIANT_FILE),
+                              "parse_error": str(exc)}
+
 doc = {
     "schema_version": int(os.environ["RELEASE_SCHEMA_VERSION"]),
     "tested_sha": sha,
@@ -298,6 +361,7 @@ doc = {
         "semantic_fingerprints_equal": semantic_fingerprints_equal,
         "phases": phase_verdicts,
     },
+    "invariant_evidence": invariant_evidence,
     "native_outputs": native_outputs,
     "release_gated_features": gated.split(),
 }
@@ -313,8 +377,9 @@ PY
 # Prints one "violation: ..." line per problem and returns 0 when the
 # evidence satisfies the schema EXACTLY, 1 otherwise. A missing required
 # artifact, an extra unlisted artifact, a failed/skipped job, a mismatched
-# hash, a missing fingerprint, an absent equality proof — every one is a
-# violation; nothing is inferred.
+# hash, a missing fingerprint, an absent equality proof, a missing/mismatched
+# invariant-registry attestation — every one is a violation; nothing is
+# inferred.
 # ────────────────────────────────────────────────────────────────────────────
 validate_release_evidence() {
   RELEASE_SCHEMA_VERSION="$RELEASE_EVIDENCE_SCHEMA_VERSION" \
@@ -326,6 +391,8 @@ validate_release_evidence() {
   RELEASE_SCHEMA_LITMUS_JOB="$RELEASE_NATIVE_LITMUS_JOB" \
   RELEASE_SCHEMA_ALLOC_JOB="$RELEASE_NATIVE_ALLOCATOR_JOB" \
   RELEASE_SCHEMA_TLS_JOB="$RELEASE_NATIVE_TLS_JOB" \
+  RELEASE_SCHEMA_INVARIANT_VERSION="$RELEASE_INVARIANT_EVIDENCE_SCHEMA_VERSION" \
+  RELEASE_SCHEMA_REPO_ROOT="$RELEASE_EVIDENCE_SCHEMA_ROOT" \
   python3 - "$1" <<'PY'
 import json, os, re, sys
 
@@ -338,14 +405,36 @@ DB_JOBS = os.environ["RELEASE_SCHEMA_DB_JOBS"].split()
 LITMUS_JOB = os.environ["RELEASE_SCHEMA_LITMUS_JOB"]
 ALLOC_JOB = os.environ["RELEASE_SCHEMA_ALLOC_JOB"]
 TLS_JOB = os.environ["RELEASE_SCHEMA_TLS_JOB"]
+INVARIANT_VERSION = int(os.environ["RELEASE_SCHEMA_INVARIANT_VERSION"])
+REPO_ROOT = os.environ.get("RELEASE_SCHEMA_REPO_ROOT", "")
 SCHEMA_VERSION = os.environ["RELEASE_SCHEMA_VERSION"]
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 violations = []
 
 
 def bad(msg):
     violations.append(msg)
+
+
+def local_registry():
+    """(registry_digest, invariant_count) recomputed from the tested tree's
+    invariants.toml via the canonical codec scripts/invariant_registry.py;
+    (None, None) when the tree/codec is unavailable (a violation)."""
+    if not REPO_ROOT:
+        return None, None
+    try:
+        sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+        import invariant_registry as ir
+        toml_path = os.path.join(REPO_ROOT, "invariants.toml")
+        if not os.path.isfile(toml_path):
+            return None, None
+        with open(toml_path, encoding="utf-8") as fh:
+            doc = ir.parse_toml(fh.read())
+        return ir.registry_digest(doc), len(ir.definitions(doc))
+    except Exception:
+        return None, None
 
 
 try:
@@ -392,6 +481,49 @@ for a in REQUIRED_ARTIFACTS:
 for a in artifacts:
     if a not in REQUIRED_ARTIFACTS:
         bad("unlisted artifact '%s' is recorded (the evidence must record exactly the required artifact set — an extra unlisted artifact fails the validation)" % a)
+
+# ── the invariant-registry attestation: the invariants-evidence artifact's
+#    projected record + the digest RECOMPUTED from the tested tree ──────────
+ie = d.get("invariant_evidence")
+if not isinstance(ie, dict) or ie.get("present") is not True:
+    bad("the invariants-evidence attestation is missing (the invariants-evidence artifact with invariants-evidence.json is required)")
+else:
+    if ie.get("schema_version") != INVARIANT_VERSION:
+        bad("invariants-evidence schema_version mismatch: expected %s, recorded %r"
+            % (INVARIANT_VERSION, ie.get("schema_version")))
+    inv_sha = ie.get("tested_commit_sha") or ""
+    if not re.fullmatch(r"[0-9a-f]{7,40}", inv_sha):
+        bad("invariants-evidence tested_commit_sha is missing or malformed (expected 7-40 hex chars)")
+    elif sha and inv_sha != sha and not (sha.startswith(inv_sha) or inv_sha.startswith(sha)):
+        bad("invariants-evidence tested_commit_sha (%s) is not the tested_sha (%s)"
+            % (inv_sha, sha))
+    registry_digest = ie.get("registry_digest") or ""
+    if not DIGEST_RE.fullmatch(registry_digest):
+        bad("invariants-evidence registry_digest is missing or malformed (expected sha256:<64 hex>): %r"
+            % registry_digest)
+    compiler_digest = ie.get("compiler_digest") or ""
+    if not DIGEST_RE.fullmatch(compiler_digest):
+        bad("invariants-evidence compiler_digest is missing or malformed (expected sha256:<64 hex>): %r"
+            % compiler_digest)
+    if ie.get("checks_passed") is not True:
+        bad("invariants-evidence records failing mechanical checks (checks.passed is not true)")
+    te = ie.get("test_evidence") or {}
+    totals = (te or {}).get("totals") or {}
+    inv_count = totals.get("invariants") if isinstance(totals, dict) else None
+    if not isinstance(inv_count, int) or inv_count < 1:
+        bad("invariants-evidence test_evidence.totals.invariants is missing or empty: %r" % (totals,))
+    if not DIGEST_RE.fullmatch((te or {}).get("matched_files_digest") or ""):
+        bad("invariants-evidence test_evidence.matched_files_digest is missing or malformed (expected sha256:<64 hex>)")
+    tree_digest, tree_count = local_registry()
+    if tree_digest is None:
+        bad("cannot recompute the registry digest from the tested tree (invariants.toml + scripts/invariant_registry.py) — the attestation link cannot be checked")
+    else:
+        if DIGEST_RE.fullmatch(registry_digest) and registry_digest != tree_digest:
+            bad("invariants-evidence registry_digest (%s) does not match the tested tree's registry digest (%s)"
+                % (registry_digest, tree_digest))
+        if isinstance(inv_count, int) and inv_count != tree_count:
+            bad("invariants-evidence records %d invariant(s) but the tested tree's registry has %d"
+                % (inv_count, tree_count))
 
 sb = d.get("stage_binaries") or {}
 if not isinstance(sb, dict) or sorted(sb.keys()) != sorted(STAGES):
@@ -554,7 +686,7 @@ PY
     return 0
   fi
   # VALID: per-category PASS, each resting on its OWN recorded artifacts.
-  local h2 canary litmus alloc db tls linux_eq fields
+  local h2 canary litmus alloc db tls linux_eq inv_digest fields
   fields="$(python3 - "$evidence" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -567,12 +699,13 @@ print("alloc=%s" % no["allocator"]["conclusion"])
 print("db=%s" % "/".join(no["db"]["conclusions"]))
 print("tls=%s" % no["tls"]["conclusion"])
 print("linux_eq=%s" % ("true" if d["verdicts"]["linux_stage2_equals_stage3"] else "false"))
+print("inv_digest=%s" % (((d.get("invariant_evidence") or {}).get("registry_digest")) or "unknown"))
 PY
 )"
   while IFS= read -r line || [ -n "$line" ]; do
     eval "${line%%=*}=\"${line#*=}\""
   done <<< "$fields"
-  printf 'EVIDENCE|VALID|the evidence at %s satisfies the release-evidence schema exactly (schema v%s; tested_sha %s)\n' "$evidence" "$RELEASE_EVIDENCE_SCHEMA_VERSION" "$sha"
+  printf 'EVIDENCE|VALID|the evidence at %s satisfies the release-evidence schema exactly (schema v%s; tested_sha %s; invariant registry digest %s)\n' "$evidence" "$RELEASE_EVIDENCE_SCHEMA_VERSION" "$sha" "${inv_digest:-unknown}"
   printf 'R5|PASS|the fixed-point proof: stage2 == stage3 byte-identical (sha256 %s); the semantic fingerprints (tokens/ast/hir/mir/mir-mono) equality proven\n' "${h2:-unknown}"
   printf 'R6|PASS|the cross-stage-ladder proof: stage1/stage2/stage3 binaries present with hashes; bootstrap + linux-x86-64-native success; the linux stage2 == stage3 link-image equality proven (%s)\n' "${linux_eq:-unknown}"
   printf 'R7|PASS|the native-run proof: %s executed canary output(s); litmus (%s), allocator (%s), db (%s), tls (%s) conclusions all success\n' "${canary:-0}" "${litmus:-unknown}" "${alloc:-unknown}" "${db:-unknown}" "${tls:-unknown}"

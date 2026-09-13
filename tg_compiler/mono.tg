@@ -14,27 +14,32 @@ use std::core::{Option, Result}
 use std::collections::{Vec, Map, Set, VecDeque}
 use tg_compiler::ids::{
   InstanceId, CallableId, DefId, DefKind, GenericParamId, ClosureId,
-  generic_param_id_numeric, generic_param_id_eq, generic_param_name_from
+  GenericArg, ConstValue,
+  generic_param_id_numeric, generic_param_id_eq, generic_param_name_from,
+  generic_arg_type_view, const_value_type_view, generic_args_of_types
 effect_vec_eq, }
 use tg_compiler::stable_ids::{
-  StructuralInstanceId, instance_key_of_renders, structural_instance_id_of_renders,
+  StructuralInstanceId, structural_instance_id_of,
   structural_instance_mangle_text, StableDeclId, stable_callable_decl_of,
   stable_structural_callable_decl_of, stable_key_module, stable_key_name,
+  canonical_type_key_of, canonical_const_value_of, canonical_const_sym_of_render,
   stable_mir_node_id_of_generated, stable_mir_block_id_of_control_generated
 }
 use tg_compiler::ast::{Program, Item, ItemKind, AccessConvention}
-use tg_compiler::resolver::{ResolvedNames}
+use tg_compiler::resolver::{ResolvedNames, def_kind_of}
 use tg_compiler::types::{
-  Type, ParamType, fn_owner_key_of_def, crate_module_path_of, def_id_kind_of, AccessEffect,
+  Type, ParamType, fn_owner_key, fn_owner_key_of_def, crate_module_path_of, AccessEffect,
   TypeCanonFrame, TypeCanonCtx, type_canon_render, effect_registry_new,
   const_sym_tree_has_param, const_sym_tree_uses_param, const_sym_tree_param_ids,
-  const_sym_tree_subst_consts, const_sym_tree_eq, const_sym_fold_type
+  const_sym_tree_subst_consts, const_sym_tree_eq, const_sym_fold_type,
+  const_sym_tree_render_numeric
 }
 use tg_compiler::mir::{
   MirProgram, MirFunction, MirLocal, MirBlock, MirStatement, MirStatementKind,
   MirRvalue, MirRvalueKind, MirOperand, MirOperandKind, MirConstant, MirConstantKind,
   MirCallArg, MirCallValue, MirTerminator, MirTerminatorKind, AggregateKind,
-  AssertMessage, Place, MirBlockId, MirLocalId, MirContract
+  AssertMessage, Place, MirBlockId, MirLocalId, MirContract,
+  mir_origins_check
 }
 
 # The work-queue guard: the queue + seen-set terminate for every FINITE
@@ -51,7 +56,8 @@ const MAX_MONO_INSTANCES: Int = 8192
 # ———————————————————————————————————————————————————————————————
 #
 # (MonoKey deletion; fourth-audit P0-5/P0-6): specialization identity is
-# the InstanceId — the semantic (def, substs) payload — NEVER a
+# the InstanceId — the semantic (def, args) payload, where args is the
+# TYPED GenericArg union in declared binder order (P0-5) — NEVER a
 # source/emission name. The cache holds the specialized bodies in ONE map
 # keyed by the STRUCTURAL instance record (StructuralInstanceId,
 # stable_ids.tg section 9 — the digest-word record of the same
@@ -88,13 +94,18 @@ pub struct MonoCache
   instances: Map[StructuralInstanceId, MirFunction]
   # Inference failures recorded during monomorphization (deduplicated)
   errors: Vec[String]
-  # The STORE-BACKED stable declaration binding of callables (fourth-audit
-  # P0-6): the key is the callable's compilation-local REGISTRATION key
-  # ("path::name") when the def has one, else the emission base text. The
-  # structured callable identity prefers this binding over the
-  # registration-scope synthetic fallback, so a driver that threads the
-  # persistent DeclLineageStore keeps instance ids rename-stable. Empty by
-  # default (the documented fallback applies).
+  # The stable declaration binding of callables (fourth-audit P0-6):
+  # keyed by the callable's compilation-local REGISTRATION key
+  # ("path::name"). mono_cache_new SEEDS this map for EVERY
+  # resolver-registered callable DefId (mono_cache_seed_stable_callables:
+  # the index-free registration-scope structural declaration), and a
+  # driver that threads the persistent DeclLineageStore OVERRIDES
+  # individual bindings (mono_cache_bind_stable_callable) so instance ids
+  # stay rename-stable. A source callable with NEITHER binding is an
+  # internal error at the instance boundary
+  # (require_stable_callable_decl_for_def) — a synthetic name-derived
+  # lineage is never substituted for a source callable; only
+  # compiler-generated entities use synthetic_for_generated.
   stable_callables: Map[String, StableDeclId]
  # the typed program's Program and the resolver's
   # ResolvedNames snapshot — the crate module table (Program.crate.modules)
@@ -119,8 +130,19 @@ pub struct MonoCache
   generic_param_names: Map[Int, String]
 end
 
+# The common monomorphization setup boundary: EVERY production entry
+# constructs its cache through here, AFTER the resolver/type checking
+# finalized (the Program + ResolvedNames snapshot are the inputs) and
+# BEFORE any instance is enqueued. Construction SEEDS the stable
+# declaration binding of EVERY resolver-registered callable DefId
+# (mono_cache_seed_stable_callables) — so the instance identity never
+# falls back to a synthetic name-derived lineage for a source callable.
+# A caller that holds a PERSISTED declaration store overrides individual
+# bindings through mono_cache_bind_stable_callable after construction;
+# the override is consulted first and the seeded declaration is never
+# consulted again for that key.
 pub def mono_cache_new(program: Program, res: ResolvedNames) -> MonoCache
-  MonoCache {
+  var cache = MonoCache {
     instances: Map::new(),
     errors: Vec::new(),
     stable_callables: Map::new(),
@@ -128,14 +150,70 @@ pub def mono_cache_new(program: Program, res: ResolvedNames) -> MonoCache
     resolutions: res.clone(),
     generic_param_names: Map::new()
   }
+  mono_cache_seed_stable_callables(&mut cache)
+  cache
+end
+
+# The resolver REGISTRATION key ("path::name") of a DefId — the
+# module_symbols identity lookup. Option::None for a def the resolver
+# never registered (compiler-synthetic entities only; a source callable
+# always has a registration). This is the DefId -> stable-key resolution
+# helper the seeding and the fail-closed lookup share.
+pub def stable_callable_key_for_def(res: ResolvedNames, did: DefId) -> Option[String]
+  for (ms_key, ms_did) in res.module_symbols.entries() do
+    if ms_did.module.id == did.module.id && ms_did.index == did.index then
+      return Option::Some(ms_key.clone())
+    end
+  end
+  Option::None
+end
+
+# Seed the STABLE DECLARATION binding of every resolver-registered
+# callable DefId (fourth-audit P0-6), keyed by the def's registration
+# key. The declaration is the INDEX-FREE registration-scope structural
+# identity (stable_structural_callable_decl_of: package + module path +
+# kind + name; the per-module definition index never enters), which is
+# the deterministic compilation-local authority the persistent
+# DeclLineageStore supersedes. Idempotent: an already-bound key (a
+# persisted store binding installed through
+# mono_cache_bind_stable_callable) is never overwritten.
+#
+# The DISPLAY cargo is the fn_owner_key render (the same emission base
+# the instance boundary derived before the general seeding landed), so
+# emitted internal symbol bytes do not move. The kind comes from the
+# resolver's DefKind metadata; a registration without metadata degrades
+# to DefKind::Other exactly like the documented fn_owner_key recovery —
+# the identity stays deterministic (the index never enters either way).
+pub def mono_cache_seed_stable_callables(inout cache: MonoCache) -> Unit
+  let res = cache.resolutions.clone()
+  let entries = res.module_symbols.entries()
+  for (ms_key, ms_did) in entries do
+    if !cache.stable_callables.contains_key(&ms_key) then
+      let kind = match def_kind_of(&res, &ms_did)
+      when Option::Some(k) then k
+      when Option::None then DefKind::Other
+      end
+      let module_path = crate_module_path_of(&cache.program, &ms_did.module).join("::")
+      let display = fn_owner_key(module_path, ms_did.index, kind)
+      cache.stable_callables.insert(ms_key.clone(), stable_structural_callable_decl_of(
+        "".to_string(),
+        stable_key_module(&ms_key),
+        mono_def_kind_word(kind),
+        stable_key_name(&ms_key),
+        display
+      ))
+    end
+  end
+  ()
 end
 
 # Install the persistent stable declaration binding of one callable
 # (fourth-audit P0-6): the store-backed authority of the callable's
 # structural instance identity, keyed by the compilation-local
-# REGISTRATION key ("path::name") when the def has one, else the emission
-# base text. The driver threads the lineage store here; absent bindings
-# the registration-scope synthetic fallback applies.
+# REGISTRATION key ("path::name"). A binding installed here OVERRIDES the
+# seeded registration-scope declaration for that key. Absent a store
+# binding the seeded declaration stands — no synthetic name-derived
+# lineage is ever substituted for a source callable.
 pub def mono_cache_bind_stable_callable(inout cache: MonoCache, callable_scope_key: String, decl: StableDeclId) -> Unit
   cache.stable_callables.insert(callable_scope_key, decl)
   ()
@@ -146,29 +224,30 @@ end
 # ———————————————————————————————————————————————————————————————
 # The semantic identity of a monomorphized callee: the DEFINITION the call
 # resolves to (the typed program's call_targets DefId) plus the concrete
-# type substitutions. This is the target shape the string-only MirFnItem
+# generic arguments — the TYPED GenericArg union in declared binder order
+# (P0-5). This is the target shape the string-only MirFnItem
 # names migrate to: a MirFnItem keeps its name as the mangled EMISSION key
 # (codegen's resolve_callee_label authority) and carries the InstanceId as
-# its semantic identity alongside. The substs are the concrete generic
-# arguments; the instance payload is the ONLY authority for type arguments
-# at the monomorphizer — ZERO-INFERENCE: the monomorphizer never fills
-# them from a call site (see the fail-closed invariant at
+# its semantic identity alongside. The args are the concrete generic
+# arguments; the instance payload is the ONLY authority for generic
+# arguments at the monomorphizer — ZERO-INFERENCE: the monomorphizer never
+# fills them from a call site (see the fail-closed invariant at
 # monomorphize_program).
 
 # NOTE: InstanceId is IMPORTED from ids.tg — the
-# target shape (def: CallableId wrapping the ModuleId-based DefId, plus the
-# concrete substitutions). The trait_resolve facade's re-export
+# target shape (def: CallableId wrapping the ModuleId-based DefId, plus
+# the typed GenericArg args vector). The trait_resolve facade's re-export
 # (pub use tg_compiler::mono::{InstanceId,...}) flows the ids.tg type
 # through unchanged, so mir.tg's payload construction
-# (InstanceId { def: CallableId { def: did }, substs }) and this module's
+# (InstanceId { def: CallableId { def: did }, args }) and this module's
 # consumption agree on the same identity.
 
 # The instance -> mangled-name mapping (fourth-audit P0-6). The emission
 # base is the DefId's fn_owner_key_of_def rendering — compilation-local
 # LOOKUP/DISPLAY only; the identity is the StructuralInstanceId, whose
-# callable is the def's stable declaration (store binding, else the
-# index-free registration scope). The suffix render is the canonical args
-# in declared order, derived from the record.
+# callable is the def's REQUIRED stable declaration (the seeded
+# registration scope, or a persisted store binding). The suffix render is
+# the canonical args in declared order, derived from the record.
 #
 # THE EMISSION-NAME FLOW: this function is the mangling
 # AUTHORITY — symbol names are produced only at this boundary, never at the
@@ -199,25 +278,20 @@ end
 
 # (audit item 49; fourth-audit P0-5/P0-6): the STRUCTURAL instance record
 # of an InstanceId — the identity face of instance_key (stable_ids.tg
-# section 9). The callable is the def's STABLE declaration: the
-# store-backed binding when the cache carries one, else the index-free
-# REGISTRATION-scope fallback (module path + kind + name — the per-module
-# definition index never enters, so inserting an unrelated function before
-# a generic never re-keys its instances). The args are the SAME canonical
-# CanonInternal renders the emission text uses, classified IN POSITION by
-# the segment grammar (const renders "c<v>" / "constparam<n>" /
-# "constsym(<tree>)" classify as const rows; every other render as a type
-# row; the order is preserved). Eq/Hash fold the record's digest words
-# (never a "$"-text). THIS RECORD IS the MonoCache.instances key (the map
-# is never keyed by the emission text).
+# section 9). The callable is the def's REQUIRED stable declaration
+# (require_stable_callable_decl_for_def: the seeded registration-scope
+# identity, or a persisted store binding — a source callable with
+# neither fails closed; the per-module definition index never enters, so
+# inserting an unrelated function before a generic never re-keys its
+# instances). The args are built DIRECTLY from the typed GenericArg
+# vector (P0-5) — each Type row renders its CanonInternal type text, each
+# Const row its canonical const segment; const-vs-type is carried by the
+# payload and NEVER re-classified from a rendered string. Eq/Hash fold
+# the record's digest words (never a "$"-text). THIS RECORD IS the
+# MonoCache.instances key (the map is never keyed by the emission text).
 pub def structured_instance_key(cache: MonoCache, instance: InstanceId) -> StructuralInstanceId
-  let base = fn_owner_key_of_def(&cache.program, &cache.resolutions, &instance.def.def)
-  let callable = stable_callable_decl_for_def(cache, &instance.def.def, &base)
-  var renders: Vec[String] = Vec::new()
-  for s in instance.substs do
-    renders.push(type_to_mangled(s))
-  end
-  structural_instance_id_of_renders(callable, renders)
+  let callable = require_stable_callable_decl_for_def(cache, &instance.def.def)
+  structural_instance_id_of(callable, canonical_args_of_typed(&instance.args))
 end
 
 # The compilation-local DefKind word of a def (the same vocabulary
@@ -238,52 +312,86 @@ def mono_def_kind_word(kind: DefKind) -> String
   end
 end
 
-# The STABLE callable declaration of a def (fourth-audit P0-6): the
-# store-backed binding first (keyed by the def's registration key
-# "path::name", else the emission base), then the index-free
-# registration-scope synthetic declaration, then the text-boundary parse.
-# The per-module definition index of fn_owner_key_of_def never enters the
-# identity; the render stays the emission base for symbol bytes.
-def stable_callable_decl_for_def(cache: MonoCache, did: DefId, base: String) -> StableDeclId
-  var found_key = "".to_string()
-  var found = false
-  for (ms_key, ms_did) in cache.resolutions.module_symbols.entries() do
-    if ms_did.module.id == did.module.id && ms_did.index == did.index then
-      found_key = ms_key.clone()
-      found = true
-      break
-    end
+# The canonical identity row of ONE typed generic argument — derived
+# DIRECTLY from the typed payload (P0-5; no render-string
+# classification):
+#   GenericArg::Type(t) -> the CanonInternal render's type row
+#   Value(v)            -> the canonical value row "c<v>"
+#   Param(g)            -> the forwarding row "constparam<n>"
+#   Sym(tree)           -> the symbolic row "constsym(<numeric tree>)"
+# The row texts are byte-identical to the CanonInternal segment renders
+# the former positional string classification produced, so emitted
+# symbols and stable identities stay stable across the migration.
+pub def canonical_arg_of_typed(arg: GenericArg) -> CanonicalGenericArg
+  match arg
+  when GenericArg::Type(ty) then CanonicalGenericArg::Type(canonical_type_key_of(type_to_mangled(ty)))
+  when GenericArg::Const(cv) then CanonicalGenericArg::Const(canonical_const_of_typed(cv))
   end
-  if found then
-    match cache.stable_callables.get(&found_key)
-    when Option::Some(decl) then
-      return decl.clone()
-    when Option::None then ()
-    end
-    let kind_word = mono_def_kind_word(def_id_kind_of(cache.resolutions.clone(), did))
-    return stable_structural_callable_decl_of(
-      "".to_string(),
-      stable_key_module(&found_key),
-      kind_word,
-      stable_key_name(&found_key),
-      base.clone()
-    )
+end
+
+pub def canonical_const_of_typed(cv: ConstValue) -> CanonicalConstValue
+  match cv
+  when ConstValue::Value(v) then canonical_const_value_of("signed".to_string(), v)
+  when ConstValue::Param(gpid) then canonical_const_value_of("constparam".to_string(), generic_param_id_numeric(&gpid))
+  when ConstValue::Sym(tree) then canonical_const_sym_of_render(const_sym_tree_render_numeric(&tree))
   end
-  match cache.stable_callables.get(&base)
-  when Option::Some(decl) then decl.clone()
-  when Option::None then stable_callable_decl_of(&base)
+end
+
+pub def canonical_args_of_typed(args: Vec[GenericArg]) -> Vec[CanonicalGenericArg]
+  var out: Vec[CanonicalGenericArg] = Vec::new()
+  for arg in args do
+    out.push(canonical_arg_of_typed(arg))
+  end
+  out
+end
+
+# The compiler-GENERATED origin boundary (audit item 1 / fourth-audit
+# P0-6): a synthetic name-derived declaration identity is allowed ONLY
+# here — explicitly, for a compiler-synthetic entity (drop glue /
+# derived / closure / shim) whose origin text the generating site owns.
+# Source callables NEVER reach this constructor:
+# require_stable_callable_decl_for_def fails closed instead.
+pub def synthetic_for_generated(origin: String) -> StableDeclId
+  stable_callable_decl_of(&origin)
+end
+
+# The REQUIRED stable declaration of a callable DefId (fail closed):
+#   - a resolver-registered source callable MUST have a seeded (or
+#     store-bound) stable declaration; a missing binding is an internal
+#     error carrying the registration key and DefId context — NEVER a
+#     synthetic name-derived lineage fallback;
+#   - a def in the compiler-SYNTHETIC band (module id < 0: drop glue,
+#     synthetic callables) has no registration by construction and builds
+#     the explicit generated-origin identity.
+pub def require_stable_callable_decl_for_def(cache: MonoCache, did: DefId) -> StableDeclId
+  match stable_callable_key_for_def(&cache.resolutions, &did)
+  when Option::Some(key) then
+    match cache.stable_callables.get(&key)
+    when Option::Some(decl) then decl.clone()
+    when Option::None then
+      panic("internal error: source callable DefId " + def_id_numeric(&did).to_string() + " (registration key `" + key + "`) has no stable declaration binding — the mono cache must be seeded at construction (mono_cache_seed_stable_callables); no synthetic name-derived lineage is substituted for a source callable")
+    end
+  when Option::None then
+    if did.module.id < 0 then
+      synthetic_for_generated("synthetic::" + def_id_numeric(&did).to_string())
+    else
+      panic("internal error: callable DefId " + def_id_numeric(&did).to_string() + " is not registered in the resolver's module_symbols and is not in the compiler-synthetic module band — a source callable must have a stable declaration identity (fail closed; no synthetic name-derived lineage)")
+    end
   end
 end
 
 # The structured key over a callable text + concrete args — the shared
 # builder behind the name-API path (mono_specialize_function, which holds
-# the template's emission name and explicit args but no InstanceId).
+# the template's emission name and explicit args but no InstanceId). This
+# is a GENERATED-origin boundary (the explicit synthetic_for_generated
+# constructor — the caller owns the emission-name text; source callables
+# never take this path). The args are wrapped through the typed view
+# (constructor inspection, never a rendering parse).
 def structured_key_of_text_and_args(callable_key_text: String, type_args: Vec[Type]) -> StructuralInstanceId
-  var renders: Vec[String] = Vec::new()
-  for s in type_args do
-    renders.push(type_to_mangled(s))
-  end
-  instance_key_of_renders(callable_key_text, renders)
+  structural_instance_id_of(
+    synthetic_for_generated(&callable_key_text),
+    canonical_args_of_typed(generic_args_of_types(type_args))
+  )
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -420,7 +528,7 @@ end
 # a specialized copy with all type parameters substituted. The
 # specialization is keyed EXCLUSIVELY by the InstanceId (the cache key is
 # the STRUCTURED instance key — StructuralInstanceId, the digest-word record of the
-# same (def, substs) payload the emission text renders); the name-derived
+# same (def, args) payload the emission text renders); the name-derived
 # dedup entry (the former name-plus-args dedup record + monomorphize) is
 # not part of the model — source/emission names never participate in
 # specialization identity.
@@ -432,18 +540,20 @@ struct TypeSubstMap
 end
 
 # Pure substitution-map builder: binds the declaration-order generic
-# parameter ids to the concrete type arguments POSITIONALLY. The min-length
-# loop below keeps the EQUAL-length semantics (each declared parameter
-# bound to its aligned argument); a length MISMATCH would silently
-# truncate to the shorter side, so the EXACT-ARITY invariant is enforced
-# by the sole caller (specialize_function_keyed — the arity guard there
-# fires BEFORE this map is ever built, catching BOTH the too-few and the
-# too-many direction).
-def type_subst_new(type_param_ids: Vec[GenericParamId], type_args: Vec[Type]) -> TypeSubstMap
+# parameter ids to the concrete arguments POSITIONALLY (P0-5: the typed
+# GenericArg vector; the map value is the Type view — Type rows as-is,
+# Const rows as their Type::Const/ConstParam/ConstSym constructor form).
+# The min-length loop below keeps the EQUAL-length semantics (each
+# declared parameter bound to its aligned argument); a length MISMATCH
+# would silently truncate to the shorter side, so the EXACT-ARITY
+# invariant is enforced by the sole caller (specialize_function_keyed —
+# the arity guard there fires BEFORE this map is ever built, catching
+# BOTH the too-few and the too-many direction).
+def type_subst_new_args(type_param_ids: Vec[GenericParamId], args: Vec[GenericArg]) -> TypeSubstMap
   var params = Map::new()
   var i = 0
-  while i < type_param_ids.len() && i < type_args.len() do
-    params.insert(generic_param_id_numeric(&type_param_ids[i]), type_args[i].clone())
+  while i < type_param_ids.len() && i < args.len() do
+    params.insert(generic_param_id_numeric(&type_param_ids[i]), generic_arg_type_view(args[i].clone()))
     i = i + 1
   end
   TypeSubstMap { params: params }
@@ -458,8 +568,9 @@ end
 # structured_instance_key — the work-queue drain and monomorphize_instance);
 # the name-API path holds no InstanceId and computes them from the
 # template's emission name + the concrete args (specialize_function_named
-# below). The specialization always proceeds from the given solved type
-# args — ZERO-INFERENCE: nothing is ever inferred here.
+# below). The specialization always proceeds from the given solved
+# arguments (the typed P0-5 vector) — ZERO-INFERENCE: nothing is ever
+# inferred here.
 #
 # FAIL-CLOSED RESULT INTERFACE: the specialization succeeds (Result::Ok)
 # and caches the body ONLY when the post-instantiation verification finds
@@ -467,14 +578,14 @@ end
 # A violation returns Result::Err WITHOUT caching the body, so the call
 # site is never rewritten to a poisoned name; the caller propagates the
 # error and aborts the compilation. An EXACT-ARITY violation
-# (type_param_ids.len() != type_args.len() — too few or too many concrete
+# (type_param_ids.len() != args.len() — too few or too many concrete
 # args) is the FIRST failure: it returns Result::Err BEFORE any
 # substitution map is built (see the arity guard below).
 def specialize_function_keyed(
   inout cache: MonoCache,
   original: MirFunction,
   type_param_ids: Vec[GenericParamId],
-  type_args: Vec[Type],
+  args: Vec[GenericArg],
   mangled: String,
   key: StructuralInstanceId
 ) -> Result[Unit, String]
@@ -486,39 +597,40 @@ def specialize_function_keyed(
   
   # EXACT-ARITY GUARD (fail-closed, BEFORE a substitution map is built):
   # the declaration-order generic parameter ids and the instance's
-  # concrete type arguments must have EXACTLY the same length. The
-  # min-length loop in type_subst_new would otherwise SILENTLY truncate:
-  # a TOO-FEW substs leaves a declaration-order parameter unbound — the
-  # residual-param verification catches that only when the specialized
-  # body happens to mention the parameter (a parameter unused in the
-  # signature would specialize silently under the truncated map); a
-  # TOO-MANY substs silently drops the excess arguments. Both directions
+  # concrete arguments must have EXACTLY the same length. The
+  # min-length loop in type_subst_new_args would otherwise SILENTLY
+  # truncate: a TOO-FEW args leaves a declaration-order parameter
+  # unbound — the residual-param verification catches that only when the
+  # specialized body happens to mention the parameter (a parameter unused
+  # in the signature would specialize silently under the truncated map);
+  # a TOO-MANY args silently drops the excess arguments. Both directions
   # are compiler-internal contract breaks (the checker records every
   # instance at the DECLARED arity — mirroring the zero-inference
   # invariant, the monomorphizer never re-derives or pads the args), so
   # both abort here with the internal arity error, never a truncated
   # substitution.
-  if type_param_ids.len() != type_args.len() then
-    return Result::Err("monomorphization arity error for `" + original.name + "`: expected " + type_param_ids.len().to_string() + " type arguments (the declared type parameters), got " + type_args.len().to_string() + " — every instance carries exactly the declared type parameters")
+  if type_param_ids.len() != args.len() then
+    return Result::Err("monomorphization arity error for `" + original.name + "`: expected " + type_param_ids.len().to_string() + " generic arguments (the declared parameters), got " + args.len().to_string() + " — every instance carries exactly the declared arguments")
   end
 
   # (§20 const generics, slice 3): FAIL-CLOSED symbolic-argument guard. A
-  # generic instance whose substitutions still carry ANY symbolic generic
-  # reference (Type::Param / Type::ConstParam / FixedArraySym — the
-  # param-carrying forms, see type_has_params) cannot specialize: a const
-  # parameter's VALUE inside the body substitutes from the instance's type
-  # argument (Type::Const(v) -> MirInt(v)), and a symbolic argument would
+  # generic instance whose arguments still carry ANY symbolic generic
+  # reference (Type::Param / Type::ConstParam / ConstValue::Param /
+  # ConstValue::Sym / FixedArraySym — the param-carrying forms, see
+  # has_any_param_args) cannot specialize: a const parameter's VALUE
+  # inside the body substitutes from the instance's argument
+  # (ConstValue::Value(v) -> MirInt(v)), and a symbolic argument would
   # leave the value placeholder unresolved in a body cached as concrete.
   # The worklist defers such instances (the caller's own specialization
   # substitutes the payload and the re-walk enqueues the now-concrete
   # instance — zero inference); reaching this point with a symbolic
   # argument is a compiler-internal gap or external-API misuse — rejected
   # here, never a placeholder-carrying body.
-  if has_any_param_types(&type_args) then
-    return Result::Err("monomorphization of `" + original.name + "` rejected: the instance's substitutions still carry a generic parameter (a symbolic const argument cannot produce the concrete per-instance value of a const parameter read; the instance must be re-specialized under the caller's concrete substitutions)")
+  if has_any_param_args(&args) then
+    return Result::Err("monomorphization of `" + original.name + "` rejected: the instance's arguments still carry a generic parameter (a symbolic const argument cannot produce the concrete per-instance value of a const parameter read; the instance must be re-specialized under the caller's concrete substitutions)")
   end
 
-  let subst = type_subst_new(type_param_ids, type_args)
+  let subst = type_subst_new_args(type_param_ids, args)
   
   # Create specialized function with substituted types. The instantiated
   # body is a CONCRETE codegen instance: it carries no generic parameters
@@ -629,7 +741,7 @@ pub def specialize_function_named(
     base = mangled.slice(0, mangled.len() - suffix.len())
   end
   let key = structured_key_of_text_and_args(base, type_args.clone())
-  specialize_function_keyed(cache, original, type_param_ids, type_args, mangled, key)
+  specialize_function_keyed(cache, original, type_param_ids, generic_args_of_types(type_args), mangled, key)
 end
 
 # (final): the post-instantiation verification. A specialized body is
@@ -637,7 +749,7 @@ end
 # unresolved Type::Var anywhere (params, return type, locals). The first
 # violation is described as:
 #   - "type parameter `<name>`" — the callee's own parameter the
-#     substitution failed to cover (a recorded instance whose substs are
+#     substitution failed to cover (a recorded instance whose args are
 #     shorter than the declaration-order ids (MirFunction.generic_params)),
 #     or a stray Param from a
 #     still-generic caller's argument types; the name renders from the
@@ -1043,7 +1155,7 @@ def substitute_aggregate_kind(subst: TypeSubstMap, kind: AggregateKind) -> Aggre
 end
 
 # Substitute types in an operand (recursively substitutes in places and
-# constants). ZERO-INFERENCE: the MirFnItem's INSTANCE payload substs are
+# constants). ZERO-INFERENCE: the MirFnItem's INSTANCE payload args are
 # substituted under the CALLER's specialization map too — a solved instance
 # that still carries the caller's generic parameters ([Param "T"] from a
 # still-generic caller, deferred by the monomorphizer's worklist) becomes
@@ -1113,11 +1225,11 @@ def substitute_operand(subst: TypeSubstMap, op: MirOperand) -> MirOperand
       ty: substitute_type(subst, &c.ty),
       instance: match c.instance.clone()
       when Option::Some(inst) then
-        var new_substs = Vec::new()
-        for s in inst.substs do
-          new_substs.push(substitute_type(subst, &s))
+        var new_args: Vec[GenericArg] = Vec::new()
+        for a in inst.args do
+          new_args.push(substitute_generic_arg(subst, a))
         end
-        Option::Some(InstanceId { def: inst.def.clone(), substs: new_substs })
+        Option::Some(InstanceId { def: inst.def.clone(), args: new_args })
       when Option::None then Option::None
       end
     })}
@@ -1194,14 +1306,36 @@ def substitute_terminator(subst: TypeSubstMap, term: MirTerminator) -> MirTermin
     # substitution is what the instance destroys with). A subst entry the
     # caller's map does not cover stays Param-carrying and keeps deferring.
     let new_place = substitute_place(subst, &place)
-    var new_deinit_substs = Vec::new()
-    for s in deinit_fn.substs do
-      new_deinit_substs.push(substitute_type(subst, &s))
+    var new_deinit_args: Vec[GenericArg] = Vec::new()
+    for a in deinit_fn.args do
+      new_deinit_args.push(substitute_generic_arg(subst, a))
     end
-    let new_deinit_fn = InstanceId { def: deinit_fn.def.clone(), substs: new_deinit_substs }
+    let new_deinit_fn = InstanceId { def: deinit_fn.def.clone(), args: new_deinit_args }
     MirTerminatorKind::MirDeinit { place: new_place, deinit_fn: new_deinit_fn, target: target.clone(), unwind: unwind.clone() }
   end
   MirTerminator { kind: new_kind, span: term.span.clone(), origin: term.origin.clone() }
+end
+
+# The TYPED generic-argument substitution (P0-5): a Type row substitutes
+# through the ordinary type visitor; a Const row substitutes through its
+# Type view (the const parameter map / symbolic-tree fold — the SAME
+# const_sym fold the type visitor applies) and is classified back to its
+# ConstValue constructor form. A Const row the substitution turns into a
+# non-const type is a compiler-internal contract break (a const parameter
+# bound to a type argument) — fail closed, never a silently re-typed row.
+def substitute_generic_arg(subst: TypeSubstMap, arg: GenericArg) -> GenericArg
+  match arg
+  when GenericArg::Type(ty) then GenericArg::Type(substitute_type(subst, &ty))
+  when GenericArg::Const(cv) then
+    let view = substitute_type(subst, &const_value_type_view(cv))
+    match view
+    when Type::Const(v) then GenericArg::Const(ConstValue::Value(v))
+    when Type::ConstParam(gpid) then GenericArg::Const(ConstValue::Param(gpid))
+    when Type::ConstSym(tree) then GenericArg::Const(ConstValue::Sym(tree))
+    when _ then
+      panic("internal error: const generic argument substitution produced a non-const type — a const parameter was bound to a type argument (fail closed; no inferred value)")
+    end
+  end
 end
 
 def substitute_assert_message(subst: TypeSubstMap, msg: AssertMessage) -> AssertMessage
@@ -1246,14 +1380,14 @@ def rewrite_call_sites_in_program(inout mir: MirProgram, inout cache: MonoCache)
                 if candidate.name == callee_name then
                   # (final): a SOLVED INSTANCE is the AUTHORITY. When
                   # the call operand's MirConstant carries an instance with
-                  # NON-EMPTY substs (the type checker solved this call's
-                  # generic arguments), use inst.substs as the type args
-                  # DIRECTLY — zero inference for this call; instance_key
+                  # NON-EMPTY args (the type checker solved this call's
+                  # generic arguments), use inst.args DIRECTLY as the typed
+                  # arguments — zero inference for this call; instance_key
                   # produces the mangled emission name and
                   # structured_instance_key the cache identity.
                   # ZERO-INFERENCE (fail-closed): there is NO fallback here.
                   # A call whose instance is not usable yet (None/empty
-                  # substs, or solved substs still carrying Params from a
+                  # args, or solved args still carrying Params from a
                   # still-generic caller) is left pointing at its base name:
                   # the caller's specialization substitutes the payload
                   # (substitute_operand carries the instance through), and
@@ -1264,7 +1398,7 @@ def rewrite_call_sites_in_program(inout mir: MirProgram, inout cache: MonoCache)
                   var specialized = false
                   match const_val.instance.clone()
                   when Option::Some(inst) then
-                    if !inst.substs.is_empty() && !has_any_param_types(&inst.substs) then
+                    if !inst.args.is_empty() && !has_any_param_args(&inst.args) then
                       # (audit item 49 migration; fourth-audit P0-6): the
                       # rewrite site holds the solved InstanceId, so the
                       # STRUCTURAL key is computed directly from it — the
@@ -1316,6 +1450,27 @@ end
 def has_any_param_types(types: Vec[Type]) -> Bool
   for ty in types do
     if type_has_params(ty) then return true end
+  end
+  false
+end
+
+# Whether any TYPED generic argument still carries a generic parameter
+# (P0-5): a Type row through type_has_params; a Const row for the
+# Param/Sym forms (a concrete Value never carries one). The
+# zero-inference enqueue/rewrite/specialize guards share this predicate.
+def has_any_param_args(args: Vec[GenericArg]) -> Bool
+  for arg in args do
+    match arg
+    when GenericArg::Type(ty) then
+      if type_has_params(ty) then return true end
+    when GenericArg::Const(cv) then
+      match cv
+      when ConstValue::Value(_) then ()
+      when ConstValue::Param(_) then return true
+      when ConstValue::Sym(tree) then
+        if const_sym_tree_has_param(&tree) then return true end
+      end
+    end
   end
   false
 end
@@ -1495,13 +1650,13 @@ def mono_fresh_local_id(f: MirFunction) -> Int
 end
 
 # The injected callee operand: the MirFnItem with the SOLVED instance
-# (resolver DefId + the concrete key type as the substitution).
+# (resolver DefId + the concrete key type as the typed argument).
 def mono_dispatch_fn_operand(base: String, did: DefId, k_ty: Type) -> MirOperand
   MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirFnItem(base.clone()),
       ty: Type::FnPtr(Vec::new(), Box::new(Type::Unit), Vec::new()),
-      instance: Option::Some(InstanceId { def: CallableId { def: did.clone() }, substs: vec![k_ty.clone()] })
+      instance: Option::Some(InstanceId { def: CallableId { def: did.clone() }, args: vec![GenericArg::Type(k_ty.clone())] })
     })
   }
 end
@@ -1751,7 +1906,7 @@ end
 #   1. a call whose instance is already concrete enters under its
 #      STRUCTURED instance key (the digest-word record; the emission text
 #      is only the label the drain derives for the body);
-#   2. a call whose SOLVED substs still carry the caller's generic
+#   2. a call whose SOLVED args still carry the caller's generic
 #      parameters (a still-generic caller) DEFERS: the caller's own
 #      specialization substitutes the payload (substitute_operand carries
 #      the instance through), and the re-walk enqueues the now-concrete
@@ -1781,7 +1936,7 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
   # mir.functions (top-level functions: the fn_owner_key_of_def rendering,
   # which IS the instance's base name; methods: the pre-mangled
   # "Type__method" name, per the exemption); the INSTANCE is the
-  # SOLVED (def, substs) payload — a call whose MirFnItem constant carries
+  # SOLVED (def, args) payload — a call whose MirFnItem constant carries
   # a solved, fully concrete instance enters under the INSTANCE's
   # STRUCTURED key (the seen-set is Set[StructuralInstanceId]).
  # (final): the recorded instances cover every shape the checker
@@ -1829,6 +1984,22 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
   # discovered instance is specialized by now, so ONE pass covers every
   # generic call site.
   rewrite_call_sites_in_program(mir, cache)
+  # (audit order item 1 closeout) FAIL CLOSED at the monomorphization
+  # boundary: every specialized body must carry the persistent origin of
+  # the node it was instantiated from. A program lowered by lower_to_mir
+  # has origins_enforced set; any surviving origin-less node aborts with
+  # the precise stage context (hand-built MIR without the flag is
+  # untouched — its persistent consumers report it untracked).
+  if mir.origins_enforced then
+    match mir_origins_check(&mir, "monomorphization".to_string())
+    when Result::Ok(()) then ()
+    when Result::Err(e) then
+      if !errors.contains(&e) then
+        errors.push(e)
+      end
+      return Result::Err(errors)
+    end
+  end
   Result::Ok(())
 end
 
@@ -1869,14 +2040,14 @@ def mono_drain_worklist(
             # order generic parameter ids were not recorded at lowering is
             # MALFORMED MIR — the former signature-derived fallback
             # (infer_type_param_names) is never used; the ids are
-            # the substs-order contract (MirFunction.generic_params is
+            # the declared-binder-order contract (MirFunction.generic_params is
             # populated at lowering in mir.tg).
             let msg = "generic template `" + callee_name + "` reached the monomorphizer without declaration-order generic parameter ids (malformed MIR — MirFunction.generic_params must be populated at lowering)"
             if !errors.contains(&msg) then
               errors.push(msg)
             end
           else
-            match specialize_function_keyed(cache, original, &type_param_names, &inst.substs, key.clone(), key_struct.clone())
+            match specialize_function_keyed(cache, original, &type_param_names, &inst.args, key.clone(), key_struct.clone())
             when Result::Ok(()) then
               # The specialized body is cached now; append it to the
               # program and re-walk its calls (the transitive discovery).
@@ -1935,10 +2106,10 @@ def scan_call_sites_in_function(
 end
 
 # Enqueue ONE call-site callee: when the MirFnItem constant carries a
-# SOLVED instance whose substs are fully concrete, the instance enters the
+# SOLVED instance whose args are fully concrete, the instance enters the
 # queue under its STRUCTURED key (deduplicated by the seen-set, itself
 # Set[StructuralInstanceId] — the worklist identity is never the render text). A
-# payload whose substs still carry Params (a still-generic caller) DEFERS —
+# payload whose args still carry Params (a still-generic caller) DEFERS —
 # the caller's specialization substitutes it and the re-walk enqueues the
 # concrete instance. A payload that is absent or empty on a generic base is
 # a compiler-internal gap: the error is recorded (fail-closed — inference
@@ -1966,7 +2137,7 @@ def enqueue_call_instance(
       if is_generic then
         match cv.instance.clone()
         when Option::Some(inst) then
-          if !inst.substs.is_empty() then
+          if !inst.args.is_empty() then
  # (final): a SOLVED INSTANCE is the AUTHORITY. Only a
             # fully-concrete payload (no Params) is enqueueable — the
             # emission label comes from instance_key, the queue/dedup
@@ -1974,7 +2145,7 @@ def enqueue_call_instance(
             # carrying the caller's generic parameters DEFERS (the
             # caller's specialization substitutes it; the re-walk
             # enqueues the concrete instance later) — zero inference.
-            if !has_any_param_types(&inst.substs) then
+            if !has_any_param_args(&inst.args) then
               let key = structured_instance_key(cache, &inst)
               if !seen.contains(&key) then
                 seen.insert(key)
@@ -2054,12 +2225,14 @@ pub def mono_specialize_function(
     # STRUCTURAL cache identity is computed ONCE from the template's
     # emission-name text + the concrete args (fourth-audit P0-6: there is
     # no InstanceId on this name-API path, so the callable text is the
-    # emission base), and the emission label is DERIVED from it (never the
-    # reverse).
+    # generated-origin emission base), and the emission label is DERIVED
+    # from it (never the reverse). The explicit args are wrapped into the
+    # typed union via the constructor-inspecting view adapter.
+    let typed_args = generic_args_of_types(type_args.clone())
     let key = structured_key_of_text_and_args(func_name.clone(), &type_args)
     let mangled = structural_instance_mangle_text(key.clone())
     if !cache.instances.contains_key(&key) then
-      match specialize_function_keyed(cache, original, &type_param_names, &type_args, mangled.clone(), key.clone())
+      match specialize_function_keyed(cache, original, &type_param_names, &typed_args, mangled.clone(), key.clone())
       when Result::Ok(()) then
         match cache.instances.get(&key)
         when Option::Some(specialized) then
@@ -2090,17 +2263,17 @@ end
 
 # Public API: monomorphize_instance — the specialize path keyed by a
 # semantic InstanceId instead of a name string. A caller that holds the
-# call site's (def, substs) requests the instance directly; the body is
+# call site's (def, args) requests the instance directly; the body is
 # produced through the SAME specialize_function_keyed path as the worklist
 # monomorphizer, so cache identity and mangling stay single-sourced.
 #
 # NOTE (layer): the MIR call lowering records the DefId with EMPTY
-# substs when the checker recorded no solved substitution — under the
+# arguments when the checker recorded no solved substitution — under the
 # ZERO-INFERENCE invariant such a call is a compiler-internal gap (the
 # worklist monomorphizer records an error for it, and the type checker
 # reports the genuinely unconstrained shape at end of checking); an
 # instance requested directly in this layer must therefore already carry
-# concrete substitutions, and empty substs are rejected here.
+# concrete arguments, and empty args are rejected here.
 # (final): the base-name lookup below is the DefId rendering
 # (fn_owner_key_of_def over the cache's program/resolutions snapshot) —
 # and MirFunction names ARE that same rendering for top-level functions
@@ -2117,8 +2290,8 @@ pub def monomorphize_instance(
   instance: InstanceId
 ) -> Result[Unit, String]
   let base = fn_owner_key_of_def(&cache.program, &cache.resolutions, &instance.def.def)
-  if instance.substs.is_empty() then
-    return Result::Err("instance " + base + " has empty substitutions — every generic call carries its solved instance; inference is not performed on the program's call graph")
+  if instance.args.is_empty() then
+    return Result::Err("instance " + base + " has empty generic arguments — every generic call carries its solved instance; inference is not performed on the program's call graph")
   end
   # (audit item 49 migration; fourth-audit P0-6): the STRUCTURAL key of
   # the requested instance — computed once per request from the
@@ -2143,7 +2316,7 @@ pub def monomorphize_instance(
     if type_param_names.is_empty() then
       return Result::Ok(())
     end
-    match specialize_function_keyed(cache, original, &type_param_names, &instance.substs, mangled.clone(), key.clone())
+    match specialize_function_keyed(cache, original, &type_param_names, &instance.args, mangled.clone(), key.clone())
     when Result::Ok(()) then
       match cache.instances.get(&key)
       when Option::Some(specialized) then
@@ -2170,7 +2343,7 @@ end
 # source for the declaration-order ids: a generic template whose list is
 # empty is MALFORMED MIR (the former signature-derived fallback —
 # infer_type_param_names — is not part of the model; the declaration-order ids ARE the
-# substs-order contract the InstanceId.substs Vec aligns with).
+# declared-binder-order contract the InstanceId.args Vec aligns with).
 def function_generic_param_names(func: MirFunction) -> Vec[GenericParamId]
   func.generic_params.clone()
 end
@@ -2222,7 +2395,7 @@ end
 #                effect sets, fixed-array lengths, tuple structure, ADT
 #                stable paths)
 #   substHash  — 64-bit hex of the canonical generic substitutions in the
-#                DECLARED parameter order (the InstanceId.substs Vec order —
+#                DECLARED parameter order (the InstanceId.args Vec order —
 #                the ABI mangling never iterates a Map); 0 for a
 #                non-generic export
 #
@@ -2356,7 +2529,7 @@ end
 
 # The canonical generic-substitution suffix of an ABI symbol — the DECLARED
 # PARAMETER ORDER (/ deterministic ordering): the
-# InstanceId.substs Vec is populated in declaration order, so the suffix
+# InstanceId.args Vec is populated in declared binder order, so the suffix
 # iterates the Vec BY INDEX; a Map is never iterated (map iteration order
 # is not canonical). The parts are joined with "$" — a character that
 # appears in NO canonical type rendering (tangerine_abi_canon_type emits
@@ -2588,8 +2761,18 @@ end
 # The caller supplies the function's canonical signature (for a generic
 # function, the SPECIALIZED post-substitution signature — a Param in the
 # signature fails the mangling, as it must) and the instance's generic
-# substitutions (the InstanceId.substs, in declared parameter order;
-# empty for a non-generic function).
+# arguments (the typed InstanceId.args in declared parameter order; empty
+# for a non-generic function). The ABI substitution hash consumes the
+# TYPE VIEW of each argument (the public ABI canonicalizer is type-only;
+# a symbolic const form fails the mangling exactly as before).
+def generic_arg_type_views(args: Vec[GenericArg]) -> Vec[Type]
+  var out: Vec[Type] = Vec::new()
+  for a in args do
+    out.push(generic_arg_type_view(a))
+  end
+  out
+end
+
 pub def tangerine_exported_symbol_name(
   cache: MonoCache,
   type_names: Map[Int, String],
@@ -2611,7 +2794,7 @@ pub def tangerine_exported_symbol_name(
   end
   let stable_paths = tangerine_abi_stable_paths(cache, type_names)
   let module_path = crate_module_path_of(&cache.program, &did.module).join("::")
-  match mangle_tangerine_symbol(pkg_name, pkg_version, module_path, source_name.clone(), signature, &stable_paths, &cache.generic_param_names, &instance.substs)
+  match mangle_tangerine_symbol(pkg_name, pkg_version, module_path, source_name.clone(), signature, &stable_paths, &cache.generic_param_names, generic_arg_type_views(instance.args))
   when Result::Ok(sym) then Result::Ok(Option::Some(sym))
   when Result::Err(msg) then Result::Err(msg)
   end
@@ -2646,7 +2829,7 @@ end
 # function, in program declaration order (deterministic — iterated by item
 # index, never by map order). A GENERIC base has no single ABI symbol:
 # each concrete instance is exported via tangerine_exported_symbol_name
-# with the instance's solved substs (declared parameter order), which is
+# with the instance's solved args (declared binder order), which is
 # the substHash component of the ABI name.
 pub def tangerine_export_symbol_table(
   cache: MonoCache,

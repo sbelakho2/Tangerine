@@ -23453,7 +23453,7 @@ end
 # aggregate-argument slice), the stack-slot
 # cleanup, the result capture into the dest vreg and the jump to the
 # success block (fixups are resolved later, at the whole-buffer level).
-def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, src_block: Int, kind: LirTermKind, sys: Option[LirSysOp], pos: Int, externs: Set[String], defined: Set[String], sret_base: Option[Int], agg_args: Vec[LirAggCallArg], cov: Option[CoverageFnPlan], tail: Bool) -> Unit
+def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, src_block: Int, kind: LirTermKind, sys: Option[LirSysOp], pos: Int, externs: Set[String], defined: Set[String], sret_base: Option[Int], agg_args: Vec[LirAggCallArg], cov: Option[CoverageFnPlan], tail: Bool, replay: LirReplayPlan) -> Unit
   match kind
   when LirTermKind::LirJump(target) then
     # (third-audit item 34) the taken goto edge's counter, bumped before
@@ -23628,6 +23628,17 @@ def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, src_b
       end
     when Option::None then ()
     end
+    # (audit order item 6) the exit-time replay dump: the same entry-only
+    # pattern as the coverage dump (the recorder data symbols exist only in
+    # a --replay build; the helper preserves x19+ and never changes the
+    # exit status).
+    if replay.enabled then
+      if fn_name == "main" || fn_name == "_start" then
+        a64_stp_pre(&mut ctx.text, A64::X0, A64::XZR, A64::SP, -16)
+        a64_bl(&mut ctx.text, "_tg_replay_dump")
+        a64_ldp_post(&mut ctx.text, A64::X0, A64::XZR, A64::SP, 16)
+      end
+    end
     lir_emit_epilogue(ctx, alloc)
   when LirTermKind::LirTrap then
     # THE ABORT FUNNEL: a trap terminator (MirUnreachable/MirAbort, the
@@ -23769,6 +23780,21 @@ def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, src_b
       a64_b(&mut ctx.text, target.clone())
       return
     end
+    # (audit order item 6) arm the runtime replay note for a wired
+    # nondeterminism call: the two scratch stores ride X16/X17 (never
+    # allocated; no live value crosses there) and precede the call, so the
+    # runtime helper reads + commits them with the call-site token. The
+    # tail path above returns before this point (a wired callee is an
+    # extern, so tail_ok is false for it).
+    var replay_armed = false
+    if replay.enabled then
+      let replay_token = lir_replay_site_token(replay.clone(), fn_name.clone(), src_block)
+      if replay_token >= 0 then
+        lir_emit_replay_note_a64(ctx, replay_token,
+          lir_replay_site_tag(replay.clone(), fn_name.clone(), src_block))
+        replay_armed = true
+      end
+    end
     if sys_nargs >= 0 then
       # The inlined kernel-call sequence (exactly the direct route's):
       # the syscall-number word rides the fixed x0 vreg and the N user
@@ -23787,6 +23813,13 @@ def lir_emit_term(inout ctx: CodegenCtx, alloc: LirAlloc, fn_name: String, src_b
     end
     if stack_args > 0 then
       a64_add_rri(&mut ctx.text, A64::SP, A64::SP, (16 * stack_args) as u32)
+    end
+    # (audit order item 6) the defensive note disarm: the runtime commit
+    # already clears the note; this covers a wired callee that returned
+    # without committing (e.g. a zero-byte read) so no stale token leaks
+    # into a later unrelated source call. X16/X17 scratch only.
+    if replay_armed then
+      lir_emit_replay_disarm_a64(ctx)
     end
     # Result capture: x0 -> dest (a fixed or ordinary vreg def at pos)
     # for a general-word destination, or V0 -> dest for a FLOAT
@@ -24304,10 +24337,167 @@ def lir_emit_coverage_data_a64(inout ctx: CodegenCtx, plan: CoverageEmissionPlan
   end
 end
 
-# Emit an entire function: symbol, prologue, entry capture for
-# main/_start, blocks (statements then terminator), walking positions
-# exactly like lir_linearize (I3).
-def lir_emit_fn(inout ctx: CodegenCtx, f: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String], cov: Option[CoverageFnPlan]) -> Unit
+# ———————————————————————————————————————————————————————————————
+# Replay recording emission (audit order item 6 — the production bridge)
+# ———————————————————————————————————————————————————————————————
+# The LIR half of the replay-record contract: the program-level trace
+# buffer + the embedded dictionary text + the header/path constants
+# (lir_emit_replay_data_a64), the per-site NOTE stores that arm the
+# runtime's `_tg_replay_note_token`/`_tg_replay_note_tag` immediately
+# before a wired nondeterminism call (lir_emit_replay_note_a64), and the
+# exit-time dump call (lir_emit_term's Ret arm). The plan is built by the
+# driver from tg_compiler/replay_bridge.tg's
+# replay_emission_plan_of_functions (the dictionary semantics live there;
+# this module only carries the byte-exact plan its own emitter needs, so
+# the kernel does not depend on the bridge module).
+pub struct LirReplaySite
+  fn_name: String
+  block_id: Int
+  token: Int
+  tag: Int
+end
+
+pub struct LirReplayPlan
+  enabled: Bool = false
+  out_path: String = ""
+  dict_text: String = ""
+  dict_hi: UInt = 0
+  dict_lo: UInt = 0
+  sites: Vec[LirReplaySite] = Vec::new()
+  buffer_bytes: Int = 65536
+end
+
+pub def lir_replay_plan_disabled() -> LirReplayPlan
+  LirReplayPlan {}
+end
+
+# The token of a wired (function, block) site (-1 = not wired).
+pub def lir_replay_site_token(plan: LirReplayPlan, fn_name: String, block_id: Int) -> Int
+  if !plan.enabled then
+    return -1
+  end
+  for s in plan.sites do
+    if s.fn_name == fn_name && s.block_id == block_id then
+      return s.token
+    end
+  end
+  -1
+end
+
+pub def lir_replay_site_tag(plan: LirReplayPlan, fn_name: String, block_id: Int) -> Int
+  if !plan.enabled then
+    return -1
+  end
+  for s in plan.sites do
+    if s.fn_name == fn_name && s.block_id == block_id then
+      return s.tag
+    end
+  end
+  -1
+end
+
+# Arm the runtime note slots: X16 = &_tg_replay_note_token, X17 = token;
+# then the same pair for the tag. X16/X17 are the emitter's never-allocated
+# scratch, so the sequence is safe at any call position before the call
+# (it clobbers no argument value, sets no flags).
+def lir_emit_replay_note_a64(inout ctx: CodegenCtx, token: Int, tag: Int) -> Unit
+  add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_replay_note_token".to_string(), 0)
+  emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X16))
+  add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_replay_note_token".to_string(), 0)
+  a64_add_rri(&mut ctx.text, A64::X16, A64::X16, 0)
+  a64_mov_ri(&mut ctx.text, A64::X17, token as i64)
+  a64_str(&mut ctx.text, A64::X17, A64::X16, 0)
+  add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_replay_note_tag".to_string(), 0)
+  emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X16))
+  add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_replay_note_tag".to_string(), 0)
+  a64_add_rri(&mut ctx.text, A64::X16, A64::X16, 0)
+  a64_mov_ri(&mut ctx.text, A64::X17, tag as i64)
+  a64_str(&mut ctx.text, A64::X17, A64::X16, 0)
+end
+
+# Disarm the note token (the defensive post-call clear: the runtime commit
+# already disarms; this covers a wired callee that returned without a
+# commit — e.g. a zero-length read — so no stale note can leak into a later
+# unrelated source call).
+def lir_emit_replay_disarm_a64(inout ctx: CodegenCtx) -> Unit
+  add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, "_tg_replay_note_token".to_string(), 0)
+  emit32_le(&mut ctx.text, 0x90000000 | a64_code(A64::X16))
+  add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADD_ABS_LO12_NC, "_tg_replay_note_token".to_string(), 0)
+  a64_add_rri(&mut ctx.text, A64::X16, A64::X16, 0)
+  a64_mov_ri(&mut ctx.text, A64::X17, 0)
+  a64_str(&mut ctx.text, A64::X17, A64::X16, 0)
+end
+
+# Emit one NUL-free rodata text blob under a global symbol.
+def lir_emit_replay_text(inout buf: CodeBuffer, name: String, text: String) -> Unit
+  while buf_pos(&buf) % 8 != 0 do
+    emit8(&mut buf, 0)
+  end
+  add_symbol(&mut buf, AsmSymbol {
+    name: name.clone(),
+    section: Section::Data,
+    offset: buf_pos(&buf),
+    size: text.len(),
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
+  def_label(&mut buf, name)
+  var i = 0
+  while i < text.len() do
+    emit8(&mut buf, text.char_at(i) as u8)
+    i = i + 1
+  end
+  while buf_pos(&buf) % 8 != 0 do
+    emit8(&mut buf, 0)
+  end
+end
+
+# Emit the whole-program replay data of an enabled plan:
+#   .bss   _tg_replay_records (the trace byte buffer)
+#   .data  _tg_replay_records_len / _tg_replay_records_capacity /
+#          _tg_replay_enabled / _tg_replay_overflow / the note slots /
+#          the header words (magic, dictionary digest, dictionary length,
+#          reserved) / the dump path / the rendered dictionary text.
+# The header byte order is the little-endian u64 order the runtime dump
+# writes and replay_bridge.tg's replay_run_decode reads: magic "TGRP"
+# then the format version (1) in the high 32 bits.
+def lir_emit_replay_data_a64(inout ctx: CodegenCtx, plan: LirReplayPlan) -> Unit
+  if !plan.enabled then
+    return ()
+  end
+  while ctx.bss_size % 8 != 0 do
+    ctx.bss_size = ctx.bss_size + 1
+  end
+  let buffer_bytes = if plan.buffer_bytes > 0 then plan.buffer_bytes else 8 end
+  ctx.bss_symbols.push(AsmSymbol {
+    name: "_tg_replay_records".to_string(),
+    section: Section::Bss,
+    offset: ctx.bss_size,
+    size: buffer_bytes,
+    binding: SymBinding::Global,
+    kind: SymKind::Data
+  })
+  ctx.bss_size = ctx.bss_size + buffer_bytes
+
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_replay_records_len".to_string(), 0)
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_replay_records_capacity".to_string(), buffer_bytes)
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_replay_enabled".to_string(), 1)
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_replay_note_token".to_string(), 0)
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_replay_note_tag".to_string(), 0)
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_replay_overflow".to_string(), 0)
+  # magic u64: "TGRP" bytes then the u32 version 1 (little-endian).
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_replay_magic".to_string(), 0x0000000150524754)
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_replay_dict_hi".to_string(), plan.dict_hi as Int)
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_replay_dict_lo".to_string(), plan.dict_lo as Int)
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_replay_dict_len".to_string(), plan.dict_text.len())
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_replay_reserved".to_string(), 0)
+  lir_emit_cov_data_u64(&mut ctx.data, "_tg_replay_path_len".to_string(), plan.out_path.len())
+  lir_emit_cov_data_blob(&mut ctx.data, "_tg_replay_path_text".to_string(), plan.out_path.clone())
+  lir_emit_replay_text(&mut ctx.data, "_tg_replay_dict_text".to_string(), plan.dict_text.clone())
+end
+
+
+def lir_emit_fn(inout ctx: CodegenCtx, f: LirFunction, alloc: LirAlloc, externs: Set[String], defined: Set[String], cov: Option[CoverageFnPlan], replay: LirReplayPlan) -> Unit
   # Symbol + entry label (block 0's label is defined by the block loop).
   # (P1-18 @cold): an attr_cold function's symbol is routed into the
   # cold section (Section::ColdText — the .text.cold region); its body
@@ -24571,7 +24761,7 @@ def lir_emit_fn(inout ctx: CodegenCtx, f: LirFunction, alloc: LirAlloc, externs:
     when Option::None then Vec::new()
     end
     let is_tail = f.tail_call_blocks.contains(&b.id)
-    lir_emit_term(ctx, alloc, f.name.clone(), b.id, b.term.kind, b.term.sys, pos, externs, defined, sret_base, agg_args, cov, is_tail)
+    lir_emit_term(ctx, alloc, f.name.clone(), b.id, b.term.kind, b.term.sys, pos, externs, defined, sret_base, agg_args, cov, is_tail, replay.clone())
     pos = pos + 1
     bi = bi + 1
   end
@@ -25328,7 +25518,7 @@ end
 # every function takes the identical lowering path whichever pass emits
 # it. (fourth-audit P0-20: the function returns Unit now — the
 # enum-ABI version marker and its object note are deleted.)
-def lir_lower_emit_prog_a64(inout ctx: CodegenCtx, f: MirFunction, type_defs: Map[Int, MirTypeDef], deinit_plans: Map[String, DeinitPlan], finalizer_names: Map[Int, String], glue_names: Set[String], drop_glue_fns: Map[Int, String], externs: Set[String], defined: Set[String], cov: Option[CoverageFnPlan]) -> Result[Unit, String]
+def lir_lower_emit_prog_a64(inout ctx: CodegenCtx, f: MirFunction, type_defs: Map[Int, MirTypeDef], deinit_plans: Map[String, DeinitPlan], finalizer_names: Map[Int, String], glue_names: Set[String], drop_glue_fns: Map[Int, String], externs: Set[String], defined: Set[String], cov: Option[CoverageFnPlan], replay: LirReplayPlan) -> Result[Unit, String]
   match lir_check_extern_enum_calls(f, type_defs, externs)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(_) then ()
@@ -25361,7 +25551,7 @@ def lir_lower_emit_prog_a64(inout ctx: CodegenCtx, f: MirFunction, type_defs: Ma
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(_) then ()
   end
-  lir_emit_fn(&mut ctx, peeped, alloc, externs, defined, cov)
+  lir_emit_fn(&mut ctx, peeped, alloc, externs, defined, cov, replay)
   Result::Ok(())
 end
 
@@ -25383,7 +25573,7 @@ end
 # row blob, tg.cov.table.v1 text and per-point counter bumps are emitted,
 # and the runtime's _tg_cov_dump is merged. A disabled plan emits the
 # byte-identical pre-coverage object.
-pub def lir_compile_object_cov(program: MirProgram, target: AsmTarget, cov_plan: CoverageEmissionPlan) -> Result[Vec[u8], String]
+pub def lir_compile_object_cov(program: MirProgram, target: AsmTarget, cov_plan: CoverageEmissionPlan, replay_plan: LirReplayPlan = lir_replay_plan_disabled()) -> Result[Vec[u8], String]
   if target.arch != Arch::AArch64 then
     return Result::Err("lir: the LIR route is aarch64-only in this slice (machine legalization for x86-64 is not implemented)")
   end
@@ -25406,6 +25596,11 @@ pub def lir_compile_object_cov(program: MirProgram, target: AsmTarget, cov_plan:
   # counter array, the .data path/header constants and the .rodata row
   # blob + tg.cov.table.v1 text. A disabled plan emits nothing.
   lir_emit_coverage_data_a64(&mut ctx, cov_plan.clone())
+  # (audit order item 6) the replay data of an enabled plan: the .bss
+  # trace buffer, the .data recorder control words / header constants /
+  # dump path and the embedded dictionary text. A disabled plan emits
+  # nothing (the pre-replay object is byte-identical).
+  lir_emit_replay_data_a64(&mut ctx, replay_plan.clone())
   # The per-function coverage lookup map, built ONCE: a lowering call
   # clones only the function's own record (its table), never the whole
   # plan (whose row/table text can be megabytes for large programs).
@@ -25484,7 +25679,7 @@ pub def lir_compile_object_cov(program: MirProgram, target: AsmTarget, cov_plan:
       # in lir_emit_fn routes them into (Section::ColdText). Programs
       # without @cold functions take the cold pass as a zero-iteration
       # no-op and the stream is byte-identical to the pre-@cold layout.
-      match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()))
+      match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()), replay_plan.clone())
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
       end
@@ -25498,6 +25693,7 @@ pub def lir_compile_object_cov(program: MirProgram, target: AsmTarget, cov_plan:
   emit_runtime_str_concat(&mut ctx)
   emit_runtime_str_chars(&mut ctx)
   var runtime_ctx = runtime_ctx_new(target.clone())
+  runtime_ctx.replay_enabled = replay_plan.enabled
   emit_all_runtime(&mut runtime_ctx)
   # (third-audit item 34) the exit-time dump helper exists only in a
   # coverage build (its _tg_cov_* data symbols are emitted above); the
@@ -25535,7 +25731,7 @@ pub def lir_compile_object_cov(program: MirProgram, target: AsmTarget, cov_plan:
     while fi < program.functions.len() do
       let f = program.functions[fi]
       if !f.is_extern && f.attr_cold then
-        match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()))
+        match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()), replay_plan.clone())
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(_) then ()
         end
@@ -25584,8 +25780,8 @@ end
 
 # The coverage-plan-aware executable entry (third-audit item 34); the
 # driver routes here when --coverage built an enabled plan.
-pub def lir_compile_executable_cov(program: MirProgram, target: AsmTarget, output_path: String, cov_plan: CoverageEmissionPlan) -> Result[Unit, String]
-  lir_link_object_cov(program, target, output_path, cov_plan)
+pub def lir_compile_executable_cov(program: MirProgram, target: AsmTarget, output_path: String, cov_plan: CoverageEmissionPlan, replay_plan: LirReplayPlan = lir_replay_plan_disabled()) -> Result[Unit, String]
+  lir_link_object_cov(program, target, output_path, cov_plan, replay_plan)
 end
 
 # The executable route shares lir_compile_object's emission and then
@@ -25602,7 +25798,7 @@ end
 # lir_link_object except the enabled plan's counters/rows/bumps are emitted
 # and the merged runtime carries _tg_cov_dump (called from the user main's
 # Return). A disabled plan emits the byte-identical pre-coverage image.
-pub def lir_link_object_cov(program: MirProgram, target: AsmTarget, output_path: String, cov_plan: CoverageEmissionPlan) -> Result[Unit, String]
+pub def lir_link_object_cov(program: MirProgram, target: AsmTarget, output_path: String, cov_plan: CoverageEmissionPlan, replay_plan: LirReplayPlan = lir_replay_plan_disabled()) -> Result[Unit, String]
   var ctx = codegen_new(target.clone())
   # The whole-program static label table + the statics' data emission
   # (the lir_compile_object wiring — the table feeds MirStaticRef
@@ -25617,6 +25813,10 @@ pub def lir_link_object_cov(program: MirProgram, target: AsmTarget, output_path:
   # (third-audit item 34) the enabled plan's coverage data (same wiring as
   # lir_compile_object_cov): .bss counters, .data constants, .rodata rows.
   lir_emit_coverage_data_a64(&mut ctx, cov_plan.clone())
+  # (audit order item 6) the enabled plan's replay data (same wiring as
+  # lir_compile_object_cov): .bss trace buffer, recorder control words,
+  # header constants, dump path and embedded dictionary text.
+  lir_emit_replay_data_a64(&mut ctx, replay_plan.clone())
   # The per-function coverage lookup map, built ONCE (same reason as
   # lir_compile_object_cov: never clone the whole plan per function).
   var cov_fns: Map[String, CoverageFnPlan] = Map::new()
@@ -25679,7 +25879,7 @@ pub def lir_link_object_cov(program: MirProgram, target: AsmTarget, output_path:
       # .text.cold region their symbols are routed into (see
       # lir_emit_fn's Section::ColdText registration). Programs without
       # @cold functions take the cold pass as a zero-iteration no-op.
-      match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()))
+      match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()), replay_plan.clone())
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
       end
@@ -25689,6 +25889,7 @@ pub def lir_link_object_cov(program: MirProgram, target: AsmTarget, output_path:
   emit_runtime_str_concat(&mut ctx)
   emit_runtime_str_chars(&mut ctx)
   var runtime_ctx = runtime_ctx_new(target.clone())
+  runtime_ctx.replay_enabled = replay_plan.enabled
   emit_all_runtime(&mut runtime_ctx)
   # (third-audit item 34) the exit-time dump helper exists only in a
   # coverage build (its _tg_cov_* data symbols are emitted above); the
@@ -25719,7 +25920,7 @@ pub def lir_link_object_cov(program: MirProgram, target: AsmTarget, output_path:
     while fi < program.functions.len() do
       let f = program.functions[fi]
       if !f.is_extern && f.attr_cold then
-        match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()))
+        match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()), replay_plan.clone())
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(_) then ()
         end

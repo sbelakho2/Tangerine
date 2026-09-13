@@ -128,10 +128,6 @@ type t = {
      defs.  Built with the exact first-match-wins semantics of the
      array scan it replaces. *)
   def_cache : (Ids.Type_id.t, Seed_mir.type_def) Hashtbl.t;
-  (* Box[T] instance membership as a table — is_box_tid is consulted at
-     every call argument and deref guard, and the mono'd Box instance
-     list can be long; the list scan would dominate the call path. *)
-  box_tbl : (Ids.Type_id.t, unit) Hashtbl.t;
   (* per-function frame-shape validation: the shape is checked once per
      function (immutable MIR) instead of re-walking every block of the
      callee on every call *)
@@ -140,11 +136,6 @@ type t = {
   (* the owning LangItems (the raw-pointer nominal class the typed raw
      deref dispatches on) *)
   lang_items : Lang_items.t;
-  (* every materialized Box[T] INSTANCE id of this program (mono re-keys
-     the generic Box nominal per instantiation, so the LangItems box_
-     identity alone does not cover the executed types; Mir_verify's
-     box_instances is the same materialization authority) *)
-  box_instances : Ids.Type_id.t list;
   (* The P1-26 canonical drop-plan table: per concrete TypeId the
      ordered (field/payload path, needs_drop) plan derived ONCE from
      program.types; the destruction sites (do_drop, the assign-overwrite
@@ -256,20 +247,6 @@ let is_ptr_handle_ty (vm : t) (ty : Type_repr.t) : bool =
       | _ -> false)
   | _ -> false
 
-(* The Box[T] nominal (the owning indirection the checker erases
-   transparently).  Its runtime value is the boxed CONTENT's allocation:
-   a { ptr: Ptr[T] } wrapper whose pointee holds the serialized content.
-   The identity test covers BOTH the generic LangItems Box id and every
-   mono-materialized Box instance id the program carries. *)
-let is_box_tid (vm : t) (tid : Ids.Type_id.t) : bool =
-  Lang_items.tid_eq vm.lang_items.Lang_items.box_ tid
-  || Hashtbl.mem vm.box_tbl tid
-
-let is_box_handle_ty (vm : t) (ty : Type_repr.t) : bool =
-  match ty with
-  | Type_repr.Named (tid, [| _ |]) -> is_box_tid vm tid
-  | _ -> false
-
 (* FieldId -> positional index within the owner StructDef. *)
 let field_index_of (vm : t) (ty : Type_repr.t) (fid : Ids.Field_id.t) : int =
   match ty with
@@ -349,12 +326,10 @@ let proj_type_of (vm : t) (ty : Type_repr.t) (proj : Seed_mir.projection) : Type
       match ty with
       | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> t
       | Type_repr.Named (id, args)
-        when Array.length args = 1
-             && (Lang_items.is_raw_pointer vm.lang_items id || is_box_tid vm id) ->
-          (* the transparent pointer/Box handle: the deref-on-field
-             projection's NEXT type is the pointee, so the remaining
-             projections resolve against the pointee's def, not the
-             handle's *)
+        when Array.length args = 1 && Lang_items.is_raw_pointer vm.lang_items id ->
+          (* the raw-pointer handle: the deref projection's NEXT type is
+             the pointee, so the remaining projections resolve against
+             the pointee's def, not the handle's *)
           args.(0)
       | _ -> ty)
   | Seed_mir.Field fid -> (
@@ -630,43 +605,25 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                recurse tv
            | Vm_value.Ref (Vm_value.Region ptr) -> recurse (memory_load vm ptr)
            | Vm_value.RawPtr ptr -> recurse (memory_load_typed vm ptr deref_ty)
-           | Vm_value.Struct [| Vm_value.Int a |] when is_ptr_handle_ty vm base_ty ->
-               (* the Ptr[T]/PtrMut[T] handle's value model: a
-                  single-address struct; deref decodes the address through
-                  the one codec *)
-               recurse
-                 (memory_load_typed vm
-                    (Vm_memory.pointer_of_int64 (Int_value.to_int64 a))
-                    deref_ty)
-           | Vm_value.Struct [| Vm_value.RawPtr boxed |] when is_box_handle_ty vm base_ty ->
-               (* the Box[T] wrapper { ptr: Ptr[T] }: deref loads the
-                  boxed content image from the box's allocation *)
-               recurse (memory_load_typed vm boxed deref_ty)
-           | Vm_value.Struct [| Vm_value.Struct [| Vm_value.Int a |] |]
-             when is_box_handle_ty vm base_ty ->
-               (* the Box[T] wrapper over a Ptr-handle struct *)
-               recurse
-                 (memory_load_typed vm
-                    (Vm_memory.pointer_of_int64 (Int_value.to_int64 a))
-                    deref_ty)
-           | _
-             when (match base_ty with
-                  | Type_repr.Ref_internal _ -> true
-                  | _ -> false) ->
-               (* the transparent-reference model: a `&T`/`&mut T`
-                  argument's value channel carries the POINTEE value (the
-                  lowering passes it by value; a real Ref value is handled
-                  above), so a Deref projection over a ref-typed base is
-                  the identity on the value already in hand *)
-               recurse base
-           | _ when is_box_handle_ty vm base_ty ->
-               (* the promoted transparent-Box content: `box_new` returns
-                  the CONTENT (the direct kernel's promote_heap_to_stack),
-                  so a `*box` deref on a Box-typed base is the identity on
-                  the content already in hand; the wrapper-shaped values
-                  are handled by the arms above *)
-               recurse base
-           | _ -> err_trap vm "deref on non-pointer")))
+            | Vm_value.Struct [| Vm_value.Int a |] when is_ptr_handle_ty vm base_ty ->
+                (* the Ptr[T]/PtrMut[T] handle's value model: a
+                   single-address struct; deref decodes the address through
+                   the one codec *)
+                recurse
+                  (memory_load_typed vm
+                     (Vm_memory.pointer_of_int64 (Int_value.to_int64 a))
+                     deref_ty)
+            | _
+              when (match base_ty with
+                   | Type_repr.Ref_internal _ -> true
+                   | _ -> false) ->
+                (* the transparent-reference model: a `&T`/`&mut T`
+                   argument's value channel carries the POINTEE value (the
+                   lowering passes it by value; a real Ref value is handled
+                   above), so a Deref projection over a ref-typed base is
+                   the identity on the value already in hand *)
+                recurse base
+            | _ -> err_trap vm "deref on non-pointer")))
 
 (* The dynamic-index form: the payload is a LOCAL whose value is the
    runtime index (the seed's dynamic-index convention).  The local is
@@ -737,8 +694,7 @@ and pointee_type_of (vm : t) (ty : Type_repr.t) : Type_repr.t option =
   match ty with
   | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) -> Some t
   | Type_repr.Named (id, args)
-    when Array.length args = 1
-         && (Lang_items.is_raw_pointer vm.lang_items id || is_box_tid vm id) ->
+    when Array.length args = 1 && Lang_items.is_raw_pointer vm.lang_items id ->
       Some args.(0)
   | _ -> None
 
@@ -950,40 +906,19 @@ and update_place (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                 | _ ->
                     let cur = memory_load_typed vm ptr deref_ty in
                     memory_store_typed vm ptr deref_ty
-                      (update_place vm frame cur next_ty rest v));
-               base)
-           | Vm_value.Struct [| Vm_value.RawPtr boxed |] when is_box_handle_ty vm base_ty -> (
-               (match rest with
-                | [] -> memory_store_typed vm boxed deref_ty v
-                | _ ->
-                    let cur = memory_load_typed vm boxed deref_ty in
-                    memory_store_typed vm boxed deref_ty
-                      (update_place vm frame cur next_ty rest v));
-               base)
-           | Vm_value.Struct [| Vm_value.Struct [| Vm_value.Int a |] |]
-             when is_box_handle_ty vm base_ty -> (
-               let ptr = Vm_memory.pointer_of_int64 (Int_value.to_int64 a) in
-               (match rest with
-                | [] -> memory_store_typed vm ptr deref_ty v
-                | _ ->
-                    let cur = memory_load_typed vm ptr deref_ty in
-                    memory_store_typed vm ptr deref_ty
-                      (update_place vm frame cur next_ty rest v));
-               base)
-           | _
-             when (match base_ty with
-                  | Type_repr.Ref_internal _ -> true
-                  | _ -> false) ->
-               (* the transparent-reference model on the WRITE side: the
-                  ref-typed slot holds the pointee value; a Deref write
-                  updates that value in place (the caller write-back rides
-                  the parameter convention, as the copy-in/out model
-                  requires) *)
-               update_place vm frame base deref_ty rest v
-           | _ when is_box_handle_ty vm base_ty ->
-               (* the promoted transparent-Box content on the WRITE side *)
-               update_place vm frame base deref_ty rest v
-           | _ -> err_trap vm "deref write on non-pointer"))
+                       (update_place vm frame cur next_ty rest v));
+                base)
+            | _
+              when (match base_ty with
+                   | Type_repr.Ref_internal _ -> true
+                   | _ -> false) ->
+                (* the transparent-reference model on the WRITE side: the
+                   ref-typed slot holds the pointee value; a Deref write
+                   updates that value in place (the caller write-back rides
+                   the parameter convention, as the copy-in/out model
+                   requires) *)
+                update_place vm frame base deref_ty rest v
+            | _ -> err_trap vm "deref write on non-pointer"))
 
 (* Replace the byte at index i with the char's UTF-8 encoding (the byte
    index is the seed String convention — see the header).  The char's
@@ -1623,51 +1558,14 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                stmt = 0 }
            in
            (try
-              (* params occupy locals _1 .. _n (local _0 is the return
-                 slot).  A Set (Initialize) parameter enters the callee
-                 as an UNINITIALIZED output place — the callee must
-                 initialize it before returning; every other convention
-                 enters as the copied Live value. *)
-               let arg_vals =
-                 Array.mapi
-                   (fun i v ->
-                     (* the transparent Box at the call boundary (the
-                        checker's unify erases the wrapper; the verifier's
-                        types_compatible accepts Box[T] where T is
-                        expected): a Box-typed ARGUMENT PLACE whose
-                        parameter's declared type is the CONTENT enters as
-                        the content — load through the box pointer.  The
-                        guard is the argument's static place type (a real
-                        Box nominal), never a value-shape guess. *)
-                     let param_ty =
-                       if i < Array.length fn.Seed_mir.params then
-                         Some fn.Seed_mir.params.(i).Type_repr.pt_type
-                       else None
-                     in
-                     let param_is_box =
-                       match param_ty with
-                       | Some (Type_repr.Named (ptid, _)) -> is_box_tid vm ptid
-                       | _ -> false
-                     in
-                     if param_is_box then v
-                     else
-                       match args.(i).Seed_mir.value with
-                       | Seed_mir.Copy p | Seed_mir.Read p | Seed_mir.Move p
-                       | Seed_mir.Consume p -> (
-                           match place_type vm frame p with
-                           | Type_repr.Named (tid, [| inner |]) when is_box_tid vm tid -> (
-                               match v with
-                               | Vm_value.Struct [| Vm_value.RawPtr boxed |] ->
-                                   memory_load_typed vm boxed inner
-                               | Vm_value.Struct [| Vm_value.Struct [| Vm_value.Int a |] |] ->
-                                   memory_load_typed vm
-                                     (Vm_memory.pointer_of_int64 (Int_value.to_int64 a))
-                                     inner
-                               | _ -> v)
-                           | _ -> v)
-                       | Seed_mir.Constant _ -> v)
-                   arg_vals
-               in
+               (* params occupy locals _1 .. _n (local _0 is the return
+                  slot).  A Set (Initialize) parameter enters the callee
+                  as an UNINITIALIZED output place — the callee must
+                  initialize it before returning; every other convention
+                  enters as the copied Live value.  Argument values pass
+                  through UNCHANGED: a Box-typed argument only ever meets
+                  a Box-typed parameter (nominal identity), so there is no
+                  transparent wrapper load at the call boundary. *)
                let all_args = Array.append arg_vals caps in
               Array.iteri
                 (fun i _slot ->
@@ -2199,8 +2097,8 @@ let statics_initial_values (program : Seed_mir.program) : Vm_value.slot array =
    below — an all-labeled function cannot carry an erasable optional
    argument, so the default is the non-_li entry point.) *)
 let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
-    ~(box_instances : Ids.Type_id.t list) ~(program : Seed_mir.program)
-    ~(entry : Instance_id.t) ~(argv : string array) : (t * frame, string) result =
+    ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array) :
+    (t * frame, string) result =
   let fn_index = Hashtbl.create 64 in
   Array.iteri (fun i fn -> Hashtbl.replace fn_index fn.Seed_mir.instance i) program.Seed_mir.functions;
   match Hashtbl.find_opt fn_index entry with
@@ -2225,19 +2123,15 @@ let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
              let tid = Seed_mir.def_id d in
              if not (Hashtbl.mem def_cache tid) then Hashtbl.add def_cache tid d)
            program.Seed_mir.types;
-         let box_tbl = Hashtbl.create (List.length box_instances * 2 + 16) in
-         List.iter (fun tid -> Hashtbl.replace box_tbl tid ()) box_instances;
          let vm =
            {
              program;
              fn_index;
              stmt_cache;
              def_cache;
-             box_tbl;
              shape_checked = Array.make (Array.length program.Seed_mir.functions) false;
              memory = Vm_memory.create ();
              lang_items;
-             box_instances;
              drop_plans = Drop_plan.of_program ~lang_items program;
              host = Host.create ~repo_root:"." ~argv:[||];
              limits;
@@ -2289,13 +2183,12 @@ let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
 let entry_frame_of ~(program : Seed_mir.program) ~(entry : Instance_id.t)
     ~(argv : string array) : (t * frame, string) result =
   entry_frame_of_li ~limits:default_limits ~lang_items:Lang_items.seed_defaults
-    ~box_instances:[] ~program ~entry ~argv
+    ~program ~entry ~argv
 
 let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
-    ~(box_instances : Ids.Type_id.t list) ~(program : Seed_mir.program)
-    ~(entry : Instance_id.t) ~(argv : string array) ~(host : Host.t) :
-    (int, vm_error) result =
-  match entry_frame_of_li ~limits ~lang_items ~box_instances ~program ~entry ~argv with
+    ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array)
+    ~(host : Host.t) : (int, vm_error) result =
+  match entry_frame_of_li ~limits ~lang_items ~program ~entry ~argv with
   | Error m -> Error { kind = Trap "entry instance not found"; message = m; trace = [] }
   | Ok (vm, entry_frame) ->
       vm.host <- host;
@@ -2331,5 +2224,5 @@ let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
 
 let run ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array)
     ~(host : Host.t) : (int, vm_error) result =
-  run_li ~limits:default_limits ~lang_items:Lang_items.seed_defaults ~box_instances:[]
-    ~program ~entry ~argv ~host
+  run_li ~limits:default_limits ~lang_items:Lang_items.seed_defaults ~program ~entry
+    ~argv ~host

@@ -33,14 +33,15 @@
      concrete instance can carry them in a valid run; the residual-var
      gates report them fail-closed).
 
-   The checker's TRANSPARENT wrapper (the Box nominal) is handled by
-   same_instance below rather than by key erasure: Box[T] and T are one
-   logical type (the checker's unify substitutes through the wrapper in
-   both directions), but the two spellings keep separate flavor-concrete
-   defs (`Option[Expr]`'s Some payload is Expr; `Option[Box[Expr]]`'s is
-   Box[Expr] — merging the keys would make one def serve both and break
-   the projection walks).  same_instance reconciles their identity from
-   the keys, never from the def shapes.
+   NOMINAL IDENTITY IS EXACT (Box-transparency regression fix): Box[T]
+   and T are DISTINCT types with distinct canonical keys, distinct
+   materialized defs, distinct layouts and distinct drop plans — the
+   checker no longer unifies through the wrapper, so no two spellings of
+   one instance may reconcile here either.  `intern` remains the single
+   physical mint; `same_instance` only reconciles GENUINE canonical
+   spellings of one instance: the 64-bit alias pairs and the integer
+   literal-adoption relation recorded in the keys below.  It never
+   erases a nominal wrapper and never compares def shapes.
 
    The table mints canonical ids in FIRST-INTERN order — the mono
    queue's deterministic first-discovery order — so deterministic builds
@@ -138,19 +139,6 @@ end)
 type t = {
   mint : int ref;                          (* the only fresh-id mint for generic instances *)
   materializable : Ids.Type_id.t -> bool;  (* which generic tids ever intern (builtin exclusion) *)
-  (* The checker's TRANSPARENT wrapper predicate (the Box nominal): a
-     mention of Box[T] denotes T under the checker's unify, so two
-     specialized instances whose keys differ only by transparent wrapper
-     positions are the SAME logical type and must compare equal even
-     though they keep separate defs (the def shapes are flavor-concrete:
-     Option[Expr]'s Some payload is Expr, Option[Box[Expr]]'s is
-     Box[Expr]; merging the keys would make one def serve both and break
-     the projection walks).  same_instance below is that comparison. *)
-  transparent : Ids.Type_id.t -> bool;
-  (* Every specialized id the table minted for a transparent TEMPLATE
-     (a Box instance mention is itself transparent, so an already-rewritten
-     mention Box#id[T] erases exactly like the original Box[T]). *)
-  transparent_instances : (int, unit) Hashtbl.t;
   (* The reverse of `table`: canonical specialized id -> its key, so the
      verifier can decide logical identity between two materialized
      instances without re-deriving def shapes. *)
@@ -166,21 +154,13 @@ let default_materializable (tid : Ids.Type_id.t) : bool =
   not (t = 0 || t = 1 || t = 2 || t = 5 || t = 6)
 
 let create ?(materializable : Ids.Type_id.t -> bool = default_materializable)
-    ?(transparent : Ids.Type_id.t -> bool = fun _ -> false) ~(mint_from : int) () : t =
+    ~(mint_from : int) () : t =
   {
     mint = ref mint_from;
     materializable;
-    transparent;
-    transparent_instances = Hashtbl.create 8;
     id_keys = Hashtbl.create 64;
     table = Key_tbl.create 64;
   }
-
-(* Whether a TypeId is a transparent wrapper mention: the checker's Box
-   template itself or any specialized id the table minted for it. *)
-let is_transparent (t : t) (tid : Ids.Type_id.t) : bool =
-  t.transparent tid
-  || Hashtbl.mem t.transparent_instances (Ids.Type_id.to_int tid)
 
 let is_materializable (t : t) (tid : Ids.Type_id.t) : bool = t.materializable tid
 
@@ -189,10 +169,9 @@ let count (t : t) : int = Key_tbl.length t.table
 (* ── Canonical argument normalization ────────────────────────────────
    The value-domain collapse applied to every keyed arg (recursively,
    so nested instances canonicalize too): the 64-bit alias pairs and the
-   literal defaulting above.  The transparent wrapper is deliberately
-   NOT erased here — each spelling keeps its own flavor-concrete def
-   (see the t.transparent comment); logical identity across wrapper
-   spellings is same_instance below.  Everything else — including
+   literal defaulting above.  A nominal wrapper (Box[T]) is NEVER erased
+   here — Box[T] and T are distinct instances under exact nominal
+   identity and keep distinct keys/defs.  Everything else — including
    Type_params and Infer_vars, which may still appear at TEMPLATE level
    (a fn's own declared binders) where the key is only used for
    equality, never for interning — passes through structurally. *)
@@ -253,11 +232,6 @@ let intern (t : t) (generic_def_id : Ids.Type_id.t) (args : Type_repr.t array) :
     | None ->
         let id = Ids.Type_id.make !(t.mint) in
         incr t.mint;
-        (* a specialized id minted for a transparent template (Box) is
-           itself a transparent wrapper mention: register it so an
-           already-rewritten Box#id[T] arg erases exactly like Box[T] *)
-        if t.transparent generic_def_id then
-          Hashtbl.replace t.transparent_instances (Ids.Type_id.to_int id) ();
         Key_tbl.add t.table key id;
         Hashtbl.replace t.id_keys (Ids.Type_id.to_int id) key;
         Some (id, true)
@@ -270,67 +244,40 @@ let lookup (t : t) (generic_def_id : Ids.Type_id.t) (args : Type_repr.t array) :
   if not (args_canonical args) then None
   else Key_tbl.find_opt t.table (key_of generic_def_id args)
 
-(* ── Logical instance identity (transparent-wrapper reconciliation) ──
-   The concrete verifier's nominal identity is canonical-id equality, but
-   the checker's transparent Box makes two canonical ids one logical type
-   when their keys differ only by wrapper positions (`Option[Expr]` vs
-   `Option[Box[Expr]]` — the checker's ctor unify erases the wrapper, so
-   both spellings flow through one program).  same_instance compares the
-   two ids' keys with the transparent wrapper erased at every nested
-   position; distinct templates or genuinely different arguments stay
-   unequal, and ids the table never minted stay unequal (fail closed). *)
+(* ── Logical instance identity (exact nominal, canonical spellings) ──
+   The concrete verifier's nominal identity is canonical-id equality.  An
+   id is the SAME instance as another only when the table minted both for
+   keys that are equal after the documented canonicalization (the 64-bit
+   alias collapse and the literal defaulting in canonical_type) PLUS the
+   genuine integer literal-adoption relation below (a key leaf that
+   stayed `Int_literal` because the magnitude exceeded the 64-bit
+   default range still denotes the concrete integer kind whose range
+   represents it — exactly the checker's literal adoption).
 
-(* One-step transparent erasure: a Box template mention or a minted Box
-   instance erases to its single type argument. *)
-let erase_transparent (t : t) (ty : Type_repr.t) : Type_repr.t =
-  match ty with
-  | Type_repr.Named (tid, [| inner |]) when is_transparent t tid -> inner
-  | _ -> ty
+   NO nominal wrapper is ever erased: `Box[Expr]` and `Expr` are distinct
+   keys, `Option[Box[Expr]]` and `Option[Expr]` keep distinct canonical
+   ids and distinct defs.  A key comparison that would need to look
+   through a minted instance id is a genuine structural mismatch, not a
+   wrapper flavor: rewrite_ty keys every mention in its TEMPLATE spelling
+   (raw tid + args), so identity never needs def-shape reconciliation.
+   Ids the table never minted stay unequal (fail closed). *)
 
-(* Structural equivalence under transparent erasure, recursing through
-   nested canonical instance ids via their keys.  `seen` guards the
-   instance-id pair walk against a cyclic key comparison (fail closed:
-   a cycle means the two ids are not proven identical at this leaf). *)
-let rec equivalent_ty (t : t) (seen : (int * int) list) (a : Type_repr.t)
-    (b : Type_repr.t) : bool =
-  let a = erase_transparent t a in
-  let b = erase_transparent t b in
+let int_kind_width_of (k : Type_repr.int_kind) : int =
+  match k with
+  | Type_repr.I8 | Type_repr.U8 -> 8
+  | Type_repr.I16 | Type_repr.U16 -> 16
+  | Type_repr.I32 | Type_repr.U32 -> 32
+  | Type_repr.I64 | Type_repr.U64 | Type_repr.Int | Type_repr.UInt -> 64
+  | Type_repr.I128 | Type_repr.U128 -> 128
+
+(* The canonical-key structural equivalence: canonical_type already
+   collapsed aliases and defaulted literals, so this only needs the
+   literal-adoption clause at Int_literal leaves plus structural
+   recursion.  It compares KEYS (not arbitrary type trees): a Named leaf
+   is equal by template id + canonical args only — never resolved through
+   an id_keys entry, so no def shape and no wrapper can sneak in. *)
+let rec canonical_key_arg_equiv (a : Type_repr.t) (b : Type_repr.t) : bool =
   match a, b with
-  | Type_repr.Named (ida, aa), Type_repr.Named (idb, ab) ->
-      if Array.length aa <> Array.length ab then false
-      else if Ids.Type_id.compare ida idb = 0 then
-        Array.for_all2 (equivalent_ty t seen) aa ab
-      else if
-        List.mem (Ids.Type_id.to_int ida, Ids.Type_id.to_int idb) seen
-        || List.mem (Ids.Type_id.to_int idb, Ids.Type_id.to_int ida) seen
-      then false
-      else (
-        match
-          ( Hashtbl.find_opt t.id_keys (Ids.Type_id.to_int ida),
-            Hashtbl.find_opt t.id_keys (Ids.Type_id.to_int idb) )
-        with
-        | Some ka, Some kb ->
-            let seen = (Ids.Type_id.to_int ida, Ids.Type_id.to_int idb) :: seen in
-            Ids.Type_id.compare ka.generic_def_id kb.generic_def_id = 0
-            && Array.length ka.canonical_type_args = Array.length kb.canonical_type_args
-            && Array.for_all2 (equivalent_ty t seen) ka.canonical_type_args
-                 kb.canonical_type_args
-        | _ -> false)
-  | Type_repr.Tuple aa, Type_repr.Tuple ab ->
-      Array.length aa = Array.length ab && Array.for_all2 (equivalent_ty t seen) aa ab
-  | Type_repr.Fixed_array (ta, na), Type_repr.Fixed_array (tb, nb) ->
-      na = nb && equivalent_ty t seen ta tb
-  | Type_repr.Raw_ptr (ma, ta), Type_repr.Raw_ptr (mb, tb) ->
-      ma = mb && equivalent_ty t seen ta tb
-  | Type_repr.Ref_internal (ma, ta), Type_repr.Ref_internal (mb, tb) ->
-      ma = mb && equivalent_ty t seen ta tb
-  | Type_repr.Function (pa, ra), Type_repr.Function (pb, rb) ->
-      Array.length pa = Array.length pb
-      && Array.for_all2
-           (fun (x : Type_repr.param_type) (y : Type_repr.param_type) ->
-             equivalent_ty t seen x.Type_repr.pt_type y.Type_repr.pt_type)
-           pa pb
-      && equivalent_ty t seen ra rb
   | Type_repr.Int_literal m, Type_repr.Int k
   | Type_repr.Int k, Type_repr.Int_literal m ->
       (* the checker's literal adoption (only magnitudes beyond the
@@ -344,24 +291,38 @@ let rec equivalent_ty (t : t) (seen : (int * int) list) (a : Type_repr.t)
           span = Span.synthetic;
         }
       in
-      let width =
-        match k with
-        | Type_repr.I8 | Type_repr.U8 -> 8
-        | Type_repr.I16 | Type_repr.U16 -> 16
-        | Type_repr.I32 | Type_repr.U32 -> 32
-        | Type_repr.I64 | Type_repr.U64 | Type_repr.Int | Type_repr.UInt -> 64
-        | Type_repr.I128 | Type_repr.U128 -> 128
-      in
+      let width = int_kind_width_of k in
       (match k with
        | Type_repr.U8 | Type_repr.U16 | Type_repr.U32 | Type_repr.U64 | Type_repr.U128
        | Type_repr.UInt ->
            Literal.fits_unsigned p width
        | _ -> Literal.fits_signed p width)
   | Type_repr.Int_literal _, Type_repr.Int_literal _ -> true
+  | Type_repr.Named (ida, aa), Type_repr.Named (idb, ab) ->
+      Ids.Type_id.compare ida idb = 0
+      && Array.length aa = Array.length ab
+      && Array.for_all2 (canonical_key_arg_equiv) aa ab
+  | Type_repr.Tuple aa, Type_repr.Tuple ab ->
+      Array.length aa = Array.length ab
+      && Array.for_all2 (canonical_key_arg_equiv) aa ab
+  | Type_repr.Fixed_array (ta, na), Type_repr.Fixed_array (tb, nb) ->
+      na = nb && canonical_key_arg_equiv ta tb
+  | Type_repr.Raw_ptr (ma, ta), Type_repr.Raw_ptr (mb, tb) ->
+      ma = mb && canonical_key_arg_equiv ta tb
+  | Type_repr.Ref_internal (ma, ta), Type_repr.Ref_internal (mb, tb) ->
+      ma = mb && canonical_key_arg_equiv ta tb
+  | Type_repr.Function (pa, ra), Type_repr.Function (pb, rb) ->
+      Array.length pa = Array.length pb
+      && Array.for_all2
+           (fun (x : Type_repr.param_type) (y : Type_repr.param_type) ->
+             canonical_key_arg_equiv x.Type_repr.pt_type y.Type_repr.pt_type)
+           pa pb
+      && canonical_key_arg_equiv ra rb
   | _ -> Type_repr.compare a b = 0
 
 (* The verifier's logical-identity predicate for two materialized ids:
-   equal (or both minted for equivalent canonical keys). *)
+   equal, or both minted for equivalent canonical keys (the alias /
+   literal-adoption spellings of ONE genuine instance). *)
 let same_instance (t : t) (a : Ids.Type_id.t) (b : Ids.Type_id.t) : bool =
   if Ids.Type_id.compare a b = 0 then true
   else
@@ -372,5 +333,6 @@ let same_instance (t : t) (a : Ids.Type_id.t) (b : Ids.Type_id.t) : bool =
     | Some ka, Some kb ->
         Ids.Type_id.compare ka.generic_def_id kb.generic_def_id = 0
         && Array.length ka.canonical_type_args = Array.length kb.canonical_type_args
-        && Array.for_all2 (equivalent_ty t []) ka.canonical_type_args kb.canonical_type_args
+        && Array.for_all2 (canonical_key_arg_equiv) ka.canonical_type_args
+             kb.canonical_type_args
     | _ -> false
