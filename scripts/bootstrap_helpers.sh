@@ -1147,18 +1147,23 @@ run_native_tests() {
 #      its trap is user-code-scoped and banned. A reintroduced trap-only
 #      runtime stub therefore fails the gate instead of shipping.
 #
-# RECORDED RESIDUAL (not part of the rule above; the honest state): the
-# compiler ALSO emits panic-class traps INLINE in user functions — the
-# signed-overflow / division-edge MirAsserts, bounds checks, unwrap panics,
-# contract checks and budget-exhaustion checks (the LIR route's synthetic
-# trap block and LirTrap terminator, and the direct emitter's emit_trap /
-# MirAssert / MirAbort arms). Those instructions are attributed to USER
-# symbols and are BANNED by rule 2, so a full-manifest canary run is NOT
-# green yet (the @budget canaries and any canary doing signed arithmetic or
-# indexing trip it). Making the manifest green requires routing those
-# aborts through the whitelisted __intrinsic_abort symbol (a call, not an
-# inline trap), or an explicit policy decision to exempt compiler-inserted
-# panic-class aborts; neither is part of this change.
+# SINGLE-TRAP-AUTHORITY (the former recorded residual, now closed): the
+# compiler inserts NO inline panic-class trap in user functions. Every
+# abort path — the signed-overflow / division-edge and div-by-zero
+# MirAsserts, the LIR division guard's synthetic trap block, LirTrap
+# terminators, bounds checks, unwrap panics, contract checks,
+# budget-exhaustion checks, MirUnreachable/MirAbort and the fail-closed
+# emission defects — routes through a CALL to the whitelisted
+# __intrinsic_abort symbol (codegen.tg's emit_trap funnel, lir.tg's
+# LirTrap/div-guard call, and the x86_64/thumb/riscv LIR backends' call)
+# with unchanged trap semantics. The runtime owns the ONE trap encoding
+# (emit_tg_intrinsic_abort); no user symbol carries brk/ud2/udf, so a
+# full-manifest canary run — including the @budget canaries and canaries
+# doing signed arithmetic or indexing — carries only whitelisted abort
+# symbols and is green under the rule above. The trap ENCODERS
+# (a64_udf/a64_brk/x64_ud2/t2_udf/rv_ebreak/x86_ud2) remain as machine
+# building blocks; no compiler-inserted user-function path emits them.
+#
 # Usage: bh_assert_no_trap_stubs <binary> <triple>
 TRAP_GATE_WHITELIST=" __intrinsic_abort panic panic_unwind begin_unwind resume_unwind unreachable assert \
 _tg_string_new _tg_string_from_bytes _tg_string_reserve _tg_string_wrap _tg_string_slice _tg_string_tolower _tg_string_toupper _tg_string_replace \
