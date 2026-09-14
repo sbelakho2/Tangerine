@@ -178,7 +178,8 @@
 #   MachineActual     — a value RECORDED by the lowering/allocator (LIR
 #                       machine level): spills, reloads, stack bytes, the
 #                       lowered LIR branch terms and the assigned
-#                       callee-saved registers.
+#                       physical registers (the allocator's segment
+#                       maps).
 #   ProfileMeasured   — a runtime profile-fed value: NO view produces one
 #                       here (the stable-keyed PGO profile lives in the
 #                       external profile file; perf_report reads no
@@ -195,7 +196,7 @@
 # is documented at the exact row site).
 
 use std::core::{Option}
-use std::collections::{Vec, Map}
+use std::collections::{Vec, Map, Set}
 
 use tg_compiler::mir::{
   MirProgram, MirFunction, MirStatementKind, MirRvalueKind, MirBinOp, MirOperand,
@@ -219,7 +220,7 @@ use tg_compiler::types::{
 use tg_compiler::ast::layout_attrs_plain
 use tg_compiler::token::span_dummy
 use tg_compiler::stable_ids::{stable_mir_node_key_of, StableMirNodeId}
-use tg_compiler::lir::{LirFunction, LirAlloc, LirTermKind}
+use tg_compiler::lir::{LirFunction, LirAlloc, LirTerm, LirTermKind, LirBlock, LirSeg, LirSwitchArm}
 
 # ———————————————————————————————————————————————————————————————
 # The §44 record — one PerfReport per function
@@ -757,20 +758,34 @@ end
 # One PerfReport over the LIR artifacts (function + allocation) when they
 # are available — the allocator-side view. spills = the allocator's
 # recorded spill-store events (LirAlloc.spills — the "(call position,
-# vreg)" store-before-call list; the alternative readings — the
-# memory-resident vreg count over LirAlloc.segs_of's phys < 0 segments and
-# LirAlloc.slots — are documented but unused); reloads = LirAlloc.reloads
-# (the recorded post-call slot re-loads — the emitter inserts no slot-load
-# STATEMENTS, so the records ARE the count); stack_bytes =
-# LirAlloc.frame_bytes (the aligned frame allocation size); branch_count =
-# the LirJump + LirSwitch terms (MIR asserts and switches lower to these —
-# LIR has no other branching term). Every MIR-level metric is None with
+# vreg)" store-before-call list, which the allocator's dead-store
+# elimination already trimmed to the values actually read after the
+# call; the alternative readings — the memory-resident vreg count over
+# LirAlloc.segs_of's phys < 0 segments and LirAlloc.slots — are
+# documented but unused); reloads = LirAlloc.reloads (the recorded
+# post-call slot re-loads — the emitter inserts no slot-load STATEMENTS,
+# so the records ARE the count); stack_bytes = LirAlloc.frame_bytes (the
+# aligned frame allocation size); branch_count = the LirJump + LirSwitch
+# terms (MIR asserts and switches lower to these — LIR has no other
+# branching term; a fused cond-marked LirJump is still one branch term);
+# allocated_registers = the DISTINCT physical registers the segment maps
+# (LirAlloc.segs_of) assigned (both integer pools and the FP pool;
+# memory-resident segments carry phys < 0 and do not count — see
+# perf_lir_allocated_registers). Every MIR-level metric is None with
 # bound_kind "unknown": bounds checks, drops and the operand traffic do
 # not survive into LIR's scalar subset (documented). instruction_count is
 # None/estimate: the emitted machine WORD count exists only inside the
-# per-route emitter buffers and never rides LirFunction/LirAlloc (the
-# prerequisite is recorded at perf_facts_of_lir); allocated_registers =
-# LirAlloc.cc_used (measured).
+# per-route emitter buffers and never rides LirFunction/LirAlloc — the
+# emitter entry signatures return Unit (lir_emit_fn, aarch64) or
+# Result[Unit, String] (x86_emit_fn / thumb_emit_fn / rv_emit_fn), never
+# a word vector, so there is no per-function machine-word artifact to
+# wire (the prerequisite is recorded at perf_facts_of_lir);
+# bounds_check_sites = None: the LIR terminator carries no MIR
+# AssertMessage — every assert lowers to a one-arm zero-test LirSwitch
+# whose trap side is the SHARED synthetic trap block (LirTrap is the
+# terminus of abort/unreachable/assert failures alike; see
+# lir_lower_assert), so no LIR artifact can reconstruct the per-site
+# list.
 pub def perf_report_of_lir_alloc(lir_fn: LirFunction, alloc: LirAlloc) -> PerfReport
   var branches = 0
   for block in lir_fn.blocks do
@@ -802,10 +817,31 @@ pub def perf_report_of_lir_alloc(lir_fn: LirFunction, alloc: LirAlloc) -> PerfRe
     instruction_count: perf_metric_none(PerfFactSource::StaticEstimate, perf_bound_estimate(), Vec::new()),
     vectorization_eligibility: perf_metric_bool_none(PerfFactSource::StaticExact, perf_bound_unknown(), Vec::new()),
     hotness: perf_metric_none(PerfFactSource::ProfileMeasured, perf_bound_unknown(), Vec::new()),
-    allocated_registers: perf_metric_machine(alloc.cc_used.len(), Vec::new()),
+    allocated_registers: perf_metric_machine(perf_lir_allocated_registers(alloc), Vec::new()),
     allocation_sites: perf_metric_none(PerfFactSource::StaticUpperBound, perf_bound_unknown(), Vec::new()),
     bounds_check_sites: perf_metric_none(PerfFactSource::StaticExact, perf_bound_unknown(), Vec::new())
   }
+end
+
+# The allocation's physical-register footprint, measured from the
+# FINAL segment maps (LirAlloc.segs_of — post-eviction, post-remat):
+# the number of DISTINCT physical register ids the scan assigned across
+# the integer caller-saved/callee-saved pools and the FP pool. A
+# memory-resident segment (phys < 0) occupies a slot, never a register,
+# so it does not count. The callee-saved save list (LirAlloc.cc_used)
+# is the SUBSET the aarch64 prologue must save, not the whole
+# footprint; this metric reports the whole assignment (MachineActual,
+# "measured").
+pub def perf_lir_allocated_registers(alloc: LirAlloc) -> Int
+  var seen: Set[Int] = Set::new()
+  for (_, segs) in alloc.segs_of do
+    for s in segs do
+      if s.phys >= 0 then
+        seen.insert(s.phys)
+      end
+    end
+  end
+  seen.len()
 end
 
 # The §44 session helper: one PerfReport per function of the optimized
@@ -991,11 +1027,15 @@ end
 # MachineInstructionCount row. That row is None with bound_kind
 # "estimate": the emitted machine WORD count exists only inside the
 # per-route emitter buffers after LIR and never rides the LIR artifacts —
-# the aarch64 emitter (lir.tg:18276 lir_emit_fn) and the x86-64 emitter
-# append their encodings into the shared CodegenCtx.text CodeBuffer
-# (codegen.tg:253); neither returns a per-function word vec. Exposing it
-# needs the emitter to record (buf_pos(&ctx.text) after lir_emit_fn minus
-# the function's start offset) / 4 on a per-function artifact field; until
+# the aarch64 emitter (lir.tg lir_emit_fn), the x86-64 emitter
+# (backend_x86_64.tg x86_emit_fn), the cortex-m emitter
+# (backend_thumb.tg thumb_emit_fn) and the riscv emitter
+# (backend_rv.tg rv_emit_fn) all append their encodings into their
+# route's CodeBuffer and return Unit / Result[Unit, String] — NONE
+# returns a Vec[UInt] (or any per-function word vector), so there is no
+# machine-word artifact to wire. Exposing it needs the emitter to record
+# (buf_pos(&ctx.text) after lir_emit_fn minus the function's start
+# offset) / 4 on a per-function LIR/allocation artifact field; until
 # then the value stays None (the MIR estimate is a separate
 # InstructionCount metric, never presented as the machine count).
 pub def perf_facts_of_lir(lir_fn: LirFunction, alloc: LirAlloc) -> Vec[PerfFact]
@@ -1240,6 +1280,202 @@ pub def perf_journal_lane_check() -> Vec[String]
   let short_value = short_report.vectorization_eligibility.value
   perf_journal_lane_expect(&mut out, "P4-non-vector-width-not-vector",
     !short_value.unwrap_or(true))
+
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# The LIR-view lane (perf_report_of_lir_alloc / perf_facts_of_lir)
+# ———————————————————————————————————————————————————————————————
+# Rows asserted by perf_lir_view_lane_check:
+#   L1 the allocator-recorded surfaces are Some/"measured"/MachineActual
+#      and read the artifacts: spills = LirAlloc.spills.len(), reloads =
+#      LirAlloc.reloads.len(), stack_bytes = LirAlloc.frame_bytes,
+#      branch_count = the LirJump + LirSwitch terms, allocated_registers
+#      = the DISTINCT phys >= 0 register ids in LirAlloc.segs_of
+#      (memory-resident segments do not count);
+#   L2 the labeled fact rows carry the SAME records;
+#   L3 every MIR-level surface whose data does not ride the LIR artifacts
+#      is None / bound_kind "unknown" (never a fabricated zero):
+#      heap/arena allocations, escapes, bounds checks (and removed),
+#      copies/moves/drops/retain-release/clones, inline decisions,
+#      vectorization eligibility, hotness, allocation sites and
+#      bounds-check sites;
+#   L4 instruction_count and the MachineInstructionCount row are
+#      None / "estimate" / StaticEstimate (no emitter exposes a word
+#      vector — see the perf_facts_of_lir doc).
+
+def perf_lir_lane_expect(inout out: Vec[String], name: String, cond: Bool) -> Unit
+  if !cond then
+    out.push(name + ": expectation failed")
+  end
+  ()
+end
+
+def perf_lir_lane_term(kind: LirTermKind) -> LirTerm
+  LirTerm { kind: kind }
+end
+
+def perf_lir_lane_block(id: Int, kind: LirTermKind) -> LirBlock
+  LirBlock { id: id, stmts: Vec::new(), term: perf_lir_lane_term(kind) }
+end
+
+def perf_lir_lane_seg(vreg: Int, phys: Int) -> LirSeg
+  LirSeg { start: 0, end: 1, vreg: vreg, phys: phys, slot: -1, needs_reload: false }
+end
+
+pub def perf_lir_view_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  # The LIR artifact: five blocks whose terminators cover jump / switch /
+  # call / trap / ret (exactly two branch terms).
+  var arms: Vec[LirSwitchArm] = Vec::new()
+  arms.push(LirSwitchArm { value: 0, target: 2 })
+  var blocks: Vec[LirBlock] = Vec::new()
+  blocks.push(perf_lir_lane_block(0, LirTermKind::LirJump(1)))
+  blocks.push(perf_lir_lane_block(1, LirTermKind::LirSwitch(0, arms, 2)))
+  blocks.push(perf_lir_lane_block(2, LirTermKind::LirCall("m::callee".to_string(), Vec::new(), 0, Option::None, 3)))
+  blocks.push(perf_lir_lane_block(3, LirTermKind::LirTrap))
+  blocks.push(perf_lir_lane_block(4, LirTermKind::LirRet(Option::None)))
+  let lir_fn = LirFunction {
+    name: "m::perf_lir_probe".to_string(),
+    vregs: 17,
+    params: Vec::new(),
+    ret_vreg: Option::None,
+    blocks: blocks,
+    entry_block: 0
+  }
+  # The allocation artifact: three assigned physical registers (9, 19
+  # integer pools; 104 = the FP namespace's 100+4) and one
+  # memory-resident segment (phys -1, which must not count).
+  var segs: Map[Int, Vec[LirSeg]] = Map::new()
+  var seg16: Vec[LirSeg] = Vec::new()
+  seg16.push(perf_lir_lane_seg(16, 9))
+  segs.insert(16, seg16)
+  var seg17: Vec[LirSeg] = Vec::new()
+  seg17.push(perf_lir_lane_seg(17, 19))
+  segs.insert(17, seg17)
+  var seg18: Vec[LirSeg] = Vec::new()
+  seg18.push(perf_lir_lane_seg(18, 104))
+  segs.insert(18, seg18)
+  var seg19: Vec[LirSeg] = Vec::new()
+  seg19.push(perf_lir_lane_seg(19, -1))
+  segs.insert(19, seg19)
+  var spills: Vec[(Int, Int)] = Vec::new()
+  spills.push((3, 16))
+  spills.push((7, 17))
+  var reloads: Vec[(Int, Int)] = Vec::new()
+  reloads.push((4, 16))
+  var cc_used: Vec[Int] = Vec::new()
+  cc_used.push(19)
+  let alloc = LirAlloc {
+    slots: 5,
+    frame_bytes: 48,
+    segs_of: segs,
+    spills: spills,
+    reloads: reloads,
+    cc_used: cc_used
+  }
+  let report = perf_report_of_lir_alloc(lir_fn.clone(), alloc.clone())
+
+  # ——— L1: the recorded surfaces ———
+  perf_lir_lane_expect(&mut out, "L1-spills",
+    report.spills.value == Option::Some(2) &&
+    report.spills.provenance == PerfFactSource::MachineActual &&
+    report.spills.bound_kind == "measured")
+  perf_lir_lane_expect(&mut out, "L1-reloads",
+    report.reloads.value == Option::Some(1) &&
+    report.reloads.provenance == PerfFactSource::MachineActual &&
+    report.reloads.bound_kind == "measured")
+  perf_lir_lane_expect(&mut out, "L1-stack-bytes",
+    report.stack_bytes.value == Option::Some(48) &&
+    report.stack_bytes.provenance == PerfFactSource::MachineActual &&
+    report.stack_bytes.bound_kind == "measured")
+  perf_lir_lane_expect(&mut out, "L1-branch-count",
+    report.branch_count.value == Option::Some(2) &&
+    report.branch_count.provenance == PerfFactSource::MachineActual)
+  perf_lir_lane_expect(&mut out, "L1-allocated-registers",
+    report.allocated_registers.value == Option::Some(3) &&
+    report.allocated_registers.provenance == PerfFactSource::MachineActual &&
+    report.allocated_registers.bound_kind == "measured")
+  perf_lir_lane_expect(&mut out, "L1-function-key",
+    report.function_key == "m::perf_lir_probe")
+
+  # ——— L2: the labeled rows carry the same records ———
+  let facts = perf_facts_of_lir(lir_fn.clone(), alloc.clone())
+  var spills_ok = false
+  var stack_ok = false
+  var regs_ok = false
+  var machine_row_ok = false
+  var fi = 0
+  while fi < facts.len() do
+    let fact = facts[fi]
+    if fact.field == PerfField::Spills then
+      if fact.metric.value == Option::Some(2) && fact.metric.provenance == PerfFactSource::MachineActual then
+        spills_ok = true
+      end
+    end
+    if fact.field == PerfField::StackBytes then
+      if fact.metric.value == Option::Some(48) && fact.metric.bound_kind == "measured" then
+        stack_ok = true
+      end
+    end
+    if fact.field == PerfField::AllocatedRegisters then
+      if fact.metric.value == Option::Some(3) then
+        regs_ok = true
+      end
+    end
+    if fact.field == PerfField::MachineInstructionCount then
+      if fact.metric.value == Option::None && fact.metric.provenance == PerfFactSource::StaticEstimate && fact.metric.bound_kind == "estimate" then
+        machine_row_ok = true
+      end
+    end
+    fi = fi + 1
+  end
+  perf_lir_lane_expect(&mut out, "L2-fact-rows", spills_ok && stack_ok && regs_ok)
+  perf_lir_lane_expect(&mut out, "L2-machine-instruction-row", machine_row_ok)
+
+  # ——— L3: the unrecorded surfaces stay None/"unknown" ———
+  var none_ok = true
+  if !(report.heap_allocations.value == Option::None) || report.heap_allocations.bound_kind != "unknown" then
+    none_ok = false
+  end
+  if !(report.arena_allocations.value == Option::None) || report.arena_allocations.bound_kind != "unknown" then
+    none_ok = false
+  end
+  if !(report.escapes.value == Option::None) || report.escapes.bound_kind != "unknown" then
+    none_ok = false
+  end
+  if !(report.bounds_checks.value == Option::None) || report.bounds_checks.bound_kind != "unknown" then
+    none_ok = false
+  end
+  if !(report.bounds_checks_removed.value == Option::None) then
+    none_ok = false
+  end
+  if !(report.copies.value == Option::None) || !(report.moves.value == Option::None) then
+    none_ok = false
+  end
+  if !(report.drops.value == Option::None) || !(report.retain_release.value == Option::None) then
+    none_ok = false
+  end
+  if !(report.clones.value == Option::None) || !(report.inline_decisions.value == Option::None) then
+    none_ok = false
+  end
+  if !(report.vectorization_eligibility.value == Option::None) || report.vectorization_eligibility.bound_kind != "unknown" then
+    none_ok = false
+  end
+  if !(report.hotness.value == Option::None) || !(report.allocation_sites.value == Option::None) then
+    none_ok = false
+  end
+  if !(report.bounds_check_sites.value == Option::None) || report.bounds_check_sites.bound_kind != "unknown" then
+    none_ok = false
+  end
+  perf_lir_lane_expect(&mut out, "L3-mir-surfaces-none", none_ok)
+
+  # ——— L4: the machine word count stays None/estimate ———
+  perf_lir_lane_expect(&mut out, "L4-instruction-count",
+    report.instruction_count.value == Option::None &&
+    report.instruction_count.provenance == PerfFactSource::StaticEstimate &&
+    report.instruction_count.bound_kind == "estimate")
 
   out
 end

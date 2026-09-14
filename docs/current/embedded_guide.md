@@ -414,6 +414,34 @@ dma.configure(
 dma.enable()
 ```
 
+### Compiler-checked DMA buffer ownership
+
+The place-keyed `dma_pin_*` / `dma_await` / `dma_unpin` surface in
+`std::embedded` is a first-class compiler ownership rule (audit item 16,
+next tier): the resource checker tracks each buffer place's DMA state
+(`not-pinned`, `pinned-read`, `pinned-write`, `pinned-readwrite`,
+`returns`) and rejects
+
+* ordinary CPU reads/writes/moves of a pinned place (`use of DMA-pinned ...`),
+* a second pin while the buffer is device-owned (double pin),
+* `dma_await` with no in-flight transfer and `dma_unpin` without a pin,
+* leaving the scope while the buffer is still pinned.
+
+```tangerine
+use std::embedded::{dma_pin_read, dma_await, dma_unpin}
+
+var buf: [u8; 256] = [0u8; 256]
+let pin = dma_pin_read(buf)   ## the engine owns buf
+## buf[0] = 1                 ## REJECTED: CPU write while DMA-pinned
+dma_await(buf)                ## completion: ownership returns
+buf[0] = 1                    ## legal again
+dma_unpin(buf)                ## release
+```
+
+The raw `DmaChannel`/`DmaTransfer` handles above take addresses, not
+places, and are not tracked — the place-keyed surface is the canonical
+compiler-visible contract.
+
 ## Power Management
 
 ```tangerine

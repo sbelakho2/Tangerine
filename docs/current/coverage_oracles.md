@@ -164,7 +164,7 @@ from the layout engine's side.
   tests/*.sh tool lanes); a file with no exercising test fails the
   gate.
 - The tests-added layer: `tests/compiler_module_sweep_tests.tg`
-  references every compiler module by qualified path (including the
-  entry points and the tool modules — all 35 previously-uncovered
-  files), so the attribution is closed: **49/49 compiler files
-  exercised**.
+  references the compiler modules with no other exercising test by
+  qualified path (the entry points and the tool modules included;
+  behavior tests carry the rest), so the attribution is closed:
+  **78/78 compiler files exercised** (the checker's live count).

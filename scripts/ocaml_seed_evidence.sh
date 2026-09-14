@@ -118,18 +118,21 @@ LOCK="$ROOT_DIR/bootstrap/ocaml-toolchain.lock"
 TG_BIN="$STAGE_DIR/_build/default/bin/tg_stage0.exe"
 TEST_BIN="$STAGE_DIR/_build/default/test/test_main.exe"
 
-# Harness timeout calibration (measured 2026-09-13 on the development host,
-# seed at commit 7e2f449): the FULL bootstrap-check closure measured 400.4 s
-# wall (6:40.37), tg_bootstrap_gate 364.9 s (6:04.93) and the tg_evidence
-# component 385.6 s (6:25.61). Each cap is the measurement x 2 rounded up to
-# the next 60 s (bootstrap-check 800.8 -> 840 s; gate 729.9 -> 780 s;
-# tg_evidence 771.2 -> 780 s): the host carries unrelated background load
-# and a 1.4-1.6x contention factor was observed on the calibration day. A
-# cap is a bound, never a skip: the full runs still execute under them.
+# Harness timeout calibration (re-measured 2026-09-14 on the development
+# host, tree at 1e5ea8a + the active workstream changes, under concurrent
+# host load; the 2026-09-13 calibration at 7e2f449 — 400.4/364.9/385.6 s —
+# is superseded): the FULL bootstrap-check closure measured 1049.9 s wall
+# (17:29.88), tg_bootstrap_gate 1207.6 s (20:07.55) and the tg_evidence
+# component 1276.6 s (21:16.63). Each cap is the measurement x 1.5 rounded
+# up to the next 60 s (bootstrap-check: 1049.9 x 1.5 = 1574.8 -> 1620 s;
+# gate: 1207.6 x 1.5 = 1811.3 -> 1860 s; tg_evidence: 1276.6 x 1.5 =
+# 1914.9 -> 1920 s). The host carries unrelated background load (load
+# average 12-17 on 18 cores during the calibration). A cap is a bound,
+# never a skip: the full runs still execute under them.
 # Re-measure when the closure grows materially.
-BOOTSTRAP_CHECK_TIMEOUT_S=840
-GATE_TIMEOUT_S=780
-EVIDENCE_TIMEOUT_S=780
+BOOTSTRAP_CHECK_TIMEOUT_S=1620
+GATE_TIMEOUT_S=1860
+EVIDENCE_TIMEOUT_S=1920
 # The generic component-selfcheck bound (components other than the full
 # closure phases); the tests binary is fast and keeps its own bound.
 COMPONENT_TIMEOUT_S=420
@@ -190,9 +193,9 @@ for EXE in "$STAGE_DIR"/_build/default/selfcheck/*.exe; do
   NAME="$(basename "$EXE" .exe)"
   set +e
   # The full-closure phases use the calibrated caps: tg_bootstrap_gate runs
-  # the whole manifest closure (measured 364.9 s on 2026-09-13) and
-  # tg_evidence the full evidence phase (measured 385.6 s); both exceeded
-  # the generic component bound under host contention.
+  # the whole manifest closure (measured 1207.6 s on 2026-09-14) and
+  # tg_evidence the full evidence phase (measured 1276.6 s); both far exceed
+  # the generic component bound.
   SC_TIMEOUT_S="$COMPONENT_TIMEOUT_S"
   if [ "$NAME" = "tg_bootstrap_gate" ]; then
     SC_TIMEOUT_S="$GATE_TIMEOUT_S"

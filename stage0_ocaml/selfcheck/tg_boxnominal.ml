@@ -28,8 +28,11 @@
      [6] end-to-end: a self-contained Box declaration (alloc + box_new +
          get/into_inner + Clone impl) type-checks, lowers, monomorphizes,
          passes the concrete MIR gate, folds its size_of queries and RUNS
-         on the VM with a real wrapper value: `Box::new(42).clone()` reads
-         back 42 through `*c.get()`.
+         on the VM with a real wrapper value: `Box::new(42).clone()
+         .into_inner()` reads back 42, AND clone is NON-DESTRUCTIVE — the
+         source box survives repeated clones (the source is read after a
+         clone, and one box is cloned twice; the pre-fix body routed the
+         source through into_inner and trapped on the freed region).
 
    Exit 0 iff every leg passes. *)
 
@@ -503,6 +506,14 @@ impl Ptr[T]
   def cast[U](self: Self) -> Ptr[U]
     Ptr { address: self.address }
   end
+
+  def is_null(self: Self) -> Bool
+    self.address == 0
+  end
+end
+
+def panic(msg: String) -> Unit
+  ()
 end
 
 extern def __intrinsic_mem_alloc(size: UInt) -> Ptr[u8]
@@ -539,7 +550,20 @@ end
 
 impl[T: Clone] Box[T]
   def clone(self: Self) -> Box[T]
-    box_new[T](self.into_inner().clone())
+    if self.ptr.is_null() then
+      panic("Box: use after drop")
+    end
+    box_new(self.ptr.read().clone())
+  end
+end
+
+struct Holder
+  a: Box[Int]
+end
+
+impl Clone for Holder
+  def clone(self: Self) -> Holder
+    Holder { a: self.a.clone() }
   end
 end
 
@@ -548,7 +572,18 @@ def main() -> Int
   let b = Box::new(v)
   let c = b.clone()
   let r = c.into_inner()
-  r
+  let r2 = b.into_inner()
+  let h = Holder { a: Box::new(v) }
+  let c1 = h.clone()
+  let c2 = h.clone()
+  let p1 = c1.a.get()
+  let p2 = c2.a.get()
+  let p3 = h.a.get()
+  let v1 = p1.read()
+  let v2 = p2.read()
+  let v3 = p3.read()
+  let total = r + r2 + v1 + v2 + v3
+  if total == 210 then 42 else total end
 end
 |}
   in
@@ -608,7 +643,7 @@ end
                      match Vm.run_inspect vm2 frame with
                      | Ok "42" ->
                          check
-                           "end-to-end: Box::new(42).clone() reads back 42 through its own clone impl"
+                           "end-to-end: Box::new(42).clone().into_inner() = 42 AND the source box survives repeated clones (source read after clone, two clones of one box)"
                            true
                      | Ok other ->
                          check "end-to-end: VM result" false;
@@ -617,6 +652,322 @@ end
                          check "end-to-end: VM result" false;
                          Printf.printf "    inspect run: %s\n" m))))
 
+(* ── [7] borrowed-tree walk: read-through vs destructive ─────────────
+   Regression for the kernel's residual macro-call scan
+   (compiler_core.residual_macro_calls_in_expr): the scan is a READ-ONLY
+   query over the program expand_macros is about to return. The pre-fix
+   walk consumed every boxed payload with into_inner(), deallocating
+   regions in the program it was inspecting; the following
+   assign_node_ids then trapped in assign_expr_ids with `deref read:
+   access to freed region`. This leg pins both halves: the read-through
+   walk (the fix: `*x.get()`, never taking ownership) leaves the owner's
+   tree fully usable, and the pre-fix destructive walk leaves it dangling
+   so the next reader fails closed. *)
+
+let contains_substring (haystack : string) (needle : string) : bool =
+  let n = String.length haystack and m = String.length needle in
+  let rec go i = i + m <= n && (String.sub haystack i m = needle || go (i + 1)) in
+  go 0
+
+let vm_result_of_src (name : string) (src : string) : (string, string) result =
+  match check_src name src with
+  | Error errs -> Error ("typecheck: " ^ String.concat "; " errs)
+  | Ok (env, prog) ->
+      let mir = lower_all env prog in
+      let entry_name, entry =
+        match Driver.resolve_bootstrap_entry mir None with
+        | Some e -> e
+        | None -> failwith "tg_boxnominal: no main entry"
+      in
+      let lang_items = Typecheck.lang_items_of_env env in
+      let query_sigs = Driver.closure_query_sigs ~lowered:(Some mir) env in
+      let generic_types = Driver.closure_generic_types env in
+      (match
+         Driver.run_mono_phase ~entry_name ~entry
+           ~box_tid:env.Typecheck.state.Typecheck.box_tid ~lang_items ~generic_types
+           ~query_sigs ~env:(Some env) mir
+       with
+       | Error errs -> Error ("mono: " ^ String.concat "; " errs)
+       | Ok mo ->
+           let vprog =
+             Layout_fold.fold_program ~lang_items
+               ~name_of:(fun tid -> List.assoc_opt tid !Typecheck.type_names_global)
+               mo.Driver.mo_program
+           in
+           let host = Host.create ~repo_root:"." ~argv:[||] in
+           (match
+              Vm.run_li ~limits:Vm.default_limits ~lang_items ~program:vprog
+                ~entry:mo.Driver.mo_entry ~argv:[||] ~host
+            with
+            | Error e -> Error e.Vm.message
+            | Ok _ -> (
+                match
+                  Vm.entry_frame_of_li ~limits:Vm.default_limits ~lang_items
+                    ~program:vprog ~entry:mo.Driver.mo_entry ~argv:[||]
+                with
+                | Error m -> Error ("inspect: " ^ m)
+                | Ok (vm2, frame) ->
+                    (* share BOTH the memory and the host record: the
+                       host's intrinsic bindings allocate in
+                       host.memory, while the VM dereferences through
+                       vm.memory; a fresh vm2 host would allocate in a
+                       different arena whose region ids alias the
+                       executed run's regions *)
+                    vm2.Vm.host <- host;
+                    vm2.Vm.memory <- host.Host.memory;
+                    (match Vm.run_inspect vm2 frame with
+                     | Ok v -> Ok v
+                     | Error m -> Error ("inspect run: " ^ m)))))
+
+let borrow_walk_part () : unit =
+  let prelude =
+    {|struct Box[T]
+  ptr: Ptr[T]
+end
+
+struct Ptr[T]
+  address: UInt
+end
+
+impl Ptr[T]
+  def cast[U](self: Self) -> Ptr[U]
+    Ptr { address: self.address }
+  end
+
+  def is_null(self: Self) -> Bool
+    self.address == 0
+  end
+end
+
+def panic(msg: String) -> Unit
+  ()
+end
+
+extern def __intrinsic_mem_alloc(size: UInt) -> Ptr[u8]
+extern def __intrinsic_mem_free(ptr: Ptr[u8], size: UInt) -> Unit
+
+def alloc[T](size: UInt) -> Ptr[T]
+  __intrinsic_mem_alloc(size).cast[T]()
+end
+
+def dealloc[T](ptr: Ptr[T], size: UInt) -> Unit
+  __intrinsic_mem_free(ptr.cast[u8](), size)
+end
+
+def box_new[T](sink value: T) -> Box[T]
+  let ptr = alloc[T](size_of[T]())
+  ptr.write(value)
+  Box { ptr: ptr }
+end
+
+impl[T] Box[T]
+  def get(self: Box[T]) -> Ptr[T]
+    self.ptr
+  end
+
+  def get_mut(inout self: Box[T]) -> Ptr[T]
+    self.ptr
+  end
+
+  def into_inner(sink self: Box[T]) -> T
+    match self
+    when Box { ptr: ptr } then
+      let value = ptr.read()
+      dealloc[T](ptr, size_of[T]())
+      value
+    end
+  end
+end
+|}
+  in
+  let shared =
+    {|struct Expr
+  kind: ExprKind
+  node_id: Int
+end
+
+enum ExprKind
+  ExprInt(Int)
+  ExprBinaryOp(Box[Expr], Box[Expr])
+end
+
+def count_nodes(expr: Expr) -> Int
+  let here = expr.node_id + 1
+  match expr.kind
+  when ExprKind::ExprInt(_) then here
+  when ExprKind::ExprBinaryOp(lhs, rhs) then
+    here + count_nodes(*lhs.get()) + count_nodes(*rhs.get())
+  end
+end
+
+def sum_ids(expr: Expr) -> Int
+  let here = expr.node_id
+  match expr.kind
+  when ExprKind::ExprInt(_) then here
+  when ExprKind::ExprBinaryOp(lhs, rhs) then
+    here + sum_ids(*lhs.get()) + sum_ids(*rhs.get())
+  end
+end
+
+def assign_ids(inout expr: Expr, inout next_id: Int) -> Unit
+  expr.node_id = next_id
+  next_id = next_id + 1
+  match expr.kind
+  when ExprKind::ExprInt(_) then ()
+  when ExprKind::ExprBinaryOp(lhs, rhs) then
+    assign_ids(*lhs.get_mut(), next_id)
+    assign_ids(*rhs.get_mut(), next_id)
+  end
+end
+
+def destroy_nodes(expr: Expr) -> Int
+  let here = expr.node_id + 1
+  match expr.kind
+  when ExprKind::ExprInt(_) then here
+  when ExprKind::ExprBinaryOp(lhs, rhs) then
+    let l = lhs.into_inner()
+    let r = rhs.into_inner()
+    here + destroy_nodes(l) + destroy_nodes(r)
+  end
+end
+
+def build_tree() -> Expr
+  let l1 = Expr { kind: ExprKind::ExprInt(1), node_id: 0 }
+  let l2 = Expr { kind: ExprKind::ExprInt(2), node_id: 0 }
+  let l3 = Expr { kind: ExprKind::ExprInt(3), node_id: 0 }
+  let inner = Expr { kind: ExprKind::ExprBinaryOp(box_new(l1), box_new(l2)), node_id: 0 }
+  Expr { kind: ExprKind::ExprBinaryOp(box_new(inner), box_new(l3)), node_id: 0 }
+end
+|}
+  in
+  (* fixed path: read-through query first, then the assign walk (the
+     kernel's post-expansion assign_node_ids shape); preorder ids 1..5. *)
+  let fixed_src =
+    prelude ^ shared
+    ^ {|def main() -> Int
+  var e = build_tree()
+  let n = count_nodes(&e)
+  var ids = 1
+  assign_ids(&mut e, &mut ids)
+  let s = sum_ids(&e)
+  n * 1000 + s
+end
+|}
+  in
+  (match vm_result_of_src "borrow-walk" fixed_src with
+  | Ok "5015" ->
+      check
+        "borrow: read-through query (the fixed residual scan) then assign_ids keeps the borrowed tree usable (= 5015)"
+        true
+  | Ok other ->
+      check
+        "borrow: read-through query (the fixed residual scan) then assign_ids keeps the borrowed tree usable (= 5015)"
+        false;
+      Printf.printf "    expected 5015, got %s\n" other
+  | Error m ->
+      check
+        "borrow: read-through query (the fixed residual scan) then assign_ids keeps the borrowed tree usable (= 5015)"
+        false;
+      Printf.printf "    VM: %s\n" m);
+  (* pre-fix shape: the destructive query consumes the boxes of the tree
+     it was lent; the owner's next reader must fail closed, never silently
+     read the freed region. *)
+  let destroyed_src =
+    prelude ^ shared
+    ^ {|def main() -> Int
+  var e = build_tree()
+  let n = destroy_nodes(&e)
+  var ids = 1
+  assign_ids(&mut e, &mut ids)
+  n + ids
+end
+|}
+  in
+  let _destructive =
+  match vm_result_of_src "borrow-walk-destructive" destroyed_src with
+  | Error m when contains_substring m "freed region" ->
+      check
+        "borrow: the pre-fix destructive query leaves the owner's boxes dangling (the next reader traps on the freed region)"
+        true
+  | Error m ->
+      check
+        "borrow: the pre-fix destructive query leaves the owner's boxes dangling (the next reader traps on the freed region)"
+        false;
+      Printf.printf "    expected a freed-region trap, got: %s\n" m
+  | Ok v ->
+      check
+        "borrow: the pre-fix destructive query leaves the owner's boxes dangling (the next reader traps on the freed region)"
+        false;
+      Printf.printf "    destructive walk did not corrupt the tree (result %s)\n" v
+  in
+  (* ── resolver/checker-shaped multi-pass reads ───────────────────────
+     The kernel's resolve_names / type_check_typed / access_check /
+     resource_check are READ-ONLY analyses over the program the pipeline
+     still owns: each walks the SAME tree, often the same expression more
+     than once (resolve then check; check_expr then check_binary_op's
+     independent walk; the deinit-plan walk). The pre-fix walks consumed
+     boxed payloads with into_inner(), so the SECOND reader over the same
+     tree dereferenced a freed region — the bootstrap VM's
+     assign_stmt_ids / check_expr freed-region trap. This leg pins:
+       (1) read-only passes before AND after the mutating assign walk
+           leave the tree fully usable (the fixed shape: `*x.get()`);
+       (2) a PURE read-only pass after a destructive pass fails closed
+           (the pre-fix shape; never a silent read of the freed region). *)
+  let multi_read_src =
+    prelude ^ shared
+    ^ {|def main() -> Int
+  var e = build_tree()
+  let n1 = count_nodes(&e)
+  let s1 = sum_ids(&e)
+  var ids = 1
+  assign_ids(&mut e, &mut ids)
+  let n2 = count_nodes(&e)
+  let s2 = sum_ids(&e)
+  n1 * 1000 + n2 * 100 + s2
+end
+|}
+  in
+  (match vm_result_of_src "borrow-walk-multi-read" multi_read_src with
+  | Ok "7015" ->
+      check
+        "borrow: read-only passes before AND after assign_ids keep the borrowed tree usable (resolver/checker multi-pass shape)"
+        true
+  | Ok other ->
+      check
+        "borrow: read-only passes before AND after assign_ids keep the borrowed tree usable (resolver/checker multi-pass shape)"
+        false;
+      Printf.printf "    expected 7015, got %s\n" other
+  | Error m ->
+      check
+        "borrow: read-only passes before AND after assign_ids keep the borrowed tree usable (resolver/checker multi-pass shape)"
+        false;
+      Printf.printf "    VM: %s\n" m);
+  let pure_destroyed_src =
+    prelude ^ shared
+    ^ {|def main() -> Int
+  var e = build_tree()
+  let n = destroy_nodes(&e)
+  let s = sum_ids(&e)
+  n + s
+end
+|}
+  in
+  match vm_result_of_src "borrow-walk-pure-after-destructive" pure_destroyed_src with
+  | Error m when contains_substring m "freed region" ->
+      check
+        "borrow: a PURE read-only pass after the destructive walk traps on the freed region (checker-style reader)"
+        true
+  | Error m ->
+      check
+        "borrow: a PURE read-only pass after the destructive walk traps on the freed region (checker-style reader)"
+        false;
+      Printf.printf "    expected a freed-region trap, got: %s\n" m
+  | Ok v ->
+      check
+        "borrow: a PURE read-only pass after the destructive walk traps on the freed region (checker-style reader)"
+        false;
+      Printf.printf "    pure reader did not trap (result %s)\n" v
+
 let () =
   canonical_part ();
   checker_part ();
@@ -624,6 +975,7 @@ let () =
   layout_part ();
   drop_plan_part ();
   end_to_end_part ();
+  borrow_walk_part ();
   if !failures = 0 then begin
     Printf.printf "tg_boxnominal: ALL BOX-NOMINAL IDENTITY LEGS PASS\n";
     exit 0

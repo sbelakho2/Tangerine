@@ -14,10 +14,10 @@ Everything below is operator-facing.
 | `.woodpecker/bootstrap.yaml` | stage0(OCaml seed) -> stage1 -> stage2 -> stage3 fixed point (Darwin/aarch64) |
 | `.woodpecker/ocaml-seed-health.yaml` | non-blocking OCaml seed development-health gate |
 | `.woodpecker/linux-native.yaml` | native Linux x86-64 self-host evidence (from source, ELF) |
-| `.woodpecker/verify-core.yaml` | lint/conformance/crypto-kat/verifier/allocator/ABI/atomic/cfg/sweep/doctests/mutation/verifier-stress |
-| `.woodpecker/verify-stdlib.yaml` | stdlib integration + Postgres/MySQL native-server lanes + new modules |
+| `.woodpecker/verify-core.yaml` | lint/conformance/crypto-kat/verifier/allocator/ABI/atomic/cfg/sweep/doctests/mutation/verifier-stress + behavior-suites/differential-corpus/budget-enforcement/mode-behavior |
+| `.woodpecker/verify-stdlib.yaml` | stdlib integration + Postgres/MySQL native-server lanes + new modules (incl. the SIMD suite) |
 | `.woodpecker/verify-gfx.yaml` | gfx-ui, gfx-ui-visual, gfx-ui-gate |
-| `.woodpecker/verify-cross.yaml` | arm64 + x86_64 cross-target canary lanes |
+| `.woodpecker/verify-cross.yaml` | arm64 + x86_64 cross-target canary lanes + embedded-lane + nostd-bare-lane |
 | `.woodpecker/bench.yaml` | benchmarks (push to `main` only) |
 | `.woodpecker/docs.yaml` | API doc generation + pages-branch publish (push to `main` only) |
 | `.woodpecker/evidence-gate.yaml` | generate-then-diff evidence (incl. the invariant registry digest + catalog + `invariants-evidence.json`) + release-required-jobs set check |
@@ -220,6 +220,34 @@ bash scripts/check_doctests.sh
 bash tests/run_release_evidence_schema_tests.sh
 ```
 
+## Test-runner wiring
+
+Every `tests/run_*.sh` verification runner is invoked by a Woodpecker step
+that mirrors the wired pattern: artifact restore (`restore-stage3` +
+`materialize-tg`), the materialized `./build/tg` compiler, a per-lane step
+name, and the runner's own exit semantics (no `|| true`, no forced SKIP).
+The Woodpecker-era lanes (no GitHub counterpart) are release-required:
+their names are listed in `.woodpecker/release_required_jobs.txt`, and
+each workflow's `job-results` step depends on the new lane steps and
+publishes their success markers — a failed lane withholds the markers and
+fails the aggregate `gate`. A lane whose runner defines a capability probe
+keeps that SKIP (exit 0); a lane whose runner defines no SKIP fails on any
+mismatch.
+
+| Runner | Workflow / step | Precondition | Skip / fail semantics |
+|--------|-----------------|--------------|-----------------------|
+| `tests/run_behavior_suites.sh` | `verify-core.yaml` / `behavior-suites` | `./build/tg` (materialize-tg) | the runner probes the compiler: unsupported → SKIP (exit 0); any suite → FAIL. Runs `run_int_arith_trap_lane.sh` and `run_differential_corpus_tests.sh` inside its own contract |
+| `tests/run_differential_corpus_tests.sh` | `verify-core.yaml` / `differential-corpus` (also nested in `behavior-suites`) | `./build/tg` | LIR/direct route probe unavailable → SKIP (exit 0); LIR-GAP / DIVERGE / COMPILE-FAIL → FAIL; execution unavailable degrades to the explicit `SKIP-EXEC` structural comparison (never a silent match) |
+| `tests/run_budget_enforcement_tests.sh` | `verify-core.yaml` / `budget-enforcement` | `./build/tg` (the script's default `build/tg_stage2` ships in the same `tg-stages-macos-arm64` artifact; `stage2 == stage3` at the fixed point) | no SKIP — every acceptance case must pass or the step fails |
+| `tests/run_mode_behavior_tests.sh` | `verify-core.yaml` / `mode-behavior` | `./build/tg` | no SKIP; contracts/capabilities must hold under all four modes or FAIL |
+| `tests/run_simd_tests.sh` | `verify-stdlib.yaml` / `stdlib-new-modules` | `./build/tg` | no SKIP; behavior/layout/ABI suite or claims-honesty failure → FAIL (the `simd` feature's declared `ci_job`) |
+| `tests/run_embedded_lane.sh` | `verify-cross.yaml` / `embedded-lane` | `./build/tg` | embedded route unsupported → SKIP (exit 0); artifact/structure mismatch, or an artifact emitted by a rejected program → FAIL |
+| `tests/run_nostd_bare_lane.sh` | `verify-cross.yaml` / `nostd-bare-lane` | `./build/tg` | `--no-std` route unsupported → SKIP (exit 0); compile/run/surface-diagnostic mismatch → FAIL |
+| `tests/run_target_lane_canaries.sh` | `verify-cross.yaml` / `cross-compile` (arm64 + x86_64) | `./build/tg` | no SKIP; compile / trap-stub gate / execution failures → FAIL |
+| `tests/run_test_runner_integrity.sh`, `tests/run_bench_runner_integrity.sh` | `verify-stdlib.yaml` / `stdlib-new-modules` | `./build/tg` | no SKIP |
+| `tests/run_release_evidence_schema_tests.sh` | `evidence-gate.yaml` / `release-evidence-schema-tests` | python3 only (no compiler) | no SKIP |
+| `tests/run_wasi_conformance.sh`, `tests/run_wasm_conformance.sh` | `wasm-wasi.yaml` (manual, NOT in the gate) | `./build/tg`; optional `wasmtime` | `wasmtime` absent → the execution sub-lane is reported skipped; the structural lane must pass or FAIL |
+
 ## GitHub job → Woodpecker mapping
 
 | GitHub job | Woodpecker workflow | Step | Image / agent | Notes |
@@ -256,6 +284,13 @@ bash tests/run_release_evidence_schema_tests.sh
 | release-freeze | `release-freeze.yaml` | `release-freeze` | docker linux, `python:3.12-bookworm` | `release/**` PRs; changed files from `CI_PIPELINE_FILES`, waiver marker from the commit message |
 | workflow-lint | `workflow-lint.yaml` | `workflow-lint` | docker linux, `woodpeckerci/woodpecker-cli:v3.9.0` | actionlint → Woodpecker linter |
 | release-gate | `gate.yaml` | `release-gate` | docker linux, `amazon/aws-cli:2.36.44` | marker-based aggregate; runs on success and failure |
+
+Woodpecker-era lanes with no GitHub counterpart (added after the
+migration, all release-required and marker-backed): `behavior-suites`,
+`differential-corpus`, `budget-enforcement`, `mode-behavior`
+(`verify-core.yaml`), `embedded-lane`, `nostd-bare-lane`
+(`verify-cross.yaml`), and the SIMD suite inside `stdlib-new-modules`
+(`verify-stdlib.yaml`). Their wiring is itemized in "Test-runner wiring".
 
 ## Branch protection (the required-check policy)
 

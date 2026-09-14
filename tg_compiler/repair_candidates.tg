@@ -105,7 +105,8 @@ use std::collections::{Vec}
 use tg_compiler::token::{Span}
 use tg_compiler::parser::{
   Diagnostic, DiagLevel, DiagnosticSemanticData, OwnershipDiagnosticData, TypeMismatchData,
-  TraitFailureData, EffectViolationData
+  TraitFailureData, EffectViolationData, CapabilityDiagnosticData, ContractDiagnosticData,
+  AbiDiagnosticData
 }
 use tg_compiler::ids::{stable_digest_of}
 use tg_compiler::stable_ids::{
@@ -506,9 +507,12 @@ def rc_ownership_candidates(
   related: Vec[String]
 ) -> Vec[RepairCandidate]
   var out: Vec[RepairCandidate] = Vec::new()
-  var name = primary.clone()
+  # The payload's place is the semantic subject (the stable-id source);
+  # the primary symbol is only the presentation fallback for a payload
+  # that carries no place.
+  var name = data.place.clone()
   if name == "" then
-    name = data.place.clone()
+    name = primary.clone()
   end
   if name == "" then
     return out
@@ -987,7 +991,12 @@ end
 #     instantiation; R4: the diagnostic id derivation round-trips through
 #     the explain tree; R5: a payload-less diagnostic yields NO candidates
 #     (prose is never parsed); R6: the stable repair id is deterministic
-#     and distinct per operation. Empty result = the lane verifies.
+#     and distinct per operation; R7: missing parameters answer the typed
+#     missing-parameter envelope; R8: a type mismatch yields
+#     ConstructVia + the From impl candidate; R9: an effect violation
+#     yields the annotation + call-removal candidates; R10: capability /
+#     contract / ABI diagnostics yield no §35 candidates (the typed
+#     explain tree stays the answer). Empty result = the lane verifies.
 
 def rc_lane_bool(inout out: Vec[String], name: String, ok: Bool) -> Unit
   if !ok then
@@ -1148,19 +1157,21 @@ pub def repair_candidates_lane_check() -> Vec[String]
   end
 
   # ———— R4: explain <-> repair round trip from the typed diagnostic ————
-  # The typed explain tree carries the payload class node; the same
-  # diagnostic id keys the candidates; the context extraction reads the
-  # class node by kind (no prose).
+  # The typed explain tree carries the payload class node AND the typed
+  # place leaf; the same diagnostic id keys the candidates; the context
+  # extraction reads the class node by kind (no prose).
   let tree = diagnostic_explain_node(&d1)
-  let class_rows = repair_context_rows_of_explain(tree)
+  let class_rows = repair_context_rows_of_explain(tree.clone())
   var saw_class = false
-  var saw_place = false
   for r in class_rows do
     if r.starts_with("class:ownership-rejection:") then saw_class = true end
-    if r == "place r" then saw_place = true end
   end
   rc_lane_bool(&mut out, "r4-explain-class", saw_class)
-  rc_lane_bool(&mut out, "r4-explain-fact", saw_place)
+  let place_leaves = explain_node_find_all(tree.clone(), "ownership-place".to_string())
+  rc_lane_int(&mut out, "r4-explain-place-leaves", place_leaves.len(), 1)
+  if place_leaves.len() == 1 then
+    rc_lane_text(&mut out, "r4-explain-place-fact", place_leaves[0].clone().subject, "place r")
+  end
   rc_lane_text(&mut out, "r4-diagnostic-round-trip",
     stable_diagnostic_id_text(cands1[0].clone().diagnostic),
     stable_diagnostic_id_text(repair_diagnostic_id_of(&d1)))
@@ -1191,6 +1202,121 @@ pub def repair_candidates_lane_check() -> Vec[String]
   let inst7 = repair_instantiate(cands1[0].clone(), repair_params_new())
   rc_lane_text(&mut out, "r7-missing-kind", inst7.kind.clone(), "missing-parameter")
   rc_lane_int(&mut out, "r7-missing-count", inst7.missing.len(), 3)
+
+  # ———— R8: type mismatch -> ConstructVia + ResolveIntoImpl ————
+  let d8 = Diagnostic {
+    level: DiagLevel::Error,
+    message: "expected `Money`, found `Int`".to_string(),
+    span: Option::Some(rc_lane_span(40)),
+    notes: Vec::new(),
+    suggestions: Vec::new(),
+    code: Option::Some("E0200".to_string()),
+    primary_symbol: Option::Some("m::f#fn()->unit".to_string()),
+    semantic_data: Option::Some(DiagnosticSemanticData::TypeMismatch(TypeMismatchData {
+      expected: "Money".to_string(),
+      actual: "Int".to_string(),
+      site: "repair-lane.tg:40".to_string()
+    }))
+  }
+  let cands8 = candidate_of_diagnostic(d8.clone())
+  rc_lane_int(&mut out, "r8-count", cands8.len(), 2)
+  if cands8.len() == 2 then
+    rc_lane_text(&mut out, "r8-target-kind", semantic_target_id_kind(cands8[0].clone().target), "decl")
+    rc_lane_text(&mut out, "r8-construct-op", rc_template_text(cands8[0].clone().operation),
+      "ConstructVia(Money::from_minor)")
+    rc_lane_text(&mut out, "r8-impl-op", rc_template_text(cands8[1].clone().operation),
+      "InsertImpl(From<Int> for Money)")
+    let params8 = rc_lane_insert_params("m::f#fn()->unit".to_string(),
+      "m::f#fn()->unit#H9".to_string(), "let m = Money::from_minor(i)".to_string())
+    let inst8 = repair_instantiate(cands8[0].clone(), params8)
+    rc_lane_text(&mut out, "r8-instantiate-kind", inst8.kind.clone(), "edit")
+    # The typed explain tree carries the mismatch class node.
+    var saw_mismatch = false
+    for r in repair_context_rows_of_explain(diagnostic_explain_node(&d8)) do
+      if r.starts_with("class:type-mismatch:") then saw_mismatch = true end
+    end
+    rc_lane_bool(&mut out, "r8-explain-class", saw_mismatch)
+  end
+
+  # ———— R9: effect violation -> RemoveEffectAnnotation / RemoveViolatingCall ————
+  let d9 = Diagnostic {
+    level: DiagLevel::Error,
+    message: "@no_alloc on `f` violated by `g`".to_string(),
+    span: Option::Some(rc_lane_span(50)),
+    notes: Vec::new(),
+    suggestions: Vec::new(),
+    code: Option::Some("E0232".to_string()),
+    primary_symbol: Option::Some("f".to_string()),
+    semantic_data: Option::Some(DiagnosticSemanticData::EffectViolation(EffectViolationData {
+      effect: "no_alloc".to_string(),
+      path: Vec::from(["f".to_string(), "m".to_string(), "g".to_string()])
+    }))
+  }
+  let cands9 = candidate_of_diagnostic(d9.clone())
+  rc_lane_int(&mut out, "r9-count", cands9.len(), 2)
+  if cands9.len() == 2 then
+    rc_lane_text(&mut out, "r9-annotation-op", rc_template_text(cands9[0].clone().operation),
+      "RemoveEffectAnnotation(@no_alloc)")
+    rc_lane_text(&mut out, "r9-call-op", rc_template_text(cands9[1].clone().operation),
+      "RemoveViolatingCall(g)")
+  end
+
+  # ———— R10: capability / contract / ABI + nonsemantic: no prose, no
+  # candidates (the typed diagnostic's explain tree stays the answer) ————
+  let d_cap = Diagnostic {
+    level: DiagLevel::Error,
+    message: "type `R` does not satisfy `Transferable`".to_string(),
+    span: Option::Some(rc_lane_span(60)),
+    notes: Vec::new(),
+    suggestions: Vec::new(),
+    code: Option::Some("E0277".to_string()),
+    semantic_data: Option::Some(DiagnosticSemanticData::Capability(CapabilityDiagnosticData {
+      capability: "Transferable".to_string(),
+      subject: "R".to_string(),
+      operation: "transfer".to_string(),
+      state_before: "not-satisfied".to_string(),
+      fact: "the structural Transferable derivation failed for `R`".to_string()
+    }))
+  }
+  rc_lane_int(&mut out, "r10-capability-none", candidate_of_diagnostic(d_cap.clone()).len(), 0)
+  let d_con = Diagnostic {
+    level: DiagLevel::Error,
+    message: "@budget on `f` violated".to_string(),
+    span: Option::Some(rc_lane_span(61)),
+    notes: Vec::new(),
+    suggestions: Vec::new(),
+    code: Option::Some("E0235".to_string()),
+    semantic_data: Option::Some(DiagnosticSemanticData::Contract(ContractDiagnosticData {
+      contract: "@budget".to_string(),
+      obligation: "heap_allocations derived 2 vs limit 0".to_string(),
+      subject: "f".to_string(),
+      state_before: "violated".to_string(),
+      fact: "heap_allocations: static-bound".to_string()
+    }))
+  }
+  rc_lane_int(&mut out, "r10-contract-none", candidate_of_diagnostic(d_con.clone()).len(), 0)
+  let d_abi = Diagnostic {
+    level: DiagLevel::Error,
+    message: "not FFI-safe".to_string(),
+    span: Option::Some(rc_lane_span(62)),
+    notes: Vec::new(),
+    suggestions: Vec::new(),
+    code: Option::None,
+    semantic_data: Option::Some(DiagnosticSemanticData::Abi(AbiDiagnosticData {
+      surface: "extern-c".to_string(),
+      requirement: "no-payload-value".to_string(),
+      subject: "E".to_string(),
+      fact: "canonical crossing: tagged-ptr".to_string()
+    }))
+  }
+  rc_lane_int(&mut out, "r10-abi-none", candidate_of_diagnostic(d_abi.clone()).len(), 0)
+  # ...and the capability explain tree answers its typed facts.
+  let cap_tree = diagnostic_explain_node(&d_cap)
+  let cap_leaves = explain_node_find_all(cap_tree, "capability-subject".to_string())
+  rc_lane_int(&mut out, "r10-capability-explain", cap_leaves.len(), 1)
+  if cap_leaves.len() == 1 then
+    rc_lane_text(&mut out, "r10-capability-explain-fact", cap_leaves[0].clone().subject, "subject R")
+  end
 
   out
 end

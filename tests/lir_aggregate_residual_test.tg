@@ -30,9 +30,17 @@
 #   word, the enum's canonical value word — stored/read by the byte-mode
 #   width-sized access at the layout byte offset, the enum's tag still
 #   reading at offset 0 of the value word, destruction through the
-#   plan's byte-offset field address), the declaration-level enum
-#   payload boundaries that stay fail-closed (a @packed/@align enum, a
-#   sub-word payload field), and verify_lir on every admitted row.
+#   plan's byte-offset field address), the ENGINE-ENUMLAYOUT SLICE (12:
+#   the declaration-level @packed/@align enum attributes, sub-word
+#   payload fields and mixed-class / float-width union words all place
+#   at the concrete EnumLayout's absolute byte offsets — construction,
+#   discriminant, downcast, copy and drop read/write at the field's own
+#   storage width and class), and the SIMD VECTOR-FIELD SLICE (13: a
+#   vector-typed aggregate field is a whole 16-byte lane image at the
+#   engine's field byte offset — construction/read/write through the
+#   marked whole-image LirVecLoad/LirVecStore, whole-aggregate copies,
+#   and the route desc's width gate), with verify_lir on every admitted
+#   row.
 #
 # Run with: tg test tests/lir_aggregate_residual_test.tg
 
@@ -56,7 +64,8 @@ use tg_compiler::target_desc::aarch64_desc
 use tg_compiler::types::{Type, DeinitPlan}
 use tg_compiler::lir::{
   LirFunction, LirVerifyRoute, LirTermKind, LirAggShape, LirAggShapeKind,
-  LirPtrOp, LirBitMoveOp,
+  LirEnumShape, LirPtrOp, LirBitMoveOp, LirVecOp, LirStmtKind, LirBinOp,
+  LirValue,
   lir_plain_struct_shape, lir_check_agg_class_plan,
   lower_mir_fn_to_lir_prog, lir_alloc_registers_a64,
   verify_lir
@@ -136,6 +145,22 @@ def ar_enum_def_attrs(id: Int, name: String, variants: Vec[MirVariantDef], layou
   }
 end
 
+def ar_vec_def(tid: Int, name: String, lane: Type, lanes: Int) -> MirTypeDef
+  var fields: Vec[MirFieldDef] = Vec::new()
+  var i = 0
+  while i < lanes do
+    fields.push(MirFieldDef { name: "e" + i.to_string(), ty: lane.clone() })
+    i = i + 1
+  end
+  MirTypeDef {
+    id: TypeId { id: tid },
+    name: name,
+    kind: MirTypeDefKind::Struct(fields),
+    generic_params: Vec::new(),
+    layout: layout_attrs_plain(span_dummy())
+  }
+end
+
 def ar_type_defs() -> Map[Int, MirTypeDef]
   var defs: Map[Int, MirTypeDef] = Map::new()
   defs.insert(400, ar_enum_def(400, "E", Vec::from([
@@ -190,9 +215,10 @@ def ar_type_defs() -> Map[Int, MirTypeDef]
     ("x".to_string(), Type::U8),
     ("e".to_string(), ar_e_ty())
   ]), ar_packed_attrs()))
-  # The declaration-level boundaries that stay fail-closed: a @packed
-  # enum, a @align enum and a sub-word payload field (the second U8
-  # payload of variant A starts at byte 9, inside variant B's word).
+  # The engine-EnumLayout slice's declarations (413-418): each admits
+  # with its payload offsets taken from the concrete EnumLayout, so the
+  # @packed/@align attribute rules, sub-word payload fields and
+  # mixed-class/float-width union words all lower.
   defs.insert(413, ar_enum_def_attrs(413, "PackedEnumDecl", Vec::from([
     MirVariantDef { name: "A".to_string(), discriminant: 0, fields: Vec::from([Type::Int]) },
     MirVariantDef { name: "B".to_string(), discriminant: 1, fields: Vec::new() }
@@ -205,6 +231,50 @@ def ar_type_defs() -> Map[Int, MirTypeDef]
     MirVariantDef { name: "A".to_string(), discriminant: 0, fields: Vec::from([Type::Int]) },
     MirVariantDef { name: "B".to_string(), discriminant: 1, fields: Vec::new() }
   ]), ar_aligned_attrs(16)))
+  # The engine-EnumLayout slice: a genuinely PACKED sub-word declaration
+  # (@packed A(U8, Int), B — the Int payload lands at byte 9, inside the
+  # word), a mixed-class union word (A(F64) / B(Int) at the same byte 8)
+  # and a float-width union word (A(F32) / B(F64) at the same byte 8).
+  defs.insert(416, ar_enum_def_attrs(416, "PackedSubwordDecl", Vec::from([
+    MirVariantDef { name: "A".to_string(), discriminant: 0, fields: Vec::from([Type::U8, Type::Int]) },
+    MirVariantDef { name: "B".to_string(), discriminant: 1, fields: Vec::new() }
+  ]), ar_packed_attrs()))
+  defs.insert(417, ar_enum_def(417, "MixedClassUnion", Vec::from([
+    MirVariantDef { name: "A".to_string(), discriminant: 0, fields: Vec::from([Type::F64]) },
+    MirVariantDef { name: "B".to_string(), discriminant: 1, fields: Vec::from([Type::Int]) }
+  ])))
+  defs.insert(418, ar_enum_def(418, "FloatWidthUnion", Vec::from([
+    MirVariantDef { name: "A".to_string(), discriminant: 0, fields: Vec::from([Type::F32]) },
+    MirVariantDef { name: "B".to_string(), discriminant: 1, fields: Vec::from([Type::F64]) }
+  ])))
+  # The vector-field slice: Vec4 = v128 (420) and a struct carrying one
+  # at the engine's 16-byte field offset (421); Vec8 = v256 (422) and
+  # its host (423) for the route's desc-width gate.
+  defs.insert(420, ar_vec_def(420, "Vec4", Type::F32, 4))
+  defs.insert(421, ar_struct_def(421, "HasVec", Vec::from([
+    ("a".to_string(), Type::U8),
+    ("v".to_string(), ar_vec4_ty())
+  ])))
+  defs.insert(422, ar_vec_def(422, "Vec8", Type::F32, 8))
+  defs.insert(423, ar_struct_def(423, "HasVec8", Vec::from([
+    ("a".to_string(), Type::U8),
+    ("v".to_string(), ar_vec8_ty())
+  ])))
+  # The dynamic-offset element slice: an array-typed field host (424), an
+  # F32-array host (425) and an aggregate-element array (426) whose
+  # element leaf is a whole sub-image (a kept fail-closed rule).
+  defs.insert(424, ar_struct_def(424, "HasArr", Vec::from([
+    ("a".to_string(), Type::FixedArray(Type::Int, 4))
+  ])))
+  defs.insert(425, ar_struct_def(425, "HasFArr", Vec::from([
+    ("a".to_string(), Type::FixedArray(Type::F32, 2))
+  ])))
+  defs.insert(426, ar_struct_def(426, "ArrOfInner", Vec::from([
+    ("a".to_string(), Type::FixedArray(ar_inner2_ty(), 2))
+  ])))
+  defs.insert(427, ar_struct_def(427, "HasU8Arr", Vec::from([
+    ("a".to_string(), Type::FixedArray(Type::U8, 4))
+  ])))
   defs
 end
 
@@ -255,6 +325,39 @@ def ar_subword_enum_ty() -> Type
 end
 def ar_aligned_enum_decl_ty() -> Type
   Type::Adt(TypeId { id: 415 }, Vec::new())
+end
+def ar_packed_subword_enum_decl_ty() -> Type
+  Type::Adt(TypeId { id: 416 }, Vec::new())
+end
+def ar_mixed_class_union_ty() -> Type
+  Type::Adt(TypeId { id: 417 }, Vec::new())
+end
+def ar_float_width_union_ty() -> Type
+  Type::Adt(TypeId { id: 418 }, Vec::new())
+end
+def ar_vec4_ty() -> Type
+  Type::Adt(TypeId { id: 420 }, Vec::from([Type::F32]))
+end
+def ar_has_vec_ty() -> Type
+  Type::Adt(TypeId { id: 421 }, Vec::new())
+end
+def ar_vec8_ty() -> Type
+  Type::Adt(TypeId { id: 422 }, Vec::from([Type::F32]))
+end
+def ar_has_vec8_ty() -> Type
+  Type::Adt(TypeId { id: 423 }, Vec::new())
+end
+def ar_has_arr_ty() -> Type
+  Type::Adt(TypeId { id: 424 }, Vec::new())
+end
+def ar_has_farr_ty() -> Type
+  Type::Adt(TypeId { id: 425 }, Vec::new())
+end
+def ar_arr_of_inner_ty() -> Type
+  Type::Adt(TypeId { id: 426 }, Vec::new())
+end
+def ar_has_u8_arr_ty() -> Type
+  Type::Adt(TypeId { id: 427 }, Vec::new())
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -477,6 +580,73 @@ def ar_shape(defs: Map[Int, MirTypeDef], ty: Type, what: String) -> LirAggShape
     when Option::None then panic(what + " did not admit as an aggregate")
     end
   end
+end
+
+def ar_enum_shape(defs: Map[Int, MirTypeDef], ty: Type, what: String) -> LirEnumShape
+  match lir_plain_struct_shape(defs, ty)
+  when Result::Err(e) then panic(what + " enum shape admission failed: " + e)
+  when Result::Ok(o) then
+    match o
+    when Option::Some(kind) then
+      match kind
+      when LirAggShapeKind::LirAggEnum(e) then e
+      when LirAggShapeKind::LirAggStruct(_) then panic(what + " admitted as a struct shape")
+      end
+    when Option::None then panic(what + " did not admit as an aggregate")
+    end
+  end
+end
+
+def ar_vec_stores(f: LirFunction) -> Vec[Int]
+  var out: Vec[Int] = Vec::new()
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].vec
+      when Option::Some(vop) then
+        match vop
+        when LirVecOp::LirVecStore(lane, _, _) then out.push(lane.bits)
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+def ar_vec_loads(f: LirFunction) -> Vec[Int]
+  var out: Vec[Int] = Vec::new()
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].vec
+      when Option::Some(vop) then
+        match vop
+        when LirVecOp::LirVecLoad(lane, _, _) then out.push(lane.bits)
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+def ar_has_bits(bits: Vec[Int], want: Int) -> Bool
+  var found = false
+  var i = 0
+  while i < bits.len() do
+    if bits[i] == want then found = true end
+    i = i + 1
+  end
+  found
 end
 
 def ar_ptr_loads(f: LirFunction) -> Vec[(Int, Int, Bool)]
@@ -1208,28 +1378,965 @@ def ar_packed_enum_downcast_fn() -> MirFunction
 end
 
 # ———————————————————————————————————————————————————————————————
-# 11. The DECLARATION-level enum payload boundaries that stay
-#     fail-closed (no marker words, no silent acceptance): a @packed
-#     enum, an @align enum and a sub-word payload field each keep their
-#     precise named rule.
+# 11. THE ENGINE-ENUMLAYOUT SLICE — declaration-level @packed/@align
+#     enums, sub-word payload fields and mixed-class / float-width
+#     union words. The LIR image takes its payload offsets and sizes
+#     from the concrete EnumLayout (the same record the direct emitter
+#     stores from), so construction, discriminant reads, downcast
+#     payload accesses, whole copies and drop plans all read/write at
+#     the engine's absolute byte offsets with the field's own storage
+#     width and class.
 # ———————————————————————————————————————————————————————————————
 
 @test
-def packed_enum_declaration_and_subword_payload_stay_fail_closed() -> Unit
+def declaration_level_enum_layouts_admit_from_the_engine() -> Unit
   let defs = ar_type_defs()
-  match lir_plain_struct_shape(defs, ar_packed_enum_decl_ty())
-  when Result::Ok(_) then panic("a @packed enum declaration must stay fail-closed")
+  # @packed A(U8, Int): offsets 8 and 9 (the Int payload genuinely packs
+  # inside the word), image 24 = align_up(8 + align_up(9, 8), 8).
+  let packed = ar_enum_shape(defs, ar_packed_subword_enum_decl_ty(), "PackedSubwordDecl")
+  assert(packed.size == 24, "@packed PackedSubwordDecl is 24 bytes, got " + packed.size.to_string())
+  assert(packed.words == 3, "the packed enum image spans 3 word slots")
+  assert(packed.variants[0].fields.len() == 2, "variant A carries both payload fields")
+  assert(packed.variants[0].fields[0].byte_off == 8 && packed.variants[0].fields[0].size == 1, "the U8 payload sits at byte 8/width 1")
+  assert(packed.variants[0].fields[1].byte_off == 9 && packed.variants[0].fields[1].size == 8, "the Int payload packs to byte 9")
+  assert(packed.variants[1].fields.len() == 0, "variant B is payload-less")
+  # @packed with an already-aligned single word is unchanged (offset 8).
+  let packed_int = ar_enum_shape(defs, ar_packed_enum_decl_ty(), "PackedEnumDecl")
+  assert(packed_int.size == 16 && packed_int.variants[0].fields[0].byte_off == 8, "the @packed single-word declaration keeps the natural byte 8")
+  # @align(16) A(Int): the payload moves to the attribute's 16-byte
+  # boundary, image 32.
+  let aligned = ar_enum_shape(defs, ar_aligned_enum_decl_ty(), "AlignedEnumDecl")
+  assert(aligned.size == 32, "@align(16) AlignedEnumDecl is 32 bytes, got " + aligned.size.to_string())
+  assert(aligned.variants[0].fields[0].byte_off == 16, "the @align(16) payload moves to byte 16")
+  # Non-packed sub-word payloads A(U8, U8): bytes 8 and 9, image 16.
+  let sub = ar_enum_shape(defs, ar_subword_enum_ty(), "SubwordEnum")
+  assert(sub.size == 16, "SubwordEnum is 16 bytes, got " + sub.size.to_string())
+  assert(sub.variants[0].fields[0].byte_off == 8 && sub.variants[0].fields[0].size == 1, "the first U8 payload sits at byte 8")
+  assert(sub.variants[0].fields[1].byte_off == 9 && sub.variants[0].fields[1].size == 1, "the second U8 payload sits at byte 9")
+  # The mixed-class union word (A(F64) / B(Int)) and the float-width
+  # union word (A(F32) / B(F64)) both hold their variant payloads at the
+  # same byte 8 — each access uses its own width/class.
+  let mixed = ar_enum_shape(defs, ar_mixed_class_union_ty(), "MixedClassUnion")
+  assert(mixed.size == 16, "MixedClassUnion is 16 bytes, got " + mixed.size.to_string())
+  assert(mixed.variants[0].fields[0].byte_off == 8 && mixed.variants[0].fields[0].size == 8, "A's F64 sits at byte 8")
+  assert(mixed.variants[1].fields[0].byte_off == 8 && mixed.variants[1].fields[0].size == 8, "B's Int shares byte 8")
+  let fw = ar_enum_shape(defs, ar_float_width_union_ty(), "FloatWidthUnion")
+  assert(fw.size == 16, "FloatWidthUnion is 16 bytes, got " + fw.size.to_string())
+  assert(fw.variants[0].fields[0].byte_off == 8 && fw.variants[0].fields[0].size == 4, "A's F32 sits at byte 8/width 4")
+  assert(fw.variants[1].fields[0].byte_off == 8 && fw.variants[1].fields[0].size == 8, "B's F64 shares byte 8 at width 8")
+end
+
+@test
+def packed_enum_construction_discriminant_downcast_and_copy_lower() -> Unit
+  let defs = ar_type_defs()
+  # Construction of A(3u8, 9): one width-1 store at byte 8 and one
+  # width-8 store at byte 9 (the engine's packed placement).
+  let c = ar_lower(ar_packed_subword_construct_fn(), defs)
+  ar_verify_clean(c, "the @packed sub-word enum construction function")
+  let stores = ar_ptr_stores(c)
+  assert(ar_has_store(stores, 8, 1), "the U8 payload stores its width-1 image at byte 8")
+  assert(ar_has_store(stores, 9, 8), "the Int payload stores its width-8 image at byte 9")
+  # The discriminant reads the frozen tag word at byte 0.
+  let d = ar_lower(ar_packed_subword_disc_fn(), defs)
+  ar_verify_clean(d, "the @packed sub-word enum discriminant function")
+  assert(ar_has_load(ar_ptr_loads(d), 0, 8, false), "the tag reads width 8 at image byte 0")
+  # Downcasts read each payload at its own width (U8 at 8 signed-free,
+  # Int at 9 with sign extension).
+  let g = ar_lower(ar_packed_subword_u8_down_fn(), defs)
+  ar_verify_clean(g, "the @packed sub-word U8 downcast function")
+  assert(ar_has_load(ar_ptr_loads(g), 8, 1, false), "the U8 downcast loads width 1 at byte 8")
+  let h = ar_lower(ar_packed_subword_int_down_fn(), defs)
+  ar_verify_clean(h, "the @packed sub-word Int downcast function")
+  assert(ar_has_load(ar_ptr_loads(h), 9, 8, true), "the Int downcast sign-extends from byte 9")
+  # A whole-value copy moves the ONE canonical value word only.
+  let cp = ar_lower(ar_packed_subword_copy_fn(), defs)
+  ar_verify_clean(cp, "the @packed sub-word enum copy function")
+  assert(ar_ptr_loads(cp).len() == 0 && ar_ptr_stores(cp).len() == 0, "a whole enum copy is a value-word move, never an image access")
+end
+
+def ar_packed_subword_construct_fn() -> MirFunction
+  let ty = ar_packed_subword_enum_decl_ty()
+  ar_mk_fn("packed_subword_construct", Vec::new(), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "e", ty, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(1), ar_agg_rvalue(
+        AggregateKind::Struct(TypeId { id: 416 }, Vec::from(["A".to_string(), "B".to_string()])),
+        Vec::from([ar_int_operand(0, Type::Int), ar_int_operand(3, Type::U8), ar_int_operand(9, Type::Int)])))
+    ]), ar_ret_term())
+  ]))
+end
+
+def ar_packed_subword_disc_fn() -> MirFunction
+  let ty = ar_packed_subword_enum_decl_ty()
+  ar_mk_fn("packed_subword_disc", Vec::from([ar_local(1, "e", ty, false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "e", ty, false),
+    ar_local(2, "d", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_disc_rvalue(ar_place(1))),
+      ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+def ar_packed_downcast_place(fidx: Int) -> Place
+  var p = ar_place(1)
+  p.projections.push(Projection::Variant(VariantId { owner: TypeId { id: 416 }, index: 0 }))
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: 416 }, index: fidx }))
+  p
+end
+
+def ar_packed_subword_u8_down_fn() -> MirFunction
+  let ty = ar_packed_subword_enum_decl_ty()
+  ar_mk_fn("packed_subword_u8_down", Vec::from([ar_local(1, "e", ty, false)]), Type::U8, Vec::from([
+    ar_local(0, "_ret", Type::U8, true),
+    ar_local(1, "e", ty, false),
+    ar_local(2, "t", Type::U8, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(ar_packed_downcast_place(0)))),
+      ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+def ar_packed_subword_int_down_fn() -> MirFunction
+  let ty = ar_packed_subword_enum_decl_ty()
+  ar_mk_fn("packed_subword_int_down", Vec::from([ar_local(1, "e", ty, false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "e", ty, false),
+    ar_local(2, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(ar_packed_downcast_place(1)))),
+      ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+def ar_packed_subword_copy_fn() -> MirFunction
+  let ty = ar_packed_subword_enum_decl_ty()
+  ar_mk_fn("packed_subword_copy", Vec::from([ar_local(1, "e", ty, false)]), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "e", ty, false),
+    ar_local(2, "t", ty, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(ar_place(1))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def aligned_enum_construction_and_downcast_lower() -> Unit
+  let defs = ar_type_defs()
+  let c = ar_lower(ar_aligned_enum_construct_fn(), defs)
+  ar_verify_clean(c, "the @align(16) enum construction function")
+  assert(ar_has_store(ar_ptr_stores(c), 16, 8), "the @align(16) payload stores width 8 at byte 16")
+  let d = ar_lower(ar_aligned_enum_down_fn(), defs)
+  ar_verify_clean(d, "the @align(16) enum downcast function")
+  assert(ar_has_load(ar_ptr_loads(d), 16, 8, true), "the @align(16) payload reads sign-extended from byte 16")
+end
+
+def ar_aligned_enum_construct_fn() -> MirFunction
+  let ty = ar_aligned_enum_decl_ty()
+  ar_mk_fn("aligned_enum_construct", Vec::new(), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "e", ty, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(1), ar_agg_rvalue(
+        AggregateKind::Struct(TypeId { id: 415 }, Vec::from(["A".to_string(), "B".to_string()])),
+        Vec::from([ar_int_operand(0, Type::Int), ar_int_operand(9, Type::Int)])))
+    ]), ar_ret_term())
+  ]))
+end
+
+def ar_aligned_enum_down_fn() -> MirFunction
+  let ty = ar_aligned_enum_decl_ty()
+  var p = ar_place(1)
+  p.projections.push(Projection::Variant(VariantId { owner: TypeId { id: 415 }, index: 0 }))
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: 415 }, index: 0 }))
+  ar_mk_fn("aligned_enum_down", Vec::from([ar_local(1, "e", ty, false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "e", ty, false),
+    ar_local(2, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(p))),
+      ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def mixed_class_union_word_lowers_per_class() -> Unit
+  let defs = ar_type_defs()
+  # B(Int 5): an integer store at byte 8, no bit move.
+  let ci = ar_lower(ar_mixed_union_int_construct_fn(), defs)
+  ar_verify_clean(ci, "the mixed-class union's Int construction function")
+  assert(ar_has_store(ar_ptr_stores(ci), 8, 8), "B's Int stores width 8 at byte 8")
+  assert(!ar_has_bitmove(ci, LirBitMoveOp::LirBitsFpToGp), "an integer payload stores without a bit move")
+  let di = ar_lower(ar_mixed_union_int_down_fn(), defs)
+  ar_verify_clean(di, "the mixed-class union's Int downcast function")
+  assert(ar_has_load(ar_ptr_loads(di), 8, 8, true), "B's Int downcast reads sign-extended from byte 8")
+  # A(F64 1.5): the same word stores the float bit image through the
+  # marked FP->GP move.
+  let cf = ar_lower(ar_mixed_union_f64_construct_fn(), defs)
+  ar_verify_clean(cf, "the mixed-class union's F64 construction function")
+  assert(ar_has_store(ar_ptr_stores(cf), 8, 8), "A's F64 stores width 8 at byte 8")
+  assert(ar_has_bitmove(cf, LirBitMoveOp::LirBitsFpToGp), "the float payload crosses FP->GP with the marked bit move")
+  let df = ar_lower(ar_mixed_union_f64_down_fn(), defs)
+  ar_verify_clean(df, "the mixed-class union's F64 downcast function")
+  assert(ar_has_load(ar_ptr_loads(df), 8, 8, false), "A's F64 downcast loads its 8-byte image at byte 8")
+  assert(ar_has_bitmove(df, LirBitMoveOp::LirBitsGpToFp), "the float payload read crosses GP->FP with the marked bit move")
+end
+
+def ar_mixed_union_construct_fn(name: String, tid: Int, disc: Int, op: MirOperand) -> MirFunction
+  let ty = ar_mixed_class_union_ty()
+  ar_mk_fn(name, Vec::new(), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "e", ty, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(1), ar_agg_rvalue(
+        AggregateKind::Struct(TypeId { id: tid }, Vec::from(["A".to_string(), "B".to_string()])),
+        Vec::from([ar_int_operand(disc, Type::Int), op])))
+    ]), ar_ret_term())
+  ]))
+end
+
+def ar_mixed_union_int_construct_fn() -> MirFunction
+  ar_mixed_union_construct_fn("mixed_union_int_construct", 417, 1, ar_int_operand(5, Type::Int))
+end
+
+def ar_mixed_union_f64_construct_fn() -> MirFunction
+  ar_mixed_union_construct_fn("mixed_union_f64_construct", 417, 0, ar_float_operand(1.5, Type::F64))
+end
+
+def ar_mixed_union_int_down_fn() -> MirFunction
+  let ty = ar_mixed_class_union_ty()
+  var p = ar_place(1)
+  p.projections.push(Projection::Variant(VariantId { owner: TypeId { id: 417 }, index: 1 }))
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: 417 }, index: 0 }))
+  ar_mk_fn("mixed_union_int_down", Vec::from([ar_local(1, "e", ty, false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "e", ty, false),
+    ar_local(2, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(p))),
+      ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+def ar_mixed_union_f64_down_fn() -> MirFunction
+  let ty = ar_mixed_class_union_ty()
+  var p = ar_place(1)
+  p.projections.push(Projection::Variant(VariantId { owner: TypeId { id: 417 }, index: 0 }))
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: 417 }, index: 0 }))
+  ar_mk_fn("mixed_union_f64_down", Vec::from([ar_local(1, "e", ty, false)]), Type::F64, Vec::from([
+    ar_local(0, "_ret", Type::F64, true),
+    ar_local(1, "e", ty, false),
+    ar_local(2, "t", Type::F64, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(p))),
+      ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def float_width_union_word_lowers_per_width() -> Unit
+  let defs = ar_type_defs()
+  let cf = ar_lower(ar_float_width_f32_construct_fn(), defs)
+  ar_verify_clean(cf, "the float-width union's F32 construction function")
+  assert(ar_has_store(ar_ptr_stores(cf), 8, 4), "A's F32 stores its 4-byte image at byte 8")
+  assert(ar_has_bitmove(cf, LirBitMoveOp::LirBitsFpToGp), "the F32 store crosses FP->GP")
+  let df = ar_lower(ar_float_width_f32_down_fn(), defs)
+  ar_verify_clean(df, "the float-width union's F32 downcast function")
+  assert(ar_has_load(ar_ptr_loads(df), 8, 4, false), "A's F32 downcast loads width 4 at byte 8")
+  assert(ar_has_bitmove(df, LirBitMoveOp::LirBitsGpToFp), "the F32 read crosses GP->FP")
+  let cd = ar_lower(ar_float_width_f64_construct_fn(), defs)
+  ar_verify_clean(cd, "the float-width union's F64 construction function")
+  assert(ar_has_store(ar_ptr_stores(cd), 8, 8), "B's F64 stores width 8 at the same byte 8")
+end
+
+def ar_float_width_construct_fn(name: String, disc: Int, op: MirOperand) -> MirFunction
+  let ty = ar_float_width_union_ty()
+  ar_mk_fn(name, Vec::new(), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "e", ty, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(1), ar_agg_rvalue(
+        AggregateKind::Struct(TypeId { id: 418 }, Vec::from(["A".to_string(), "B".to_string()])),
+        Vec::from([ar_int_operand(disc, Type::Int), op])))
+    ]), ar_ret_term())
+  ]))
+end
+
+def ar_float_width_f32_construct_fn() -> MirFunction
+  ar_float_width_construct_fn("float_width_f32_construct", 0, ar_float_operand(1.5, Type::F32))
+end
+
+def ar_float_width_f64_construct_fn() -> MirFunction
+  ar_float_width_construct_fn("float_width_f64_construct", 1, ar_float_operand(1.5, Type::F64))
+end
+
+def ar_float_width_f32_down_fn() -> MirFunction
+  let ty = ar_float_width_union_ty()
+  var p = ar_place(1)
+  p.projections.push(Projection::Variant(VariantId { owner: TypeId { id: 418 }, index: 0 }))
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: 418 }, index: 0 }))
+  ar_mk_fn("float_width_f32_down", Vec::from([ar_local(1, "e", ty, false)]), Type::F32, Vec::from([
+    ar_local(0, "_ret", Type::F32, true),
+    ar_local(1, "e", ty, false),
+    ar_local(2, "t", Type::F32, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(p))),
+      ar_assign_stmt(ar_place(0), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def packed_subword_enum_drop_plan_consumes_engine_offsets() -> Unit
+  let defs = ar_type_defs()
+  var plans: Map[String, DeinitPlan] = Map::new()
+  var vmap: Map[Int, (VariantId, Vec[DeinitPlan])] = Map::new()
+  vmap.insert(0, (VariantId { owner: TypeId { id: 416 }, index: 0 }, Vec::from([
+    DeinitPlan::Call(ar_inst(1))
+  ])))
+  vmap.insert(1, (VariantId { owner: TypeId { id: 416 }, index: 1 }, Vec::from([
+    DeinitPlan::Trivial
+  ])))
+  plans.insert(mir_type_identity_key(ar_packed_subword_enum_decl_ty()), DeinitPlan::Enum(vmap))
+  let f = ar_lower_with_deinit(ar_deinit_fn("packed_subword_drop", ar_packed_subword_enum_decl_ty()), defs, plans, ar_finalizer_names())
+  ar_verify_clean(f, "the @packed sub-word enum drop function")
+  let (arm0, arm1) = ar_find_disc_switch(f)
+  assert(arm0 >= 0 && arm1 >= 0, "the packed enum's drop plan switches on the value word")
+  let chain_a = ar_follow_call_order(f, arm0)
+  assert(chain_a.len() == 1 && chain_a[0] == "drop_a", "variant A's arm carries its payload finalizer, got " + chain_a.len().to_string())
+  assert(ar_has_load(ar_ptr_loads(f), 8, 1, false), "the sub-word payload receiver reads its width-1 image at byte 8")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 12. THE SIMD VECTOR-FIELD SLICE — a vector-typed aggregate field is
+#     a whole 16-byte lane image at the engine's field byte offset
+#     (HasVec { a: U8, v: Vec4 } places v at 16). Construction and
+#     whole-field reads/writes lower through the marked whole-image
+#     LirVecLoad/LirVecStore at the field's frame byte address; a
+#     whole-aggregate copy carries the image; a width the route's desc
+#     does not model (v256 on aarch64) fails closed at the hosting
+#     local.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def simd_vector_field_admits_and_lowers_whole_image() -> Unit
+  let defs = ar_type_defs()
+  let shape = ar_shape(defs, ar_has_vec_ty(), "HasVec")
+  assert(shape.size == 32, "HasVec { a: U8, v: Vec4 } is 32 bytes, got " + shape.size.to_string())
+  assert(shape.fields[1].byte_off == 16 && shape.fields[1].size == 16, "the v128 field sits at the engine's 16-byte offset")
+  assert(shape.fields[1].enum_nested == Option::None, "a vector field carries no enum shape")
+  # Construction: the vector operand stores its whole image at the
+  # field's frame byte address through ONE marked 128-bit LirVecStore.
+  let c = ar_lower(ar_vec_field_construct_fn(), defs)
+  ar_verify_clean(c, "the vector-field construction function")
+  assert(ar_has_bits(ar_vec_stores(c), 128), "the vector field stores ONE 128-bit whole image")
+  assert(ar_has_bits(ar_ptr_addrs(c), 16), "the vector field's frame address is base + 16")
+  # A whole-field read loads the same image into the destination vector
+  # local through ONE marked 128-bit LirVecLoad.
+  let r = ar_lower(ar_vec_field_read_fn(), defs)
+  ar_verify_clean(r, "the vector-field read function")
+  assert(ar_has_bits(ar_vec_loads(r), 128), "the vector field read is ONE 128-bit whole image")
+  # A whole-aggregate copy carries the vector field's bytes with the
+  # rest of the image.
+  let cp = ar_lower(ar_vec_field_copy_fn(), defs)
+  ar_verify_clean(cp, "the vector-field aggregate copy function")
+end
+
+def ar_vec_field_construct_fn() -> MirFunction
+  let vy = ar_vec4_ty()
+  let sy = ar_has_vec_ty()
+  ar_mk_fn("vec_field_construct", Vec::from([ar_local(1, "v", vy, false)]), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "v", vy, false),
+    ar_local(2, "s", sy, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_agg_rvalue(
+        AggregateKind::Struct(TypeId { id: 421 }, Vec::from(["a".to_string(), "v".to_string()])),
+        Vec::from([ar_int_operand(3, Type::U8), ar_copy_operand(ar_place(1))])))
+    ]), ar_ret_term())
+  ]))
+end
+
+def ar_vec_field_read_fn() -> MirFunction
+  let vy = ar_vec4_ty()
+  let sy = ar_has_vec_ty()
+  ar_mk_fn("vec_field_read", Vec::from([ar_local(1, "s", sy, false)]), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "s", sy, false),
+    ar_local(2, "w", vy, true),
+    ar_local(3, "t", vy, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(ar_field_place(1, 421, 1)))),
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+def ar_vec_field_copy_fn() -> MirFunction
+  let sy = ar_has_vec_ty()
+  ar_mk_fn("vec_field_copy", Vec::from([ar_local(1, "s", sy, false)]), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "s", sy, false),
+    ar_local(2, "t", sy, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(ar_place(1))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def vector_field_of_an_unmodelled_width_stays_fail_closed() -> Unit
+  let defs = ar_type_defs()
+  let f = ar_ret_fn("vec8_host", Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "s", ar_has_vec8_ty(), true)
+  ]), Vec::new())
+  match lower_mir_fn_to_lir_prog(f, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Ok(_) then panic("a v256 vector field must fail closed on the aarch64 route")
   when Result::Err(e) then
-    assert(e.contains("@packed"), "the @packed enum refusal names the rule, got: " + e)
+    assert(e.contains("does not model"), "the vector-width refusal names the descriptor rule, got: " + e)
   end
-  match lir_plain_struct_shape(defs, ar_aligned_enum_decl_ty())
-  when Result::Ok(_) then panic("an @align enum declaration must stay fail-closed")
-  when Result::Err(e) then
-    assert(e.contains("@align"), "the @align enum refusal names the rule, got: " + e)
+end
+
+# ———————————————————————————————————————————————————————————————
+# 13. THE DYNAMIC-OFFSET ELEMENT SLICE (the runtime-index element
+#     place) and THE COPY-THROUGH-POINTER SLICE (the whole-image deref
+#     of a pointed-to aggregate). The place shape carries a runtime
+#     index vreg: the element address is
+#     base + static_off + index * stride, the stride from the admitted
+#     layout's element spacing; the access rides the existing marked
+#     pointer memory ops at the leaf's width/class. The whole-image
+#     deref copies between the pointed image and a frame image through
+#     the shared address-image loop.
+#
+#     BOUNDS BEHAVIOR (mirroring the direct route exactly): the direct
+#     emitter's ProjIndex arm scales the index by the element stride,
+#     adds the base and performs the width-sized load/store with NO
+#     bounds assertion of its own (its bounds guards are separate MIR
+#     MirAssert/BoundsCheck terminators, which lower through
+#     lir_lower_assert like every other guard). This slice emits the
+#     same — no compare and no trap come from the element access (the
+#     rows below assert the absence).
+# ———————————————————————————————————————————————————————————————
+
+def ar_index_place(id: Int, index_id: Int) -> Place
+  var p = ar_place(id)
+  p.projections.push(Projection::ProjIndex(MirLocalId { id: index_id }))
+  p
+end
+
+def ar_index_field_place(id: Int, index_id: Int, owner: Int, field: Int) -> Place
+  var p = ar_index_place(id, index_id)
+  p.projections.push(Projection::Field(FieldId { owner: TypeId { id: owner }, index: field }))
+  p
+end
+
+# Count the LirBinop statements whose RIGHT operand is the given
+# immediate (the index*stride multiply and the base+offset add of the
+# dynamic-address emission).
+def ar_binop_imm_count(f: LirFunction, op: LirBinOp, imm: Int) -> Int
+  var count = 0
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].kind
+      when LirStmtKind::LirBinop(opk, _, _, rhs) then
+        match rhs
+        when LirValue::LirImm(v) then
+          if opk == op && v == imm then count = count + 1 end
+        when LirValue::LirReg(_) then ()
+        end
+      when _ then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
   end
-  match lir_plain_struct_shape(defs, ar_subword_enum_ty())
-  when Result::Ok(_) then panic("a sub-word enum payload field must stay fail-closed")
+  count
+end
+
+# Count the LirBinop statements whose right operand is a REGISTER (the
+# dynamic base + scaled-index add).
+def ar_binop_reg_count(f: LirFunction, op: LirBinOp) -> Int
+  var count = 0
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].kind
+      when LirStmtKind::LirBinop(opk, _, _, rhs) then
+        match rhs
+        when LirValue::LirReg(_) then
+          if opk == op then count = count + 1 end
+        when LirValue::LirImm(_) then ()
+        end
+      when _ then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  count
+end
+
+def ar_has_lea(f: LirFunction) -> Bool
+  var found = false
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].ptr
+      when Option::Some(pop) then
+        match pop
+        when LirPtrOp::LirPtrLea(_, _) then found = true
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  found
+end
+
+# The marked static byte offsets the dynamic-address emission folds into
+# the base (LirPtrAddr) — the array-field / tail offsets that ride the
+# address rather than the access.
+def ar_ptr_addrs(f: LirFunction) -> Vec[Int]
+  var out: Vec[Int] = Vec::new()
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].ptr
+      when Option::Some(pop) then
+        match pop
+        when LirPtrOp::LirPtrAddr(_, _, off) then out.push(off)
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+def ar_has_addr(addrs: Vec[Int], want: Int) -> Bool
+  var found = false
+  var i = 0
+  while i < addrs.len() do
+    if addrs[i] == want then found = true end
+    i = i + 1
+  end
+  found
+end
+
+# The element access's BOUNDS BEHAVIOR: no compare and no trap come from
+# it (the direct route's ProjIndex arm is unchecked too).
+def ar_cmp_count(f: LirFunction) -> Int
+  var count = 0
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].kind
+      when LirStmtKind::LirCmp(_, _) then count = count + 1
+      when _ then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  count
+end
+
+def ar_trap_count(f: LirFunction) -> Int
+  var count = 0
+  var bi = 0
+  while bi < f.blocks.len() do
+    match f.blocks[bi].term.kind
+    when LirTermKind::LirTrap then count = count + 1
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  count
+end
+
+# `t = a[i]; a[i] = t` over a whole fixed-array local: the frame
+# dynamic-offset form (LirPlaceIndex).
+def ar_rt_index_frame_fn() -> MirFunction
+  ar_mk_fn("rt_index_frame", Vec::new(), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "a", Type::FixedArray(Type::Int, 4), true),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_index_place(1, 2)))),
+      ar_assign_stmt(ar_index_place(1, 2), ar_move_rvalue(ar_copy_operand(ar_place(3))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def runtime_index_frame_element_read_write_lower() -> Unit
+  let defs = ar_type_defs()
+  let f = ar_lower(ar_rt_index_frame_fn(), defs)
+  ar_verify_clean(f, "the frame runtime-index element read/write function")
+  # The addressing shape: the frame LEA, the index*8 multiply (the
+  # element stride the admitted [Int;4] shape carries) and the
+  # base+scaled-index register add.
+  assert(ar_has_lea(f), "the dynamic element address starts from the aggregate local's frame LEA")
+  assert(ar_binop_imm_count(f, LirBinOp::LirMul, 8) >= 2, "each access scales the runtime index by the element stride 8")
+  assert(ar_binop_reg_count(f, LirBinOp::LirAdd) >= 2, "each access adds the scaled index to the base")
+  # The widths: an Int element reads/writes as the width-8 signed word
+  # at the computed address (a static offset of 0 relative to it).
+  let loads = ar_ptr_loads(f)
+  let stores = ar_ptr_stores(f)
+  assert(ar_has_load(loads, 0, 8, false), "the element read is a width-8 load at the computed address")
+  assert(ar_has_store(stores, 0, 8), "the element write is a width-8 store at the computed address")
+  # The direct route's ProjIndex arm is unchecked; so is this access.
+  assert(ar_cmp_count(f) == 0, "the element access emits no bounds compare of its own (the direct route's ProjIndex arm is unchecked)")
+  assert(ar_trap_count(f) == 0, "the element access emits no trap of its own (bounds guards are separate MIR MirAssert terms)")
+end
+
+# `t = s.a[i]` over an array-typed field: the static tail before the
+# index accumulates the field's layout offset (here 0 — the sole field),
+# the element is an Int (its stride-8 scaling).
+def ar_rt_index_field_fn() -> MirFunction
+  let sy = ar_has_arr_ty()
+  ar_mk_fn("rt_index_field", Vec::new(), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "s", sy, false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_index_field_place(1, 2, 424, 0))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def runtime_index_field_element_lowers() -> Unit
+  let defs = ar_type_defs()
+  let shape = ar_shape(defs, ar_has_arr_ty(), "HasArr")
+  assert(shape.size == 16 && shape.fields.len() == 1 && shape.fields[0].byte_off == 0, "the array field sits at byte 0 of the 16-byte host")
+  let f = ar_lower(ar_rt_index_field_fn(), defs)
+  ar_verify_clean(f, "the field runtime-index element read function")
+  assert(ar_binop_imm_count(f, LirBinOp::LirMul, 8) >= 1, "the array field's element stride 8 drives the scaling")
+  let loads = ar_ptr_loads(f)
+  assert(ar_has_load(loads, 0, 8, false), "the Int element reads as a width-8 word (the static array-field offset is folded into the base add)")
+end
+
+# `t = s.a[i]` over a [U8; 4] field: a unit element stride skips the
+# multiply and the sub-word width (1) drives the access.
+def ar_rt_index_u8_fn() -> MirFunction
+  let sy = ar_has_u8_arr_ty()
+  ar_mk_fn("rt_index_u8", Vec::new(), Type::U8, Vec::from([
+    ar_local(0, "_ret", Type::U8, true),
+    ar_local(1, "s", sy, false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::U8, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_index_field_place(1, 2, 427, 0))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def runtime_index_unit_stride_sub_word_element_lowers() -> Unit
+  let defs = ar_type_defs()
+  let f = ar_lower(ar_rt_index_u8_fn(), defs)
+  ar_verify_clean(f, "the U8-array runtime-index element read function")
+  assert(ar_binop_imm_count(f, LirBinOp::LirMul, 1) == 0, "a unit element stride emits no multiply")
+  assert(ar_binop_reg_count(f, LirBinOp::LirAdd) >= 1, "the base + raw index add is still emitted")
+  assert(ar_has_load(ar_ptr_loads(f), 0, 1, false), "the U8 element reads as a width-1 unsigned word")
+end
+
+# `t = s.a[i]` over an F32 array: the sub-word float element path (the
+# width-4 bit image into a GP temporary plus the marked GP->FP move).
+def ar_rt_index_farr_fn() -> MirFunction
+  let sy = ar_has_farr_ty()
+  ar_mk_fn("rt_index_farr", Vec::new(), Type::F32, Vec::from([
+    ar_local(0, "_ret", Type::F32, true),
+    ar_local(1, "s", sy, false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::F32, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_index_field_place(1, 2, 425, 0)))),
+      ar_assign_stmt(ar_index_field_place(1, 2, 425, 0), ar_move_rvalue(ar_copy_operand(ar_place(3))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def runtime_index_float_element_lowers() -> Unit
+  let defs = ar_type_defs()
+  let f = ar_lower(ar_rt_index_farr_fn(), defs)
+  ar_verify_clean(f, "the F32-array runtime-index element read/write function")
+  assert(ar_binop_imm_count(f, LirBinOp::LirMul, 4) >= 2, "an F32 element's stride is 4")
+  let loads = ar_ptr_loads(f)
+  let stores = ar_ptr_stores(f)
+  assert(ar_has_load(loads, 0, 4, false), "the F32 element read is a width-4 bit-image load")
+  assert(ar_has_store(stores, 0, 4), "the F32 element write is a width-4 bit-image store")
+  assert(ar_has_bitmove(f, LirBitMoveOp::LirBitsGpToFp), "the F32 read crosses GP->FP through the marked move")
+  assert(ar_has_bitmove(f, LirBitMoveOp::LirBitsFpToGp), "the F32 write crosses FP->GP through the marked move")
+end
+
+# `t = r[i]` where r is a RefInternal to a [Int;4]: the deref chain's
+# fixed-array sub-image (the [ProjDeref, ProjIndex] MIR form) — the
+# same LirPlaceDerefIndex shape based at the pointer word.
+def ar_rt_index_ref_fn() -> MirFunction
+  let ry = Type::RefInternal(Type::FixedArray(Type::Int, 4), false)
+  var p = ar_place(1)
+  p.projections.push(Projection::ProjDeref)
+  p.projections.push(Projection::ProjIndex(MirLocalId { id: 2 }))
+  ar_mk_fn("rt_index_ref", Vec::from([ar_local(1, "r", ry, false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "r", ry, false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(p)))
+    ]), ar_ret_term())
+  ]))
+end
+
+# `t = a[i]` where a is a Ptr[Int]: the RAW pointer-indexing form the
+# MIR emits with no explicit deref projection (the unsafe indexing API
+# the direct emitter's ProjIndex arm admits by scaling the index with
+# the POINTEE's own storage size).
+def ar_rt_ptr_index_fn() -> MirFunction
+  ar_mk_fn("rt_ptr_index", Vec::from([ar_local(1, "p", Type::Ptr(Type::Int), false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "p", Type::Ptr(Type::Int), false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_index_place(1, 2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+# `t = p[i].y` where p is a Ptr[Inner2]: the raw pointer-index's element
+# is the whole aggregate image (stride = its admitted size 16) and the
+# static tail resolves y at the element's byte 8.
+def ar_rt_ptr_index_tail_fn() -> MirFunction
+  ar_mk_fn("rt_ptr_index_tail", Vec::from([ar_local(1, "p", Type::Ptr(ar_inner2_ty()), false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "p", Type::Ptr(ar_inner2_ty()), false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_index_field_place(1, 2, 407, 1))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def runtime_index_pointer_forms_lower() -> Unit
+  let defs = ar_type_defs()
+  # The ref-to-array deref chain form: base word + index*8.
+  let rf = ar_lower(ar_rt_index_ref_fn(), defs)
+  ar_verify_clean(rf, "the ref-to-array runtime-index read function")
+  assert(ar_binop_imm_count(rf, LirBinOp::LirMul, 8) >= 1, "the deref chain's [Int;4] element scales by 8")
+  assert(ar_has_load(ar_ptr_loads(rf), 0, 8, false), "the ref element read is a width-8 load at the computed address")
+  assert(ar_cmp_count(rf) == 0 && ar_trap_count(rf) == 0, "the deref-chain element access is unchecked like the direct route's")
+  # The raw pointer-index form (no deref projection): the pointee's own
+  # storage size 8 is the stride, and the pointer value is the base.
+  let pf = ar_lower(ar_rt_ptr_index_fn(), defs)
+  ar_verify_clean(pf, "the raw pointer-index read function")
+  assert(ar_binop_imm_count(pf, LirBinOp::LirMul, 8) >= 1, "a Ptr[Int] index scales by the pointee size 8")
+  assert(ar_binop_reg_count(pf, LirBinOp::LirAdd) >= 1, "the pointer word + scaled index add is emitted")
+  assert(ar_has_load(ar_ptr_loads(pf), 0, 8, false), "the pointer element read is a width-8 load at the computed address")
+  assert(!ar_has_lea(pf), "the raw pointer-index form needs no frame LEA (the base is the pointer word)")
+  # The pointer-index + static tail form: stride 16 (Inner2's admitted
+  # size), the leaf at the element's byte 8 — the static offset rides
+  # the marked address add before the width-8 load.
+  let tf = ar_lower(ar_rt_ptr_index_tail_fn(), defs)
+  ar_verify_clean(tf, "the raw pointer-index + static tail read function")
+  assert(ar_binop_imm_count(tf, LirBinOp::LirMul, 16) >= 1, "a Ptr[Inner2] index scales by the aggregate's admitted size 16")
+  assert(ar_has_addr(ar_ptr_addrs(tf), 8), "the element's tail byte 8 folds into the marked address add")
+  assert(ar_has_load(ar_ptr_loads(tf), 0, 8, false), "the tail's width-8 load reads at the computed address")
+end
+
+# `d = *p` then `*p = d` over p: Ptr[Inner2]: the WHOLE-IMAGE DEREF
+# copy-through-pointer round trip (the pointed image and the frame
+# image copied through the shared 8/4/2/1 address-image loop).
+def ar_whole_deref_round_trip_fn() -> MirFunction
+  ar_mk_fn("whole_deref_round_trip", Vec::from([ar_local(1, "p", Type::Ptr(ar_inner2_ty()), false)]), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "p", Type::Ptr(ar_inner2_ty()), false),
+    ar_local(2, "d", ar_inner2_ty(), true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(ar_deref_place(1)))),
+      ar_assign_stmt(ar_deref_place(1), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def whole_image_deref_copy_through_pointer_round_trip() -> Unit
+  let defs = ar_type_defs()
+  let shape = ar_shape(defs, ar_inner2_ty(), "Inner2")
+  assert(shape.size == 16, "the pointed-to Inner2 image is 16 bytes")
+  let f = ar_lower(ar_whole_deref_round_trip_fn(), defs)
+  ar_verify_clean(f, "the whole-image deref copy-through-pointer round trip")
+  let loads = ar_ptr_loads(f)
+  let stores = ar_ptr_stores(f)
+  # The read half: the pointed image's two 8-byte words load into the
+  # destination local's frame image; the write half stores the local's
+  # two words back through the pointer.
+  assert(ar_has_load(loads, 0, 8, false) && ar_has_load(loads, 8, 8, false), "the pointed image loads both 8-byte words")
+  assert(ar_has_store(stores, 0, 8) && ar_has_store(stores, 8, 8), "the pointed image stores both 8-byte words")
+  assert(ar_cmp_count(f) == 0 && ar_trap_count(f) == 0, "the copy-through-pointer walk emits no compare and no trap")
+end
+
+# The WHOLE-IMAGE DEREF of a pointed-to TAGGED ENUM: its ONE canonical
+# value word (a whole-enum copy through the pointer is the one-word
+# move/store).
+def ar_whole_deref_enum_fn() -> MirFunction
+  ar_mk_fn("whole_deref_enum", Vec::from([ar_local(1, "p", Type::Ptr(ar_e_ty()), false)]), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "p", Type::Ptr(ar_e_ty()), false),
+    ar_local(2, "e", ar_e_ty(), true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(ar_deref_place(1)))),
+      ar_assign_stmt(ar_deref_place(1), ar_move_rvalue(ar_copy_operand(ar_place(2))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def whole_image_deref_of_a_pointed_enum_is_one_word() -> Unit
+  let defs = ar_type_defs()
+  let f = ar_lower(ar_whole_deref_enum_fn(), defs)
+  ar_verify_clean(f, "the whole-enum deref read/write function")
+  assert(ar_has_load(ar_ptr_loads(f), 0, 8, false), "the whole-enum deref read is the one width-8 value word")
+  assert(ar_has_store(ar_ptr_stores(f), 0, 8), "the whole-enum deref write is the one width-8 value word")
+  assert(ar_binop_imm_count(f, LirBinOp::LirMul, 8) == 0, "no element scaling is involved in a whole-enum deref")
+end
+
+# ———————————————————————————————————————————————————————————————
+# 13b. The still-fail-closed rules of the slice, each named.
+# ———————————————————————————————————————————————————————————————
+
+@test
+def runtime_index_outside_a_fixed_array_image_stays_fail_closed() -> Unit
+  let defs = ar_type_defs()
+  let f = ar_mk_fn("rt_index_struct", Vec::new(), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "s", ar_inner2_ty(), false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_index_place(1, 2))))
+    ]), ar_ret_term())
+  ]))
+  match lower_mir_fn_to_lir_prog(f, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Ok(_) then panic("a runtime index over a non-array aggregate image must stay fail-closed")
   when Result::Err(e) then
-    assert(e.contains("inside an 8-byte word"), "the sub-word payload refusal names the rule, got: " + e)
+    assert(e.contains("FIXED-ARRAY image only"), "the rule names the admitted array image, got: " + e)
+  end
+end
+
+@test
+def runtime_index_with_a_non_integer_index_stays_fail_closed() -> Unit
+  let defs = ar_type_defs()
+  let f = ar_mk_fn("rt_index_float_idx", Vec::new(), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "a", Type::FixedArray(Type::Int, 4), true),
+    ar_local(2, "i", Type::F32, true),
+    ar_local(3, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_index_place(1, 2))))
+    ]), ar_ret_term())
+  ]))
+  match lower_mir_fn_to_lir_prog(f, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Ok(_) then panic("a non-integer runtime index must stay fail-closed")
+  when Result::Err(e) then
+    assert(e.contains("integer word"), "the rule names the integer-word admission, got: " + e)
+  end
+end
+
+@test
+def runtime_index_of_a_whole_element_sub_image_stays_fail_closed() -> Unit
+  let defs = ar_type_defs()
+  # `[Inner2; 2]`: the element leaf is a whole aggregate sub-image, which
+  # is not a scalar element access (copy-through-pointer element images
+  # are not implemented).
+  let f = ar_mk_fn("rt_index_subimage", Vec::new(), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "s", ar_arr_of_inner_ty(), false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "d", ar_inner2_ty(), true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_index_field_place(1, 2, 426, 0))))
+    ]), ar_ret_term())
+  ]))
+  match lower_mir_fn_to_lir_prog(f, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Ok(_) then panic("a runtime-index element that is a whole sub-image must stay fail-closed")
+  when Result::Err(e) then
+    assert(e.contains("whole aggregate sub-image"), "the rule names the sub-image leaf, got: " + e)
+  end
+end
+
+@test
+def whole_image_deref_size_mismatch_stays_fail_closed() -> Unit
+  let defs = ar_type_defs()
+  # p points at a 16-byte Inner2 image; the destination is a 24-byte
+  # Outer2 local: the copy-through-pointer layouts disagree.
+  let f = ar_mk_fn("whole_deref_mismatch", Vec::from([ar_local(1, "p", Type::Ptr(ar_inner2_ty()), false)]), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "p", Type::Ptr(ar_inner2_ty()), false),
+    ar_local(2, "o", ar_outer2_ty(), true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_move_rvalue(ar_copy_operand(ar_deref_place(1))))
+    ]), ar_ret_term())
+  ]))
+  match lower_mir_fn_to_lir_prog(f, defs, Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Ok(_) then panic("a whole-image deref with a layout size mismatch must stay fail-closed")
+  when Result::Err(e) then
+    assert(e.contains("16 byte(s)") && e.contains("24 byte(s)"), "the rule names both sizes, got: " + e)
   end
 end

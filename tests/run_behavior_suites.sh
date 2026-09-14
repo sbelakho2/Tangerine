@@ -54,6 +54,10 @@ fi
 SUITES=(
   "tests/embedded/embedded_mmio_behavior_test.tg"
   "tests/embedded/embedded_volatile_surface_test.tg"
+  # audit item 16 (next tier): the DMA ownership lattice lane (the canonical
+  # std::embedded dma_* op table, the pin/await/unpin transition matrix, the
+  # conservative flow join).
+  "tests/dma_ownership_lane_test.tg"
   "tests/wasi/wasi_guest_surface_test.tg"
   "tests/kernel/kernel_primitives_test.tg"
   "tests/hal/hal_software_backend_test.tg"
@@ -178,6 +182,15 @@ SUITES=(
   # the AVX2 x86-64 desc with the baseline refusal, and the stale-note
   # gate over lir.tg's live header.
   "tests/lir_vector_move_rows_test.tg"
+  # Slice 5: the peephole lane (self-move + subsumption, dead flag-set
+  # elimination, cmp+cond-branch fusion on the a64 entry, the emitter's
+  # fallthrough branch elision) and the allocator's dead-store
+  # elimination, each with the verify_lir gate.
+  "tests/lir_peephole_lane_test.tg"
+  # the perf report's LIR/allocator view: the MachineActual surfaces
+  # (spills/reloads/frame bytes/branch terms/allocated registers) and the
+  # honest None surfaces with their provenance.
+  "tests/perf_lir_view_lane_test.tg"
   # third-audit item 34: the §40 coverage ingest lane (tg.cov.v1 ids, the
   # tg.cov.trace.v1 ingest, the point indexes, uncovered_paths and the
   # test.affected / coverage.affected ops).
@@ -207,6 +220,12 @@ SUITES=(
   # events (the ReplayChoice union, the deterministic choice stream, the
   # semantic-only replay_compare and the sync-edge happens-before slice).
   "tests/replay_typed_events_test.tg"
+  # audit order item 6: the replay production bridge — the stable event
+  # dictionary (the sorted render/parse/digest round trip), the run-artifact
+  # codec (replay_run_encode / replay_run_decode) and the session comparison
+  # (the first divergence + the minimal causal slice, the documented
+  # untracked result for raw/unknown/origin-less input).
+  "tests/replay_bridge_test.tg"
 )
 
 FAILED=0
