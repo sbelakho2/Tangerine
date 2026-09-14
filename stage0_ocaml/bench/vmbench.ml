@@ -1,5 +1,8 @@
 (* vmbench.ml — focused Seed VM dispatch-loop micro-benchmark.
 
+   The stage0 seed's only VM tuning harness (kept out of selfcheck/dune:
+   a benchmark is not a gate).  Build with plain `dune build`, then:
+     _build/default/bench/vmbench.exe <arith|fields> [iterations]
    Builds hand-constructed Seed MIR programs (same construction style as
    selfcheck/tg_vmsem.ml) that exercise the interpreter's per-instruction
    paths:
