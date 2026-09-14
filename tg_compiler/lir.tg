@@ -13,6 +13,13 @@
 #   TypedProgram -> Ownership MIR -> semantic optimization -> LIR ->
 #   machine legalization -> register allocation -> peephole/scheduling ->
 #   object emission.
+# The implemented LIR route orders the post-lowering legs as
+# lower -> peephole -> machine scheduling -> register allocation ->
+# verify_lir -> emit: the bounded list scheduler runs AFTER the peephole
+# and BEFORE allocation so the allocator and the emitter share the
+# scheduled linear positions (I3) and every position-keyed allocation
+# record stays valid — see the machine scheduling section's placement
+# rule for why the reverse seam is unsound.
 # This module implements the LIR stage of that pipeline for a CORE aarch64
 # integer subset. MIR keeps moves/drops/ownership/typed places/high-level
 # aggregates; LIR has virtual registers, basic blocks, load/store, machine-
@@ -715,6 +722,36 @@
 #     only; a vector-field aggregate crossing an extern boundary fails
 #     closed).
 #
+# ── THE HEAP-COLLECTION RUNTIME-INDEX SLICE (Vec[T]/Array[T]) ─────────
+# A Vec[T]/Array[T] value is ONE handle word to the 32-byte runtime
+# header { data @ 0, len @ 8, cap @ 16, stride @ 24 }
+# (layout_engine.container_field_offset — the ONE layout authority).
+# A runtime index over the handle lowers as the dynamic-offset place
+# family LirPlaceHeapIndex / LirPlaceHeapDerefIndex (see the place-shape
+# section): the handle word at an admitted image's layout byte offset,
+# the header's data pointer loaded through it, then the SAME
+# base + static_off + index*stride arithmetic and the same marked
+# width/class accesses the fixed-array slice uses — reads, writes,
+# address-of, whole-enum copies, float moves and deinit-plan element
+# drops all ride the existing funnels (lir_heap_frame_handle_v /
+# lir_heap_deref_handle_v / lir_heap_data_v). MirLen lowers for a fixed
+# array (the compile-time count) and a Vec/Array handle (the header len
+# field after the direct route's ref-deref walk). The checker's Array
+# accessor calls lower through the direct route's runtime machinery
+# (lir_lower_collection_call): ArrayGet is the CHECKED read (the signed
+# index < len compare with an out-of-range trap, then the runtime's
+# `_tg_array_get(header, index)` address primitive and the per-class
+# element materialization), ArraySet is `_tg_array_set(header, index,
+# value)`, ArrayLen/ArrayCap are the header field loads, ArrayNew is
+# `_tg_array_new(stride)` and ArrayPush is `_tg_array_push(header,
+# value)`. The remaining fail-closed rules name themselves: the Map/Set
+# helpers (hash/eq function ADDRESSES are not carryable), the
+# Option/Result-returning array accessors (the post-call Option image
+# construction is not carried), the rest of the Array helper surface,
+# a constant-folded ProjConstantIndex over a heap collection (the heap
+# forms carry a runtime index vreg) and an aggregate element leaf
+# through the element PLACE forms.
+#
 # ── Not-implemented backlog (each entry states the exact missing rule) ─
 #   Plain-struct locals/construction/copies/field access AND tagged-
 #   enum locals ARE implemented
@@ -1020,11 +1057,16 @@
 #     beyond the zero-test encoders on the a64 route (the emitter emits
 #     one b.cond), fallthrough branch elision in the a64 emitter,
 #     and constant rematerialization in the allocator (audit item 33
-#     item 3). A sequencing/scheduling pass remains absent by design:
-#     the LIR records and target descriptions model no machine
-#     scheduler to sequence against (emission is the deterministic
-#     linear order I3); see the peephole section's not-implemented
-#     note;
+#     item 3). The MACHINE-SCHEDULING slice adds the bounded
+#     list-scheduling pass (see the machine scheduling section): it runs
+#     after the peephole and before the allocator, is gated off at
+#     O0/O1 and on at O2+ through the stamped MirProgram.opt_level, and
+#     reads its ordering-only cost model from the target description
+#     (target_desc.tg's SchedModel — approximate per-class latencies and
+#     the dual-issue flag, never a correctness input). Emission still
+#     follows the deterministic linear order (I3) — the scheduler only
+#     permutes statements inside a block, before the positions are
+#     allocated;
 #   - entry argc/argv capture for "main": not implemented as a
 #     self-contained LIR sequence — the route reuses codegen.tg's
 #     emit_save_argc_argv ctx helper (see lir_emit_function);
@@ -1207,7 +1249,8 @@ use tg_compiler::mir::{
   MirBinOp, MirUnOp, CastKind,
   MirTypeDef, MirTypeDefKind, MirVariantDef, AggregateKind,
   Place, Projection, MirBlockId, mir_opt_local_type,
-  mir_type_identity_key, mir_drop_glue_name
+  mir_type_identity_key, mir_drop_glue_name,
+  OptimizationDecision, opt_dec_row
 }
 use tg_compiler::asm::{
   CodeBuffer, buf_pos, emit8, emit32_le, emit64_le,
@@ -1273,13 +1316,14 @@ use tg_compiler::coverage_graph::{
    codegen_neon_128_binop,
    codegen_syscall
  }
- use tg_compiler::target_desc::{
-   TargetDesc, AtomicSupport, atomic_support, VectorSupport, vector_support,
-   SyscallAbi, target_desc_syscall_abi,
-   UnalignedPolicy,
-   aarch64_desc, thumbv7em_cortex_m4f_desc,
-   riscv32imac_desc, riscv64imac_desc, x86_64_desc
- }
+use tg_compiler::target_desc::{
+    TargetDesc, AtomicSupport, atomic_support, VectorSupport, vector_support,
+    SyscallAbi, target_desc_syscall_abi,
+    UnalignedPolicy,
+    SchedModel, SchedClass, sched_class_latency, sched_model_text,
+    aarch64_desc, thumbv7em_cortex_m4f_desc,
+    riscv32imac_desc, riscv64imac_desc, x86_64_desc
+  }
 # (audit items 28 + 29): the ONE ABI call-plan authority.  LIR's
 # aggregate/enum image classes route through abi_internal_image_class and
 # its scalar class decisions are cross-checked against
@@ -1293,6 +1337,7 @@ use tg_compiler::layout_engine::{
   layout_of_concrete, substituted_type_def, type_repr, Repr,
   is_simd_vector_type,
   repr_storage_size, repr_storage_align, inline_array_storage_size,
+  container_field_offset,
   classify_call_plan, AbiFlavor,
   AbiCallPlan, AbiParam, AbiReturn, AbiLocation,
   AbiLocationKind, abi_location_vector_index, abi_location_text,
@@ -7861,6 +7906,38 @@ enum LirPlaceShape
                              # id + index local id + static leaf byte
                              # offset from the base address + element
                              # stride + concrete leaf type
+  # ——— the HEAP-COLLECTION element forms (the heap-collection runtime-index
+  # slice). A Vec[T]/Array[T] value is ONE handle word pointing at the
+  # 32-byte runtime header { data @ 0, len @ 8, cap @ 16, stride @ 24 }
+  # (container_field_offset — the layout authority). The element address is
+  #     [[handle] + data_off] + static_off + index_local_vreg * stride
+  # i.e. the handle word is loaded first, the header's data pointer is
+  # loaded through it, and the SAME dynamic-offset arithmetic the fixed
+  # array forms use runs over the data pointer. This mirrors the direct
+  # emitter's ProjIndex heap arm exactly (codegen.tg's apply_projections:
+  # emit_load_mem(reg, reg, 0) header->data, then scale/add/width-access),
+  # and carries NO bounds assertion (the direct route's ProjIndex arm has
+  # no guard; the checked `.get` path is the ArrayGet intrinsic call, and
+  # out-of-range `.get` traps there — see the collection-intrinsic call
+  # lowering). Map/Set have no element places at all (an indexing surface
+  # reaches them through their runtime helper calls); String's byte
+  # indexing is not on this slice (its element is a Char, which has no LIR
+  # word rule). The element leaf must be a word-class leaf (a scalar /
+  # pointer / handle / enum value word / float); an aggregate element
+  # sub-image is not a scalar element access and fails closed.
+  LirPlaceHeapIndex(Int, Int, Int, Int, Int, Type) # frame handle element:
+                             # aggregate local id + the HANDLE WORD's layout
+                             # byte offset inside the local image (0 for a
+                             # whole Vec/Array local, the field offset for a
+                             # Vec/Array field) + runtime index local id +
+                             # static leaf byte offset inside the element +
+                             # element stride + concrete leaf type
+  LirPlaceHeapDerefIndex(Int, Int, Int, Int, Int, Type) # the same element
+                             # through a Ptr/PtrMut/RefInternal word local:
+                             # base local id + the handle word's byte offset
+                             # from the base address + index local id +
+                             # static leaf byte offset + element stride +
+                             # concrete leaf type
   LirPlaceDerefAgg(Int, Int, Type) # the WHOLE image of a pointed-to admitted
                              # aggregate (struct / tuple / fixed array):
                              # base local id + the pointee image's layout
@@ -7984,7 +8061,7 @@ def lir_index_element_rec(ctx: LirLowerCtx, cur: LirAggShape, cur_ty: Type, proj
   let n = match cur_ty
   when Type::FixedArray(_, cnt) then cnt
   when _ then
-    return Result::Err("lir: " + ctx.fn_name + ": a runtime-index projection lowers over an admitted FIXED-ARRAY image only (the projected image here is " + mir_type_identity_key(&cur_ty) + "; heap collections have no LIR local image and stay fail-closed)")
+    return Result::Err("lir: " + ctx.fn_name + ": a runtime-index projection lowers over an admitted FIXED-ARRAY image or a Vec/Array heap handle only (the projected image here is " + mir_type_identity_key(&cur_ty) + "; Map/Set have no element places and a constant-folded heap index is not this slice — fail-closed)")
   end
   if n <= 0 then
     return Result::Err("lir: " + ctx.fn_name + ": a runtime index over a zero-length fixed array does not lower (there is no element zero; fail-closed)")
@@ -8009,6 +8086,199 @@ def lir_index_element_rec(ctx: LirLowerCtx, cur: LirAggShape, cur_ty: Type, proj
   end
   if !lir_is_int_word(idx_ty) then
     return Result::Err("lir: " + ctx.fn_name + ": a runtime index local must be an integer word (local " + idx_id.to_string() + " carries " + mir_type_identity_key(&idx_ty) + " — fail-closed)")
+  end
+  let (tail, leaf_ty) = match lir_resolve_element_tail(ctx, elem, projections, fi + 1)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(r) then r
+  end
+  Result::Ok((idx_id, stride, tail, leaf_ty))
+end
+
+# ———————————————————————————————————————————————————————————————
+# HEAP-COLLECTION ELEMENT RESOLUTION (the heap-collection runtime-index
+# slice)
+# ———————————————————————————————————————————————————————————————
+# A Vec[T]/Array[T] value is ONE handle word pointing at the 32-byte
+# runtime header (container_field_offset: data @ 0, len @ 8, cap @ 16,
+# stride @ 24). The element resolution below mirrors the direct
+# emitter's ProjIndex heap arm: resolve the handle word's byte offset in
+# the base image, resolve the runtime index local and the element's
+# stride from the CLASS of the concrete element type (the same
+# classify_value_category sizes element_stride_bytes derives: a scalar
+# word's width, a one-word enum/handle/pointer, a float's byte image, an
+# admitted aggregate image's layout size) and resolve the static tail
+# inside the element exactly like the fixed-array resolver does. Map/Set
+# are NOT element-indexable (no place form); a String's byte-indexing
+# element is a Char (no LIR word rule). A constant-folded
+# ProjConstantIndex over a heap collection does not lower (MIR
+# materializes source indices as index locals; a folded constant heap
+# place is a named refusal).
+
+# The element type of a HEAP-VECTOR handle (a named Vec/Array Adt): the
+# Adt's first type argument. Option::None for every other type (a
+# FixedArray, a scalar, a Map/Set handle, a String). The names mirror
+# layout_engine's container table (container_repr_for_name) and codegen's
+# vec_elem_type_of — the two heap-vector names share ONE repr.
+def lir_heap_vec_element_type(ctx: LirLowerCtx, ty: Type) -> Option[Type]
+  match ty
+  when Type::Adt(tid, args) then
+    let name = match ctx.type_defs.get(tid.id)
+    when Option::Some(td) then td.name.clone()
+    when Option::None then "".to_string()
+    end
+    if (name == "Vec" || name == "Array") && args.len() >= 1 then
+      Option::Some(args[0].clone())
+    else
+      Option::None
+    end
+  when _ then Option::None
+  end
+end
+
+# Is this concrete type a Map/Set handle (the containers with no element
+# place)? Used only to name the refusal precisely.
+def lir_type_is_map_or_set_handle(ctx: LirLowerCtx, ty: Type) -> Bool
+  match ty
+  when Type::Adt(tid, _) then
+    let name = match ctx.type_defs.get(tid.id)
+    when Option::Some(td) then td.name.clone()
+    when Option::None then "".to_string()
+    end
+    name == "Map" || name == "HashMap" || name == "Set" || name == "HashSet"
+  when _ then false
+  end
+end
+
+# The HEAP HEADER field offsets — the ONE layout authority
+# (layout_engine.container_field_offset), never a hard-coded literal.
+def lir_heap_data_field_offset() -> Int
+  container_field_offset("Vec", "data")
+end
+
+def lir_heap_len_field_offset() -> Int
+  container_field_offset("Vec", "len")
+end
+
+# The element STRIDE of a heap-collection element, from the concrete
+# element type's class: the direct route's element_stride_bytes mirror
+# (scalar width / 8 for a one-word enum / handle / pointer / float byte
+# image / the admitted aggregate's layout size). A zero-sized element
+# (stride 0) has no addressable elements and fails closed.
+def lir_heap_element_stride(ctx: LirLowerCtx, elem_ty: Type) -> Result[Int, String]
+  if lir_field_is_enum_type(ctx, elem_ty.clone()) then
+    return Result::Ok(8)
+  end
+  if lir_field_is_handle_word(ctx, elem_ty.clone()) then
+    return Result::Ok(8)
+  end
+  if lir_is_fp_type(elem_ty.clone()) then
+    return match lir_fp_width_of(elem_ty.clone())
+    when Option::Some(w) then Result::Ok(lir_fp_bytes(w))
+    when Option::None then
+      Result::Err("lir: " + ctx.fn_name + ": a heap-collection element float type has no float width (fail-closed)")
+    end
+  end
+  if lir_is_value_word(elem_ty.clone()) || lir_is_ptr_word(elem_ty.clone()) then
+    let s = lir_field_size_bytes(elem_ty.clone())
+    if s <= 0 then
+      return Result::Err("lir: " + ctx.fn_name + ": a heap-collection element of type " + mir_type_identity_key(&elem_ty) + " has no storage width on this route (fail-closed)")
+    end
+    return Result::Ok(s)
+  end
+  match lir_plain_struct_shape(ctx.type_defs, elem_ty.clone())
+  when Result::Err(e) then
+    Result::Err("lir: " + ctx.fn_name + ": a heap-collection element with no admitted shape does not lower: " + e)
+  when Result::Ok(o) then
+    match o
+    when Option::Some(kind) then
+      match kind
+      when LirAggShapeKind::LirAggStruct(sh) then
+        if sh.size <= 0 then
+          Result::Err("lir: " + ctx.fn_name + ": a heap-collection element image is zero-sized (every element would alias; fail-closed)")
+        else
+          Result::Ok(sh.size)
+        end
+      when LirAggShapeKind::LirAggEnum(_) then Result::Ok(8)
+      end
+    when Option::None then
+      Result::Err("lir: " + ctx.fn_name + ": a heap-collection element of type " + mir_type_identity_key(&elem_ty) + " has no scalar word lowering (fail-closed)")
+    end
+  end
+end
+
+# The element RECORD for the tail resolver: the element type's admitted
+# nested shape / enum shape when it has one, so a static tail after the
+# index (Field / TupleIndex / ProjConstantIndex) descends exactly like
+# the fixed-array resolver's element walk. A scalar leaf keeps both None
+# and the tail resolver validates the leaf itself.
+def lir_heap_element_record(ctx: LirLowerCtx, elem_ty: Type, stride: Int) -> Result[LirAggField, String]
+  var nested: Option[LirAggShape] = Option::None
+  var enum_nested: Option[LirEnumShape] = Option::None
+  if lir_field_is_enum_type(ctx, elem_ty.clone()) then
+    match lir_enum_shape_of_type(ctx, elem_ty.clone())
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(e) then enum_nested = Option::Some(e)
+    end
+  elsif lir_field_is_handle_word(ctx, elem_ty.clone()) then
+    # A HANDLE element (String / Vec / Map / Set / Box / ...) is ONE
+    # scalar word leaf: its pointer-layout "shape" (a zero-field 8-byte
+    # image) must NOT make the tail resolver treat the element as a
+    # whole sub-image.
+    ()
+  else
+    match lir_plain_struct_shape(ctx.type_defs, elem_ty.clone())
+    when Result::Err(e) then
+      return Result::Err("lir: " + ctx.fn_name + ": a heap-collection element with no admitted shape does not lower: " + e)
+    when Result::Ok(o) then
+      match o
+      when Option::Some(kind) then
+        match kind
+        when LirAggShapeKind::LirAggStruct(sh) then nested = Option::Some(sh)
+        when LirAggShapeKind::LirAggEnum(e) then enum_nested = Option::Some(e)
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  Result::Ok(LirAggField {
+    name: "".to_string(),
+    word: 0,
+    byte_off: 0,
+    size: stride,
+    ty: elem_ty.clone(),
+    nested: nested,
+    enum_nested: enum_nested
+  })
+end
+
+# Resolve the runtime-index element of a heap Vec/Array handle: the
+# element type is the handle's type argument; returns (index local id,
+# element stride, static leaf offset inside the element, concrete leaf
+# type). The index local must exist and be an integer word (the direct
+# emitter loads the index word and scales it), and the tail after the
+# index uses the shared element-tail resolver, so the leaf admission is
+# exactly the fixed-array slice's.
+def lir_heap_index_element_rec(ctx: LirLowerCtx, elem_ty: Type, projections: Vec[Projection], fi: Int) -> Result[(Int, Int, Int, Type), String]
+  let idx_id = match projections[fi]
+  when Projection::ProjIndex(i) then i.id
+  when _ then
+    return Result::Err("lir: " + ctx.fn_name + ": internal divergence: the heap element resolver was called on a non-index projection (fail-closed)")
+  end
+  let idx_ty = match ctx.local_tys.get(idx_id)
+  when Option::Some(t) then t.clone()
+  when Option::None then
+    return Result::Err("lir: " + ctx.fn_name + ": a runtime index names local " + idx_id.to_string() + ", which is not a local of this function (typed MIR never produces this — fail-closed)")
+  end
+  if !lir_is_int_word(idx_ty) then
+    return Result::Err("lir: " + ctx.fn_name + ": a runtime index local must be an integer word (local " + idx_id.to_string() + " carries " + mir_type_identity_key(&idx_ty) + " — fail-closed)")
+  end
+  let stride = match lir_heap_element_stride(ctx, elem_ty.clone())
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(s) then s
+  end
+  let elem = match lir_heap_element_record(ctx, elem_ty.clone(), stride)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(r) then r
   end
   let (tail, leaf_ty) = match lir_resolve_element_tail(ctx, elem, projections, fi + 1)
   when Result::Err(e) then return Result::Err(e)
@@ -8049,7 +8319,13 @@ end
 #     pointer word instead of a frame LEA) — `off` is then the static
 #     leaf byte offset from the base address and the shape is
 #     LirPlaceDerefIndex; Option::None for every static tail.
-def lir_deref_tail_off(ctx: LirLowerCtx, pointee: Type, projections: Vec[Projection], from: Int) -> Result[(Int, Int, Type, Bool, Option[(Int, Int)]), String]
+#   - `heap_index` is the HEAP-COLLECTION marker: Option::Some((handle
+#     byte offset, index local id, element stride, static leaf offset,
+#     concrete leaf type)) when the tail's leaf is a runtime-index
+#     element of a Vec/Array HANDLE field of the pointed-to image (the
+#     heap-collection runtime-index slice — the shape is
+#     LirPlaceHeapDerefIndex); Option::None for every other tail.
+def lir_deref_tail_off(ctx: LirLowerCtx, pointee: Type, projections: Vec[Projection], from: Int) -> Result[(Int, Int, Type, Bool, Option[(Int, Int)], Option[(Int, Int, Int, Int, Type)]), String]
   var pointee_tid = -1
   match pointee
   when Type::Adt(tid, _) then pointee_tid = tid.id
@@ -8112,7 +8388,7 @@ def lir_deref_tail_off(ctx: LirLowerCtx, pointee: Type, projections: Vec[Project
             # image (one extra load); a NICHEd enum's one word IS the
             # payload (base+off geometry unchanged).
             let heap = lir_enum_shape_is_tagged(eshape) && lir_enum_shape_has_payload(eshape)
-            Result::Ok((pf.byte_off, 0, pf.ty.clone(), heap, Option::None))
+            Result::Ok((pf.byte_off, 0, pf.ty.clone(), heap, Option::None, Option::None))
           when _ then
             Result::Err("lir: " + ctx.fn_name + ": the deref downcast tail is Variant(v).Field(f) (fail-closed)")
           end
@@ -8130,7 +8406,7 @@ end
 # nested enum field's downcast tail, a fixed-array runtime-index
 # element (the dynamic-offset marker) and the final scalar/enum-word
 # leaf. A leading-deref projection inside the chain stays fail-closed.
-def lir_deref_struct_tail(ctx: LirLowerCtx, pointee: Type, pointee_tid: Int, shape0: LirAggShape, projections: Vec[Projection], from: Int) -> Result[(Int, Int, Type, Bool, Option[(Int, Int)]), String]
+def lir_deref_struct_tail(ctx: LirLowerCtx, pointee: Type, pointee_tid: Int, shape0: LirAggShape, projections: Vec[Projection], from: Int) -> Result[(Int, Int, Type, Bool, Option[(Int, Int)], Option[(Int, Int, Int, Int, Type)]), String]
   var cur = shape0
   var cur_ty = pointee.clone()
   var off = 0
@@ -8145,10 +8421,24 @@ def lir_deref_struct_tail(ctx: LirLowerCtx, pointee: Type, pointee_tid: Int, sha
     when Projection::TupleIndex(ti) then idx = ti
     when Projection::ProjConstantIndex(ci) then idx = ci
     when Projection::ProjIndex(_) then
-      # A runtime-index element of the pointed-to image's fixed-array
-      # sub-image: the same dynamic-offset geometry as the frame form,
-      # based at the pointer word (the deref chain's accumulated `off`
-      # is the array start's byte offset within the pointed-to image).
+      # A runtime-index element of the pointed-to image: a heap Vec/Array
+      # handle field of the pointed image (the heap-collection
+      # runtime-index slice — the handle word at the deref chain's
+      # accumulated `off`, the header's data pointer loaded through it,
+      # then the same dynamic-offset arithmetic) or a fixed-array
+      # sub-image (the same dynamic-offset geometry as the frame form,
+      # based at the pointer word). The heap marker tuple carries
+      # (handle byte offset, index local id, element stride, static leaf
+      # offset, concrete leaf type).
+      match lir_heap_vec_element_type(ctx, cur_ty.clone())
+      when Option::Some(elem_ty) then
+        let hrec = match lir_heap_index_element_rec(ctx, elem_ty.clone(), projections, fi)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(r) then r
+        end
+        return Result::Ok((0, 0, hrec.3.clone(), false, Option::None, Option::Some((off, hrec.0, hrec.1, hrec.2, hrec.3))))
+      when Option::None then ()
+      end
       let rec = match lir_index_element_rec(ctx, cur, cur_ty.clone(), projections, fi)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(r) then r
@@ -8157,7 +8447,7 @@ def lir_deref_struct_tail(ctx: LirLowerCtx, pointee: Type, pointee_tid: Int, sha
       let stride = rec.1
       let tail = rec.2
       let leaf_ty = rec.3
-      return Result::Ok((off + tail, 0, leaf_ty, false, Option::Some((idx_id, stride))))
+      return Result::Ok((off + tail, 0, leaf_ty, false, Option::Some((idx_id, stride)), Option::None))
     when Projection::ProjDeref then
       return Result::Err("lir: " + ctx.fn_name + ": a deref projection inside a deref chain does not lower (the deref slice admits a leading ProjDeref only; fail-closed)")
     when Projection::Variant(_) then
@@ -8177,14 +8467,14 @@ def lir_deref_struct_tail(ctx: LirLowerCtx, pointee: Type, pointee_tid: Int, sha
       # sub-image is not a scalar deref.
       match fld.enum_nested
       when Option::Some(_) then
-        return Result::Ok((off, 0, fld.ty.clone(), false, Option::None))
+        return Result::Ok((off, 0, fld.ty.clone(), false, Option::None, Option::None))
       when Option::None then
         match fld.nested
         when Option::Some(_) then
           return Result::Err("lir: " + ctx.fn_name + ": deref projection reaches the whole nested aggregate field `" + fld.name + "` (a sub-image, not a scalar word — fail-closed)")
         when Option::None then
           if lir_is_scalar_word(fld.ty) || lir_is_ptr_word(fld.ty) || lir_field_is_handle_word(ctx, fld.ty.clone()) then
-            return Result::Ok((off, 0, fld.ty.clone(), false, Option::None))
+            return Result::Ok((off, 0, fld.ty.clone(), false, Option::None, Option::None))
           else
             return Result::Err("lir: " + ctx.fn_name + ": deref projection reaches field `" + fld.name + "` of a type with no scalar word lowering (" + mir_type_identity_key(&fld.ty) + "; fail-closed)")
           end
@@ -8225,11 +8515,11 @@ def lir_deref_struct_tail(ctx: LirLowerCtx, pointee: Type, pointee_tid: Int, sha
             return Result::Err("lir: " + ctx.fn_name + ": deref downcast payload field is not a scalar word (fail-closed)")
           end
           if lir_enum_shape_is_tagged(eshape) && lir_enum_shape_has_payload(eshape) then
-            return Result::Ok((pf.byte_off, off, pf.ty.clone(), true, Option::None))
+            return Result::Ok((pf.byte_off, off, pf.ty.clone(), true, Option::None, Option::None))
           else
             # A NICHEd enum field's payload IS the field's value word:
             # the payload offset is the field's own byte offset.
-            return Result::Ok((off + pf.byte_off, 0, pf.ty.clone(), false, Option::None))
+            return Result::Ok((off + pf.byte_off, 0, pf.ty.clone(), false, Option::None, Option::None))
           end
         when _ then
           return Result::Err("lir: " + ctx.fn_name + ": the deref downcast tail is Variant(v).Field(f) (fail-closed)")
@@ -8312,12 +8602,24 @@ def lir_classify_agg_chain(ctx: LirLowerCtx, lid: Int, shape0: LirAggShape, root
     when Projection::ProjConstantIndex(ci) then
       idx = ci
     when Projection::ProjIndex(_) then
-      # A runtime-index element of an admitted fixed-array image: the
-      # dynamic-offset place (LirPlaceIndex) carrying the index vreg,
-      # the layout element stride and the static leaf offset. The index
-      # must select an element of the CURRENT image (a fixed array) and
-      # the (possibly static) tail inside the element must reach a
-      # scalar/enum/float leaf.
+      # A runtime-index element of the CURRENT image: a heap Vec/Array
+      # handle (the heap-collection runtime-index slice — the handle word
+      # at the accumulated offset `off`, the header's data pointer loaded
+      # through it, then the same dynamic-offset arithmetic) or an
+      # admitted fixed-array image (the dynamic-offset place LirPlaceIndex
+      # carrying the index vreg, the layout element stride and the static
+      # leaf offset). The index must select an element of the CURRENT
+      # image and the (possibly static) tail inside the element must
+      # reach a scalar/enum/float leaf.
+      match lir_heap_vec_element_type(ctx, cur_ty.clone())
+      when Option::Some(elem_ty) then
+        let rec = match lir_heap_index_element_rec(ctx, elem_ty.clone(), projections, fi)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(r) then r
+        end
+        return Result::Ok(LirPlaceShape::LirPlaceHeapIndex(lid, off, rec.0, rec.2, rec.1, rec.3))
+      when Option::None then ()
+      end
       let rec = match lir_index_element_rec(ctx, cur, cur_ty.clone(), projections, fi)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(r) then r
@@ -8468,6 +8770,19 @@ def lir_classify_ptr_index(ctx: LirLowerCtx, base_id: Int, projections: Vec[Proj
   if !lir_is_int_word(idx_ty) then
     return Result::Err("lir: " + ctx.fn_name + ": a runtime index local must be an integer word (local " + idx_id.to_string() + " carries " + mir_type_identity_key(&idx_ty) + " — fail-closed)")
   end
+  # A Vec/Array POINTEE: `p[i]` names an element of the Vec the pointer
+  # points at (the direct emitter's ref-like pre-load reaches the same
+  # handle), so the heap-collection element shape indexes through the
+  # handle word at the base address — never an array of Vec handles.
+  match lir_heap_vec_element_type(ctx, pointee.clone())
+  when Option::Some(elem_ty) then
+    let rec = match lir_heap_index_element_rec(ctx, elem_ty.clone(), projections, from)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then r
+    end
+    return Result::Ok(LirPlaceShape::LirPlaceHeapDerefIndex(base_id, 0, rec.0, rec.2, rec.1, rec.3))
+  when Option::None then ()
+  end
   if lir_field_is_enum_type(ctx, pointee.clone()) then
     if from + 1 != projections.len() then
       return Result::Err("lir: " + ctx.fn_name + ": a runtime-index of a pointed-to enum carries no trailing projections (the element is the enum's ONE value word; a payload is reached through the enum's own place forms — fail-closed)")
@@ -8530,6 +8845,13 @@ end
 # lookup the raw pointer-index classifier arm keys on — a place over a
 # local with no lowering record must fall through to the named
 # refusals, never panic.)
+def lir_projection_is_index(p: Projection) -> Bool
+  match p
+  when Projection::ProjIndex(_) then true
+  when _ then false
+  end
+end
+
 def lir_place_base_is_ptr_word(ctx: LirLowerCtx, id: Int) -> Bool
   match ctx.local_tys.get(id)
   when Option::Some(t) then lir_is_ptr_word(t.clone())
@@ -8580,6 +8902,13 @@ def lir_classify_place(ctx: LirLowerCtx, place: Place) -> Result[LirPlaceShape, 
         let ty = leaf.2
         let heap = leaf.3
         let index = leaf.4
+        let heap_index = leaf.5
+        match heap_index
+        when Option::Some(hpair) then
+          # The Vec/Array HANDLE field of the pointed-to image, indexed by
+          # a runtime index (the heap-collection runtime-index slice).
+          Result::Ok(LirPlaceShape::LirPlaceHeapDerefIndex(base_id, hpair.0, hpair.1, hpair.3, hpair.2, hpair.4))
+        when Option::None then
         match index
         when Option::Some(pair) then
           Result::Ok(LirPlaceShape::LirPlaceDerefIndex(base_id, pair.0, off, pair.1, ty))
@@ -8590,9 +8919,10 @@ def lir_classify_place(ctx: LirLowerCtx, place: Place) -> Result[LirPlaceShape, 
             Result::Ok(LirPlaceShape::LirPlaceDerefWord(base_id, off, ty))
           end
         end
+        end
       end
     end
-  elsif place.projections.len() > 0 && place.projections[0] == Projection::ProjIndex(_) && lir_place_base_is_ptr_word(ctx, place.local.id) then
+  elsif place.projections.len() > 0 && lir_projection_is_index(place.projections[0]) && lir_place_base_is_ptr_word(ctx, place.local.id) then
     # The RAW POINTER-INDEX form (`p[i]` over a Ptr/PtrMut/RefInternal
     # word local): the unsafe element sequence the direct emitter
     # indexes by scaling the index with the pointee's own stride.
@@ -8775,6 +9105,10 @@ def lir_place_ty(ctx: LirLowerCtx, place: Place) -> Result[Type, String]
       Result::Ok(ty)
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, ty) then
       Result::Ok(ty)
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, ty) then
+      Result::Ok(ty)
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, ty) then
+      Result::Ok(ty)
     when LirPlaceShape::LirPlaceDerefAgg(_, _, ty) then
       # The whole pointed image is not a scalar type: the shape names the
       # aggregate image itself (the copy-through-pointer paths consume it).
@@ -8846,6 +9180,10 @@ def lir_place_src_vreg(inout ctx: LirLowerCtx, place: Place) -> Result[Int, Stri
       Result::Err("lir: " + ctx.fn_name + ": runtime-index element reads materialize as width-sized dynamic-address loads at the read sites, never as an existing vreg source (fail-closed)")
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, _) then
       Result::Err("lir: " + ctx.fn_name + ": runtime-index element reads through a pointer materialize as width-sized dynamic-address loads at the read sites, never as an existing vreg source (fail-closed)")
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": heap-collection runtime-index element reads materialize as width-sized dynamic-address loads at the read sites, never as an existing vreg source (fail-closed)")
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": heap-collection runtime-index element reads through a pointer materialize as width-sized dynamic-address loads at the read sites, never as an existing vreg source (fail-closed)")
     when LirPlaceShape::LirPlaceDerefAgg(_, _, _) then
       Result::Err("lir: " + ctx.fn_name + ": a whole pointed-to image is not a scalar value (it lowers only as a copy-through-pointer source/destination; fail-closed)")
     end
@@ -9188,6 +9526,172 @@ def lir_index_element_addr(inout ctx: LirLowerCtx, block_id: Int, base_v: Int, i
   Result::Ok(addr)
 end
 
+# ———————————————————————————————————————————————————————————————
+# THE HEAP-COLLECTION ELEMENT ACCESSES (the heap-collection
+# runtime-index slice)
+# ———————————————————————————————————————————————————————————————
+# The LirPlaceHeapIndex / LirPlaceHeapDerefIndex shapes resolve the
+# element's DATA pointer through the handle: ONE word load of the
+# handle at its image offset (the local's own word at 0, or a handle
+# field's word at its layout byte offset), then ONE word load of the
+# header's data field through that handle (container_field_offset — the
+# layout authority's data @ 0 for the 32-byte Vec/Array header). The
+# resulting data pointer feeds the SAME dynamic-offset arithmetic the
+# fixed-array slice uses (lir_index_element_addr + the width/class
+# accesses), so the element read/write/address has ONE emission. NO
+# bounds assertion is emitted: the direct emitter's ProjIndex arm has
+# none either (its checked surface is the ArrayGet intrinsic call —
+# see the collection-intrinsic call lowering below).
+
+# Load ONE pointer-sized word at [base_v + off] into a fresh vreg: the
+# naturally-aligned marked load, or the byte-wise little-endian
+# fallback for a misaligned placement on a Faulting desc (the same
+# authority the aggregate field accesses use).
+def lir_load_handle_word(inout ctx: LirLowerCtx, block_id: Int, base_v: Int, off: Int) -> Int
+  let tmp = lir_fresh_vreg(ctx)
+  if off % 8 == 0 then
+    lir_block_push(ctx, block_id, LirStmt {
+      kind: LirStmtKind::LirUnop(LirUnOp::LirNeg, tmp, base_v),
+      div: Option::None,
+      ptr: Option::Some(LirPtrOp::LirPtrLoad(tmp, base_v, off, 8, false))
+    })
+  else
+    lir_agg_bytewise_read(ctx, block_id, tmp, base_v, off, 8, false)
+  end
+  tmp
+end
+
+# The frame form's handle word: the Vec/Array handle lives at
+# [frame_base(lid) + handle_off] (0 for a whole handle local).
+def lir_heap_frame_handle_v(inout ctx: LirLowerCtx, block_id: Int, lid: Int, handle_off: Int) -> Result[Int, String]
+  let agg = match ctx.agg_of.get(lid)
+  when Option::Some(a) then a
+  when Option::None then
+    return Result::Err("lir: " + ctx.fn_name + ": a heap-collection element place over a local with no aggregate record (fail-closed)")
+  end
+  let base_v = lir_agg_emit_frame_base(ctx, block_id, agg.base_slot)
+  Result::Ok(lir_load_handle_word(ctx, block_id, base_v, handle_off))
+end
+
+# The deref form's handle word: the Vec/Array handle lives at
+# [base_word + handle_off].
+def lir_heap_deref_handle_v(inout ctx: LirLowerCtx, block_id: Int, base_id: Int, handle_off: Int) -> Result[Int, String]
+  let base_v = match lir_vreg_of_local(ctx, base_id)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(b) then b
+  end
+  Result::Ok(lir_load_handle_word(ctx, block_id, base_v, handle_off))
+end
+
+# The header's DATA pointer through a collection handle (one word load at
+# the layout authority's data field offset).
+def lir_heap_data_v(inout ctx: LirLowerCtx, block_id: Int, handle_v: Int) -> Int
+  lir_load_handle_word(ctx, block_id, handle_v, lir_heap_data_field_offset())
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE LENGTH READ (MirLen) — fixed-array counts and heap-vec lengths
+# ———————————————————————————————————————————————————————————————
+# MirLen over a fixed array is its compile-time count (the direct
+# emitter's constant move). Over a Vec/Array handle it is the header's
+# len field (container_field_offset("Vec", "len") = 8) read through the
+# handle, after the direct route's ref-deref walk (codegen's
+# emit_len_ref_derefs): every Ptr/PtrMut/RefInternal layer loads its
+# pointee word first, because the collection place may be a bare &Vec
+# parameter, a nested ref, or an inout receiver. The direct route also
+# guards a NULL handle (it skips the header read when the handle word is
+# zero); this slice omits the guard — a null collection handle has no
+# live header, and every collection constructor allocates one before any
+# len read (the guard is defensive on the direct route, not a value a
+# live program can hold). Map/Set lengths are NOT this shape (their
+# std accessors are intrinsic calls, not MirLen).
+
+# The word vreg and static type a MirLen place starts from: a whole
+# scalar/ref local's vreg, a whole aggregate local's first image word (a
+# Vec/Array local is a one-word zero-field aggregate), a handle/pointer
+# field's loaded word, a deref word through the base pointer, or the
+# first word of a pointed-to admitted image (a pointed-to handle).
+def lir_len_base_word(inout ctx: LirLowerCtx, block_id: Int, place: Place, ty: Type) -> Result[(Int, Type), String]
+  match lir_classify_place(ctx, place)
+  when Result::Err(e) then Result::Err(e)
+  when Result::Ok(shape) then
+    match shape
+    when LirPlaceShape::LirPlaceScalarLocal(id) then
+      let v = match lir_vreg_of_local(ctx, id)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(vv) then vv
+      end
+      Result::Ok((v, ty))
+    when LirPlaceShape::LirPlaceAggLocal(id) then
+      Result::Ok((lir_agg_word_vreg(ctx, id, 0), ty))
+    when LirPlaceShape::LirPlaceField(lid, _, off, _, _) then
+      let agg = match ctx.agg_of.get(lid)
+      when Option::Some(a) then a
+      when Option::None then
+        return Result::Err("lir: " + ctx.fn_name + ": a length read over an aggregate field of a local with no aggregate record (fail-closed)")
+      end
+      let base_v = lir_agg_emit_frame_base(ctx, block_id, agg.base_slot)
+      Result::Ok((lir_load_handle_word(ctx, block_id, base_v, off), ty))
+    when LirPlaceShape::LirPlaceDerefWord(base_id, off, _) then
+      let base_v = match lir_vreg_of_local(ctx, base_id)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(b) then b
+      end
+      Result::Ok((lir_load_handle_word(ctx, block_id, base_v, off), ty))
+    when LirPlaceShape::LirPlaceDerefAgg(base_id, size, _) then
+      if size != 8 then
+        return Result::Err("lir: " + ctx.fn_name + ": a length read over a pointed-to aggregate image of " + size.to_string() + " byte(s) does not lower (a collection handle image is exactly one pointer word; fail-closed)")
+      end
+      let base_v = match lir_vreg_of_local(ctx, base_id)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(b) then b
+      end
+      Result::Ok((lir_load_handle_word(ctx, block_id, base_v, 0), ty))
+    when _ then
+      Result::Err("lir: " + ctx.fn_name + ": a length read over a heap-collection element place does not lower (the collection itself has no element place; fail-closed)")
+    end
+  end
+end
+
+def lir_lower_len_rvalue(inout ctx: LirLowerCtx, block_id: Int, dst_v: Int, place: Place) -> Result[Unit, String]
+  let pty = match lir_place_ty(ctx, place)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(t) then t
+  end
+  match pty
+  when Type::FixedArray(_, n) then
+    lir_append_stmt(ctx, block_id, LirStmtKind::LirMove(dst_v, LirValue::LirImm(n)))
+    return Result::Ok(())
+  when _ then ()
+  end
+  let base = match lir_len_base_word(ctx, block_id, place, pty.clone())
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(b) then b
+  end
+  var ty = base.1
+  var v = base.0
+  while lir_is_ptr_word(ty.clone()) do
+    let inner = match ty
+    when Type::Ptr(i) then i.clone()
+    when Type::PtrMut(i) then i.clone()
+    when Type::RefInternal(i, _) then i.clone()
+    when _ then Type::Unit
+    end
+    v = lir_load_handle_word(ctx, block_id, v, 0)
+    ty = inner
+  end
+  match lir_heap_vec_element_type(ctx, ty.clone())
+  when Option::Some(_) then
+    let len_v = lir_load_handle_word(ctx, block_id, v, lir_heap_len_field_offset())
+    if len_v != dst_v then
+      lir_emit_move_vreg(ctx, block_id, dst_v, LirValue::LirReg(len_v))
+    end
+    Result::Ok(())
+  when Option::None then
+    Result::Err("lir: " + ctx.fn_name + ": length reads lower over a fixed array (the compile-time count) or a Vec/Array heap handle (the header len field) only (the place resolves to " + mir_type_identity_key(&ty) + "; fail-closed)")
+  end
+end
+
 # Emit the width-sized READ of a runtime-index element at the computed
 # address into `dst_v`: the general-word load with the leaf's sign
 # extension, or — for an FP leaf — the width-sized bit image into a GP
@@ -9344,6 +9848,18 @@ def lir_lower_index_read(inout ctx: LirLowerCtx, block_id: Int, dst_v: Int, plac
       when Result::Ok(b) then b
       end
       lir_lower_index_read_at(ctx, block_id, dst_v, base_v, idx_id, off, stride, ty)
+    when LirPlaceShape::LirPlaceHeapIndex(lid, handle_off, idx_id, off, stride, ty) then
+      let handle_v = match lir_heap_frame_handle_v(ctx, block_id, lid, handle_off)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(v) then v
+      end
+      lir_lower_index_read_at(ctx, block_id, dst_v, lir_heap_data_v(ctx, block_id, handle_v), idx_id, off, stride, ty)
+    when LirPlaceShape::LirPlaceHeapDerefIndex(base_id, handle_off, idx_id, off, stride, ty) then
+      let handle_v = match lir_heap_deref_handle_v(ctx, block_id, base_id, handle_off)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(v) then v
+      end
+      lir_lower_index_read_at(ctx, block_id, dst_v, lir_heap_data_v(ctx, block_id, handle_v), idx_id, off, stride, ty)
     when _ then
       Result::Err("lir: " + ctx.fn_name + ": index read helper on a non-index place (the shape gate and the lowering disagree — fail-closed)")
     end
@@ -9371,6 +9887,18 @@ def lir_lower_index_store(inout ctx: LirLowerCtx, block_id: Int, src_v: Int, pla
       when Result::Ok(b) then b
       end
       lir_lower_index_store_at(ctx, block_id, src_v, base_v, idx_id, off, stride, ty)
+    when LirPlaceShape::LirPlaceHeapIndex(lid, handle_off, idx_id, off, stride, ty) then
+      let handle_v = match lir_heap_frame_handle_v(ctx, block_id, lid, handle_off)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(v) then v
+      end
+      lir_lower_index_store_at(ctx, block_id, src_v, lir_heap_data_v(ctx, block_id, handle_v), idx_id, off, stride, ty)
+    when LirPlaceShape::LirPlaceHeapDerefIndex(base_id, handle_off, idx_id, off, stride, ty) then
+      let handle_v = match lir_heap_deref_handle_v(ctx, block_id, base_id, handle_off)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(v) then v
+      end
+      lir_lower_index_store_at(ctx, block_id, src_v, lir_heap_data_v(ctx, block_id, handle_v), idx_id, off, stride, ty)
     when _ then
       Result::Err("lir: " + ctx.fn_name + ": index store helper on a non-index place (the shape gate and the lowering disagree — fail-closed)")
     end
@@ -9399,6 +9927,18 @@ def lir_index_place_addr(inout ctx: LirLowerCtx, block_id: Int, place: Place) ->
       when Result::Ok(b) then b
       end
       lir_index_element_addr(ctx, block_id, base_v, idx_id, off, stride)
+    when LirPlaceShape::LirPlaceHeapIndex(lid, handle_off, idx_id, off, stride, _) then
+      let handle_v = match lir_heap_frame_handle_v(ctx, block_id, lid, handle_off)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(v) then v
+      end
+      lir_index_element_addr(ctx, block_id, lir_heap_data_v(ctx, block_id, handle_v), idx_id, off, stride)
+    when LirPlaceShape::LirPlaceHeapDerefIndex(base_id, handle_off, idx_id, off, stride, _) then
+      let handle_v = match lir_heap_deref_handle_v(ctx, block_id, base_id, handle_off)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(v) then v
+      end
+      lir_index_element_addr(ctx, block_id, lir_heap_data_v(ctx, block_id, handle_v), idx_id, off, stride)
     when _ then
       Result::Err("lir: " + ctx.fn_name + ": internal divergence: a non-index place reached the dynamic-index address helper (fail-closed)")
     end
@@ -9506,6 +10046,10 @@ def lir_frame_place_slot(inout ctx: LirLowerCtx, shape: LirPlaceShape) -> Result
     Result::Err("lir: " + ctx.fn_name + ": a runtime-index element has no whole frame slot (its address is base + static_off + index*stride — the address-of path forms it directly; fail-closed)")
   when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, _) then
     Result::Err("lir: " + ctx.fn_name + ": a runtime-index element through a pointer has no frame slot (its address is base + static_off + index*stride — the address-of path forms it directly; fail-closed)")
+  when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, _) then
+    Result::Err("lir: " + ctx.fn_name + ": a heap-collection runtime-index element has no whole frame slot (its address is the header's data pointer + static_off + index*stride — the address-of path forms it directly; fail-closed)")
+  when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, _) then
+    Result::Err("lir: " + ctx.fn_name + ": a heap-collection runtime-index element through a pointer has no whole frame slot (its address is the header's data pointer + static_off + index*stride — the address-of path forms it directly; fail-closed)")
   when LirPlaceShape::LirPlaceDerefAgg(_, _, _) then
     Result::Err("lir: " + ctx.fn_name + ": a whole pointed-to image has no frame slot (its address IS the base word — the address-of path forms it directly; fail-closed)")
   when LirPlaceShape::LirPlaceUnit(_) then
@@ -9599,6 +10143,28 @@ def lir_lower_ref_of_place(inout ctx: LirLowerCtx, block_id: Int, dst_v: Int, re
       end
       Result::Ok(())
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, _) then
+      let addr = match lir_index_place_addr(ctx, block_id, ref_place)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(a) then a
+      end
+      if dst_v != addr then
+        lir_emit_move_vreg(ctx, block_id, dst_v, LirValue::LirReg(addr))
+      end
+      Result::Ok(())
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, _) then
+      # The address of a heap-collection element: the SAME header-data +
+      # static_off + index*stride geometry the accesses compute (the
+      # direct emitter's address_of ProjIndex arm too), moved into the
+      # destination word.
+      let addr = match lir_index_place_addr(ctx, block_id, ref_place)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(a) then a
+      end
+      if dst_v != addr then
+        lir_emit_move_vreg(ctx, block_id, dst_v, LirValue::LirReg(addr))
+      end
+      Result::Ok(())
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, _) then
       let addr = match lir_index_place_addr(ctx, block_id, ref_place)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(a) then a
@@ -9790,6 +10356,8 @@ def lir_operand_place_value(inout ctx: LirLowerCtx, place: Place) -> Result[Opti
     when LirPlaceShape::LirPlaceEnumDerefField(_, _, _, _) then Result::Ok(Option::None)
     when LirPlaceShape::LirPlaceIndex(_, _, _, _, _) then Result::Ok(Option::None)
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, _) then Result::Ok(Option::None)
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, _) then Result::Ok(Option::None)
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, _) then Result::Ok(Option::None)
     when LirPlaceShape::LirPlaceField(_, _, off, size, ty) then
       # A byte-mode scalar field has no vreg source: the marker path
       # materializes its width-sized frame load at the read sites
@@ -9994,6 +10562,40 @@ def lir_value_of_deref_place(inout ctx: LirLowerCtx, block_id: Int, place: Place
         Result::Ok(tmp)
       end
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, ty) then
+      match lir_fp_width_of(ty)
+      when Option::Some(fw) then
+        let tmpf = lir_fresh_fp_vreg(ctx, fw)
+        match lir_lower_index_read(ctx, block_id, tmpf, place)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        Result::Ok(tmpf)
+      when Option::None then
+        let tmp = lir_fresh_vreg(ctx)
+        match lir_lower_index_read(ctx, block_id, tmp, place)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        Result::Ok(tmp)
+      end
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, ty) then
+      match lir_fp_width_of(ty)
+      when Option::Some(fw) then
+        let tmpf = lir_fresh_fp_vreg(ctx, fw)
+        match lir_lower_index_read(ctx, block_id, tmpf, place)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        Result::Ok(tmpf)
+      when Option::None then
+        let tmp = lir_fresh_vreg(ctx)
+        match lir_lower_index_read(ctx, block_id, tmp, place)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(_) then ()
+        end
+        Result::Ok(tmp)
+      end
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, ty) then
       match lir_fp_width_of(ty)
       when Option::Some(fw) then
         let tmpf = lir_fresh_fp_vreg(ctx, fw)
@@ -10520,6 +11122,30 @@ def lir_lower_assign(inout ctx: LirLowerCtx, block_id: Int, place: Place, rvalue
         end
         lir_lower_index_store(ctx, block_id, tmp, place)
       end
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, ty) then
+      # A heap-collection element destination: the rvalue lowers into a
+      # fresh temporary of the leaf's class, then the width-sized
+      # dynamic-address store through the header's data pointer (the
+      # same geometry as the fixed-array element destination).
+      match rvalue.kind
+      when MirRvalueKind::MirPhi(_) then Result::Ok(())
+      when _ then
+        let tmp = match lir_lower_index_rv_to_temp(ctx, block_id, ty.clone(), rvalue)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(v) then v
+        end
+        lir_lower_index_store(ctx, block_id, tmp, place)
+      end
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, ty) then
+      match rvalue.kind
+      when MirRvalueKind::MirPhi(_) then Result::Ok(())
+      when _ then
+        let tmp = match lir_lower_index_rv_to_temp(ctx, block_id, ty.clone(), rvalue)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(v) then v
+        end
+        lir_lower_index_store(ctx, block_id, tmp, place)
+      end
     when LirPlaceShape::LirPlaceDerefAgg(base_id, size, ty) then
       # A WHOLE-IMAGE deref destination (the copy-through-pointer
       # slice): the rvalue is a whole-value move from an admitted
@@ -10934,8 +11560,8 @@ def lir_lower_scalar_dst(inout ctx: LirLowerCtx, block_id: Int, dst_ty: Type, ds
       let eshape = pair.1
       lir_lower_enum_word_discriminant(ctx, block_id, dst_v, word_v, eshape)
     end
-  when MirRvalueKind::MirLen(_) then
-    Result::Err("lir: " + ctx.fn_name + ": length reads do not lower (collections and slices are not implemented)")
+  when MirRvalueKind::MirLen(place) then
+    lir_lower_len_rvalue(ctx, block_id, dst_v, place)
   when MirRvalueKind::MirRepeat(_, _) then
     Result::Err("lir: " + ctx.fn_name + ": array-repeat does not lower (fixed-array aggregates are not implemented)")
   end
@@ -11151,6 +11777,18 @@ def lir_enum_word_of_dynamic_place(inout ctx: LirLowerCtx, block_id: Int, place:
       end
       Result::Ok(dst)
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, _) then
+      match lir_lower_index_read(ctx, block_id, dst, place)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      Result::Ok(dst)
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, _) then
+      match lir_lower_index_read(ctx, block_id, dst, place)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      Result::Ok(dst)
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, _) then
       match lir_lower_index_read(ctx, block_id, dst, place)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
@@ -11624,6 +12262,10 @@ def lir_enum_place_word(inout ctx: LirLowerCtx, block_id: Int, place: Place) -> 
       lir_enum_place_word_dynamic(ctx, block_id, place, ty)
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, ty) then
       lir_enum_place_word_dynamic(ctx, block_id, place, ty)
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, ty) then
+      lir_enum_place_word_dynamic(ctx, block_id, place, ty)
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, ty) then
+      lir_enum_place_word_dynamic(ctx, block_id, place, ty)
     when _ then
       Result::Err("lir: " + ctx.fn_name + ": an enum place must be a whole enum local, an enum-typed aggregate field place, a whole-enum deref or an enum-typed runtime-index element (fail-closed)")
     end
@@ -11805,6 +12447,10 @@ def lir_lower_whole_copy(inout ctx: LirLowerCtx, block_id: Int, dst_id: Int, src
       # funnels, never into a whole copy.
       lir_lower_index_whole_enum_copy(ctx, block_id, dst_agg, src_place, ty)
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, ty) then
+      lir_lower_index_whole_enum_copy(ctx, block_id, dst_agg, src_place, ty)
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, ty) then
+      lir_lower_index_whole_enum_copy(ctx, block_id, dst_agg, src_place, ty)
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, ty) then
       lir_lower_index_whole_enum_copy(ctx, block_id, dst_agg, src_place, ty)
     when _ then
       Result::Err("lir: " + ctx.fn_name + ": whole-aggregate copy source is not a whole aggregate local (rvalue and destination types disagree — fail-closed)")
@@ -12237,6 +12883,16 @@ def lir_fp_move_from_place(inout ctx: LirLowerCtx, block_id: Int, dw: LirFpWidth
         return Result::Err("lir: " + ctx.fn_name + ": float move from a non-float runtime-index element through a pointer (typed MIR never produces this — fail-closed)")
       end
       return lir_lower_index_read(ctx, block_id, dst_v, place)
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, ty) then
+      if !lir_is_fp_type(ty) then
+        return Result::Err("lir: " + ctx.fn_name + ": float move from a non-float heap-collection element (typed MIR never produces this — fail-closed)")
+      end
+      return lir_lower_index_read(ctx, block_id, dst_v, place)
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, ty) then
+      if !lir_is_fp_type(ty) then
+        return Result::Err("lir: " + ctx.fn_name + ": float move from a non-float heap-collection element through a pointer (typed MIR never produces this — fail-closed)")
+      end
+      return lir_lower_index_read(ctx, block_id, dst_v, place)
     when _ then ()
     end
   end
@@ -12301,6 +12957,12 @@ def lir_move_from_place(inout ctx: LirLowerCtx, block_id: Int, dst_v: Int, place
       # load IS the move.
       return lir_lower_index_read(ctx, block_id, dst_v, place)
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, _) then
+      return lir_lower_index_read(ctx, block_id, dst_v, place)
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, _) then
+      # A heap-collection element read: the width-sized dynamic-address
+      # load through the header's data pointer IS the move.
+      return lir_lower_index_read(ctx, block_id, dst_v, place)
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, _) then
       return lir_lower_index_read(ctx, block_id, dst_v, place)
     when LirPlaceShape::LirPlaceDerefAgg(_, _, _) then
       # A whole pointed-to image is not a scalar value (it lowers only
@@ -12412,6 +13074,22 @@ def lir_rhs_from_place(inout ctx: LirLowerCtx, block_id: Int, place: Place) -> R
       end
       Result::Ok(LirValue::LirReg(tmp))
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, _) then
+      let tmp = lir_fresh_vreg(ctx)
+      match lir_lower_index_read(ctx, block_id, tmp, place)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      Result::Ok(LirValue::LirReg(tmp))
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, _) then
+      # A heap-collection element materializes as a width-sized
+      # dynamic-address load into a fresh register.
+      let tmp = lir_fresh_vreg(ctx)
+      match lir_lower_index_read(ctx, block_id, tmp, place)
+      when Result::Err(e) then return Result::Err(e)
+      when Result::Ok(_) then ()
+      end
+      Result::Ok(LirValue::LirReg(tmp))
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, _) then
       let tmp = lir_fresh_vreg(ctx)
       match lir_lower_index_read(ctx, block_id, tmp, place)
       when Result::Err(e) then return Result::Err(e)
@@ -13358,6 +14036,20 @@ def lir_lower_terminator(inout ctx: LirLowerCtx, f: MirFunction, block: MirBlock
         return lir_lower_option_intrinsic(ctx, block_id, okind, dest, args, success)
       when Option::None then ()
       end
+      # (the heap-collection slice): the checked/indexed Array accessors
+      # lower through their runtime helpers (see the collection-call
+      # section); the accessor families this slice does not carry return
+      # their NAMED refusal instead of the generic intrinsic fallback.
+      match lir_coll_intrinsic_of(iid)
+      when Option::Some(cop) then
+        return lir_lower_collection_call(ctx, block_id, cop, dest, args, success)
+      when Option::None then ()
+      end
+      match lir_coll_refusal_of(iid)
+      when Option::Some(reason) then
+        return Result::Err("lir: " + ctx.fn_name + ": collection intrinsic does not lower: " + reason)
+      when Option::None then ()
+      end
       # (audit item 34 — the explicit SIMD sub-domain): a call the
       # checker classified as a SIMD intrinsic (types.tg's
       # simd_intrinsic_kind_of router — the __intrinsic_simd_<op>_<lane>
@@ -13870,6 +14562,10 @@ def lir_lower_call(inout ctx: LirLowerCtx, block_id: Int, callee_name: String, d
       return Result::Err("lir: " + ctx.fn_name + ": call destinations that are runtime-index elements do not lower (the post-call store at a dynamic element address is not carried by the ordinary call capture; fail-closed)")
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, _) then
       return Result::Err("lir: " + ctx.fn_name + ": call destinations that are runtime-index elements through a pointer do not lower (the post-call store at a dynamic element address is not carried by the ordinary call capture; fail-closed)")
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, _) then
+      return Result::Err("lir: " + ctx.fn_name + ": call destinations that are heap-collection runtime-index elements do not lower (the post-call store at a dynamic element address is not carried by the ordinary call capture; fail-closed)")
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, _) then
+      return Result::Err("lir: " + ctx.fn_name + ": call destinations that are heap-collection runtime-index elements through a pointer do not lower (the post-call store at a dynamic element address is not carried by the ordinary call capture; fail-closed)")
     when LirPlaceShape::LirPlaceDerefAgg(_, _, _) then
       return Result::Err("lir: " + ctx.fn_name + ": call destinations that are whole pointed-to images do not lower (a post-call copy-through-pointer into the pointed image is not carried by the ordinary call capture; fail-closed)")
     when LirPlaceShape::LirPlaceVectorLocal(_) then
@@ -14707,6 +15403,456 @@ def lir_lower_call(inout ctx: LirLowerCtx, block_id: Int, callee_name: String, d
 end
 
 # ———————————————————————————————————————————————————————————————
+# The heap-collection slice — Array intrinsic call lowering
+# (__intrinsic_array_get/set/len/cap/new/push)
+# ———————————————————————————————————————————————————————————————
+# A checker-classified ArrayGet/ArraySet/ArrayLen/ArrayCap/ArrayNew/
+# ArrayPush call lowers through the SAME runtime machinery the direct
+# emitter uses (codegen.g's collection arms):
+#   - ArrayLen / ArrayCap read the header's len (offset 8) / cap (offset
+#     16) through the deref'd receiver — no call (the direct route's
+#     codegen_array_len/codegen_array_capacity inline the same load);
+#   - ArrayGet is the CHECKED read: index < len is compared with the
+#     direct route's exact signed `b.lt` arm and an out-of-range index
+#     TRAPS (the defined std OOB policy), then the runtime's unchecked
+#     address primitive `_tg_array_get(header, index)` runs and its
+#     returned element ADDRESS is materialized into the call destination
+#     per the element's class (a width-matched load for a scalar / enum /
+#     handle / pointer / float leaf — the FP leaf crossing through the
+#     marked GP->FP bit move — or the FULL image byte copy for an
+#     aggregate element);
+#   - ArraySet is the direct route's unchecked write: `_tg_array_set(
+#     header, index, value)` with the value word per class (NO bounds
+#     guard precedes it, exactly like codegen_array_set);
+#   - ArrayNew is `_tg_array_new(stride)` — the element stride comes from
+#     the DESTINATION type's element (codegen's destination-type stride
+#     authority), the returned header becomes the destination word;
+#   - ArrayPush is `_tg_array_push(header, value)`.
+# The receiver is the checker's re-borrow reference (mir_recv_operand:
+# a RefInternal/Ptr/PtrMut to the collection); every reference layer
+# loads its pointee word first (codegen_collection_receiver_deref) and
+# the final word is the 32-byte header handle. Map/Set intrinsics and
+# the Option/Result-returning array accessors (pop/remove/last/first/
+# drain) stay fail-closed with their named rules: their runtime
+# contracts need hash/eq function addresses or an Option image
+# construction this slice does not carry (see the refusal messages
+# below and the retirement-contract bullet).
+
+enum LirCollOp
+  LirCollGet
+  LirCollSet
+  LirCollLen
+  LirCollCapacity
+  LirCollNew
+  LirCollPush
+end
+
+def lir_coll_intrinsic_of(iid: IntrinsicId) -> Option[LirCollOp]
+  match iid
+  when IntrinsicId::ArrayGet then Option::Some(LirCollOp::LirCollGet)
+  when IntrinsicId::ArraySet then Option::Some(LirCollOp::LirCollSet)
+  when IntrinsicId::ArrayLen then Option::Some(LirCollOp::LirCollLen)
+  when IntrinsicId::ArrayCap then Option::Some(LirCollOp::LirCollCapacity)
+  when IntrinsicId::ArrayNew then Option::Some(LirCollOp::LirCollNew)
+  when IntrinsicId::ArrayPush then Option::Some(LirCollOp::LirCollPush)
+  when _ then Option::None
+  end
+end
+
+# The named refusals of the collection families this slice does not
+# carry (each with its reason): the Option/Result-returning array
+# accessors need an Option image construction after the call, and every
+# Map/Set accessor needs hash/eq function-address operands the LIR slice
+# cannot materialize.
+def lir_coll_refusal_of(iid: IntrinsicId) -> Option[String]
+  match iid
+  when IntrinsicId::ArrayPop then
+    Option::Some("Array::pop returns Option[T] and its Option image construction (tag + payload through the enum allocation path) is not carried by the collection call slice")
+  when IntrinsicId::ArrayRemove | IntrinsicId::ArrayInsert | IntrinsicId::ArrayLast | IntrinsicId::ArrayFirst then
+    Option::Some("Array::remove/insert/last/first return an element value or Option[T] through a runtime call whose post-call materialization shape (an address-returning helper plus a value/Option wrap) is not carried by the collection call slice")
+  when IntrinsicId::ArrayDestroy | IntrinsicId::ArrayClear | IntrinsicId::ArrayResize | IntrinsicId::ArrayTruncate | IntrinsicId::ArrayReverse | IntrinsicId::ArrayExtend | IntrinsicId::ArrayContains | IntrinsicId::ArraySort | IntrinsicId::ArrayReplace | IntrinsicId::ArraySlice | IntrinsicId::ArrayAsPtr | IntrinsicId::ArrayAsPtrAddress | IntrinsicId::ArrayAsStr | IntrinsicId::ArrayIsEmpty | IntrinsicId::ArrayFromList | IntrinsicId::ArrayWithCapacity | IntrinsicId::ArrayCapacity | IntrinsicId::ArrayJoin then
+    Option::Some("the Array helper surface beyond the indexed get/set/len/cap/new/push accessors (destroy/clear/resize/truncate/reverse/extend/contains/sort/replace/slice/as_ptr/as_str/is_empty/from_list/with_capacity/capacity/join) is not implemented on the LIR route (fail-closed)")
+  when IntrinsicId::MapGet | IntrinsicId::MapInsert | IntrinsicId::MapRemove | IntrinsicId::MapRemoveKey | IntrinsicId::MapContains | IntrinsicId::MapLen | IntrinsicId::MapNew | IntrinsicId::MapClone | IntrinsicId::MapClear | IntrinsicId::MapKeys | IntrinsicId::MapValues | IntrinsicId::MapEntries | IntrinsicId::MapDrainOne | IntrinsicId::MapDestroy | IntrinsicId::MapPush then
+    Option::Some("the map runtime helpers take hash/eq function addresses (a function-symbol address operand this LIR slice cannot materialize), so Map accessors do not lower")
+  when IntrinsicId::SetInsert | IntrinsicId::SetContains | IntrinsicId::SetRemove | IntrinsicId::SetRemoveKey | IntrinsicId::SetLen | IntrinsicId::SetNew | IntrinsicId::SetClone | IntrinsicId::SetEntries | IntrinsicId::SetDrainOne | IntrinsicId::SetDestroy | IntrinsicId::SetClear | IntrinsicId::SetIsEmpty then
+    Option::Some("the set runtime helpers take hash/eq function addresses (a function-symbol address operand this LIR slice cannot materialize), so Set accessors do not lower")
+  when _ then Option::None
+  end
+end
+
+# Resolve one collection intrinsic scalar argument (an index or a value
+# word) — the atomic/option argument rule (place-like operands through
+# the word-value funnel, a whole scalar Place accepted).
+def lir_coll_arg_v(inout ctx: LirLowerCtx, block_id: Int, args: Vec[MirCallArg], idx: Int, what: String) -> Result[Int, String]
+  if idx >= args.len() then
+    return Result::Err("lir: " + ctx.fn_name + ": collection intrinsic is missing its " + what + " argument (the call carries " + args.len().to_string() + " arguments; fail-closed)")
+  end
+  match args[idx].value
+  when MirCallValue::Place(p) then
+    match lir_place_src_vreg(ctx, p)
+    when Result::Ok(v) then Result::Ok(v)
+    when Result::Err(e) then Result::Err(e)
+    end
+  when MirCallValue::Value(op) then lir_value_of_operand(ctx, block_id, op)
+  end
+end
+
+# Arity guard for the collection intrinsic argument lists (the checker
+# always produces the declared arity; a divergence must not index past
+# the end).
+def lir_coll_arity(ctx: LirLowerCtx, args: Vec[MirCallArg], n: Int, what: String) -> Result[Unit, String]
+  if args.len() < n then
+    return Result::Err("lir: " + ctx.fn_name + ": " + what + " carries " + args.len().to_string() + " argument(s); the intrinsic contract needs " + n.to_string() + " (typed MIR never produces this — fail-closed)")
+  end
+  Result::Ok(())
+end
+
+# The collection HEADER vreg from the receiver argument (the first
+# argument): the checker always re-borrows the receiver, so the operand
+# is a reference/pointer word; every reference layer loads its pointee
+# word and the final word is the header handle. Returns the header and
+# the element type of the Vec/Array handle.
+def lir_coll_receiver(inout ctx: LirLowerCtx, block_id: Int, args: Vec[MirCallArg], what: String) -> Result[(Int, Type), String]
+  if args.len() == 0 then
+    return Result::Err("lir: " + ctx.fn_name + ": " + what + " carries no receiver argument (the collection receiver is the first argument; fail-closed)")
+  end
+  let recv_ty = lir_call_plan_arg_type(ctx, args[0])
+  if !lir_is_ptr_word(recv_ty.clone()) then
+    return Result::Err("lir: " + ctx.fn_name + ": " + what + " receiver is not a reference/pointer word (the checker re-borrows the collection — a by-value handle receiver is not the MIR form; fail-closed)")
+  end
+  let recv_v = match lir_coll_arg_v(ctx, block_id, args, 0, "receiver")
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  var ty = recv_ty
+  var v = recv_v
+  while lir_is_ptr_word(ty.clone()) do
+    let inner = match ty
+    when Type::RefInternal(i, _) then i.clone()
+    when Type::Ptr(i) then i.clone()
+    when Type::PtrMut(i) then i.clone()
+    when _ then Type::Unit
+    end
+    v = lir_load_handle_word(ctx, block_id, v, 0)
+    ty = inner
+  end
+  match lir_heap_vec_element_type(ctx, ty.clone())
+  when Option::Some(elem_ty) then
+    Result::Ok((v, elem_ty))
+  when Option::None then
+    if lir_type_is_map_or_set_handle(ctx, ty.clone()) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " over a Map/Set handle does not lower (the map/set runtime contract needs hash/eq function addresses this LIR slice cannot materialize; fail-closed)")
+    else
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " receiver is not a Vec/Array handle (resolves to " + mir_type_identity_key(&ty) + "; fail-closed)")
+    end
+  end
+end
+
+# The scalar word destination of a collection intrinsic result: a whole
+# scalar local, a word-mode scalar field, an enum payload field, or a
+# WHOLE one-word aggregate local (a Vec/Array/Map/Set handle local and a
+# whole-enum local are one-word aggregate images on this route — their
+# word 0 IS the result word; the ordinary call capture reaches the same
+# fixed word vreg). Every other shape fails closed with the reason.
+def lir_coll_dest_word_v(inout ctx: LirLowerCtx, dest: Place, what: String) -> Result[Int, String]
+  match lir_classify_place(ctx, dest)
+  when Result::Err(e) then Result::Err(e)
+  when Result::Ok(shape) then
+    match shape
+    when LirPlaceShape::LirPlaceUnit(_) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a word result but the call destination is Unit (a typed-MIR divergence; fail-closed)")
+    when LirPlaceShape::LirPlaceScalarLocal(dst_id) then
+      match lir_vreg_of_local(ctx, dst_id)
+      when Result::Ok(v) then Result::Ok(v)
+      when Result::Err(e) then Result::Err(e)
+      end
+    when LirPlaceShape::LirPlaceAggLocal(dst_id) then
+      let agg = match ctx.agg_of.get(dst_id)
+      when Option::Some(a) then a
+      when Option::None then
+        return Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a word result into an aggregate local with no aggregate record (fail-closed)")
+      end
+      if agg.shape.words != 1 then
+        return Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a one-word result but the destination aggregate image spans " + agg.shape.words.to_string() + " words (a whole-image result needs the copy path; fail-closed)")
+      end
+      Result::Ok(lir_agg_word_vreg(ctx, dst_id, 0))
+    when LirPlaceShape::LirPlaceField(lid, _, off, size, ty) then
+      if !lir_agg_field_word_mode(ctx, off, size, ty) then
+        return Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a word result into a word-mode destination only (a byte-mode field destination would need a post-call width store; fail-closed)")
+      end
+      Result::Ok(lir_agg_word_vreg(ctx, lid, off / 8))
+    when LirPlaceShape::LirPlaceEnumField(lid, vidx, fidx) then
+      let payload_word = match ctx.agg_of.get(lid)
+      when Option::Some(agg) then
+        match agg.enum_shape
+        when Option::Some(eshape) then eshape.variants[vidx].fields[fidx].word
+        when Option::None then return Result::Err("lir: " + ctx.fn_name + ": enum payload destination of a non-enum local (fail-closed)")
+        end
+      when Option::None then return Result::Err("lir: " + ctx.fn_name + ": enum payload destination of a non-aggregate local (fail-closed)")
+      end
+      Result::Ok(lir_agg_word_vreg(ctx, lid, payload_word))
+    when LirPlaceShape::LirPlaceVectorLocal(_) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a word result but the call destination is a whole vector local (fail-closed)")
+    when LirPlaceShape::LirPlaceEnumHeapField(_, _, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a word result but the call destination is a canonical-heap enum payload field (a post-call store is not carried; fail-closed)")
+    when LirPlaceShape::LirPlaceEnumDerefField(_, _, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a word result but the call destination is a canonical-heap enum payload field through a pointer (a post-call store is not carried; fail-closed)")
+    when LirPlaceShape::LirPlaceDerefWord(_, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a word result but the call destination is a deref place (a post-call store is not carried; fail-closed)")
+    when LirPlaceShape::LirPlaceIndex(_, _, _, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a word result but the call destination is a runtime-index element (a post-call store at a dynamic address is not carried; fail-closed)")
+    when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a word result but the call destination is a runtime-index element through a pointer (a post-call store at a dynamic address is not carried; fail-closed)")
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a word result but the call destination is a heap-collection element (a post-call store at a dynamic address is not carried; fail-closed)")
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a word result but the call destination is a heap-collection element through a pointer (a post-call store at a dynamic address is not carried; fail-closed)")
+    when LirPlaceShape::LirPlaceDerefAgg(_, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a word result but the call destination is a whole pointed-to image (fail-closed)")
+    end
+  end
+end
+
+# Materialize the CHECKED-GET result from the runtime's returned element
+# ADDRESS into the call destination: a width-matched marked load for a
+# scalar/enum/handle/pointer leaf, the marked GP->FP bit move for a
+# float leaf, or the full image byte copy for an aggregate element (the
+# destination must be a whole aggregate local with the element's image).
+def lir_coll_get_materialize(inout ctx: LirLowerCtx, block_id: Int, dest: Place, addr_v: Int, elem_ty: Type) -> Result[Unit, String]
+  # The aggregate element: copy the element image into the destination
+  # aggregate local's frame image (codegen_array_image_to_dest mirror).
+  match lir_plain_struct_shape(ctx.type_defs, elem_ty.clone())
+  when Result::Ok(o) then
+    match o
+    when Option::Some(kind) then
+      match kind
+      when LirAggShapeKind::LirAggStruct(sh) then
+        match lir_classify_place(ctx, dest)
+        when Result::Err(e) then return Result::Err(e)
+        when Result::Ok(dshape) then
+          match dshape
+          when LirPlaceShape::LirPlaceAggLocal(did) then
+            let agg = match ctx.agg_of.get(did)
+            when Option::Some(a) then a
+            when Option::None then
+              return Result::Err("lir: " + ctx.fn_name + ": aggregate element destination local has no aggregate record (fail-closed)")
+            end
+            let dbase = lir_agg_emit_frame_base(ctx, block_id, agg.base_slot)
+            return lir_lower_addr_image_copy(ctx, block_id, dbase, 0, addr_v, 0, sh.size)
+          when _ then
+            return Result::Err("lir: " + ctx.fn_name + ": an aggregate element read writes a whole aggregate local destination only (the element image copy needs the destination frame image; fail-closed)")
+          end
+        end
+      when LirAggShapeKind::LirAggEnum(_) then ()
+      end
+    when Option::None then ()
+    end
+  when Result::Err(e) then
+    return Result::Err("lir: " + ctx.fn_name + ": aggregate element read with no admitted element shape: " + e)
+  end
+  let dst_v = match lir_coll_dest_word_v(ctx, dest, "array get")
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  if lir_is_fp_type(elem_ty.clone()) then
+    let fw = match lir_fp_width_of(elem_ty.clone())
+    when Option::Some(w) then w
+    when Option::None then
+      return Result::Err("lir: " + ctx.fn_name + ": array get element float type without a float width (fail-closed)")
+    end
+    match lir_ctx_fp_width_of(ctx, dst_v)
+    when Option::Some(dw) then
+      if dw != fw then
+        return Result::Err("lir: " + ctx.fn_name + ": array get element float read of width " + (if fw == LirFpWidth::LirF32 then "f32" else "f64" end) + " into a " + (if dw == LirFpWidth::LirF32 then "f32" else "f64" end) + " register (a width cast is required; fail-closed)")
+      end
+    when Option::None then
+      return Result::Err("lir: " + ctx.fn_name + ": array get element float read into a non-float destination (fail-closed)")
+    end
+    let width = lir_fp_bytes(fw)
+    let tmp = lir_fresh_vreg(ctx)
+    lir_block_push(ctx, block_id, LirStmt {
+      kind: LirStmtKind::LirUnop(LirUnOp::LirNeg, tmp, addr_v),
+      div: Option::None,
+      ptr: Option::Some(LirPtrOp::LirPtrLoad(tmp, addr_v, 0, width, false))
+    })
+    lir_block_push(ctx, block_id, LirStmt {
+      kind: LirStmtKind::LirUnop(LirUnOp::LirNeg, dst_v, tmp),
+      div: Option::None,
+      ptr: Option::None,
+      bm: Option::Some(LirBitMoveOp::LirBitsGpToFp)
+    })
+    return Result::Ok(())
+  end
+  if !lir_is_value_word(elem_ty.clone()) && !lir_is_ptr_word(elem_ty.clone()) && !lir_field_is_enum_type(ctx, elem_ty.clone()) && !lir_field_is_handle_word(ctx, elem_ty.clone()) then
+    return Result::Err("lir: " + ctx.fn_name + ": array get element of type " + mir_type_identity_key(&elem_ty) + " has no scalar word lowering (fail-closed)")
+  end
+  let (width, sign) = lir_index_leaf_io(ctx, elem_ty.clone())
+  if width <= 0 then
+    return Result::Err("lir: " + ctx.fn_name + ": array get element has no storage width on this route (fail-closed)")
+  end
+  lir_block_push(ctx, block_id, LirStmt {
+    kind: LirStmtKind::LirUnop(LirUnOp::LirNeg, dst_v, addr_v),
+    div: Option::None,
+    ptr: Option::Some(LirPtrOp::LirPtrLoad(dst_v, addr_v, 0, width, sign))
+  })
+  Result::Ok(())
+end
+
+# Lower one collection intrinsic call inline. Ends block_id with its own
+# terminator (a call / a jump / a switch) and writes the result into the
+# call destination.
+def lir_lower_collection_call(inout ctx: LirLowerCtx, block_id: Int, op: LirCollOp, dest: Place, args: Vec[MirCallArg], success: MirBlockId) -> Result[Unit, String]
+  match op
+  when LirCollOp::LirCollNew then
+    # __intrinsic_array_new(): the stride comes from the destination
+    # type's element (the direct route's destination-type authority).
+    let dst_ty = match lir_place_ty(ctx, dest)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(t) then t
+    end
+    let elem_ty = match lir_heap_vec_element_type(ctx, dst_ty.clone())
+    when Option::Some(e) then e
+    when Option::None then
+      return Result::Err("lir: " + ctx.fn_name + ": array_new destination is not a Vec/Array type (resolves to " + mir_type_identity_key(&dst_ty) + "; fail-closed)")
+    end
+    let stride = match lir_heap_element_stride(ctx, elem_ty.clone())
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(s) then s
+    end
+    let dst_v = match lir_coll_dest_word_v(ctx, dest, "array_new")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(v) then v
+    end
+    # The stride crosses as a materialized immediate word (call argument
+    # vregs are registers, never inline immediates).
+    let stride_v = lir_fresh_vreg(ctx)
+    lir_append_stmt(ctx, block_id, LirStmtKind::LirMove(stride_v, LirValue::LirImm(stride)))
+    var nargs: Vec[Int] = Vec::new()
+    nargs.push(stride_v)
+    lir_set_term(ctx, block_id, LirTermKind::LirCall("_tg_array_new".to_string(), nargs, 0, Option::Some(dst_v), success.id))
+    Result::Ok(())
+  when LirCollOp::LirCollSet then
+    match lir_coll_arity(ctx, args, 3, "array set")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    let recv = match lir_coll_receiver(ctx, block_id, args, "array set")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then r
+    end
+    let idx_ty = lir_call_plan_arg_type(ctx, args[1])
+    if !lir_is_int_word(idx_ty) then
+      return Result::Err("lir: " + ctx.fn_name + ": array set index must be an integer word (fail-closed)")
+    end
+    let val_ty = lir_call_plan_arg_type(ctx, args[2])
+    if !lir_is_value_word(val_ty.clone()) && !lir_is_ptr_word(val_ty.clone()) && !lir_field_is_enum_type(ctx, val_ty.clone()) && !lir_field_is_handle_word(ctx, val_ty.clone()) then
+      return Result::Err("lir: " + ctx.fn_name + ": array set value of type " + mir_type_identity_key(&val_ty) + " is not a one-word class (aggregate element writes cross by address through the indexed-assignment place path, not this call; fail-closed)")
+    end
+    let idx_v = match lir_coll_arg_v(ctx, block_id, args, 1, "index")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(v) then v
+    end
+    let val_v = match lir_coll_arg_v(ctx, block_id, args, 2, "value")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(v) then v
+    end
+    if lir_is_fp_type(val_ty.clone()) then
+      return Result::Err("lir: " + ctx.fn_name + ": array set of a FLOAT value does not lower (the runtime helper consumes one general word; the float bit-move crossing is not carried — fail-closed)")
+    end
+    var sargs: Vec[Int] = Vec::new()
+    sargs.push(recv.0)
+    sargs.push(idx_v)
+    sargs.push(val_v)
+    lir_set_term(ctx, block_id, LirTermKind::LirCall("_tg_array_set".to_string(), sargs, 0, Option::None, success.id))
+    Result::Ok(())
+  when LirCollOp::LirCollLen | LirCollOp::LirCollCapacity then
+    let recv = match lir_coll_receiver(ctx, block_id, args, "array length/capacity")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then r
+    end
+    let dst_v = match lir_coll_dest_word_v(ctx, dest, "array length/capacity")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(v) then v
+    end
+    let off = if op == LirCollOp::LirCollLen then lir_heap_len_field_offset() else container_field_offset("Vec", "cap") end
+    let field_v = lir_load_handle_word(ctx, block_id, recv.0, off)
+    if field_v != dst_v then
+      lir_emit_move_vreg(ctx, block_id, dst_v, LirValue::LirReg(field_v))
+    end
+    lir_set_term(ctx, block_id, LirTermKind::LirJump(success.id))
+    Result::Ok(())
+  when LirCollOp::LirCollGet then
+    match lir_coll_arity(ctx, args, 2, "array get")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    let recv = match lir_coll_receiver(ctx, block_id, args, "array get")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then r
+    end
+    let idx_ty = lir_call_plan_arg_type(ctx, args[1])
+    if !lir_is_int_word(idx_ty) then
+      return Result::Err("lir: " + ctx.fn_name + ": array get index must be an integer word (fail-closed)")
+    end
+    let idx_v = match lir_coll_arg_v(ctx, block_id, args, 1, "index")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(v) then v
+    end
+    # THE CHECKED ARM (codegen_array_get_checked): len = [header + 8];
+    # index < len (signed, the direct route's b.lt) continues, otherwise
+    # TRAP (the defined std OOB policy). The boolean rides a Cset and a
+    # switch to the trap / runtime-call blocks.
+    let len_v = lir_load_handle_word(ctx, block_id, recv.0, lir_heap_len_field_offset())
+    let ok_v = lir_fresh_vreg(ctx)
+    lir_append_stmt(ctx, block_id, LirStmtKind::LirCmp(LirValue::LirReg(idx_v), LirValue::LirReg(len_v)))
+    lir_append_stmt(ctx, block_id, LirStmtKind::LirCset(LirCond::LirLt, ok_v))
+    let get_blk = lir_fresh_dispatch_block(ctx)
+    ctx.trap_used = true
+    var tarm: Vec[LirSwitchArm] = Vec::new()
+    tarm.push(LirSwitchArm { value: 0, target: lir_trap_block_id() })
+    lir_set_term(ctx, block_id, LirTermKind::LirSwitch(ok_v, tarm, get_blk))
+    # The runtime's UNCHECKED address primitive.
+    let addr_v = lir_fresh_vreg(ctx)
+    let mat_blk = lir_fresh_dispatch_block(ctx)
+    var gargs: Vec[Int] = Vec::new()
+    gargs.push(recv.0)
+    gargs.push(idx_v)
+    lir_set_term(ctx, get_blk, LirTermKind::LirCall("_tg_array_get".to_string(), gargs, 0, Option::Some(addr_v), mat_blk))
+    match lir_coll_get_materialize(ctx, mat_blk, dest, addr_v, recv.1)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    lir_set_term(ctx, mat_blk, LirTermKind::LirJump(success.id))
+    Result::Ok(())
+  when LirCollOp::LirCollPush then
+    match lir_coll_arity(ctx, args, 2, "array push")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(_) then ()
+    end
+    let recv = match lir_coll_receiver(ctx, block_id, args, "array push")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(r) then r
+    end
+    let val_ty = lir_call_plan_arg_type(ctx, args[1])
+    if !lir_is_value_word(val_ty.clone()) && !lir_is_ptr_word(val_ty.clone()) && !lir_field_is_enum_type(ctx, val_ty.clone()) && !lir_field_is_handle_word(ctx, val_ty.clone()) then
+      return Result::Err("lir: " + ctx.fn_name + ": array push value of type " + mir_type_identity_key(&val_ty) + " is not a one-word class (fail-closed)")
+    end
+    if lir_is_fp_type(val_ty.clone()) then
+      return Result::Err("lir: " + ctx.fn_name + ": array push of a FLOAT value does not lower (the runtime helper consumes one general word; the float bit-move crossing is not carried — fail-closed)")
+    end
+    let val_v = match lir_coll_arg_v(ctx, block_id, args, 1, "value")
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(v) then v
+    end
+    var pargs: Vec[Int] = Vec::new()
+    pargs.push(recv.0)
+    pargs.push(val_v)
+    lir_set_term(ctx, block_id, LirTermKind::LirCall("_tg_array_push".to_string(), pargs, 0, Option::None, success.id))
+    Result::Ok(())
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # The pointer/atomic slice — atomic-intrinsic call lowering
 # (__intrinsic_atomic_* on the aarch64, cortex-m and riscv routes)
 # ———————————————————————————————————————————————————————————————
@@ -14876,6 +16022,10 @@ def lir_atomic_dest_v(inout ctx: LirLowerCtx, dest: Place) -> Result[Option[Int]
       Result::Err("lir: " + ctx.fn_name + ": atomic-intrinsic results write a scalar word destination only (a runtime-index element destination would need a post-op store at a dynamic address the atomic lowering does not carry; fail-closed)")
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, _) then
       Result::Err("lir: " + ctx.fn_name + ": atomic-intrinsic results write a scalar word destination only (a runtime-index element through a pointer destination would need a post-op store at a dynamic address the atomic lowering does not carry; fail-closed)")
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": atomic-intrinsic results write a scalar word destination only (a heap-collection element destination would need a post-op store at a dynamic address the atomic lowering does not carry; fail-closed)")
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": atomic-intrinsic results write a scalar word destination only (a heap-collection element through a pointer destination would need a post-op store at a dynamic address the atomic lowering does not carry; fail-closed)")
     when LirPlaceShape::LirPlaceDerefAgg(_, _, _) then
       Result::Err("lir: " + ctx.fn_name + ": atomic-intrinsic results write a scalar word destination only (a whole pointed-to image is not a scalar result destination; fail-closed)")
     end
@@ -15602,6 +16752,10 @@ def lir_option_dest_v(inout ctx: LirLowerCtx, dest: Place, what: String) -> Resu
       Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a scalar result but the call destination is a runtime-index element (a post-call store at a dynamic address is not carried; fail-closed)")
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, _) then
       Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a scalar result but the call destination is a runtime-index element through a pointer (a post-call store at a dynamic address is not carried; fail-closed)")
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a scalar result but the call destination is a heap-collection element (a post-call store at a dynamic address is not carried; fail-closed)")
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, _) then
+      Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a scalar result but the call destination is a heap-collection element through a pointer (a post-call store at a dynamic address is not carried; fail-closed)")
     when LirPlaceShape::LirPlaceDerefAgg(_, _, _) then
       Result::Err("lir: " + ctx.fn_name + ": " + what + " writes a scalar result but the call destination is a whole pointed-to image (fail-closed)")
     end
@@ -16943,6 +18097,13 @@ def lir_deinit_plan_place_addr(inout ctx: LirLowerCtx, block_id: Int, place: Pla
       lir_index_place_addr(ctx, block_id, place)
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, _) then
       lir_index_place_addr(ctx, block_id, place)
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, _) then
+      # A heap-collection element, exactly the address the accesses
+      # compute: the deinit-plan consumer (an element drop) receives the
+      # same dynamic address the direct route's plan walk forms.
+      lir_index_place_addr(ctx, block_id, place)
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, _) then
+      lir_index_place_addr(ctx, block_id, place)
     when LirPlaceShape::LirPlaceDerefAgg(base_id, _, _) then
       # A whole pointed-to image's address IS the base word.
       lir_vreg_of_local(ctx, base_id)
@@ -17106,6 +18267,28 @@ def lir_deinit_plan_receiver_word(inout ctx: LirLowerCtx, block_id: Int, place: 
       when Result::Ok(_) then Result::Ok(dst)
       end
     when LirPlaceShape::LirPlaceDerefIndex(_, _, _, _, ty) then
+      if lir_is_fp_type(ty) then
+        Result::Err("lir: " + ctx.fn_name + ": a floating-point place cannot be a finalizer receiver (fail-closed)")
+      end
+      let dst = lir_fresh_vreg(ctx)
+      match lir_lower_index_read(ctx, block_id, dst, place)
+      when Result::Err(e) then Result::Err(e)
+      when Result::Ok(_) then Result::Ok(dst)
+      end
+    when LirPlaceShape::LirPlaceHeapIndex(_, _, _, _, _, ty) then
+      # A heap-collection element receiver materializes its value word
+      # through the same dynamic-address read through the header's data
+      # pointer (a float receiver fails closed in the read helper's
+      # class rule).
+      if lir_is_fp_type(ty) then
+        Result::Err("lir: " + ctx.fn_name + ": a floating-point place cannot be a finalizer receiver (fail-closed)")
+      end
+      let dst = lir_fresh_vreg(ctx)
+      match lir_lower_index_read(ctx, block_id, dst, place)
+      when Result::Err(e) then Result::Err(e)
+      when Result::Ok(_) then Result::Ok(dst)
+      end
+    when LirPlaceShape::LirPlaceHeapDerefIndex(_, _, _, _, _, ty) then
       if lir_is_fp_type(ty) then
         Result::Err("lir: " + ctx.fn_name + ": a floating-point place cannot be a finalizer receiver (fail-closed)")
       end
@@ -18836,12 +20019,16 @@ end
 #     the slot reservation stays conservative, so the frame layout is
 #     unchanged). Reload records are only created where a real post-call
 #     read exists, so none is ever dead.
-#   - a sequencing/scheduling pass: the LIR record set and the target
-#     descriptions model NO machine scheduler (no pipeline, latency,
-#     issue or port model exists), so there is no scheduling
-#     architecture to sequence against; emission follows the
-#     deterministic linear order (I3). A sequencing pass would need a
-#     cost model this slice deliberately does not carry.
+#   - a full machine scheduler: the bounded list-scheduling pass of the
+#     machine scheduling section IS implemented, but it deliberately
+#     carries NO pipeline/port/issue-width model (target_desc's
+#     SchedModel is approximate orientation data: per-class latencies
+#     and a dual-issue flag) and it reorders statements only WITHIN one
+#     basic block, only when the LIR-level data/flag/memory barriers
+#     allow it, and only inside fixed statement windows. Software
+#     pipelining, loop scheduling, trace scheduling, block reordering
+#     and cross-block motion remain absent; emission follows the
+#     deterministic scheduled linear order (I3).
 #   - fallthrough branch elision on the x86-64/thumb/riscv emitters:
 #     their block loops do not pass a next-block neighbor yet, so they
 #     keep the explicit unconditional branch (the canonical aarch64
@@ -19183,6 +20370,610 @@ end
 def lir_peephole_cond_branch(f: LirFunction) -> LirFunction
   lir_peephole_pass(f, true)
 end
+
+# ———————————————————————————————————————————————————————————————
+# Machine scheduling (the bounded list-scheduling slice)
+# ———————————————————————————————————————————————————————————————
+# A bounded, semantics-preserving LIST SCHEDULER over basic blocks,
+# running AFTER the peephole and BEFORE the register allocator:
+#
+#   lower -> peephole -> SCHEDULE -> allocate -> verify_lir -> emit
+#
+# PLACEMENT AND WHY (the sound seam): scheduling runs on the
+# virtual-register function, before allocation. Two constraints force
+# this seam:
+#   - I3 (linear positions): the allocator computes per-vreg interval
+#     hulls over the SAME linear statement order the emitter walks, and
+#     its output (segment decisions, spill/reload records, cc_used,
+#     remat choices) is position-keyed. Reordering AFTER allocation
+#     would invalidate every position-keyed record and would require
+#     reasoning about physical-register reuse (two vregs may share a
+#     physical register only because their original intervals do not
+#     overlap — reordering can break that silently). Scheduling BEFORE
+#     allocation keeps I3 trivially: the allocator and the emitter both
+#     walk the SCHEDULED order, so every decision lookup is consistent
+#     by construction. Register pressure is NOT an allocator assumption
+#     here: the linear-scan allocator handles whatever pressure the new
+#     order creates (spill/reload pairing is DERIVED after scheduling,
+#     so there is no pairing to preserve).
+#   - the call-boundary model (I2): calls are terminators, and this
+#     pass only permutes the statements INSIDE one block, so a
+#     statement can never cross a call; the allocator's call-boundary
+#     splitting then runs on the scheduled order exactly as before.
+#
+# THE RULES (each reorder is allowed only when NO rule below keeps the
+# original order; every rule is a conservative, route-agnostic
+# over-approximation of the machine hazard):
+#   R1 data: two statements that touch a common vreg keep their order
+#     whenever either DEFINES it (a def-use, WAW or WAR hazard).
+#     Read-read pairs with no common def commute.
+#   R2 flags (I1): every flag-touching statement — an unmarked
+#     LirCmp/LirFCmp setter or a LirCset consumer — is a FULL BARRIER:
+#     its order is preserved against every other statement in the
+#     block. This is deliberately stronger than the aarch64 NZCV rule
+#     ("only flag-neutral code may separate a compare from its Cset"):
+#     the x86-64 and riscv emitters REQUIRE the Cmp/Cset pair to be
+#     adjacent (their pending-compare state panics on any interleaving —
+#     backend_x86_64.tg's X86Emit.pending_cmp, backend_rv.tg's
+#     rv_emit_term), so the route-agnostic sound rule freezes the order
+#     around every flag statement. A fused cond-branch terminator stays
+#     last in its block by construction.
+#   R3 memory: conservatively ALIASING memory statements keep their
+#     order. The memory-kind classes are: non-atomic reads (LirPtrLoad,
+#     LirStaticLoad, LirVecLoad, LirVecAbiArg), writes (LirPtrStore,
+#     LirVecStore and every vector statement that writes its dst
+#     image), atomics (LirAtomLoad/Store/Rmw/Cas — every atomic keeps
+#     its order against every other memory statement) and fences. Only
+#     a READ/READ pair may invert: the LIR records carry no alias facts
+#     beyond the access marker itself, so every non-read access is
+#     assumed potentially aliasing with every other memory statement
+#     and the original order is kept — a load never hoists above an
+#     earlier store, and a store never sinks below a later load.
+#   R4 barriers: LirPushArg (the caller-stack stores must keep their
+#     descending order — the emitter lays them down in statement order),
+#     LirPtrFence (the
+#     memory-ordering barrier) and the vector ABI crossings
+#     (LirVecAbiBind/LirVecAbiArg — their ABI register-file positions
+#     are payload data, not vreg dependencies, so their order is not
+#     visible to R1 and must be frozen) are FULL BARRIERS.
+#   R5 structure: terminators (Jump/Switch/Ret/Trap/Call — the call
+#     clobber boundary and every trap/branch) never move; blocks are
+#     never reordered or merged, and the pass only permutes statements
+#     WITHIN one block. So a potential trap (a faulting access) never
+#     crosses a control-flow edge or a call.
+#
+# THE HEURISTIC (ordering only — correctness never reads it): windows of
+# `lir_sched_window()` consecutive statements are scheduled
+# independently by a deterministic critical-path list scheduler. A
+# window is a fixed contiguous slice of the ORIGINAL order, so no
+# statement ever crosses a window boundary (cross-boundary hazards are
+# preserved by construction) and the work per block is bounded by
+# O(statements x window). Within a window:
+#   priority(i) = latency(class(i)) + max(priority(j)) over window
+#   successors j of i under the rules above (the model's class latencies
+#   — target_desc's SchedModel, read through sched_class_latency).
+# The ready list is then drained by (priority desc, original index asc),
+# with the model's dual_issue flag used only as a tie-break preference
+# for alternating compute/memory picks. This is the classic
+# critical-path order: a load feeding a long dependent chain is started
+# far enough ahead of its consumer that independent work fills the
+# latency — dependent chains stay together and short-lived loads drift
+# toward the end of their window (the "loads late" intent).
+# DETERMINISM (the I3 reproducibility requirement): the ready list is
+# drained by a total order — (priority desc, dual-issue preference,
+# original index asc) — over a fixed window decomposition, with no Map
+# iteration or unordered structure anywhere in the pass, so the same
+# input always yields the same order (the lane's S4 row pins it).
+#
+# OPT-LEVEL GATE: the pass is off at O0/O1 and on at O2+ — the LIR
+# route mirrors the MIR passes' level gate through the stamped
+# MirProgram.opt_level (driver.tg's compile_lir_route stamps the SAME
+# level optimize_mir consumed; mir.tg's MirProgram.opt_level doc). The
+# gate lives in lir_schedule_impl so every caller (all four backends
+# and the ABI verifiers' pipeline rebuilds) observes the identical rule;
+# a hand-built program (opt_level default 0) never schedules.
+#
+# OBSERVABILITY (the OptimizationDecision journal convention): the
+# capturing entry lir_schedule_function_capture records ONE row per
+# function through opt_dec_row — pass "machine scheduling",
+# decision "scheduled" with the displaced-statement/block counts and
+# the model text (sched_model_text), decision "schedule-kept" when the
+# gate is open but no window has a legal reorder, and
+# decision "schedule-skipped" when the opt level is below the gate. The
+# plain entry builds no row at all (mirroring mir.tg's plain/capturing
+# optimizer split); the LIR route consumes the plain entry, so the
+# journal surface is the capture entry the lane and any future LIR
+# decision channel read.
+#
+# HONEST LIMITS: the pass models no pipeline, port, in-order stall or
+# issue-width behavior (the SchedModel is orientation data only); it
+# never speculates, never moves memory statements except read/read
+# inversions, never reorders blocks/labels/fallthrough and never
+# touches terminators; a block whose window contains only barriers and
+# hazard-linked statements is left unchanged; and fault ORDER is not
+# modeled: two potentially-faulting accesses keep their order only
+# under R3/R4, so inverting two independent loads (a legal R3
+# read/read inversion) may change which of two faults the machine
+# reports first. The pass's sub-word/alias knowledge is exactly the LIR
+# marker surface: no range/points-to analysis exists in this slice.
+
+# The window size: the bounded scope of one list-scheduling decision.
+# Windows are fixed contiguous slices of the original statement order,
+# so smaller windows are strictly more conservative; 16 keeps the
+# O(n x window^2) work negligible for the route's block sizes.
+def lir_sched_window() -> Int = 16
+
+# The minimum opt level that enables scheduling (mirrors the MIR
+# passes' `opt_level >= 2` gate shape).
+def lir_sched_min_opt_level() -> Int = 2
+
+# The scheduling-latency class of a vector lane (float lanes ride the FP
+# class, integer lanes the ALU class).
+def lir_sched_lane_class(lane: LirVectorLane) -> SchedClass
+  if lir_vector_lane_is_float(lane) then
+    SchedClass::SchedFp
+  else
+    SchedClass::SchedAlu
+  end
+end
+
+# The scheduling-latency class of one statement (marker-aware, the same
+# precedence the def/use walks use; the class only feeds the priority
+# heuristic — never correctness).
+def lir_sched_class_of(stmt: LirStmt) -> SchedClass
+  match stmt.vec
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecLoad(_, _, _) then return SchedClass::SchedLoad
+    when LirVecOp::LirVecBinop(_, lane, _, _, _) then return lir_sched_lane_class(lane)
+    when LirVecOp::LirVecMove(lane, _, _) then return lir_sched_lane_class(lane)
+    when LirVecOp::LirVecShuffle(lane, _, _, _) then return lir_sched_lane_class(lane)
+    when LirVecOp::LirVecShiftImm(lane, _, _, _, _) then return lir_sched_lane_class(lane)
+    when LirVecOp::LirVecShiftVec(lane, _, _, _, _) then return lir_sched_lane_class(lane)
+    when LirVecOp::LirVecSplat(lane, _, _) then return lir_sched_lane_class(lane)
+    when LirVecOp::LirVecExtract(lane, _, _, _) then return lir_sched_lane_class(lane)
+    when LirVecOp::LirVecInsert(lane, _, _, _, _) then return lir_sched_lane_class(lane)
+    when LirVecOp::LirVecPack(_, to_lane, _, _, _) then return lir_sched_lane_class(to_lane)
+    when LirVecOp::LirVecUnpack(_, to_lane, _, _, _) then return lir_sched_lane_class(to_lane)
+    when _ then return SchedClass::SchedAlu
+    end
+  when Option::None then ()
+  end
+  match stmt.div
+  when Option::Some(_) then return SchedClass::SchedDiv
+  when Option::None then ()
+  end
+  match stmt.ptr
+  when Option::Some(pop) then
+    match pop
+    when LirPtrOp::LirPtrLoad(_, _, _, _, _) then return SchedClass::SchedLoad
+    when _ then return SchedClass::SchedAlu
+    end
+  when Option::None then ()
+  end
+  match stmt.kind
+  when LirStmtKind::LirLoadFrame(_, _) then SchedClass::SchedLoad
+  when LirStmtKind::LirStaticLoad(_, _) then SchedClass::SchedLoad
+  when LirStmtKind::LirBinop(op, _, _, _) then
+    match op
+    when LirBinOp::LirMul then SchedClass::SchedMul
+    when _ then SchedClass::SchedAlu
+    end
+  when LirStmtKind::LirFBinop(op, _, _, _, _) then
+    match op
+    when LirFpBinOp::LirFDiv then SchedClass::SchedDiv
+    when _ then SchedClass::SchedFp
+    end
+  when LirStmtKind::LirFMove(_, _) then SchedClass::SchedFp
+  when LirStmtKind::LirFNeg(_, _, _) then SchedClass::SchedFp
+  when LirStmtKind::LirFCmp(_, _, _) then SchedClass::SchedFp
+  when LirStmtKind::LirFConst(_, _, _) then SchedClass::SchedFp
+  when LirStmtKind::LirIntToFloat(_, _, _, _) then SchedClass::SchedFp
+  when LirStmtKind::LirFloatToInt(_, _, _) then SchedClass::SchedFp
+  when LirStmtKind::LirFcvt(_, _, _) then SchedClass::SchedFp
+  when _ then SchedClass::SchedAlu
+  end
+end
+
+# Whether a statement touches the NZCV flag state (an I1 chain member):
+# the unmarked flag setters and the LirCset consumer. Marker carriers are
+# never flag statements (a marked LirCmp is an atomic fence's carrier).
+def lir_sched_touches_flags(stmt: LirStmt) -> Bool
+  if lir_peephole_stmt_marked(stmt) then
+    return false
+  end
+  match stmt.kind
+  when LirStmtKind::LirCmp(_, _) then true
+  when LirStmtKind::LirFCmp(_, _, _) then true
+  when LirStmtKind::LirCset(_, _) then true
+  when _ then false
+  end
+end
+
+# The memory-access kind of one statement (R3's dispatch key). The
+# conservative default is "none" (register-only statements); a marker
+# that touches memory must be classified here or R3 cannot see it.
+enum LirSchedMem
+  LirSchedMemNone
+  LirSchedMemRead
+  LirSchedMemWrite
+  LirSchedMemAtomic
+end
+
+def lir_sched_stmt_mem(stmt: LirStmt) -> LirSchedMem
+  match stmt.vec
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecLoad(_, _, _) then return LirSchedMem::LirSchedMemRead
+    when LirVecOp::LirVecAbiArg(_, _, _) then return LirSchedMem::LirSchedMemRead
+    when _ then return LirSchedMem::LirSchedMemWrite
+    end
+  when Option::None then ()
+  end
+  match stmt.ptr
+  when Option::Some(pop) then
+    match pop
+    when LirPtrOp::LirPtrLea(_, _) then return LirSchedMem::LirSchedMemNone
+    when LirPtrOp::LirPtrAddr(_, _, _) then return LirSchedMem::LirSchedMemNone
+    when LirPtrOp::LirPtrLoad(_, _, _, _, _) then return LirSchedMem::LirSchedMemRead
+    when LirPtrOp::LirPtrStore(_, _, _, _) then return LirSchedMem::LirSchedMemWrite
+    when _ then return LirSchedMem::LirSchedMemAtomic
+    end
+  when Option::None then ()
+  end
+  match stmt.kind
+  when LirStmtKind::LirLoadFrame(_, _) then LirSchedMem::LirSchedMemRead
+  when LirStmtKind::LirStaticLoad(_, _) then LirSchedMem::LirSchedMemRead
+  when _ then LirSchedMem::LirSchedMemNone
+  end
+end
+
+# Whether a statement is a full scheduling barrier: R2's flag statements
+# and R4's push/fence/vector-ABI crossings. Nothing crosses a barrier.
+def lir_sched_stmt_barrier(stmt: LirStmt) -> Bool
+  if lir_sched_touches_flags(stmt) then
+    return true
+  end
+  match stmt.vec
+  when Option::Some(vop) then
+    match vop
+    when LirVecOp::LirVecAbiBind(_, _, _) then return true
+    when LirVecOp::LirVecAbiArg(_, _, _) then return true
+    when _ then ()
+    end
+  when Option::None then ()
+  end
+  match stmt.ptr
+  when Option::Some(pop) then
+    match pop
+    when LirPtrOp::LirPtrFence(_) then return true
+    when _ then ()
+    end
+  when Option::None then ()
+  end
+  match stmt.kind
+  when LirStmtKind::LirPushArg(_) then true
+  when _ then false
+  end
+end
+
+# The per-statement scheduling snapshot (defs/uses/memory/barrier and
+# the model latency seed). lir_verify_stmt_occ is the marker-aware def/
+# use authority the whole module shares, so the scheduler sees exactly
+# the occurrences the allocator and the verifier see.
+struct LirSchedInfo
+  defs: Vec[Int]
+  uses: Vec[Int]
+  barrier: Bool
+  mem: LirSchedMem
+  class: SchedClass
+  latency: Int
+end
+
+def lir_sched_info_new(stmt: LirStmt, model: SchedModel) -> LirSchedInfo
+  var defs: Vec[Int] = Vec::new()
+  var uses: Vec[Int] = Vec::new()
+  lir_verify_stmt_occ(stmt, &mut defs, &mut uses)
+  let class = lir_sched_class_of(stmt)
+  LirSchedInfo {
+    defs: defs,
+    uses: uses,
+    barrier: lir_sched_stmt_barrier(stmt),
+    mem: lir_sched_stmt_mem(stmt),
+    class: class,
+    latency: sched_class_latency(model, class)
+  }
+end
+
+def lir_sched_ids_has(ids: Vec[Int], v: Int) -> Bool
+  var i = 0
+  while i < ids.len() do
+    if ids[i] == v then
+      return true
+    end
+    i = i + 1
+  end
+  false
+end
+
+# R1 — the data hazard: a common vreg touched by both statements, with a
+# def on either side (def-use, WAW or WAR). Uses-only overlaps commute.
+def lir_sched_reg_conflict(a: LirSchedInfo, b: LirSchedInfo) -> Bool
+  var i = 0
+  while i < a.defs.len() do
+    let v = a.defs[i]
+    if lir_sched_ids_has(b.defs, v) || lir_sched_ids_has(b.uses, v) then
+      return true
+    end
+    i = i + 1
+  end
+  i = 0
+  while i < a.uses.len() do
+    let v = a.uses[i]
+    if lir_sched_ids_has(b.defs, v) then
+      return true
+    end
+    i = i + 1
+  end
+  false
+end
+
+# R3 — the memory hazard: only a read/read pair commutes; every pair
+# involving a write or an atomic keeps its original order (no alias facts
+# exist to justify anything stronger).
+def lir_sched_mem_conflict(a: LirSchedMem, b: LirSchedMem) -> Bool
+  match a
+  when LirSchedMem::LirSchedMemNone then false
+  when LirSchedMem::LirSchedMemRead then
+    match b
+    when LirSchedMem::LirSchedMemRead then false
+    when LirSchedMem::LirSchedMemNone then false
+    when _ then true
+    end
+  when _ then
+    match b
+    when LirSchedMem::LirSchedMemNone then false
+    when _ then true
+    end
+  end
+end
+
+# The full pairwise conflict: a before b must keep its order iff any rule
+# fires.
+def lir_sched_conflict(a: LirSchedInfo, b: LirSchedInfo) -> Bool
+  if a.barrier || b.barrier then
+    return true
+  end
+  if lir_sched_reg_conflict(a, b) then
+    return true
+  end
+  lir_sched_mem_conflict(a.mem, b.mem)
+end
+
+# Is window index i ready (every window predecessor already placed)?
+def lir_sched_ready(deps: Vec[Bool], placed: Vec[Bool], m: Int, i: Int) -> Bool
+  var k = 0
+  while k < i do
+    if deps[k * m + i] && !placed[k] then
+      return false
+    end
+    k = k + 1
+  end
+  true
+end
+
+# Schedule ONE block's statements: fixed windows of lir_sched_window()
+# consecutive statements, each drained by the deterministic ready-list
+# rule. Returns the scheduled statements and the number of statements
+# whose position inside its window changed (the decision row's count).
+def lir_sched_block(stmts: Vec[LirStmt], model: SchedModel) -> (Vec[LirStmt], Int)
+  let n = stmts.len()
+  if n <= 1 then
+    return (stmts.clone(), 0)
+  end
+  var infos: Vec[LirSchedInfo] = Vec::new()
+  var si = 0
+  while si < n do
+    infos.push(lir_sched_info_new(stmts[si].clone(), model))
+    si = si + 1
+  end
+  var out: Vec[LirStmt] = Vec::new()
+  var moved = 0
+  var w0 = 0
+  while w0 < n do
+    var w1 = w0 + lir_sched_window()
+    if w1 > n then
+      w1 = n
+    end
+    let m = w1 - w0
+    # The window dependency graph, flat m x m: deps[i * m + j] = i
+    # must precede j.
+    var deps: Vec[Bool] = Vec::new()
+    var cells = 0
+    while cells < m * m do
+      deps.push(false)
+      cells = cells + 1
+    end
+    var i = 0
+    while i < m do
+      var j = i + 1
+      while j < m do
+        if lir_sched_conflict(infos[w0 + i], infos[w0 + j]) then
+          deps[i * m + j] = true
+        end
+        j = j + 1
+      end
+      i = i + 1
+    end
+    # The critical-path heights: latency(i) + max height over i's
+    # window successors (computed in reverse original order — all edges
+    # go forward, so one backward sweep suffices).
+    var heights: Vec[Int] = Vec::new()
+    i = 0
+    while i < m do
+      heights.push(infos[w0 + i].latency)
+      i = i + 1
+    end
+    i = m - 1
+    while i >= 0 do
+      var best = 0
+      var j2 = i + 1
+      while j2 < m do
+        if deps[i * m + j2] && heights[j2] > best then
+          best = heights[j2]
+        end
+        j2 = j2 + 1
+      end
+      heights[i] = infos[w0 + i].latency + best
+      i = i - 1
+    end
+    # The ready list: (height desc, dual-issue alternation, original
+    # index asc) — the total order that makes the output deterministic.
+    var placed: Vec[Bool] = Vec::new()
+    i = 0
+    while i < m do
+      placed.push(false)
+      i = i + 1
+    end
+    var last_class = SchedClass::SchedAlu
+    var have_last = false
+    var picked = 0
+    while picked < m do
+      var best_i = -1
+      var best_h = -1
+      i = 0
+      while i < m do
+        if !placed[i] && lir_sched_ready(deps, placed, m, i) then
+          if heights[i] > best_h then
+            best_h = heights[i]
+          end
+        end
+        i = i + 1
+      end
+      i = 0
+      while i < m do
+        if !placed[i] && lir_sched_ready(deps, placed, m, i) && heights[i] == best_h then
+          if best_i < 0 then
+            best_i = i
+          elsif model.dual_issue && have_last then
+            let i_diff = infos[w0 + i].class != last_class
+            let b_diff = infos[w0 + best_i].class != last_class
+            if i_diff && !b_diff then
+              best_i = i
+            end
+          end
+        end
+        i = i + 1
+      end
+      placed[best_i] = true
+      out.push(stmts[w0 + best_i].clone())
+      if best_i != picked then
+        moved = moved + 1
+      end
+      last_class = infos[w0 + best_i].class
+      have_last = true
+      picked = picked + 1
+    end
+    w0 = w1
+  end
+  (out, moved)
+end
+
+# The scheduler's shared implementation: `capture` gates the
+# OptimizationDecision row builds (false -> no row, mirroring the MIR
+# optimizer's plain/capturing split), and the opt-level gate lives HERE
+# so every caller observes one rule.
+def lir_schedule_impl(f: LirFunction, desc: TargetDesc, opt_level: Int, capture: Bool, inout rows: Vec[OptimizationDecision]) -> LirFunction
+  if opt_level < lir_sched_min_opt_level() then
+    if capture then
+      rows.push(opt_dec_row(
+        "machine scheduling".to_string(),
+        f.name.clone(),
+        "lir".to_string(),
+        "schedule-skipped".to_string(),
+        "opt_level " + opt_level.to_string() + " is below the scheduling gate (the pass enables at O" + lir_sched_min_opt_level().to_string() + "+)"))
+    end
+    return f
+  end
+  let model = desc.sched.clone()
+  var blocks: Vec[LirBlock] = Vec::new()
+  var total_moved = 0
+  var blocks_changed = 0
+  var bi = 0
+  while bi < f.blocks.len() do
+    let b = f.blocks[bi]
+    let (scheduled, moved) = lir_sched_block(b.stmts.clone(), model.clone())
+    if moved > 0 then
+      total_moved = total_moved + moved
+      blocks_changed = blocks_changed + 1
+    end
+    blocks.push(LirBlock {
+      id: b.id,
+      stmts: scheduled,
+      term: b.term.clone()
+    })
+    bi = bi + 1
+  end
+  if capture then
+    if total_moved > 0 then
+      rows.push(opt_dec_row(
+        "machine scheduling".to_string(),
+        f.name.clone(),
+        "lir".to_string(),
+        "scheduled".to_string(),
+        "reordered " + total_moved.to_string() + " statement position(s) across " + blocks_changed.to_string() + " block(s), windows of " + lir_sched_window().to_string() + "; " + sched_model_text(model.clone())))
+    else
+      rows.push(opt_dec_row(
+        "machine scheduling".to_string(),
+        f.name.clone(),
+        "lir".to_string(),
+        "schedule-kept".to_string(),
+        "no hazard-free reorder inside the " + lir_sched_window().to_string() + "-statement windows; " + sched_model_text(model.clone())))
+    end
+  end
+  # The rebuild preserves every non-statement field exactly as the
+  # peephole does (I3's positions are the scheduled statement order).
+  LirFunction {
+    name: f.name.clone(),
+    attr_cold: f.attr_cold,
+    attr_interrupt: f.attr_interrupt,
+    vregs: f.vregs,
+    fp_widths: f.fp_widths,
+    vector_widths: f.vector_widths,
+    vector_lanes: f.vector_lanes,
+    params: f.params.clone(),
+    ret_vreg: f.ret_vreg,
+    blocks: blocks,
+    entry_block: f.entry_block,
+    agg_slots: f.agg_slots,
+    agg_word_slots: f.agg_word_slots,
+    sret_words: f.sret_words,
+    sret_base_slot: f.sret_base_slot,
+    sret_bytes: f.sret_bytes,
+    sret_call_slots: f.sret_call_slots,
+    agg_call_args: f.agg_call_args,
+    agg_params: f.agg_params.clone(),
+    niched_enum_crossing: f.niched_enum_crossing,
+    tail_call_blocks: f.tail_call_blocks}
+end
+
+# The route-facing entry: schedule at the program's stamped opt level,
+# building no decision row (the LIR route's production path).
+pub def lir_schedule_function(f: LirFunction, desc: TargetDesc, opt_level: Int) -> LirFunction
+  var discard: Vec[OptimizationDecision] = Vec::new()
+  lir_schedule_impl(f, desc, opt_level, false, &mut discard)
+end
+
+# The capturing entry (the journal convention): same pass, plus the ONE
+# per-function OptimizationDecision row — "scheduled" with the displaced
+# statement positions and the model text, "schedule-kept" when nothing
+# was legally reorderable, or "schedule-skipped" below the O2 gate.
+pub def lir_schedule_function_capture(f: LirFunction, desc: TargetDesc, opt_level: Int) -> (LirFunction, Vec[OptimizationDecision])
+  var rows: Vec[OptimizationDecision] = Vec::new()
+  let scheduled = lir_schedule_impl(f, desc, opt_level, true, &mut rows)
+  (scheduled, rows)
+end
+
 # ———————————————————————————————————————————————————————————————
 # Linear-scan register allocation (Slice 3)
 # ———————————————————————————————————————————————————————————————
@@ -25421,7 +27212,11 @@ pub def abi_verify_program_a64(program: MirProgram, desc: TargetDesc) -> Vec[Str
         out.push(abi_verify_row(f.name.clone(), "lowering failed before ABI verification: " + e))
       when Result::Ok(lir_fn) then
         let peeped = lir_peephole_cond_branch(lir_fn)
-        let alloc = lir_alloc_registers_a64(peeped.clone())
+        # (machine-scheduling slice) the SAME post-peephole scheduling
+        # seam the emission pipeline runs, at the SAME stamped level —
+        # the verifier must rebuild the exact LIR the route emits.
+        let scheduled = lir_schedule_function(peeped, desc.clone(), program.opt_level)
+        let alloc = lir_alloc_registers_a64(scheduled.clone())
         var pty: Vec[Type] = Vec::new()
         var pi = 0
         while pi < f.params.len() do
@@ -25434,7 +27229,7 @@ pub def abi_verify_program_a64(program: MirProgram, desc: TargetDesc) -> Vec[Str
           ret: f.ret_type.clone(),
           variadic: f.is_extern_variadic,
           is_extern: false,
-          lir: peeped,
+          lir: scheduled,
           alloc: alloc
         }
         for row in verify_abi_fn(ctx, vf) do
@@ -28914,7 +30709,11 @@ def lir_validate_callees(f: LirFunction, defined: Set[String], externs: Set[Stri
     # their symbols live in the runtime object, never in the program's
     # function list (the same allowance the direct route's runtime
     # labels rely on).
-    if !defined.contains(&t) && !externs.contains(&t) && t != "_tg_bump_alloc" && t != "_tg_string_drop" then
+    # `_tg_array_get/set/new/push` are the heap-collection runtime helpers
+    # of the collection slice (emitted unconditionally by
+    # emit_array_runtime): the LIR calls them directly with the direct
+    # route's register convention.
+    if !defined.contains(&t) && !externs.contains(&t) && t != "_tg_bump_alloc" && t != "_tg_string_drop" && t != "_tg_array_get" && t != "_tg_array_set" && t != "_tg_array_new" && t != "_tg_array_push" then
       return Result::Err("lir: function " + f.name + " calls unknown target `" + t + "` (not a program function, not an extern — fail-closed)")
     end
     ci = ci + 1
@@ -29416,7 +31215,7 @@ end
 # every function takes the identical lowering path whichever pass emits
 # it. (fourth-audit P0-20: the function returns Unit now — the
 # enum-ABI version marker and its object note are deleted.)
-def lir_lower_emit_prog_a64(inout ctx: CodegenCtx, f: MirFunction, type_defs: Map[Int, MirTypeDef], deinit_plans: Map[String, DeinitPlan], finalizer_names: Map[Int, String], glue_names: Set[String], drop_glue_fns: Map[Int, String], externs: Set[String], defined: Set[String], cov: Option[CoverageFnPlan], replay: LirReplayPlan, abi_ctx: AbiVerifyCtx) -> Result[Unit, String]
+def lir_lower_emit_prog_a64(inout ctx: CodegenCtx, f: MirFunction, type_defs: Map[Int, MirTypeDef], deinit_plans: Map[String, DeinitPlan], finalizer_names: Map[Int, String], glue_names: Set[String], drop_glue_fns: Map[Int, String], externs: Set[String], defined: Set[String], cov: Option[CoverageFnPlan], replay: LirReplayPlan, abi_ctx: AbiVerifyCtx, opt_level: Int) -> Result[Unit, String]
   match lir_check_extern_enum_calls(f, type_defs, externs)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(_) then ()
@@ -29439,13 +31238,19 @@ def lir_lower_emit_prog_a64(inout ctx: CodegenCtx, f: MirFunction, type_defs: Ma
   when Result::Ok(_) then ()
   end
   let peeped = lir_peephole_cond_branch(lir_fn)
-  let alloc = lir_alloc_registers_a64(peeped)
+  # (machine-scheduling slice) the bounded list scheduler runs AFTER the
+  # peephole and BEFORE allocation (the placement rule — see the machine
+  # scheduling section): the allocator and the emitter then share the
+  # scheduled linear order (I3), so every position-keyed record stays
+  # consistent. The gate is the program's stamped opt level (O2+).
+  let scheduled = lir_schedule_function(peeped, lir_target_desc(), opt_level)
+  let alloc = lir_alloc_registers_a64(scheduled)
   # Mandatory verification (audit item 26 — verify_lir): the post-
-  # allocation, pre-emission gate over the peeped function and its
+  # allocation, pre-emission gate over the SCHEDULED function and its
   # allocation. A non-empty violation list FAILS CLOSED with the first
   # violations named; a valid function's behavior is unchanged (the
   # gate emits nothing and mutates nothing).
-  match lir_verify_route(peeped, alloc, LirVerifyRoute::LirVerifyA64)
+  match lir_verify_route(scheduled, alloc, LirVerifyRoute::LirVerifyA64)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(_) then ()
   end
@@ -29467,13 +31272,13 @@ def lir_lower_emit_prog_a64(inout ctx: CodegenCtx, f: MirFunction, type_defs: Ma
     ret: f.ret_type.clone(),
     variadic: f.is_extern_variadic,
     is_extern: false,
-    lir: peeped,
+    lir: scheduled,
     alloc: alloc
   })
   if abi_rows.len() > 0 then
     return Result::Err(abi_verify_fail_err(f.name.clone(), abi_rows))
   end
-  lir_emit_fn(&mut ctx, peeped, alloc, externs, defined, cov, replay)
+  lir_emit_fn(&mut ctx, scheduled, alloc, externs, defined, cov, replay)
   Result::Ok(())
 end
 
@@ -29606,7 +31411,7 @@ pub def lir_compile_object_cov(program: MirProgram, target: AsmTarget, cov_plan:
       # in lir_emit_fn routes them into (Section::ColdText). Programs
       # without @cold functions take the cold pass as a zero-iteration
       # no-op and the stream is byte-identical to the pre-@cold layout.
-      match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()), replay_plan.clone(), abi_ctx)
+      match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()), replay_plan.clone(), abi_ctx, program.opt_level)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
       end
@@ -29658,7 +31463,7 @@ pub def lir_compile_object_cov(program: MirProgram, target: AsmTarget, cov_plan:
     while fi < program.functions.len() do
       let f = program.functions[fi]
       if !f.is_extern && f.attr_cold then
-        match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()), replay_plan.clone(), abi_ctx)
+        match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()), replay_plan.clone(), abi_ctx, program.opt_level)
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(_) then ()
         end
@@ -29809,7 +31614,7 @@ pub def lir_link_object_cov(program: MirProgram, target: AsmTarget, output_path:
       # .text.cold region their symbols are routed into (see
       # lir_emit_fn's Section::ColdText registration). Programs without
       # @cold functions take the cold pass as a zero-iteration no-op.
-      match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()), replay_plan.clone(), abi_ctx)
+      match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()), replay_plan.clone(), abi_ctx, program.opt_level)
       when Result::Err(e) then return Result::Err(e)
       when Result::Ok(_) then ()
       end
@@ -29850,7 +31655,7 @@ pub def lir_link_object_cov(program: MirProgram, target: AsmTarget, output_path:
     while fi < program.functions.len() do
       let f = program.functions[fi]
       if !f.is_extern && f.attr_cold then
-        match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()), replay_plan.clone(), abi_ctx)
+        match lir_lower_emit_prog_a64(&mut ctx, f, type_defs, deinit_plans, finalizer_names, glue_names, drop_glue_fns, externs, defined, cov_fns.get(f.name.clone()), replay_plan.clone(), abi_ctx, program.opt_level)
         when Result::Err(e) then return Result::Err(e)
         when Result::Ok(_) then ()
         end
@@ -30211,6 +32016,353 @@ pub def lir_peephole_lane_check() -> Vec[String]
   lir_peephole_lane_row(&mut out, "P5-live-reload-kept", lir_peephole_lane_has_rec(f5_alloc.reloads, 3, 16))
   lir_peephole_lane_row(&mut out, "P5-dead-store-elided", !lir_peephole_lane_has_rec(f5_alloc.spills, 2, 17))
   lir_peephole_lane_row(&mut out, "P5-verify", lir_verified(f5.clone(), f5_alloc.clone(), LirVerifyRoute::LirVerifyA64))
+
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
+# Machine-scheduling lane (the bounded list scheduler's pinned rows)
+# ———————————————————————————————————————————————————————————————
+# The one engine under test is lir_schedule_function /
+# lir_schedule_function_capture (see the machine scheduling section):
+# the A64 route's desc drives the pass directly (the lane is
+# target-agnostic — the scheduler consumes a TargetDesc and LIR records
+# only). Rows:
+#   S0 the model DATA is carried by the descriptors (the host OoO model
+#      dual-issues; the Cortex-M model does not);
+#   S1 two independent loads: the load whose consumer chain is longer is
+#      hoisted before the lower-height one (order changes), dependent
+#      chains stay ordered, verify_lir green;
+#   S2 a store and a potentially-aliasing load keep their order (the
+#      read never hoists above the write), verify_lir green;
+#   S3 statements around a call keep their order: the call stays the
+#      block terminator, the R4 push barrier keeps every pre-push
+#      statement before it (and the post-push statement after it), and
+#      the post-call block's statement order is untouched, verify_lir
+#      green;
+#   S4 determinism: the same input schedules to the same statement
+#      order (a second run's block key list is identical);
+#   S5 semantics preservation: a small computation evaluated before and
+#      after scheduling produces identical results for several inputs
+#      (the lane's tiny evaluator), verify_lir green;
+#   S6 the opt-level gate: O1 leaves the function byte-identical and
+#      records "schedule-skipped"; O2 records "scheduled" and verify
+#      stays green.
+# The test file tests/lir_schedule_lane_test.tg asserts the empty list.
+
+def lir_sched_lane_value_key(v: LirValue) -> String
+  match v
+  when LirValue::LirReg(r) then "r" + r.to_string()
+  when LirValue::LirImm(i) then "i" + i.to_string()
+  end
+end
+
+def lir_sched_lane_op_key(op: LirBinOp) -> String
+  match op
+  when LirBinOp::LirAdd then "add"
+  when LirBinOp::LirSub then "sub"
+  when LirBinOp::LirMul then "mul"
+  when LirBinOp::LirAnd then "and"
+  when LirBinOp::LirOr then "or"
+  when LirBinOp::LirXor then "xor"
+  when LirBinOp::LirShl then "shl"
+  when LirBinOp::LirAsr then "asr"
+  when LirBinOp::LirLsr then "lsr"
+  end
+end
+
+# A stable per-statement key for the lane's order assertions (the shapes
+# the lane builds: moves, binops, the pointer markers and the pushes).
+def lir_sched_lane_stmt_key(stmt: LirStmt) -> String
+  match stmt.vec
+  when Option::Some(_) then return "vec"
+  when Option::None then ()
+  end
+  match stmt.div
+  when Option::Some(_) then
+    match stmt.kind
+    when LirStmtKind::LirBinop(_, dst, l, r) then
+      return "div " + dst.to_string() + " " + lir_sched_lane_value_key(l) + " " + lir_sched_lane_value_key(r)
+    when _ then return "div-other"
+    end
+  when Option::None then ()
+  end
+  match stmt.ptr
+  when Option::Some(pop) then
+    match pop
+    when LirPtrOp::LirPtrLea(dst, off) then
+      return "lea " + dst.to_string() + " " + off.to_string()
+    when LirPtrOp::LirPtrLoad(dst, base, off, w, _) then
+      return "load " + dst.to_string() + " " + base.to_string() + " " + off.to_string() + " " + w.to_string()
+    when LirPtrOp::LirPtrStore(base, off, src, w) then
+      return "store " + base.to_string() + " " + off.to_string() + " " + src.to_string() + " " + w.to_string()
+    when _ then return "ptr-other"
+    end
+  when Option::None then ()
+  end
+  match stmt.kind
+  when LirStmtKind::LirMove(dst, val) then
+    "mov " + dst.to_string() + " " + lir_sched_lane_value_key(val)
+  when LirStmtKind::LirBinop(op, dst, l, r) then
+    "bin " + dst.to_string() + " " + lir_sched_lane_value_key(l) + " " + lir_sched_lane_value_key(r) + " " + lir_sched_lane_op_key(op)
+  when LirStmtKind::LirUnop(_, dst, src) then
+    "un " + dst.to_string() + " " + src.to_string()
+  when LirStmtKind::LirPushArg(v) then
+    "push " + v.to_string()
+  when _ then "other"
+  end
+end
+
+def lir_sched_lane_block_keys(f: LirFunction, block_id: Int) -> String
+  var out = ""
+  var bi = 0
+  while bi < f.blocks.len() do
+    if f.blocks[bi].id == block_id then
+      var si = 0
+      while si < f.blocks[bi].stmts.len() do
+        if si > 0 then
+          out = out + "|"
+        end
+        out = out + lir_sched_lane_stmt_key(f.blocks[bi].stmts[si])
+        si = si + 1
+      end
+    end
+    bi = bi + 1
+  end
+  out
+end
+
+def lir_sched_lane_index_of(f: LirFunction, block_id: Int, key: String) -> Int
+  var bi = 0
+  while bi < f.blocks.len() do
+    if f.blocks[bi].id == block_id then
+      var si = 0
+      while si < f.blocks[bi].stmts.len() do
+        if lir_sched_lane_stmt_key(f.blocks[bi].stmts[si]) == key then
+          return si
+        end
+        si = si + 1
+      end
+    end
+    bi = bi + 1
+  end
+  -1
+end
+
+# The lane's tiny straight-line evaluator (the semantics-preservation
+# row): integer moves and add/sub/mul binops over fixed vregs 0/1 as the
+# two inputs, read out of the block's LirRet. It exists only to compare
+# a function with its scheduled form — the production evaluator is the
+# emitter.
+def lir_sched_lane_eval_value(env: Map[Int, Int], v: LirValue) -> Int
+  match v
+  when LirValue::LirReg(r) then
+    match env.get(r)
+    when Option::Some(x) then x
+    when Option::None then 0
+    end
+  when LirValue::LirImm(i) then i
+  end
+end
+
+def lir_sched_lane_eval_stmt(stmt: LirStmt, inout env: Map[Int, Int]) -> Unit
+  match stmt.kind
+  when LirStmtKind::LirMove(dst, val) then
+    env.insert(dst, lir_sched_lane_eval_value(env.clone(), val))
+  when LirStmtKind::LirBinop(op, dst, l, r) then
+    let lv = lir_sched_lane_eval_value(env.clone(), l)
+    let rv = lir_sched_lane_eval_value(env.clone(), r)
+    match op
+    when LirBinOp::LirAdd then env.insert(dst, lv + rv)
+    when LirBinOp::LirSub then env.insert(dst, lv - rv)
+    when LirBinOp::LirMul then env.insert(dst, lv * rv)
+    when _ then ()
+    end
+  when _ then ()
+  end
+end
+
+def lir_sched_lane_eval(f: LirFunction, a: Int, b: Int) -> Int
+  var env: Map[Int, Int] = Map::new()
+  env.insert(0, a)
+  env.insert(1, b)
+  var ret = 0
+  var bi = 0
+  while bi < f.blocks.len() do
+    let blk = f.blocks[bi]
+    var si = 0
+    while si < blk.stmts.len() do
+      lir_sched_lane_eval_stmt(blk.stmts[si].clone(), &mut env)
+      si = si + 1
+    end
+    match blk.term.kind
+    when LirTermKind::LirRet(Option::Some(v)) then
+      ret = lir_sched_lane_eval_value(env.clone(), LirValue::LirReg(v))
+    when _ then ()
+    end
+    bi = bi + 1
+  end
+  ret
+end
+
+# S1's function: two independent pointer loads. The long consumer chain
+# hangs off v24 (address v20); the short chain off v22 (address v21).
+def lir_sched_lane_s1_fn() -> LirFunction
+  var stmts: Vec[LirStmt] = Vec::new()
+  stmts.push(LirStmt { kind: LirStmtKind::LirCset(LirCond::LirEq, 20), ptr: Option::Some(LirPtrOp::LirPtrLea(20, -8)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirCset(LirCond::LirEq, 21), ptr: Option::Some(LirPtrOp::LirPtrLea(21, -16)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirCset(LirCond::LirEq, 22), ptr: Option::Some(LirPtrOp::LirPtrLoad(22, 21, 0, 8, false)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirAdd, 23, LirValue::LirReg(22), LirValue::LirImm(1)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirCset(LirCond::LirEq, 24), ptr: Option::Some(LirPtrOp::LirPtrLoad(24, 20, 0, 8, false)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirAdd, 25, LirValue::LirReg(24), LirValue::LirImm(1)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirAdd, 26, LirValue::LirReg(25), LirValue::LirImm(1)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirAdd, 27, LirValue::LirReg(26), LirValue::LirImm(1)) })
+  var blocks: Vec[LirBlock] = Vec::new()
+  blocks.push(LirBlock { id: 0, stmts: stmts, term: LirTerm { kind: LirTermKind::LirRet(Option::Some(27)) } })
+  lir_peephole_lane_fn("m::sched_s1".to_string(), 32, blocks)
+end
+
+# S2's function: a store followed by a potentially-aliasing load.
+def lir_sched_lane_s2_fn() -> LirFunction
+  var stmts: Vec[LirStmt] = Vec::new()
+  stmts.push(LirStmt { kind: LirStmtKind::LirCset(LirCond::LirEq, 20), ptr: Option::Some(LirPtrOp::LirPtrLea(20, -8)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirCset(LirCond::LirEq, 21), ptr: Option::Some(LirPtrOp::LirPtrLea(21, -16)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirMove(16, LirValue::LirImm(7)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirCmp(LirValue::LirReg(20), LirValue::LirImm(0)), ptr: Option::Some(LirPtrOp::LirPtrStore(20, 0, 16, 8)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirCset(LirCond::LirEq, 22), ptr: Option::Some(LirPtrOp::LirPtrLoad(22, 21, 0, 8, false)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirAdd, 23, LirValue::LirReg(22), LirValue::LirImm(1)) })
+  var blocks: Vec[LirBlock] = Vec::new()
+  blocks.push(LirBlock { id: 0, stmts: stmts, term: LirTerm { kind: LirTermKind::LirRet(Option::Some(23)) } })
+  lir_peephole_lane_fn("m::sched_s2".to_string(), 32, blocks)
+end
+
+# S3's function: a call-ending block with a pushed stack argument and an
+# independent statement AFTER the push, plus a post-call block. The push
+# barrier must keep every original pre-push statement before it and the
+# mov18 statement after it (nothing crosses the caller-stack setup), the
+# call must stay the block terminator, and the post-call block must be
+# untouched.
+def lir_sched_lane_s3_fn() -> LirFunction
+  var pre: Vec[LirStmt] = Vec::new()
+  pre.push(LirStmt { kind: LirStmtKind::LirCset(LirCond::LirEq, 20), ptr: Option::Some(LirPtrOp::LirPtrLea(20, -8)) })
+  pre.push(LirStmt { kind: LirStmtKind::LirMove(16, LirValue::LirImm(5)) })
+  pre.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirAdd, 17, LirValue::LirReg(16), LirValue::LirImm(1)) })
+  pre.push(LirStmt { kind: LirStmtKind::LirPushArg(17) })
+  pre.push(LirStmt { kind: LirStmtKind::LirMove(18, LirValue::LirImm(9)) })
+  var post: Vec[LirStmt] = Vec::new()
+  post.push(LirStmt { kind: LirStmtKind::LirMove(23, LirValue::LirReg(19)) })
+  post.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirAdd, 24, LirValue::LirReg(23), LirValue::LirImm(1)) })
+  var call_args: Vec[Int] = Vec::new()
+  call_args.push(17)
+  var blocks: Vec[LirBlock] = Vec::new()
+  blocks.push(LirBlock {
+    id: 0,
+    stmts: pre,
+    term: LirTerm { kind: LirTermKind::LirCall("m::sched_callee".to_string(), call_args, 1, Option::Some(19), 1) }
+  })
+  blocks.push(LirBlock { id: 1, stmts: post, term: LirTerm { kind: LirTermKind::LirRet(Option::Some(24)) } })
+  lir_peephole_lane_fn("m::sched_s3".to_string(), 32, blocks)
+end
+
+# S5's function: a small two-chain computation whose order the scheduler
+# legitimately changes (the second chain's first half hoists).
+def lir_sched_lane_s5_fn() -> LirFunction
+  var stmts: Vec[LirStmt] = Vec::new()
+  stmts.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirAdd, 16, LirValue::LirReg(0), LirValue::LirReg(1)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirMul, 17, LirValue::LirReg(16), LirValue::LirImm(2)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirSub, 18, LirValue::LirReg(17), LirValue::LirImm(1)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirMul, 19, LirValue::LirReg(0), LirValue::LirReg(1)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirAdd, 20, LirValue::LirReg(19), LirValue::LirImm(4)) })
+  stmts.push(LirStmt { kind: LirStmtKind::LirBinop(LirBinOp::LirSub, 21, LirValue::LirReg(20), LirValue::LirReg(18)) })
+  var blocks: Vec[LirBlock] = Vec::new()
+  blocks.push(LirBlock { id: 0, stmts: stmts, term: LirTerm { kind: LirTermKind::LirRet(Option::Some(21)) } })
+  lir_peephole_lane_fn("m::sched_s5".to_string(), 32, blocks)
+end
+
+pub def lir_schedule_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  let desc = aarch64_desc()
+
+  # ——— S0: the model data on the descriptors ———
+  let m_host = aarch64_desc().sched.clone()
+  let m_cm = thumbv7em_cortex_m4f_desc().sched.clone()
+  lir_peephole_lane_row(&mut out, "S0-model-host", m_host.dual_issue && m_host.load_latency == 4 && m_host.div_latency == 12)
+  lir_peephole_lane_row(&mut out, "S0-model-cm", !m_cm.dual_issue && m_cm.load_latency == 2)
+
+  # ——— S1: two independent loads, the long-chain load hoists ———
+  let f1 = lir_sched_lane_s1_fn()
+  let (f1s, f1_rows) = lir_schedule_function_capture(f1.clone(), desc.clone(), 2)
+  let o1_load24 = lir_sched_lane_index_of(f1s.clone(), 0, "load 24 20 0 8")
+  let o1_load22 = lir_sched_lane_index_of(f1s.clone(), 0, "load 22 21 0 8")
+  let r1_load24 = lir_sched_lane_index_of(f1, 0, "load 24 20 0 8")
+  let r1_load22 = lir_sched_lane_index_of(f1, 0, "load 22 21 0 8")
+  lir_peephole_lane_row(&mut out, "S1-load-order-changed", r1_load22 < r1_load24 && o1_load24 >= 0 && o1_load22 >= 0 && o1_load24 < o1_load22)
+  lir_peephole_lane_row(&mut out, "S1-long-chain-grouped",
+    lir_sched_lane_index_of(f1s.clone(), 0, "bin 25 r24 i1 add") < lir_sched_lane_index_of(f1s.clone(), 0, "bin 26 r25 i1 add") &&
+    lir_sched_lane_index_of(f1s.clone(), 0, "bin 26 r25 i1 add") < lir_sched_lane_index_of(f1s.clone(), 0, "bin 27 r26 i1 add"))
+  lir_peephole_lane_row(&mut out, "S1-short-chain-grouped",
+    lir_sched_lane_index_of(f1s.clone(), 0, "load 22 21 0 8") < lir_sched_lane_index_of(f1s.clone(), 0, "bin 23 r22 i1 add"))
+  lir_peephole_lane_row(&mut out, "S1-verify", lir_verified(f1s.clone(), lir_peephole_lane_plain_alloc(f1s.clone()), LirVerifyRoute::LirVerifyA64))
+  lir_peephole_lane_row(&mut out, "S1-decision-row", f1_rows.len() == 1 && f1_rows[0].decision == "scheduled" && f1_rows[0].pass == "machine scheduling")
+
+  # ——— S2: a store and a potentially-aliasing load keep their order ———
+  let f2 = lir_sched_lane_s2_fn()
+  let (f2s, _f2_rows) = lir_schedule_function_capture(f2.clone(), desc.clone(), 2)
+  let s2_store = lir_sched_lane_index_of(f2s.clone(), 0, "store 20 0 16 8")
+  let s2_load = lir_sched_lane_index_of(f2s.clone(), 0, "load 22 21 0 8")
+  lir_peephole_lane_row(&mut out, "S2-alias-order-kept", s2_store >= 0 && s2_load >= 0 && s2_store < s2_load)
+  lir_peephole_lane_row(&mut out, "S2-verify", lir_verified(f2s.clone(), lir_peephole_lane_plain_alloc(f2s.clone()), LirVerifyRoute::LirVerifyA64))
+
+  # ——— S3: statements around a call keep their order ———
+  let f3 = lir_sched_lane_s3_fn()
+  let (f3s, _f3_rows) = lir_schedule_function_capture(f3.clone(), desc.clone(), 2)
+  let f3_post_same = lir_sched_lane_block_keys(f3s.clone(), 1) == lir_sched_lane_block_keys(f3.clone(), 1)
+  let p3_push = lir_sched_lane_index_of(f3s.clone(), 0, "push 17")
+  let p3_add17 = lir_sched_lane_index_of(f3s.clone(), 0, "bin 17 r16 i1 add")
+  let p3_mov18 = lir_sched_lane_index_of(f3s.clone(), 0, "mov 18 i9")
+  let p3_lea20 = lir_sched_lane_index_of(f3s.clone(), 0, "lea 20 -8")
+  let f3_push_barrier = p3_push >= 0 && p3_add17 >= 0 && p3_lea20 >= 0 && p3_mov18 >= 0 &&
+    p3_add17 < p3_push && p3_lea20 < p3_push && p3_mov18 > p3_push
+  var f3_call_kept = false
+  if f3s.blocks.len() == 2 then
+    match f3s.blocks[0].term.kind
+    when LirTermKind::LirCall(target, args, sa, dest, success) then
+      match dest
+      when Option::Some(dv) then
+        f3_call_kept = target == "m::sched_callee" && args.len() == 1 && sa == 1 && dv == 19 && success == 1
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+  lir_peephole_lane_row(&mut out, "S3-push-barrier-kept", f3_push_barrier && f3_call_kept)
+  lir_peephole_lane_row(&mut out, "S3-post-call-kept", f3_post_same)
+  lir_peephole_lane_row(&mut out, "S3-verify", lir_verified(f3s.clone(), lir_peephole_lane_plain_alloc(f3s.clone()), LirVerifyRoute::LirVerifyA64))
+
+  # ——— S4: deterministic output ———
+  let (f1s_again, _) = lir_schedule_function_capture(f1.clone(), desc.clone(), 2)
+  lir_peephole_lane_row(&mut out, "S4-deterministic",
+    lir_sched_lane_block_keys(f1s.clone(), 0) == lir_sched_lane_block_keys(f1s_again.clone(), 0))
+
+  # ——— S5: semantics preservation on a small computation ———
+  let f5 = lir_sched_lane_s5_fn()
+  let (f5s, _) = lir_schedule_function_capture(f5.clone(), desc.clone(), 2)
+  let f5_changed = lir_sched_lane_block_keys(f5s.clone(), 0) != lir_sched_lane_block_keys(f5.clone(), 0)
+  let same_sem = lir_sched_lane_eval(f5s.clone(), 5, 7) == lir_sched_lane_eval(f5.clone(), 5, 7) &&
+                 lir_sched_lane_eval(f5s.clone(), 10, 3) == lir_sched_lane_eval(f5.clone(), 10, 3) &&
+                 lir_sched_lane_eval(f5s.clone(), 0 - 2, 4) == lir_sched_lane_eval(f5.clone(), 0 - 2, 4)
+  lir_peephole_lane_row(&mut out, "S5-order-changed", f5_changed)
+  lir_peephole_lane_row(&mut out, "S5-eval-preserved", same_sem && lir_sched_lane_eval(f5.clone(), 5, 7) == 16 && lir_sched_lane_eval(f5.clone(), 10, 3) == 9 && lir_sched_lane_eval(f5.clone(), 0 - 2, 4) == 0 - 7)
+  lir_peephole_lane_row(&mut out, "S5-verify", lir_verified(f5s.clone(), lir_peephole_lane_plain_alloc(f5s.clone()), LirVerifyRoute::LirVerifyA64))
+
+  # ——— S6: the opt-level gate ———
+  let (f1_o1, rows_o1) = lir_schedule_function_capture(f1.clone(), desc.clone(), 1)
+  lir_peephole_lane_row(&mut out, "S6-o1-unchanged",
+    lir_sched_lane_block_keys(f1_o1.clone(), 0) == lir_sched_lane_block_keys(f1.clone(), 0))
+  lir_peephole_lane_row(&mut out, "S6-o1-row", rows_o1.len() == 1 && rows_o1[0].decision == "schedule-skipped")
+  let (f1_o0, _) = lir_schedule_function_capture(f1.clone(), desc.clone(), 0)
+  lir_peephole_lane_row(&mut out, "S6-o0-unchanged",
+    lir_sched_lane_block_keys(f1_o0.clone(), 0) == lir_sched_lane_block_keys(f1.clone(), 0))
 
   out
 end

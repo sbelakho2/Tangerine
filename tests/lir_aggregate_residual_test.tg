@@ -50,18 +50,19 @@ use std::test::*
 use tg_compiler::ast::{LayoutAttrs, layout_attrs_plain}
 use tg_compiler::ids::{
   TypeId, VariantId, FieldId, ModuleId, DefId, CallableId, InstanceId,
-  def_id_numeric
+  IntrinsicId, def_id_numeric
 }
 use tg_compiler::mir::{
   MirFunction, MirLocal, MirLocalId, MirBlock, MirBlockId, MirStatement,
   MirStatementKind, MirRvalue, MirRvalueKind, MirOperand, MirOperandKind,
   MirConstant, MirConstantKind, MirTerminator, MirTerminatorKind,
+  MirCallArg, MirCallValue,
   MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef,
   AggregateKind, Place, Projection, place_local, mir_type_identity_key
 }
 use tg_compiler::token::span_dummy
 use tg_compiler::target_desc::aarch64_desc
-use tg_compiler::types::{Type, DeinitPlan}
+use tg_compiler::types::{Type, DeinitPlan, AccessEffect}
 use tg_compiler::lir::{
   LirFunction, LirVerifyRoute, LirTermKind, LirAggShape, LirAggShapeKind,
   LirEnumShape, LirPtrOp, LirBitMoveOp, LirVecOp, LirStmtKind, LirBinOp,
@@ -274,6 +275,14 @@ def ar_type_defs() -> Map[Int, MirTypeDef]
   ])))
   defs.insert(427, ar_struct_def(427, "HasU8Arr", Vec::from([
     ("a".to_string(), Type::FixedArray(Type::U8, 4))
+  ])))
+  # The heap-collection runtime-index slice: a Vec/Array-named zero-field
+  # Adt is the HeapVecHeader HANDLE (its layout is one pointer word,
+  # exactly like std's `struct Vec[T]`), and a struct carrying one tests
+  # the field-offset handle word.
+  defs.insert(430, ar_struct_def(430, "Vec", Vec::new()))
+  defs.insert(431, ar_struct_def(431, "HasVecField", Vec::from([
+    ("v".to_string(), ar_vec_int_ty())
   ])))
   defs
 end
@@ -2338,5 +2347,474 @@ def whole_image_deref_size_mismatch_stays_fail_closed() -> Unit
   when Result::Ok(_) then panic("a whole-image deref with a layout size mismatch must stay fail-closed")
   when Result::Err(e) then
     assert(e.contains("16 byte(s)") && e.contains("24 byte(s)"), "the rule names both sizes, got: " + e)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# 14. HEAP-COLLECTION RUNTIME INDEXING (the heap-collection
+#     runtime-index slice): Vec[T]/Array[T] element places through the
+#     32-byte runtime header, the header length read, and the checked
+#     Array accessor calls. Fixture: type 430 is a zero-field Vec-named
+#     Adt whose layout is the HeapVecHeader handle word (exactly like
+#     std's `struct Vec[T]`); the accessor receiver is the checker's
+#     re-borrow reference word (RefInternal).
+# ———————————————————————————————————————————————————————————————
+
+def ar_vec_int_ty() -> Type
+  Type::Adt(TypeId { id: 430 }, Vec::from([Type::Int]))
+end
+
+def ar_vec_string_ty() -> Type
+  Type::Adt(TypeId { id: 430 }, Vec::from([Type::String]))
+end
+
+def ar_has_vec_field_ty() -> Type
+  Type::Adt(TypeId { id: 431 }, Vec::new())
+end
+
+def ar_vec_ref_ty() -> Type
+  Type::RefInternal(ar_vec_int_ty(), false)
+end
+
+def ar_call_arg_read(p: Place) -> MirCallArg
+  MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(ar_copy_operand(p)) }
+end
+
+def ar_call_arg_modify(p: Place) -> MirCallArg
+  MirCallArg { effect: AccessEffect::Modify, value: MirCallValue::Value(ar_copy_operand(p)) }
+end
+
+def ar_call_term(dest: Place, target: String, args: Vec[MirCallArg], intrinsic: Option[IntrinsicId], success: Int) -> MirTerminator
+  MirTerminator {
+    kind: MirTerminatorKind::MirCall {
+      dest: dest,
+      func: MirOperand { kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirFnItem(target),
+        ty: Type::Unit,
+        instance: Option::None
+      }) },
+      args: args,
+      success: MirBlockId { id: success },
+      unwind: Option::None,
+      intrinsic: intrinsic,
+      tail: false
+    },
+    span: span_dummy()
+  }
+end
+
+def ar_len_rvalue(p: Place) -> MirRvalue
+  MirRvalue { kind: MirRvalueKind::MirLen(p), span: span_dummy() }
+end
+
+def ar_has_move_imm(f: LirFunction, imm: Int) -> Bool
+  var found = false
+  var bi = 0
+  while bi < f.blocks.len() do
+    var si = 0
+    while si < f.blocks[bi].stmts.len() do
+      match f.blocks[bi].stmts[si].kind
+      when LirStmtKind::LirMove(_, v) then
+        match v
+        when LirValue::LirImm(n) then
+          if n == imm then found = true end
+        when _ then ()
+        end
+      when _ then ()
+      end
+      si = si + 1
+    end
+    bi = bi + 1
+  end
+  found
+end
+
+# `t = v[i]` / `v[i] = t` over a whole Vec[Int] local: the handle word
+# from the frame image, the header's data pointer through it, and the
+# stride-8 dynamic element access — the inline ProjIndex heap arm.
+def ar_heap_index_frame_fn() -> MirFunction
+  ar_mk_fn("heap_index_frame", Vec::new(), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "v", ar_vec_int_ty(), false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_index_place(1, 2)))),
+      ar_assign_stmt(ar_index_place(1, 2), ar_move_rvalue(ar_copy_operand(ar_place(3))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def heap_vec_index_frame_read_write_lowers() -> Unit
+  let defs = ar_type_defs()
+  # The Vec handle image: a zero-field 8-byte aggregate (HeapVecHeader
+  # pointer layout), so a whole Vec local is admitted.
+  let shape = ar_shape(defs, ar_vec_int_ty(), "Vec[Int]")
+  assert(shape.size == 8 && shape.fields.len() == 0, "the Vec handle image is one 8-byte word")
+  let f = ar_lower(ar_heap_index_frame_fn(), defs)
+  ar_verify_clean(f, "the heap Vec frame runtime-index read/write function")
+  assert(ar_has_lea(f), "the heap element address starts from the frame LEA")
+  assert(ar_binop_imm_count(f, LirBinOp::LirMul, 8) >= 2, "each access scales the index by the stride-8 element")
+  assert(ar_binop_reg_count(f, LirBinOp::LirAdd) >= 2, "each access adds the scaled index to the header's data pointer")
+  let loads = ar_ptr_loads(f)
+  assert(loads.len() >= 4, "each access loads the handle word AND the header data pointer before the element access")
+  assert(ar_has_load(loads, 0, 8, false), "the handle word and the data pointer load as width-8 words at displacement 0")
+  assert(ar_has_store(ar_ptr_stores(f), 0, 8), "the element write is a width-8 store at the computed address")
+  assert(ar_cmp_count(f) == 0, "the heap element place emits no bounds compare (the direct ProjIndex heap arm is unchecked)")
+  assert(ar_trap_count(f) == 0, "the heap element place emits no trap of its own")
+  assert(!ar_has_call(f, "_tg_array_get"), "the place form accesses the element inline, never through the accessor helper")
+end
+
+# `t = s.v[i]` over a struct field of type Vec[Int]: the handle word at
+# the FIELD's layout byte offset (its own frame slot).
+def ar_heap_index_field_fn() -> MirFunction
+  let sy = ar_has_vec_field_ty()
+  ar_mk_fn("heap_index_field", Vec::new(), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "s", sy, false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_index_field_place(1, 2, 431, 0))))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def heap_vec_field_index_lowers() -> Unit
+  let defs = ar_type_defs()
+  let shape = ar_shape(defs, ar_has_vec_field_ty(), "HasVecField")
+  assert(shape.size == 8 && shape.fields.len() == 1 && shape.fields[0].byte_off == 0, "the Vec handle field is one word at byte 0")
+  let f = ar_lower(ar_heap_index_field_fn(), defs)
+  ar_verify_clean(f, "the heap Vec field runtime-index read function")
+  assert(ar_binop_imm_count(f, LirBinOp::LirMul, 8) >= 1, "the field's Vec element stride 8 drives the scaling")
+  assert(ar_has_load(ar_ptr_loads(f), 0, 8, false), "the handle word and the data pointer load as width-8 words")
+end
+
+# `t = len(v)` (MirLen over the whole handle) and `t = len(*r)` (MirLen
+# over a RefInternal — the glue/iterator form): the header's len field.
+def ar_heap_len_fn() -> MirFunction
+  ar_mk_fn("heap_len", Vec::new(), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "v", ar_vec_int_ty(), false),
+    ar_local(2, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_len_rvalue(ar_place(1)))
+    ]), ar_ret_term())
+  ]))
+end
+
+def ar_heap_len_ref_fn() -> MirFunction
+  ar_mk_fn("heap_len_ref", Vec::from([ar_local(1, "r", ar_vec_ref_ty(), false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "r", ar_vec_ref_ty(), false),
+    ar_local(2, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_len_rvalue(ar_deref_place(1)))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def heap_vec_len_reads_lower() -> Unit
+  let defs = ar_type_defs()
+  let f = ar_lower(ar_heap_len_fn(), defs)
+  ar_verify_clean(f, "the heap Vec length-read function")
+  assert(ar_has_load(ar_ptr_loads(f), 8, 8, false), "the whole-local length read loads the header len field (the layout authority's offset 8)")
+  assert(ar_cmp_count(f) == 0 && ar_trap_count(f) == 0, "the length read carries neither compare nor trap")
+  let g = ar_lower(ar_heap_len_ref_fn(), defs)
+  ar_verify_clean(g, "the heap Vec length-through-reference function")
+  assert(ar_has_load(ar_ptr_loads(g), 8, 8, false), "the reference form derefs to the handle first, then reads len at offset 8")
+  assert(ar_ptr_loads(g).len() >= 2, "the reference form loads the handle through the ref word before the len field")
+end
+
+# A fixed inline collection ([Int; 4] field, the ArrayVecN/RingBufferN
+# shape) stays on the dynamic-offset IMAGE slice: no heap helper call.
+def ar_fixed_collection_index_fn() -> MirFunction
+  let sy = ar_has_arr_ty()
+  ar_mk_fn("fixed_collection_index", Vec::new(), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "s", sy, false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(3), ar_move_rvalue(ar_copy_operand(ar_index_field_place(1, 2, 424, 0)))),
+      ar_assign_stmt(ar_index_field_place(1, 2, 424, 0), ar_move_rvalue(ar_copy_operand(ar_place(3))))
+    ]), ar_ret_term())
+  ]))
+end
+
+# A fixed inline array's MirLen is its compile-time count (the direct
+# emitter's constant move), never a header read.
+def ar_fixed_len_fn() -> MirFunction
+  let sy = ar_has_arr_ty()
+  ar_mk_fn("fixed_len", Vec::new(), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "s", sy, false),
+    ar_local(2, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::from([
+      ar_assign_stmt(ar_place(2), ar_len_rvalue(ar_field_place(1, 424, 0)))
+    ]), ar_ret_term())
+  ]))
+end
+
+@test
+def fixed_collection_len_read_is_the_static_count() -> Unit
+  let f = ar_lower(ar_fixed_len_fn(), ar_type_defs())
+  ar_verify_clean(f, "the fixed array length-read function")
+  assert(ar_has_move_imm(f, 4), "MirLen over a fixed array lowers as the compile-time element count (4)")
+end
+
+# `t = v.len()` — the __intrinsic_array_len call: the receiver derefs to
+# the handle and the header len field loads (no runtime call).
+def ar_heap_len_call_fn() -> MirFunction
+  ar_mk_fn("heap_len_call", Vec::from([ar_local(1, "r", ar_vec_ref_ty(), false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "r", ar_vec_ref_ty(), false)
+  ]), Vec::from([
+    ar_block(0, Vec::new(), ar_call_term(
+      ar_place(0),
+      "__intrinsic_array_len".to_string(),
+      Vec::from([ar_call_arg_read(ar_place(1))]),
+      Option::Some(IntrinsicId::ArrayLen),
+      1
+    )),
+    ar_block(1, Vec::new(), ar_ret_term())
+  ]))
+end
+
+@test
+def heap_array_len_call_lowers() -> Unit
+  let f = ar_lower(ar_heap_len_call_fn(), ar_type_defs())
+  ar_verify_clean(f, "the ArrayLen call function")
+  assert(ar_ptr_loads(f).len() >= 2, "the receiver derefs to the handle word before the field load")
+  assert(ar_has_load(ar_ptr_loads(f), 8, 8, false), "the len call reads the header len field at the layout offset 8")
+end
+
+@test
+def fixed_collection_field_index_stays_on_the_image_slice() -> Unit
+  let f = ar_lower(ar_fixed_collection_index_fn(), ar_type_defs())
+  ar_verify_clean(f, "the fixed-collection field index function")
+  assert(!ar_has_call(f, "_tg_array_get") && !ar_has_call(f, "_tg_array_set"), "a fixed inline collection's element access is the dynamic-offset IMAGE place, never a heap helper call")
+  assert(ar_has_load(ar_ptr_loads(f), 0, 8, false), "the Int element reads as a width-8 image word")
+  assert(ar_binop_imm_count(f, LirBinOp::LirMul, 8) >= 2, "the fixed array's stride-8 scaling is still emitted")
+end
+
+# `t = v.get(i)` — the __intrinsic_array_get call with the checked arm:
+# the signed index < len compare, the OOB trap, the runtime address
+# helper and the width-matched element load.
+def ar_heap_get_call_fn() -> MirFunction
+  ar_mk_fn("heap_get_call", Vec::from([ar_local(1, "r", ar_vec_ref_ty(), false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "r", ar_vec_ref_ty(), false),
+    ar_local(2, "i", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::new(), ar_call_term(
+      ar_place(0),
+      "__intrinsic_array_get".to_string(),
+      Vec::from([
+        ar_call_arg_read(ar_place(1)),
+        ar_call_arg_read(ar_place(2))
+      ]),
+      Option::Some(IntrinsicId::ArrayGet),
+      1
+    )),
+    ar_block(1, Vec::new(), ar_ret_term())
+  ]))
+end
+
+@test
+def heap_array_get_call_lowers_checked() -> Unit
+  let f = ar_lower(ar_heap_get_call_fn(), ar_type_defs())
+  ar_verify_clean(f, "the checked ArrayGet call function")
+  assert(ar_has_call(f, "_tg_array_get"), "the checked get calls the runtime address primitive")
+  assert(ar_cmp_count(f) >= 1, "the checked arm compares the index against the header length")
+  assert(ar_trap_count(f) >= 1, "an out-of-range index reaches a trap (the defined std OOB policy)")
+  assert(ar_has_load(ar_ptr_loads(f), 8, 8, false), "the length guard reads the header len field")
+  assert(ar_has_load(ar_ptr_loads(f), 0, 8, false), "the returned element address materializes through a width-8 element load")
+end
+
+# `v.set(i, t)` — __intrinsic_array_set: the runtime write helper with
+# no bounds guard of its own (the direct route's unchecked write).
+def ar_heap_set_call_fn() -> MirFunction
+  ar_mk_fn("heap_set_call", Vec::from([
+    ar_local(1, "r", ar_vec_ref_ty(), false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::Int, true)
+  ]), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "r", ar_vec_ref_ty(), false),
+    ar_local(2, "i", Type::Int, true),
+    ar_local(3, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::new(), ar_call_term(
+      ar_place(0),
+      "__intrinsic_array_set".to_string(),
+      Vec::from([
+        ar_call_arg_modify(ar_place(1)),
+        ar_call_arg_read(ar_place(2)),
+        ar_call_arg_read(ar_place(3))
+      ]),
+      Option::Some(IntrinsicId::ArraySet),
+      1
+    )),
+    ar_block(1, Vec::new(), ar_ret_term())
+  ]))
+end
+
+@test
+def heap_array_set_call_lowers() -> Unit
+  let f = ar_lower(ar_heap_set_call_fn(), ar_type_defs())
+  ar_verify_clean(f, "the ArraySet call function")
+  assert(ar_has_call(f, "_tg_array_set"), "the set call targets the runtime element-write helper")
+  assert(ar_cmp_count(f) == 0 && ar_trap_count(f) == 0, "the unchecked set arm carries no bounds guard (the direct codegen_array_set arm has none)")
+end
+
+# `let v = Vec.new()` — __intrinsic_array_new: the runtime header
+# constructor with the destination element's stride.
+def ar_heap_new_call_fn() -> MirFunction
+  ar_mk_fn("heap_new_call", Vec::new(), ar_vec_int_ty(), Vec::from([
+    ar_local(0, "_ret", ar_vec_int_ty(), true)
+  ]), Vec::from([
+    ar_block(0, Vec::new(), ar_call_term(
+      ar_place(0),
+      "__intrinsic_array_new".to_string(),
+      Vec::new(),
+      Option::Some(IntrinsicId::ArrayNew),
+      1
+    )),
+    ar_block(1, Vec::new(), ar_ret_term())
+  ]))
+end
+
+@test
+def heap_array_new_call_lowers() -> Unit
+  let f = ar_lower(ar_heap_new_call_fn(), ar_type_defs())
+  ar_verify_clean(f, "the ArrayNew call function")
+  assert(ar_has_call(f, "_tg_array_new"), "the constructor calls the runtime header allocator")
+end
+
+# `v.push(t)` — __intrinsic_array_push: the runtime append helper.
+def ar_heap_push_call_fn() -> MirFunction
+  ar_mk_fn("heap_push_call", Vec::from([
+    ar_local(1, "r", ar_vec_ref_ty(), false),
+    ar_local(2, "t", Type::Int, true)
+  ]), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "r", ar_vec_ref_ty(), false),
+    ar_local(2, "t", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::new(), ar_call_term(
+      ar_place(0),
+      "__intrinsic_array_push".to_string(),
+      Vec::from([
+        ar_call_arg_modify(ar_place(1)),
+        ar_call_arg_read(ar_place(2))
+      ]),
+      Option::Some(IntrinsicId::ArrayPush),
+      1
+    )),
+    ar_block(1, Vec::new(), ar_ret_term())
+  ]))
+end
+
+@test
+def heap_array_push_call_lowers() -> Unit
+  let f = ar_lower(ar_heap_push_call_fn(), ar_type_defs())
+  ar_verify_clean(f, "the ArrayPush call function")
+  assert(ar_has_call(f, "_tg_array_push"), "the append call targets the runtime helper")
+end
+
+# The element DROP over a heap element place: the plan consumer's String
+# leaf runs its destructor on the SAME dynamic element address the
+# accesses form (the ownership half of an owning-element write).
+def ar_heap_string_drop_fn() -> MirFunction
+  ar_mk_fn("heap_string_drop", Vec::new(), Type::Unit, Vec::from([
+    ar_local(0, "_ret", Type::Unit, true),
+    ar_local(1, "v", ar_vec_string_ty(), true),
+    ar_local(2, "i", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::new(), ar_deinit_term(ar_index_place(1, 2), ar_inst(9), 1)),
+    ar_block(1, Vec::new(), ar_ret_term())
+  ]))
+end
+
+@test
+def heap_vec_string_element_drop_lowers() -> Unit
+  let defs = ar_type_defs()
+  var plans: Map[String, DeinitPlan] = Map::new()
+  plans.insert(mir_type_identity_key(Type::String), DeinitPlan::String)
+  let d = ar_lower_with_plans(ar_heap_string_drop_fn(), defs, plans)
+  ar_verify_clean(d, "the heap String-element drop function")
+  assert(ar_has_call(d, "_tg_string_drop"), "the element's String plan calls the runtime destructor on the element address")
+  assert(ar_binop_imm_count(d, LirBinOp::LirMul, 8) >= 1, "the drop address scales the index by the handle's element stride")
+  assert(ar_has_load(ar_ptr_loads(d), 0, 8, false), "the drop address chain loads the handle and data words first")
+end
+
+# The refusal rows: the accessor families the slice does not carry keep
+# their NAMED fail-closed rules.
+def ar_map_get_call_fn() -> MirFunction
+  ar_mk_fn("map_get_call", Vec::from([
+    ar_local(1, "r", ar_vec_ref_ty(), false),
+    ar_local(2, "k", Type::Int, true)
+  ]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "r", ar_vec_ref_ty(), false),
+    ar_local(2, "k", Type::Int, true)
+  ]), Vec::from([
+    ar_block(0, Vec::new(), ar_call_term(
+      ar_place(0),
+      "__intrinsic_map_get".to_string(),
+      Vec::from([
+        ar_call_arg_read(ar_place(1)),
+        ar_call_arg_read(ar_place(2))
+      ]),
+      Option::Some(IntrinsicId::MapGet),
+      1
+    )),
+    ar_block(1, Vec::new(), ar_ret_term())
+  ]))
+end
+
+@test
+def map_get_intrinsic_stays_fail_closed() -> Unit
+  let f = ar_map_get_call_fn()
+  match lower_mir_fn_to_lir_prog(f, ar_type_defs(), Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Ok(_) then panic("a Map::get intrinsic call must stay fail-closed (hash/eq function addresses are not carryable)")
+  when Result::Err(e) then
+    assert(e.contains("hash/eq function addresses"), "the rule names the missing hash/eq address operands, got: " + e)
+  end
+end
+
+def ar_pop_call_fn() -> MirFunction
+  ar_mk_fn("pop_call", Vec::from([ar_local(1, "r", ar_vec_ref_ty(), false)]), Type::Int, Vec::from([
+    ar_local(0, "_ret", Type::Int, true),
+    ar_local(1, "r", ar_vec_ref_ty(), false)
+  ]), Vec::from([
+    ar_block(0, Vec::new(), ar_call_term(
+      ar_place(0),
+      "__intrinsic_array_pop".to_string(),
+      Vec::from([ar_call_arg_modify(ar_place(1))]),
+      Option::Some(IntrinsicId::ArrayPop),
+      1
+    )),
+    ar_block(1, Vec::new(), ar_ret_term())
+  ]))
+end
+
+@test
+def array_pop_option_result_stays_fail_closed() -> Unit
+  let f = ar_pop_call_fn()
+  match lower_mir_fn_to_lir_prog(f, ar_type_defs(), Map::new(), Map::new(), Set::new(), Map::new(), Map::new())
+  when Result::Ok(_) then panic("the Option-returning Array::pop must stay fail-closed (its Option image construction is not carried)")
+  when Result::Err(e) then
+    assert(e.contains("Option"), "the rule names the Option result boundary, got: " + e)
   end
 end

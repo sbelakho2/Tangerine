@@ -10,10 +10,13 @@
 # float_abi/fpu — the CPU and the FPU are SEPARATE data: a Cortex-M4
 # without its optional FPU is NOT the same target as a Cortex-M4F),
 # the calling-convention register classes (arg / caller-saved /
-# callee-saved), the interrupt (handler) ABI, and the flash/RAM-style
-# address spaces — is DATA: one canonical TargetDesc instance per
-# target, defined in THIS module and consumed by the backends (the LIR
-# backend's accessor is lir_target_desc() in lir.tg, which the
+# callee-saved), the interrupt (handler) ABI, the flash/RAM-style
+# address spaces and the APPROXIMATE machine-scheduling cost model
+# (per-class latencies + dual-issue — SchedModel, consumed only by the
+# LIR scheduler's ordering heuristic) — is DATA: one canonical
+# TargetDesc instance per target, defined in THIS module and consumed
+# by the backends (the LIR backend's accessor is lir_target_desc() in
+# lir.tg, which the
 # driver's LIR route consults at its gate). Target properties must NOT
 # be re-derived as scattered arch conditionals inside codegen: a
 # backend that needs a target property reads it from the desc it is
@@ -137,6 +140,12 @@
 #     Unsupported and fail closed).
 #   - TLS: tls_model is "none" on every instance; a target whose
 #     runtime enables TLS grows the model token here.
+#   - machine-scheduling granularity: the sched field models ONLY the
+#     LIR list scheduler's five latency classes and a dual-issue flag
+#     (see the SchedModel section). There is deliberately no pipeline
+#     depth, per-port issue width, in-order stall, forwarding or
+#     operand-latency table: the pass's ordering is a bounded
+#     hazard-preserving heuristic, never a throughput claim.
 #
 # The instances are plain functions returning FRESH records — the desc
 # is value data, never a shared mutable singleton, so two consumers (or
@@ -345,6 +354,136 @@ def armv7m_interrupt_abi() -> InterruptAbi
 end
 
 # ———————————————————————————————————————————————————————————————
+# SchedModel — the APPROXIMATE machine-scheduling cost model
+# ———————————————————————————————————————————————————————————————
+# The target side of the LIR machine scheduler's ordering heuristic
+# (lir.tg's lir_schedule_function — the bounded list-scheduling pass).
+# The model is ORIENTATION DATA, never a correctness input: the
+# scheduler's reordering freedom is decided exclusively by the LIR
+# records' data/flag/memory hazards (see the pass's rule list), so a
+# latency value can only change the chosen order among candidates that
+# are ALREADY hazard-free — a wrong number can never change a program's
+# semantics, only its performance. The values are documented
+# approximations of typical issue-to-use distances in cycles for the
+# modeled core class; they exist to give the ready-list priority a
+# stable, data-driven shape:
+#   alu_latency  — registered ALU ops (moves, add/sub/logic/shift) and
+#                  the integer compares;
+#   load_latency — frame/static/pointer loads (L2-class latency on the
+#                  OoO hosts; the in-order embedded cores use their
+#                  documented low single-digit figure);
+#   mul_latency  — integer multiply;
+#   div_latency  — integer divide (the long latency the pass hides);
+#   fp_latency   — FP arithmetic/compare/cast (a *scalar* FLOP figure;
+#                  vector ops reuse the class of their lane's domain);
+#   dual_issue   — TRUE where the modeled core can co-issue unrelated
+#                  ALU and memory work (the OoO hosts); the scheduler
+#                  uses it only as a tie-break preference for
+#                  alternating compute/memory picks, never as a
+#                  correctness condition.
+# The values are NOT a pipeline/port model: there is no per-pipe width,
+# no in-order stall model and no dual-issue pairing table, so the
+# scheduler's claims are ordering-only (see the LIR module's scheduling
+# section for the honest limits).
+enum SchedClass
+  SchedAlu
+  SchedLoad
+  SchedMul
+  SchedDiv
+  SchedFp
+end
+
+struct SchedModel
+  alu_latency: Int
+  load_latency: Int
+  mul_latency: Int
+  div_latency: Int
+  fp_latency: Int
+  dual_issue: Bool
+end
+
+# The fail-closed default model (the struct default below): conservative
+# low-single-digit latencies and no dual issue — a target that carries no
+# explicit model behaves like the in-order class.
+def sched_model_default() -> SchedModel
+  SchedModel {
+    alu_latency: 1,
+    load_latency: 4,
+    mul_latency: 3,
+    div_latency: 12,
+    fp_latency: 4,
+    dual_issue: false
+  }
+end
+
+# The host OoO class (aarch64 Apple/ARM server-cores and x86-64): 1-cycle
+# ALU, a multi-cycle load-to-use window and co-issue of ALU/memory work.
+# APPROXIMATE — see the model doc above.
+def sched_model_host_oo() -> SchedModel
+  SchedModel {
+    alu_latency: 1,
+    load_latency: 4,
+    mul_latency: 3,
+    div_latency: 12,
+    fp_latency: 4,
+    dual_issue: true
+  }
+end
+
+# The Cortex-M in-order single-issue class: short load paths, no
+# co-issue (the M-profile pipeline is single-issue in this model).
+# APPROXIMATE — see the model doc above.
+def sched_model_thumb_inorder() -> SchedModel
+  SchedModel {
+    alu_latency: 1,
+    load_latency: 2,
+    mul_latency: 2,
+    div_latency: 5,
+    fp_latency: 4,
+    dual_issue: false
+  }
+end
+
+# The RISC-V in-order class: the load path is longer than the ARMv7-M
+# one and the divide is architecturally slow. APPROXIMATE — see the
+# model doc above.
+def sched_model_riscv_inorder() -> SchedModel
+  SchedModel {
+    alu_latency: 1,
+    load_latency: 3,
+    mul_latency: 2,
+    div_latency: 10,
+    fp_latency: 4,
+    dual_issue: false
+  }
+end
+
+# The latency of one scheduling-latency class under a model. The LIR
+# scheduler's classification (lir_sched_stmt_class) maps statements onto
+# the five classes; this is the ONLY read of the model's latency fields.
+def sched_class_latency(model: SchedModel, class: SchedClass) -> Int
+  match class
+  when SchedClass::SchedAlu then model.alu_latency
+  when SchedClass::SchedLoad then model.load_latency
+  when SchedClass::SchedMul then model.mul_latency
+  when SchedClass::SchedDiv then model.div_latency
+  when SchedClass::SchedFp then model.fp_latency
+  end
+end
+
+# The model's deterministic one-line text (the scheduling decision
+# journal's reason evidence — lir.tg's lir_schedule_impl). Kept here so
+# every route's row renders the same fields from the SAME record.
+def sched_model_text(model: SchedModel) -> String
+  "model alu=" + model.alu_latency.to_string() +
+  " load=" + model.load_latency.to_string() +
+  " mul=" + model.mul_latency.to_string() +
+  " div=" + model.div_latency.to_string() +
+  " fp=" + model.fp_latency.to_string() +
+  " dual=" + model.dual_issue.to_string()
+end
+
+# ———————————————————————————————————————————————————————————————
 # TargetDesc — the canonical per-target ABI record
 # ———————————————————————————————————————————————————————————————
 # Fields:
@@ -376,6 +515,13 @@ end
 #     convention is modeled (see InterruptAbi).
 #   reg_caller_saved / reg_callee_saved / arg_regs / memory_spaces —
 #     as before.
+#   sched — the APPROXIMATE scheduling cost model (SchedModel): per-class
+#     latencies for the ALU/load/mul/div/FP classes and the dual-issue
+#     flag, consumed ONLY by the LIR list scheduler's priority heuristic
+#     (lir.tg's lir_schedule_function). The struct default is the
+#     fail-closed in-order model (sched_model_default), so a desc
+#     literal that predates the field (tests, future instances) never
+#     schedules against a fabricated host model.
 struct TargetDesc
   name: String                     # canonical instance name ("cortex-m4f", ...)
   pointer_width: Int               # bytes per pointer / address
@@ -401,6 +547,13 @@ struct TargetDesc
   reg_callee_saved: Vec[String]    # registers a callee must preserve
   arg_regs: Vec[String]            # integer/pointer argument registers, ABI order
   memory_spaces: Vec[String]       # address spaces ("flash", "ram", ...)
+  # (machine-scheduling slice) the APPROXIMATE per-target scheduling
+  # model used by the LIR list scheduler's ordering heuristic ONLY —
+  # never a correctness input (see the SchedModel section above). The
+  # default is the fail-closed in-order model, so a desc literal that
+  # omits the field (tests, future instances) never schedules against a
+  # fabricated host model.
+  sched: SchedModel = sched_model_default()
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -672,6 +825,7 @@ def aarch64_desc() -> TargetDesc
     red_zone: 128,
     tls_model: "none",
     interrupt_abi: Option::None,
+    sched: sched_model_host_oo(),
     reg_caller_saved: Vec::from([
       "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
       "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
@@ -751,6 +905,7 @@ def thumbv7m_cortex_m3_desc() -> TargetDesc
     red_zone: 0,
     tls_model: "none",
     interrupt_abi: Option::Some(armv7m_interrupt_abi()),
+    sched: sched_model_thumb_inorder(),
     reg_caller_saved: Vec::from(["r0", "r1", "r2", "r3", "r12"]),
     reg_callee_saved: Vec::from([
       "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11"
@@ -782,6 +937,7 @@ def thumbv7em_cortex_m4_desc() -> TargetDesc
     red_zone: 0,
     tls_model: "none",
     interrupt_abi: Option::Some(armv7m_interrupt_abi()),
+    sched: sched_model_thumb_inorder(),
     reg_caller_saved: Vec::from(["r0", "r1", "r2", "r3", "r12"]),
     reg_callee_saved: Vec::from([
       "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11"
@@ -813,6 +969,7 @@ def thumbv7em_cortex_m4f_desc() -> TargetDesc
     red_zone: 0,
     tls_model: "none",
     interrupt_abi: Option::Some(armv7m_interrupt_abi()),
+    sched: sched_model_thumb_inorder(),
     reg_caller_saved: Vec::from(["r0", "r1", "r2", "r3", "r12"]),
     reg_callee_saved: Vec::from([
       "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11"
@@ -844,6 +1001,7 @@ def thumbv7em_cortex_m7_desc() -> TargetDesc
     red_zone: 0,
     tls_model: "none",
     interrupt_abi: Option::Some(armv7m_interrupt_abi()),
+    sched: sched_model_thumb_inorder(),
     reg_caller_saved: Vec::from(["r0", "r1", "r2", "r3", "r12"]),
     reg_callee_saved: Vec::from([
       "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11"
@@ -908,6 +1066,7 @@ def riscv32imac_desc() -> TargetDesc
     red_zone: 0,
     tls_model: "none",
     interrupt_abi: Option::None,
+    sched: sched_model_riscv_inorder(),
     reg_caller_saved: Vec::from([
       "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
       "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"
@@ -943,6 +1102,7 @@ def riscv32imafc_desc() -> TargetDesc
     red_zone: 0,
     tls_model: "none",
     interrupt_abi: Option::None,
+    sched: sched_model_riscv_inorder(),
     reg_caller_saved: Vec::from([
       "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
       "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"
@@ -978,6 +1138,7 @@ def riscv32imafdc_desc() -> TargetDesc
     red_zone: 0,
     tls_model: "none",
     interrupt_abi: Option::None,
+    sched: sched_model_riscv_inorder(),
     reg_caller_saved: Vec::from([
       "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
       "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"
@@ -1013,6 +1174,7 @@ def riscv64imac_desc() -> TargetDesc
     red_zone: 0,
     tls_model: "none",
     interrupt_abi: Option::None,
+    sched: sched_model_riscv_inorder(),
     reg_caller_saved: Vec::from([
       "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
       "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"
@@ -1048,6 +1210,7 @@ def riscv64gc_desc() -> TargetDesc
     red_zone: 0,
     tls_model: "none",
     interrupt_abi: Option::None,
+    sched: sched_model_riscv_inorder(),
     reg_caller_saved: Vec::from([
       "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
       "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"
@@ -1092,6 +1255,7 @@ def x86_64_desc() -> TargetDesc
     red_zone: 128,
     tls_model: "none",
     interrupt_abi: Option::None,
+    sched: sched_model_host_oo(),
     reg_caller_saved: Vec::from([
       "rax", "rcx", "rdx", "rsi", "rdi",
       "r8", "r9", "r10", "r11"
