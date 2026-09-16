@@ -1,0 +1,122 @@
+# span_probe.tg — focused regression probe for (1) the diagnostic emitter's
+# span rendering (compiler_core.tg print_source_location / line_starts_of /
+# line_index_of_offset), (2) the no-method receiver attribution, and (3) the
+# readiness gate's located-origin context + derived-aware knock-on
+# suppression.
+#
+# Run under the seed VM through bootstrap/span_probe_mini.manifest. The
+# probe emits four diagnostics through the REAL emitter, then runs the REAL
+# type checker on a program with one located root cause, and prints
+# machine-checkable facts:
+#   1. a registered source (the root compilation-unit path): the byte-offset
+#      span must render as a true line:column (the parser span style);
+#   2. an UNREGISTERED merged-dependency source (std/core.tg — never
+#      add_source'd by the real compile): the fallback must read the source,
+#      build the line-start index and render the TRUE line:column, never the
+#      raw byte offset as a line number;
+#   3. an unregistered + unreadable file: the offset is rendered explicitly
+#      as a BYTE OFFSET, never a fabricated line;
+#   4. a span with no file: NO location block at all;
+#   5. one `no method` root cause: the message must carry the receiver, the
+#      gate must NOT add knock-on rows for the failed node, and the typed
+#      channels must have recorded the node/local origins.
+use std::core::{Option, Result}
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse, diag_has_errors, diag_internal}
+use tg_compiler::ast::{assign_node_ids}
+use tg_compiler::resolver::{resolve_names}
+use tg_compiler::token::{Span}
+use tg_compiler::types::{type_env_new, type_check_typed}
+use tg_compiler::compiler_core::{emitter_new, add_source, emit_diagnostic, line_starts_of, line_index_of_offset, DiagnosticEmitter}
+
+def span_probe_typecheck_case(inout em: DiagnosticEmitter) -> Unit
+  # (receiver attribution): a located `no method` root cause on a built-in
+  # receiver; the message must carry the receiver and the readiness gate
+  # must not add knock-on rows for the failed node.
+  let src = "def main() -> Int\n  let x = 1\n  x.missing_method()\n  0\nend\n"
+  let lex = tokenize(src, "probe_typecheck.tg")
+  let parsed = parse(lex)
+  if diag_has_errors(&parsed.diagnostics) then
+    println("typecheck_parse=failed")
+    return
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let tr = type_check_typed(&mut env, &program, &res)
+    println("typecheck_errors=" + tr.errors.len().to_string())
+    var gate_rows = 0
+    var no_method_rows = 0
+    var i = 0
+    while i < tr.errors.len() do
+      let msg = tr.errors[i].message.clone()
+      let sp = tr.errors[i].span.clone()
+      println("  TCE " + sp.file + ":" + sp.start.to_string() + " | " + msg)
+      if msg.contains("would reach MIR/codegen") then gate_rows = gate_rows + 1 end
+      if msg.contains("no method") then no_method_rows = no_method_rows + 1 end
+      emit_diagnostic(&mut em, diag_internal(msg, sp))
+      i = i + 1
+    end
+    println("gate_rows=" + gate_rows.to_string() + " no_method_rows=" + no_method_rows.to_string())
+    # (gate diagnostics context): the typed channels recorded an owning item
+    # + span for the checked nodes and locals (the located origin the gate
+    # renders).
+    println("ctx_node_spans=" + env.typed_node_spans.len().to_string() + " ctx_node_owners=" + env.typed_node_owners.len().to_string() + " ctx_local_owners=" + env.typed_local_owners.len().to_string())
+    let spans = env.typed_node_spans.entries()
+    var si = 0
+    while si < spans.len() && si < 2 do
+      let nid = spans[si].0
+      let sp = spans[si].1
+      let owner = match env.typed_node_owners.get(nid)
+      when Option::Some(l) then l
+      when Option::None then "?".to_string()
+      end
+      println("  CTX node=" + nid.to_string() + " " + sp.file + ":" + sp.start.to_string() + " owner=" + owner)
+      si = si + 1
+    end
+  when Result::Err(errs) then
+    println("resolve_failed=" + errs.len().to_string())
+  end
+end
+
+def main() -> Int
+  # (binary-search line index): the exact boundary cases of the one
+  # line-start authority.
+  let lines = line_starts_of("a\nbb\nccc")
+  println("lineidx_off0=" + line_index_of_offset(&lines, 0).to_string())
+  println("lineidx_off1=" + line_index_of_offset(&lines, 1).to_string())
+  println("lineidx_off2=" + line_index_of_offset(&lines, 2).to_string())
+  println("lineidx_off3=" + line_index_of_offset(&lines, 3).to_string())
+  println("lineidx_off4=" + line_index_of_offset(&lines, 4).to_string())
+  println("lineidx_off9=" + line_index_of_offset(&lines, 9).to_string())
+
+  var em = emitter_new()
+
+  # (1) registered source: the in-map path keeps the parser byte-offset ->
+  # line:column rendering. "beta" starts at byte offset 6 (line 2).
+  let _sid = add_source(&mut em, "probe_registered.tg", "alpha\nbeta\ngamma\n")
+  emit_diagnostic(&mut em, diag_internal("registered case", Span { file: "probe_registered.tg", start: 6, end_pos: 10 }))
+
+  # (2) merged-dependency span (std/core.tg is never registered by the real
+  # compile — merge_imported_deps reads it): byte offset 634 is on the true
+  # line 18, NOT line 634. This is the regression: before the fix the
+  # fallback printed "std/core.tg:634".
+  emit_diagnostic(&mut em, diag_internal("merged-dep case", Span { file: "std/core.tg", start: 634, end_pos: 640 }))
+  # a second diagnostic on the same file — the cached line index resolves it.
+  emit_diagnostic(&mut em, diag_internal("merged-dep cached case", Span { file: "std/core.tg", start: 700, end_pos: 703 }))
+
+  # (3) unregistered AND unreadable: render the offset explicitly as an offset.
+  emit_diagnostic(&mut em, diag_internal("unreadable case", Span { file: "no/such/file.tg", start: 42, end_pos: 43 }))
+
+  # (4) spanless: no location block (never a fabricated ":0" locator).
+  emit_diagnostic(&mut em, diag_internal("spanless case", Span { file: "", start: 0, end_pos: 0 }))
+
+  # (5) the located root cause + gate suppression + recorded origins.
+  span_probe_typecheck_case(&mut em)
+
+  println("SPAN_PROBE_DONE")
+  0
+end

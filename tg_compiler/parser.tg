@@ -6593,6 +6593,105 @@ def looks_like_bracket_type_args_start(p: TgcParser) -> Bool
   false
 end
 
+# Multi-argument turbofish call detection: `name[T, U](...)` — a bracket
+# whose matching `]` is immediately followed by `(` AND whose content has
+# a top-level comma (bracket depth 1). That shape can never be an index
+# expression (a comma is not an expression operator), and the seed's
+# committed-call rule (`looks_like_expr_type_args`) parses the bracket as
+# the CALL's explicit type-argument list. The single-argument form keeps
+# the historical expression parse unchanged. Uses lookahead_kind so the
+# parser state is unchanged.
+def looks_like_multi_type_arg_call_start(p: TgcParser) -> Bool
+  if !at(p, TokenKind::LBracket) then
+    return false
+  end
+  var depth = 0
+  var saw_comma = false
+  mut i = 0
+  while true do
+    match lookahead_kind(p, i)
+    when TokenKind::LBracket then depth = depth + 1
+    when TokenKind::RBracket then
+      depth = depth - 1
+      if depth == 0 then
+        return saw_comma && lookahead_kind(p, i + 1) == TokenKind::LParen
+      end
+    when TokenKind::Comma then
+      if depth == 1 then saw_comma = true end
+    when TokenKind::Eof then return false
+    when _ then ()
+    end
+    i = i + 1
+  end
+  false
+end
+
+# The expression spelling of one parsed type argument for the turbofish
+# index payload (the kernel AST has no call type-argument slot, so the
+# checker's turbofish arm reads the bracket payload as the type-argument
+# list): a named type as an identifier (its generic application as an
+# index, its argument list as a nested payload), a qualified path as a
+# path. Option::None for a spelling with no expression form (a const
+# literal, a tuple/fn/pointer type) — the caller then keeps the payload's
+# shape and the checker reports the non-type argument.
+def encode_type_arg_as_index_expr(te: TypeExpr) -> Option[Expr]
+  match te.kind
+  when TypeExprKind::Named(name, args) then
+    if args.len() == 0 then
+      Option::Some(make_expr(ExprKind::ExprIdent(name), te.span.clone()))
+    else
+      var converted: Vec[Expr] = Vec::new()
+      var ok = true
+      var i = 0
+      while i < args.len() do
+        match encode_type_arg_as_index_expr(args[i].clone())
+        when Option::Some(e) then converted.push(e)
+        when Option::None then ok = false
+        end
+        i = i + 1
+      end
+      if !ok then
+        Option::None
+      else
+        let inner = if converted.len() == 1 then converted[0].clone() else make_expr(ExprKind::ExprTupleLit(converted), te.span.clone()) end
+        Option::Some(make_expr(ExprKind::ExprIndex(Box::new(make_expr(ExprKind::ExprIdent(name), te.span.clone())), Box::new(inner)), te.span.clone()))
+      end
+    end
+  when TypeExprKind::Path(path) then
+    Option::Some(make_expr(ExprKind::ExprPath(path.clone()), te.span.clone()))
+  when _ then Option::None
+  end
+end
+
+# The index payload for a turbofish type-argument list: one argument is
+# its own expression spelling, several are the tuple payload (the
+# checker's turbofish arm reads a tuple payload as the argument list).
+# None when a list element has no expression spelling.
+def encode_type_arg_list_as_index_expr(targs: Vec[TypeExpr]) -> Option[Expr]
+  if targs.len() == 0 then
+    return Option::None
+  end
+  var converted: Vec[Expr] = Vec::new()
+  var ok = true
+  var i = 0
+  while i < targs.len() do
+    match encode_type_arg_as_index_expr(targs[i].clone())
+    when Option::Some(e) then converted.push(e)
+    when Option::None then ok = false
+    end
+    i = i + 1
+  end
+  if !ok then
+    Option::None
+  else
+    if converted.len() == 1 then
+      Option::Some(converted[0].clone())
+    else
+      Option::Some(make_expr(ExprKind::ExprTupleLit(converted), targs[0].span.clone()))
+    end
+  end
+end
+
 def at_postfix_start(inout p: TgcParser) -> Bool
   let saved = p.pos
   skip_newlines(p)
@@ -6726,12 +6825,35 @@ def parse_postfix(inout p: TgcParser) -> Option[Expr]
         result = make_expr(ExprKind::ExprCall(Box::new(result), args), span_merge(start, peek_span(p)))
       when TokenKind::LBracket then
         let start = result.span
-        advance(p)
-        match parse_expr(p)
-        when Option::Some(index) then
+        # (turbofish multi-argument call): `f[T, U](args)` — the bracket
+        # closes onto `(` with a top-level comma inside, a shape the index
+        # expression parser cannot represent (a comma is not an operator).
+        # The seed's committed-call rule parses exactly this bracket as the
+        # CALL's explicit type-argument list; the list is encoded as the
+        # index payload (one argument's expression spelling, or the tuple
+        # of several) for the checker's turbofish arm. The single-argument
+        # form keeps the historical expression parse unchanged.
+        if looks_like_multi_type_arg_call_start(p) then
+          advance(p)
+          let targs = parse_type_arg_list(p)
           expect(p, TokenKind::RBracket)
-          result = make_expr(ExprKind::ExprIndex(Box::new(result), Box::new(index)), span_merge(start, peek_span(p)))
-        when Option::None then break
+          match encode_type_arg_list_as_index_expr(targs)
+          when Option::Some(encoded) then
+            result = make_expr(ExprKind::ExprIndex(Box::new(result), Box::new(encoded)), span_merge(start, peek_span(p)))
+          when Option::None then
+            # No expression spelling for the list: keep the payload shape
+            # (the empty tuple) so the checker's turbofish arm reports the
+            # non-type argument — never a silent value index.
+            result = make_expr(ExprKind::ExprIndex(Box::new(result), Box::new(make_expr(ExprKind::ExprTupleLit(Vec::new()), peek_span(p)))), span_merge(start, peek_span(p)))
+          end
+        else
+          advance(p)
+          match parse_expr(p)
+          when Option::Some(index) then
+            expect(p, TokenKind::RBracket)
+            result = make_expr(ExprKind::ExprIndex(Box::new(result), Box::new(index)), span_merge(start, peek_span(p)))
+          when Option::None then break
+          end
         end
       when TokenKind::Is then
         let start = result.span

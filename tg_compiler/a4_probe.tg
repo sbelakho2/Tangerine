@@ -1,0 +1,482 @@
+# a4_probe.tg — focused probe for the kernel checker's typed-channel
+# internal errors (the A4 class): "cannot assemble the typed HIR call node",
+# "missing typed HIR child" and "finalizer ... has no resolver DefId".
+#
+# The probe runs the REAL kernel front end (lexer -> parser -> resolver ->
+# type_check_typed) over the differential corpus entry
+# tests/differential/corpus/01_defs_arith.tg, writes every ICE-class error
+# (message + span) to build/a4_probe.txt and returns 0 when none fired.
+# The bootstrap/a4_mini.manifest closure + tg_a4 selfcheck run this probe
+# under the seed VM.
+
+use std::core::{Option, Result}
+use std::collections::{Vec, Map, Set}
+use std::fs::{read_file, write_file, file_exists}
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse, diag_has_errors}
+use tg_compiler::ast::{assign_node_ids, Program, Item, ItemId, ModuleId, Module, Crate, ItemKind, UseDecl, FnBody, Stmt, StmtKind, Expr, ExprKind}
+use tg_compiler::ids::{DefKind}
+use tg_compiler::resolver::{resolve_names, def_kind_of, module_qualified_key}
+use tg_compiler::types::{type_env_new, type_check_typed, crate_module_path_of, impl_registry_method_key}
+
+def def_kind_tag(k: DefKind) -> String
+  match k
+  when DefKind::Function then "Function"
+  when DefKind::Method then "Method"
+  when DefKind::Static then "Static"
+  when DefKind::Constant then "Constant"
+  when DefKind::EnumVariant then "EnumVariant"
+  when DefKind::StructField then "StructField"
+  when DefKind::Intrinsic then "Intrinsic"
+  when DefKind::TypeName then "TypeName"
+  when DefKind::Trait then "Trait"
+  when DefKind::Other then "Other"
+  end
+end
+
+def a4_probe_classify(message: String) -> Int
+  if message.contains("cannot assemble the typed HIR call node") then return 1 end
+  if message.contains("cannot assemble the typed effect-perform call node") then return 2 end
+  if message.contains("missing typed HIR child") then return 3 end
+  if message.contains("has no resolver DefId") then return 4 end
+  0
+end
+
+def a4_probe_strip_debug_assert_pass(source: String) -> String
+  let parts = source.split("debug_assert!")
+  if parts.len() <= 1 then
+    return source
+  end
+  var out = parts[0].clone()
+  var pi = 1
+  while pi < parts.len() do
+    let seg = parts[pi].clone()
+    if seg.starts_with("(") then
+      var depth = 0
+      var i = 0
+      var close_idx = -1
+      var comma_idx = -1
+      var saw_comma = false
+      while i < seg.len() do
+        let ch = seg.slice(i, i + 1)
+        if ch == "(" then depth = depth + 1 end
+        if ch == ")" then
+          depth = depth - 1
+          if depth == 0 then
+            close_idx = i
+            break
+          end
+        end
+        if ch == "," && depth == 1 && !saw_comma then
+          comma_idx = i
+          saw_comma = true
+        end
+        i = i + 1
+      end
+      if close_idx < 0 then
+        out = out + "debug_assert!" + seg
+      else
+        let inner_end = if comma_idx >= 0 then comma_idx else close_idx end
+        out = out + "(" + seg.slice(1, inner_end) + ")"
+        out = out + seg.slice(close_idx + 1, seg.len())
+      end
+    else
+      out = out + "debug_assert!" + seg
+    end
+    pi = pi + 1
+  end
+  out
+end
+
+def a4_probe_strip_debug_assert(source: String) -> String
+  var cur = source.clone()
+  var pass = 0
+  while pass < 8 && cur.contains("debug_assert!") do
+    cur = a4_probe_strip_debug_assert_pass(cur)
+    pass = pass + 1
+  end
+  cur
+end
+
+def a4_probe_join_path(segments: Vec[String]) -> String
+  var out = ""
+  var i = 0
+  while i < segments.len() do
+    if i > 0 then out = out + "::" end
+    out = out + segments[i].clone()
+    i = i + 1
+  end
+  out
+end
+
+def a4_probe_module_path_from_file(path: String) -> Vec[String]
+  var segments = Vec::new()
+  let parts = path.split("/")
+  var pi = 0
+  while pi < parts.len() do
+    var seg = parts[pi].clone()
+    if pi == parts.len() - 1 && seg.ends_with(".tg") then
+      seg = seg.slice(0, seg.len() - 3)
+    end
+    if !seg.is_empty() then
+      segments.push(seg)
+    end
+    pi = pi + 1
+  end
+  segments
+end
+
+def a4_probe_build_dep_file_path(segments: Vec[String], count: Int) -> Option[String]
+  if count < 2 then
+    return Option::None
+  end
+  let root = segments[0]
+  var path = if root == "std" then "std/" elsif root == "tg_compiler" then "tg_compiler/" else return Option::None end
+  var i = 1
+  while i < count do
+    if i > 1 then path = path + "/" end
+    path = path + segments[i]
+    i = i + 1
+  end
+  Option::Some(path + ".tg")
+end
+
+def a4_probe_dep_use_to_file(u: UseDecl) -> Option[String]
+  let segment_count = u.path.segments.len()
+  if segment_count < 2 then
+    return Option::None
+  end
+  match u.names
+  when Option::Some(_) then return a4_probe_build_dep_file_path(u.path.segments.clone(), segment_count)
+  when Option::None then ()
+  end
+  if u.glob then
+    return a4_probe_build_dep_file_path(u.path.segments.clone(), segment_count)
+  end
+  match a4_probe_build_dep_file_path(u.path.segments.clone(), segment_count)
+  when Option::Some(full_path) then
+    if file_exists(full_path.clone()) then
+      return Option::Some(full_path)
+    end
+    if segment_count > 2 then
+      match a4_probe_build_dep_file_path(u.path.segments.clone(), segment_count - 1)
+      when Option::Some(parent_path) then
+        if file_exists(parent_path.clone()) then
+          return Option::Some(parent_path)
+        end
+      when Option::None then ()
+      end
+    end
+    Option::None
+  when Option::None then Option::None
+  end
+end
+
+def a4_probe_collect_dep_file(path: String, inout out: Vec[Item], inout loaded: Set[String], inout modules: Map[ModuleId, Module]) -> Int
+  if loaded.contains(&path) then
+    return 0
+  end
+  loaded.insert(path.clone())
+  if !file_exists(path.clone()) then
+    return 2
+  end
+  let source = match read_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then return 2
+  end
+  let parsed = parse(tokenize(a4_probe_strip_debug_assert(source), path.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    return 3
+  end
+  let dep_ast = parsed.program
+  for item in dep_ast.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then
+      match a4_probe_dep_use_to_file(u.clone())
+      when Option::Some(p) then
+        let rc = a4_probe_collect_dep_file(p, &mut out, &mut loaded, &mut modules)
+        if rc != 0 then return rc end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+  var mod_start = out.len()
+  let dep_id = ModuleId { id: modules.len() }
+  for item in dep_ast.items do
+    var owned = item.clone()
+    owned.owner_module = dep_id
+    out.push(owned)
+  end
+  var mod_items = Vec::new()
+  var mi = mod_start
+  while mi < out.len() do
+    mod_items.push(ItemId { id: mi })
+    mi = mi + 1
+  end
+  var mod_imports = Vec::new()
+  for item in dep_ast.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then mod_imports.push(a4_probe_join_path(u.path.segments.clone()))
+    when _ then ()
+    end
+  end
+  modules.insert(dep_id, Module {
+    id: dep_id,
+    path: a4_probe_module_path_from_file(path.clone()),
+    items: mod_items,
+    imports: mod_imports
+  })
+  0
+end
+
+def a4_probe_run_merged(corpus_path: String, inout report: String, inout call_target: Int, inout effect_perform: Int, inout missing_child: Int, inout finalizer: Int) -> Int
+  let source = match read_file(corpus_path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then
+    report = report + "a4_probe[merged]: cannot read corpus\n"
+    return 2
+  end
+  let parsed = parse(tokenize(a4_probe_strip_debug_assert(source), corpus_path.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "a4_probe[merged]: corpus parse failed\n"
+    return 2
+  end
+  var merged_items = Vec::new()
+  for item in parsed.program.items do merged_items.push(item.clone()) end
+  var root_items = Vec::new()
+  var ri = 0
+  while ri < merged_items.len() do
+    root_items.push(ItemId { id: ri })
+    ri = ri + 1
+  end
+  let root_id = ModuleId { id: 0 }
+  var merged_modules = Map::new()
+  merged_modules.insert(root_id, Module {
+    id: root_id,
+    path: Vec::new(),
+    items: root_items,
+    imports: Vec::new()
+  })
+  var loaded = Set::new()
+  let preludes = ["std/alloc.tg", "std/collections.tg", "std/core.tg", "std/ffi.tg", "std/fmt.tg", "std/fs.tg", "std/io.tg", "std/taint.tg"]
+  var pi = 0
+  while pi < preludes.len() do
+    let rc = a4_probe_collect_dep_file(preludes[pi].clone(), &mut merged_items, &mut loaded, &mut merged_modules)
+    if rc != 0 then
+      report = report + "a4_probe[merged]: load failed (" + rc.to_string() + ") " + preludes[pi].clone() + "\n"
+      return 2
+    end
+    pi = pi + 1
+  end
+  var program = Program {
+    items: merged_items,
+    crate: Crate { root: root_id, modules: merged_modules },
+    span: parsed.program.span.clone()
+  }
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(env, program, &res)
+    report = report + "a4_probe[merged]: items=" + program.items.len().to_string() + " -> " + result.errors.len().to_string() + " diagnostic(s)\n"
+    var shown = 0
+    var i = 0
+    while i < result.errors.len() do
+      let cls = a4_probe_classify(result.errors[i].message.clone())
+      if cls == 1 then call_target = call_target + 1 end
+      if cls == 2 then effect_perform = effect_perform + 1 end
+      if cls == 3 then missing_child = missing_child + 1 end
+      if cls == 4 then finalizer = finalizer + 1 end
+      if cls > 0 && shown < 40 then
+        let sp = result.errors[i].span
+        report = report + "  M[" + cls.to_string() + "] " + sp.file + ":" + sp.start.to_string() + ": " + result.errors[i].message.clone() + "\n"
+        shown = shown + 1
+      end
+      i = i + 1
+    end
+    0
+  when Result::Err(errs) then
+    report = report + "a4_probe[merged]: resolve failed -> " + errs.len().to_string() + "\n"
+    var ri2 = 0
+    while ri2 < errs.len() && ri2 < 12 do
+      report = report + "  R: " + errs[ri2].message.clone() + " @" + errs[ri2].span.file + ":" + errs[ri2].span.start.to_string() + "\n"
+      ri2 = ri2 + 1
+    end
+    2
+  end
+end
+
+def a4_probe_check_source(label: String, source: String, inout report: String, inout call_target: Int, inout effect_perform: Int, inout missing_child: Int, inout finalizer: Int) -> Int
+  let lex = tokenize(source, label.clone())
+  let parsed = parse(lex)
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "a4_probe[" + label.clone() + "]: parse failed\n"
+    return 2
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(env, program, &res)
+    var sym_dump = ""
+    let sym_entries = res.module_symbols.entries()
+    for (k, v) in sym_entries do
+      if k.contains("deinit") || k.contains("drop") || k.contains("Res") then
+        sym_dump = sym_dump + " mq[" + k + "]=m" + v.module.id.to_string() + "i" + v.index.to_string()
+      end
+    end
+    var impl_dump = ""
+    var ii = 0
+    while ii < program.items.len() do
+      match program.items[ii].kind
+      when ItemKind::ItemImpl(imp) then
+        let item_path = crate_module_path_of(program, &program.items[ii].owner_module)
+        var mj = 0
+        while mj < imp.methods.len() do
+          let mkey = impl_registry_method_key(&imp.for_type, &imp.methods[mj].name)
+          let qkey = module_qualified_key(&item_path, &mkey)
+          let hit = match res.module_symbols.get(&qkey)
+          when Option::Some(v) then
+            match def_kind_of(&res, &v)
+            when Option::Some(k) then "HIT " + def_kind_tag(k)
+            when Option::None then "HIT NOKIND"
+            end
+          when Option::None then "MISS"
+          end
+          impl_dump = impl_dump + " impl[" + imp.methods[mj].name.clone() + "] path_len=" + item_path.len().to_string() + " key=" + qkey + " -> " + hit
+          mj = mj + 1
+        end
+      when _ then ()
+      end
+      ii = ii + 1
+    end
+    report = report + "a4_probe[" + label.clone() + "]: " + result.errors.len().to_string() + " diagnostic(s)" + sym_dump + impl_dump + "\n"
+    var i = 0
+    while i < result.errors.len() do
+      let cls = a4_probe_classify(result.errors[i].message.clone())
+      let sp = result.errors[i].span
+      report = report + "  [" + cls.to_string() + "] line" + sp.start.to_string() + ": " + result.errors[i].message.clone() + "\n"
+      if cls == 1 then call_target = call_target + 1 end
+      if cls == 2 then effect_perform = effect_perform + 1 end
+      if cls == 3 then missing_child = missing_child + 1 end
+      if cls == 4 then finalizer = finalizer + 1 end
+      i = i + 1
+    end
+    0
+  when Result::Err(errs) then
+    report = report + "a4_probe[" + label.clone() + "]: resolve failed -> " + errs.len().to_string() + "\n"
+    2
+  end
+end
+
+def a4_probe_run(path: String, inout report: String, inout call_target: Int, inout effect_perform: Int, inout missing_child: Int, inout finalizer: Int) -> Int
+  let source = match read_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then
+    report = report + "a4_probe: cannot read " + path.clone() + "\n"
+    return 2
+  end
+  let lex = tokenize(source, path.clone())
+  let parsed = parse(lex)
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "a4_probe: parse failed for " + path.clone() + "\n"
+    return 2
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(env, program, &res)
+    report = report + "a4_probe: " + path.clone() + " -> " + result.errors.len().to_string() + " diagnostic(s)\n"
+    var i = 0
+    while i < result.errors.len() do
+      let cls = a4_probe_classify(result.errors[i].message.clone())
+      if cls > 0 then
+        let sp = result.errors[i].span
+        report = report + "  [" + cls.to_string() + "] " + sp.file + ":" + sp.start.to_string() + ": " + result.errors[i].message.clone() + "\n"
+        if cls == 1 then call_target = call_target + 1 end
+        if cls == 2 then effect_perform = effect_perform + 1 end
+        if cls == 3 then missing_child = missing_child + 1 end
+        if cls == 4 then finalizer = finalizer + 1 end
+      end
+      i = i + 1
+    end
+    0
+  when Result::Err(errs) then
+    report = report + "a4_probe: resolve failed for " + path.clone() + " -> " + errs.len().to_string() + "\n"
+    2
+  end
+end
+
+def main() -> Int
+  var report = ""
+  var call_target = 0
+  var effect_perform = 0
+  var missing_child = 0
+  var finalizer = 0
+  var rc = 0
+  let rc1 = a4_probe_check_source("fin_impl_deinit", "struct Res\n  x: Int\nend\n\nimpl Res\n  def deinit(sink self: Self) -> Unit\n  end\nend\n\ndef main() -> Int\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc1 != 0 then rc = rc1 end
+  let rc2 = a4_probe_check_source("fin_generic_impl_deinit", "struct Box2[T]\n  x: T\nend\n\nimpl[T] Box2[T]\n  def deinit(sink self: Self) -> Unit\n  end\nend\n\ndef main() -> Int\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc2 != 0 then rc = rc2 end
+  let rc4 = a4_probe_check_source("fin_drop_trait", "trait Drop\n  def drop(self: Self) -> Unit\nend\n\nstruct B2[T]\n  x: T\nend\n\nimpl[T] Drop for B2[T]\n  def drop(self: Self) -> Unit\n  end\nend\n\ndef main() -> Int\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc4 != 0 then rc = rc4 end
+  let rc7 = a4_probe_check_source("lit_impl_method_tail", "struct Q\n  a: Int\n  b: Int\nend\n\nimpl Q\n  def mk(x: Int) -> Q\n    Q { a: x, b: x }\n  end\nend\n\ndef main() -> Int\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc7 != 0 then rc = rc7 end
+  let rc8 = a4_probe_check_source("lit_call_arg", "struct Q\n  a: Int\n  b: Int\nend\n\ndef take(q: Q) -> Int\n  q.a\nend\n\ndef main() -> Int\n  take(Q { a: 1, b: 2 })\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc8 != 0 then rc = rc8 end
+  let rc9 = a4_probe_check_source("lit_generic_impl_tail", "struct P2[T]\n  address: UInt\nend\n\nimpl[T] P2[T]\n  def null() -> P2[T]\n    P2 { address: 0 }\n  end\n  def cast2[U](self: Self) -> P2[U]\n    P2 { address: self.address }\n  end\nend\n\ndef main() -> Int\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc9 != 0 then rc = rc9 end
+  let rc10 = a4_probe_check_source("lit_method_arg", "struct Q\n  a: Int\n  b: Int\nend\n\nstruct Box3\n  q: Q\nend\n\nimpl Box3\n  def make(x: Int) -> Box3\n    Box3 { q: Q { a: x, b: x } }\n  end\nend\n\ndef main() -> Int\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc10 != 0 then rc = rc10 end
+  let rc11 = a4_probe_check_source("lit_cast_field", "struct Q\n  a: UInt\nend\n\ndef mkq(x: Int) -> Q\n  Q { a: x as UInt }\nend\n\ndef main() -> Int\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc11 != 0 then rc = rc11 end
+  let rc12 = a4_probe_check_source("lit_vec_push", "struct Q\n  a: Int\n  b: Int\nend\n\ndef main() -> Int\n  let v = Vec::new()\n  v.push(Q { a: 1, b: 2 })\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc12 != 0 then rc = rc12 end
+  let rc13 = a4_probe_check_source("method_call_arg", "struct Q\n  n: Int\nend\n\nimpl Q\n  def clone2(self: Self) -> Q\n    Q { n: self.n }\n  end\nend\n\ndef take(q: Q) -> Int\n  q.n\nend\n\ndef main() -> Int\n  let q = Q { n: 1 }\n  take(q.clone2())\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc13 != 0 then rc = rc13 end
+  let rc14 = a4_probe_check_source("access_in_lit_cast", "struct P\n  address: UInt\nend\n\ndef addr(inout x: Int) -> UInt\n  x as UInt\nend\n\ndef cstr(p: P) -> Int\n  0\nend\n\ndef use_it(inout x: Int) -> Int\n  cstr(P { address: addr(&mut x) })\nend\n\ndef main() -> Int\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc14 != 0 then rc = rc14 end
+  let rc15 = a4_probe_check_source("match_call_scrutinee", "struct M\n  is_dir: Bool\nend\n\ndef meta(p: Int) -> M\n  M { is_dir: false }\nend\n\ndef scan(p: Int) -> Bool\n  let m = match meta(p)\n  when M { is_dir: d } then d\n  end\n  m\nend\n\ndef main() -> Int\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc15 != 0 then rc = rc15 end
+  # The builtin-Opaque shadowing regression (the std Ptr/Rc/Arc shape):
+  # the bare name `Ptr` is first-wins owned by the compiler's Opaque
+  # builtin, so the source struct's fields never reach the struct-literal
+  # field check — the recording-totality branch must still CHECK the field
+  # value expressions (their typed records are what the call/cast assembly
+  # is keyed by), even though the Opaque declaration cannot type-unify the
+  # fields. Before the fix this shape recorded the literal with an
+  # unrecorded `0` child and every parent (the call, the impl body) failed
+  # the typed-HIR assembly.
+  let rc16 = a4_probe_check_source("builtin_shadowed_lit", "struct Ptr[T]\n  address: UInt\nend\n\nimpl[T] Ptr[T]\n  def null() -> Ptr[T]\n    Ptr { address: 0 }\n  end\nend\n\ndef main() -> Int\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc16 != 0 then rc = rc16 end
+  let rc17 = a4_probe_check_source("builtin_shadowed_lit_arg", "def take(p: Ptr[Int]) -> Int\n  0\nend\n\ndef use_it(x: Int) -> Int\n  take(Ptr { address: 0 })\nend\n\ndef main() -> Int\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc17 != 0 then rc = rc17 end
+  # The qualified-path call shape (ExprEnumVariant: `Owner::method(...)`,
+  # the std __sync_* runtime intrinsics): its arguments are call arguments,
+  # so an `&mut place` access marker must be allowed exactly like the
+  # ExprCall / ExprMethodCall argument positions. Before the marker-depth
+  # bracket the access gate rejected the marker, the argument never got a
+  # typed record and the call node's assembly cascaded into the A4 ICEs.
+  let rc18 = a4_probe_check_source("qualified_call_marker", "struct Lock\n  held: Int\nend\n\nimpl Lock\n  def acquire(self: Self, inout v: Int) -> Int\n    v\n  end\nend\n\ndef use_it(l: Lock, v: Int) -> Int\n  Lock::acquire(l, &mut v)\nend\n\ndef main() -> Int\n  0\nend\n", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc18 != 0 then rc = rc18 end
+  let rc5 = a4_probe_run("tests/differential/corpus/01_defs_arith.tg", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+  if rc5 != 0 then rc = rc5 end
+  if file_exists("build/a4_merged.flag") then
+    let rc6 = a4_probe_run_merged("tests/differential/corpus/01_defs_arith.tg", &mut report, &mut call_target, &mut effect_perform, &mut missing_child, &mut finalizer)
+    if rc6 != 0 then rc = rc6 end
+  end
+  report = report + "a4_probe: TOTALS call_target=" + call_target.to_string() + " effect_perform=" + effect_perform.to_string() + " missing_child=" + missing_child.to_string() + " finalizer=" + finalizer.to_string() + "\n"
+  let _ = write_file("build/a4_probe.txt", report)
+  if rc != 0 then return rc end
+  if call_target + effect_perform + missing_child + finalizer == 0 then
+    return 0
+  end
+  1
+end

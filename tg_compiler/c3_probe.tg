@@ -1,0 +1,464 @@
+# c3_probe.tg — focused probe for the kernel checker's method-resolution
+# gaps (the C3 class) and the obligation-solver loop regression.
+#
+# Two modes:
+#   1. the loop regression — a battery of trivial struct/method sources
+#      checked standalone; a hang here is the solve_obligation_depth /
+#      derive_transferable / pointer_gate_holds cycle;
+#   2. the merged corpus mode (flag build/c3_merged.flag) — the differential
+#      corpus entry + the std preludes merged exactly like the kernel's
+#      compile path, type-checked by the REAL kernel checker; every
+#      no-method diagnostic is counted (total + per receiver + clone) and
+#      written to build/c3_probe.txt.
+#
+# bootstrap/c3_mini.manifest closes it under the seed VM;
+# stage0_ocaml/selfcheck/tg_c3.ml runs it as the focused regression.
+use std::core::{Option, Result}
+use std::collections::{Vec, Map}
+use std::fs::{read_file, write_file, file_exists}
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse, diag_has_errors}
+use tg_compiler::ast::{assign_node_ids, Program, Item, ItemId, ModuleId, Module, Crate, UseDecl}
+use tg_compiler::resolver::{resolve_names}
+use tg_compiler::types::{type_env_new, type_check_typed}
+
+def c3_probe_run_case(label: String, source: String, inout report: String, inout no_method: Int, inout gate: Int, inout total: Int) -> Int
+  let parsed = parse(tokenize(source.clone(), label.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "CASE " + label.clone() + ": parse-failed\n"
+    return 0
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    var case_no_method = 0
+    var case_gate = 0
+    var i = 0
+    while i < result.errors.len() do
+      let msg = result.errors[i].message.clone()
+      let sp = result.errors[i].span.clone()
+      if msg.contains("no method") then
+        case_no_method = case_no_method + 1
+        report = report + "  NM " + label.clone() + " @" + sp.start.to_string() + ": " + msg + "\n"
+      end
+      if msg.contains("would reach MIR/codegen") then
+        case_gate = case_gate + 1
+      end
+      i = i + 1
+    end
+    no_method = no_method + case_no_method
+    gate = gate + case_gate
+    total = total + result.errors.len()
+    report = report + "CASE " + label.clone() + ": errors=" + result.errors.len().to_string() + " no_method=" + case_no_method.to_string() + " gate=" + case_gate.to_string() + "\n"
+    0
+  when Result::Err(errs) then
+    report = report + "CASE " + label.clone() + ": resolve-failed=" + errs.len().to_string() + "\n"
+    0
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# merged corpus mode — the a4_probe loader pattern (strip debug_assert
+# statements, load the preludes + their `use` dependencies, merge every
+# item into one program with per-item owner modules, then run the real
+# kernel checker).
+# ———————————————————————————————————————————————————————————————
+
+def c3_probe_strip_debug_assert_pass(source: String) -> String
+  let parts = source.split("debug_assert!")
+  if parts.len() <= 1 then
+    return source
+  end
+  var out = parts[0].clone()
+  var pi = 1
+  while pi < parts.len() do
+    let seg = parts[pi].clone()
+    if seg.starts_with("(") then
+      var depth = 0
+      var i = 0
+      var close_idx = -1
+      var comma_idx = -1
+      var saw_comma = false
+      while i < seg.len() do
+        let ch = seg.slice(i, i + 1)
+        if ch == "(" then depth = depth + 1 end
+        if ch == ")" then
+          depth = depth - 1
+          if depth == 0 then
+            close_idx = i
+            break
+          end
+        end
+        if ch == "," && depth == 1 && !saw_comma then
+          comma_idx = i
+          saw_comma = true
+        end
+        i = i + 1
+      end
+      if close_idx < 0 then
+        out = out + "debug_assert!" + seg
+      else
+        let inner_end = if comma_idx >= 0 then comma_idx else close_idx end
+        out = out + "(" + seg.slice(1, inner_end) + ")"
+        out = out + seg.slice(close_idx + 1, seg.len())
+      end
+    else
+      out = out + "debug_assert!" + seg
+    end
+    pi = pi + 1
+  end
+  out
+end
+
+def c3_probe_strip_debug_assert(source: String) -> String
+  var cur = source.clone()
+  var pass = 0
+  while pass < 8 && cur.contains("debug_assert!") do
+    cur = c3_probe_strip_debug_assert_pass(cur)
+    pass = pass + 1
+  end
+  cur
+end
+
+# (cfg elimination, focused): the probe host is macOS. The kernel's real
+# compile path eliminates @cfg-gated items before checking; the probe
+# drops the windows/linux-gated items so its diagnostics match the real
+# target's closure (an item with any other cfg — macos, any/all/not
+# forms — is kept).
+def c3_probe_item_active(item: Item) -> Bool
+  for attr in item.attrs do
+    if attr.name == "cfg" then
+      var drop_it = false
+      for a in attr.args do
+        if a == "windows" || a == "linux" then drop_it = true end
+      end
+      if drop_it then return false end
+    end
+  end
+  true
+end
+
+def c3_probe_join_path(segments: Vec[String]) -> String
+  var out = ""
+  var i = 0
+  while i < segments.len() do
+    if i > 0 then out = out + "::" end
+    out = out + segments[i].clone()
+    i = i + 1
+  end
+  out
+end
+
+def c3_probe_module_path_from_file(path: String) -> Vec[String]
+  var segments = Vec::new()
+  let parts = path.split("/")
+  var pi = 0
+  while pi < parts.len() do
+    var seg = parts[pi].clone()
+    if pi == parts.len() - 1 && seg.ends_with(".tg") then
+      seg = seg.slice(0, seg.len() - 3)
+    end
+    if !seg.is_empty() then
+      segments.push(seg)
+    end
+    pi = pi + 1
+  end
+  segments
+end
+
+def c3_probe_build_dep_file_path(segments: Vec[String], count: Int) -> Option[String]
+  if count < 2 then
+    return Option::None
+  end
+  let root = segments[0]
+  var path = if root == "std" then "std/" elsif root == "tg_compiler" then "tg_compiler/" else return Option::None end
+  var i = 1
+  while i < count do
+    if i > 1 then path = path + "/" end
+    path = path + segments[i]
+    i = i + 1
+  end
+  Option::Some(path + ".tg")
+end
+
+def c3_probe_dep_use_to_file(u: UseDecl) -> Option[String]
+  let segment_count = u.path.segments.len()
+  if segment_count < 2 then
+    return Option::None
+  end
+  match u.names
+  when Option::Some(_) then return c3_probe_build_dep_file_path(u.path.segments.clone(), segment_count)
+  when Option::None then ()
+  end
+  if u.glob then
+    return c3_probe_build_dep_file_path(u.path.segments.clone(), segment_count)
+  end
+  match c3_probe_build_dep_file_path(u.path.segments.clone(), segment_count)
+  when Option::Some(full_path) then
+    if file_exists(full_path.clone()) then
+      return Option::Some(full_path)
+    end
+    if segment_count > 2 then
+      match c3_probe_build_dep_file_path(u.path.segments.clone(), segment_count - 1)
+      when Option::Some(parent_path) then
+        if file_exists(parent_path.clone()) then
+          return Option::Some(parent_path)
+        end
+      when Option::None then ()
+      end
+    end
+    Option::None
+  when Option::None then Option::None
+  end
+end
+
+def c3_probe_collect_dep_file(path: String, inout out: Vec[Item], inout loaded: Set[String], inout modules: Map[ModuleId, Module]) -> Int
+  if loaded.contains(&path) then
+    return 0
+  end
+  loaded.insert(path.clone())
+  if !file_exists(path.clone()) then
+    return 2
+  end
+  let source = match read_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then return 2
+  end
+  let parsed = parse(tokenize(c3_probe_strip_debug_assert(source), path.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    return 3
+  end
+  let dep_ast = parsed.program
+  for item in dep_ast.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then
+      match c3_probe_dep_use_to_file(u.clone())
+      when Option::Some(p) then
+        let rc = c3_probe_collect_dep_file(p, &mut out, &mut loaded, &mut modules)
+        if rc != 0 then return rc end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+  var mod_start = out.len()
+  let dep_id = ModuleId { id: modules.len() }
+  for item in dep_ast.items do
+    if c3_probe_item_active(item.clone()) then
+      var owned = item.clone()
+      owned.owner_module = dep_id
+      out.push(owned)
+    end
+  end
+  var mod_items = Vec::new()
+  var mi = mod_start
+  while mi < out.len() do
+    mod_items.push(ItemId { id: mi })
+    mi = mi + 1
+  end
+  var mod_imports = Vec::new()
+  for item in dep_ast.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then mod_imports.push(c3_probe_join_path(u.path.segments.clone()))
+    when _ then ()
+    end
+  end
+  modules.insert(dep_id, Module {
+    id: dep_id,
+    path: c3_probe_module_path_from_file(path.clone()),
+    items: mod_items,
+    imports: mod_imports
+  })
+  0
+end
+
+def c3_probe_debug_dump(env: TypeEnv) -> String
+  var out = ""
+  out = out + "DBG impls=" + env.impls.len().to_string() + "\n"
+  var tdi = 0
+  while tdi < env.type_list.len() do
+    let td = env.type_list[tdi]
+    if td.id.id == 122 || td.id.id == 123 || td.id.id == 124 || td.id.id == 128 || td.id.id == 129 then
+      out = out + "DBG type " + td.id.id.to_string() + " = " + td.name.clone() + "\n"
+    end
+    tdi = tdi + 1
+  end
+  var ii = 0
+  while ii < env.impls.len() do
+    let imp = env.impls[ii]
+    match imp.for_type
+    when Type::Adt(tid, _) then
+      match get_type_by_id_ref(env, &tid)
+      when Option::Some(td) then
+        if td.name == "Ptr" || td.name == "Vec" || td.name == "Array" then
+          var mnames = ""
+          var mi0 = 0
+          while mi0 < imp.methods.len() do
+            mnames = mnames + imp.methods[mi0].name.clone() + " "
+            mi0 = mi0 + 1
+          end
+          out = out + "DBG impl[" + ii.to_string() + "] for=" + td.name.clone() + "#" + tid.id.to_string() + " trait=[" + imp.trait_name.clone() + "] ms=" + mnames + "\n"
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    ii = ii + 1
+  end
+  var entries = env.method_lookup.entries()
+  var ei = 0
+  while ei < entries.len() do
+    if entries[ei].0 == 122 || entries[ei].0 == 128 || entries[ei].0 == 129 then
+      var names = ""
+      let mm = entries[ei].1.clone()
+      let ments = mm.entries()
+      var mi = 0
+      while mi < ments.len() do
+        names = names + ments[mi].0.clone() + "(" + ments[mi].1.len().to_string() + ") "
+        mi = mi + 1
+      end
+      out = out + "DBG ml[" + entries[ei].0.to_string() + "] " + names + "\n"
+    end
+    ei = ei + 1
+  end
+  out
+end
+
+def c3_probe_run_merged(corpus_path: String, inout report: String, inout no_method: Int, inout clone_count: Int, inout total: Int, inout ice: Int) -> Int
+  let source = match read_file(corpus_path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then
+    report = report + "MERGED: cannot read corpus\n"
+    return 2
+  end
+  let parsed = parse(tokenize(c3_probe_strip_debug_assert(source), corpus_path.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "MERGED: corpus parse failed\n"
+    return 2
+  end
+  var merged_items = Vec::new()
+  for item in parsed.program.items do
+    if c3_probe_item_active(item.clone()) then merged_items.push(item.clone()) end
+  end
+  var root_items = Vec::new()
+  var ri = 0
+  while ri < merged_items.len() do
+    root_items.push(ItemId { id: ri })
+    ri = ri + 1
+  end
+  let root_id = ModuleId { id: 0 }
+  var merged_modules = Map::new()
+  merged_modules.insert(root_id, Module {
+    id: root_id,
+    path: Vec::new(),
+    items: root_items,
+    imports: Vec::new()
+  })
+  var loaded = Set::new()
+  let preludes = ["std/alloc.tg", "std/collections.tg", "std/core.tg", "std/ffi.tg", "std/fmt.tg", "std/fs.tg", "std/io.tg", "std/taint.tg"]
+  var pi = 0
+  while pi < preludes.len() do
+    let rc = c3_probe_collect_dep_file(preludes[pi].clone(), &mut merged_items, &mut loaded, &mut merged_modules)
+    if rc != 0 then
+      report = report + "MERGED: load failed (" + rc.to_string() + ") " + preludes[pi].clone() + "\n"
+      return 2
+    end
+    pi = pi + 1
+  end
+  var program = Program {
+    items: merged_items,
+    crate: Crate { root: root_id, modules: merged_modules },
+    span: parsed.program.span.clone()
+  }
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    report = report + c3_probe_debug_dump(env) + "\n"
+    var shown = 0
+    var i = 0
+    while i < result.errors.len() do
+      let msg = result.errors[i].message.clone()
+      if msg.contains("no method") then
+        no_method = no_method + 1
+        if msg.contains("`clone`") then clone_count = clone_count + 1 end
+        if shown < 400 then
+          report = report + "  NMC " + result.errors[i].span.file + ":" + result.errors[i].span.start.to_string() + " " + msg.clone() + "\n"
+          shown = shown + 1
+        end
+      end
+      i = i + 1
+    end
+    total = total + result.errors.len()
+    var other_shown = 0
+    var ice_count = 0
+    var oi = 0
+    while oi < result.errors.len() do
+      let omsg = result.errors[oi].message.clone()
+      if omsg.contains("internal error") then
+        ice_count = ice_count + 1
+      end
+      if !omsg.contains("no method") && other_shown < 60 then
+        report = report + "  DBGE " + result.errors[oi].span.file + ":" + result.errors[oi].span.start.to_string() + " " + omsg + "\n"
+        other_shown = other_shown + 1
+      end
+      oi = oi + 1
+    end
+    ice = ice + ice_count
+    report = report + "MERGED: items=" + program.items.len().to_string() + " errors=" + result.errors.len().to_string() + " no_method=" + no_method.to_string() + " clone=" + clone_count.to_string() + " ice=" + ice_count.to_string() + "\n"
+    0
+  when Result::Err(errs) then
+    report = report + "MERGED: resolve failed -> " + errs.len().to_string() + "\n"
+    2
+  end
+end
+
+def main() -> Int
+  var report = ""
+  var no_method = 0
+  var gate = 0
+  var total = 0
+  let cases = Vec::from([
+    ("struct_method", "struct S\n  x: Int\nend\n\nimpl S\n  def get(self: Self) -> Int\n    self.x\n  end\nend\n\ndef main() -> Int\n  let s = S { x: 1 }\n  s.get()\nend\n"),
+    ("struct_clone", "struct S\n  x: Int\nend\n\ndef main() -> Int\n  let a = S { x: 1 }\n  let b = a.clone()\n  0\nend\n"),
+    ("struct_clone_impl_later", "struct S\n  x: Int\nend\n\ndef dup(a: S) -> S\n  a.clone()\nend\n\nimpl Clone for S\n  def clone(self: Self) -> S\n    S { x: self.x }\n  end\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("param_clone_bound", "trait Cloner\n  def dup2(self: Self) -> Self\nend\n\ndef copy_it[T: Cloner](v: T) -> T\n  v.dup2()\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("int_missing", "def main() -> Int\n  let x = 1\n  x.missing_method()\n  0\nend\n"),
+    ("int_clone", "def main() -> Int\n  let x = 1\n  let y = x.clone()\n  0\nend\n"),
+    ("string_clone", "def main() -> Int\n  let s = \"hi\"\n  let t = s.clone()\n  0\nend\n"),
+    ("option_clone", "use std::core::Option\ndef main() -> Int\n  let o = Option::Some(1)\n  let p = o.clone()\n  0\nend\n"),
+    ("enum_clone", "enum E\n  A\n  B(Int)\nend\n\ndef main() -> Int\n  let e = E::A\n  let f = e.clone()\n  0\nend\n"),
+    ("nested_struct", "struct Inner\n  v: Int\nend\n\nstruct Outer\n  i: Inner\nend\n\ndef main() -> Int\n  let a = Outer { i: Inner { v: 1 } }\n  let b = a.clone()\n  0\nend\n"),
+    ("generic_impl_method", "struct W[T]\n  v: T\nend\n\nimpl[T] W[T]\n  def cap(self: Self) -> Int\n    0\n  end\nend\n\ndef main() -> Int\n  let w = W { v: 1 }\n  w.cap()\nend\n"),
+    ("vec_resize", "def main() -> Int\n  var v = Vec[u8]::new()\n  v.resize(4, 0)\n  0\nend\n"),
+    ("rc_nested_ptr_field", "struct Inner[T]\n  value: T\n  strong_count: UInt\nend\n\nstruct Rc[T]\n  ptr: Ptr[Inner[T]]\nend\n\nimpl[T] Rc[T]\n  def strong(self: Rc[T]) -> UInt\n    self.ptr.as_ref().strong_count\n  end\n\n  def peek(self: Rc[T]) -> T\n    self.ptr.as_ref().value\n  end\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("turbofish_type_arg_binding", "struct Wrap[T]\n  v: T\nend\n\ndef id[T](x: T) -> T\n  x\nend\n\ndef pick2[A, B](a: A, b: B) -> A\n  a\nend\n\ndef main() -> Int\n  let a = id[Int](1)\n  let b = id[Wrap[Int]](Wrap { v: 2 })\n  let c = a + b.v\n  let d = pick2[Int, UInt](c, 3)\n  d\nend\n"),
+    ("string_index_upper", "def main() -> Int\n  let s = \"hi\"\n  let c = s.char_at(0)\n  let t = c.to_uppercase().to_string()\n  let p = s.ptr()\n  0\nend\n"),
+    ("ptr_cast_write", "def probe_ptr(p: Ptr[u8]) -> Unit\n  let q = p.cast[u8]()\n  q.write(0)\n  q.as_ref()\nend\n\ndef main() -> Int\n  0\nend\n")
+  ])
+  var i = 0
+  while i < cases.len() do
+    let label = cases[i].0.clone()
+    report = report + "BEGIN " + label.clone() + "\n"
+    let _ = write_file("build/c3_probe.txt", report.clone())
+    let rc = c3_probe_run_case(label, cases[i].1.clone(), &mut report, &mut no_method, &mut gate, &mut total)
+    i = i + 1
+  end
+  var clone_count = 0
+  var ice = 0
+  if file_exists("build/c3_merged.flag") then
+    report = report + "BEGIN merged\n"
+    let _ = write_file("build/c3_probe.txt", report.clone())
+    let rcm = c3_probe_run_merged("tests/differential/corpus/01_defs_arith.tg", &mut report, &mut no_method, &mut clone_count, &mut total, &mut ice)
+    let _ = rcm
+  end
+  report = report + "TOTALS cases=" + cases.len().to_string() + " errors=" + total.to_string() + " no_method=" + no_method.to_string() + " clone=" + clone_count.to_string() + " ice=" + ice.to_string() + " gate=" + gate.to_string() + "\n"
+  let _ = write_file("build/c3_probe.txt", report.clone())
+  0
+end

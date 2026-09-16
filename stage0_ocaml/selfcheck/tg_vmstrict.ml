@@ -161,6 +161,57 @@ let check_uninit_return () =
    | Error e -> fail "Unit-typed callee unexpectedly trapped: %s" e.Vm.message
    | Ok _ -> fail "Unit-typed callee program returned a non-zero exit code")
 
+(* ── (b2) the entry exit-status convention ──────────────────────────
+   The native main/_start convention (the direct route's CRT stub calls
+   exit(main's return)) is mirrored by Vm.run: a Live Int return value
+   IS the process status; a Unit return is 0.  The pre-fix VM returned
+   0 for every normal entry return, which masked the kernel's
+   bootstrap_main compile result (1 on a failed compile). *)
+
+let check_entry_exit_code () =
+  let int_main =
+    {
+      Seed_mir.name = "main";
+      instance = instance 1;
+      params = [||];
+      locals = [| i64 |];
+      blocks =
+        [|
+          { id = 0;
+            statements =
+              [
+                Seed_mir.Assign
+                  ({ root = Seed_mir.Local 0; projections = [] },
+                   Seed_mir.Use (Seed_mir.Constant (int_constant 7L)));
+              ];
+            terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  let prog = { Seed_mir.functions = [| int_main |]; statics = [||]; types = [||] } in
+  (match run_program prog with
+   | Ok 7 ->
+       pass
+         "entry exit status: main returning 7 runs to Ok 7 (the native main/_start convention)"
+   | Ok other -> fail "entry exit status: main returning 7 ran to Ok %d (expected 7)" other
+   | Error e -> fail "entry exit status: main returning 7 trapped: %s" e.Vm.message);
+  let unit_main =
+    {
+      Seed_mir.name = "main";
+      instance = instance 2;
+      params = [||];
+      locals = [| Type_repr.Unit |];
+      blocks = [| { id = 0; statements = []; terminator = Seed_mir.Ret } |];
+      entry = 0;
+    }
+  in
+  let prog_u = { Seed_mir.functions = [| unit_main |]; statics = [||]; types = [||] } in
+  (match run_program prog_u with
+   | Ok 0 -> pass "entry exit status: a Unit-returning main runs to Ok 0"
+   | Ok other -> fail "entry exit status: Unit main ran to Ok %d (expected 0)" other
+   | Error e -> fail "entry exit status: Unit main trapped: %s" e.Vm.message)
+
 (* ── (c) block array must be indexed by block id ──────────────────── *)
 
 let check_block_id_invariant () =
@@ -225,6 +276,7 @@ let () =
   Printf.printf "Seed VM strictness self-check\n";
   check_div_rem ();
   check_uninit_return ();
+  check_entry_exit_code ();
   check_block_id_invariant ();
   check_memory ();
   Printf.printf "OK: vm strictness self-check passed\n";

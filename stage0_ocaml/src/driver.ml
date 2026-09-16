@@ -1065,7 +1065,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
       | Some main ->
           let host = Host.create ~repo_root:"." ~argv:[||] in
           (match Vm.run_li ~limits:Vm.default_limits ~lang_items:(Typecheck.lang_items_of_env env) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] ~host with
-           | Ok _ -> Printf.printf "// VM: exit 0\n"; 0
+           | Ok code -> Printf.printf "// VM: exit %d\n" code; 0
            | Error e -> Printf.printf "// VM: %s\n" e.Vm.message; 1))
 
 
@@ -3304,14 +3304,30 @@ type mono_outcome = {
    fast and deterministically (the guard stays a bounded resource budget,
    never an unbounded run).  Host calls keep >6x over the worst observed
    30.5e6. *)
-let bootstrap_vm_max_steps = 5_000_000_000
-let bootstrap_vm_max_host_calls = 200_000_000
+(* (recalibrated bootstrap caps): the bootstrap VM budget is overridable via
+   the environment so deep corpus+stdlib compiles can be given a larger
+   budget without a rebuild; the defaults stay bounded, fail-fast guards. *)
+let env_budget name default =
+  match Sys.getenv_opt name with
+  | Some s -> (
+      match int_of_string_opt (String.trim s) with Some n -> n | None -> default)
+  | None -> default
+
+let bootstrap_vm_max_steps =
+  env_budget "TANGERINE_BOOTSTRAP_VM_MAX_STEPS" 30_000_000_000
+
+let bootstrap_vm_max_host_calls =
+  env_budget "TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS" 1_000_000_000
+
+let bootstrap_vm_max_alloc_bytes =
+  env_budget "TANGERINE_BOOTSTRAP_VM_MAX_ALLOC" 8_589_934_592
 
 let bootstrap_vm_limits : Vm.limits =
   {
     Vm.default_limits with
     max_steps = bootstrap_vm_max_steps;
     max_host_calls = bootstrap_vm_max_host_calls;
+    max_alloc_bytes = bootstrap_vm_max_alloc_bytes;
   }
 
 (* ── The VM-side layout fold (the TypeQuery resolution) ──────────────
@@ -5429,7 +5445,8 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                         }
                   | Ok report -> (
                       match Vm.run_li ~limits:bootstrap_vm_limits ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:(vm_program_with_folded_queries ctx mo) ~entry:mo.mo_entry ~argv ~host with
-                      | Error _ ->
+                      | Error e ->
+                          Printf.eprintf "VM TRAP (diagnostic patch): %s\n%!" e.Vm.message;
                           Ok
                             {
                               bs_ctx = ctx;
@@ -5946,6 +5963,13 @@ let cmd_compile (args : string list) : int =
                          | Ok code ->
                              let out = Host.stdout_contents host in
                              if out <> "" then Printf.printf "compile: kernel stdout:\n%s\n" out;
+                             (* The kernel's structured diagnostics ride stderr; a
+                                completed run (exit 0 or nonzero) must surface
+                                them exactly like the trap path does — otherwise
+                                a failed kernel compile reports only its exit
+                                code and the diagnostics are dropped. *)
+                             let err = Host.stderr_contents host in
+                             if err <> "" then Printf.printf "compile: kernel stderr:\n%s\n" err;
                              Printf.printf "compile: VM bootstrap run exit %d\n" code;
                              (match kernel_output_path kernel_args with
                               | None ->

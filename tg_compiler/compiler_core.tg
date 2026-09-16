@@ -998,7 +998,12 @@ pub def emitter_new_json() -> DiagnosticEmitter
   }
 end
 
-pub def add_source(inout e: DiagnosticEmitter, name: String, content: String) -> Int
+# The line-start offset index of a source text: lines[0] = 0 and lines[k]
+# is the byte offset just past the k-th '\n' (the offset of the following
+# line's first byte). The SAME index backs add_source and the lazy
+# merged-dependency resolution below — one line-index authority, so the
+# two paths can never disagree about what a line is.
+pub def line_starts_of(content: String) -> Vec[Int]
   var lines = Vec::new()
   lines.push(0)
   var i = 0
@@ -1008,6 +1013,30 @@ pub def add_source(inout e: DiagnosticEmitter, name: String, content: String) ->
     end
     i = i + 1
   end
+  lines
+end
+
+# The 0-based line index of `offset` — a BINARY SEARCH over the ascending
+# line-start offsets (the previous linear walk was O(lines) per
+# diagnostic; the index is sorted by construction). Returns the greatest
+# index whose line-start offset is <= offset (0 when offset precedes the
+# first line).
+pub def line_index_of_offset(lines: Vec[Int], offset: Int) -> Int
+  var lo = 0
+  var hi = lines.len()
+  while lo < hi do
+    let mid = lo + (hi - lo) / 2
+    if lines[mid] <= offset then
+      lo = mid + 1
+    else
+      hi = mid
+    end
+  end
+  if lo > 0 then lo - 1 else 0 end
+end
+
+pub def add_source(inout e: DiagnosticEmitter, name: String, content: String) -> Int
+  let lines = line_starts_of(&content)
 
   e.source_map.files.push(SourceFile {
     name: name,
@@ -1072,7 +1101,7 @@ pub def emit_diagnostic(inout e: DiagnosticEmitter, d: Diagnostic) -> Unit
   # Print source location
   match d.span
   when Option::Some(span) then
-    print_source_location(e, span)
+    print_source_location(&mut e, span)
   when Option::None then ()
   end
 
@@ -1097,7 +1126,13 @@ pub def eprint(s: String) -> Unit
   let _n = syscall_write(2, s.as_ptr(), s.len() as UInt)
 end
 
-pub def print_source_location(e: DiagnosticEmitter, span: Span) -> Unit
+pub def print_source_location(inout e: DiagnosticEmitter, span: Span) -> Unit
+  # A span with NO file carries no source location at all (the spanless
+  # internal/gate rows): print NOTHING — never a fabricated ":0" locator.
+  # The message carries the node/item identity for those rows.
+  if span.file.len() == 0 then
+    return
+  end
   # Find the source file containing this span using span.file
   var found_file: Option[SourceFile] = Option::None
   for f in e.source_map.files do
@@ -1109,66 +1144,89 @@ pub def print_source_location(e: DiagnosticEmitter, span: Span) -> Unit
 
   match found_file
   when Option::Some(file) then
-    # Find the line number and column
-    var line_num = 1
-    var line_start = 0
-    for offset in file.lines do
-      if offset > span.start then
-        break
-      end
-      line_start = offset
-      line_num = line_num + 1
-    end
-    line_num = line_num - 1  # Adjust (loop increments one extra)
-    let col = span.start - line_start
-
-    # Find end of line
-    var line_end = line_start
-    while line_end < file.content.len() && file.content.char_at(line_end) != '\n' do
-      line_end = line_end + 1
-    end
-
-    # Extract the source line
-    let source_line = file.content.slice(line_start, line_end)
-
-    # Print location header
-    let loc_header = "  --> " + file.name.clone() + ":" + line_num.to_string() + ":" + (col + 1).to_string()
-
-    # Print line number gutter
-    let line_str = line_num.to_string()
-    let padding = "     ".slice(0, 5 - line_str.len())
-
-    # Print caret indicator
-    var caret_line = ""
-    var i = 0
-    while i < 5 do
-      caret_line = caret_line + " "
-      i = i + 1
-    end
-    caret_line = caret_line + " | "
-    i = 0
-    while i < col do
-      caret_line = caret_line + " "
-      i = i + 1
-    end
-    # Draw the caret(s) for the span width
-    let span_len = if span.end_pos > span.start then span.end_pos - span.start else 1 end
-    i = 0
-    while i < span_len do
-      caret_line = caret_line + "^"
-      i = i + 1
-    end
-
-    eprint(loc_header + "\n")
-    eprint(padding + " |\n")
-    eprint(line_str + padding + " | " + source_line + "\n")
-    eprint(caret_line + "\n")
+    print_source_file_span(&file, span)
 
   when Option::None then
-    # Fallback when the source file is not in the emitter's source map:
-    # print the file name and byte offset so diagnostics are still locatable.
-    eprint("  --> " + span.file.clone() + ":" + span.start.to_string() + "\n")
+    # The span's file is not a REGISTERED source of this emitter: only the
+    # root compilation unit is add_source'd; merged dependencies (the std /
+    # module files read by merge_imported_deps) carry byte-offset spans
+    # whose file is never registered. Resolve the TRUE line from the
+    # source text read on demand through the pipeline's one read API,
+    # reusing the same line-start index, and CACHE the file in the source
+    # map so N diagnostics in one file build the index once. A parser
+    # line:col span whose file IS registered keeps the in-map rendering
+    # above (the two paths share print_source_file_span).
+    match read_source_file(span.file.clone())
+    when Result::Ok(content) then
+      let file_lines = line_starts_of(&content)
+      let file = SourceFile {
+        name: span.file.clone(),
+        content: content,
+        lines: file_lines
+      }
+      e.source_map.files.push(file.clone())
+      print_source_file_span(&file, span)
+    when Result::Err(_) then
+      # No source text available at all: render the offset EXPLICITLY as a
+      # byte offset — never a fabricated line number.
+      eprint("  --> " + span.file.clone() + ":" + span.start.to_string() + " (byte offset; source text unavailable)\n")
+    end
   end
+end
+
+# The located rendering of ONE span against ONE source file: line:column
+# from the line-start index (binary search), the source line and the caret
+# run. Shared by the source-map path and the on-demand merged-dependency
+# path of print_source_location so both render identically.
+pub def print_source_file_span(file: SourceFile, span: Span) -> Unit
+  # Find the line number and column (binary search over the line-start
+  # index — never the old linear walk)
+  let line_idx = line_index_of_offset(&file.lines, span.start)
+  let line_num = line_idx + 1
+  let line_start = if line_idx >= 0 && line_idx < file.lines.len() then file.lines[line_idx] else 0 end
+  let col = if span.start >= line_start then span.start - line_start else 0 end
+
+  # Find end of line
+  var line_end = line_start
+  while line_end < file.content.len() && file.content.char_at(line_end) != '\n' do
+    line_end = line_end + 1
+  end
+
+  # Extract the source line
+  let source_line = file.content.slice(line_start, line_end)
+
+  # Print location header
+  let loc_header = "  --> " + file.name.clone() + ":" + line_num.to_string() + ":" + (col + 1).to_string()
+
+  # Print line number gutter
+  let line_str = line_num.to_string()
+  let padding = "     ".slice(0, 5 - line_str.len())
+
+  # Print caret indicator
+  var caret_line = ""
+  var i = 0
+  while i < 5 do
+    caret_line = caret_line + " "
+    i = i + 1
+  end
+  caret_line = caret_line + " | "
+  i = 0
+  while i < col do
+    caret_line = caret_line + " "
+    i = i + 1
+  end
+  # Draw the caret(s) for the span width
+  let span_len = if span.end_pos > span.start then span.end_pos - span.start else 1 end
+  i = 0
+  while i < span_len do
+    caret_line = caret_line + "^"
+    i = i + 1
+  end
+
+  eprint(loc_header + "\n")
+  eprint(padding + " |\n")
+  eprint(line_str + padding + " | " + source_line + "\n")
+  eprint(caret_line + "\n")
 end
 
 #

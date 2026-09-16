@@ -1,0 +1,459 @@
+# c5_probe.tg — focused probe for the kernel checker's C5 diagnostic
+# classes (variant-owner resolution, builtin-identity reconciliation,
+# for-loop iterable resolution, the bound solver's Hash gate).
+#
+# Two modes:
+#   1. standalone focused cases — trivial sources checked in isolation
+#      (fast; the variant-owner resolution and the bound gate);
+#   2. the merged corpus mode (flag build/c5_merged.flag) — the
+#      differential corpus entry + the std preludes merged exactly like
+#      the kernel's compile path, type-checked by the REAL kernel checker;
+#      every class diagnostic is counted and written to build/c5_probe.txt.
+#
+# bootstrap/c5_mini.manifest closes it under the seed VM.
+use std::core::{Option, Result}
+use std::collections::{Vec, Map}
+use std::fs::{read_file, write_file, file_exists}
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse, diag_has_errors}
+use tg_compiler::ast::{assign_node_ids, Program, Item, ItemId, ModuleId, Module, Crate, UseDecl}
+use tg_compiler::resolver::{resolve_names}
+use tg_compiler::types::{type_env_new, type_check_typed}
+
+def c5_probe_class_of(msg: String, code: String) -> String
+  if code == "E0229" || code == "E0226" || code == "E0224" || code == "E0225" then
+    return "C5f"
+  end
+  if msg.contains("wrong number of arguments: variant") then return "C5e" end
+  if msg.contains("ambiguous variant `") then return "C5e-amb" end
+  if msg.contains("duplicate type definition") then return "C5h" end
+  if msg.contains("cannot iterate") then return "C5l" end
+  if msg.contains("requires `") && msg.contains("Hash") then return "C5m" end
+  if msg.contains("requires `") && msg.contains("Copy") then return "GATE" end
+  "other"
+end
+
+def c5_probe_run_case(label: String, source: String, inout report: String, inout c5e: Int, inout c5f: Int, inout c5h: Int, inout c5l: Int, inout c5m: Int, inout total: Int) -> Int
+  let parsed = parse(tokenize(source.clone(), label.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "CASE " + label.clone() + ": parse-failed\n"
+    return 0
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    var case_rows = 0
+    var i = 0
+    while i < result.errors.len() do
+      let msg = result.errors[i].message.clone()
+      let code = match result.errors[i].code
+      when Option::Some(c) then c.clone()
+      when Option::None then ""
+      end
+      let cls = c5_probe_class_of(msg.clone(), code)
+      if cls == "C5e" then
+        c5e = c5e + 1
+        case_rows = case_rows + 1
+        report = report + "  E " + label.clone() + " @" + result.errors[i].span.start.to_string() + ": " + msg + "\n"
+      end
+      if cls == "C5e-amb" then
+        c5e = c5e + 1
+        case_rows = case_rows + 1
+        report = report + "  EA " + label.clone() + " @" + result.errors[i].span.start.to_string() + ": " + msg + "\n"
+      end
+      if cls == "C5f" then
+        c5f = c5f + 1
+        case_rows = case_rows + 1
+        report = report + "  F " + label.clone() + " @" + result.errors[i].span.start.to_string() + ": " + msg + "\n"
+      end
+      if cls == "C5h" then
+        c5h = c5h + 1
+        case_rows = case_rows + 1
+        report = report + "  H " + label.clone() + " @" + result.errors[i].span.start.to_string() + ": " + msg + "\n"
+      end
+      if cls == "C5l" then
+        c5l = c5l + 1
+        case_rows = case_rows + 1
+        report = report + "  L " + label.clone() + " @" + result.errors[i].span.start.to_string() + ": " + msg + "\n"
+      end
+      if cls == "C5m" then
+        c5m = c5m + 1
+        case_rows = case_rows + 1
+        report = report + "  M " + label.clone() + " @" + result.errors[i].span.start.to_string() + ": " + msg + "\n"
+      end
+      if cls == "GATE" then
+        case_rows = case_rows + 1
+        report = report + "  G " + label.clone() + " @" + result.errors[i].span.start.to_string() + ": " + msg + "\n"
+      end
+      i = i + 1
+    end
+    total = total + result.errors.len()
+    report = report + "CASE " + label.clone() + ": errors=" + result.errors.len().to_string() + " c5rows=" + case_rows.to_string() + "\n"
+    0
+  when Result::Err(errs) then
+    report = report + "CASE " + label.clone() + ": resolve-failed=" + errs.len().to_string() + "\n"
+    0
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# merged corpus mode — the a4/c3 probe loader pattern (strip
+# debug_assert statements, load the preludes + their `use` dependencies,
+# merge every item into one program with per-item owner modules, then run
+# the real kernel checker).
+# ———————————————————————————————————————————————————————————————
+
+def c5_probe_strip_debug_assert_pass(source: String) -> String
+  let parts = source.split("debug_assert!")
+  if parts.len() <= 1 then
+    return source
+  end
+  var out = parts[0].clone()
+  var pi = 1
+  while pi < parts.len() do
+    let seg = parts[pi].clone()
+    if seg.starts_with("(") then
+      var depth = 0
+      var i = 0
+      var close_idx = -1
+      var comma_idx = -1
+      var saw_comma = false
+      while i < seg.len() do
+        let ch = seg.slice(i, i + 1)
+        if ch == "(" then depth = depth + 1 end
+        if ch == ")" then
+          depth = depth - 1
+          if depth == 0 then
+            close_idx = i
+            break
+          end
+        end
+        if ch == "," && depth == 1 && !saw_comma then
+          comma_idx = i
+          saw_comma = true
+        end
+        i = i + 1
+      end
+      if close_idx < 0 then
+        out = out + "debug_assert!" + seg
+      else
+        let inner_end = if comma_idx >= 0 then comma_idx else close_idx end
+        out = out + "(" + seg.slice(1, inner_end) + ")"
+        out = out + seg.slice(close_idx + 1, seg.len())
+      end
+    else
+      out = out + "debug_assert!" + seg
+    end
+    pi = pi + 1
+  end
+  out
+end
+
+def c5_probe_strip_debug_assert(source: String) -> String
+  var cur = source.clone()
+  var pass = 0
+  while pass < 8 && cur.contains("debug_assert!") do
+    cur = c5_probe_strip_debug_assert_pass(cur)
+    pass = pass + 1
+  end
+  cur
+end
+
+def c5_probe_join_path(segments: Vec[String]) -> String
+  var out = ""
+  var i = 0
+  while i < segments.len() do
+    if i > 0 then out = out + "::" end
+    out = out + segments[i].clone()
+    i = i + 1
+  end
+  out
+end
+
+def c5_probe_module_path_from_file(path: String) -> Vec[String]
+  var segments = Vec::new()
+  let parts = path.split("/")
+  var pi = 0
+  while pi < parts.len() do
+    var seg = parts[pi].clone()
+    if pi == parts.len() - 1 && seg.ends_with(".tg") then
+      seg = seg.slice(0, seg.len() - 3)
+    end
+    if !seg.is_empty() then
+      segments.push(seg)
+    end
+    pi = pi + 1
+  end
+  segments
+end
+
+def c5_probe_build_dep_file_path(segments: Vec[String], count: Int) -> Option[String]
+  if count < 2 then
+    return Option::None
+  end
+  let root = segments[0]
+  var path = if root == "std" then "std/" elsif root == "tg_compiler" then "tg_compiler/" else return Option::None end
+  var i = 1
+  while i < count do
+    if i > 1 then path = path + "/" end
+    path = path + segments[i]
+    i = i + 1
+  end
+  Option::Some(path + ".tg")
+end
+
+def c5_probe_dep_use_to_file(u: UseDecl) -> Option[String]
+  let segment_count = u.path.segments.len()
+  if segment_count < 2 then
+    return Option::None
+  end
+  match u.names
+  when Option::Some(_) then return c5_probe_build_dep_file_path(u.path.segments.clone(), segment_count)
+  when Option::None then ()
+  end
+  if u.glob then
+    return c5_probe_build_dep_file_path(u.path.segments.clone(), segment_count)
+  end
+  match c5_probe_build_dep_file_path(u.path.segments.clone(), segment_count)
+  when Option::Some(full_path) then
+    if file_exists(full_path.clone()) then
+      return Option::Some(full_path)
+    end
+    if segment_count > 2 then
+      match c5_probe_build_dep_file_path(u.path.segments.clone(), segment_count - 1)
+      when Option::Some(parent_path) then
+        if file_exists(parent_path.clone()) then
+          return Option::Some(parent_path)
+        end
+      when Option::None then ()
+      end
+    end
+    Option::None
+  when Option::None then Option::None
+  end
+end
+
+def c5_probe_collect_dep_file(path: String, inout out: Vec[Item], inout loaded: Set[String], inout modules: Map[ModuleId, Module]) -> Int
+  if loaded.contains(&path) then
+    return 0
+  end
+  loaded.insert(path.clone())
+  if !file_exists(path.clone()) then
+    return 2
+  end
+  let source = match read_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then return 2
+  end
+  let parsed = parse(tokenize(c5_probe_strip_debug_assert(source), path.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    return 3
+  end
+  let dep_ast = parsed.program
+  for item in dep_ast.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then
+      match c5_probe_dep_use_to_file(u.clone())
+      when Option::Some(p) then
+        let rc = c5_probe_collect_dep_file(p, &mut out, &mut loaded, &mut modules)
+        if rc != 0 then return rc end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+  var mod_start = out.len()
+  let dep_id = ModuleId { id: modules.len() }
+  for item in dep_ast.items do
+    var owned = item.clone()
+    owned.owner_module = dep_id
+    out.push(owned)
+  end
+  var mod_items = Vec::new()
+  var mi = mod_start
+  while mi < out.len() do
+    mod_items.push(ItemId { id: mi })
+    mi = mi + 1
+  end
+  var mod_imports = Vec::new()
+  for item in dep_ast.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then mod_imports.push(c5_probe_join_path(u.path.segments.clone()))
+    when _ then ()
+    end
+  end
+  modules.insert(dep_id, Module {
+    id: dep_id,
+    path: c5_probe_module_path_from_file(path.clone()),
+    items: mod_items,
+    imports: mod_imports
+  })
+  0
+end
+
+def c5_probe_run_merged(corpus_path: String, inout report: String, inout c5e: Int, inout c5f: Int, inout c5h: Int, inout c5l: Int, inout c5m: Int, inout total: Int) -> Int
+  let source = match read_file(corpus_path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then
+    report = report + "MERGED: cannot read corpus\n"
+    return 2
+  end
+  let parsed = parse(tokenize(c5_probe_strip_debug_assert(source), corpus_path.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "MERGED: corpus parse failed\n"
+    return 2
+  end
+  var merged_items = Vec::new()
+  for item in parsed.program.items do merged_items.push(item.clone()) end
+  var root_items = Vec::new()
+  var ri = 0
+  while ri < merged_items.len() do
+    root_items.push(ItemId { id: ri })
+    ri = ri + 1
+  end
+  let root_id = ModuleId { id: 0 }
+  var merged_modules = Map::new()
+  merged_modules.insert(root_id, Module {
+    id: root_id,
+    path: Vec::new(),
+    items: root_items,
+    imports: Vec::new()
+  })
+  var loaded = Set::new()
+  let preludes = ["std/alloc.tg", "std/collections.tg", "std/core.tg", "std/ffi.tg", "std/fmt.tg", "std/fs.tg", "std/io.tg", "std/taint.tg", "std/gfx_errors.tg"]
+  var pi = 0
+  while pi < preludes.len() do
+    let rc = c5_probe_collect_dep_file(preludes[pi].clone(), &mut merged_items, &mut loaded, &mut merged_modules)
+    if rc != 0 then
+      report = report + "MERGED: load failed (" + rc.to_string() + ") " + preludes[pi].clone() + "\n"
+      return 2
+    end
+    pi = pi + 1
+  end
+  var program = Program {
+    items: merged_items,
+    crate: Crate { root: root_id, modules: merged_modules },
+    span: parsed.program.span.clone()
+  }
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    var shown_e = 0
+    var shown_f = 0
+    var shown_h = 0
+    var shown_l = 0
+    var shown_m = 0
+    var i = 0
+    while i < result.errors.len() do
+      let msg = result.errors[i].message.clone()
+      let code = match result.errors[i].code
+      when Option::Some(c) then c.clone()
+      when Option::None then ""
+      end
+      let cls = c5_probe_class_of(msg.clone(), code)
+      let sp = result.errors[i].span.clone()
+      let loc = sp.file.clone() + ":" + sp.start.to_string()
+      if cls == "C5e" || cls == "C5e-amb" then
+        c5e = c5e + 1
+        if shown_e < 60 then
+          report = report + "  E " + loc.clone() + ": " + msg + "\n"
+          shown_e = shown_e + 1
+        end
+      end
+      if cls == "C5f" then
+        c5f = c5f + 1
+        if shown_f < 60 then
+          report = report + "  F " + loc.clone() + ": " + msg + "\n"
+          shown_f = shown_f + 1
+        end
+      end
+      if cls == "C5h" then
+        c5h = c5h + 1
+        if shown_h < 60 then
+          report = report + "  H " + loc.clone() + ": " + msg + "\n"
+          shown_h = shown_h + 1
+        end
+      end
+      if cls == "C5l" then
+        c5l = c5l + 1
+        if shown_l < 60 then
+          report = report + "  L " + loc.clone() + ": " + msg + "\n"
+          shown_l = shown_l + 1
+        end
+      end
+      if cls == "C5m" then
+        c5m = c5m + 1
+        if shown_m < 60 then
+          report = report + "  M " + loc.clone() + ": " + msg + "\n"
+          shown_m = shown_m + 1
+        end
+      end
+      if cls == "GATE" then
+        if shown_m < 60 then
+          report = report + "  G " + loc.clone() + ": " + msg + "\n"
+        end
+      end
+      i = i + 1
+    end
+    total = total + result.errors.len()
+    report = report + "MERGED: items=" + program.items.len().to_string() + " errors=" + result.errors.len().to_string() + " C5e=" + c5e.to_string() + " C5f=" + c5f.to_string() + " C5h=" + c5h.to_string() + " C5l=" + c5l.to_string() + " C5m=" + c5m.to_string() + "\n"
+    0
+  when Result::Err(errs) then
+    report = report + "MERGED: resolve failed -> " + errs.len().to_string() + "\n"
+    2
+  end
+end
+
+def main() -> Int
+  var report = ""
+  var c5e = 0
+  var c5f = 0
+  var c5h = 0
+  var c5l = 0
+  var c5m = 0
+  var total = 0
+  let cases = Vec::from([
+    ("variant_owner_other", "enum SmallErrorCode\n  Other\n  NotFound\nend\n\nenum IOError\n  Other(String)\n  NotFound(String)\nend\n\ndef main() -> Int\n  let e = IOError::Other(\"boom\")\n  match e\n  when IOError::Other(m) then 0\n  when IOError::NotFound(m) then 0\n  end\nend\n"),
+    ("variant_bare_option", "def main() -> Int\n  let o = Option::Some(1)\n  match o\n  when Some(v) then v\n  when None then 0\n  end\nend\n"),
+    ("variant_nullary_owner", "enum SmallErrorCode\n  NotFound\nend\n\nenum IOError\n  NotFound(String)\nend\n\ndef main() -> Int\n  let e = IOError::NotFound(\"gone\")\n  0\nend\n"),
+    ("box_redeclare", "struct Box[T]\n  ptr: Ptr[T]\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("into_redeclare", "trait Into[T]\n  def into(self: Self) -> T\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("from_redeclare", "trait From[T]\n  def from(x: T) -> Self\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("display_redeclare", "trait Display\n  def fmt(self: Self) -> String\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("debug_redeclare", "trait Debug\n  def debug(self: Self) -> String\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("iterator_redeclare", "trait Iterator[T]\n  def advance(inout self: Self) -> Option[T]\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("conv_convention_neg", "trait ConvC\n  def m(self: Self, x: Int) -> Int\nend\n\nstruct SC\n  v: Int\nend\n\nimpl ConvC for SC\n  def m(self: SC, inout x: Int) -> Int\n    0\n  end\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("conv_return_neg", "trait ConvR\n  def m(self: Self) -> Int\nend\n\nstruct SR\n  v: Int\nend\n\nimpl ConvR for SR\n  def m(self: SR) -> String\n    \"wrong\"\n  end\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("conv_param_neg", "trait ConvP\n  def m(self: Self, x: Int) -> Int\nend\n\nstruct SP\n  v: Int\nend\n\nimpl ConvP for SP\n  def m(self: SP, x: String) -> Int\n    0\n  end\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("conv_receiver_inout_ok", "trait ConvI\n  def iter(self: Self) -> Int\nend\n\nstruct SI\n  v: Int\nend\n\nimpl ConvI for SI\n  def iter(inout self: SI) -> Int\n    self.v\n  end\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("variant_amb_qualified", "enum AmbA\n  Wrap(Int)\nend\n\nenum AmbB\n  Wrap(Int)\nend\n\ndef main() -> Int\n  let x = Mod::Wrap(1)\n  0\nend\n"),
+    ("copy_gate_neg", "struct RB[T]\n  x: T\nend\n\nimpl[T: Copy] RB[T]\n  def peek(self: Self) -> T\n    self.x\n  end\nend\n\ndef peek_unbounded(rb: RB[String]) -> String\n  rb.peek()\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("set_iterate", "def main() -> Int\n  let s = Set::new()\n  for x in s do\n    let _y = x\n  end\n  0\nend\n"),
+    ("set_union_hash", "def main() -> Int\n  let a = Set::new()\n  let b = Set::new()\n  let c = a.union(b)\n  0\nend\n")
+  ])
+  var i = 0
+  while i < cases.len() do
+    let label = cases[i].0.clone()
+    report = report + "BEGIN " + label.clone() + "\n"
+    let _ = write_file("build/c5_probe.txt", report.clone())
+    let rc = c5_probe_run_case(label, cases[i].1.clone(), &mut report, &mut c5e, &mut c5f, &mut c5h, &mut c5l, &mut c5m, &mut total)
+    i = i + 1
+  end
+  if file_exists("build/c5_merged.flag") then
+    report = report + "BEGIN merged\n"
+    let _ = write_file("build/c5_probe.txt", report.clone())
+    let rcm = c5_probe_run_merged("tests/differential/corpus/01_defs_arith.tg", &mut report, &mut c5e, &mut c5f, &mut c5h, &mut c5l, &mut c5m, &mut total)
+    let _ = rcm
+  end
+  report = report + "TOTALS errors=" + total.to_string() + " C5e=" + c5e.to_string() + " C5f=" + c5f.to_string() + " C5h=" + c5h.to_string() + " C5l=" + c5l.to_string() + " C5m=" + c5m.to_string() + "\n"
+  let _ = write_file("build/c5_probe.txt", report.clone())
+  println("c5_probe: TOTALS errors=" + total.to_string() + " C5e=" + c5e.to_string() + " C5f=" + c5f.to_string() + " C5h=" + c5h.to_string() + " C5l=" + c5l.to_string() + " C5m=" + c5m.to_string())
+  0
+end

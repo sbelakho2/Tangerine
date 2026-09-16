@@ -2185,6 +2185,18 @@ let entry_frame_of ~(program : Seed_mir.program) ~(entry : Instance_id.t)
   entry_frame_of_li ~limits:default_limits ~lang_items:Lang_items.seed_defaults
     ~program ~entry ~argv
 
+(* The entry's process status mirrors the native main/_start convention:
+   the entry function's Live Int return value IS the exit code (the
+   direct route's CRT stub calls exit(main's return)).  Every other
+   return shape (Unit, non-Int, uninitialized/moved slot) is status 0.
+   Without this the VM discarded the entry return value and reported 0
+   for a failed kernel compile (bootstrap_main's compile result). *)
+let entry_exit_code (entry_frame : frame) : int =
+  match entry_frame.locals.(0) with
+  | Vm_value.Live (Vm_value.Int i) when i.Int_value.width <= 64 ->
+      Int64.to_int (Int_value.to_int64 i)
+  | _ -> 0
+
 let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
     ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array)
     ~(host : Host.t) : (int, vm_error) result =
@@ -2209,7 +2221,7 @@ let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
          (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
             Printf.eprintf "VM STEPS: %d (limit %d), host calls: %d (limit %d)\n"
               vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls);
-         Ok 0
+         Ok (entry_exit_code entry_frame)
        with
       | Failure msg ->
           (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
@@ -2220,7 +2232,7 @@ let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
           (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
              Printf.eprintf "VM STEPS: %d (limit %d), host calls: %d (limit %d)\n"
                vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls);
-          Ok 0)
+          Ok (entry_exit_code entry_frame))
 
 let run ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array)
     ~(host : Host.t) : (int, vm_error) result =

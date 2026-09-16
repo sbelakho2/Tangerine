@@ -1,0 +1,778 @@
+# infer_probe.tg — focused probe for the kernel checker's inference /
+# expected-type propagation families:
+#   VAR    — "unresolved inference variable (Type::Var) ..." gate rows
+#   PARAM  — "generic parameter (Type::Param) ..." gate rows
+#   INFER  — "cannot infer type parameter/const parameter ..." rows
+#   UNIFY  — "cannot unify ..." rows
+#
+# Two modes:
+#   1. a standalone battery of the representative expected-type shapes
+#      (call results solved from the use-site's declared type, generic
+#      call instantiation from the expected type, enum-path values,
+#      casts, chained destinations);
+#   2. the merged corpus mode (flag build/infer_merged.flag) — the
+#      differential corpus entry + the std preludes merged exactly like
+#      the kernel's compile path, type-checked by the REAL kernel checker;
+#      every family row is counted and written to build/infer_probe.txt.
+#
+# bootstrap/infer_mini.manifest closes it under the seed VM;
+# stage0_ocaml/selfcheck/tg_infer.ml runs it as the focused regression.
+use std::core::{Option, Result}
+use std::collections::{Vec, Map, Set}
+use std::fs::{read_file, write_file, file_exists}
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse, diag_has_errors}
+use tg_compiler::ast::{assign_node_ids, Program, Item, ItemId, ModuleId, Module, Crate, UseDecl, Span}
+use tg_compiler::resolver::{resolve_names}
+use tg_compiler::types::{type_env_new, type_check_typed}
+
+# The family classification: every kernel diagnostic that names one of the
+# four inference/expected-type families. The order resolves the only
+# overlap (a gate row never contains "cannot unify").
+def infer_probe_n(n: Int) -> Int
+  n
+end
+
+def infer_probe_class_of(msg: String) -> String
+  if msg.contains("unresolved inference variable (Type::Var)") then return "VAR" end
+  if msg.contains("generic parameter (Type::Param)") then return "PARAM" end
+  if msg.contains("cannot infer type parameter") || msg.contains("cannot infer const parameter") then return "INFER" end
+  if msg.contains("cannot unify") then return "UNIFY" end
+  infer_probe_residual_class(msg.clone())
+end
+
+# ———————————————————————————————————————————————————————————————
+# Residual re-bucketing: every non-family diagnostic is canonically
+# normalized so the class table collapses the id-varying duplicates — the
+# variance channels in the kernel's messages are the embedded TypeId
+# ("Named#123") and the numeric node/var/literal ids ("node 11334",
+# "?T501", "IntLiteral(61440)"). Every DIGIT RUN of length >= 2 becomes
+# "N" (single digits stay: "u8" is a type spelling, not an id). The class
+# is the whole normalized message (capped) so distinct shapes stay
+# distinct rows.
+# ———————————————————————————————————————————————————————————————
+
+def infer_probe_is_digit(ch: String) -> Bool
+  ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" ||
+  ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9"
+end
+
+def infer_probe_norm_ids(s: String) -> String
+  var out = ""
+  var i = 0
+  while i < s.len() do
+    let ch = s.slice(i, i + 1)
+    if infer_probe_is_digit(ch.clone()) then
+      var j = i
+      while j < s.len() do
+        if infer_probe_is_digit(s.slice(j, j + 1)) then
+          j = j + 1
+        else
+          break
+        end
+      end
+      if j - i >= 2 then
+        out = out + "N"
+      else
+        out = out + ch
+      end
+      i = j
+    else
+      out = out + ch
+      i = i + 1
+    end
+  end
+  out
+end
+
+def infer_probe_residual_class(msg: String) -> String
+  let norm = infer_probe_norm_ids(msg.clone())
+  if norm.len() > 140 then norm.slice(0, 140) else norm end
+end
+
+# The structural renderer for the unresolved-node dump (the family work's
+# construct identification): Var -> "?<id>", Adt -> "#<id>[..]", the
+# wrappers recurse; everything else is a scalar tag.
+def infer_probe_render(ty: Type) -> String
+  match ty
+  when Type::Var(id) then "?" + id.to_string()
+  when Type::Param(p) then "P#" + p.index.to_string()
+  when Type::Adt(tid, args) then
+    var out = "#" + tid.id.to_string() + "["
+    var i = 0
+    while i < args.len() do
+      if i > 0 then out = out + "," end
+      out = out + infer_probe_render(args[i].clone())
+      i = i + 1
+    end
+    out + "]"
+  when Type::Ptr(inner) then "Ptr[" + infer_probe_render(inner) + "]"
+  when Type::PtrMut(inner) then "PtrMut[" + infer_probe_render(inner) + "]"
+  when Type::RefInternal(inner, _) then "Ref[" + infer_probe_render(inner) + "]"
+  when Type::Tuple(fs) then
+    var out2 = "("
+    var j = 0
+    while j < fs.len() do
+      if j > 0 then out2 = out2 + "," end
+      out2 = out2 + infer_probe_render(fs[j].clone())
+      j = j + 1
+    end
+    out2 + ")"
+  when Type::FixedArray(elem, n) then "[" + infer_probe_render(elem) + ";" + n.to_string() + "]"
+  when Type::FixedArraySym(elem, _) then "[" + infer_probe_render(elem) + ";N]"
+  when Type::FnPtr(ps, ret, _) then
+    var out3 = "fn("
+    var k = 0
+    while k < ps.len() do
+      if k > 0 then out3 = out3 + "," end
+      out3 = out3 + infer_probe_render(ps[k].ty.clone())
+      k = k + 1
+    end
+    out3 + ")->" + infer_probe_render(ret)
+  when Type::Closure(_, ps, ret, _, _) then
+    var out4 = "clo("
+    var m = 0
+    while m < ps.len() do
+      if m > 0 then out4 = out4 + "," end
+      out4 = out4 + infer_probe_render(ps[m].ty.clone())
+      m = m + 1
+    end
+    out4 + ")->" + infer_probe_render(ret)
+  when Type::IntLiteral(v) then "lit(" + v.to_string() + ")"
+  when Type::Unit then "Unit"
+  when Type::Bool then "Bool"
+  when Type::Int then "Int"
+  when Type::UInt then "UInt"
+  when Type::String then "String"
+  when Type::Never then "Never"
+  when Type::Error then "Error"
+  when _ then "t"
+  end
+end
+
+def infer_probe_has_var(ty: Type) -> Bool
+  match ty
+  when Type::Var(_) then true
+  when Type::Adt(_, args) then
+    var found = false
+    for a in args do
+      if infer_probe_has_var(a) then found = true end
+    end
+    found
+  when Type::Ptr(inner) then infer_probe_has_var(inner)
+  when Type::PtrMut(inner) then infer_probe_has_var(inner)
+  when Type::RefInternal(inner, _) then infer_probe_has_var(inner)
+  when Type::Tuple(fs) then
+    var found2 = false
+    for f in fs do
+      if infer_probe_has_var(f) then found2 = true end
+    end
+    found2
+  when Type::FixedArray(elem, _) then infer_probe_has_var(elem)
+  when Type::FixedArraySym(elem, _) then infer_probe_has_var(elem)
+  when Type::FnPtr(ps, ret, _) then
+    var found3 = infer_probe_has_var(ret)
+    for p in ps do
+      if infer_probe_has_var(p.ty.clone()) then found3 = true end
+    end
+    found3
+  when Type::Closure(_, ps, ret, _, _) then
+    var found4 = infer_probe_has_var(ret)
+    for p in ps do
+      if infer_probe_has_var(p.ty.clone()) then found4 = true end
+    end
+    found4
+  when _ then false
+  end
+end
+
+# The source line at a byte offset (the construct-identification channel
+# for the unresolved dump): the merged source's first line from the span.
+def infer_probe_src_snippet(inout cache: Map[String, String], file: String, start: Int) -> String
+  var src = ""
+  match cache.get(file.clone())
+  when Option::Some(s) then src = s.clone()
+  when Option::None then
+    if file.len() > 0 then
+      match read_file(file.clone())
+      when Result::Ok(s2) then src = s2.clone()
+      when Result::Err(_) then ()
+      end
+    end
+    cache.insert(file.clone(), src.clone())
+  end
+  if src.len() == 0 then return "-" end
+  if start < 0 || start >= src.len() then return "-" end
+  var endp = start + 64
+  if endp > src.len() then endp = src.len() end
+  let raw = src.slice(start, endp)
+  let lines = raw.split("\n")
+  if lines.len() > 0 then lines[0].clone() else raw end
+end
+
+# The unresolved-record dump: the first 160 expression nodes / locals whose
+# recorded type still carries an inference variable, with the node's span
+# and owner — the family work's construct identification channel.
+def infer_probe_dump_unresolved(env: TypeEnv, inout report: String) -> Unit
+  var shown = 0
+  var file_cache: Map[String, String] = Map::new()
+  let entries = env.typed_expr_types.entries()
+  var i = 0
+  while i < entries.len() do
+    let nid = entries[i].0
+    let ty = entries[i].1
+    if infer_probe_has_var(ty.clone()) && shown < 160 then
+      let sp = match env.typed_node_spans.get(nid)
+      when Option::Some(s) then s.clone()
+      when Option::None then Span { file: "", start: 0, end_pos: 0 }
+      end
+      let owner = match env.typed_node_owners.get(nid)
+      when Option::Some(o) then o.clone()
+      when Option::None then "".to_string()
+      end
+      report = report + "  NR node=" + nid.to_string() + " owner=" + owner.clone() + " file=" + sp.file.clone() + ":" + sp.start.to_string() + " ty=" + infer_probe_render(ty.clone()) + " src=" + infer_probe_src_snippet(&mut file_cache, sp.file.clone(), sp.start) + "\n"
+      shown = shown + 1
+    end
+    i = i + 1
+  end
+  let lentries = env.typed_local_bindings.entries()
+  var li = 0
+  var lshown = 0
+  while li < lentries.len() do
+    let lid = lentries[li].0
+    let lb = lentries[li].1
+    if infer_probe_has_var(lb.ty.clone()) && lshown < 60 then
+      let owner2 = match env.typed_local_owners.get(lid)
+      when Option::Some(o) then o.clone()
+      when Option::None then "".to_string()
+      end
+      report = report + "  NL local=" + lid.to_string() + " name=" + lb.name.clone() + " owner=" + owner2.clone() + " ty=" + infer_probe_render(lb.ty.clone()) + "\n"
+      lshown = lshown + 1
+    end
+    li = li + 1
+  end
+end
+
+# (name resolution for the residual table): the merged env's TypeDef table
+# rows for every user-level id (>= 140 — above the builtin/primitive
+# domain), so a "Named#N" class is identifiable by name. Printed once per
+# merged run.
+def infer_probe_type_kind_tag(td: TypeDef) -> String
+  match td.def_kind
+  when TypeDefKind::Struct(_) then "Struct"
+  when TypeDefKind::Enum(_) then "Enum"
+  when TypeDefKind::Trait(_) then "Trait"
+  when TypeDefKind::Alias(_) then "Alias"
+  when TypeDefKind::Opaque then "Opaque"
+  when TypeDefKind::Primitive then "Primitive"
+  when _ then "Other"
+  end  end
+end
+
+def infer_probe_dump_types(env: TypeEnv, inout report: String) -> Unit
+  report = report + "  LANG option=" + env.lang_items.option.to_string() +
+    " result=" + env.lang_items.result.to_string() +
+    " vec=" + env.lang_items.vec.to_string() +
+    " array=" + env.lang_items.array.to_string() +
+    " map=" + env.lang_items.map.to_string() +
+    " set=" + env.lang_items.set.to_string() +
+    " box=" + env.lang_items.box_.to_string() +
+    " rc=" + env.lang_items.rc.to_string() +
+    " slice=" + env.lang_items.slice.to_string() +
+    " ptr=" + env.lang_items.ptr.to_string() +
+    " ptr_mut=" + env.lang_items.ptr_mut.to_string() + "\n"
+  var i = 0
+  while i < env.type_list.len() do
+    let td = env.type_list[i]
+    if td.id.id >= 100 then
+      report = report + "  TY #" + td.id.id.to_string() + " " + td.name.clone() + " " + infer_probe_type_kind_tag(td) + "\n"
+    end
+    i = i + 1
+  end
+end
+
+# (cfg elimination, focused): the probe host is macOS. The kernel's real
+# compile path eliminates @cfg-gated items before checking; the probe
+# drops the windows/linux-gated items so its diagnostics match the real
+# target's closure (an item with any other cfg — macos, any/all/not
+# forms — is kept).
+def infer_probe_item_active(item: Item) -> Bool
+  for attr in item.attrs do
+    if attr.name == "cfg" then
+      var drop_it = false
+      for a in attr.args do
+        if a == "windows" || a == "linux" then drop_it = true end
+      end
+      if drop_it then return false end
+    end
+  end
+  true
+end
+
+def infer_probe_run_case(label: String, source: String, inout report: String, inout counts: Vec[Int]) -> Int
+  let parsed = parse(tokenize(source.clone(), label.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "CASE " + label.clone() + ": parse-failed\n"
+    return 0
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    var case_var = 0
+    var case_param = 0
+    var case_infer = 0
+    var case_unify = 0
+    var i = 0
+    while i < result.errors.len() do
+      let msg = result.errors[i].message.clone()
+      let cls = infer_probe_class_of(msg.clone())
+      if cls == "VAR" then
+        case_var = case_var + 1
+        report = report + "  V " + label.clone() + "@" + result.errors[i].span.start.to_string() + ": " + msg.clone() + "\n"
+      end
+      if cls == "PARAM" then
+        case_param = case_param + 1
+        report = report + "  P " + label.clone() + "@" + result.errors[i].span.start.to_string() + ": " + msg.clone() + "\n"
+      end
+      if cls == "INFER" then
+        case_infer = case_infer + 1
+        report = report + "  I " + label.clone() + "@" + result.errors[i].span.start.to_string() + ": " + msg.clone() + "\n"
+      end
+      if cls == "UNIFY" then
+        case_unify = case_unify + 1
+        report = report + "  U " + label.clone() + "@" + result.errors[i].span.start.to_string() + ": " + msg.clone() + "\n"
+      end
+      i = i + 1
+    end
+    counts.set(0, counts[0] + case_var)
+    counts.set(1, counts[1] + case_param)
+    counts.set(2, counts[2] + case_infer)
+    counts.set(3, counts[3] + case_unify)
+    counts.set(4, counts[4] + result.errors.len())
+    report = report + "CASE " + label.clone() + ": errors=" + result.errors.len().to_string() + " VAR=" + case_var.to_string() + " PARAM=" + case_param.to_string() + " INFER=" + case_infer.to_string() + " UNIFY=" + case_unify.to_string() + "\n"
+    0
+  when Result::Err(errs) then
+    report = report + "CASE " + label.clone() + ": resolve-failed=" + errs.len().to_string() + "\n"
+    var rei = 0
+    while rei < errs.len() && rei < 4 do
+      report = report + "    RE: " + errs[rei].message.clone() + " @" + errs[rei].span.file.clone() + ":" + errs[rei].span.start.to_string() + "\n"
+      rei = rei + 1
+    end
+    0
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# merged corpus mode — the a4/c3/c5 probe loader pattern (strip
+# debug_assert statements, load the preludes + their `use` dependencies,
+# merge every item into one program with per-item owner modules, then run
+# the real kernel checker).
+# ———————————————————————————————————————————————————————————————
+
+def infer_probe_strip_debug_assert_pass(source: String) -> String
+  let parts = source.split("debug_assert!")
+  if parts.len() <= 1 then
+    return source
+  end
+  var out = parts[0].clone()
+  var pi = 1
+  while pi < parts.len() do
+    let seg = parts[pi].clone()
+    if seg.starts_with("(") then
+      var depth = 0
+      var i = 0
+      var close_idx = -1
+      var comma_idx = -1
+      var saw_comma = false
+      while i < seg.len() do
+        let ch = seg.slice(i, i + 1)
+        if ch == "(" then depth = depth + 1 end
+        if ch == ")" then
+          depth = depth - 1
+          if depth == 0 then
+            close_idx = i
+            break
+          end
+        end
+        if ch == "," && depth == 1 && !saw_comma then
+          comma_idx = i
+          saw_comma = true
+        end
+        i = i + 1
+      end
+      if close_idx < 0 then
+        out = out + "debug_assert!" + seg
+      else
+        let inner_end = if comma_idx >= 0 then comma_idx else close_idx end
+        out = out + "(" + seg.slice(1, inner_end) + ")"
+        out = out + seg.slice(close_idx + 1, seg.len())
+      end
+    else
+      out = out + "debug_assert!" + seg
+    end
+    pi = pi + 1
+  end
+  out
+end
+
+def infer_probe_strip_debug_assert(source: String) -> String
+  var cur = source.clone()
+  var pass = 0
+  while pass < 8 && cur.contains("debug_assert!") do
+    cur = infer_probe_strip_debug_assert_pass(cur)
+    pass = pass + 1
+  end
+  cur
+end
+
+def infer_probe_join_path(segments: Vec[String]) -> String
+  var out = ""
+  var i = 0
+  while i < segments.len() do
+    if i > 0 then out = out + "::" end
+    out = out + segments[i].clone()
+    i = i + 1
+  end
+  out
+end
+
+def infer_probe_module_path_from_file(path: String) -> Vec[String]
+  var segments = Vec::new()
+  let parts = path.split("/")
+  var pi = 0
+  while pi < parts.len() do
+    var seg = parts[pi].clone()
+    if pi == parts.len() - 1 && seg.ends_with(".tg") then
+      seg = seg.slice(0, seg.len() - 3)
+    end
+    if !seg.is_empty() then
+      segments.push(seg)
+    end
+    pi = pi + 1
+  end
+  segments
+end
+
+def infer_probe_build_dep_file_path(segments: Vec[String], count: Int) -> Option[String]
+  if count < 2 then
+    return Option::None
+  end
+  let root = segments[0]
+  var path = if root == "std" then "std/" elsif root == "tg_compiler" then "tg_compiler/" else return Option::None end
+  var i = 1
+  while i < count do
+    if i > 1 then path = path + "/" end
+    path = path + segments[i]
+    i = i + 1
+  end
+  Option::Some(path + ".tg")
+end
+
+def infer_probe_dep_use_to_file(u: UseDecl) -> Option[String]
+  let segment_count = u.path.segments.len()
+  if segment_count < 2 then
+    return Option::None
+  end
+  match u.names
+  when Option::Some(_) then return infer_probe_build_dep_file_path(u.path.segments.clone(), segment_count)
+  when Option::None then ()
+  end
+  if u.glob then
+    return infer_probe_build_dep_file_path(u.path.segments.clone(), segment_count)
+  end
+  match infer_probe_build_dep_file_path(u.path.segments.clone(), segment_count)
+  when Option::Some(full_path) then
+    if file_exists(full_path.clone()) then
+      return Option::Some(full_path)
+    end
+    if segment_count > 2 then
+      match infer_probe_build_dep_file_path(u.path.segments.clone(), segment_count - 1)
+      when Option::Some(parent_path) then
+        if file_exists(parent_path.clone()) then
+          return Option::Some(parent_path)
+        end
+      when Option::None then ()
+      end
+    end
+    Option::None
+  when Option::None then Option::None
+  end
+end
+
+def infer_probe_collect_dep_file(path: String, inout out: Vec[Item], inout loaded: Set[String], inout modules: Map[ModuleId, Module]) -> Int
+  if loaded.contains(&path) then
+    return 0
+  end
+  loaded.insert(path.clone())
+  if !file_exists(path.clone()) then
+    return 2
+  end
+  let source = match read_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then return 2
+  end
+  let parsed = parse(tokenize(infer_probe_strip_debug_assert(source), path.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    return 3
+  end
+  let dep_ast = parsed.program
+  for item in dep_ast.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then
+      match infer_probe_dep_use_to_file(u.clone())
+      when Option::Some(p) then
+        let rc = infer_probe_collect_dep_file(p, &mut out, &mut loaded, &mut modules)
+        if rc != 0 then return rc end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+  var mod_start = out.len()
+  let dep_id = ModuleId { id: modules.len() }
+  for item in dep_ast.items do
+    if infer_probe_item_active(item.clone()) then
+      var owned = item.clone()
+      owned.owner_module = dep_id
+      out.push(owned)
+    end
+  end
+  var mod_items = Vec::new()
+  var mi = mod_start
+  while mi < out.len() do
+    mod_items.push(ItemId { id: mi })
+    mi = mi + 1
+  end
+  var mod_imports = Vec::new()
+  for item in dep_ast.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then mod_imports.push(infer_probe_join_path(u.path.segments.clone()))
+    when _ then ()
+    end
+  end
+  modules.insert(dep_id, Module {
+    id: dep_id,
+    path: infer_probe_module_path_from_file(path.clone()),
+    items: mod_items,
+    imports: mod_imports
+  })
+  0
+end
+
+# Per-construct tally: the (class, file) pairs and the first message of
+# each pair — the "with their constructs" extraction the report needs.
+def infer_probe_note_row(inout keys: Vec[String], inout counts: Vec[Int], inout samples: Vec[String], cls: String, file: String, start: Int, msg: String) -> Unit
+  let key = cls.clone() + " " + file.clone()
+  var ki = 0
+  var found = -1
+  while ki < keys.len() do
+    if keys[ki] == key then found = ki end
+    ki = ki + 1
+  end
+  if found < 0 then
+    keys.push(key.clone())
+    counts.push(1)
+    samples.push(msg.clone())
+  else
+    counts.set(found, counts[found] + 1)
+  end
+end
+
+def infer_probe_run_merged(corpus_path: String, inout report: String, inout counts: Vec[Int], inout rows: Vec[String], inout row_counts: Vec[Int], inout row_samples: Vec[String]) -> Int
+  let source = match read_file(corpus_path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then
+    report = report + "MERGED: cannot read corpus\n"
+    return 2
+  end
+  let parsed = parse(tokenize(infer_probe_strip_debug_assert(source), corpus_path.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "MERGED: corpus parse failed\n"
+    return 2
+  end
+  var merged_items = Vec::new()
+  for item in parsed.program.items do
+    if infer_probe_item_active(item.clone()) then merged_items.push(item.clone()) end
+  end
+  var root_items = Vec::new()
+  var ri = 0
+  while ri < merged_items.len() do
+    root_items.push(ItemId { id: ri })
+    ri = ri + 1
+  end
+  let root_id = ModuleId { id: 0 }
+  var merged_modules = Map::new()
+  merged_modules.insert(root_id, Module {
+    id: root_id,
+    path: Vec::new(),
+    items: root_items,
+    imports: Vec::new()
+  })
+  var loaded = Set::new()
+  let preludes = ["std/alloc.tg", "std/collections.tg", "std/core.tg", "std/ffi.tg", "std/fmt.tg", "std/fs.tg", "std/io.tg", "std/taint.tg"]
+  var pi = 0
+  while pi < preludes.len() do
+    let rc = infer_probe_collect_dep_file(preludes[pi].clone(), &mut merged_items, &mut loaded, &mut merged_modules)
+    if rc != 0 then
+      report = report + "MERGED: load failed (" + rc.to_string() + ") " + preludes[pi].clone() + "\n"
+      return 2
+    end
+    pi = pi + 1
+  end
+  var program = Program {
+    items: merged_items,
+    crate: Crate { root: root_id, modules: merged_modules },
+    span: parsed.program.span.clone()
+  }
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    var n_var = 0
+    var n_param = 0
+    var n_infer = 0
+    var n_unify = 0
+    var shown_var = 0
+    var shown_param = 0
+    var shown_infer = 0
+    var shown_unify = 0
+    var snippet_cache: Map[String, String] = Map::new()
+    var shown_residual = 0
+    var i = 0
+    while i < result.errors.len() do
+      let msg = result.errors[i].message.clone()
+      let sp = result.errors[i].span.clone()
+      let cls = infer_probe_class_of(msg.clone())
+      if cls == "VAR" then
+        n_var = n_var + 1
+        if shown_var < 60 then
+          report = report + "  MV " + sp.file + ":" + sp.start.to_string() + ": " + msg.clone() + "\n"
+          shown_var = shown_var + 1
+        end
+      end
+      if cls == "PARAM" then
+        n_param = n_param + 1
+        if shown_param < 60 then
+          report = report + "  MP " + sp.file + ":" + sp.start.to_string() + ": " + msg.clone() + "\n"
+          shown_param = shown_param + 1
+        end
+      end
+      if cls == "INFER" then
+        n_infer = n_infer + 1
+        if shown_infer < 60 then
+          report = report + "  MI " + sp.file + ":" + sp.start.to_string() + ": " + msg.clone() + "\n"
+          shown_infer = shown_infer + 1
+        end
+      end
+      if cls == "UNIFY" then
+        n_unify = n_unify + 1
+        if shown_unify < 60 then
+          report = report + "  MU " + sp.file + ":" + sp.start.to_string() + ": " + msg.clone() + "\n"
+          shown_unify = shown_unify + 1
+        end
+      end
+      if cls != "VAR" && cls != "PARAM" && cls != "INFER" && cls != "UNIFY" then
+        if shown_residual < 140 then
+          report = report + "  RE " + sp.file.clone() + ":" + sp.start.to_string() + " [" + cls.clone() + "] | " + infer_probe_src_snippet(&mut snippet_cache, sp.file.clone(), sp.start) + "\n"
+          shown_residual = shown_residual + 1
+        end
+      end
+      if cls != "other" then
+        let snippet = infer_probe_src_snippet(&mut snippet_cache, sp.file.clone(), sp.start)
+        let sample = msg.clone() + " @" + sp.file.clone() + ":" + sp.start.to_string() + " | " + snippet
+        infer_probe_note_row(&mut rows, &mut row_counts, &mut row_samples, cls.clone(), sp.file.clone(), sp.start, sample)
+      else
+        # (residual re-bucketing): the non-family diagnostics are the
+        # class-table rows too — the normalized message as the class and
+        # the message + the source line of the first occurrence as the
+        # representative.
+        let snippet = infer_probe_src_snippet(&mut snippet_cache, sp.file.clone(), sp.start)
+        let sample = msg.clone() + " @" + sp.file.clone() + ":" + sp.start.to_string() + " | " + snippet
+        infer_probe_note_row(&mut rows, &mut row_counts, &mut row_samples, cls.clone(), sp.file.clone(), sp.start, sample)
+      end
+      i = i + 1
+    end
+    counts.set(0, counts[0] + n_var)
+    counts.set(1, counts[1] + n_param)
+    counts.set(2, counts[2] + n_infer)
+    counts.set(3, counts[3] + n_unify)
+    counts.set(4, counts[4] + result.errors.len())
+    infer_probe_dump_unresolved(env, &mut report)
+    infer_probe_dump_types(env, &mut report)
+    report = report + "MERGED: items=" + program.items.len().to_string() + " errors=" + result.errors.len().to_string() + " VAR=" + n_var.to_string() + " PARAM=" + n_param.to_string() + " INFER=" + n_infer.to_string() + " UNIFY=" + n_unify.to_string() + "\n"
+    # The per-construct tally, sorted by class then count (insertion sort —
+    # deterministic).
+    var si = 1
+    while si < rows.len() do
+      var sj = si
+      while sj > 0 && row_counts[sj] > row_counts[sj - 1] do
+        let tk = rows[sj]
+        let tc = row_counts[sj]
+        let ts = row_samples[sj]
+        rows.set(sj, rows[sj - 1])
+        row_counts.set(sj, row_counts[sj - 1])
+        row_samples.set(sj, row_samples[sj - 1])
+        rows.set(sj - 1, tk)
+        row_counts.set(sj - 1, tc)
+        row_samples.set(sj - 1, ts)
+        sj = sj - 1
+      end
+      si = si + 1
+    end
+    var rj = 0
+    while rj < rows.len() do
+      report = report + "ROW " + rows[rj] + " count=" + row_counts[rj].to_string() + " sample=" + row_samples[rj] + "\n"
+      rj = rj + 1
+    end
+    0
+  when Result::Err(errs) then
+    report = report + "MERGED: resolve failed -> " + errs.len().to_string() + "\n"
+    2
+  end
+end
+
+def main() -> Int
+  var report = ""
+  var counts = Vec::from([infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0)])
+  var rows = Vec::new()
+  var row_counts = Vec::new()
+  var row_samples = Vec::new()
+  let cases = Vec::from([
+    ("result_ok_call_expected", "def inc(x: Int) -> Int\n  x + 1\nend\n\ndef main() -> Int\n  let r: Result[Int, String] = Result::Ok(inc(1))\n  0\nend\n"),
+    ("call_expected_annotation", "def make[T](x: T) -> Option[T]\n  Option::Some(x)\nend\n\ndef main() -> Int\n  let o: Option[Int] = make(1)\n  0\nend\n"),
+    ("enum_none_expected", "def main() -> Int\n  let o: Option[Int] = Option::None\n  0\nend\n"),
+    ("enum_none_then_some", "def main() -> Int\n  var o = Option::None\n  o = Option::Some(1)\n  0\nend\n"),
+    ("chained_dest", "def main() -> Int\n  let a: Result[Int, String] = Result::Ok(1)\n  let b = a.map(|x| x + 1)\n  let c: Result[Int, String] = b\n  0\nend\n"),
+    ("size_of_cast", "def size_of[T]() -> UInt\n  0 as UInt\nend\n\ndef align_of[T]() -> UInt\n  0 as UInt\nend\n\ndef sz[T]() -> Int\n  size_of[T]() as Int\nend\n\ndef main() -> Int\n  sz[u8]()\nend\n"),
+    ("layout_chain", "struct Layout\n  size: Int\n  align: Int\nend\n\ndef size_of[T]() -> UInt\n  0 as UInt\nend\n\ndef align_of[T]() -> UInt\n  0 as UInt\nend\n\ndef layout_for2[T]() -> Layout\n  Layout { size: size_of[T]() as Int, align: align_of[T]() as Int }\nend\n\ndef main() -> Int\n  let l = layout_for2[u8]()\n  l.size\nend\n"),
+    ("generic_alloc_arg", "def alloc2[T]() -> Ptr[T]\n  Ptr::null()\nend\n\ndef main() -> Int\n  let p: Ptr[u8] = alloc2[u8]()\n  0\nend\n"),
+    ("vec_new_push", "def main() -> Int\n  var v = Vec::new()\n  v.push(1)\n  0\nend\n"),
+    ("vec_new_annotation", "def main() -> Int\n  let v: Vec[u8] = Vec::new()\n  0\nend\n"),
+    ("ret_tail_call", "def mk() -> Option[Int]\n  Option::None\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("arg_expected_tuple", "def takes(t: Option[Int]) -> Int\n  0\nend\n\ndef main() -> Int\n  takes(Option::None)\nend\n")
+  ])
+  var i = 0
+  while i < cases.len() do
+    let label = cases[i].0.clone()
+    report = report + "BEGIN " + label.clone() + "\n"
+    let _ = write_file("build/infer_probe.txt", report.clone())
+    let rc = infer_probe_run_case(label, cases[i].1.clone(), &mut report, &mut counts)
+    i = i + 1
+  end
+  if file_exists("build/infer_merged.flag") then
+    report = report + "BEGIN merged\n"
+    let _ = write_file("build/infer_probe.txt", report.clone())
+    let rcm = infer_probe_run_merged("tests/differential/corpus/01_defs_arith.tg", &mut report, &mut counts, &mut rows, &mut row_counts, &mut row_samples)
+    let _ = rcm
+  end
+  report = report + "TOTALS errors=" + counts[4].to_string() + " VAR=" + counts[0].to_string() + " PARAM=" + counts[1].to_string() + " INFER=" + counts[2].to_string() + " UNIFY=" + counts[3].to_string() + "\n"
+  let _ = write_file("build/infer_probe.txt", report.clone())
+  println("infer_probe: TOTALS errors=" + counts[4].to_string() + " VAR=" + counts[0].to_string() + " PARAM=" + counts[1].to_string() + " INFER=" + counts[2].to_string() + " UNIFY=" + counts[3].to_string())
+  0
+end
