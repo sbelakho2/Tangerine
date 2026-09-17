@@ -427,8 +427,8 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
           Vm_value.Enum (Ids.Variant_index.to_int vi, [||])
       | Seed_mir.Struct _ -> Vm_value.Struct [||]
       | Seed_mir.Array _ -> Vm_value.Array [||]
-      | Seed_mir.Map _ -> Vm_value.Map []
-      | Seed_mir.Set _ -> Vm_value.Set [])
+      | Seed_mir.Map _ -> Vm_value.map_empty
+      | Seed_mir.Set _ -> Vm_value.set_empty)
   | Seed_mir.Copy p | Seed_mir.Read p -> (
       match read_place vm frame p with
       | Ok v -> v
@@ -2085,8 +2085,8 @@ let statics_initial_values (program : Seed_mir.program) : Vm_value.slot array =
               Vm_value.Live (Vm_value.Enum (Ids.Variant_index.to_int vi, [||]))
           | Seed_mir.Struct _ -> Vm_value.Live (Vm_value.Struct [||])
           | Seed_mir.Array _ -> Vm_value.Live (Vm_value.Array [||])
-          | Seed_mir.Map _ -> Vm_value.Live (Vm_value.Map [])
-          | Seed_mir.Set _ -> Vm_value.Live (Vm_value.Set [])))
+          | Seed_mir.Map _ -> Vm_value.Live Vm_value.map_empty
+          | Seed_mir.Set _ -> Vm_value.Live Vm_value.set_empty))
     program.Seed_mir.statics
 
 (* Build an entry frame without running (inspection).  The drop-plan

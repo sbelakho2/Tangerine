@@ -27,8 +27,8 @@ authority (`features.toml` → `scripts/gen_feature_registry.sh` →
 
 ## Kernel closure note
 
-"Bootstrap closure" below means the 37 files in
-`bootstrap/compiler_kernel.manifest` (14 std modules + the compiler kernel)
+"Bootstrap closure" below means the 45 sources in
+`bootstrap/compiler_kernel.manifest` (14 std modules + 31 compiler sources)
 that the stage0→stage1 ladder compiles. Everything outside the closure is
 **API-only** until it passes per-module native test suites. The E106
 migration of the non-kernel stdlib is **COMPLETE** (2026-08-20): every

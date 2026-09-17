@@ -2,7 +2,7 @@
 
    Bootstrap-profile decision (documented, machine-enforced in the subset
    profile): identifiers outside the ASCII range are EXCLUDED from the
-   bootstrap profile. The manifest closure (37 files) is ASCII-only;
+   bootstrap profile. The manifest closure (45 sources) is ASCII-only;
    non-ASCII identifiers are hard-rejected at lex time so the seed and
    self-host cannot silently diverge on identifier tables.
 

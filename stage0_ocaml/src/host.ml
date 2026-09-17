@@ -243,24 +243,11 @@ type adapter = {
    through Eq on a resource carrier).  Non-resource values (scalars,
    strings, plain records/enums/arrays/sets/maps of them) compare with
    the plain structural equality. *)
-let rec has_owned_ref (v : Vm_value.t) : bool =
-  match v with
-  | Vm_value.Tuple elems | Vm_value.Struct elems | Vm_value.Array elems
-  | Vm_value.Enum (_, elems) ->
-      Array.exists has_owned_ref elems
-  | Vm_value.Set elems -> List.exists has_owned_ref elems
-  | Vm_value.Map pairs -> List.exists (fun (k, v) -> has_owned_ref k || has_owned_ref v) pairs
-  | Vm_value.Closure (_, caps) -> Array.exists has_owned_ref caps
-  | Vm_value.Ref (Vm_value.Region _) -> true
-  | Vm_value.Unit | Vm_value.Bool _ | Vm_value.Int _ | Vm_value.Float32 _
-  | Vm_value.Float64 _ | Vm_value.Char _ | Vm_value.String _
-  | Vm_value.Function _ | Vm_value.RawPtr _ | Vm_value.Ref (Vm_value.Place _)
-  | Vm_value.Null | Vm_value.MovedOut ->
-      false
-
-(* the collection-lookup equality (see above). *)
-let lookup_eq (a : Vm_value.t) (b : Vm_value.t) : bool =
-  not (has_owned_ref a) && not (has_owned_ref b) && Vm_value.equal a b
+(* The lookup equality now lives beside the value type (vm_value.ml) so
+   the hash-indexed Map/Set stores can use it without a host dependency;
+   the host keeps these aliases for its own containment decisions. *)
+let has_owned_ref : Vm_value.t -> bool = Vm_value.has_owned_ref
+let lookup_eq (a : Vm_value.t) (b : Vm_value.t) : bool = Vm_value.lookup_eq a b
 
 let arg_mismatch expected : (Vm_value.t, string) result =
   Error ("argument mismatch: expected " ^ expected)
@@ -1965,20 +1952,20 @@ let binding_manifest : binding list =
     intrinsic_binding "__intrinsic_set_new"
       (adapter_raw [] (set_of p0) (fun _ args ->
            match args with
-           | [||] -> Ok (Vm_value.Set [])
+           | [||] -> Ok Vm_value.set_empty
            | _ -> arg_mismatch "no arguments"));
     intrinsic_binding "__intrinsic_map_new"
       (adapter_raw [] (map_of p0 p1) (fun _ args ->
            match args with
-           | [||] -> Ok (Vm_value.Map [])
+           | [||] -> Ok Vm_value.map_empty
            | _ -> arg_mismatch "no arguments"));
     intrinsic_binding "__intrinsic_set_contains"
       (adapter_raw (lets [ set_of p0; p0 ]) ty_bool (fun _ args ->
            (* pure read: the containment decision uses lookup_eq — a
               resource-containing aggregate is never reported Eq *)
            match args with
-           | [| Vm_value.Set elems; item |] ->
-               Ok (Vm_value.Bool (List.exists (fun e -> lookup_eq e item) elems))
+           | [| Vm_value.Set store; item |] ->
+               Ok (Vm_value.Bool (Vm_value.set_mem store item))
            | _ -> arg_mismatch "(Set, item)"));
     intrinsic_binding "__intrinsic_set_remove"
       (adapter_raw_wb
@@ -1997,20 +1984,20 @@ let binding_manifest : binding list =
               no removal decision is made through equality on resource
               carriers. *)
            match args with
-           | [| Vm_value.Set elems; item |] ->
-               let rec remove acc = function
-                 | [] -> (None, List.rev acc)
-                 | x :: rest when lookup_eq x item ->
-                     (Some x, List.rev_append acc rest)
-                 | x :: rest -> remove (x :: acc) rest
-               in
-               let removed_el, new_elems = remove [] elems in
-               let removed = match removed_el with Some x -> [ x ] | None -> [] in
-               Ok
-                 { value = Vm_value.Bool (removed_el <> None);
-                   writebacks =
-                     [ { arg_index = 0; replacement = Vm_value.Set new_elems;
-                         removed } ] }
+           | [| Vm_value.Set store; item |] -> (
+               match Vm_value.set_remove store item with
+               | None, store' ->
+                   Ok
+                     { value = Vm_value.Bool false;
+                       writebacks =
+                         [ { arg_index = 0; replacement = Vm_value.Set store';
+                             removed = [] } ] }
+               | Some victim, store' ->
+                   Ok
+                     { value = Vm_value.Bool true;
+                       writebacks =
+                         [ { arg_index = 0; replacement = Vm_value.Set store';
+                             removed = [ victim ] } ] })
            | _ -> Error "argument mismatch: expected (Set, item)"));
     intrinsic_binding "__intrinsic_set_insert"
       (adapter_raw_wb
@@ -2031,34 +2018,31 @@ let binding_manifest : binding list =
               already existed (its slot was replaced), `false` when a
               fresh slot was created. *)
            match args with
-           | [| Vm_value.Set elems; item |] ->
-               let rec insert acc = function
-                 | [] -> (false, [], List.rev_append acc [ item ])
-                 | x :: rest when lookup_eq x item ->
-                     (true, [ x ], List.rev_append acc (item :: rest))
-                 | x :: rest -> insert (x :: acc) rest
+           | [| Vm_value.Set store; item |] ->
+               let existed, displaced, store' =
+                 Vm_value.set_insert_entry store item
                in
-               let existed, displaced, new_elems = insert [] elems in
                Ok
                  { value = Vm_value.Bool existed;
                    writebacks =
-                     [ { arg_index = 0; replacement = Vm_value.Set new_elems;
-                         removed = displaced } ] }
+                     [ { arg_index = 0; replacement = Vm_value.Set store';
+                         removed =
+                           (match displaced with Some x -> [ x ] | None -> []) } ] }
            | _ -> Error "argument mismatch: expected (Set, item)"));
     intrinsic_binding "__intrinsic_set_len"
       (adapter_raw (lets [ set_of p0 ]) ty_int (fun _ args ->
            match args with
-           | [| Vm_value.Set elems |] ->
+           | [| Vm_value.Set store |] ->
                Ok
                  (Vm_value.Int
                     (Int_value.of_int64 ~width:64 ~signed:true
-                       (Int64.of_int (List.length elems))))
+                       (Int64.of_int (Vm_value.set_len store))))
            | _ -> arg_mismatch "(Set)"));
     intrinsic_binding "__intrinsic_set_entries"
       (adapter_raw (lets [ set_of p0 ]) (vec_of p0) (fun _ args ->
            match args with
-           | [| Vm_value.Set elems |] ->
-               Ok (Vm_value.Array (Array.of_list elems))
+           | [| Vm_value.Set store |] ->
+               Ok (Vm_value.Array (Array.of_list (Vm_value.set_elems store)))
            | _ -> arg_mismatch "(Set)"));
     intrinsic_binding "__intrinsic_set_drain_one"
       (adapter_raw_wb [ (Access_effect.Inout, set_of p0) ] (option_of p0)
@@ -2072,19 +2056,19 @@ let binding_manifest : binding list =
               replacement nor the writeback's `removed` list (audit
               P0-3). *)
            match args with
-           | [| Vm_value.Set elems |] -> (
-               match elems with
-               | [] ->
+           | [| Vm_value.Set store |] -> (
+               match Vm_value.set_drain_one store with
+               | None, store' ->
                    Ok
                      { value = Vm_value.Enum (1, [||]);
                        writebacks =
-                         [ { arg_index = 0; replacement = Vm_value.Set [];
+                         [ { arg_index = 0; replacement = Vm_value.Set store';
                              removed = [] } ] }
-               | x :: rest ->
+               | Some x, store' ->
                    Ok
                      { value = Vm_value.Enum (0, [| x |]);
                        writebacks =
-                         [ { arg_index = 0; replacement = Vm_value.Set rest;
+                         [ { arg_index = 0; replacement = Vm_value.Set store';
                              removed = [] } ] })
            | _ -> Error "argument mismatch: expected (Set)"));
     intrinsic_binding "__intrinsic_set_clear"
@@ -2095,22 +2079,20 @@ let binding_manifest : binding list =
               writeback application drops each exactly once (audit
               P0-3) *)
            match args with
-           | [| Vm_value.Set elems |] ->
+           | [| Vm_value.Set store |] ->
                Ok
                  { value = Vm_value.Unit;
                    writebacks =
-                     [ { arg_index = 0; replacement = Vm_value.Set [];
-                         removed = elems } ] }
+                     [ { arg_index = 0; replacement = Vm_value.set_empty;
+                         removed = Vm_value.set_elems store } ] }
            | _ -> Error "argument mismatch: expected (Set)"));
     intrinsic_binding "__intrinsic_map_contains_key"
       (adapter_raw (lets [ map_of p0 p1; p0 ]) ty_bool (fun _ args ->
            (* pure read; the key decision uses lookup_eq — a
               resource-containing key aggregate is never reported Eq *)
            match args with
-           | [| Vm_value.Map pairs; key |] ->
-               Ok
-                 (Vm_value.Bool
-                    (List.exists (fun (k, _) -> lookup_eq k key) pairs))
+           | [| Vm_value.Map store; key |] ->
+               Ok (Vm_value.Bool (Vm_value.map_mem store key))
            | _ -> arg_mismatch "(Map, key)"));
     intrinsic_binding "__intrinsic_map_get"
       (adapter_raw (lets [ map_of p0 p1; p0 ]) (option_of p1) (fun _ args ->
@@ -2118,8 +2100,8 @@ let binding_manifest : binding list =
               aliases the map's stored value only for copy payloads;
               containment/lookup never compares resource carriers) *)
            match args with
-           | [| Vm_value.Map pairs; key |] -> (
-               match List.find_opt (fun (k, _) -> lookup_eq k key) pairs with
+           | [| Vm_value.Map store; key |] -> (
+               match Vm_value.map_find store key with
                | Some (_, v) ->
                    Ok (Vm_value.Enum (0, [| v |]))
                | None -> Ok (Vm_value.Enum (1, [||])))
@@ -2156,46 +2138,38 @@ let binding_manifest : binding list =
                lookup_eq found equal, and lookup_eq refuses resource
                carriers — the discarded sink key can never own a
                drop). *)
-          match args with
-          | [| Vm_value.Map pairs; key; value |] -> (
-              match List.find_opt (fun (k, _) -> lookup_eq k key) pairs with
-              | Some (_, old) ->
-                  let new_pairs =
-                    List.map
-                      (fun (k, v) -> if lookup_eq k key then (k, value) else (k, v))
-                      pairs
-                  in
-                  Ok
-                    { value = Vm_value.Enum (0, [| old |]);
-                      writebacks =
-                        [ { arg_index = 0; replacement = Vm_value.Map new_pairs;
-                            removed = [] } ] }
-              | None ->
-                  Ok
-                    { value = Vm_value.Enum (1, [||]);
-                      writebacks =
-                        [ { arg_index = 0;
-                            replacement = Vm_value.Map (pairs @ [ (key, value) ]);
-                            removed = [] } ] })
-          | _ -> Error "argument mismatch: expected (Map, key, value)"));
+           match args with
+           | [| Vm_value.Map store; key; value |] ->
+               let old, store' = Vm_value.map_insert_entry store key value in
+               Ok
+                 { value =
+                     (match old with
+                      | Some v -> Vm_value.Enum (0, [| v |])
+                      | None -> Vm_value.Enum (1, [||]));
+                   writebacks =
+                     [ { arg_index = 0; replacement = Vm_value.Map store';
+                         removed = [] } ] }
+           | _ -> Error "argument mismatch: expected (Map, key, value)"));
     intrinsic_binding "__intrinsic_map_len"
       (adapter_raw (lets [ map_of p0 p1 ]) ty_int (fun _ args ->
            match args with
-           | [| Vm_value.Map pairs |] ->
+           | [| Vm_value.Map store |] ->
                Ok
                  (Vm_value.Int
                     (Int_value.of_int64 ~width:64 ~signed:true
-                       (Int64.of_int (List.length pairs))))
+                       (Int64.of_int (Vm_value.map_len store))))
            | _ -> arg_mismatch "(Map)"));
     intrinsic_binding "__intrinsic_map_entries"
       (adapter_raw (lets [ map_of p0 p1 ])
          (vec_of (tuple_of [| p0; p1 |])) (fun _ args ->
            match args with
-           | [| Vm_value.Map pairs |] ->
+           | [| Vm_value.Map store |] ->
                Ok
                  (Vm_value.Array
                     (Array.of_list
-                       (List.map (fun (k, v) -> Vm_value.Tuple [| k; v |]) pairs)))
+                       (List.map
+                          (fun (k, v) -> Vm_value.Tuple [| k; v |])
+                          (Vm_value.map_pairs store))))
            | _ -> arg_mismatch "(Map)"));
     (* ── The Vec/Array host surface (the growable-array family) ──────
        The seed's runtime Vec/Array form is Vm_value.Array (the
@@ -2866,42 +2840,37 @@ let binding_manifest : binding list =
          [ (Access_effect.Inout, map_of p0 p1); (Access_effect.Let, p0) ]
          (option_of p1) (fun _ args ->
            match args with
-           | [| Vm_value.Map pairs; key |] ->
-               let rec go acc = function
-                 | [] -> (None, List.rev acc)
-                 | (k, v) :: rest when lookup_eq k key ->
-                     (Some (k, v), List.rev_append acc rest)
-                 | pair :: rest -> go (pair :: acc) rest
-               in
-               let found, new_pairs = go [] pairs in
-               (match found with
-                | Some (k, v) ->
-                    (* the old value transfers to the Option return; the
-                       discarded stored key leaves the container and is
-                       enumerated in `removed` for the single drop *)
-                    Ok
-                      { value = Vm_value.Enum (0, [| v |]);
-                        writebacks =
-                          [ { arg_index = 0; replacement = Vm_value.Map new_pairs;
-                              removed = [ k ] } ] }
-                | None ->
-                    Ok
-                      { value = Vm_value.Enum (1, [||]);
-                        writebacks =
-                          [ { arg_index = 0; replacement = Vm_value.Map pairs;
-                              removed = [] } ] })
+           | [| Vm_value.Map store; key |] -> (
+               match Vm_value.map_remove store key with
+               | Some (k, v), store' ->
+                   (* the old value transfers to the Option return; the
+                      discarded stored key leaves the container and is
+                      enumerated in `removed` for the single drop *)
+                   Ok
+                     { value = Vm_value.Enum (0, [| v |]);
+                       writebacks =
+                         [ { arg_index = 0; replacement = Vm_value.Map store';
+                             removed = [ k ] } ] }
+               | None, store' ->
+                   Ok
+                     { value = Vm_value.Enum (1, [||]);
+                       writebacks =
+                         [ { arg_index = 0; replacement = Vm_value.Map store';
+                             removed = [] } ] })
            | _ -> Error "argument mismatch: expected (Map, key)"));
     intrinsic_binding "__intrinsic_map_clear"
       (adapter_raw_wb [ (Access_effect.Inout, map_of p0 p1) ] Type_repr.Unit
          (fun _ args ->
            match args with
-           | [| Vm_value.Map pairs |] ->
+           | [| Vm_value.Map store |] ->
                Ok
                  { value = Vm_value.Unit;
                    writebacks =
-                     [ { arg_index = 0; replacement = Vm_value.Map [];
+                     [ { arg_index = 0; replacement = Vm_value.map_empty;
                          removed =
-                           List.concat_map (fun (k, v) -> [ k; v ]) pairs } ] }
+                           List.concat_map
+                             (fun (k, v) -> [ k; v ])
+                             (Vm_value.map_pairs store) } ] }
            | _ -> Error "argument mismatch: expected (Map)"));
     intrinsic_binding "__intrinsic_map_drain_one"
       (adapter_raw_wb [ (Access_effect.Inout, map_of p0 p1) ]
@@ -2909,43 +2878,45 @@ let binding_manifest : binding list =
            (* the head pair transfers OWNED into the Option tuple return;
               it is never in the writeback's `removed` list (P0-3) *)
            match args with
-           | [| Vm_value.Map pairs |] -> (
-               match pairs with
-               | [] ->
+           | [| Vm_value.Map store |] -> (
+               match Vm_value.map_drain_one store with
+               | (None, store') ->
                    Ok
                      { value = Vm_value.Enum (1, [||]);
                        writebacks =
-                         [ { arg_index = 0; replacement = Vm_value.Map [];
+                         [ { arg_index = 0; replacement = Vm_value.Map store';
                              removed = [] } ] }
-               | (k, v) :: rest ->
+               | (Some (k, v), store') ->
                    Ok
                      { value = Vm_value.Enum (0, [| Vm_value.Tuple [| k; v |] |]);
                        writebacks =
-                         [ { arg_index = 0; replacement = Vm_value.Map rest;
+                         [ { arg_index = 0; replacement = Vm_value.Map store';
                              removed = [] } ] })
            | _ -> Error "argument mismatch: expected (Map)"));
     intrinsic_binding "__intrinsic_map_destroy"
       (adapter_raw_wb [ (Access_effect.Inout, map_of p0 p1) ] Type_repr.Unit
          (fun _ args ->
            match args with
-           | [| Vm_value.Map pairs |] ->
+           | [| Vm_value.Map store |] ->
                Ok
                  { value = Vm_value.Unit;
                    writebacks =
-                     [ { arg_index = 0; replacement = Vm_value.Map [];
+                     [ { arg_index = 0; replacement = Vm_value.map_empty;
                          removed =
-                           List.concat_map (fun (k, v) -> [ k; v ]) pairs } ] }
+                           List.concat_map
+                             (fun (k, v) -> [ k; v ])
+                             (Vm_value.map_pairs store) } ] }
            | _ -> Error "argument mismatch: expected (Map)"));
     intrinsic_binding "__intrinsic_set_destroy"
       (adapter_raw_wb [ (Access_effect.Inout, set_of p0) ] Type_repr.Unit
          (fun _ args ->
            match args with
-           | [| Vm_value.Set elems |] ->
+           | [| Vm_value.Set store |] ->
                Ok
                  { value = Vm_value.Unit;
                    writebacks =
-                     [ { arg_index = 0; replacement = Vm_value.Set [];
-                         removed = elems } ] }
+                     [ { arg_index = 0; replacement = Vm_value.set_empty;
+                         removed = Vm_value.set_elems store } ] }
            | _ -> Error "argument mismatch: expected (Set)"));
     (* ── the record-visit traversal (see the protocol note above): pure
        non-destructive reads; begin -> Some(first key/element) or None;
@@ -2955,8 +2926,8 @@ let binding_manifest : binding list =
       (adapter_raw (lets [ map_of p0 p1 ]) (option_of (ref_ p0))
          (fun _ args ->
            match args with
-           | [| Vm_value.Map pairs |] -> (
-               match pairs with
+           | [| Vm_value.Map store |] -> (
+               match Vm_value.map_pairs store with
                | [] -> Ok vm_option_none
                | (k, _) :: _ -> Ok (vm_option_some k))
            | _ -> arg_mismatch "Map"));
@@ -2964,8 +2935,8 @@ let binding_manifest : binding list =
       (adapter_raw (lets [ map_of p0 p1; p0 ]) (option_of (ref_ p0))
          (fun _ args ->
            match args with
-           | [| Vm_value.Map pairs; handle |] -> (
-               match map_visit_pair pairs handle with
+           | [| Vm_value.Map store; handle |] -> (
+               match map_visit_pair (Vm_value.map_pairs store) handle with
                | Some (_, (k, _) :: _) -> Ok (vm_option_some k)
                | Some (_, []) | None -> Ok vm_option_none)
            | _ -> arg_mismatch "(Map, key)"));
@@ -2973,8 +2944,8 @@ let binding_manifest : binding list =
       (adapter_raw (lets [ map_of p0 p1; p0 ]) (ref_ p1)
          (fun _ args ->
            match args with
-           | [| Vm_value.Map pairs; handle |] -> (
-               match map_visit_pair pairs handle with
+           | [| Vm_value.Map store; handle |] -> (
+               match map_visit_pair (Vm_value.map_pairs store) handle with
                | Some ((_, v), _) -> Ok v
                | None ->
                    Error
@@ -2985,8 +2956,8 @@ let binding_manifest : binding list =
       (adapter_raw (lets [ set_of p0 ]) (option_of (ref_ p0))
          (fun _ args ->
            match args with
-           | [| Vm_value.Set elems |] -> (
-               match elems with
+           | [| Vm_value.Set store |] -> (
+               match Vm_value.set_elems store with
                | [] -> Ok vm_option_none
                | x :: _ -> Ok (vm_option_some x))
            | _ -> arg_mismatch "Set"));
@@ -2994,8 +2965,8 @@ let binding_manifest : binding list =
       (adapter_raw (lets [ set_of p0; p0 ]) (option_of (ref_ p0))
          (fun _ args ->
            match args with
-           | [| Vm_value.Set elems; handle |] -> (
-               match set_visit_after elems handle with
+           | [| Vm_value.Set store; handle |] -> (
+               match set_visit_after (Vm_value.set_elems store) handle with
                | Some (x :: _) -> Ok (vm_option_some x)
                | Some [] | None -> Ok vm_option_none)
            | _ -> arg_mismatch "(Set, item)"));

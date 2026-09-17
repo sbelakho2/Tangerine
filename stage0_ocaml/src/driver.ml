@@ -3283,9 +3283,15 @@ type mono_outcome = {
    std prelude set (prelude_files(): std/alloc, collections, core, ffi, fmt,
    fs, io, taint) plus every transitive `use` of those through the dependency
    scanner (collect_dep_file lexes + parses each dependency), then lexes,
-   parses, typechecks, lowers and codegens that whole 45-module closure in
-   the interpreter.  The budget is the intended ceiling for THAT workload,
-   measured, not a mask for a slow implementation.
+   parses, typechecks, lowers and codegens that corpus/prelude closure in the
+   interpreter — 9 std modules plus the corpus root (10 files, 805 items; the
+   merged probe's loader is a verbatim copy of the same code, so it measures
+   this exact set).  The "45" is a DIFFERENT workload: the kernel-entry ladder
+   build (include_compiler_lib=true) is the manifest-closed
+   bootstrap/compiler_kernel.manifest closure (45 sources: 14 std + 31
+   compiler files), never this corpus/prelude compile.  The budget is the
+   intended ceiling for THAT workload, measured, not a mask for a slow
+   implementation.
 
    Measurements (TANGERINE_DEBUG_STEPS runs of the bootstrap-check kernel at
    a 2e9 ceiling):
@@ -5446,7 +5452,15 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                   | Ok report -> (
                       match Vm.run_li ~limits:bootstrap_vm_limits ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:(vm_program_with_folded_queries ctx mo) ~entry:mo.mo_entry ~argv ~host with
                       | Error e ->
-                          Printf.eprintf "VM TRAP (diagnostic patch): %s\n%!" e.Vm.message;
+                          (* the trap message is the ONLY diagnostic of an
+                             in-VM failure (the exit code is unavailable) —
+                             surface it exactly like bootstrap-check does;
+                             the gate's fail text carries the precise trap. *)
+                          Printf.printf "  VM closure run TRAPPED: %s\n" e.Vm.message;
+                          let out = Host.stdout_contents host in
+                          if out <> "" then Printf.printf "  kernel stdout:\n%s\n" out;
+                          let err = Host.stderr_contents host in
+                          if err <> "" then Printf.printf "  kernel stderr:\n%s\n" err;
                           Ok
                             {
                               bs_ctx = ctx;

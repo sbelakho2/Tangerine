@@ -5120,6 +5120,31 @@ def mir_impl_has_named_type(b: MirBuilder, for_type: TypeExpr, self_type: TypeEx
   end  end
 end
 
+# (THE LOWERING AST OWNERSHIP CONTRACT): MIR lowering receives a
+# BORROWED, ALIASED AST. Every caller passes the program by the `&`
+# borrow marker (compiler_core.driver_lower_to_mir(&ast, ...);
+# lib_kernel.compile lowers `&ast` and then hands the SAME `ast` to
+# mono_cache_new), the analysis artifact separately carries its own
+# `typed.ast` clone, and even a tree header lowering DOES own (an
+# IR-synthesized `renamed_method` from lower_program's PASS 2) shares its
+# Box payloads with the source method it was cloned from — so no
+# `Box[Expr]` reachable from the lowered program may ever be CONSUMED
+# here. The pre-fix lowering extracted boxed children with
+# `child.into_inner()`, which reads the pointee and DEALLOCATES the
+# box's backing store while the owner's tree still holds the box: the
+# next read over an alias (the same expression revisited by a second
+# lowering site — the PASS-1/lower_enum_def discriminant folds, the
+# callee-name/ret-type lookups, the mono_cache walk after lowering)
+# dereferenced a freed region (the bootstrap VM's `host call
+# __intrinsic_ptr_read: access to freed region` trap in
+# qualify_field_callee_name). Every extraction below therefore reads
+# through the box's own NON-OWNING pointer (`*child.get()`, the same
+# discipline as the resolver/types/access/resource walks and Box::clone);
+# no `into_inner()` on a borrowed-tree box remains in this file. Where a
+# child must be RETAINED in a builder record across the pass (the
+# pending-closure body), the boundary performs an explicit DEEP clone
+# through the pointee's own Clone surface, never a move out of the
+# borrowed tree.
 def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProgram, String]
   var b = builder_new()
  # (ONE AnalyzedProgram): the semantic analysis artifact reaches this
@@ -5265,9 +5290,11 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
           match expr.kind
           when ExprKind::ExprIntLit(n) then disc = parsed_int_to_host(&n)
           when ExprKind::ExprUnaryOp(UnOp::Neg, inner) then
-            # The operand is an OWNED Box[Expr]: unbox it explicitly
-            # (Box is the wrapper, never transparent to the Expr it holds).
-            let inner_expr = inner.into_inner()
+            # READ-ONLY (the lowering AST ownership contract): the
+            # operand is a box in the caller's tree — read through its
+            # non-owning pointer, never into_inner (the same discriminant
+            # is re-read by lower_enum_def below).
+            let inner_expr = *inner.get()
             match inner_expr.kind
             when ExprKind::ExprIntLit(n) then disc = 0 - parsed_int_to_host(&n)
             when _ then ()
@@ -6585,6 +6612,17 @@ def lower_static_init_operand(inout b: MirBuilder, value: Expr, resolved_ty: Typ
   # Anything else is an unsupported initializer and must fail fast: a static
   # init is a supported constant, a supported runtime init, or an error —
   # never a silently invented zero/None.
+  # The ExprEnumVariant form below serves BOTH a variant reference and a
+  # QUALIFIED CALL: the parser produces it for `A::b(args)` (including the
+  # zero-arg `Vec::new()` / `Map::new()` / `Mutex::new()` constructors,
+  # whose resolved callable is recorded in call_def_ids), while a bare
+  # qualified path (`Option::None`) stays the ExprPath form. The recorded
+  # call target therefore distinguishes the qualified-call shape.
+  var qualified_call = false
+  match b.call_def_ids.get(value.node_id)
+  when Option::Some(_) then qualified_call = true
+  when Option::None then ()
+  end
   match value.kind
   when ExprKind::ExprPath(path) then
     if path.segments.len() >= 2 then
@@ -6618,6 +6656,77 @@ def lower_static_init_operand(inout b: MirBuilder, value: Expr, resolved_ty: Typ
           instance: Option::None
         })
       })
+    end
+  when ExprKind::ExprEnumVariant(path, _, args) then
+    # (a) A QUALIFIED zero-arg CALL (`Vec::new()` — std/core.tg's
+    # `static mut _catch_frame_stack: Vec[CatchFrame] = Vec::new()` — and
+    # Map/Set/Mutex::new()) is the type's empty value: the same zero-init
+    # constant the ExprCall arm produces.
+    # (b) A payload-less VARIANT reference resolves to its discriminant
+    # (the ExprPath arm's rule; fail closed when unknown).
+    # (c) A payload-carrying variant is not a supported static constant:
+    # fail closed with a diagnostic (never a silently invented value,
+    # never a trap).
+    if qualified_call then
+      Option::Some(MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirInt(0),
+          ty: Type::Int,
+          instance: Option::None
+        })
+      })
+    elsif args.len() == 0 then
+      if path.segments.len() >= 2 then
+        match resolve_enum_variant_discriminant(b, &path)
+        when Result::Ok(disc) then
+          Option::Some(MirOperand {
+            kind: MirOperandKind::MirConstant(MirConstant {
+              kind: MirConstantKind::MirInt(disc),
+              ty: Type::Int,
+              instance: Option::None
+            })
+          })
+        when Result::Err(e) then
+          b.errors.push(e)
+          Option::Some(MirOperand {
+            kind: MirOperandKind::MirConstant(MirConstant {
+              kind: MirConstantKind::MirUnit,
+              ty: Type::Unit,
+              instance: Option::None
+            })
+          })
+        end
+      else
+        Option::Some(MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirUnit,
+            ty: Type::Unit,
+            instance: Option::None
+          })
+        })
+      end
+    else
+      b.errors.push("internal error: unsupported static initializer (enum variant with payload) for type " + format_mir_type(&b.typed_type_names, &b.generic_param_names, &resolved_ty) + "; a static initializer must be a supported constant or runtime init, never a silent zero")
+      Option::None
+    end
+  when ExprKind::ExprStructLit(_, fields) then
+    # A PAYLOAD-LESS struct literal is the unique (zero-sized) value of a
+    # stateless struct — std/alloc.tg's global
+    # `mut __tg_system_alloc: SystemAllocator = SystemAllocator {}` (the
+    # standalone-allocation entry point's allocator). A field-carrying
+    # struct literal is not a supported constant init: fail closed with a
+    # diagnostic.
+    if fields.len() == 0 then
+      Option::Some(MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirInt(0),
+          ty: Type::Int,
+          instance: Option::None
+        })
+      })
+    else
+      b.errors.push("internal error: unsupported static initializer (struct literal with fields) for type " + format_mir_type(&b.typed_type_names, &b.generic_param_names, &resolved_ty) + "; a static initializer must be a supported constant or runtime init, never a silent zero")
+      Option::None
     end
   when ExprKind::ExprIntLit(n) then
     Option::Some(MirOperand {
@@ -6919,9 +7028,11 @@ def lower_enum_def(inout b: MirBuilder, e: EnumDecl) -> MirTypeDef
       match expr.kind
       when ExprKind::ExprIntLit(n) then disc = parsed_int_to_host(&n)
       when ExprKind::ExprUnaryOp(UnOp::Neg, inner) then
-        # The operand is an OWNED Box[Expr]: unbox it explicitly
-        # (Box is the wrapper, never transparent to the Expr it holds).
-        let inner_expr = inner.into_inner()
+        # READ-ONLY (the lowering AST ownership contract): the operand
+        # belongs to the caller's borrowed tree — read through the box's
+        # non-owning pointer; PASS 1's fold already visited this same
+        # discriminant.
+        let inner_expr = *inner.get()
         match inner_expr.kind
         when ExprKind::ExprIntLit(n) then disc = 0 - parsed_int_to_host(&n)
         when _ then ()
@@ -7342,7 +7453,9 @@ def lower_call_arg(inout b: MirBuilder, callee: Option[Expr], callee_name: Optio
     value = MirCallValue::Value(lower_string_literal_to_owned(b, arg_expr, span))
   elsif kind_name == "ExprAccess" then
     match arg_expr.kind
-    when ExprKind::ExprAccess(inner) then value = MirCallValue::Place(lower_place(b, inner.into_inner()))
+    # READ-ONLY (the lowering AST ownership contract): the `&place`
+    # operand stays owned by the borrowed tree — lower_place reads it.
+    when ExprKind::ExprAccess(inner) then value = MirCallValue::Place(lower_place(b, *inner.get()))
     when _ then ()
     end
   elsif effect == AccessEffect::Consume then
@@ -7361,12 +7474,22 @@ def mir_call_result_temp_type(ret_type: Type) -> Type
   if ret_type == Type::Unit then Type::Int else ret_type end
 end
 
+# A READ-ONLY qualifier walk (the lowering AST ownership contract): the
+# receiver chain belongs to the caller's borrowed tree. It is reached up
+# to three times for one callee node (lower_callee_expr, lr_call's ret-type
+# lookup, lower_callee_operand), so the pre-fix `base.into_inner()`
+# recursion freed the chain's boxes on the FIRST call and the NEXT call
+# (or any later lowering read of the same subtree) trapped on the freed
+# region — the bootstrap VM's
+# `host call __intrinsic_ptr_read: access to freed region ... (in
+# qualify_field_callee_name)`. Recurse through the box's non-owning
+# pointer; never consume a child.
 def qualify_field_callee_name(expr: Expr, field_name: String) -> String
   match expr.kind
   when ExprKind::ExprIdent(name) then
     name.clone() + "::" + field_name
   when ExprKind::ExprFieldAccess(base, inner_field) then
-    qualify_field_callee_name(base.into_inner(), inner_field.clone()) + "::" + field_name
+    qualify_field_callee_name(*base.get(), inner_field.clone()) + "::" + field_name
   when ExprKind::ExprPath(path) then
     var qualified = ""
     for seg in path.segments do
@@ -7436,6 +7559,25 @@ def typed_variant_id(b: MirBuilder, enum_name: String, variant_name: String) -> 
     when Option::None then Option::None
     end
   when Option::None then Option::None
+  end  end
+end
+
+# (diagnostics only) the local-lookup context of a failed `lookup_local_*`:
+# whether the lowering has a current function and how many locals it holds —
+# the "semantic local present but its MIR local unreachable" class prints
+# this so the failing layer is identified from the error alone.
+def mir_local_lookup_context(b: MirBuilder) -> String
+  match b.current_fn
+  when Option::Some(f) then
+    var lo = -1
+    var hi = -1
+    if f.locals.len() > 0 then
+      lo = f.locals[0].id.id
+      hi = f.locals[f.locals.len() - 1].id.id
+    end
+    "fn present, " + f.locals.len().to_string() + " locals (ids " + lo.to_string() + ".." + hi.to_string() + "), local_counter " + b.local_counter.to_string()
+  when Option::None then
+    "NO current function (current_fn = None)"
   end  end
 end
 
@@ -7593,6 +7735,34 @@ def typed_iteration_of(b: MirBuilder, node_id: Int) -> Option[TypedIteration]
   match b.typed_iterations.get(node_id)
   when Option::Some(ti) then Option::Some(ti)
   when Option::None then Option::None
+  end  end
+end
+
+# (diagnostics only) the typed-node tag of a field-access node that has no
+# typed FieldId — distinguishes "the checker never recorded a typed node"
+# (typed-absent) from "recorded with a non-Field kind" (the tag) in the
+# fail-closed field-identity panic.
+def typed_node_tag_of(b: MirBuilder, node_id: Int) -> String
+  if node_id == 0 then
+    return "node-id-0"
+  end
+  match b.typed_exprs.get(node_id)
+  when Option::Some(te) then
+    match te.kind
+    when TypedExprKind::Field(_) then "Field"
+    when TypedExprKind::TupleIndex { base: _, name: _, index: _ } then "TupleIndex"
+    when TypedExprKind::Local(_) then "Local"
+    when TypedExprKind::Global(_) then "Global"
+    when TypedExprKind::BinaryOp { op: _, left: _, right: _ } then "BinaryOp"
+    when TypedExprKind::Call(_) then "Call"
+    when TypedExprKind::Variant(_) then "Variant"
+    when TypedExprKind::StructLit { path: _, fields: _ } then "StructLit"
+    when TypedExprKind::Literal(_) then "Literal"
+    when TypedExprKind::Path(_) then "Path"
+    when _ then "other"
+    end
+  when Option::None then
+    "typed-absent"
   end  end
 end
 
@@ -7904,7 +8074,7 @@ def bind_match_arm_pattern_locals(inout b: MirBuilder, scrut_local: MirLocalId, 
         b.errors.push("internal error: missing typed variant identity for pattern variant '" + variant_name.clone() + "' during MIR lowering")
       end
     when Option::None then
-      b.errors.push("internal error: missing typed scrutinee enum identity for pattern variant '" + variant_name.clone() + "' during MIR lowering")
+      b.errors.push("internal error: missing typed scrutinee enum identity for pattern variant '" + variant_name.clone() + "' during MIR lowering (scrutinee type " + format_mir_type(&b.typed_type_names, &b.generic_param_names, &scrut_ty) + ", local " + scrut_local.id.to_string() + ", " + mir_local_lookup_context(b) + ", fn " + b.current_fn_key.clone() + ")")
     end
 
     let payload_fid = match scrut_tid
@@ -9228,9 +9398,11 @@ def mir_emit_accessor_writeback(inout b: MirBuilder, expr: Expr, local_id: MirLo
       b.errors.push("internal error: a Map::get_modify accessor call without its key argument reached the with write-back lowering (node " + expr.node_id.to_string() + ")")
       return true
     end
-    # The receiver is an OWNED Box[Expr]: unbox it once (Box is the
-    # wrapper, never transparent to the Expr it holds).
-    let recv_expr = recv.into_inner()
+    # READ-ONLY (the lowering AST ownership contract): the receiver is a
+    # box in the borrowed tree — read through the box's non-owning
+    # pointer (the accessor call is re-lowered later; consuming here freed
+    # the receiver's region for that next read).
+    let recv_expr = *recv.get()
     if !expr_is_place_like(&recv_expr) then
       b.errors.push("internal error: the with-scoped access write-back needs the accessor's map receiver as a place (node " + expr.node_id.to_string() + ")")
       return true
@@ -10480,7 +10652,10 @@ def lower_callee_expr(inout b: MirBuilder, callee_expr: Expr, span: Span) -> Mir
   elsif ck == "ExprFieldAccess" then
     match callee_expr.kind
     when ExprKind::ExprFieldAccess(recv, field) then
-      return mir_fn_operand(b, qualify_field_callee_name(recv.into_inner(), field.clone()))
+      # READ-ONLY (the lowering AST ownership contract): qualify reads
+      # the receiver chain through the box's non-owning pointer — the
+      # same chain is read again by the call's ret-type lookup.
+      return mir_fn_operand(b, qualify_field_callee_name(*recv.get(), field.clone()))
     when _ then ()
     end
   elsif ck == "ExprEnumVariant" then
@@ -10753,7 +10928,10 @@ def lr_call(inout b: MirBuilder, callee_expr: Expr, arg_exprs: Vec[Expr], span: 
       when _ then ret_type = mir_lookup_fn_ret_type(b, name.clone())
       end
     when ExprKind::ExprFieldAccess(recv, field_name) then
-      ret_type = mir_lookup_fn_ret_type(b, qualify_field_callee_name(recv.into_inner(), field_name.clone()))
+      # READ-ONLY (the lowering AST ownership contract): the ret-type
+      # lookup reads the callee chain, never consumes it (the same
+      # callee is qualified again by lower_callee_operand).
+      ret_type = mir_lookup_fn_ret_type(b, qualify_field_callee_name(*recv.get(), field_name.clone()))
     when ExprKind::ExprEnumVariant(path, _, _) then
       ret_type = mir_lookup_fn_ret_type(b, resolve_static_path_callee_name(b, &path))
     when ExprKind::ExprPath(path) then
@@ -11762,8 +11940,9 @@ def mir_try_collection_ownership_lowering(
           # frame slot holding the consumed key image).
           let key_slot = match arg_exprs[0].kind
           when ExprKind::ExprAccess(inner) then
-            # The access operand is an OWNED Box[Expr]: unbox it once.
-            let inner_expr = inner.into_inner()
+            # READ-ONLY (the lowering AST ownership contract): the
+            # access operand belongs to the borrowed tree.
+            let inner_expr = *inner.get()
             if expr_is_place_like(&inner_expr) then Option::Some(lower_place(b, &inner_expr)) else Option::None end
           when _ then
             if expr_is_place_like(&arg_exprs[0]) then Option::Some(lower_place(b, &arg_exprs[0])) else Option::None end
@@ -11781,8 +11960,9 @@ def mir_try_collection_ownership_lowering(
         when Option::Some(t_glue) then
           let item_slot = match arg_exprs[0].kind
           when ExprKind::ExprAccess(inner) then
-            # The access operand is an OWNED Box[Expr]: unbox it once.
-            let inner_expr = inner.into_inner()
+            # READ-ONLY (the lowering AST ownership contract): the
+            # access operand belongs to the borrowed tree.
+            let inner_expr = *inner.get()
             if expr_is_place_like(&inner_expr) then Option::Some(lower_place(b, &inner_expr)) else Option::None end
           when _ then
             if expr_is_place_like(&arg_exprs[0]) then Option::Some(lower_place(b, &arg_exprs[0])) else Option::None end
@@ -11897,21 +12077,23 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
     match expr.kind
     when ExprKind::ExprBinaryOp(op, left, right) then
       let bt_ty = mir_binop_result_type(b, &expr)
-      return Result::Ok(lr_binary(b, op, left.into_inner(), right.into_inner(), span, &bt_ty))
+      # READ-ONLY (the lowering AST ownership contract): both operands
+      # stay owned by the borrowed tree — lr_binary lowers them by read.
+      return Result::Ok(lr_binary(b, op, *left.get(), *right.get(), span, &bt_ty))
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
     
   elsif kind_name == "ExprUnaryOp" then
     match expr.kind
-    when ExprKind::ExprUnaryOp(op, inner) then return Result::Ok(lr_unary(b, op, inner.into_inner(), span))
+    when ExprKind::ExprUnaryOp(op, inner) then return Result::Ok(lr_unary(b, op, *inner.get(), span))
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
     
   elsif kind_name == "ExprRawDeref" then
     match expr.kind
-    when ExprKind::ExprRawDeref(inner) then return Result::Ok(lr_deref(b, inner.into_inner(), span))
+    when ExprKind::ExprRawDeref(inner) then return Result::Ok(lr_deref(b, *inner.get(), span))
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -11925,7 +12107,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
 
   elsif kind_name == "ExprArrayRepeat" then
     match expr.kind
-    when ExprKind::ExprArrayRepeat(elem, count) then return lr_array_repeat(b, elem.into_inner(), count.into_inner(), span)
+    when ExprKind::ExprArrayRepeat(elem, count) then return lr_array_repeat(b, *elem.get(), *count.get(), span)
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -11940,7 +12122,10 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
   elsif kind_name == "ExprCall" then
     match expr.kind
     when ExprKind::ExprCall(callee_expr, arg_exprs) then
-      return Result::Ok(lr_call(b, callee_expr.into_inner(), &arg_exprs, span, expr.node_id))
+      # READ-ONLY (the lowering AST ownership contract): the callee
+      # payload stays owned by the borrowed tree — lr_call lowers it by
+      # read (its own qualify/ret-type lookups re-read the same chain).
+      return Result::Ok(lr_call(b, *callee_expr.get(), &arg_exprs, span, expr.node_id))
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -11948,9 +12133,9 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
   elsif kind_name == "ExprMethodCall" then
     match expr.kind
     when ExprKind::ExprMethodCall(receiver, method_name, type_args, arg_exprs) then
-      # The receiver is an OWNED Box[Expr]: unbox it once (Box is the
-      # wrapper, never transparent to the Expr it holds).
-      let receiver_expr = receiver.into_inner()
+      # READ-ONLY (the lowering AST ownership contract): the receiver
+      # stays owned by the borrowed tree.
+      let receiver_expr = *receiver.get()
       let normalized_method_name = normalize_method_name(method_name.clone())
       # Lower receiver as a reference (address-of) for method calls.
       # If the receiver is not already place-like (for example a chained call
@@ -12393,7 +12578,9 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
   elsif kind_name == "ExprFieldAccess" then
     match expr.kind
     when ExprKind::ExprFieldAccess(recv, field_name) then
-      let base_place = lower_place(b, recv.into_inner())
+      # READ-ONLY (the lowering AST ownership contract): the receiver
+      # stays owned by the borrowed tree.
+      let base_place = lower_place(b, *recv.get())
       # If the base local has a reference type, auto-insert a ProjDeref
       let base_ty = lookup_local_type(b, &base_place.local)
       let needs_deref = match base_ty
@@ -12401,7 +12588,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       when _ then false
       end
       # Resolve field projection — typed field index first, name fallback
-      let field_proj = typed_field_projection(b, expr.node_id, &field_name, &base_place)
+      let field_proj = typed_field_projection(b, expr.node_id, &field_name, &base_place, expr.span.clone())
       var new_projections = base_place.projections.clone()
       if needs_deref && base_place.projections.is_empty() then
         new_projections.push(Projection::ProjDeref)
@@ -12421,8 +12608,10 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
   elsif kind_name == "ExprIndex" then
     match expr.kind
     when ExprKind::ExprIndex(base_expr, index_expr) then
-      let base_place = lower_place(b, base_expr.into_inner())
-      let idx_op = lower_expr(b, index_expr.into_inner(), span)
+      # READ-ONLY (the lowering AST ownership contract): base and index
+      # stay owned by the borrowed tree.
+      let base_place = lower_place(b, *base_expr.get())
+      let idx_op = lower_expr(b, *index_expr.get(), span)
       # Store index into a temp so we can reference it as a MirLocalId
       let idx_tmp = add_temp(b, Type::Int, span)
       push_stmt(b, MirStatementKind::MirAssign(place_local(idx_tmp), MirRvalue {
@@ -12529,10 +12718,10 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
                 })
               end
             when Option::None then
-              b.errors.push("internal error: closure capture MIR local _" + mid.to_string() + " missing")
+              b.errors.push("internal error: closure capture MIR local _" + mid.to_string() + " missing (semantic local _" + cap_id.to_string() + ", " + mir_local_lookup_context(b) + ", fn " + b.current_fn_key.clone() + ")")
             end
           when Option::None then
-            b.errors.push("internal error: closure capture semantic local _" + cap_id.to_string() + " has no MIR local")
+            b.errors.push("internal error: closure capture semantic local _" + cap_id.to_string() + " has no MIR local (" + mir_local_lookup_context(b) + ", fn " + b.current_fn_key.clone() + ")")
           end
         end
       when Option::None then ()
@@ -12567,6 +12756,13 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       
       # Step 4: Record the closure body to be lowered as a separate MirFunction
       # (This would be processed after the containing function)
+      # RETENTION BOUNDARY (the lowering AST ownership contract): the
+      # pending record OUTLIVES the current lowering walk, so the body
+      # cannot be borrowed — and it must not be moved out of the source
+      # box either (the closure expression stays in the caller's tree).
+      # Take an explicit DEEP clone through the pointee's own Clone
+      # surface (Box::clone / Expr::clone allocate a fresh tree), exactly
+      # like the effect-dispatcher arm bodies retained below.
       b.pending_closures.push(PendingClosure {
         name: closure_name.clone(),
         params: params.clone(),
@@ -12574,7 +12770,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
         captures: captures.clone(),
         capture_types: capture_types.clone(),
         capture_ids: capture_ids.clone(),
-        body: body.into_inner(),
+        body: (*body.get()).clone(),
         ret_type: ret_type.clone(),
         node_id: expr.node_id
       })
@@ -12687,9 +12883,9 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
   elsif kind_name == "ExprCast" then
     match expr.kind
     when ExprKind::ExprCast(inner, target_ty) then
-      # The operand is an OWNED Box[Expr]: unbox it once (Box is the
-      # wrapper, never transparent to the Expr it holds).
-      let inner_expr = inner.into_inner()
+      # READ-ONLY (the lowering AST ownership contract): the operand
+      # stays owned by the borrowed tree.
+      let inner_expr = *inner.get()
       let inner_op = lower_expr(b, &inner_expr, span)
   # the cast's TARGET type is the cast expression's typed-tree
       # record (the checker's resolved cast result type — the typed table
@@ -12822,10 +13018,11 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       # Assignment EXPRESSIONS share the statement-assignment replacement
       # semantics (drop old -> store new), keyed on the EXPRESSION's node id
       # ("assign::<expr id>" — the checker records the same key). The
-      # target/value payloads are OWNED Box[Expr]s: unbox them once (Box
-      # is the wrapper, never transparent to the Expr it holds).
-      let target_expr = target.into_inner()
-      let value_expr = value.into_inner()
+      # target/value payloads are boxes in the borrowed tree: read them
+      # through their non-owning pointers (the lowering AST ownership
+      # contract), never into_inner.
+      let target_expr = *target.get()
+      let value_expr = *value.get()
       let place = lower_place(b, &target_expr)
       let value_ty = mir_source_expr_ty(b, &value_expr)
       match lower_assign_drop_chain(b, expr.node_id, span, place.clone())
@@ -12902,8 +13099,10 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       # expression with no CFG edge, and the backend has no exception
       # runtime. Erasure matches the stage0 lowering and keeps the
       # compiler kernel — which uses `?` throughout (e.g.
-      # `parse_toml(s)?`) — compiling through MIR.
-      return lower_expr_to_rvalue(b, inner.into_inner(), span)
+      # `parse_toml(s)?`) — compiling through MIR. The operand is read
+      # through the box's non-owning pointer (the lowering AST ownership
+      # contract: erasure must not consume a borrowed child).
+      return lower_expr_to_rvalue(b, *inner.get(), span)
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -13055,9 +13254,10 @@ def lower_place(inout b: MirBuilder, expr: Expr) -> Place
     # that as the place base.  Falling through to lower_place's catch-all
     # would otherwise yield place_local(MirLocalId{id:0}) and silently
     # compute the field address off local 0, corrupting unrelated memory.
-    # The receiver is an OWNED Box[Expr]: unbox it once (Box is the
-    # wrapper, never transparent to the Expr it holds).
-    let recv_expr = recv.into_inner()
+    # The receiver is read through its box's non-owning pointer (the
+    # lowering AST ownership contract): the same field access is re-lowered
+    # by the rvalue path, so consuming here would free it for that read.
+    let recv_expr = *recv.get()
     let base = if expr_is_place_like(&recv_expr) then
       lower_place(b, &recv_expr)
     else
@@ -13080,7 +13280,7 @@ def lower_place(inout b: MirBuilder, expr: Expr) -> Place
     when Type::RefInternal(_, _) then true
     when _ then false
     end
-    let field_proj = typed_field_projection(b, expr.node_id, field, &base)
+    let field_proj = typed_field_projection(b, expr.node_id, field, &base, expr.span.clone())
     var new_projections = base.projections.clone()
     if needs_deref && base.projections.is_empty() then
       new_projections.push(Projection::ProjDeref)
@@ -13092,8 +13292,9 @@ def lower_place(inout b: MirBuilder, expr: Expr) -> Place
   elsif kind_name == "ExprRawDeref" then
     match expr.kind
     when ExprKind::ExprRawDeref(inner) then
-    # The operand is an OWNED Box[Expr]: unbox it once.
-    let inner_expr = inner.into_inner()
+    # READ-ONLY (the lowering AST ownership contract): the operand stays
+    # owned by the borrowed tree.
+    let inner_expr = *inner.get()
     let base = if expr_is_place_like(&inner_expr) then
       lower_place(b, &inner_expr)
     else
@@ -13114,8 +13315,9 @@ def lower_place(inout b: MirBuilder, expr: Expr) -> Place
     match expr.kind
     when ExprKind::ExprIndex(recv, index) then
     # Same spill-non-place-receivers rule as ExprFieldAccess. The receiver
-    # and index payloads are OWNED Box[Expr]s: unbox them explicitly.
-    let recv_expr = recv.into_inner()
+    # and index payloads stay owned by the borrowed tree (the lowering AST
+    # ownership contract) — read them through their non-owning pointers.
+    let recv_expr = *recv.get()
     let base = if expr_is_place_like(&recv_expr) then
       lower_place(b, &recv_expr)
     else
@@ -13130,7 +13332,7 @@ def lower_place(inout b: MirBuilder, expr: Expr) -> Place
       place_local(recv_tmp)
     end
     # Evaluate the index expression and store in a temp
-    let idx_op = lower_expr(b, index.into_inner(), Span { file: "", start: 0, end_pos: 0 })
+    let idx_op = lower_expr(b, *index.get(), Span { file: "", start: 0, end_pos: 0 })
     let idx_tmp = add_temp(b, Type::Int, Span { file: "", start: 0, end_pos: 0 })
     push_stmt(b, MirStatementKind::MirAssign(place_local(idx_tmp), MirRvalue {
       kind: MirRvalueKind::MirMove(idx_op)
@@ -13202,8 +13404,10 @@ def lower_call_callee(inout b: MirBuilder, expr: Expr, span: Span) -> MirOperand
     end
   when ExprKind::ExprFieldAccess(recv, field) then
     # Preserve qualified static calls such as Module::func or Type::new.
-    # The receiver is an OWNED Box[Expr]: unbox it explicitly.
-    mir_fn_operand(b, qualify_field_callee_name(recv.into_inner(), field.clone()))
+    # READ-ONLY (the lowering AST ownership contract): the receiver chain
+    # is read through its non-owning pointer (this is the THIRD qualifier
+    # read of a callee the rvalue path already read).
+    mir_fn_operand(b, qualify_field_callee_name(*recv.get(), field.clone()))
   when ExprKind::ExprEnumVariant(path, _, _) then
     mir_fn_operand(b, resolve_static_path_callee_name(b, &path))
   when ExprKind::ExprPath(path) then
@@ -13240,6 +13444,21 @@ end
 # There are NO name-scan / numeric-index / discriminant fallbacks: a
 # projection that does not resolve against the current type stops the walk
 # and returns the current type (the verifier reports the mismatch).
+# (builtin raw pointer): the nominal TypeId a pointer-typed place projects
+# its fields into — the std Ptr/PtrMut declarations (the builder's
+# LangItems ptr/ptr_mut ids), the SAME nominal view the checker's field
+# resolution recorded the FieldId from (builtin_ptr_nominal_ty). Peels
+# borrows first: a `&Ptr[T]` receiver projects like the pointer itself.
+# -1 when the type is not a builtin pointer.
+def mir_pointer_nominal_tid(b: MirBuilder, ty: Type) -> Int
+  match ty
+  when Type::RefInternal(inner, _) then mir_pointer_nominal_tid(b, inner)
+  when Type::Ptr(_) then b.lang_items.ptr
+  when Type::PtrMut(_) then b.lang_items.ptr_mut
+  when _ then -1
+  end  end
+end
+
 def resolve_type_through_projections(b: MirBuilder, start_type: Type, projections: Vec[Projection]) -> Type
   var current = start_type
   var proj_idx = 0
@@ -13303,7 +13522,12 @@ def resolve_type_through_projections(b: MirBuilder, start_type: Type, projection
           when _ then Option::None
           end
         when Type::Adt(tid, _) then Option::Some(tid.id)
-        when _ then Option::None
+        when _ then
+          # (builtin raw pointer): the std Ptr/PtrMut nominal identity —
+          # the checker recorded the FieldId with that owner for a
+          # `p.address` projection on a Type::Ptr/Type::PtrMut base.
+          let ptid = mir_pointer_nominal_tid(b, current)
+          if ptid != -1 then Option::Some(ptid) else Option::None end
         end
         match cur_tid_opt
         when Option::Some(cur_tid) then
@@ -13450,13 +13674,15 @@ end
 # (the same semantic tuple form the synthesized tuple-pattern bindings and
 # the drain/entries glue use); the named len/cap forms (index = -1) have no
 # projection identity and stay an ICE (the std uses the.len() methods).
-def typed_field_projection(b: MirBuilder, node_id: Int, fallback_name: String, place: Place) -> Projection
+def typed_field_projection(b: MirBuilder, node_id: Int, fallback_name: String, place: Place, span: Span) -> Projection
  # (phase 2): the typed node form's FieldId (TypedExprKind::Field's
   # TypedField — the same data the flat field_targets holds, recorded in
   # the tree) is the PRIMARY source; the flat field_targets is the
   # fallback for the nodes the checker recorded only in the flat map. A
   # missing FieldId in BOTH is an ICE: re-deriving the index from the field
-  # name here would silently diverge from the typed program.
+  # name here would silently diverge from the typed program. The ICE names
+  # the node, the field and the source span so the unchecked/unrecorded
+  # site is locatable without a rebuild.
   match typed_field_id_of(b, node_id)
   when Option::Some(fid) then Projection::Field(fid)
   when Option::None then
@@ -13474,7 +13700,7 @@ def typed_field_projection(b: MirBuilder, node_id: Int, fallback_name: String, p
     match b.field_targets.get(node_id)
     when Option::Some(fid2) then Projection::Field(fid2)
     when Option::None then
-      panic("internal error: missing typed field target for field '" + fallback_name.clone() + "' during MIR lowering; field identity must come from the typed program, not name-based fallback")
+      panic("internal error: missing typed field target for field '" + fallback_name.clone() + "' on node " + node_id.to_string() + " @" + span.file.clone() + ":" + span.start.to_string() + " (typed node " + typed_node_tag_of(b, node_id) + ", field_targets " + b.field_targets.len().to_string() + ", fn " + b.current_fn_key.clone() + ") during MIR lowering; field identity must come from the typed program, not name-based fallback")
     end
   end
 end
@@ -14879,8 +15105,9 @@ def for_call_arg_uses_name(b: MirBuilder, name: String, arg: Expr) -> Bool
   if kind_name == "ExprAccess" then
     match arg.kind
     when ExprKind::ExprAccess(inner) then
-      # The access operand is an OWNED Box[Expr]: unbox it once.
-      let inner_expr = inner.into_inner()
+      # READ-ONLY query (the lowering AST ownership contract): the access
+      # operand stays owned by the borrowed tree.
+      let inner_expr = *inner.get()
       if for_expr_rooted_at_name(name, &inner_expr) then
         if for_expr_is_bare_name(name, &inner_expr) then
           true
@@ -15698,13 +15925,15 @@ def lower_for(inout b: MirBuilder, pat: Pattern, iter: Expr, body: Block, span: 
     var lo_op = operand_int(0)
     match lo_box
     when Option::Some(lo_e) then
-      lo_op = lower_expr(b, lo_e.into_inner(), span)
+      # READ-ONLY (the lowering AST ownership contract): the range bound
+      # stays owned by the borrowed tree.
+      lo_op = lower_expr(b, *lo_e.get(), span)
     when Option::None then ()
     end
     var hi_op = operand_int(0)
     match hi_box
     when Option::Some(hi_e) then
-      hi_op = lower_expr(b, hi_e.into_inner(), span)
+      hi_op = lower_expr(b, *hi_e.get(), span)
     when Option::None then ()
     end
 
@@ -16192,7 +16421,7 @@ def lower_match(inout b: MirBuilder, m: MatchExpr, span: Span) -> Unit
               b.errors.push("internal error: missing typed variant identity for payload-guard variant '" + vn.clone() + "' during MIR lowering")
             end
           when Option::None then
-            b.errors.push("internal error: missing typed scrutinee enum identity for payload-guard variant '" + vn.clone() + "' during MIR lowering")
+            b.errors.push("internal error: missing typed scrutinee enum identity for payload-guard variant '" + vn.clone() + "' during MIR lowering (scrutinee type " + format_mir_type(&b.typed_type_names, &b.generic_param_names, &scrutinee_ty) + ", " + mir_local_lookup_context(b) + ", fn " + b.current_fn_key.clone() + ")")
           end
           var ppl = place_local(scrut_local)
           ppl.projections.push(vproj)
@@ -16480,7 +16709,7 @@ def lower_match_to_place(inout b: MirBuilder, m: MatchExpr, dest: Place, span: S
               b.errors.push("internal error: missing typed variant identity for payload-guard variant '" + vn.clone() + "' during MIR lowering")
             end
           when Option::None then
-            b.errors.push("internal error: missing typed scrutinee enum identity for payload-guard variant '" + vn.clone() + "' during MIR lowering")
+            b.errors.push("internal error: missing typed scrutinee enum identity for payload-guard variant '" + vn.clone() + "' during MIR lowering (scrutinee type " + format_mir_type(&b.typed_type_names, &b.generic_param_names, &scrutinee_ty) + ", " + mir_local_lookup_context(b) + ", fn " + b.current_fn_key.clone() + ")")
           end
           var ppl = place_local(scrut_local)
           ppl.projections.push(vproj)
@@ -33154,11 +33383,37 @@ end
 # equal the projected type's Adt TypeId; anything else (wrong owner, index
 # out of range, non-struct def) is unresolvable (Option::None → the caller
 # reports the invalid projection chain / owner mismatch).
+# (builtin raw pointer): a field projection on a `Type::Ptr` / `Type::PtrMut`
+# base. The checker resolves such a receiver against the std nominal
+# Ptr/PtrMut declaration and records the FieldId with THAT nominal owner
+# (types.tg's builtin_ptr_nominal_ty; mir.tg's mir_pointer_nominal_tid) —
+# the base type in MIR stays the builtin pointer form, so the verifier
+# reads the field through the RECORDED owner def with the pointee as the
+# owner's single generic argument (the same substituted-field computation
+# as the Adt arm).
+def verifier_ptr_field_type_at(type_index: Map[Int, MirTypeDef], pointee: Type, owner_id: Int, index: Int) -> Option[Type]
+  match verifier_type_def(type_index, owner_id)
+  when Option::Some(td) then
+    match td.kind
+    when MirTypeDefKind::Struct(fields) then
+      if index >= 0 && index < fields.len() then
+        Option::Some(subst_type_args(&fields[index].ty, &td.generic_params, [pointee]))
+      else
+        Option::None
+      end
+    when _ then Option::None
+    end
+  when Option::None then Option::None
+  end  end
+end
+
 def verifier_field_type_at(type_index: Map[Int, MirTypeDef], ty: Type, owner_id: Int, index: Int) -> Option[Type]
   match ty
   when Type::RefInternal(inner, _) then verifier_field_type_at(type_index, inner, owner_id, index)
   when Type::Tuple(fields) then
     if index >= 0 && index < fields.len() then Option::Some(fields[index].clone()) else Option::None end
+  when Type::Ptr(pointee) then verifier_ptr_field_type_at(type_index, pointee, owner_id, index)
+  when Type::PtrMut(pointee) then verifier_ptr_field_type_at(type_index, pointee, owner_id, index)
   when Type::Adt(tid, args) then
     if tid.id == owner_id then
       match verifier_type_def(type_index, tid.id)

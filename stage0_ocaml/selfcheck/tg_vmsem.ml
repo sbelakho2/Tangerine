@@ -1525,7 +1525,7 @@ let check_clear_ownership () =
   in
   let seed_set (_vm : Vm.t) (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
     frame.locals.(1) <-
-      Vm_value.Live (Vm_value.Set [ ref_of res.(0); ref_of res.(1) ])
+      Vm_value.Live (Vm_value.set_of_list [ ref_of res.(0); ref_of res.(1) ])
   in
   (match seeded_run prog_set seed_set 2 with
    | Setup_error m -> fail "set_clear: entry setup: %s" m
@@ -1533,7 +1533,7 @@ let check_clear_ownership () =
    | Ran_ok run ->
        expect_dropped run.svm "set_clear" (Array.to_list run.sres);
        (match run.sframe.locals.(1) with
-        | Vm_value.Live (Vm_value.Set []) ->
+        | Vm_value.Live (Vm_value.Set store) when Vm_value.set_elems store = [] ->
             pass "set_clear: every prior member drops exactly once (the removed channel)"
         | other -> fail "set_clear: the set local is not empty: %s" (Vm_value.slot_state other)))
 
@@ -1556,7 +1556,8 @@ let check_set_remove_ownership () =
   in
   let seed_matched (_vm : Vm.t) (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
     ignore res;
-    frame.locals.(1) <- Vm_value.Live (Vm_value.Set [ Vm_value.String "a"; Vm_value.String "b" ]);
+    frame.locals.(1) <-
+      Vm_value.Live (Vm_value.set_of_list [ Vm_value.String "a"; Vm_value.String "b" ]);
     frame.locals.(2) <- Vm_value.Live (Vm_value.String "b")
   in
   (match seeded_run prog seed_matched 0 with
@@ -1564,13 +1565,15 @@ let check_set_remove_ownership () =
    | Ran_error (m, _) -> fail "set_remove matched: %s" m
    | Ran_ok run -> (
        match (run.sframe.locals.(0), run.sframe.locals.(1)) with
-       | Vm_value.Live (Vm_value.Bool true), Vm_value.Live (Vm_value.Set [ e ])
-         when Vm_value.equal e (Vm_value.String "a") ->
-           pass
-             "set_remove: the matched element leaves the caller's set exactly once (Bool=true, set = {a}) and the removed channel drops it"
+       | Vm_value.Live (Vm_value.Bool true), Vm_value.Live (Vm_value.Set store) -> (
+           match Vm_value.set_elems store with
+           | [ e ] when Vm_value.equal e (Vm_value.String "a") ->
+               pass
+                 "set_remove: the matched element leaves the caller's set exactly once (Bool=true, set = {a}) and the removed channel drops it"
+           | _ -> fail "set_remove matched: wrong Bool/set shape after the call")
        | _ -> fail "set_remove matched: wrong Bool/set shape after the call"));
   let seed_resource (_vm : Vm.t) (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
-    frame.locals.(1) <- Vm_value.Live (Vm_value.Set [ ref_of res.(0) ]);
+    frame.locals.(1) <- Vm_value.Live (Vm_value.set_of_list [ ref_of res.(0) ]);
     frame.locals.(2) <- Vm_value.Live (ref_of res.(1))
   in
   (match seeded_run prog seed_resource 2 with
@@ -1614,7 +1617,7 @@ let check_map_insert_ownership () =
       |]
   in
   let seed (_vm : Vm.t) (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
-    frame.locals.(1) <- Vm_value.Live (Vm_value.Map []);
+    frame.locals.(1) <- Vm_value.Live Vm_value.map_empty;
     frame.locals.(2) <- Vm_value.Live (Vm_value.String "a");
     frame.locals.(3) <- Vm_value.Live (Vm_value.Array [| ref_of res.(0); ref_of res.(1) |]);
     frame.locals.(5) <- Vm_value.Live (Vm_value.String "a");
@@ -1652,17 +1655,22 @@ let check_map_insert_ownership () =
          [ run.sres.(0); run.sres.(1) ];
        expect_owned run.svm "map_insert replace: new V member (stored exactly once)"
          [ run.sres.(2) ];
-       (match (run.sframe.locals.(1), run.sframe.locals.(4)) with
-        | Vm_value.Live (Vm_value.Map [ (k, Vm_value.Array v2) ]),
-          Vm_value.Live (Vm_value.Enum (0, [| Vm_value.Array v1 |]))
-          when Vm_value.equal k (Vm_value.String "a") && Array.length v2 = 1
-               && Vm_value.equal v2.(0) (ref_of run.sres.(2)) && Array.length v1 = 2
-               && Vm_value.equal v1.(0) (ref_of run.sres.(0))
-               && Vm_value.equal v1.(1) (ref_of run.sres.(1)) ->
-            pass
-              "map_insert replace: old V returned in the Option (not dropped internally), new V stored exactly once"
-        | _ ->
-            fail "map_insert replace: wrong map/Option shape after the calls"));
+        (match (run.sframe.locals.(1), run.sframe.locals.(4)) with
+         | Vm_value.Live (Vm_value.Map store),
+           Vm_value.Live (Vm_value.Enum (0, [| Vm_value.Array v1 |])) -> (
+             match Vm_value.map_pairs store with
+             | [ (k, Vm_value.Array v2) ]
+               when Vm_value.equal k (Vm_value.String "a")
+                    && Array.length v2 = 1 && Array.length v1 = 2
+                    && Vm_value.equal v2.(0) (ref_of run.sres.(2))
+                    && Vm_value.equal v1.(0) (ref_of run.sres.(0))
+                    && Vm_value.equal v1.(1) (ref_of run.sres.(1)) ->
+                 pass
+                   "map_insert replace: old V returned in the Option (not dropped internally), new V stored exactly once"
+             | _ ->
+                 fail "map_insert replace: wrong map/Option shape after the calls")
+         | _ ->
+             fail "map_insert replace: wrong map/Option shape after the calls"));
   (match seeded_run prog seed 3 with
    | Setup_error m -> fail "map_insert caller drop: entry setup: %s" m
    | Ran_error (m, _) -> fail "map_insert caller drop trapped (a double drop?): %s" m

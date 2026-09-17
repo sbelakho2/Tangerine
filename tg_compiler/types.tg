@@ -3686,6 +3686,14 @@ struct TypeEnv
   # (TypedPattern), assembled at check_pattern's tail (the Closure /
   # Match / Let tree forms carry these records).
   typed_patterns: Map[Int, TypedPattern]
+ # (seed's const-call pattern fallback — check_pattern's PatVariant Error
+  # arm): per pattern node id, the scrutinee type of a BARE zero-arg path
+  # pattern on a non-enum subject (`when DT_DIR() then` against a u8
+  # `d_type`; the name is a zero-arg const function). The seed records
+  # `TP_literal (c, ty)`; the kernel records the scrutinee type here and
+  # typed_pattern_for builds the constant-pattern record (no expression
+  # node exists for the path spelling).
+  pattern_const_calls: Map[Int, Type]
   typed_aggregate_ownership: Map[Int, Vec[Bool]]
   closure_captures: Map[Int, Map[Int, AccessEffect]]
   access_marker_depth: Int
@@ -3933,6 +3941,7 @@ impl Clone for TypeEnv
       typed_exprs: self.typed_exprs.clone(),
       typed_stmts: self.typed_stmts.clone(),
       typed_patterns: self.typed_patterns.clone(),
+      pattern_const_calls: self.pattern_const_calls.clone(),
       typed_aggregate_ownership: self.typed_aggregate_ownership.clone(),
       closure_captures: self.closure_captures.clone(),
       access_marker_depth: self.access_marker_depth.clone(),
@@ -5351,13 +5360,23 @@ def typed_pattern_for(env: TypeEnv, pat: Pattern) -> Option[TypedPattern]
     if fields_ok then
       kind = Option::Some(TypedPatternKind::Struct { path: if path.segments.len() > 0 then path.segments.join("::") else "" end, fields: fields_typed })
     end
-  when PatternKind::Variant(_, pats) then
+  when PatternKind::Variant(path, pats) then
     match typed_patterns_of(env, &pats)
     when Option::Some(items) then
       match env.pattern_variant_resolutions.get(pat.node_id)
       when Option::Some((tid, vidx)) then
         kind = Option::Some(TypedPatternKind::Variant { variant: VariantId { owner: TypeId { id: tid }, index: vidx as UInt }, args: items })
-      when Option::None then ()
+      when Option::None then
+        # (seed's const-call pattern fallback): the bare zero-arg path on
+        # a non-enum subject records the constant pattern's scrutinee type
+        # (check_pattern's PatVariant Error arm); every other unresolved
+        # variant shape keeps the fail-closed missing-record ICE.
+        match env.pattern_const_calls.get(pat.node_id)
+        when Option::Some(call_ty) then
+          let const_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1].clone() else "" end
+          kind = Option::Some(TypedPatternKind::Literal(Box::new(TypedExpr { id: pat.node_id, ty: call_ty.clone(), kind: TypedExprKind::Global(const_name) })))
+        when Option::None then ()
+        end
       end
     when Option::None then ()
     end
@@ -6606,6 +6625,7 @@ def type_env_new() -> TypeEnv
     typed_exprs: Map::new(),
     typed_stmts: Map::new(),
     typed_patterns: Map::new(),
+    pattern_const_calls: Map::new(),
     typed_aggregate_ownership: Map::new(),
     closure_captures: Map::new(),
     access_marker_depth: 0,
@@ -9201,7 +9221,7 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
       when Option::Some(bound) then unify(env, bound, b, span)
       when Option::None then
         if occurs_check(env, id1, b, span.clone()) then
-          type_add_error(env, "infinite type", span)
+          type_add_error(env, "infinite type: ?T" + id1.id.to_string() + " occurs in " + type_display(env, &b), span)
           false
         else
           env.subst.insert(id1, b)
@@ -9216,7 +9236,7 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
       when Option::Some(bound2) then unify(env, a, bound2, span)
       when Option::None then
         if occurs_check(env, id2, a, span.clone()) then
-          type_add_error(env, "infinite type", span)
+          type_add_error(env, "infinite type: ?T" + id2.id.to_string() + " occurs in " + type_display(env, &a), span)
           false
         else
           env.subst.insert(id2, a)
@@ -9613,7 +9633,7 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
           when Option::Some(bound2) then unify(env, a, bound2, span)
           when Option::None then
             if occurs_check(env, id2, a, span.clone()) then
-              type_add_error(env, "infinite type", span)
+              type_add_error(env, "infinite type: ?T" + id2.id.to_string() + " occurs in " + type_display(env, &a), span)
               false
             else
               env.subst.insert(id2, a)
@@ -12819,6 +12839,25 @@ def contract_unify_probe(inout env: TypeEnv, a: Type, b: Type) -> Bool
   ok
 end
 
+# (canonical conformance identity): the comparison the impl-conformance
+# validation runs on a parameter/return position. The kernel's canonical,
+# ARG-AWARE type identity (type_identity_key — the structural key the
+# solver's cycle set and the signature/obligation tables use, the same
+# identity the host consumes) is consulted FIRST: two canonically
+# identical types conform even when a unification probe would decline
+# them for a representation difference (the builtin-vs-std declaration
+# ids already reconciled by store_type_def, tuple/alias spellings), and
+# a type with the same canonical args can never be a false mismatch.
+# Types that are NOT canonically identical fall through to the
+# transactional unifier, which proves equality structurally (and binds
+# inference variables in the process, with no residue on failure).
+def contract_types_conform(inout env: TypeEnv, impl_ty: Type, contract_ty: Type) -> Bool
+  if type_identity_key(env, impl_ty.clone()) == type_identity_key(env, contract_ty.clone()) then
+    return true
+  end
+  contract_unify_probe(env, impl_ty, contract_ty)
+end
+
 # (impl conformance): the per-method signature comparison — parameter
 # count (d), parameter types (e), access conventions (f), return type (g),
 # method generic arity (h), method generic bounds (i), effects (k) and
@@ -12904,8 +12943,13 @@ def check_impl_method_conformance(inout env: TypeEnv, contract: TraitContract, c
       valid = false
     end
     let contract_ty = contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &cpt.ty)
-    if !contract_unify_probe(env, ipt.ty.clone(), contract_ty) then
-      add_error_with_code(env, "parameter type mismatch: parameter " + pi.to_string() + " of method `" + cm.name + "` of trait `" + trait_name + "` has type `" + type_tag(env, &ipt.ty) + "`, the trait declares `" + type_tag(env, &cpt.ty) + "`", m.span, "E0224")
+    if !contract_types_conform(env, ipt.ty.clone(), contract_ty.clone()) then
+      # The render names the ARGS (type_display), so a genuine mismatch
+      # is visible: `Option[Int]` vs `Option[U]`, never two `Option`s
+      # that print identically. The declared side is the SUBSTITUTED
+      # contract type — the type the impl is actually being compared
+      # against.
+      add_error_with_code(env, "parameter type mismatch: parameter " + pi.to_string() + " of method `" + cm.name + "` of trait `" + trait_name + "` has type `" + type_display(env, &ipt.ty) + "`, the trait declares `" + type_display(env, &contract_ty) + "`", m.span, "E0224")
       valid = false
     end
     pi = pi + 1
@@ -12919,7 +12963,7 @@ def check_impl_method_conformance(inout env: TypeEnv, contract: TraitContract, c
   # obligation solve is transactional — no substitution or diagnostic
   # residue survives the probe.
   let contract_ret = contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &cm.ret_type)
-  var ret_ok = contract_unify_probe(env, im.ret_type.clone(), contract_ret.clone())
+  var ret_ok = contract_types_conform(env, im.ret_type.clone(), contract_ret.clone())
   if !ret_ok then
     match contract_ret
     when Type::Adt(rtid, rargs) then
@@ -12945,7 +12989,11 @@ def check_impl_method_conformance(inout env: TypeEnv, contract: TraitContract, c
     end
   end
   if !ret_ok then
-    add_error_with_code(env, "return type mismatch: method `" + cm.name + "` of trait `" + trait_name + "` returns `" + type_tag(env, &im.ret_type) + "`, the trait declares `" + type_tag(env, &cm.ret_type) + "`", m.span, "E0226")
+    # The render names the ARGS and the SUBSTITUTED declared type
+    # (contract_ret — after the impl's declared trait instantiation),
+    # so a genuine mismatch is visible: `Option[Array[T]]` vs
+    # `Option[T]`, never two `Option`s that print identically.
+    add_error_with_code(env, "return type mismatch: method `" + cm.name + "` of trait `" + trait_name + "` returns `" + type_display(env, &im.ret_type) + "`, the trait declares `" + type_display(env, &contract_ret) + "`", m.span, "E0226")
     valid = false
   end
 
@@ -13208,8 +13256,6 @@ def register_impl_head(inout env: TypeEnv, i: ImplDecl) -> Option[ImplRegState]
  # the AST's trait type arguments are the authority — resolve them
     # in the impl's generic scope (the exact declared reference, e.g. the
     # (K, V) tuple of `impl[K, V] Iterator[(K, V)] for MapIterator[K, V]`).
-    # The empty-vector fallback is the declaration-order derivation (an
-    # inherent impl, or a declaration whose arguments were not parsed).
     if i.trait_type_args.len() > 0 then
       var ta_expr = 0
       while ta_expr < i.trait_type_args.len() do
@@ -13217,18 +13263,25 @@ def register_impl_head(inout env: TypeEnv, i: ImplDecl) -> Option[ImplRegState]
         ta_expr = ta_expr + 1
       end
     else
-      # The declaration-order derivation runs ONLY for a trait that
-      # declares at least one type parameter. (§23): an ARITY-0 trait
-      # (Eq/Ord/Hash/Display/Clone-style core traits declare no type
-      # parameters) takes NO trait arguments — the impl's declared generic
-      # parameters, const parameters included, are the SELF TYPE's
-      # arguments only (`impl[const SCALE: Int] Eq for Decimal64[SCALE]`
-      # is expressible: Decimal64[SCALE] resolves against the impl-declared
-      # const parameter, and the trait reference stays argument-less), so
-      # the derivation pushes NOTHING into the trait reference. The
-      # exact-arity E0229 check then compares 0 declared against the empty
-      # reference and passes; the impl's head (whose const slot is the
-      # symbolic ConstParam) instantiates per obligation through head
+      # (declared instantiation absent): the impl declares NO trait
+      # instantiation — `impl[T] Trait for X[T]` with no `[Args]` after
+      # the trait name. The trait-argument COUNT of the declared
+      # reference is 0, NEVER the impl's binder list: deriving the
+      # reference from the impl's generic parameters re-derived the
+      # trait's arity from binder count and produced the E0229
+      # false-positive family (`impl[K: Clone, V] Iterator[K]` is 1
+      # declared trait argument, not 2). The exact-arity E0229 check
+      # below then compares the declared 0 against the trait's declared
+      # parameter count and reports every omission. (§23): an ARITY-0
+      # trait (Eq/Ord/Hash/Display/Clone-style core traits declare no
+      # type parameters) takes NO trait arguments — the impl's declared
+      # generic parameters, const parameters included, are the SELF
+      # TYPE's arguments only (`impl[const SCALE: Int] Eq for
+      # Decimal64[SCALE]` is expressible: Decimal64[SCALE] resolves
+      # against the impl-declared const parameter, and the trait
+      # reference stays argument-less), so the empty reference passes
+      # 0 == 0; the impl's head (whose const slot is the symbolic
+      # ConstParam) instantiates per obligation through head
       # unification — an Eq obligation on Decimal64[4] matches this impl
       # with SCALE bound to Const(4).
       var trait_decl_arity = -1
@@ -13236,13 +13289,13 @@ def register_impl_head(inout env: TypeEnv, i: ImplDecl) -> Option[ImplRegState]
       when Option::Some(tcontract_arity) then trait_decl_arity = tcontract_arity.generic_params.len()
       when Option::None then ()
       end
-      if trait_decl_arity != 0 then
-        # (§20 slice 1): the declaration-order derivation (the trait's type
-        # arguments ARE the impl's declared parameters — only valid while
-        # EVERY parameter is a type parameter; a const generic parameter in
-        # the impl list makes the derivation unsound (a const position is not
-        # a trait type argument), so it is rejected with a diagnostic instead
-        # of silently pushing Type::Param into a const parameter's slot).
+      if trait_decl_arity > 0 then
+        # (§20 slice 1): a const generic parameter in the impl list can
+        # never be a trait type argument, and with no declared
+        # instantiation there is nothing to derive from — an explicit
+        # instantiation is required, reported with the dedicated
+        # diagnostic (the E0229 arity row follows from the empty
+        # declared reference).
         var const_in_impl = false
         var cpi = 0
         while cpi < i.generic_params.len() do
@@ -13254,11 +13307,6 @@ def register_impl_head(inout env: TypeEnv, i: ImplDecl) -> Option[ImplRegState]
         end
         if const_in_impl then
           type_add_error(env, "an impl declaring a const generic parameter must state the trait's type arguments explicitly (`impl[T, const N: UInt] Trait[Args] for Type`)", i.span)
-        end
-        var ta_idx = 0
-        while ta_idx < impl_param_ids.len() do
-          imp_trait_args.push(Type::Param(impl_param_ids[ta_idx].clone()))
-          ta_idx = ta_idx + 1
         end
       end
     end
@@ -15927,6 +15975,14 @@ def check_pattern(inout env: TypeEnv, pat: Pattern, expected: Type, source_place
       # No resolution record (permissive recovery — the junction records
       # every variant node on the compilation path): accept the pattern
       # structurally, checking the sub-patterns against fresh variables.
+      # (seed's const-call pattern fallback — the PatVariant Error arm): a
+      # BARE zero-arg path on a non-enum subject is the zero-arg const
+      # function's value (`when DT_DIR() then` against a u8 `d_type`); the
+      # scrutinee type is recorded so the typed-HIR assembly builds the
+      # constant-pattern record (the seed's TP_literal (c, ty)).
+      if path.segments.len() == 1 && pats.len() == 0 && pat.node_id != 0 then
+        env.pattern_const_calls.insert(pat.node_id, expected.clone())
+      end
       var fi = 0
       while fi < pats.len() do
         check_pattern(env, &pats[fi], fresh_type_var(env), source_place.clone())
@@ -19612,13 +19668,40 @@ def find_method_expected_args(inout env: TypeEnv, recv_type: Type, method: Strin
   end
 end
 
+# The NOMINAL view of a builtin raw-pointer type: the std's `Ptr[T]` /
+# `PtrMut[T]` declarations own the pointer's fields (`address: UInt`), while
+# the checker's canonical spelling of a pointer type is the builtin
+# `Type::Ptr` / `Type::PtrMut` form (resolve_type_expr folds the std names
+# into the builtin form — the Box/Rc families keep their Adt identity, the
+# pointers do not). A field lookup on a pointer receiver must resolve
+# against the nominal struct, exactly like Box: otherwise `p.address` finds
+# no FieldId, the name-based fallback types it silently (a fresh var) and
+# MIR lowering's strict identity lookup rejects the program (fail-closed
+# `missing typed field target`; the `sv_cptr.address == 0` shape throughout
+# std/ffi.tg's Ptr impl/consumers). No LangItem registered (a program
+# without the std pointer declarations) → None: the old behavior.
+def builtin_ptr_nominal_ty(env: TypeEnv, ty: Type) -> Option[Type]
+  match ty
+  when Type::Ptr(t) then
+    if env.lang_items.ptr != -1 then Option::Some(Type::Adt(TypeId { id: env.lang_items.ptr }, [t])) else Option::None end
+  when Type::PtrMut(t) then
+    if env.lang_items.ptr_mut != -1 then Option::Some(Type::Adt(TypeId { id: env.lang_items.ptr_mut }, [t])) else Option::None end
+  when _ then Option::None
+  end  end
+end
+
 def field_target_of(env: TypeEnv, recv_type: Type, field: String) -> Option[FieldId]
   # Auto-deref through BORROWS only. A Box receiver resolves its OWN
   # fields (`b.ptr` is the wrapper's field; nominal identity — Box[T] is
-  # never unwrapped to T).
-  let base = match recv_type
+  # never unwrapped to T). A builtin raw-pointer receiver resolves against
+  # its std nominal declaration the same way (see builtin_ptr_nominal_ty).
+  let base0 = match recv_type
   when Type::RefInternal(inner, _) then inner
   when _ then recv_type
+  end
+  let base = match builtin_ptr_nominal_ty(env, base0)
+  when Option::Some(named) then named
+  when Option::None then base0
   end
   match base
   when Type::Adt(tid, _) then
@@ -19649,10 +19732,17 @@ end
 # the field NAME is used only for diagnostics.
 def field_type_by_id(inout env: TypeEnv, recv_type: Type, owner: TypeId, index: Int, field: String, span: Span) -> Type
   # Auto-deref through BORROWS only (Box keeps its nominal identity: the
-  # field id's owner IS the Box, never its pointee).
-  let base = match recv_type
+  # field id's owner IS the Box, never its pointee). The builtin
+  # raw-pointer forms resolve their fields against the std nominal
+  # Ptr/PtrMut declarations — the same view field_target_of recorded the
+  # FieldId from (see builtin_ptr_nominal_ty).
+  let base0 = match recv_type
   when Type::RefInternal(inner, _) then inner
   when _ then recv_type
+  end
+  let base = match builtin_ptr_nominal_ty(env, base0)
+  when Option::Some(named) then named
+  when Option::None then base0
   end
   match base
   when Type::Adt(tid, _) then
@@ -21280,11 +21370,14 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
       var pi = 0
       while pi < args.len() && pi < inst_params.len() do
         let pt = inst_params[pi]
-        # (seed's ref_to_raw_ptr): an explicit-ref argument at a raw-pointer
-        # parameter is the borrow-to-pointer coercion (see
-        # unify_call_arg_borrow_to_ptr) — the direct unification is the
-        # fallback for every other argument shape.
-        if !unify_call_arg_borrow_to_ptr(env, args[pi].clone(), arg_types[pi].clone(), pt.ty.clone(), args[pi].span) then
+        # (seed's call-boundary adaptation): an explicit-ref argument goes
+        # through the deref-first / borrow-to-pointer reconciliation
+        # (unify_call_arg_with_access_marker); every other argument shape
+        # is the plain argument-parameter unification.
+        match args[pi].kind
+        when ExprKind::ExprAccess(_) then
+          unify_call_arg_with_access_marker(env, arg_types[pi].clone(), pt.ty.clone(), args[pi].span.clone())
+        when _ then
           unify(env, arg_types[pi], pt.ty, args[pi].span)
         end
         record_arg_effect(env, &args[pi], pt.convention)
@@ -21666,7 +21759,18 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
     end
     ret
   when ExprKind::ExprFieldAccess(recv, field) then
-    let recv_type = check_expr(env, *recv.get())
+    let recv_expr = *recv.get()
+    # (seed check_field parity): the base may carry a STALE UNSOLVED VAR
+    # from an earlier call — the call arm returns the fresh result var
+    # UNCHASED for a non-generic callee (its `ret_type` is unified with
+    # the declared return type but the arm hands the var back) — so the
+    # substitution is chased BEFORE the field projection, exactly like
+    # the seed's check_field. Without the chase `field_target_of` sees a
+    # Type::Var, the name-based fallback types the access WITHOUT
+    # recording the FieldId, and MIR lowering's strict identity lookup
+    # rejects the program (fail-closed `missing typed field target`; the
+    # `RUBY_Qnil().raw` shape in std/ffi.tg's merged closure).
+    let recv_type = resolve_type_var(env, check_expr(env, &recv_expr))
     let fdid = field_target_of(env, &recv_type, field)
     # The FieldId (owner TypeId + index) is the semantic field identity: it is
     # recorded in typed_field_targets (Map[Int, FieldId]) and the field's type
@@ -22682,15 +22786,23 @@ def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, 
       var ai2 = 0
       while ai2 < args.len() do
         arg_tys.push(check_expr(env, &args[ai2]))
-        # The unregistered-form fallback (vec![..] / Vec::from([..]) — the
-        # array-literal payload arg) consumes the payload the same way: the
-        # arg node records AccessEffect::Consume into the construction (the
-        # literal's elements are consumed into the array by the
-        # array-literal aggregate-ownership record).
-        env.typed_access_effects.insert(args[ai2].node_id, AccessEffect::Consume)
-        # (partial moves): a projected OWNING payload is moved out of its
-        # root (see the registered-variant arm).
-        record_projected_consume(env, &args[ai2])
+        # Every argument carries an effect record from here (the typed-HIR
+        # call assembly and the MIR's call-arg lookups require one per
+        # argument). The DEFAULT is the unregistered-form aggregate payload
+        # rule (vec![..] / Vec::from([..]): the payload is consumed into
+        # the construction). A RESOLVED static-path associated method then
+        # OVERWRITES it with the argument's own convention (the
+        # record_arg_effect in the candidate loop below); an explicit
+        # `&place` argument is a BORROW on every shape — the seed records
+        # `read` for it and the marker never transfers ownership (the
+        # sink-parameter gate rejects `&place` at a sink parameter).
+        match args[ai2].kind
+        when ExprKind::ExprAccess(_) then
+          env.typed_access_effects.insert(args[ai2].node_id, AccessEffect::Read)
+        when _ then
+          env.typed_access_effects.insert(args[ai2].node_id, AccessEffect::Consume)
+          record_projected_consume(env, &args[ai2])
+        end
         ai2 = ai2 + 1
       end
       env.access_marker_depth = env.access_marker_depth - 1
@@ -22840,7 +22952,20 @@ def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, 
                             let sp_errs = env.errors.len()
                             let sp_uok = try_head_unify(env, arg_tys[sai].clone(), sp_inst_params[sai].ty.clone())
                             if sp_uok then
-                              ()
+                              # (the per-argument effect record): a
+                              # RESOLVED static-path associated call
+                              # records each argument's effect from the
+                              # resolved method's OWN convention —
+                              # overwriting the unregistered-form
+                              # fallback's blanket
+                              # AccessEffect::Consume (the vec! /
+                              # Vec::from([..]) payload shape). Without
+                              # this, `String::from_utf8_range(&buf, ..)`
+                              # (whose `data: Vec[u8]` is a by-value let
+                              # parameter) marked `&buf` as a MOVE, and the
+                              # resource checker consumed the caller's
+                              # buffer (std/fs.tg's read_dir loop).
+                              record_arg_effect(env, &args[sai], sp_inst_params[sai].convention)
                             else
                               subst_restore(env, &sp_snap)
                               errors_truncate(env, sp_errs)
@@ -22990,10 +23115,17 @@ def resolve_field_type(inout env: TypeEnv, recv_type: Type, field: String, span:
   end
 
   # Auto-deref through BORROWS only (RefInternal). Box is NOT deref-
-  # transparent: `b.ptr` is resolved on the Box nominal itself.
-  let base = match recv_type
+  # transparent: `b.ptr` is resolved on the Box nominal itself. The
+  # builtin raw-pointer forms resolve against the std nominal
+  # Ptr/PtrMut declarations (see builtin_ptr_nominal_ty) so `p.address`
+  # types as the declared field, never a silent fresh var.
+  let base0 = match recv_type
   when Type::RefInternal(inner, _) then inner
   when _ then recv_type
+  end
+  let base = match builtin_ptr_nominal_ty(env, base0)
+  when Option::Some(named) then named
+  when Option::None then base0
   end
 
   # Guard: if base after deref is Error, return Error
@@ -25437,29 +25569,51 @@ def raw_deref_pointee(inout env: TypeEnv, inner_type: Type, strict: Bool, span: 
   end  end
 end
 
-# (seed's ref_to_raw_ptr — the borrow-to-pointer call-boundary coercion):
-# `&place` at an ABI/intrinsic boundary whose parameter is a raw pointer
-# (Ptr[T]/PtrMut[T] — __sync_fetch_and_add,
-# __sync_val_compare_and_swap_uint and the allocator internals) IS the
-# language's explicit borrow-to-pointer coercion: the address-of the
-# place, typed as the pointer itself. The kernel's ExprAccess passthrough
-# types `&x` as x, so at a Ptr[T] parameter the pointee (x's type) is
-# unified with T and the coercion accepted. Returns true when the rule
-# applied (the caller skips its direct arg-param unification).
-def unify_call_arg_borrow_to_ptr(inout env: TypeEnv, arg: Expr, arg_ty: Type, param_ty: Type, span: Span) -> Bool
-  match arg.kind
-  when ExprKind::ExprAccess(_) then
-    let param_norm = normalize_adt_for_unify(env, param_ty.clone())
-    match param_norm
-    when Type::Ptr(pointee) then
+# (seed's deref_first + ref_to_raw_ptr — the call-boundary adaptation for
+# an explicit-ref argument, `&place`): the kernel's ExprAccess passthrough
+# types `&x` as x, so the DIRECT unification with the declared parameter
+# is exactly the seed's Ref-inner-vs-pt unification (`&handle` at a
+# Ptr[u8] parameter: the place IS a pointer — accepted). When the place
+# is a concrete NON-pointer at a raw-pointer parameter, the coercion
+# applies: the place's type is the pointer's POINTEE
+# (`__sync_fetch_and_add(&vec.as_mut().len, 1)`: the place is UInt and
+# the parameter is Ptr[UInt]). An unresolved place keeps the seed's
+# ordering transactionally (direct first, the pointee coercion as the
+# rollback fallback). Only the pointer-parameter shape is special; every
+# other argument keeps the plain argument-parameter unification.
+def unify_call_arg_with_access_marker(inout env: TypeEnv, arg_ty: Type, param_ty: Type, span: Span) -> Unit
+  let param_norm = normalize_adt_for_unify(env, param_ty.clone())
+  match param_norm
+  when Type::Ptr(pointee) then
+    unify_access_marker_vs_ptr(env, arg_ty, param_ty, pointee, span)
+  when Type::PtrMut(pointee) then
+    unify_access_marker_vs_ptr(env, arg_ty, param_ty, pointee, span)
+  when _ then
+    unify(env, arg_ty, param_ty, span)
+  end  end
+end
+
+# The pointer-parameter case of the access-marker adaptation. A concrete
+# pointer-typed place takes the direct unification (deref_first); a
+# concrete non-pointer place IS the pointee (the coercion); an unresolved
+# place runs the seed's order transactionally — the direct attempt first
+# (the place may be the pointer), the pointee coercion on rollback.
+def unify_access_marker_vs_ptr(inout env: TypeEnv, arg_ty: Type, param_ty: Type, pointee: Type, span: Span) -> Unit
+  let arg_norm = normalize_adt_for_unify(env, arg_ty.clone())
+  match arg_norm
+  when Type::Ptr(_) then unify(env, arg_ty, param_ty, span)
+  when Type::PtrMut(_) then unify(env, arg_ty, param_ty, span)
+  when Type::Var(_) then
+    let snap = subst_snapshot(env)
+    let errors_before = env.errors.len()
+    let direct_ok = unify(env, arg_ty.clone(), param_ty.clone(), span.clone())
+    if !direct_ok then
+      subst_restore(env, &snap)
+      errors_truncate(env, errors_before)
       unify(env, arg_ty, pointee, span)
-      true
-    when Type::PtrMut(pointee) then
-      unify(env, arg_ty, pointee, span)
-      true
-    when _ then false
     end
-  when _ then false
+  when _ then
+    unify(env, arg_ty, pointee, span)
   end  end
 end
 

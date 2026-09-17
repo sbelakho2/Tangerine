@@ -4,16 +4,29 @@
 #   PARAM  — "generic parameter (Type::Param) ..." gate rows
 #   INFER  — "cannot infer type parameter/const parameter ..." rows
 #   UNIFY  — "cannot unify ..." rows
+#   IMPLCONF — the impl-conformance rows (E0229 trait argument count,
+#              E0226 return type, E0224 parameter type) that the in-VM
+#              kernel must agree with the host typechecker on.
 #
-# Two modes:
+# Modes:
 #   1. a standalone battery of the representative expected-type shapes
 #      (call results solved from the use-site's declared type, generic
 #      call instantiation from the expected type, enum-path values,
 #      casts, chained destinations);
 #   2. the merged corpus mode (flag build/infer_merged.flag) — the
 #      differential corpus entry + the std preludes merged exactly like
-#      the kernel's compile path, type-checked by the REAL kernel checker;
-#      every family row is counted and written to build/infer_probe.txt.
+#      the kernel's compile path AND prepared with the SAME canonical
+#      preparation the real compile path runs (apply_cfg_elimination +
+#      prepare_parsed: macro expansion + node-id assignment), then
+#      type-checked by the REAL kernel checker; every family row is
+#      counted and written to build/infer_probe.txt.
+#
+# Plus the MIR LOWERING regression (flag build/infer_lower.flag, the
+# `tg_infer --lower` mode): the REAL compile path (analyze_parsed) then
+# lower_to_mir TWICE over the same borrowed tree — the lowering
+# ownership contract's executable pin (the pre-fix `into_inner()`
+# extractions freed the borrowed tree's boxes and the second pass
+# trapped on the freed region).
 #
 # bootstrap/infer_mini.manifest closes it under the seed VM;
 # stage0_ocaml/selfcheck/tg_infer.ml runs it as the focused regression.
@@ -21,10 +34,14 @@ use std::core::{Option, Result}
 use std::collections::{Vec, Map, Set}
 use std::fs::{read_file, write_file, file_exists}
 use tg_compiler::lexer::{tokenize}
-use tg_compiler::parser::{parse, diag_has_errors}
+use tg_compiler::parser::{parse, diag_has_errors, Diagnostic}
 use tg_compiler::ast::{assign_node_ids, Program, Item, ItemId, ModuleId, Module, Crate, UseDecl, Span}
 use tg_compiler::resolver::{resolve_names}
-use tg_compiler::types::{type_env_new, type_check_typed}
+use tg_compiler::types::{type_env_new, type_check_typed, TypeCheckResult, type_display}
+use tg_compiler::compiler_core::{default_options, apply_cfg_elimination, prepare_parsed, analyze_parsed}
+use tg_compiler::mir::{lower_to_mir}
+use tg_compiler::access_check::{access_check, AccessError}
+use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_context_new, ResourceError, engine_env_empty}
 
 # The family classification: every kernel diagnostic that names one of the
 # four inference/expected-type families. The order resolves the only
@@ -367,6 +384,271 @@ def infer_probe_run_case(label: String, source: String, inout report: String, in
 end
 
 # ———————————————————————————————————————————————————————————————
+# the INTEGRATED resource/access pass (the gate's [6/10] lane consumed
+# through the kernel's own checkers): the SAME sequence the real compile
+# path runs in compiler_core's analyze_parsed — build_typed_cfg ONCE,
+# access_check over the shared AnalysisContext, then resource_check with
+# the typechecker's engine snapshot. Every ResourceError is bucketed by
+# class (maybe-consumed / let-param-readonly / owned-result-dropped /
+# consume-in-loop / created-in-loop / inout-param / consumed-twice /
+# use-after-consume / use-uninitialized / other) and reported with its
+# file:site and source snippet, plus a per-file tally. This is the
+# iteration harness: the resource parity work is measured here without
+# the full compile.
+# ———————————————————————————————————————————————————————————————
+
+# (temporary effect-channel debug): dump every recorded access effect with
+# its node's resolved type, so a Consume record on an argument can be
+# attributed to the exact call shape. Gated on build/infer_effects.flag.
+def infer_probe_dump_effects(typed: TypedProgram, label: String, inout report: String) -> Unit
+  report = report + "EFFECTS " + label.clone() + " count=" + typed.access_effects.len().to_string() + "\n"
+  for (nid, eff) in typed.access_effects do
+    var word = "read"
+    match eff
+    when AccessEffect::Read then word = "read"
+    when AccessEffect::Consume then word = "consume"
+    when AccessEffect::Modify then word = "modify"
+    when AccessEffect::Initialize then word = "initialize"
+    end
+    var ty_s = "?"
+    match typed.expr_types.get(nid)
+    when Option::Some(t) then ty_s = type_display(engine_env_empty(), t.clone())
+    when Option::None then ()
+    end
+    var local_s = ""
+    match typed.ident_resolutions.get(nid)
+    when Option::Some(lid) then local_s = " local=" + lid.to_string()
+    when Option::None then ()
+    end
+    var call_s = ""
+    match typed.call_targets.get(nid)
+    when Option::Some(_) then call_s = " call-target"
+    when Option::None then ()
+    end
+    report = report + "  EFF " + label.clone() + " node=" + nid.to_string() + " " + word + " type=" + ty_s + local_s + call_s + "\n"
+  end
+end
+
+def infer_probe_resource_class(msg: String) -> String
+  if msg.contains("may be consumed on one path") then return "maybe-consumed" end
+  if msg.contains("let parameter is read-only") then return "let-param-readonly" end
+  if msg.contains("owned resource result must be consumed") then return "owned-result-dropped" end
+  if msg.contains("cannot be consumed inside a repeatable loop") then return "consume-in-loop" end
+  if msg.contains("created in loop") then return "created-in-loop" end
+  if msg.contains("inout parameter may be modified but not consumed") then return "inout-param" end
+  if msg.contains("consumed twice") then return "consumed-twice" end
+  if msg.contains("use of consumed") then return "use-after-consume" end
+  if msg.contains("use of uninitialized") then return "use-uninitialized" end
+  "other"
+end
+
+def infer_probe_resource_class_index(cls: String) -> Int
+  if cls == "maybe-consumed" then 0
+  elsif cls == "let-param-readonly" then 1
+  elsif cls == "owned-result-dropped" then 2
+  elsif cls == "consume-in-loop" then 3
+  elsif cls == "created-in-loop" then 4
+  elsif cls == "inout-param" then 5
+  elsif cls == "consumed-twice" then 6
+  elsif cls == "use-after-consume" then 7
+  elsif cls == "use-uninitialized" then 8
+  else 9
+  end
+end
+
+def infer_probe_resource_class_name(i: Int) -> String
+  if i == 0 then "maybe-consumed"
+  elsif i == 1 then "let-param-readonly"
+  elsif i == 2 then "owned-result-dropped"
+  elsif i == 3 then "consume-in-loop"
+  elsif i == 4 then "created-in-loop"
+  elsif i == 5 then "inout-param"
+  elsif i == 6 then "consumed-twice"
+  elsif i == 7 then "use-after-consume"
+  elsif i == 8 then "use-uninitialized"
+  else "other"
+  end
+end
+
+def infer_probe_resource_note_file(inout keys: Vec[String], inout counts: Vec[Int], file: String) -> Unit
+  var ki = 0
+  var found = -1
+  while ki < keys.len() do
+    if keys[ki] == file then found = ki end
+    ki = ki + 1
+  end
+  if found < 0 then
+    keys.push(file.clone())
+    counts.push(1)
+  else
+    counts.set(found, counts[found] + 1)
+  end
+end
+
+# Run the integrated access + resource pass over an already-prepared
+# program (the typechecker's result carries the typed HIR and the engine
+# snapshot). Every resource diagnostic is classified, counted and (for the
+# first 60 of each class) printed with its source line. Returns the number
+# of access findings (must be 0 for a clean closure).
+def infer_probe_run_resource_pass(program: Program, tr: TypeCheckResult, label: String, inout report: String, inout res_counts: Vec[Int], inout res_shown: Vec[Int], inout res_rows: Vec[String], inout res_row_counts: Vec[Int], inout res_row_samples: Vec[String], inout res_files: Vec[String], inout res_file_counts: Vec[Int], inout snippet_cache: Map[String, String], show_all: Bool) -> Int
+  let cfg = build_typed_cfg(&program, &tr.program.typed)
+  var actx = analysis_context_new()
+  let access_errors = access_check(&program, &tr.program.typed, &cfg, &mut actx)
+  var engine_snapshot = tr.program.engine_snapshot
+  let res_result = resource_check(&program, &tr.program.typed, &cfg, &mut actx, &mut engine_snapshot)
+  var ai = 0
+  while ai < access_errors.len() do
+    if show_all && ai < 60 then
+      let asp = access_errors[ai].span.clone()
+      report = report + "  AR " + label.clone() + " " + asp.file.clone() + ":" + asp.start.to_string() + ": " + access_errors[ai].message.clone() + "\n"
+    end
+    ai = ai + 1
+  end
+  var i = 0
+  while i < res_result.errors.len() do
+    let err = res_result.errors[i]
+    let cls = infer_probe_resource_class(err.message.clone())
+    let ci = infer_probe_resource_class_index(cls.clone())
+    res_counts.set(ci, res_counts[ci] + 1)
+    let sp = err.span.clone()
+    infer_probe_resource_note_file(&mut res_files, &mut res_file_counts, sp.file.clone())
+    let snippet = infer_probe_src_snippet(&mut snippet_cache, sp.file.clone(), sp.start)
+    let sample = err.message.clone() + " @" + sp.file.clone() + ":" + sp.start.to_string() + " | " + snippet.clone()
+    infer_probe_note_row(&mut res_rows, &mut res_row_counts, &mut res_row_samples, cls.clone(), sp.file.clone(), sp.start, sample)
+    if res_shown[ci] < 60 then
+      report = report + "  RR " + label.clone() + " " + sp.file.clone() + ":" + sp.start.to_string() + " [" + cls.clone() + "] " + err.message.clone() + " | " + snippet.clone() + "\n"
+      res_shown.set(ci, res_shown[ci] + 1)
+    end
+    i = i + 1
+  end
+  report = report + label.clone() + ": items=" + program.items.len().to_string() + " access=" + access_errors.len().to_string() + " resource=" + res_result.errors.len().to_string() + "\n"
+  res_result.errors.len()
+end
+
+# ———————————————————————————————————————————————————————————————
+# the MIR LOWERING stage (the freed-region regression): the kernel's
+# lowering is a READ-ONLY pass over a BORROWED, aliased AST (mir.tg's
+# lower_program contract comment). This stage runs the REAL compile
+# path — analyze_parsed (canonical preparation + strict resolve +
+# typecheck + access + resource) — and then lowers the SAME tree TWICE:
+# the second pass re-reads every Box[Expr] the first pass read, so any
+# ownership-taking extraction (the pre-fix `into_inner()` sites) has
+# deallocated a region the owner still holds and the VM traps with
+# `host call __intrinsic_ptr_read: access to freed region` — the exact
+# bootstrap failure (`... in qualify_field_callee_name ...`). The rows
+# are the assertion targets of `tg_infer --lower`:
+#   MIR_LOWER <label> functions=N errors=0
+#   MIR_RELOWER <label> functions=N errors=0
+# ———————————————————————————————————————————————————————————————
+def infer_probe_lower_program(program: Program, label: String, inout report: String) -> Int
+  var env = type_env_new()
+  env.strict_resolution = true
+  let opts = default_options()
+  report = report + "MIR_ANALYZE " + label.clone() + " begin\n"
+  let _ = write_file("build/infer_probe.txt", report.clone())
+  match analyze_parsed(&mut env, &mut program, opts)
+  when Result::Ok(analyzed) then
+    report = report + "MIR_ANALYZE " + label.clone() + " ok\n"
+    let _ = write_file("build/infer_probe.txt", report.clone())
+    match lower_to_mir(&program, &analyzed)
+    when Result::Ok(mir) then
+      report = report + "MIR_LOWER " + label.clone() + " functions=" + mir.functions.len().to_string() + " errors=0\n"
+      let _ = write_file("build/infer_probe.txt", report.clone())
+      match lower_to_mir(&program, &analyzed)
+      when Result::Ok(mir2) then
+        report = report + "MIR_RELOWER " + label.clone() + " functions=" + mir2.functions.len().to_string() + " errors=0\n"
+        let _ = write_file("build/infer_probe.txt", report.clone())
+        0
+      when Result::Err(e2) then
+        report = report + "MIR_RELOWER " + label.clone() + " error=" + e2.clone() + "\n"
+        let _ = write_file("build/infer_probe.txt", report.clone())
+        2
+      end
+    when Result::Err(e) then
+      report = report + "MIR_LOWER " + label.clone() + " error=" + e.clone() + "\n"
+      let _ = write_file("build/infer_probe.txt", report.clone())
+      2
+    end
+  when Result::Err(diags) then
+    report = report + "MIR_LOWER " + label.clone() + " analyze-diags=" + diags.len().to_string() + "\n"
+    var di = 0
+    while di < diags.len() && di < 6 do
+      report = report + "  MDA " + label.clone() + " " + diags[di].message.clone() + "\n"
+      di = di + 1
+    end
+    let _ = write_file("build/infer_probe.txt", report.clone())
+    2
+  end
+end
+
+# the lowering SHAPE entry: a tiny inline program through the SAME
+# analyze + double-lowering sequence as the merged stage.
+def infer_probe_run_lower_shape(label: String, source: String, inout report: String) -> Int
+  let parsed = parse(tokenize(source.clone(), label.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "MIR_LOWER " + label.clone() + " parse-failed\n"
+    return 2
+  end
+  var program = parsed.program
+  infer_probe_lower_program(program, label, &mut report)
+end
+
+def infer_probe_resource_totals_word(res_counts: Vec[Int]) -> String
+  "RESOURCE errors=" + (res_counts[0] + res_counts[1] + res_counts[2] + res_counts[3] + res_counts[4] + res_counts[5] + res_counts[6] + res_counts[7] + res_counts[8] + res_counts[9]).to_string() +
+    " maybe-consumed=" + res_counts[0].to_string() +
+    " let-param-readonly=" + res_counts[1].to_string() +
+    " owned-result-dropped=" + res_counts[2].to_string() +
+    " consume-in-loop=" + res_counts[3].to_string() +
+    " created-in-loop=" + res_counts[4].to_string() +
+    " inout-param=" + res_counts[5].to_string() +
+    " consumed-twice=" + res_counts[6].to_string() +
+    " use-after-consume=" + res_counts[7].to_string() +
+    " use-uninitialized=" + res_counts[8].to_string() +
+    " other=" + res_counts[9].to_string()
+end
+
+# the SHAPE battery entry: a tiny inline program through the SAME
+# preparation (assign_node_ids -> resolve -> typecheck -> the integrated
+# resource pass), every diagnostic printed verbatim — the construct-level
+# kernel-vs-seed parity channel of the resource work.
+def infer_probe_run_shape(label: String, source: String, inout report: String, inout res_counts: Vec[Int], inout res_shown: Vec[Int], inout res_rows: Vec[String], inout res_row_counts: Vec[Int], inout res_row_samples: Vec[String], inout res_files: Vec[String], inout res_file_counts: Vec[Int], inout snippet_cache: Map[String, String]) -> Int
+  let parsed = parse(tokenize(source.clone(), label.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "SHAPE " + label.clone() + ": parse-failed\n"
+    return 0
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    if result.errors.len() > 0 then
+      report = report + "SHAPE " + label.clone() + ": typecheck errors=" + result.errors.len().to_string() + "\n"
+      var ei = 0
+      while ei < result.errors.len() && ei < 6 do
+        report = report + "    TE " + result.errors[ei].message.clone() + "\n"
+        ei = ei + 1
+      end
+      return 0
+    end
+    report = report + "SHAPE " + label.clone() + ":\n"
+    # seed the snippet cache under the shape's label so every diagnostic's
+    # offset renders the exact source text at the span.
+    snippet_cache.insert(label.clone(), source.clone())
+    if file_exists("build/infer_effects.flag") then
+      infer_probe_dump_effects(result.program.typed, label.clone(), &mut report)
+    end
+    infer_probe_run_resource_pass(program, result, "shape:" + label.clone(), report, res_counts, res_shown, res_rows, res_row_counts, res_row_samples, res_files, res_file_counts, snippet_cache, true)
+    0
+  when Result::Err(errs) then
+    report = report + "SHAPE " + label.clone() + ": resolve-failed=" + errs.len().to_string() + "\n"
+    0
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # merged corpus mode — the a4/c3/c5 probe loader pattern (strip
 # debug_assert statements, load the preludes + their `use` dependencies,
 # merge every item into one program with per-item owner modules, then run
@@ -582,7 +864,15 @@ def infer_probe_note_row(inout keys: Vec[String], inout counts: Vec[Int], inout 
   end
 end
 
-def infer_probe_run_merged(corpus_path: String, inout report: String, inout counts: Vec[Int], inout rows: Vec[String], inout row_counts: Vec[Int], inout row_samples: Vec[String]) -> Int
+# The impl-conformance class: the trait-impl conformance diagnostics
+# (E0229 trait argument count, E0226 return type, E0224 parameter type,
+# E0225 access convention) — the rows the in-VM kernel must agree with
+# the host typechecker on.
+def infer_probe_implconf_code(code: String) -> Bool
+  code == "E0229" || code == "E0226" || code == "E0224" || code == "E0225"
+end
+
+def infer_probe_run_merged(corpus_path: String, inout report: String, inout counts: Vec[Int], inout rows: Vec[String], inout row_counts: Vec[Int], inout row_samples: Vec[String], inout res_counts: Vec[Int], inout res_shown: Vec[Int], inout res_rows: Vec[String], inout res_row_counts: Vec[Int], inout res_row_samples: Vec[String], inout res_files: Vec[String], inout res_file_counts: Vec[Int], inout snippet_cache: Map[String, String]) -> Int
   let source = match read_file(corpus_path.clone())
   when Result::Ok(s) then s
   when Result::Err(_) then
@@ -628,7 +918,26 @@ def infer_probe_run_merged(corpus_path: String, inout report: String, inout coun
     crate: Crate { root: root_id, modules: merged_modules },
     span: parsed.program.span.clone()
   }
-  assign_node_ids(&mut program)
+  # (the lowering regression input): the RAW merged program — the
+  # lowering stage below feeds analyze_parsed (which runs its own
+  # canonical preparation), so it must start from the unprepared tree.
+  let raw_program = program.clone()
+  # (canonical preparation — the REAL compile path's analyze_parsed head):
+  # @cfg elimination, then prepare_parsed (macro expansion + node-id
+  # assignment). The merged mode MUST run this: the kernel's impl
+  # conformance reads the impl's DECLARED trait instantiation
+  # (`impl[K, V] Iterator[K] for ...` -> 1 trait argument), so any
+  # preparation pass that rewrites impl items must preserve it end to
+  # end — skipping the preparation would hide exactly the family this
+  # probe exists to pin.
+  let prep_opts = default_options()
+  apply_cfg_elimination(&mut program, prep_opts)
+  var prep_diags: Vec[Diagnostic] = Vec::new()
+  prepare_parsed(&mut program, &mut prep_diags)
+  if diag_has_errors(&prep_diags) then
+    report = report + "MERGED: canonical preparation failed (" + prep_diags.len().to_string() + " diagnostic(s))\n"
+    return 2
+  end
   match resolve_names(program)
   when Result::Ok(res) then
     var env = type_env_new()
@@ -638,10 +947,12 @@ def infer_probe_run_merged(corpus_path: String, inout report: String, inout coun
     var n_param = 0
     var n_infer = 0
     var n_unify = 0
+    var n_implconf = 0
     var shown_var = 0
     var shown_param = 0
     var shown_infer = 0
     var shown_unify = 0
+    var shown_implconf = 0
     var snippet_cache: Map[String, String] = Map::new()
     var shown_residual = 0
     var i = 0
@@ -677,6 +988,20 @@ def infer_probe_run_merged(corpus_path: String, inout report: String, inout coun
           shown_unify = shown_unify + 1
         end
       end
+      # (impl-conformance class): the E0229/E0226/E0224/E0225 rows — the
+      # in-VM kernel's trait-impl conformance verdicts. These MUST be 0:
+      # the host typechecker reports 0 errors on the same modules.
+      let ecode = match result.errors[i].code
+      when Option::Some(c) then c.clone()
+      when Option::None then ""
+      end
+      if infer_probe_implconf_code(ecode.clone()) then
+        n_implconf = n_implconf + 1
+        if shown_implconf < 60 then
+          report = report + "  IC " + sp.file.clone() + ":" + sp.start.to_string() + " [" + ecode.clone() + "]: " + msg.clone() + "\n"
+          shown_implconf = shown_implconf + 1
+        end
+      end
       if cls != "VAR" && cls != "PARAM" && cls != "INFER" && cls != "UNIFY" then
         if shown_residual < 140 then
           report = report + "  RE " + sp.file.clone() + ":" + sp.start.to_string() + " [" + cls.clone() + "] | " + infer_probe_src_snippet(&mut snippet_cache, sp.file.clone(), sp.start) + "\n"
@@ -703,9 +1028,33 @@ def infer_probe_run_merged(corpus_path: String, inout report: String, inout coun
     counts.set(2, counts[2] + n_infer)
     counts.set(3, counts[3] + n_unify)
     counts.set(4, counts[4] + result.errors.len())
+    counts.set(5, counts[5] + n_implconf)
     infer_probe_dump_unresolved(env, &mut report)
     infer_probe_dump_types(env, &mut report)
-    report = report + "MERGED: items=" + program.items.len().to_string() + " errors=" + result.errors.len().to_string() + " VAR=" + n_var.to_string() + " PARAM=" + n_param.to_string() + " INFER=" + n_infer.to_string() + " UNIFY=" + n_unify.to_string() + "\n"
+    report = report + "MERGED: items=" + program.items.len().to_string() + " errors=" + result.errors.len().to_string() + " VAR=" + n_var.to_string() + " PARAM=" + n_param.to_string() + " INFER=" + n_infer.to_string() + " UNIFY=" + n_unify.to_string() + " IMPLCONF=" + n_implconf.to_string() + "\n"
+    if result.errors.len() == 0 then
+      report = report + "RESOURCE_BEGIN merged\n"
+      let _ = write_file("build/infer_probe.txt", report.clone())
+      let merged_resource_errors = infer_probe_run_resource_pass(program, result, "merged", &mut report, &mut res_counts, &mut res_shown, &mut res_rows, &mut res_row_counts, &mut res_row_samples, &mut res_files, &mut res_file_counts, &mut snippet_cache, false)
+      report = report + "MERGED_RESOURCE errors=" + merged_resource_errors.to_string() + "\n"
+      report = report + infer_probe_resource_totals_word(res_counts.clone()) + "\n"
+      # (the MIR lowering regression, flag build/infer_lower_merged.flag):
+      # the REAL compile path from the raw merged closure — analyze_parsed
+      # then lower_to_mir TWICE over the same borrowed tree. Any
+      # ownership-taking lowering extraction leaves a freed region and
+      # this stage (or the VM itself) fails closed. The flag is separate
+      # from the shape battery's (build/infer_lower.flag) so the
+      # minutes-scale merged leg is opt-in on its own.
+      if file_exists("build/infer_lower_merged.flag") then
+        report = report + "MIR_LOWER_BEGIN merged\n"
+        let _ = write_file("build/infer_probe.txt", report.clone())
+        let _ = infer_probe_lower_program(raw_program, "merged", &mut report)
+        report = report + "MIR_LOWER_END merged\n"
+        let _ = write_file("build/infer_probe.txt", report.clone())
+      end
+    else
+      report = report + "RESOURCE_SKIPPED merged: typecheck errors=" + result.errors.len().to_string() + "\n"
+    end
     # The per-construct tally, sorted by class then count (insertion sort —
     # deterministic).
     var si = 1
@@ -739,10 +1088,18 @@ end
 
 def main() -> Int
   var report = ""
-  var counts = Vec::from([infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0)])
+  var counts = Vec::from([infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0)])
   var rows = Vec::new()
   var row_counts = Vec::new()
   var row_samples = Vec::new()
+  var res_counts = Vec::from([infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0)])
+  var res_shown = Vec::from([infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0)])
+  var res_rows = Vec::new()
+  var res_row_counts = Vec::new()
+  var res_row_samples = Vec::new()
+  var res_files = Vec::new()
+  var res_file_counts = Vec::new()
+  var snippet_cache: Map[String, String] = Map::new()
   let cases = Vec::from([
     ("result_ok_call_expected", "def inc(x: Int) -> Int\n  x + 1\nend\n\ndef main() -> Int\n  let r: Result[Int, String] = Result::Ok(inc(1))\n  0\nend\n"),
     ("call_expected_annotation", "def make[T](x: T) -> Option[T]\n  Option::Some(x)\nend\n\ndef main() -> Int\n  let o: Option[Int] = make(1)\n  0\nend\n"),
@@ -765,14 +1122,132 @@ def main() -> Int
     let rc = infer_probe_run_case(label, cases[i].1.clone(), &mut report, &mut counts)
     i = i + 1
   end
+  # the SHAPE battery: the kernel resource checker's verdict on the
+  # construct shapes the gate's [6/10] lane must agree with the seed on
+  # (branch joins with returning arms, value-position tails, by-value
+  # params, match-arm payload bindings, loop-created/per-iteration cleanup,
+  # projected for-bindings, discards). Each shape's diagnostics print
+  # verbatim; the merged closure counts are the parity measure.
+  let shapes = Vec::from([
+    ("tail_move_owned", "def mk() -> String\n  let s = \"x\".to_string()\n  s\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("tail_discard_unit", "def sink_it() -> Unit\n  let s = \"x\".to_string()\n  s\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("discard_expr_stmt", "def make() -> String\n  \"x\".to_string()\nend\n\ndef main() -> Int\n  make()\n  0\nend\n"),
+    ("let_param_into_aggregate", "struct Box2\n  message: String\nend\n\ndef wrap(message: String) -> Box2\n  Box2 { message: message }\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("match_arm_payload_consumed", "def pick(r: Result[String, String]) -> Option[String]\n  match r\n  when Result::Ok(_) then Option::None\n  when Result::Err(msg) then Option::Some(msg)\n  end\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("returning_arm_then_use", "def first_ok(out: Vec[u8]) -> Result[String, String]\n  loop\n    if out.len() > 3 then\n      return Result::Ok(\"stop\")\n    end\n    out.push(1u8)\n  end\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("loop_outer_consume_return", "def take_bytes(bytes: Vec[u8], stop: Bool) -> Result[Vec[u8], Vec[u8]]\n  loop\n    if stop then\n      return Result::Ok(bytes)\n    end\n    bytes.push(1u8)\n  end\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("loop_outer_consume_continue", "def take_bytes2(bytes: Vec[u8], stop: Bool) -> Vec[u8]\n  loop\n    if stop then\n      next\n    end\n    let b = bytes\n    bytes.push(1u8)\n    return b\n  end\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("loop_created_partial_consume", "def pick_names(buf: Vec[u8]) -> Vec[String]\n  var out: Vec[String] = Vec::new()\n  for i in 0..3 do\n    let name = String::from_utf8_range(buf.clone(), 0, i)\n    if name != \".\" then\n      out.push(name)\n    end\n  end\n  out\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("for_binding_projected_consume", "def push_all(parts: Vec[String]) -> Vec[String]\n  var result: Vec[String] = Vec::new()\n  for part in parts do\n    result.push(part)\n  end\n  result\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("borrow_arg_of_outer_local", "def from_range(data: Vec[u8], start: Int, len: Int) -> String\n  \"x\".to_string()\nend\n\ndef scan(buf: Vec[u8]) -> String\n  for i in 0..2 do\n    let name = from_range(&buf, i, 1)\n    buf.push(1u8)\n  end\n  \"done\".to_string()\nend\n\ndef main() -> Int\n  0\nend\n"),
+    # the fs.tg read_dir shape: the STANDARD associated function consumes
+    # nothing (the seed records `read` for the `&buf` argument) — the probe
+    # isolates whether the kernel's effect table agrees.
+    ("borrow_std_assoc_utf8", "def scan_utf8(buf: Vec[u8]) -> Int\n  let name = String::from_utf8_range(&buf, 0, 1)\n  let _ = name\n  buf.len()\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("borrow_std_assoc_utf8_loop", "def scan_utf8_loop(buf: Vec[u8]) -> Int\n  for i in 0..2 do\n    let name = String::from_utf8_range(&buf, i, 1)\n    let _ = name\n  end\n  buf.len()\nend\n\ndef main() -> Int\n  0\nend\n"),
+    # the Vec receiver/method shapes of the read loops: as_mut_ptr /
+    # as_mut_slice / resize / capacity on a borrowed Vec param.
+    ("vec_as_mut_ptr_read", "def scan_ptr(buf: Vec[u8]) -> Int\n  let p = buf.as_mut_ptr() as Int\n  let _ = p\n  buf.len()\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("vec_as_mut_slice_read", "def scan_slice(buf: Vec[u8]) -> Int\n  let s = buf.as_mut_slice()\n  let _ = s\n  buf.len()\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("vec_resize_read", "def scan_resize(buf: Vec[u8]) -> Int\n  buf.resize(8, 0)\n  buf.len()\nend\n\ndef main() -> Int\n  0\nend\n"),
+    # the buf_reader_read projected-receiver shape: methods on a FIELD of an
+    # inout struct receiver, then whole reads of the struct.
+    ("projected_receiver_reads", "struct Buf\n  data: Vec[u8]\n  pos: Int\n  len: Int\nend\n\ndef refill(inout b: Buf) -> Int\n  if b.pos >= b.len then\n    b.data.resize(b.data.capacity(), 0)\n    b.len = 1\n    b.pos = 0\n  end\n  let available = b.len - b.pos\n  b.pos = b.pos + available\n  available\nend\n\ndef main() -> Int\n  0\nend\n"),
+    # the negative canary's shape (kernel-only inout rule): the diagnostic
+    # class the canary lane asserts.
+    ("inout_param_consume_negative", "resource File\n  fd: Int\nend\n\ndef destroy(sink x: File) -> Unit\nend\n\ndef inspect(inout x: File) -> Unit\n  destroy(x)\nend\n\ndef main() -> Int\n  var f = File { fd: 1 }\n  inspect(f)\n  0\nend\n"),
+    # the buf_reader_read call shape: a borrowed FIELD argument (`&h.file`)
+    # into a by-value owning param, then whole reads of the struct.
+    ("borrow_projected_field_arg", "resource File\n  fd: Int\nend\n\nstruct Holder\n  file: File\n  buf: Vec[u8]\n  pos: Int\nend\n\ndef take(file: File, buf: SliceMut[u8]) -> Int\n  0\nend\n\ndef scan(inout h: Holder) -> Int\n  let n = take(&h.file, h.buf.as_mut_slice())\n  let _ = n\n  h.buf.len() + h.pos\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("borrow_std_assoc_utf8_stmt", "def scan_utf8_stmt(buf: Vec[u8]) -> Int\n  String::from_utf8_range(&buf, 0, 1)\n  buf.len()\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("borrow_marker_let", "def scan_marker_let(buf: Vec[u8]) -> Int\n  let f = &buf\n  let _ = f\n  buf.len()\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("borrow_std_assoc_bare", "def scan_utf8_bare(buf: Vec[u8]) -> Int\n  let name = String::from_utf8_range(buf, 0, 1)\n  let _ = name\n  buf.len()\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("value_tail_conditional_consume", "def read_link(buf: Vec[u8], result: Int) -> String\n  if result < 0 then\n    \"err\".to_string()\n  else\n    buf.truncate(result)\n    String::from_bytes(buf)\n  end\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("inout_param_field_after_return", "struct Arena\n  offset: Int\n  capacity: Int\nend\n\ndef reset(inout arena: Arena) -> Unit\n  if arena.capacity == 0 then\n    arena.offset = 0\n    return\n  end\n  arena.offset = 0\nend\n\ndef main() -> Int\n  0\nend\n"),
+    ("replace_owned_field_conditional", "struct Holder\n  name: String\n  tag: Int\nend\n\ndef main() -> Int\n  var h = Holder { name: \"a\".to_string(), tag: 1 }\n  if h.tag == 1 then\n    h.name = \"b\".to_string()\n  end\n  let t = h.tag\n  t - 1\nend\n"),
+    ("match_arm_returning_use", "def conv(r: Result[String, String]) -> Result[String, String]\n  match r\n  when Result::Ok(v) then\n    if v.len() == 0 then\n      return Result::Err(\"empty\".to_string())\n    end\n    Result::Ok(v)\n  when Result::Err(e) then Result::Err(e)\n  end\nend\n\ndef main() -> Int\n  0\nend\n")
+  ])
+  var sh = 0
+  while sh < shapes.len() do
+    let label = shapes[sh].0.clone()
+    report = report + "BEGIN shape " + label.clone() + "\n"
+    let _ = write_file("build/infer_probe.txt", report.clone())
+    let _ = infer_probe_run_shape(label, shapes[sh].1.clone(), &mut report, &mut res_counts, &mut res_shown, &mut res_rows, &mut res_row_counts, &mut res_row_samples, &mut res_files, &mut res_file_counts, &mut snippet_cache)
+    sh = sh + 1
+  end
+  # the MIR LOWERING regression battery (flag build/infer_lower.flag): each
+  # shape goes through the REAL analyze_parsed + lower_to_mir TWICE over
+  # the same borrowed tree (mir.tg's lowering ownership contract). The
+  # pre-fix `into_inner()` extractions freed the boxes the second pass
+  # re-read — the VM trapped on the freed region. Every row must read
+  # `functions=N errors=0` on BOTH passes (asserted by tg_infer --lower).
+  if file_exists("build/infer_lower.flag") then
+    let lower_shapes = Vec::from([
+      # binary/unary/raw-deref operand boxes (lr_binary/lr_unary/lr_deref)
+      ("lower_arith", "def main() -> Int\n  let a = 1 + 2\n  let b = a * 3 - 1\n  b\nend\n"),
+      # nested field access + method receiver chain (lower_place /
+      # lower_callee_operand / qualify_field_callee_name)
+      ("lower_field_chain", "struct Inner\n  v: Int\nend\n\nstruct Outer\n  inner: Inner\nend\n\ndef take(o: Outer) -> Int\n  o.inner.v + 1\nend\n\ndef main() -> Int\n  let o = Outer { inner: Inner { v: 4 } }\n  take(o)\nend\n"),
+      # enum variant payload arguments (lr_enum_variant / lower_call_arg):
+      # the enum is declared IN the shape program (an isolated program has
+      # no std type tables, so std's Option/Result matches are covered by
+      # the merged closure leg instead).
+      ("lower_enum_payload", "enum E\n  Pair(Int, Int)\n  Nil\nend\n\ndef mk(v: Int) -> E\n  E::Pair(v + 1, v)\nend\n\ndef main() -> Int\n  let e = mk(1)\n  match e\n  when E::Pair(a, _b) then a\n  when E::Nil then 0\n  end\nend\n"),
+      # assignment expression target/value boxes (lower_expr_assign_to /
+      # lr_enum_variant)
+      ("lower_enum_assign", "struct Holder\n  v: Int\nend\n\ndef main() -> Int\n  var h = Holder { v: 1 }\n  match h.v\n  when 1 then h.v = 2\n  when _ then ()\n  end\n  h.v\nend\n"),
+      # match-to-place with a field payload (lower_match_to_place); the
+      # enum is declared in the shape (see lower_enum_payload).
+      ("lower_match_field", "struct Inner\n  v: Int\nend\n\nenum Boxed\n  Has(Inner)\n  None\nend\n\ndef pick(o: Boxed) -> Int\n  let x = match o\n  when Boxed::Has(inner) then inner.v\n  when Boxed::None then 0\n  end\n  x\nend\n\ndef main() -> Int\n  let i = Inner { v: 3 }\n  pick(Boxed::Has(i))\nend\n"),
+      # closure body retention (the deep-clone boundary) + capture: the
+      # capture is a PARAMETER (its semantic id is registered at the
+      # function head, the shape the parameter-capture channel supports)
+      ("lower_closure_capture", "def apply_base(base: Int) -> Int\n  let f = |x: Int| x + base\n  f(2)\nend\n\ndef main() -> Int\n  apply_base(10)\nend\n"),
+      # for-range bound boxes (lower_for)
+      ("lower_for_range", "def hi() -> Int\n  3\nend\n\ndef main() -> Int\n  var acc = 0\n  for i in 0..hi() do\n    acc = acc + i\n  end\n  acc\nend\n"),
+      # array/index/cast operand boxes (lr_array_lit / ExprIndex / cast)
+      ("lower_array_index", "def main() -> Int\n  let arr: [Int; 3] = [1, 2, 3]\n  let i = 1\n  let x = arr[i] as Int\n  x + arr[0]\nend\n"),
+      # the ffi.tg RubyValue shape: a field access in a binary comparison
+      # whose OTHER operand is a field access on a CALL result (the
+      # merged-closure lowering's `missing typed field target for field
+      # 'raw'` site)
+      ("lower_field_call_recv", "struct V\n  raw: UInt\nend\n\ndef nil_v() -> V\n  V { raw: 8 }\nend\n\ndef is_nil(v: V) -> Bool\n  v.raw == nil_v().raw\nend\n\ndef main() -> Int\n  0\nend\n"),
+      ("lower_field_bitand", "struct V\n  raw: UInt\nend\n\ndef odd(v: V) -> Bool\n  (v.raw & 1) == 1\nend\n\ndef main() -> Int\n  0\nend\n"),
+      ("lower_field_shr_cast", "struct V\n  raw: UInt\nend\n\ndef to_int(v: V) -> Int\n  (v.raw >> 1) as Int\nend\n\ndef main() -> Int\n  0\nend\n"),
+      # the expression-bodied declaration form (`def f() -> T = expr`)
+      ("lower_expr_body_field", "struct V\n  raw: UInt\nend\n\ndef make() -> V = V { raw: 1 }\n\ndef main() -> Int\n  0\nend\n")
+    ])
+    var lsi = 0
+    while lsi < lower_shapes.len() do
+      let label = lower_shapes[lsi].0.clone()
+      report = report + "BEGIN lower-shape " + label.clone() + "\n"
+      let _ = write_file("build/infer_probe.txt", report.clone())
+      let _ = infer_probe_run_lower_shape(label, lower_shapes[lsi].1.clone(), &mut report)
+      lsi = lsi + 1
+    end
+  end
   if file_exists("build/infer_merged.flag") then
     report = report + "BEGIN merged\n"
     let _ = write_file("build/infer_probe.txt", report.clone())
-    let rcm = infer_probe_run_merged("tests/differential/corpus/01_defs_arith.tg", &mut report, &mut counts, &mut rows, &mut row_counts, &mut row_samples)
+    let rcm = infer_probe_run_merged("tests/differential/corpus/01_defs_arith.tg", &mut report, &mut counts, &mut rows, &mut row_counts, &mut row_samples, &mut res_counts, &mut res_shown, &mut res_rows, &mut res_row_counts, &mut res_row_samples, &mut res_files, &mut res_file_counts, &mut snippet_cache)
     let _ = rcm
   end
-  report = report + "TOTALS errors=" + counts[4].to_string() + " VAR=" + counts[0].to_string() + " PARAM=" + counts[1].to_string() + " INFER=" + counts[2].to_string() + " UNIFY=" + counts[3].to_string() + "\n"
+  # the resource class table + per-file tally (deterministic order), then
+  # the totals rows.
+  var ri2 = 0
+  while ri2 < res_files.len() do
+    report = report + "RESFILE " + res_files[ri2] + " count=" + res_file_counts[ri2].to_string() + "\n"
+    ri2 = ri2 + 1
+  end
+  var rc2 = 0
+  while rc2 < res_rows.len() do
+    report = report + "RESROW " + res_rows[rc2] + " count=" + res_row_counts[rc2].to_string() + " sample=" + res_row_samples[rc2] + "\n"
+    rc2 = rc2 + 1
+  end
+  report = report + "TOTALS errors=" + counts[4].to_string() + " VAR=" + counts[0].to_string() + " PARAM=" + counts[1].to_string() + " INFER=" + counts[2].to_string() + " UNIFY=" + counts[3].to_string() + " IMPLCONF=" + counts[5].to_string() + "\n"
+  report = report + infer_probe_resource_totals_word(res_counts.clone()) + "\n"
   let _ = write_file("build/infer_probe.txt", report.clone())
-  println("infer_probe: TOTALS errors=" + counts[4].to_string() + " VAR=" + counts[0].to_string() + " PARAM=" + counts[1].to_string() + " INFER=" + counts[2].to_string() + " UNIFY=" + counts[3].to_string())
+  println("infer_probe: TOTALS errors=" + counts[4].to_string() + " VAR=" + counts[0].to_string() + " PARAM=" + counts[1].to_string() + " INFER=" + counts[2].to_string() + " UNIFY=" + counts[3].to_string() + " IMPLCONF=" + counts[5].to_string())
+  println("infer_probe: " + infer_probe_resource_totals_word(res_counts.clone()))
   0
 end

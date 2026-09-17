@@ -23,6 +23,16 @@
 # This script is NOT a compiler-closure gate: the closure gate is
 # check_ocaml_bootstrap_complete.sh (zero semantic debt, full closure).
 #
+# Toolchain (authoritative pins): bootstrap/ocaml-toolchain.lock pins
+# OCaml 5.4.0 / dune 3.21.1 / arm64, and the CI lane
+# .woodpecker/ocaml-seed-health.yaml runs this script THROUGH the opam
+# switch that carries them:
+#   eval "$(opam env --switch=5.4.0 --set-switch)"
+#   bash scripts/check_ocaml_seed_health.sh
+# A bare host toolchain (e.g. brew's OCaml 5.5.0 / dune 3.24.2) fails the
+# check_ocaml_toolchain.sh pre-check BY DESIGN — the pins are the tested
+# versions, not a range.
+#
 # Usage: scripts/check_ocaml_seed_health.sh [repo-root]
 set -euo pipefail
 
@@ -47,6 +57,31 @@ PINNED_TEST_INVENTORY=230
 BOOTSTRAP_CHECK_TIMEOUT_S=1620
 GATE_TIMEOUT_S=1860
 EVIDENCE_TIMEOUT_S=1920
+
+# Merged-probe calibration (the tg_infer probe: the Seed VM typecheck of
+# the merged corpus+std closure — see tg_compiler/infer_probe.tg's merged
+# mode).  The probe's merged mode runs the REAL compile path's canonical
+# preparation (apply_cfg_elimination + prepare_parsed: macro expansion +
+# node-id assignment) before the kernel checker — the impl-conformance
+# rows (E0229/E0226/E0224) only reproduce after that preparation has
+# rewritten the impl items, so tg_compiler/compiler_core.tg and its FULL
+# dependency closure (asm/codegen/linker/object/runtime/mono/
+# layout_engine/target_desc — the manifest grew from 26 to 36 modules)
+# are part of bootstrap/infer_mini.manifest.  The larger closure raises
+# both invocations' cost:
+#   - the DEFAULT component-lane invocation (standalone battery; the
+#     probe entry always runs it): re-measured 2026-09-16 on this host
+#     under load average 15, 549 s worst wall — cap 549 x 1.5 = 823.5 ->
+#     900 s (the generic 420 s bound no longer covers the closure);
+#   - the --merged opt-in invocation (battery + canonical preparation +
+#     merged-closure VM typecheck): measured 250-370 s at load ~10 and
+#     600 s worst estimated at load 15 — cap 1200 s (2x the load-15
+#     estimate; the old 466 s-based 720 s cap is superseded).
+# The merged mode is still opt-in (TG_INFER_MERGED=1) so the default lane
+# pays the closure build once.  Re-measure when the closure or the probe
+# grows materially.  A cap is a bound, never a skip.
+TG_INFER_TIMEOUT_S=900
+TG_INFER_MERGED_TIMEOUT_S=1200
 
 if [ -f scripts/check_ocaml_toolchain.sh ]; then
   scripts/check_ocaml_toolchain.sh
@@ -98,16 +133,38 @@ for name in $NAMES; do
   SELFCHECK_TOTAL=$((SELFCHECK_TOTAL + 1))
   SELFCHECK_COUNT=$((SELFCHECK_COUNT + 1))
   # The generic component bound is 420 s; tg_evidence runs the full evidence
-  # phase (measured 1276.6 s on 2026-09-14, far above the generic bound), so
-  # it uses the calibrated evidence cap.
+  # phase (measured 1276.6 s on 2026-09-14, far above the generic bound) and
+  # tg_infer builds the canonical-preparation closure (compiler_core + its
+  # closure; measured 549 s worst on 2026-09-16, also above the generic
+  # bound) — both use their calibrated caps.
   SC_TIMEOUT_S=420
   if [ "$name" = "tg_evidence" ]; then
     SC_TIMEOUT_S="$EVIDENCE_TIMEOUT_S"
+  fi
+  if [ "$name" = "tg_infer" ]; then
+    SC_TIMEOUT_S="$TG_INFER_TIMEOUT_S"
   fi
   if ! timeout "$SC_TIMEOUT_S" "_build/default/selfcheck/${name}.exe" >"/tmp/ocaml_sc_${name}.out" 2>&1; then
     echo "check_ocaml_seed_health: FAIL — selfcheck ${name} exited non-zero"
     tail -10 "/tmp/ocaml_sc_${name}.out" || true
     SELFCHECK_FAIL=1
+  fi
+  # tg_infer's merged-corpus diagnostic (opt-in, TG_INFER_MERGED=1): the
+  # probe's merged mode runs the canonical preparation + the kernel
+  # checker over the merged corpus+std closure (build/infer_merged.flag)
+  # and asserts the same zero-diagnostic battery plus IMPLCONF=0 (the
+  # impl-conformance rows must agree with the host typechecker).  It is
+  # minutes-scale (see the merged-probe calibration above), so the
+  # default lane runs the standalone battery under its calibrated cap and
+  # the opt-in runs the full merged workload under its own.
+  if [ "$name" = "tg_infer" ] && [ "${TG_INFER_MERGED:-0}" = "1" ]; then
+    if ! timeout "$TG_INFER_MERGED_TIMEOUT_S" \
+        "_build/default/selfcheck/${name}.exe" .. --merged \
+        >/tmp/ocaml_sc_tg_infer_merged.out 2>&1; then
+      echo "check_ocaml_seed_health: FAIL — tg_infer --merged exited non-zero"
+      tail -10 /tmp/ocaml_sc_tg_infer_merged.out || true
+      SELFCHECK_FAIL=1
+    fi
   fi
 done
 

@@ -6,11 +6,11 @@ use tg_compiler::ast::{
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
   GuardElse, MatchExpr, AstPath
 }
-use tg_compiler::types::{AccessEffect, TypedProgram, Type, ParamType, TypedExprKind}
+use tg_compiler::types::{AccessEffect, TypedProgram, Type, ParamType, TypedExprKind, is_trivially_copyable}
 use tg_compiler::ids::{FieldId, AccessRoot, LocalId, DefId}
 use tg_compiler::resource_check::{
   TypedCFG, stmt_is_terminator, AnalysisContext,
-  access_registry_fresh_id, access_registry_register
+  access_registry_fresh_id, access_registry_register, engine_snapshot_env
 }
 
 enum AccessProjection
@@ -34,6 +34,9 @@ end
 
 struct ActiveAccess
   path: AccessPath
+  # the EFFECTIVE access effect (record_access applies the seed's
+  # Consume-of-Copy downgrade at record time): Read/Modify/Initialize, or
+  # Consume only for a genuinely non-Copy value.
   effect: AccessEffect
 end
 
@@ -590,9 +593,20 @@ end
 # successor registration inside a function body would fail loudly there,
 # never silently.
 def record_access(typed: TypedProgram, expr: Expr, effect: AccessEffect, inout actives: Vec[ActiveAccess], inout spans: Vec[Span], inout errors: Vec[AccessError], edge_source: Int, cfg: TypedCFG, inout ctx: AnalysisContext) -> Unit
+  # (the seed's effective effect — check_call_args' `effective`,
+  # access_check.ml:180-184): a Consume of a Copy-typed value is a COPY,
+  # recorded as Read. The recorded access carries the EFFECTIVE effect
+  # (the seed's `(path, effective, type)` triple's first two slots), so
+  # the read/read shortcut of accesses_conflict applies — a Consume of a
+  # Copy-typed value never conflicts with a Read — and the diagnostic
+  # names the effective effect exactly like the seed's.
+  var effective = effect
+  if effect == AccessEffect::Consume && access_expr_is_copy(typed, &expr, ctx) then
+    effective = AccessEffect::Read
+  end
   match derive_access_path(typed, expr, errors)
   when Option::Some(path) then
-    actives.push(ActiveAccess { path: path, effect: effect })
+    actives.push(ActiveAccess { path: path, effect: effective })
     spans.push(expr.span)
     let aid = access_registry_fresh_id(ctx)
     let edge_ids = successor_edge_ids(cfg, edge_source)
@@ -601,6 +615,24 @@ def record_access(typed: TypedProgram, expr: Expr, effect: AccessEffect, inout a
     end
   when Option::None then ()
   end  end
+end
+
+# (the seed's per-access `copy` bit — is_copy a.a_type at recording time):
+# is the access EXPRESSION's recorded type trivially copyable? The engine
+# snapshot (the serialized type tables the type checker registered) is
+# built LAZILY on the first Consume access and cached in the analysis
+# context for the rest of the run. A node with no recorded type FAILS
+# CLOSED: a Consume that cannot be proven a copy stays a Consume.
+def access_expr_is_copy(typed: TypedProgram, expr: Expr, inout ctx: AnalysisContext) -> Bool
+  match typed.expr_types.get(expr.node_id)
+  when Option::Some(ty) then
+    if !ctx.access_copy_env_ready then
+      ctx.access_copy_env = engine_snapshot_env(typed)
+      ctx.access_copy_env_ready = true
+    end
+    is_trivially_copyable(ctx.access_copy_env, ty)
+  when Option::None then false
+  end
 end
 
 def check_overlaps(typed: TypedProgram, actives: Vec[ActiveAccess], spans: Vec[Span], inout errors: Vec[AccessError]) -> Unit
@@ -621,6 +653,10 @@ def check_overlaps(typed: TypedProgram, actives: Vec[ActiveAccess], spans: Vec[S
 end
 
 def accesses_conflict(a: ActiveAccess, b: ActiveAccess) -> Bool
+  # The recorded effects are ALREADY effective (record_access downgrades
+  # a Consume of a Copy-typed value to Read — the seed's `effective`,
+  # access_check.ml:180-184), so Consume-of-Copy vs Read reaches this
+  # shortcut as Read vs Read and is not a conflict.
   if a.effect == AccessEffect::Read && b.effect == AccessEffect::Read then
     return false
   end
@@ -820,9 +856,12 @@ end
 
 # derive the TYPED PLACE of an access expression — the semantic
 # AccessRoot (Local(LocalId) for identifiers, SelfValue for `self`,
-# Static(DefId) for static/const paths, RawUnknown for unknown-provenance
-# roots) plus the projection chain. The former integer-root sentinels
-# (the raw local id, the magic -1 `self` root) are GONE.
+# Static(DefId) for static/const paths) plus the projection chain. An
+# expression with NO derivable place (an unresolved path rvalue, a
+# literal, a call result) yields Option::None and is dropped from the
+# overlap matrix — exactly the seed's `place_of_expr`. The former
+# integer-root sentinels (the raw local id, the magic -1 `self` root)
+# are GONE.
 def derive_access_path(typed: TypedProgram, expr: Expr, inout errors: Vec[AccessError]) -> Option[AccessPath]
   match expr.kind
   when ExprKind::ExprIdent(name) then
@@ -845,14 +884,20 @@ def derive_access_path(typed: TypedProgram, expr: Expr, inout errors: Vec[Access
     # root (-1) is GONE.
     Option::Some(AccessPath { root: AccessRoot::SelfValue, projections: Vec::new() })
   when ExprKind::ExprPath(path) then
- # a static/const reference is a Static(DefId) root when the
-    # resolver recorded the module-qualified def; unresolvable paths are
-    # RawUnknown (never provably disjoint).
+    # (seed parity — place_of_expr's `Ast.Path _ -> None`, typecheck.ml
+    # :3211): an unresolved path is an RVALUE (an enum constructor like
+    # `Option::None`, a bare const/function path), NOT a place. The seed
+    # records NO place for it, so the argument is dropped from the
+    # pairwise matrix. The former RawUnknown placeholder overlapped every
+    # receiver and reported a false conflict for `buf.push(Option::None)`
+    # (the receiver's modify vs the rvalue's consume). A RESOLVED path
+    # (a static/const reference the resolver recorded) stays a
+    # Static(DefId) root.
     match static_def_of(typed, &path)
     when Option::Some(did) then
       Option::Some(AccessPath { root: AccessRoot::Static(did), projections: Vec::new() })
     when Option::None then
-      Option::Some(AccessPath { root: AccessRoot::RawUnknown, projections: Vec::new() })
+      Option::None
     end
   when ExprKind::ExprFieldAccess(base, field) then
     match derive_access_path(typed, *base.get(), errors)
@@ -910,8 +955,8 @@ end
 
 # resolve a static/const path to its DefId — the resolver's
 # module_symbols snapshot ("path::name" -> DefId); a miss (or a
-# type-position path) yields Option::None (the caller degrades to
-# RawUnknown).
+# type-position path) yields Option::None — the caller records NO place
+# for the path (seed parity: an unresolved path is an rvalue).
 def static_def_of(typed: TypedProgram, path: AstPath) -> Option[DefId]
   var key = ""
   var first = true
