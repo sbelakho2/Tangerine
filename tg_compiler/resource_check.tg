@@ -11,6 +11,16 @@ use tg_compiler::types::{Type, TypeKind, AccessEffect, TypedProgram, TypeId, Typ
 use tg_compiler::resolver::{module_path_of_item_resolver, ResolvedNames}
 use tg_compiler::access_check::{AccessError}
 use tg_compiler::ids::{DefId, LocalId, TraitId, FinalizerKind, generic_param_table_new, NodeId, AccessId, CfgEdgeId, CallableId, def_id_numeric}
+# (DMA keying refinement) The typed stable place identity the committed DMA
+# facts carry: the fact-commit derivation builds a function-scoped
+# StablePlaceId from the owner key + the typed projection chain (the
+# same stable_ids constructors the snapshot/ownership boundaries use).
+use tg_compiler::stable_ids::{
+  StablePlaceId, StableProjection, StableLocalId, stable_place_id_of,
+  stable_callable_decl_of, structural_instance_id_of, stable_binder_id_of,
+  stable_projection_field, stable_projection_tuple, stable_projection_index,
+  stable_field_id_of, stable_synthetic_lineage
+}
 
 enum ResourceState
   Uninitialized
@@ -613,6 +623,17 @@ pub struct ResourceDmaFact
   op: String
   # The commit site label ("<file>:<start>" — provenance metadata only).
   site: String = ""
+  # (DMA keying refinement) The TYPED place key, derived at fact-commit
+  # time: the function-scoped StablePlaceId of the buffer place (root =
+  # the owning function's stable declaration via the owner key's
+  # text-boundary callable parse + the stable local/binder identity;
+  # projections = the typed field/tuple/constant-index chain). The stable
+  # text `place` stays the display/legacy identity; this typed key is the
+  # DMA reasoning key (the snapshot builder re-roots it on the persistent
+  # store-stamped declaration/binder before persisting). Option::None for
+  # a place outside the stable grammar (a dynamic index or a deref — the
+  # whole-value boundary; never a fabricated id).
+  place_id: Option[StablePlaceId] = Option::None
 end
 
 # Result of resource checking: the diagnostics plus the authoritative
@@ -1328,6 +1349,25 @@ def resource_dma_facts_sort(inout facts: Vec[ResourceDmaFact]) -> Unit
   end
 end
 
+# (DMA keying refinement) Typed place-key equality of two facts: the
+# StablePlaceId identity words (None == None; a typed key never equals an
+# absent one). The text identity alone must not collapse two facts whose
+# typed chains differ.
+def resource_dma_place_ids_same(a: Option[StablePlaceId], b: Option[StablePlaceId]) -> Bool
+  match a
+  when Option::Some(pa) then
+    match b
+    when Option::Some(pb) then pa.digest_hi == pb.digest_hi && pa.digest_lo == pb.digest_lo
+    when Option::None then false
+    end
+  when Option::None then
+    match b
+    when Option::None then true
+    when Option::Some(_) then false
+    end
+  end
+end
+
 # Drop adjacent duplicate rows (the same commit recorded by a repeated
 # block visit). Sorting first makes duplicates adjacent.
 def resource_dma_facts_dedup(inout facts: Vec[ResourceDmaFact]) -> Unit
@@ -1341,7 +1381,9 @@ def resource_dma_facts_dedup(inout facts: Vec[ResourceDmaFact]) -> Unit
           if facts[i].state == facts[i - 1].state then
             if facts[i].op == facts[i - 1].op then
               if facts[i].site == facts[i - 1].site then
-                same = true
+                if resource_dma_place_ids_same(facts[i].clone().place_id, facts[i - 1].clone().place_id) then
+                  same = true
+                end
               end
             end
           end
@@ -5455,12 +5497,14 @@ end
 # projected path (its runtime value is a bare data pointer with no len header,
 # and a String receiver would misread the Vec__len header offset) — the
 # kernel iterates strings through the Slice-returning forms
-# (s.chars()/s.bytes()/s.split(...), classified as Slice — kind 0 — when the
-# iterable is a place) or through Vec[u8] forms (s.as_bytes()); method-call
-# iterables get no plan and lower through the MIR's slice-aware fallback
-# (MirLen's slice-view path and ProjIndex's slice data-pointer path in
-# codegen.tg — verified), so String iteration is covered by the Slice/array
-# classes, never by a direct String class.
+# (s.chars()/s.bytes()/s.split(...), classified as Slice — kind 0) or
+# through Vec[u8] forms (s.as_bytes()); a DIRECT String iterable stays the
+# unclassifiable (-1) class and the MIR's gap check fails closed. Method-call
+# iterables of the collection classes are classified like any other
+# expression (for_iterable_kind reads the typed expr_types; place-likeness is
+# applied by for_iteration_plan, which forces the non-projected access), so
+# String iteration is covered by the Slice/array classes, never by a direct
+# String class.
 def for_iter_type_kind(typed: TypedProgram, ty: Type) -> (Int, Type)
   match ty
   when Type::RefInternal(inner, _) then for_iter_type_kind(typed, inner)
@@ -5488,18 +5532,45 @@ def for_iterable_kind(typed: TypedProgram, iter: Expr) -> (Int, Type)
   match iter.kind
   when ExprKind::ExprRange(_, _, _) then (3, Type::Int)
   when _ then
-    # The MIR's projected path only fires for PLACE iterables (Ident, self,
-    # field access, raw deref, index); map/set/unknown iterables classify
-    # through the type alone. Non-place iterables (e.g. `for x in vec![...]`)
-    # get no plan → the MIR falls back to its heuristic, exactly as today.
-    if for_iter_place_like(iter) then
-      match typed.expr_types.get(iter.node_id)
-      when Option::Some(iter_ty) then for_iter_type_kind(typed, &iter_ty)
-      when Option::None then (-1, Type::Unit)
-      end
-    else
-      (-1, Type::Unit)
+    # The TYPE classification is a pure typed-record query over the same
+    # expr_types the MIR reads, and it applies to EVERY iterable expression
+    # shape — not only place-like ones. A method-call result
+    # (`for ch in s.chars()`, `for line in content.split(...)`) is a
+    # materialized value whose type the checker recorded exactly like a
+    # place's. Gating this query on place-likeness left the typed iteration
+    # channel EMPTY for those legal loops, and the MIR's fail-closed gap
+    # check then aborted lowering with `missing typed iteration record`
+    # (the corpus-compile blocker). PLACE-LIKENESS — the
+    # projected-vs-desugar decision — is applied in for_iteration_plan
+    # below, never here.
+    match typed.expr_types.get(iter.node_id)
+    when Option::Some(iter_ty) then for_iter_type_kind(typed, &iter_ty)
+    when Option::None then (-1, Type::Unit)
     end
+  end  end
+end
+
+# Whether the typed iterable type (refs peeled) is an OWNED heap container —
+# Vec/Array (the container classes the MIR can MATERIALIZE and drain). The
+# raw view class (UnsafeSlice, the slice LangItems id) answers false: a view
+# cannot be drained, and moving non-Copy elements out of one is unsound.
+# This gates the non-place Consume plan for NON-Copy elements in
+# for_iteration_plan (the genuinely unsupported shape stays fail-closed: no
+# plan, and the MIR's gap check reports it).
+def for_iter_type_is_owned_container(typed: TypedProgram, iter: Expr) -> Bool
+  match typed.expr_types.get(iter.node_id)
+  when Option::Some(iter_ty) then
+    let li = typed.lang_items
+    let inner = match iter_ty
+    when Type::RefInternal(inner, _) then inner
+    when _ then iter_ty
+    end
+    match inner
+    when Type::Adt(tid, args) then
+      ((li.vec != -1 && tid.id == li.vec) || (li.array != -1 && tid.id == li.array)) && args.len() > 0
+    when _ then false
+    end
+  when Option::None then false
   end  end
 end
 
@@ -6051,38 +6122,72 @@ def plan_body_is_projected_safe(typed: TypedProgram, pat: Pattern, body: Block) 
 end
 
 # build the typed iteration plan for a for-stmt. Option::None means
-# the iterable could not be classified (unresolvable / non-place iterable):
-# no plan is recorded and the MIR's legacy heuristic fallback handles the
-# loop exactly as before. For classified iterables the access encodes what
-# the MIR's lowering already does:
+# the iterable could not be classified (unresolvable / an unsupported
+# non-place class): no plan is recorded and the MIR's fail-closed gap check
+# reports the loop. EVERY classified for-stmt the checker processes gets a
+# record, place-like or not. For classified iterables the access encodes
+# what the MIR's lowering already does:
 #   - array/vec/slice (kind 0): projected (Read) when the pattern is a plain
 #     Ident whose name the body does not use — OR when the element type is
-# NOT Copy (the consuming desugar raw-copies each element out of
+#     NOT Copy (the consuming desugar raw-copies each element out of
 #     the collection's storage, which is sound only for Copy elements; a
 #     non-Copy element can never be consumed by value, so the loop must be
 #     projected — the binding is bound by reference, reads through it are
 #     the safe semantics, and the projected-iteration guard rejects moves
 #     out of the binding). Snapshot (Consume) only for Copy elements whose
 #     binding the body uses.
+#     A NON-PLACE iterable (method-call result, literal — a materialized
+#     temporary) is ALWAYS Consume: there is no storage to project into.
+#     The MIR drains an owned Vec/Array temporary (for_consume_temporary)
+#     and lowers every other non-place class through the collection
+#     desugar; a raw view (UnsafeSlice) or non-place Map/Set result of
+#     NON-Copy elements has no sound lowering and stays fail-closed (no
+#     plan → the MIR gap check).
 #   - map/set (kinds 1/2): snapshot (Consume) — the only supported map/set
 #     iteration is the materialized-snapshot form (the snapshot is safe
-#     against mutation of the live collection).
+#     against mutation of the live collection) and only for PLACE iterables
+#     (the desugar has no entries materialization for a temporary result).
 #   - range (kind 3): Read — the counter loop binds a plain Int value,
 #     never a reference into a collection.
 # The iterated collection's ROOT local id is recorded for the projected-
 # mutation rule (rejecting mutation of the iterated collection inside the
-# loop body where the access is projected).
+# loop body where the access is projected); it is -1 for every non-place
+# iterable (ranges, method-call results, unresolved).
 def for_iteration_plan(typed: TypedProgram, env: TypeEnv, for_stmt: ForStmt, iter_binding_ids: Vec[Int]) -> Option[IterationPlan]
   let (kind, elem_ty) = for_iterable_kind(typed, &for_stmt.iter)
   if kind < 0 then
     return Option::None
   end
-  let root_id = match expr_root_id(typed, &for_stmt.iter)
-  when Option::Some(id) then id
-  when Option::None then -1
+  let place_like = for_iter_place_like(&for_stmt.iter)
+  var root_id = -1
+  if place_like then
+    match expr_root_id(typed, &for_stmt.iter)
+    when Option::Some(id) then root_id = id
+    when Option::None then ()
+    end
   end
   let elem_is_copy = is_trivially_copyable(env, &elem_ty)
-  let access = if kind == 0 then
+  var access = AccessEffect::Read
+  if kind == 3 then
+    # ranges: the documented value-transfer mode, never a projection
+    access = AccessEffect::Read
+  elsif !place_like then
+    # A NON-PLACE iterable is a materialized value (method-call result,
+    # literal): there is no storage to project into, so the plan is the
+    # snapshot/consume mode — never projected. The owned Vec/Array class is
+    # drained by the MIR after materialization; the raw-view class lowers
+    # through the slice-aware desugar. The genuinely unsupported shapes
+    # keep the fail-closed unrecorded path: a raw view of NON-Copy
+    # elements (the desugar would move them out of a view) and non-place
+    # Map/Set results (no entries materialization on the desugar path).
+    if kind == 1 || kind == 2 then
+      return Option::None
+    end
+    if kind == 0 && !elem_is_copy && !for_iter_type_is_owned_container(typed, &for_stmt.iter) then
+      return Option::None
+    end
+    access = AccessEffect::Consume
+  elsif kind == 0 then
  # a plain Ident pattern over a NON-Copy element is ALWAYS
     # projected — the consuming desugar would raw-bit-copy the element out
     # of the collection's storage (duplicating unique ownership, e.g. a
@@ -6093,20 +6198,18 @@ def for_iteration_plan(typed: TypedProgram, env: TypeEnv, for_stmt: ForStmt, ite
     if !elem_is_copy then
       match for_stmt.pattern.kind
       when PatternKind::Ident(name, _) then
-        if name == "_" then AccessEffect::Consume else AccessEffect::Read end
-      when _ then AccessEffect::Consume
+        if name == "_" then access = AccessEffect::Consume else access = AccessEffect::Read end
+      when _ then access = AccessEffect::Consume
       end
     else
       if plan_body_is_projected_safe(typed, &for_stmt.pattern, &for_stmt.body) then
-        AccessEffect::Read
+        access = AccessEffect::Read
       else
-        AccessEffect::Consume
+        access = AccessEffect::Consume
       end
     end
-  elsif kind == 1 || kind == 2 then
-    AccessEffect::Consume
   else
-    AccessEffect::Read
+    access = AccessEffect::Consume
   end
   Option::Some(IterationPlan {
     source_kind: kind,
@@ -7910,6 +8013,73 @@ def check_dma_cpu_use(typed: TypedProgram, frame: ResFrame, id: Int, span: Span,
   end
 end
 
+# (DMA keying refinement) The stable binder sequence of a place root text:
+# the "l<digits>" ordinal locator's number, else the deterministic synthetic
+# sequence of the name (the same rule semantic_planning's
+# planning_binder_seq applies at the identity boundary).
+def resource_dma_binder_seq(root_text: String) -> Int
+  if root_text.len() > 0 && root_text.slice(0, 1) == "l" then
+    let rest = root_text.slice(1, root_text.len())
+    let parsed = rest.parse_int().unwrap_or(-1)
+    if parsed >= 0 then
+      return parsed
+    end
+  end
+  stable_synthetic_lineage(&root_text)
+end
+
+# (DMA keying refinement) The TYPED place key of a committed DMA op,
+# derived at fact-commit time: the function-scoped StablePlaceId of the
+# buffer place. The root is the owning function's stable declaration (the
+# text-boundary callable parse of the owner key — the snapshot builder
+# re-roots it on the persistent store-stamped declaration before
+# persisting) plus the binder identity of the place root's canonical name;
+# the projection chain is the TYPED field/tuple/constant-index chain
+# (FieldId/TupleIndex/Index — never a text re-parse). Option::None when the
+# place is outside the stable grammar: a dynamic index or a deref chain
+# (the ownership lattice's whole-value boundary), a variant downcast, or a
+# field projection the typed tables cannot name — the stable text key
+# stays the only identity, no id is fabricated.
+def resource_dma_place_id(typed: TypedProgram, owner_key: String, root_name: String, arg: Expr) -> Option[StablePlaceId]
+  var keys: Vec[ProjectionKey] = Vec::new()
+  let static_chain = place_projection_keys(typed, &arg, &mut keys)
+  if !static_chain then
+    return Option::None
+  end
+  var projs: Vec[StableProjection] = Vec::new()
+  for k in keys do
+    match k
+    when ProjectionKey::Field(fid) then
+      var fname = ""
+      match typed.type_fields.get(fid.owner.id)
+      when Option::Some(fields) then
+        if fid.index >= 0 && fid.index < fields.len() then
+          fname = fields[fid.index].0.clone()
+        end
+      when Option::None then ()
+      end
+      if fname.len() == 0 then
+        return Option::None
+      end
+      projs.push(stable_projection_field(stable_field_id_of(Option::None, fid.index, fname)))
+    when ProjectionKey::TupleIndex(ti) then
+      projs.push(stable_projection_tuple(ti))
+    when ProjectionKey::Index(ci) then
+      if ci < 0 then
+        return Option::None
+      end
+      projs.push(stable_projection_index(ci))
+    when ProjectionKey::Variant(_) then
+      return Option::None
+    end
+  end
+  let owner_decl = stable_callable_decl_of(&owner_key)
+  let owner = structural_instance_id_of(owner_decl, Vec::new())
+  let binder = stable_binder_id_of(owner.callable.clone(), resource_dma_binder_seq(root_name.clone()))
+  let root = StableLocalId { owner: owner, binder: binder, display_name: root_name }
+  stable_place_id_of(root, projs)
+end
+
 # apply_dma_call — the canonical DMA op commit site (check_expr_call's
 # interception of the std::embedded dma_* calls): looks the buffer's place
 # root up, applies the ONE pure transition rule and either commits the
@@ -7919,11 +8089,12 @@ end
 # the remaining arguments are applied normally.
 def apply_dma_call(typed: TypedProgram, inout ctx: AnalysisContext, op: String, arg: Expr, inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
   let span = arg.span
-  match expr_root_id(typed, arg)
+  match expr_root_id(typed, &arg)
   when Option::Some(id) then
     let lid = tg_compiler::ids::LocalId { id: id }
     let cur = res_frame_dma_get(frame, lid)
     let name = binding_name(typed, id)
+    let place_id = resource_dma_place_id(typed, ctx.current_owner_key.clone(), name.clone(), &arg)
     var prior_site = ""
     var prior_op = ""
     match frame.dma.get(&lid)
@@ -7940,7 +8111,8 @@ def apply_dma_call(typed: TypedProgram, inout ctx: AnalysisContext, op: String, 
         place: name.clone(),
         state: resource_dma_state_word(next),
         op: op.clone(),
-        site: span_site_label(span)
+        site: span_site_label(span),
+        place_id: place_id
       })
     when DmaTransition::Reject(reason) then
       var message = "rejected DMA operation `" + resource_dma_op_display(op.clone()) + "` on `" + name.clone() + "`"

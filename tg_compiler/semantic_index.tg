@@ -149,7 +149,10 @@ use tg_compiler::mir::{
 use tg_compiler::stable_ids::{
   StableDeclId, StableTestId, stable_decl_of_key, stable_decl_collision_check,
   stable_key_name_part, stable_decl_reference_text,
-  stable_mir_statement_role_key_text, instance_key_to_text
+  stable_mir_statement_role_key_text, instance_key_to_text,
+  # (DMA keying refinement) the typed DMA place keys the dma_places map
+  # indexes. Eq/Hash fold the StablePlaceId's digest words (section 6).
+  StablePlaceId, stable_place_id_from_digest
 }
 # The §33 MIR-graph machinery (third-audit item 20): the on-demand
 # MirGraphIndex reuses the reaching-definition authority and delegates the
@@ -165,7 +168,10 @@ use tg_compiler::semantic_model::{
   TraitImplEdge, TraitSelectionEdge, GenericInstantiationEdge,
   ContractReferenceEdge, semantic_json_escape, semantic_summary_dirty_word,
   semantic_strings_sort,
-  semantic_contract_expr_text, semantic_digest_zero
+  semantic_contract_expr_text, semantic_digest_zero,
+  # (DMA keying refinement) the canonical DMA row text the dma_places
+  # map's values carry, plus the row record/state the lane fixture builds.
+  semantic_dma_ownership_fact_text, DmaOwnershipFact, DmaState
 }
 
 # ———————————————————————————————————————————————————————————————
@@ -231,6 +237,12 @@ struct SemanticIndex
   # symbol decl -> test stable key texts (the reverse edge the delta's
   # TestReferences closure reads).
   test_symbols: Map[StableDeclId, Vec[String]] = Map::new()
+  # (DMA keying refinement) the per-place DMA-ownership rows keyed by the
+  # TYPED StablePlaceId the row carries (audit item 16 rows with a typed
+  # place id; a legacy row without one is not indexed here — the
+  # ownership.dma_state text scan still serves it). Values are the
+  # canonical DMA row texts.
+  dma_places: Map[StablePlaceId, Vec[String]] = Map::new()
   # function decl -> the function's coarse MirSemanticSummary row.
   mir_summaries: Map[StableDeclId, MirSemanticSummary] = Map::new()
   # def decl -> the FULL canonical key text of the def (the attached text:
@@ -578,6 +590,37 @@ def index_single_rows_text(m: Map[String, String], key: String) -> Vec[String]
   out
 end
 
+# (DMA keying refinement) Append one row under a TYPED place key, deduped
+# (the StablePlaceId Eq/Hash fold the digest words). The get borrows the
+# key; the insert consumes it on first sight.
+def index_map_push_place(inout m: Map[StablePlaceId, Vec[String]], key: StablePlaceId, val: String) -> Unit
+  match m.get(&key)
+  when Option::Some(rows) then
+    var new_rows = rows.clone()
+    if !new_rows.contains(&val) then
+      new_rows.push(val)
+      m.insert(key, new_rows)
+    end
+  when Option::None then
+    m.insert(key, Vec::from([val]))
+  end
+  ()
+end
+
+# The sorted rows of a typed-place-keyed map ([] when the key is absent).
+def index_map_rows_place(m: Map[StablePlaceId, Vec[String]], key: StablePlaceId) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  match m.get(&key)
+  when Option::Some(rows) then
+    for r in rows do
+      out.push(r.clone())
+    end
+  when Option::None then ()
+  end
+  semantic_strings_sort(&mut out)
+  out
+end
+
 # The deterministic site render of a provenance span ("file:start-end");
 # "" when the row carries no span (or a dummy one) — no site row is
 # invented for absent provenance.
@@ -902,6 +945,20 @@ pub def build_semantic_index(snapshot: SemanticSnapshot) -> SemanticIndex
     index_map_push_decl(&mut test_symbols, tr.target.clone(), tr.test.stable_key.clone())
   end
 
+  # 6b. (DMA keying refinement) The typed DMA-ownership place map: one
+  #     entry per snapshot.dma_ownership row carrying a typed
+  #     StablePlaceId — the O(1) companion of the ownership.dma_state
+  #     text scan. A legacy row without a typed key is not indexed (the
+  #     identity is not fabricated).
+  var dma_places: Map[StablePlaceId, Vec[String]] = Map::new()
+  for dm in snapshot.dma_ownership do
+    let row = semantic_dma_ownership_fact_text(&dm)
+    match dm.place_id
+    when Option::Some(p) then index_map_push_place(&mut dma_places, p, row)
+    when Option::None then ()
+    end
+  end
+
   # 7. The typed dependency graph (third-audit item 18 rows): the type-USE
   #    inverse (used type -> user key texts), the trait impl / selection
   #    relations (trait -> "self-type|impl-key"; impl key -> selected
@@ -1001,6 +1058,7 @@ pub def build_semantic_index(snapshot: SemanticSnapshot) -> SemanticIndex
     type_instances: type_instances,
     test_targets: test_targets,
     test_symbols: test_symbols,
+    dma_places: dma_places,
     mir_summaries: mir_summaries,
     def_texts: def_texts
   }
@@ -1261,6 +1319,15 @@ pub def index_tests_for_symbol_decl(idx: SemanticIndex, key: StableDeclId) -> Ve
   index_map_rows_decl(&idx.test_symbols, key.clone())
 end
 
+# (DMA keying refinement) The DMA-ownership row texts recorded under a
+# TYPED place key ([] when the place has no typed DMA rows — never a
+# fabricated row). The O(1) companion of the ownership.dma_state text
+# scan; keyed by the StablePlaceId identity (the digest words Eq/Hash
+# folds).
+pub def index_dma_rows_of_place(idx: SemanticIndex, place: StablePlaceId) -> Vec[String]
+  index_map_rows_place(&idx.dma_places, place)
+end
+
 # The coarse MirSemanticSummary of a def-keyed function (block/statement/
 # local counts, reachability, the fail-closed markers and the transitive
 # §11 summary). The statement-level graphs ride the on-demand
@@ -1387,6 +1454,25 @@ def index_collect_text_vec_lines(tag: String, m: Map[String, Vec[String]], inout
   ()
 end
 
+# (DMA keying refinement) The typed-place-keyed row map (dma_places): the
+# key render is the place identity's digest-words render — the map key has
+# no canonical display text (stable_place_text_of is diagnostics-only and
+# cannot distinguish a field from a variant), so identity words are the
+# one deterministic, collision-free render.
+def index_collect_place_lines(tag: String, m: Map[StablePlaceId, Vec[String]], inout lines: Vec[String]) -> Unit
+  var entries: Vec[(StablePlaceId, Vec[String])] = m.entries()
+  for entry in entries do
+    let key = entry.0.clone()
+    let key_text = key.digest_hi.to_string() + "-" + key.digest_lo.to_string()
+    let rows = index_map_rows_place(&m, key.clone())
+    for row in rows do
+      lines.push("{\"s\":\"" + tag + "\",\"k\":\"" + semantic_json_escape(&key_text) + "\"," +
+        "\"v\":\"" + semantic_json_escape(&row) + "\"}")
+    end
+  end
+  ()
+end
+
 # The canonical sorted text form of an index.
 def semantic_index_digest_text(idx: SemanticIndex) -> String
   var lines: Vec[String] = Vec::new()
@@ -1412,6 +1498,7 @@ def semantic_index_digest_text(idx: SemanticIndex) -> String
   index_collect_text_vec_lines("type_instances", &idx.type_instances, &mut lines)
   index_collect_text_vec_lines("test_targets", &idx.test_targets, &mut lines)
   index_collect_vec_lines("test_symbols", &idx.test_symbols, &idx, &mut lines)
+  index_collect_place_lines("dma_places", &idx.dma_places, &mut lines)
   index_collect_mir_lines(&idx.mir_summaries, &idx, &mut lines)
   semantic_strings_sort(&mut lines)
   var text = ""
@@ -1568,7 +1655,27 @@ def index_lane_snapshot() -> SemanticSnapshot
       span: Option::Some(Span { file: "lane.tg".to_string(), start: 11, end_pos: 15 })
     }
   ])
+  # (DMA keying refinement) ONE DMA-ownership row carrying the typed place
+  # key: the dma_places map indexes it by identity; the row text is the
+  # canonical render with the "pid" suffix.
+  s.dma_ownership = Vec::from([
+    DmaOwnershipFact {
+      function: "m::u#fn(m::T)->unit".to_string(),
+      place: "buf".to_string(),
+      state: DmaState::PinnedRead,
+      op: "dma-pin-read".to_string(),
+      site: "lane.tg:21".to_string(),
+      place_id: Option::Some(index_lane_dma_place())
+    }
+  ])
   s
+end
+
+# (DMA keying refinement) The index lane's typed place fixture: a place
+# identity built from its persisted words (Eq/Hash fold them), so the
+# accessor comparison is exact.
+def index_lane_dma_place() -> StablePlaceId
+  stable_place_id_from_digest("buf".to_string(), 0x1234, 0x5678)
 end
 
 def index_lane_return() -> MirTerminator
@@ -1667,6 +1774,15 @@ pub def semantic_index_lane_check() -> Vec[String]
   index_lane_rows(&mut out, "l14-type-instances",
     index_type_instances_of(&idx, "m::G#fn()->unit".to_string()),
     Vec::from(["instance::m::G$Int".to_string()]))
+  # (DMA keying refinement) L5b — the typed DMA place map: the row answers
+  # under the StablePlaceId identity (the digest words), and an unknown
+  # place answers empty (never a fabricated row).
+  index_lane_rows(&mut out, "l21-dma-places",
+    index_dma_rows_of_place(&idx, index_lane_dma_place()),
+    Vec::from(["m::u#fn(m::T)->unit|dma|buf|pinned-read|dma-pin-read|lane.tg:21|pid:4660-22136".to_string()]))
+  index_lane_rows(&mut out, "l22-dma-places-miss",
+    index_dma_rows_of_place(&idx, stable_place_id_from_digest("nope".to_string(), 1, 2)),
+    Vec::new())
 
   # L6 — the on-demand MIR graph index + the delegated builders.
   let program = index_lane_program()

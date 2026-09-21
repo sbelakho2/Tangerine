@@ -39,7 +39,7 @@ use tg_compiler::ast::{assign_node_ids, Program, Item, ItemId, ModuleId, Module,
 use tg_compiler::resolver::{resolve_names}
 use tg_compiler::types::{type_env_new, type_check_typed, TypeCheckResult, type_display}
 use tg_compiler::compiler_core::{default_options, apply_cfg_elimination, prepare_parsed, analyze_parsed}
-use tg_compiler::mir::{lower_to_mir}
+use tg_compiler::mir::{lower_to_mir, verify_mir, MirProgram}
 use tg_compiler::access_check::{access_check, AccessError}
 use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_context_new, ResourceError, engine_env_empty}
 
@@ -540,7 +540,62 @@ end
 #   MIR_LOWER <label> functions=N errors=0
 #   MIR_RELOWER <label> functions=N errors=0
 # ———————————————————————————————————————————————————————————————
-def infer_probe_lower_program(program: Program, label: String, inout report: String) -> Int
+# ———————————————————————————————————————————————————————————————
+# (table-persistence regression): the builder-state copy bug class. Every
+# lowered MirFunction MUST carry its return-place local (local 0 = the
+# `_ret` slot, added by start_function) and the parameter table of its
+# declaration — `match b.current_fn when Option::Some(f) then
+# f.locals.push(...)` without the `b.current_fn = Option::Some(f)`
+# write-back mutated a COPY, so every function ended with locals=0/params=0
+# and `lookup_local_type` answered Type::Unit for every id (the
+# missing-scrutinee-identity ICE). The row below is the executable pin:
+# empty_locals counts functions with an EMPTY local table (must be 0 — the
+# return place is unconditional) and params_total sums every function's
+# parameter table (must be >= the shape's declared parameter minimum).
+# `MIR_LOCALCHECK <label> pass` is the assertion target of tg_infer
+# --lower/--lower-shapes (the lower_enum_payload / lower_match_field /
+# lower_closure_capture rows are the direct regression set).
+def infer_probe_check_mir_tables(mir: MirProgram, label: String, min_params: Int, inout report: String) -> Bool
+  var empty_locals = 0
+  var empty_params = 0
+  var bodyless = 0
+  var params_total = 0
+  var fi = 0
+  while fi < mir.functions.len() do
+    let f = mir.functions[fi]
+    # (the declaration class): an extern function (or any declaration
+    # without a lowered body) carries NO local/parameter table by
+    # construction — the MirFunction record is the declaration surface, not
+    # a lowered body. The table-persistence invariant is about LOWERED
+    # functions (the return place is unconditional there); counting
+    # declarations was the empty_locals=30 false row.
+    if f.is_extern || f.blocks.is_empty() then
+      bodyless = bodyless + 1
+    else
+      if f.locals.is_empty() then
+        empty_locals = empty_locals + 1
+        if empty_locals <= 8 then
+          report = report + "MIR_EMPTY_LOCALS " + label.clone() + " fn=" + f.name.clone() + "\n"
+        end
+      end
+      if f.params.is_empty() then
+        empty_params = empty_params + 1
+      end
+      params_total = params_total + f.params.len()
+    end
+    fi = fi + 1
+  end
+  report = report + "MIR_LOCALS " + label.clone() + " functions=" + mir.functions.len().to_string() + " bodyless=" + bodyless.to_string() + " empty_locals=" + empty_locals.to_string() + " empty_params=" + empty_params.to_string() + " params_total=" + params_total.to_string() + "\n"
+  if empty_locals == 0 && params_total >= min_params then
+    report = report + "MIR_LOCALCHECK " + label.clone() + " pass\n"
+    true
+  else
+    report = report + "MIR_LOCALCHECK " + label.clone() + " fail empty_locals=" + empty_locals.to_string() + " params_total=" + params_total.to_string() + " min_params=" + min_params.to_string() + "\n"
+    false
+  end
+end
+
+def infer_probe_lower_program(program: Program, label: String, min_params: Int, inout report: String) -> Int
   var env = type_env_new()
   env.strict_resolution = true
   let opts = default_options()
@@ -553,10 +608,23 @@ def infer_probe_lower_program(program: Program, label: String, inout report: Str
     match lower_to_mir(&program, &analyzed)
     when Result::Ok(mir) then
       report = report + "MIR_LOWER " + label.clone() + " functions=" + mir.functions.len().to_string() + " errors=0\n"
+      # (MIR_VERIFY row dump): the post-lower verify_mir faces over the
+      # SAME lowered program, row by row — the corpus-probe parity channel
+      # (the kernel's compile pipeline reports the identical rows; this
+      # probe makes them iterable without the full kernel closure run).
+      let vrows = verify_mir(mir.clone())
+      report = report + "MIR_VERIFY " + label.clone() + " rows=" + vrows.len().to_string() + "\n"
+      var vri = 0
+      while vri < vrows.len() do
+        report = report + "MIR_VERIFY_ROW " + label.clone() + " " + vrows[vri].clone() + "\n"
+        vri = vri + 1
+      end
+      let _ = infer_probe_check_mir_tables(mir, label.clone(), min_params, &mut report)
       let _ = write_file("build/infer_probe.txt", report.clone())
       match lower_to_mir(&program, &analyzed)
       when Result::Ok(mir2) then
         report = report + "MIR_RELOWER " + label.clone() + " functions=" + mir2.functions.len().to_string() + " errors=0\n"
+        let _ = infer_probe_check_mir_tables(mir2, label.clone() + "-relower", min_params, &mut report)
         let _ = write_file("build/infer_probe.txt", report.clone())
         0
       when Result::Err(e2) then
@@ -582,15 +650,18 @@ def infer_probe_lower_program(program: Program, label: String, inout report: Str
 end
 
 # the lowering SHAPE entry: a tiny inline program through the SAME
-# analyze + double-lowering sequence as the merged stage.
-def infer_probe_run_lower_shape(label: String, source: String, inout report: String) -> Int
+# analyze + double-lowering sequence as the merged stage. `min_params` is
+# the shape's declared parameter minimum — the table-persistence leg
+# (MIR_LOCALCHECK) asserts every function carries its return place and the
+# shape's parameter tables survive lowering.
+def infer_probe_run_lower_shape(label: String, source: String, min_params: Int, inout report: String) -> Int
   let parsed = parse(tokenize(source.clone(), label.clone()))
   if diag_has_errors(&parsed.diagnostics) then
     report = report + "MIR_LOWER " + label.clone() + " parse-failed\n"
     return 2
   end
   var program = parsed.program
-  infer_probe_lower_program(program, label, &mut report)
+  infer_probe_lower_program(program, label, min_params, &mut report)
 end
 
 def infer_probe_resource_totals_word(res_counts: Vec[Int]) -> String
@@ -1048,7 +1119,7 @@ def infer_probe_run_merged(corpus_path: String, inout report: String, inout coun
       if file_exists("build/infer_lower_merged.flag") then
         report = report + "MIR_LOWER_BEGIN merged\n"
         let _ = write_file("build/infer_probe.txt", report.clone())
-        let _ = infer_probe_lower_program(raw_program, "merged", &mut report)
+        let _ = infer_probe_lower_program(raw_program, "merged", 1, &mut report)
         report = report + "MIR_LOWER_END merged\n"
         let _ = write_file("build/infer_probe.txt", report.clone())
       end
@@ -1184,45 +1255,72 @@ def main() -> Int
   if file_exists("build/infer_lower.flag") then
     let lower_shapes = Vec::from([
       # binary/unary/raw-deref operand boxes (lr_binary/lr_unary/lr_deref)
-      ("lower_arith", "def main() -> Int\n  let a = 1 + 2\n  let b = a * 3 - 1\n  b\nend\n"),
+      ("lower_arith", "def main() -> Int\n  let a = 1 + 2\n  let b = a * 3 - 1\n  b\nend\n", 0),
       # nested field access + method receiver chain (lower_place /
       # lower_callee_operand / qualify_field_callee_name)
-      ("lower_field_chain", "struct Inner\n  v: Int\nend\n\nstruct Outer\n  inner: Inner\nend\n\ndef take(o: Outer) -> Int\n  o.inner.v + 1\nend\n\ndef main() -> Int\n  let o = Outer { inner: Inner { v: 4 } }\n  take(o)\nend\n"),
+      ("lower_field_chain", "struct Inner\n  v: Int\nend\n\nstruct Outer\n  inner: Inner\nend\n\ndef take(o: Outer) -> Int\n  o.inner.v + 1\nend\n\ndef main() -> Int\n  let o = Outer { inner: Inner { v: 4 } }\n  take(o)\nend\n", 1),
       # enum variant payload arguments (lr_enum_variant / lower_call_arg):
       # the enum is declared IN the shape program (an isolated program has
       # no std type tables, so std's Option/Result matches are covered by
       # the merged closure leg instead).
-      ("lower_enum_payload", "enum E\n  Pair(Int, Int)\n  Nil\nend\n\ndef mk(v: Int) -> E\n  E::Pair(v + 1, v)\nend\n\ndef main() -> Int\n  let e = mk(1)\n  match e\n  when E::Pair(a, _b) then a\n  when E::Nil then 0\n  end\nend\n"),
+      ("lower_enum_payload", "enum E\n  Pair(Int, Int)\n  Nil\nend\n\ndef mk(v: Int) -> E\n  E::Pair(v + 1, v)\nend\n\ndef main() -> Int\n  let e = mk(1)\n  match e\n  when E::Pair(a, _b) then a\n  when E::Nil then 0\n  end\nend\n", 1),
+      # (enum associated fn vs variant construction): `Type::assoc_fn(args)`
+      # over an ENUM owner parses as an ExprEnumVariant, but only a path
+      # whose LAST segment is a registered variant may construct (the
+      # seed's ctor_of lookup). The pre-fix owner-only check routed
+      # `Budget::capped(4)` into the variant-construction arm, whose
+      # discriminant lookup failed closed with `unknown enum variant
+      # 'Budget::capped'` — the std/fs.tg `IoError::from_errno` corpus
+      # trap. The impl-registry static-path call must lower instead.
+      ("lower_enum_assoc_fn", "enum Budget\n  Capped(Int)\n  Uncapped\nend\n\nimpl Budget\n  def capped(limit: Int) -> Budget\n    Budget::Capped(limit)\n  end\nend\n\ndef main() -> Int\n  match Budget::capped(4)\n  when Budget::Capped(v) then v\n  when Budget::Uncapped then 0\n  end\nend\n", 1),
       # assignment expression target/value boxes (lower_expr_assign_to /
       # lr_enum_variant)
-      ("lower_enum_assign", "struct Holder\n  v: Int\nend\n\ndef main() -> Int\n  var h = Holder { v: 1 }\n  match h.v\n  when 1 then h.v = 2\n  when _ then ()\n  end\n  h.v\nend\n"),
+      ("lower_enum_assign", "struct Holder\n  v: Int\nend\n\ndef main() -> Int\n  var h = Holder { v: 1 }\n  match h.v\n  when 1 then h.v = 2\n  when _ then ()\n  end\n  h.v\nend\n", 0),
       # match-to-place with a field payload (lower_match_to_place); the
       # enum is declared in the shape (see lower_enum_payload).
-      ("lower_match_field", "struct Inner\n  v: Int\nend\n\nenum Boxed\n  Has(Inner)\n  None\nend\n\ndef pick(o: Boxed) -> Int\n  let x = match o\n  when Boxed::Has(inner) then inner.v\n  when Boxed::None then 0\n  end\n  x\nend\n\ndef main() -> Int\n  let i = Inner { v: 3 }\n  pick(Boxed::Has(i))\nend\n"),
+      ("lower_match_field", "struct Inner\n  v: Int\nend\n\nenum Boxed\n  Has(Inner)\n  None\nend\n\ndef pick(o: Boxed) -> Int\n  let x = match o\n  when Boxed::Has(inner) then inner.v\n  when Boxed::None then 0\n  end\n  x\nend\n\ndef main() -> Int\n  let i = Inner { v: 3 }\n  pick(Boxed::Has(i))\nend\n", 1),
       # closure body retention (the deep-clone boundary) + capture: the
       # capture is a PARAMETER (its semantic id is registered at the
       # function head, the shape the parameter-capture channel supports)
-      ("lower_closure_capture", "def apply_base(base: Int) -> Int\n  let f = |x: Int| x + base\n  f(2)\nend\n\ndef main() -> Int\n  apply_base(10)\nend\n"),
+      ("lower_closure_capture", "def apply_base(base: Int) -> Int\n  let f = |x: Int| x + base\n  f(2)\nend\n\ndef main() -> Int\n  apply_base(10)\nend\n", 1),
       # for-range bound boxes (lower_for)
-      ("lower_for_range", "def hi() -> Int\n  3\nend\n\ndef main() -> Int\n  var acc = 0\n  for i in 0..hi() do\n    acc = acc + i\n  end\n  acc\nend\n"),
+      ("lower_for_range", "def hi() -> Int\n  3\nend\n\ndef main() -> Int\n  var acc = 0\n  for i in 0..hi() do\n    acc = acc + i\n  end\n  acc\nend\n", 0),
+      # (const-call pattern): `when FOUR() then` against a non-enum subject
+      # is the checker's const-call fallback (types.tg pattern_const_calls);
+      # the pre-fix MIR routed the 1-segment Variant path into the
+      # variant-construction arm and failed closed with `enum variant path
+      # needs at least two segments` — the std/fs.tg `when DT_DIR() then`
+      # corpus trap. The declaration's literal body folds to the test value.
+      ("lower_const_call_pattern", "def FOUR() -> Int = 4\n\ndef classify(x: Int) -> Int\n  match x\n  when FOUR() then 1\n  when _ then 0\n  end\nend\n\ndef main() -> Int\n  classify(4) + classify(5) * 10\nend\n", 1),
       # array/index/cast operand boxes (lr_array_lit / ExprIndex / cast)
-      ("lower_array_index", "def main() -> Int\n  let arr: [Int; 3] = [1, 2, 3]\n  let i = 1\n  let x = arr[i] as Int\n  x + arr[0]\nend\n"),
+      ("lower_array_index", "def main() -> Int\n  let arr: [Int; 3] = [1, 2, 3]\n  let i = 1\n  let x = arr[i] as Int\n  x + arr[0]\nend\n", 0),
       # the ffi.tg RubyValue shape: a field access in a binary comparison
       # whose OTHER operand is a field access on a CALL result (the
       # merged-closure lowering's `missing typed field target for field
       # 'raw'` site)
-      ("lower_field_call_recv", "struct V\n  raw: UInt\nend\n\ndef nil_v() -> V\n  V { raw: 8 }\nend\n\ndef is_nil(v: V) -> Bool\n  v.raw == nil_v().raw\nend\n\ndef main() -> Int\n  0\nend\n"),
-      ("lower_field_bitand", "struct V\n  raw: UInt\nend\n\ndef odd(v: V) -> Bool\n  (v.raw & 1) == 1\nend\n\ndef main() -> Int\n  0\nend\n"),
-      ("lower_field_shr_cast", "struct V\n  raw: UInt\nend\n\ndef to_int(v: V) -> Int\n  (v.raw >> 1) as Int\nend\n\ndef main() -> Int\n  0\nend\n"),
+      ("lower_field_call_recv", "struct V\n  raw: UInt\nend\n\ndef nil_v() -> V\n  V { raw: 8 }\nend\n\ndef is_nil(v: V) -> Bool\n  v.raw == nil_v().raw\nend\n\ndef main() -> Int\n  0\nend\n", 1),
+      ("lower_field_bitand", "struct V\n  raw: UInt\nend\n\ndef odd(v: V) -> Bool\n  (v.raw & 1) == 1\nend\n\ndef main() -> Int\n  0\nend\n", 1),
+      ("lower_field_shr_cast", "struct V\n  raw: UInt\nend\n\ndef to_int(v: V) -> Int\n  (v.raw >> 1) as Int\nend\n\ndef main() -> Int\n  0\nend\n", 1),
       # the expression-bodied declaration form (`def f() -> T = expr`)
-      ("lower_expr_body_field", "struct V\n  raw: UInt\nend\n\ndef make() -> V = V { raw: 1 }\n\ndef main() -> Int\n  0\nend\n")
+      ("lower_expr_body_field", "struct V\n  raw: UInt\nend\n\ndef make() -> V = V { raw: 1 }\n\ndef main() -> Int\n  0\nend\n", 0),
+      # a payload-less enum variant VALUE in a match arm (the IoError::code /
+      # SmallErrorCode::code shape): the constant must carry the ENUM's type,
+      # never the bare Int, and the switch must read the Discriminant.
+      ("lower_enum_value_match", "enum EC\n  A\n  B\nend\n\ndef pick(x: Int) -> EC\n  match x\n  when 1 then EC::A\n  when _ then EC::B\n  end\nend\n\ndef main() -> Int\n  0\nend\n", 1),
+      # an inout parameter assigned as a bare target: the store goes through
+      # the pointee (ProjDeref), never into the reference slot.
+      ("lower_inout_self_assign", "enum E\n  Some(Int)\n  None\nend\n\ndef take(inout e: E) -> E\n  let old = e\n  e = E::None\n  old\nend\n\ndef main() -> Int\n  0\nend\n", 1),
+      # an annotated scalar local with an unsuffixed literal initializer and
+      # a call argument in a declared scalar slot (the dest-typed and
+      # call-site literal expectations).
+      ("lower_scalar_literal_slots", "def add(x: UInt, y: UInt) -> UInt\n  x + y\nend\n\ndef main() -> Int\n  let a: UInt = 0\n  let b: u8 = 8\n  let c = add(1, 2)\n  (a + c + (b as UInt)) as Int\nend\n", 1)
     ])
     var lsi = 0
     while lsi < lower_shapes.len() do
       let label = lower_shapes[lsi].0.clone()
       report = report + "BEGIN lower-shape " + label.clone() + "\n"
       let _ = write_file("build/infer_probe.txt", report.clone())
-      let _ = infer_probe_run_lower_shape(label, lower_shapes[lsi].1.clone(), &mut report)
+      let _ = infer_probe_run_lower_shape(label, lower_shapes[lsi].1.clone(), lower_shapes[lsi].2, &mut report)
       lsi = lsi + 1
     end
   end

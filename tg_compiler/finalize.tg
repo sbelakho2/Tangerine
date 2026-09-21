@@ -1,0 +1,458 @@
+# tg_compiler/finalize.tg — THE SHARED FINALIZED-MIR PIPELINE
+# (audit: the normative verified pipeline is lower -> verify post-lower ->
+# effect/purity/budget annotations -> mono -> verify post-mono
+# (unconditional) -> ABI/tail/target stamps -> optimize -> post-opt verify
+# -> final pre-codegen verify; compiler_core's compile flows implemented it
+# but every full-library route hand-repeated the sequence and the LIR /
+# wasm / snapshot / coverage routes SKIPPED the unconditional post-mono
+# checkpoint).
+#
+# This module is the ONE owner of that sequence for every full-library
+# production route:
+#   - the LIR native compile (driver.tg compile_lir_route),
+#   - the semantic snapshot / server route
+#     (driver.tg compile_snapshot_serve_route),
+#   - the coverage test harness (the ONE coverage.tg harness-construction
+#     entry coverage_harness_build_and_run, shared by the driver's CLI
+#     route and the verified-edit transaction),
+#   - the wasm route (driver.tg compile_to_wasm_route),
+#   - the semantic server compile + verified-edit transaction
+#     (semantic_server.tg session_compile_source /
+#     session_verified_edit_full).
+# Each route now calls finalize_verified_mir ONCE and reads the returned
+# VerifiedFinalMir + its per-stage evidence; none of them may re-spell the
+# phase sequence (scripts/check_finalized_mir_pipeline.sh gates that).
+#
+# THE KERNEL/BOOTSTRAP EXCEPTION (by construction): compiler_core.tg's
+# compile_file_core / compile_startup_entry / compile_multiple_files and
+# the lib / lib_kernel convenience entries stay on their EXPLICIT
+# EPHEMERAL path — they live in the bootstrap kernel closure (see
+# bootstrap/compiler_kernel.manifest) which must never import this
+# full-library module, hold no persistent DeclLineageStore (so they build
+# the mono cache through the documented mono_cache_new_ephemeral
+# constructor) and run the SAME boundary checks inline. They are the
+# normative shape this entry extracts; the kernel exception is documented
+# at each of those entries. The driver's --dump-abi-plans inspection
+# (dump_abi_plans_direct) is likewise an explicit ephemeral consumer, not
+# a compile route: it stops after the stamps and emits no artifact.
+#
+# PER-STAGE EVIDENCE: VerifiedFinalMir carries the finalized program plus
+# ONE FinalizeEvidence record whose statuses are set ONLY for the stages
+# this entry really ran to success (a failure returns Err at the exact
+# stage, so a success record never claims an unrun stage). Routes map the
+# statuses onto VerifiedCompilationEvidence / the verified-edit
+# transaction statuses — post-mono-mir is real on every migrated route.
+
+use std::core::{Option, Result}
+use std::collections::{Vec}
+
+use tg_compiler::parser::{Diagnostic}
+use tg_compiler::types::{TypeEnv}
+use tg_compiler::resource_check::{AnalyzedProgram}
+use tg_compiler::compiler_core::{
+  CompilerOptions, driver_lower_to_mir, type_errors_to_diags, mir_verify_everything
+}
+use tg_compiler::mir::{
+  MirProgram, MirBlockId, verify_mir,
+  check_effect_class_annotations_mir, check_purity_annotations_mir,
+  check_budget_annotations_mir, optimize_mir_verified, optimize_mir_with_decisions
+}
+use tg_compiler::codegen::{
+  detect_host_target, stamp_tail_abi_plans, stamp_slp_vector_facility_desc
+}
+use tg_compiler::mono::{monomorphize_program, mono_cache_new_persistent}
+use tg_compiler::semantic_snapshot::{snapshot_lineage_view_of, SnapshotError}
+use tg_compiler::stable_ids::{DeclLineageStore}
+use tg_compiler::target_desc::{TargetDesc}
+
+# ———————————————————————————————————————————————————————————————
+# The finalization request records
+# ———————————————————————————————————————————————————————————————
+
+# The route-selected target facts the finalization stamps:
+#   slp_desc — the descriptor whose 128-bit vector facility decides the
+#              SLP target-capability stamp (stamp_slp_vector_facility_desc)
+#              BEFORE the optimizer runs. Option::None = a target-agnostic
+#              route (wasm): the flag keeps its fail-closed default and the
+#              optimizer's SLP pass stays a no-op. The LIR route resolves
+#              the EFFECTIVE emission target (lir_route_slp_desc), the
+#              host routes their canonical host descriptor.
+# The AbiCallPlan stamp and the completion oracles stay host-keyed exactly
+# as the routes ran them (detect_host_target().arch — the cross routes
+# carry the advisory host plan table their backends ignore).
+pub struct FinalizeTarget
+  slp_desc: Option[TargetDesc] = Option::None
+end
+
+# TEST-ONLY finalization probes (the route-level negative lane): Clean is
+# the production shape; CorruptPostMono deliberately corrupts the
+# monomorphized program at the unchecked post-mono seam, so the shared
+# entry's negative test can prove the post-mono verify_mir checkpoint is
+# armed and cannot silently pass a corrupt generic substitution. The probe
+# is a defaulted option, never enabled by a route.
+pub enum FinalizeProbe
+  Clean
+  CorruptPostMono
+end
+
+# The finalization policy: the compiler options this run executes under
+# plus the route-level switches. The CompilerOptions record is carried
+# WHOLE so the shared entry derives the one verify-everything policy
+# (mir_verify_everything — the mode system's Dev/Strict = every-pass
+# checkpoints rule) and no route re-derives a policy of its own.
+pub struct FinalizeOptions
+  # The compiler options of this compile: opt_level, mode /
+  # verify_everything, target triple.
+  compiler: CompilerOptions
+  # Capture the optimizer's decision rows on program.opt_decisions (the
+  # rationale artifact's grounding). True only where this build persists a
+  # rationale store fed from opt_decisions_of_mir (the snapshot route and
+  # the wasm route); the optimized MIR is byte-identical either way.
+  capture_opt_decisions: Bool = false
+  # Stamp the authoritative AbiCallPlan table the tail pass consumes
+  # before the optimizer. Off for the target-agnostic wasm route.
+  stamp_tail_abi_plans: Bool = true
+  # Stop after the post-mono stamps (the --dump-abi-plans inspection): the
+  # optimizer and the post-opt / pre-codegen verifications do not run and
+  # their evidence statuses stay false/uncaptured.
+  stop_after_stamps: Bool = false
+  # TEST-ONLY probe (see FinalizeProbe).
+  probe: FinalizeProbe = FinalizeProbe::Clean
+end
+
+# The per-stage verification evidence of ONE successful finalization.
+# EVERY field is true exactly when the stage ran and passed; a stage that
+# did not run (stop_after_stamps) stays false AND is absent from `stages`,
+# so the proof_patch mapping (false + captured = Failed, false +
+# uncaptured = Unavailable) is exact.
+pub struct FinalizeEvidence
+  # the post-lowering verify_mir accepted the lowered program.
+  mir_verify_ok: Bool = false
+  # the §11 effect-class annotation check passed over the lowered program.
+  effect_verify_ok: Bool = false
+  # the `pure`-declaration theorem passed (E0234 fails closed).
+  purity_verify_ok: Bool = false
+  # the @budget declaration check passed (E0235 fails closed).
+  budget_verify_ok: Bool = false
+  # the pre-mono callable lineage view was stamped through the caller's
+  # persistent DeclLineageStore (the mono cache is the persistent
+  # constructor).
+  lineage_ok: Bool = false
+  # the UNCONDITIONAL post-mono verify_mir accepted the monomorphized
+  # program — the stage the audited routes used to skip.
+  mono_verify_ok: Bool = false
+  # the post-optimization verify_mir accepted the optimized program.
+  post_opt_mir_verify_ok: Bool = false
+  # the final pre-codegen verify_mir accepted the exact IR the route
+  # consumes.
+  pre_codegen_mir_verify_ok: Bool = false
+  # The stage names THIS finalization captured, in pipeline order. The MIR
+  # words are the shared vocabulary the proof_patch evidence uses
+  # ("mir", "post-mono-mir", "post-opt-mir"); "effects" is the §11 check
+  # and "pre-codegen-mir" names the final firewall.
+  stages: Vec[String] = Vec::new()
+end
+
+# The finalized program + its verification evidence — THE product of the
+# shared pipeline. `mir` is the monomorphized, stamped, optimized and
+# fully verified MirProgram the route hands to codegen / the snapshot
+# builder / the transaction; `evidence` is the per-stage proof that the
+# boundaries ran.
+pub struct VerifiedFinalMir
+  mir: MirProgram
+  evidence: FinalizeEvidence
+end
+
+# ONE finalization failure: the canonical stage word plus the exact rows
+# the route renders. `rows` carries the verifier / lowering / mono error
+# strings; `diagnostics` carries the structured annotation diagnostics
+# (effects / purity / budget) for the routes that render them through
+# their own structured channel. Routes map `stage` onto their own refusal
+# prefixes — never onto a re-derived sequence.
+pub struct FinalizeFailure
+  # one of: "lower", "mir-after-lowering", "effects", "purity",
+  # "budget-annotations", "lineage", "mono", "post-mono-mir",
+  # "post-opt-mir", "pre-codegen-mir".
+  stage: String
+  rows: Vec[String] = Vec::new()
+  diagnostics: Vec[Diagnostic] = Vec::new()
+end
+
+# The stage names a full (optimized) finalization captures, in pipeline
+# order — the ONE spelling the evidence and the route-level tests read.
+pub def finalize_stage_names() -> Vec[String]
+  Vec::from([
+    "mir".to_string(),
+    "effects".to_string(),
+    "post-mono-mir".to_string(),
+    "post-opt-mir".to_string(),
+    "pre-codegen-mir".to_string()
+  ])
+end
+
+def finalize_evidence_stages(optimized: Bool) -> Vec[String]
+  var stages: Vec[String] = Vec::new()
+  stages.push("mir".to_string())
+  stages.push("effects".to_string())
+  stages.push("post-mono-mir".to_string())
+  if optimized then
+    stages.push("post-opt-mir".to_string())
+    stages.push("pre-codegen-mir".to_string())
+  end
+  stages
+end
+
+# The first human-readable row of a failure: the verifier / lowering / mono
+# row when one exists, else the first structured diagnostic rendered in
+# the "<code>: <message>" form the semantic routes use for refusal
+# prefixes. "" only for a failure with neither channel (never produced).
+pub def finalize_failure_detail(f: FinalizeFailure) -> String
+  if f.rows.len() > 0 then
+    return f.rows[0].clone()
+  end
+  if f.diagnostics.len() > 0 then
+    let d = f.diagnostics[0].clone()
+    let code_str = match d.code.clone()
+    when Option::Some(c) then c + ": "
+    when Option::None then ""
+    end
+    return code_str + d.message.clone()
+  end
+  "".to_string()
+end
+
+# The SnapshotError renderer (the semantic_snapshot error vocabulary).
+# Mirrors the driver's snapshot_error_text / the session's
+# session_snapshot_error_text so the shared entry owns its own diagnostic
+# text without importing either route module.
+pub def finalize_snapshot_error_text(e: SnapshotError) -> String
+  match e
+  when SnapshotError::UnstableTypeIdentity(tid) then
+    "unstable type identity (type id " + tid + ")"
+  when SnapshotError::UnstableDefIdentity then "unstable def identity"
+  when SnapshotError::UnstableFieldIdentity then "unstable field identity"
+  when SnapshotError::UnstableVariantIdentity then "unstable variant identity"
+  when SnapshotError::UnstableLocalIdentity then "unstable local identity"
+  when SnapshotError::UnstableClosureIdentity then "unstable closure identity"
+  when SnapshotError::UnstableBlockIdentity then "unstable block identity"
+  when SnapshotError::UnstableInstanceDisplay then "unstable instance display"
+  when SnapshotError::UnstableTarget then "unstable target"
+  when SnapshotError::UntrackedOrigin(api, detail) then
+    "untracked-artifact: " + api + ": " + detail
+  end
+end
+
+# TEST-ONLY (FinalizeProbe::CorruptPostMono): replace the first function's
+# entry block with a nonexistent id — a structural violation the MIR
+# verifier reports ("entry block bbN does not exist") without panicking.
+def finalize_probe_corrupt_post_mono(inout mir: MirProgram) -> Unit
+  if mir.functions.len() == 0 then
+    return
+  end
+  mir.functions[0].entry_block = MirBlockId { id: -424242 }
+  ()
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE ENTRY
+# ———————————————————————————————————————————————————————————————
+# finalize_verified_mir — the ONE finalized-MIR pipeline. Owns, in order:
+#
+#   1. lowering (driver_lower_to_mir over the analyzed artifact);
+#   2. the post-lower verify_mir;
+#   3. the §11 effect-class, purity and @budget annotation checks (each a
+#      structured-diagnostic compile error, E0232/E0234/E0235);
+#   4. the pre-mono callable lineage view stamped through `lineage_store`
+#      (snapshot_lineage_view_of) and the PERSISTENT mono cache
+#      (mono_cache_new_persistent);
+#   5. monomorphization;
+#   6. the UNCONDITIONAL post-mono verify_mir (the audited missing stage);
+#   7. the AbiCallPlan + SLP target stamps;
+#   8. the optimizer — optimize_mir_verified under the options' one
+#      verify-everything policy, or optimize_mir_with_decisions when the
+#      route captures rationale rows; the machine scheduler's opt-level
+#      stamp follows the same level the optimizer consumed;
+#   9. the post-opt verify_mir;
+#  10. the final pre-codegen verify_mir firewall over the exact IR the
+#      route consumes.
+#
+# `env` is the analyzer's live TypeEnv (the annotation checks and the
+# lineage view consume the checker's resolution / claim tables — NOT the
+# reduced engine snapshot carried inside AnalyzedProgram). `lineage_store`
+# is the caller's persistent store: the entry stamps the view through it
+# (mutating the store's revision state) and the caller threads the SAME
+# store into the snapshot build / publication afterwards.
+#
+# The kernel/bootstrap routes never call this entry (see the module doc);
+# every full-library production route calls it exactly once.
+pub def finalize_verified_mir(
+  env: TypeEnv,
+  analyzed: AnalyzedProgram,
+  target: FinalizeTarget,
+  options: FinalizeOptions,
+  inout lineage_store: DeclLineageStore
+) -> Result[VerifiedFinalMir, FinalizeFailure]
+  let opts = options.compiler.clone()
+
+  # 1. Lowering. The analyzed artifact's own AST is the lowered program's
+  # source (analyze_parsed stores typed.ast; the kernel convenience entry
+  # lowers the same face) — no route re-threads a separate AST.
+  var mir = match driver_lower_to_mir(&analyzed.ast, Option::Some(analyzed.clone()))
+  when Result::Ok(m) then m
+  when Result::Err(e) then
+    return Result::Err(FinalizeFailure {
+      stage: "lower".to_string(),
+      rows: Vec::from([e])
+    })
+  end
+
+  # 2. The post-lower verification boundary.
+  let post_lower_errs = verify_mir(&mir)
+  if !post_lower_errs.is_empty() then
+    return Result::Err(FinalizeFailure {
+      stage: "mir-after-lowering".to_string(),
+      rows: post_lower_errs
+    })
+  end
+
+  # 3. The annotation checks (the same structured-diagnostic channel the
+  # routes used: the failure carries the typed diagnostics and the route
+  # renders them through its own emitter / row helper).
+  let mir_effect_errs = check_effect_class_annotations_mir(&mir, env)
+  if !mir_effect_errs.is_empty() then
+    return Result::Err(FinalizeFailure {
+      stage: "effects".to_string(),
+      diagnostics: type_errors_to_diags(&mir_effect_errs)
+    })
+  end
+  let mir_purity_errs = check_purity_annotations_mir(&mut mir, env)
+  if !mir_purity_errs.is_empty() then
+    return Result::Err(FinalizeFailure {
+      stage: "purity".to_string(),
+      diagnostics: type_errors_to_diags(&mir_purity_errs)
+    })
+  end
+  let mir_budget_errs = check_budget_annotations_mir(&mir, env)
+  if !mir_budget_errs.is_empty() then
+    return Result::Err(FinalizeFailure {
+      stage: "budget-annotations".to_string(),
+      diagnostics: type_errors_to_diags(&mir_budget_errs)
+    })
+  end
+
+  # 4. The persistent declaration-lineage view (stamped AFTER lowering /
+  # verification and BEFORE monomorphization, so every source callable
+  # carries its persisted declaration before any instance enqueues) and
+  # the persistent mono cache.
+  let lineage_view = match snapshot_lineage_view_of(&env, &analyzed.typed, &mir, &mut lineage_store)
+  when Result::Ok(v) then v
+  when Result::Err(e) then
+    return Result::Err(FinalizeFailure {
+      stage: "lineage".to_string(),
+      rows: Vec::from([finalize_snapshot_error_text(e)])
+    })
+  end
+  var mono_cache = mono_cache_new_persistent(&analyzed.ast, &analyzed.resolutions, lineage_view)
+
+  # 5. Monomorphization.
+  match monomorphize_program(&mut mir, &mut mono_cache)
+  when Result::Ok(_) then ()
+  when Result::Err(me) then
+    return Result::Err(FinalizeFailure {
+      stage: "mono".to_string(),
+      rows: me
+    })
+  end
+
+  # TEST-ONLY probe: an invalid post-mono fixture can only fail HERE.
+  match options.probe
+  when FinalizeProbe::CorruptPostMono then finalize_probe_corrupt_post_mono(&mut mir)
+  when FinalizeProbe::Clean then ()
+  end
+
+  # 6. THE UNCONDITIONAL POST-MONO CHECKPOINT: the generic substitution is
+  # a transformative boundary every build must re-prove.
+  let post_mono_errs = verify_mir(&mir)
+  if !post_mono_errs.is_empty() then
+    return Result::Err(FinalizeFailure {
+      stage: "post-mono-mir".to_string(),
+      rows: post_mono_errs
+    })
+  end
+
+  # 7. The route's stamp seams: the authoritative AbiCallPlan oracle
+  # before the tail pass, then the SLP target-capability stamp keyed on
+  # the route's effective target descriptor.
+  if options.stamp_tail_abi_plans then
+    stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
+  end
+  match target.slp_desc.clone()
+  when Option::Some(d) then stamp_slp_vector_facility_desc(&mut mir, d)
+  when Option::None then ()
+  end
+
+  if options.stop_after_stamps then
+    return Result::Ok(VerifiedFinalMir {
+      mir: mir,
+      evidence: FinalizeEvidence {
+        mir_verify_ok: true,
+        effect_verify_ok: true,
+        purity_verify_ok: true,
+        budget_verify_ok: true,
+        lineage_ok: true,
+        mono_verify_ok: true,
+        post_opt_mir_verify_ok: false,
+        pre_codegen_mir_verify_ok: false,
+        stages: finalize_evidence_stages(false)
+      }
+    })
+  end
+
+  # 8. The optimizer under the ONE verify-everything policy the kernel
+  # pipeline also derives (mir_verify_everything: Dev/Strict builds verify
+  # after every transformative pass). The decision-capturing sibling
+  # stores the rationale rows on the program; the optimized MIR is
+  # byte-identical either way. The machine scheduler's opt-level stamp is
+  # the same level the optimizer just consumed.
+  let verify_everything = mir_verify_everything(opts.clone())
+  if options.capture_opt_decisions then
+    optimize_mir_with_decisions(&mut mir, opts.opt_level, verify_everything, Option::Some(Vec::new()))
+  else
+    optimize_mir_verified(&mut mir, opts.opt_level, verify_everything)
+  end
+  mir.opt_level = opts.opt_level
+
+  # 9. The post-opt verification boundary.
+  let post_opt_errs = verify_mir(&mir)
+  if !post_opt_errs.is_empty() then
+    return Result::Err(FinalizeFailure {
+      stage: "post-opt-mir".to_string(),
+      rows: post_opt_errs
+    })
+  end
+
+  # 10. The FINAL pre-codegen firewall: the verifier re-proves the exact
+  # IR instance the route hands to codegen / the snapshot builder.
+  let pre_codegen_errs = verify_mir(&mir)
+  if !pre_codegen_errs.is_empty() then
+    return Result::Err(FinalizeFailure {
+      stage: "pre-codegen-mir".to_string(),
+      rows: pre_codegen_errs
+    })
+  end
+
+  Result::Ok(VerifiedFinalMir {
+    mir: mir,
+    evidence: FinalizeEvidence {
+      mir_verify_ok: true,
+      effect_verify_ok: true,
+      purity_verify_ok: true,
+      budget_verify_ok: true,
+      lineage_ok: true,
+      mono_verify_ok: true,
+      post_opt_mir_verify_ok: true,
+      pre_codegen_mir_verify_ok: true,
+      stages: finalize_stage_names()
+    }
+  })
+end

@@ -1,0 +1,257 @@
+# tests/finalized_mir_pipeline_test.tg — THE SHARED FINALIZED-MIR PIPELINE
+# (tg_compiler/finalize.tg) route-level evidence lane.
+#
+# The audit finding: the normative verified pipeline is lower -> verify
+# post-lower -> effect/purity/budget annotations -> mono -> verify post-mono
+# (unconditional) -> ABI/tail/target stamps -> optimize -> post-opt verify
+# -> final pre-codegen verify; compiler_core followed it but every
+# full-library route hand-repeated the sequence and the LIR / wasm /
+# snapshot / coverage routes SKIPPED the post-mono checkpoint. The shared
+# entry finalize_verified_mir now owns it and every production route calls
+# it exactly once (scripts/check_finalized_mir_pipeline.sh gates the
+# no-duplication rule).
+#
+# This lane pins:
+#   - the VALID fixture: the shared entry succeeds and its FinalizeEvidence
+#     reports every stage it ran (mir / effects / post-mono-mir /
+#     post-opt-mir / pre-codegen-mir) — the positive route-level control;
+#   - the INVALID POST-MONO FIXTURE: a program deliberately corrupted AFTER
+#     monomorphization (the test-only FinalizeProbe::CorruptPostMono)
+#     FAILS at the post-mono checkpoint — proving the verifier really runs
+#     there and cannot silently pass a corrupt generic substitution;
+#   - the --dump-abi-plans stop shape: the post-opt / pre-codegen stages
+#     are NOT claimed when the entry stops after the stamps;
+#   - the exact option shapes the migrated routes pass (LIR / snapshot /
+#     coverage / wasm), each running the unconditional post-mono
+#     checkpoint;
+#   - the semantic-server routes end to end: session_compile_source's
+#     evidence and the verified-edit transaction's stage statuses are the
+#     shared entry's real evidence (post-mono Verified, never a
+#     placeholder).
+#
+# Run with:
+#   tg test tests/finalized_mir_pipeline_test.tg
+
+use std::core::{Option, Result}
+use std::collections::{Vec}
+use std::test::*
+
+use tg_compiler::types::{TypeEnv}
+use tg_compiler::resource_check::{AnalyzedProgram}
+use tg_compiler::compiler_core::{
+  default_options, parse_source_program, merge_imported_deps, analyze_program,
+  join_diagnostics
+}
+use tg_compiler::stable_ids::{stable_lineage_store_new}
+use tg_compiler::target_desc::{TargetDesc, aarch64_desc, x86_64_desc}
+use tg_compiler::asm::{Arch}
+use tg_compiler::codegen::{detect_host_target}
+use tg_compiler::finalize::{
+  finalize_verified_mir, finalize_stage_names, finalize_failure_detail,
+  FinalizeTarget, FinalizeOptions, FinalizeProbe, VerifiedFinalMir, FinalizeFailure
+}
+use tg_compiler::semantic_edit::{
+  SemanticEdit, resolve_edit, edit_error_word, edit_budget_for_plan, edit_plan_regs
+}
+use tg_compiler::proof_patch::{verification_status_is_verified}
+use tg_compiler::semantic_server::{
+  session_compile_source, session_apply_verified_edit
+}
+
+def fmp_host_desc() -> TargetDesc
+  match detect_host_target().arch
+  when Arch::AArch64 then aarch64_desc()
+  when Arch::X86_64 then x86_64_desc()
+  when _ then panic("the finalize lane needs the aarch64/x86-64 host descriptor")
+  end
+end
+
+def fmp_analyze(source: String) -> Result[(TypeEnv, AnalyzedProgram), String]
+  var ast = match parse_source_program(source, "finalize_lane.tg".to_string())
+  when Result::Ok(p) then p
+  when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
+  end
+  ast = match merge_imported_deps(ast, false)
+  when Result::Ok(a) then a
+  when Result::Err(e) then return Result::Err(e)
+  end
+  var env = type_env_new()
+  let analyzed = match analyze_program(&mut env, &mut ast, default_options())
+  when Result::Ok(a) then a
+  when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
+  end
+  Result::Ok((env, analyzed))
+end
+
+# One finalization over the lane fixture with the explicit route shape:
+# probe = the test-only post-mono corruption, capture/stamps/stop_after =
+# the route policy under test.
+def fmp_finalize(
+  source: String, probe: FinalizeProbe, capture: Bool, stamps: Bool, stop_after: Bool
+) -> Result[VerifiedFinalMir, FinalizeFailure]
+  let pair = match fmp_analyze(source)
+  when Result::Ok(p) then p
+  when Result::Err(e) then panic("finalize lane fixture analysis failed: " + e)
+  end
+  var store = stable_lineage_store_new()
+  let options = FinalizeOptions {
+    compiler: default_options(),
+    capture_opt_decisions: capture,
+    stamp_tail_abi_plans: stamps,
+    stop_after_stamps: stop_after,
+    probe: probe
+  }
+  finalize_verified_mir(
+    pair.0, pair.1,
+    FinalizeTarget { slp_desc: Option::Some(fmp_host_desc()) },
+    options, &mut store)
+end
+
+def fmp_valid_source() -> String
+  "def main() -> Int\n  1\nend\n"
+end
+
+@test
+def test_finalize_valid_fixture_reports_stage_evidence() -> Unit
+  let result = fmp_finalize(fmp_valid_source(), FinalizeProbe::Clean, false, true, false)
+  match result
+  when Result::Err(f) then
+    panic("the valid fixture must finalize: " + f.stage + ": " + finalize_failure_detail(f))
+  when Result::Ok(finalized) then
+    let ev = finalized.evidence.clone()
+    assert_true(ev.mir_verify_ok, "the post-lower verify must be captured")
+    assert_true(ev.effect_verify_ok, "the §11 effect check must be captured")
+    assert_true(ev.purity_verify_ok, "the purity theorem must be captured")
+    assert_true(ev.budget_verify_ok, "the @budget check must be captured")
+    assert_true(ev.lineage_ok, "the pre-mono lineage view must be captured")
+    assert_true(ev.mono_verify_ok, "the unconditional post-mono checkpoint must be captured")
+    assert_true(ev.post_opt_mir_verify_ok, "the post-opt verify must be captured")
+    assert_true(ev.pre_codegen_mir_verify_ok, "the final firewall must be captured")
+    assert_true(ev.stages.contains(&"mir".to_string()), "stages must name the post-lower verify")
+    assert_true(ev.stages.contains(&"effects".to_string()), "stages must name the §11 check")
+    assert_true(ev.stages.contains(&"post-mono-mir".to_string()),
+      "stages must name the post-mono checkpoint")
+    assert_true(ev.stages.contains(&"post-opt-mir".to_string()), "stages must name the post-opt verify")
+    assert_true(ev.stages.contains(&"pre-codegen-mir".to_string()), "stages must name the final verify")
+    assert_true(ev.stages.len() == finalize_stage_names().len(),
+      "the full finalization must capture every canonical stage")
+  end
+end
+
+@test
+def test_finalize_invalid_post_mono_fixture_fails_at_checkpoint() -> Unit
+  let result = fmp_finalize(fmp_valid_source(), FinalizeProbe::CorruptPostMono, false, true, false)
+  match result
+  when Result::Ok(_) then
+    panic("a deliberately corrupted post-mono program must FAIL the shared finalization")
+  when Result::Err(f) then
+    assert_true(f.stage == "post-mono-mir".to_string(),
+      "the corruption must be caught by the post-mono checkpoint, got stage: " + f.stage)
+    assert_true(f.rows.len() > 0, "the verifier violation rows must be carried")
+  end
+end
+
+@test
+def test_finalize_stop_after_stamps_does_not_claim_post_opt() -> Unit
+  let result = fmp_finalize(fmp_valid_source(), FinalizeProbe::Clean, false, true, true)
+  match result
+  when Result::Err(f) then
+    panic("the --dump-abi-plans stop shape must finalize: " + f.stage)
+  when Result::Ok(finalized) then
+    let ev = finalized.evidence.clone()
+    assert_true(ev.mir_verify_ok && ev.mono_verify_ok,
+      "the stop shape still runs the post-lower and post-mono checks")
+    assert_false(ev.post_opt_mir_verify_ok,
+      "the stop shape runs no optimizer, so post-opt is not claimed")
+    assert_false(ev.pre_codegen_mir_verify_ok,
+      "the stop shape claims no final verify")
+    assert_false(ev.stages.contains(&"post-opt-mir".to_string()),
+      "the stop shape must not capture post-opt-mir")
+  end
+end
+
+# The exact route shapes of the migrated call sites. Each must run the
+# unconditional post-mono checkpoint; the flags mirror driver.tg /
+# semantic_server.tg's finalize_verified_mir calls.
+@test
+def test_every_route_shape_runs_post_mono() -> Unit
+  # LIR native route: effective-target SLP desc, host tail stamps, no capture.
+  let lir = fmp_finalize(fmp_valid_source(), FinalizeProbe::Clean, false, true, false)
+  match lir
+  when Result::Ok(v) then assert_true(v.evidence.mono_verify_ok, "LIR route: post-mono must run")
+  when Result::Err(f) then panic("LIR route shape failed: " + f.stage)
+  end
+  # Snapshot route: SLP desc + tail stamps + the decision-capturing optimizer.
+  let snapshot = fmp_finalize(fmp_valid_source(), FinalizeProbe::Clean, true, true, false)
+  match snapshot
+  when Result::Ok(v) then assert_true(v.evidence.mono_verify_ok, "snapshot route: post-mono must run")
+  when Result::Err(f) then panic("snapshot route shape failed: " + f.stage)
+  end
+  # Coverage harness route: the same host shape.
+  let coverage = fmp_finalize(fmp_valid_source(), FinalizeProbe::Clean, false, true, false)
+  match coverage
+  when Result::Ok(v) then assert_true(v.evidence.mono_verify_ok, "coverage route: post-mono must run")
+  when Result::Err(f) then panic("coverage route shape failed: " + f.stage)
+  end
+  # Wasm route: target-agnostic (no SLP desc, no tail stamps) + capture.
+  let pair = match fmp_analyze(fmp_valid_source())
+  when Result::Ok(p) then p
+  when Result::Err(e) then panic("wasm route fixture analysis failed: " + e)
+  end
+  var store = stable_lineage_store_new()
+  let wasm_options = FinalizeOptions {
+    compiler: default_options(),
+    capture_opt_decisions: true,
+    stamp_tail_abi_plans: false
+  }
+  match finalize_verified_mir(pair.0, pair.1, FinalizeTarget {}, wasm_options, &mut store)
+  when Result::Ok(v) then assert_true(v.evidence.mono_verify_ok, "wasm route: post-mono must run")
+  when Result::Err(f) then panic("wasm route shape failed: " + f.stage)
+  end
+end
+
+@test
+def test_session_compile_source_evidence_is_real_post_mono() -> Unit
+  let session = match session_compile_source(
+    fmp_valid_source(), "finalize_route.tg".to_string(), fmp_host_desc())
+  when Result::Ok(s) then s
+  when Result::Err(e) then panic("the baseline session compile must succeed: " + e)
+  end
+  match session.evidence.clone()
+  when Option::None then
+    panic("the baseline session must carry its VerifiedCompilationEvidence")
+  when Option::Some(ev) then
+    assert_true(ev.mir_verify_ok, "session evidence: the post-lower verify must be real")
+    assert_true(ev.mono_verify_ok,
+      "session evidence: the post-mono checkpoint must be real (no mono_verify_ok=false placeholder)")
+    assert_true(ev.post_opt_mir_verify_ok, "session evidence: the post-opt verify must be real")
+    assert_true(ev.effect_verify_ok, "session evidence: the §11 check must be real")
+    assert_true(ev.stages.contains(&"post-mono-mir".to_string()),
+      "session evidence: the captured set must name post-mono-mir")
+  end
+end
+
+@test
+def test_verified_edit_transaction_statuses_are_real_post_mono() -> Unit
+  let src = "def f() -> Int\n  1\nend\n"
+  let session = match session_compile_source(src.to_string(), "finalize_tx.tg".to_string(), fmp_host_desc())
+  when Result::Ok(s) then s
+  when Result::Err(e) then panic("the baseline session compile must succeed: " + e)
+  end
+  let k_f = "f#fn()->Int".to_string()
+  let resolved = match resolve_edit(&session.index, &session.snapshot,
+    SemanticEdit::Rename(k_f.clone(), "f2".to_string()))
+  when Result::Ok(r) then r
+  when Result::Err(e) then panic("the rename must resolve: " + edit_error_word(e))
+  end
+  let budget = edit_budget_for_plan(edit_plan_regs(resolved.clone()))
+  let tx = session_apply_verified_edit(session.clone(),
+    SemanticEdit::Rename(k_f.clone(), "f2".to_string()), budget)
+  assert_true(tx.accepted, "the rename transaction must be accepted: " + tx.refusal.clone())
+  assert_true(verification_status_is_verified(tx.mir_status),
+    "the transaction's mir status must be the shared entry's real evidence")
+  assert_true(verification_status_is_verified(tx.post_mono_mir_status),
+    "the transaction's post-mono status must be the shared entry's real evidence")
+  assert_true(verification_status_is_verified(tx.post_opt_mir_status),
+    "the transaction's post-opt status must be the shared entry's real evidence")
+end

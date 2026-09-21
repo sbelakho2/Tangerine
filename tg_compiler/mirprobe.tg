@@ -1,0 +1,496 @@
+use std::core::{Option, Result}
+use std::collections::{Vec, Map}
+use std::fs::{read_file, file_exists}
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse, diag_has_errors}
+use tg_compiler::ast::{assign_node_ids, Program, Item, ItemId, ModuleId, Module, Crate, UseDecl, FnBody, StmtKind}
+use tg_compiler::resolver::{resolve_names}
+use tg_compiler::types::{type_env_new, type_check_typed, Type, TypeDef, TypeDefKind}
+use tg_compiler::access_check::{access_check}
+use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_context_new, AnalyzedProgram, TypedIteration}
+use tg_compiler::mir::{lower_to_mir}
+
+def mp_strip_debug_assert_pass(source: String) -> String
+  let parts = source.split("debug_assert!")
+  if parts.len() <= 1 then
+    return source
+  end
+  var out = parts[0].clone()
+  var pi = 1
+  while pi < parts.len() do
+    let seg = parts[pi].clone()
+    if seg.starts_with("(") then
+      var depth = 0
+      var i = 0
+      var close_idx = -1
+      var comma_idx = -1
+      var saw_comma = false
+      while i < seg.len() do
+        let ch = seg.slice(i, i + 1)
+        if ch == "(" then depth = depth + 1 end
+        if ch == ")" then
+          depth = depth - 1
+          if depth == 0 then
+            close_idx = i
+            break
+          end
+        end
+        if ch == "," && depth == 1 && !saw_comma then
+          comma_idx = i
+          saw_comma = true
+        end
+        i = i + 1
+      end
+      if close_idx < 0 then
+        out = out + "debug_assert!" + seg
+      else
+        let inner_end = if comma_idx >= 0 then comma_idx else close_idx end
+        out = out + "(" + seg.slice(1, inner_end) + ")"
+        out = out + seg.slice(close_idx + 1, seg.len())
+      end
+    else
+      out = out + "debug_assert!" + seg
+    end
+    pi = pi + 1
+  end
+  out
+end
+
+def mp_strip_debug_assert(source: String) -> String
+  var cur = source.clone()
+  var pass = 0
+  while pass < 8 && cur.contains("debug_assert!") do
+    cur = mp_strip_debug_assert_pass(cur)
+    pass = pass + 1
+  end
+  cur
+end
+
+def mp_item_active(item: Item) -> Bool
+  for attr in item.attrs do
+    if attr.name == "cfg" then
+      var drop_it = false
+      for a in attr.args do
+        if a == "windows" || a == "linux" then drop_it = true end
+      end
+      if drop_it then return false end
+    end
+  end
+  true
+end
+
+def mp_join_path(segments: Vec[String]) -> String
+  var out = ""
+  var i = 0
+  while i < segments.len() do
+    if i > 0 then out = out + "::" end
+    out = out + segments[i].clone()
+    i = i + 1
+  end
+  out
+end
+
+def mp_module_path_from_file(path: String) -> Vec[String]
+  var segments = Vec::new()
+  let parts = path.split("/")
+  var pi = 0
+  while pi < parts.len() do
+    var seg = parts[pi].clone()
+    if pi == parts.len() - 1 && seg.ends_with(".tg") then
+      seg = seg.slice(0, seg.len() - 3)
+    end
+    if !seg.is_empty() then
+      segments.push(seg)
+    end
+    pi = pi + 1
+  end
+  segments
+end
+
+def mp_build_dep_file_path(segments: Vec[String], count: Int) -> Option[String]
+  if count < 2 then
+    return Option::None
+  end
+  let root = segments[0]
+  var path = if root == "std" then "std/" elsif root == "tg_compiler" then "tg_compiler/" else return Option::None end
+  var i = 1
+  while i < count do
+    if i > 1 then path = path + "/" end
+    path = path + segments[i]
+    i = i + 1
+  end
+  Option::Some(path + ".tg")
+end
+
+def mp_dep_use_to_file(u: UseDecl) -> Option[String]
+  let segment_count = u.path.segments.len()
+  if segment_count < 2 then
+    return Option::None
+  end
+  match u.names
+  when Option::Some(_) then return mp_build_dep_file_path(u.path.segments.clone(), segment_count)
+  when Option::None then ()
+  end
+  if u.glob then
+    return mp_build_dep_file_path(u.path.segments.clone(), segment_count)
+  end
+  match mp_build_dep_file_path(u.path.segments.clone(), segment_count)
+  when Option::Some(full_path) then
+    if file_exists(full_path.clone()) then
+      return Option::Some(full_path)
+    end
+    if segment_count > 2 then
+      match mp_build_dep_file_path(u.path.segments.clone(), segment_count - 1)
+      when Option::Some(parent_path) then
+        if file_exists(parent_path.clone()) then
+          return Option::Some(parent_path)
+        end
+      when Option::None then ()
+      end
+    end
+    Option::None
+  when Option::None then Option::None
+  end
+end
+
+def mp_collect_dep_file(path: String, inout out: Vec[Item], inout loaded: Set[String], inout modules: Map[ModuleId, Module]) -> Int
+  if loaded.contains(&path) then
+    return 0
+  end
+  loaded.insert(path.clone())
+  if !file_exists(path.clone()) then
+    return 2
+  end
+  let source = match read_file(path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then return 2
+  end
+  let parsed = parse(tokenize(mp_strip_debug_assert(source), path.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    return 3
+  end
+  let dep_ast = parsed.program
+  for item in dep_ast.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then
+      match mp_dep_use_to_file(u.clone())
+      when Option::Some(p) then
+        let rc = mp_collect_dep_file(p, &mut out, &mut loaded, &mut modules)
+        if rc != 0 then return rc end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+  end
+  var mod_start = out.len()
+  let dep_id = ModuleId { id: modules.len() }
+  for item in dep_ast.items do
+    if mp_item_active(item.clone()) then
+      var owned = item.clone()
+      owned.owner_module = dep_id
+      out.push(owned)
+    end
+  end
+  var mod_items = Vec::new()
+  var mi = mod_start
+  while mi < out.len() do
+    mod_items.push(ItemId { id: mi })
+    mi = mi + 1
+  end
+  var mod_imports = Vec::new()
+  for item in dep_ast.items do
+    match item.kind
+    when ItemKind::ItemUse(u) then mod_imports.push(mp_join_path(u.path.segments.clone()))
+    when _ then ()
+    end
+  end
+  modules.insert(dep_id, Module {
+    id: dep_id,
+    path: mp_module_path_from_file(path.clone()),
+    items: mod_items,
+    imports: mod_imports
+  })
+  0
+end
+
+def mp_kind_word(kind: TypeDefKind) -> String
+  match kind
+  when TypeDefKind::Struct(_) then "struct"
+  when TypeDefKind::Enum(_) then "enum"
+  when TypeDefKind::Trait(_) then "trait"
+  when TypeDefKind::Alias(_) then "alias"
+  when TypeDefKind::Primitive then "primitive"
+  when TypeDefKind::Opaque then "opaque"
+  end  end
+end
+
+def mp_prelude_files() -> Vec[String]
+  # EXACTLY compiler_core.prelude_files() — the user-program compile
+  # prelude (args/env/bench/process/gfx_errors/time are manifest entries
+  # loaded only on demand, never by a corpus with no imports).
+  var files = Vec::new()
+  files.push("std/alloc.tg")
+  files.push("std/collections.tg")
+  files.push("std/core.tg")
+  files.push("std/ffi.tg")
+  files.push("std/fmt.tg")
+  files.push("std/fs.tg")
+  files.push("std/io.tg")
+  files.push("std/taint.tg")
+  files
+end
+
+def mp_line_of(path: String, offset: Int) -> Int
+  match read_file(path.clone())
+  when Result::Ok(src) then
+    var line = 1
+    var i = 0
+    let lim = if offset < src.len() then offset else src.len() end
+    while i < lim do
+      if src.slice(i, i + 1) == "\n" then line = line + 1 end
+      i = i + 1
+    end
+    line
+  when Result::Err(_) then 0
+  end  end
+end
+
+def mp_iter_kind_word(expr: Expr) -> String
+  match expr.kind
+  when ExprKind::ExprIdent(_) then "ident"
+  when ExprKind::ExprSelfRef then "self"
+  when ExprKind::ExprFieldAccess(_, _) then "field"
+  when ExprKind::ExprRawDeref(_) then "rawderef"
+  when ExprKind::ExprIndex(_, _) then "index"
+  when ExprKind::ExprRange(_, _, _) then "range"
+  when ExprKind::ExprMethodCall(_, _, _, _) then "methodcall"
+  when ExprKind::ExprCall(_, _) then "call"
+  when ExprKind::ExprArrayLit(_) then "arraylit"
+  when ExprKind::ExprMapLit(_) then "maplit"
+  when ExprKind::ExprStringLit(_) then "strlit"
+  when _ then "other"
+  end  end
+end
+
+def mp_ty_word(ty: Type) -> String
+  match ty
+  when Type::Adt(tid, args) then "Adt#" + tid.id.to_string() + "[" + args.len().to_string() + "]"
+  when Type::RefInternal(inner, _) then "Ref[" + mp_ty_word(inner) + "]"
+  when Type::FixedArray(inner, _) then "Fixed[" + mp_ty_word(inner) + "]"
+  when Type::String then "String"
+  when Type::Unit then "Unit"
+  when Type::Int then "Int"
+  when Type::Char then "Char"
+  when Type::Tuple(items) then "Tuple[" + items.len().to_string() + "]"
+  when Type::Var(_) then "Var"
+  when Type::Param(_) then "Param"
+  when _ then "other"
+  end  end
+end
+
+def mp_for_report_block(typed: TypedProgram, iterations: Map[Int, TypedIteration], inout rows: Vec[String], block: Block) -> Unit
+  var si = 0
+  while si < block.stmts.len() do
+    let stmt = block.stmts[si].clone()
+    match stmt.kind
+    when StmtKind::StmtFor(fs) then
+      let recorded = iterations.contains_key(&stmt.node_id)
+      let ty_word = match typed.expr_types.get(&fs.iter.node_id)
+      when Option::Some(t) then mp_ty_word(t.clone())
+      when Option::None then "untyped"
+      end
+      let file = fs.span.file.clone()
+      let line = mp_line_of(file.clone(), fs.span.start)
+      rows.push("  FOR " + file.clone() + ":" + line.to_string() + " node=" + stmt.node_id.to_string() + " recorded=" + recorded.to_string() + " kind=" + mp_iter_kind_word(&fs.iter) + " ty=" + ty_word)
+      mp_for_report_block(typed, iterations, &mut rows, &fs.body)
+    when StmtKind::StmtIf(is) then
+      mp_for_report_block(typed, iterations, &mut rows, &is.then_block)
+      var ei = 0
+      while ei < is.elsif_branches.len() do
+        mp_for_report_block(typed, iterations, &mut rows, &is.elsif_branches[ei].1)
+        ei = ei + 1
+      end
+      match is.else_block
+      when Option::Some(eb) then mp_for_report_block(typed, iterations, &mut rows, &eb)
+      when Option::None then ()
+      end
+    when StmtKind::StmtWhile(_, body) then mp_for_report_block(typed, iterations, &mut rows, &body)
+    when StmtKind::StmtLoop(body) then mp_for_report_block(typed, iterations, &mut rows, &body)
+    when StmtKind::StmtMatch(m) then
+      var ai = 0
+      while ai < m.arms.len() do
+        mp_for_report_block(typed, iterations, &mut rows, &m.arms[ai].body)
+        ai = ai + 1
+      end
+    when StmtKind::StmtUnsafe(_, body) then mp_for_report_block(typed, iterations, &mut rows, &body)
+    when StmtKind::StmtDefer(body) then mp_for_report_block(typed, iterations, &mut rows, &body)
+    when StmtKind::StmtWith(_, _, body) then mp_for_report_block(typed, iterations, &mut rows, &body)
+    when _ then ()
+    end
+    si = si + 1
+  end
+end
+
+def mp_for_report_program(typed: TypedProgram, iterations: Map[Int, TypedIteration], inout rows: Vec[String], program: Program) -> Unit
+  var ii = 0
+  while ii < program.items.len() do
+    let item = program.items[ii].clone()
+    match item.kind
+    when ItemKind::ItemFunction(f) then
+      match f.body
+      when FnBody::FnBlock(b) then mp_for_report_block(typed, iterations, &mut rows, &b)
+      when _ then ()
+      end
+    when ItemKind::ItemImpl(im) then
+      var mi = 0
+      while mi < im.methods.len() do
+        match im.methods[mi].body
+        when FnBody::FnBlock(b) then mp_for_report_block(typed, iterations, &mut rows, &b)
+        when _ then ()
+        end
+        mi = mi + 1
+      end
+    when _ then ()
+    end
+    ii = ii + 1
+  end
+end
+
+def mp_merged(corpus_path: String) -> Int
+  let source = match read_file(corpus_path.clone())
+  when Result::Ok(s) then s
+  when Result::Err(_) then
+    println("mirprobe merged: cannot read corpus")
+    return 2
+  end
+  let parsed = parse(tokenize(mp_strip_debug_assert(source), corpus_path.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    println("mirprobe merged: corpus parse failed")
+    return 2
+  end
+  var merged_items = Vec::new()
+  for item in parsed.program.items do
+    if mp_item_active(item.clone()) then merged_items.push(item.clone()) end
+  end
+  var root_items = Vec::new()
+  var ri = 0
+  while ri < merged_items.len() do
+    root_items.push(ItemId { id: ri })
+    ri = ri + 1
+  end
+  let root_id = ModuleId { id: 0 }
+  var merged_modules = Map::new()
+  merged_modules.insert(root_id, Module {
+    id: root_id,
+    path: Vec::new(),
+    items: root_items,
+    imports: Vec::new()
+  })
+  var loaded = Set::new()
+  let preludes = mp_prelude_files()
+  var pi = 0
+  while pi < preludes.len() do
+    let rc = mp_collect_dep_file(preludes[pi].clone(), &mut merged_items, &mut loaded, &mut merged_modules)
+    if rc != 0 then
+      println("mirprobe merged: load failed (" + rc.to_string() + ") " + preludes[pi].clone())
+      return 2
+    end
+    pi = pi + 1
+  end
+  var program = Program {
+    items: merged_items,
+    crate: Crate { root: root_id, modules: merged_modules },
+    span: parsed.program.span.clone()
+  }
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    println("mirprobe merged: items=" + program.items.len().to_string() + " typecheck_errors=" + result.errors.len().to_string())
+    # THE FULL ANALYSIS (mirror of compiler_core.analyze_parsed): ONE cfg,
+    # access check, resource check — the typed iteration records are produced
+    # HERE, so the lowering below sees the real artifact.
+    var engine_snapshot = result.program.engine_snapshot
+    let typed = result.program.typed
+    let ast_owned = result.program.ast
+    let resolutions_owned = result.program.resolutions
+    let cfg = build_typed_cfg(&program, &typed)
+    var actx = analysis_context_new()
+    let access_errors = access_check(&program, &typed, &cfg, &mut actx)
+    let res_result = resource_check(&program, &typed, &cfg, &mut actx, &mut engine_snapshot)
+    println("mirprobe merged: access_errors=" + access_errors.len().to_string() + " resource_errors=" + res_result.errors.len().to_string() + " typed_iterations=" + actx.typed_iterations.len().to_string())
+    var rows = Vec::new()
+    mp_for_report_program(&typed, &actx.typed_iterations, &mut rows, &program)
+    var ri = 0
+    while ri < rows.len() do
+      println("mirprobe for-report:" + rows[ri].clone())
+      ri = ri + 1
+    end
+    let analyzed = AnalyzedProgram {
+      typed: typed,
+      ast: ast_owned,
+      resolutions: resolutions_owned,
+      cfg: res_result.cfg,
+      finalize_plan: res_result.finalize_plan,
+      context: actx,
+      engine_snapshot: engine_snapshot,
+      access_errors: access_errors,
+      resource_errors: res_result.errors
+    }
+    match lower_to_mir(program, analyzed)
+    when Result::Ok(mir) then
+      println("mirprobe merged: lowering OK (functions=" + mir.functions.len().to_string() + ")")
+      0
+    when Result::Err(e) then
+      println("mirprobe merged: lowering failed: " + e.clone())
+      1
+    end
+  when Result::Err(errs) then
+    println("mirprobe merged: resolve failed = " + errs.len().to_string())
+    3
+  end
+end
+
+def main() -> Int
+  mp_merged("tests/differential/corpus/01_defs_arith.tg")
+end
+
+
+def mirprobe_lower(label: String, source: String) -> Int
+  let parsed = parse(tokenize(source.clone(), label.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    println("mirprobe " + label.clone() + ": parse failed")
+    return 2
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    if result.errors.len() > 0 then
+      println("mirprobe " + label.clone() + ": typecheck errors = " + result.errors.len().to_string())
+      var ei = 0
+      while ei < result.errors.len() do
+        println("  " + result.errors[ei].message.clone())
+        ei = ei + 1
+      end
+      return 1
+    end
+    println("mirprobe " + label.clone() + ": typecheck clean, lowering")
+    match lower_to_mir(program, result.program)
+    when Result::Ok(mir) then
+      println("mirprobe " + label.clone() + ": lowering OK (functions=" + mir.functions.len().to_string() + ")")
+      0
+    when Result::Err(e) then
+      println("mirprobe " + label.clone() + ": lowering failed: " + e.clone())
+      1
+    end
+  when Result::Err(errs) then
+    println("mirprobe " + label.clone() + ": resolve failed = " + errs.len().to_string())
+    3
+  end
+end

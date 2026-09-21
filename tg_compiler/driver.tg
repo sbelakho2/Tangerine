@@ -43,8 +43,16 @@ use tg_compiler::types::{type_check_typed, type_env_new, builtin_adt}
 use tg_compiler::resolver::{resolve_names}
 use tg_compiler::access_check::{access_check}
 use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_context_new, AnalyzedProgram}
-use tg_compiler::mir::{MirProgram, optimize_mir, opt_decisions_of_mir, verify_mir, check_effect_class_annotations_mir, check_purity_annotations_mir, check_budget_annotations_mir}
-use tg_compiler::codegen::{detect_host_target, stamp_tail_abi_plans, stamp_slp_vector_facility_desc}
+use tg_compiler::mir::{MirProgram, opt_decisions_of_mir, verify_mir}
+# (the shared finalized-MIR pipeline) EVERY production compile route of
+# this driver runs lower -> verify -> annotations -> mono -> post-mono
+# verify -> stamps -> optimize -> post-opt/final verify through the ONE
+# shared entry and never re-spells the sequence (see finalize.tg and
+# scripts/check_finalized_mir_pipeline.sh). The --dump-abi-plans
+# inspection (dump_abi_plans_direct) is the documented explicit-ephemeral
+# exception: it stops after the stamps and emits no artifact.
+use tg_compiler::finalize::{finalize_verified_mir, finalize_failure_detail, FinalizeOptions, FinalizeTarget, FinalizeFailure}
+use tg_compiler::codegen::{detect_host_target, stamp_tail_abi_plans}
 use tg_compiler::lir::{
   lir_compile_object_cov, lir_compile_executable_cov, lir_target_desc,
   LirReplayPlan, LirReplaySite, lir_replay_plan_disabled, abi_verify_program_a64
@@ -57,7 +65,7 @@ use tg_compiler::target_desc::{
   target_desc_is_thumb_family, target_desc_is_riscv_family
 }
 use tg_compiler::asm::{Arch, OsAbi, asm_target}
-use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new}
+use tg_compiler::trait_resolve::{monomorphize_program, mono_cache_new_ephemeral}
 use tg_compiler::mode::{Mode, config_for_mode}
 use tg_compiler::version::{VERSION}
 
@@ -92,17 +100,25 @@ use tg_compiler::compiler_core::{
   get_output_path, explain_error_code, error_code_example,
   emitter_new, emitter_new_json, driver_lower_to_mir, analyze_program,
   Diagnostic, DiagLevel, json_escape, parse_source_program, join_diagnostics,
-  emit_diagnostic, type_errors_to_diags, merge_imported_deps,
+  emit_diagnostic, merge_imported_deps,
   CodegenRoute, parse_codegen_route, resolve_coverage_out, resolve_replay_out,
   codegen_route_gap_hint
 }
 # (third-audit item 34 — the runtime producer): the coverage emission plan
 # the LIR route consumes (coverage_graph.tg section 2b). The driver builds
 # it from the finalized MIR when --coverage is on and hands it to the
-# plan-aware LIR entries.
+# plan-aware LIR entries. (The test-harness coverage lane no longer builds
+# the plan here — the ONE harness-construction entry in coverage.tg owns
+# that, see the import below.)
 use tg_compiler::coverage_graph::{
-  coverage_emission_plan_of_functions, coverage_emission_plan_disabled,
-  coverage_ingest, coverage_trace_bind_stable
+  coverage_emission_plan_of_functions, coverage_emission_plan_disabled
+}
+# (test-harness dedup) THE ONE coverage-harness construction: the CLI
+# coverage route calls it with its own paths/argv/store publication, so the
+# driver no longer mirrors coverage.tg's harness pipeline. The import is
+# acyclic (coverage.tg imports neither the driver nor semantic_server).
+use tg_compiler::coverage::{
+  coverage_harness_source, coverage_harness_build_and_run, CoverageHarnessError
 }
 # (audit order item 5 closeout) THE FULL-LIBRARY TEST-SYNTHESIS ENTRY:
 # coverage_graph.tg (kernel) exposes ONLY the typed targeted requests —
@@ -112,12 +128,12 @@ use tg_compiler::coverage_graph::{
 # the canonical recursive loader (the closure-scoped load path — the
 # same path std::test_gen's own imports ride), so this import is what
 # makes the synthesis producer reachable by the full compiler. The
-# driver-side entry below wires test_targeted_for_delta's uncovered-path
-# rows to concrete test sources (deterministic naming from the stable
-# id/constraint digest) and returns the test-source text; the kernel
-# never calls the generator and never fabricates a test.
+# driver-side entry below delegates to the ONE shared wrapper
+# (test_synthesis.synthesize_delta_suite — the same wrapper the
+# verified-edit transaction calls) and returns the test-source text; the
+# kernel never calls the generator and never fabricates a test.
 use tg_compiler::test_synthesis::{
-  synthesize_tests_for_delta, render_synthesized_suite
+  synthesize_delta_suite
 }
 use tg_compiler::semantic_delta::{SemanticDelta}
 # (audit order item 6 — the replay production bridge): the event-dictionary
@@ -142,6 +158,9 @@ use tg_compiler::replay_bridge::{
 use tg_compiler::semantic_snapshot::{
   semantic_snapshot_of_final_state, semantic_snapshot_finalize, semantic_snapshot_serialize,
   snapshot_feature_set_of, snapshot_semantic_options_of,
+  # (the shared finalized-MIR pipeline) the pre-mono callable lineage
+  # view is built INSIDE finalize_verified_mir (finalize.tg) from the
+  # route's persistent store — the route only loads/publishes the store.
   SemanticSnapshot, SnapshotError
 }
 # The persistent declaration-lineage store (third-audit item 11;
@@ -1628,57 +1647,38 @@ def run_test_files(opts: CompilerOptions, files: Vec[String], strict: Bool, cove
   }
 end
 
-# Compile the test file once with a generated dispatch main, then run each
-# @test function by name as its own process. When coverage_on is true the
-# harness is compiled through the canonical LIR coverage route (the
-# emitted counters + the exit-time dump), every test process writes the
-# tg.cov.trace.v1 trace to coverage_out, and each trace is normalized
-# through the discovery table and ingested into the file's run
-# SemanticSnapshot (finalized and written beside the harness).
+# Compile the test file once with a generated dispatch main (the ONE
+# coverage.tg generator), then run each @test function by name as its own
+# process. Without coverage the harness is compiled through the direct
+# emitter exactly as before; with coverage_on the WHOLE construction —
+# dispatch main, the shared finalized-MIR compile with the coverage
+# emission plan, the LIR coverage executable, the per-test run and the
+# trace ingest — is the ONE coverage_harness_build_and_run entry (the same
+# one the verified-edit transaction calls); this route keeps only its
+# CLI-specific paths and the sibling run-snapshot / lineage-store
+# publication.
 def compile_and_run_tests(opts: CompilerOptions, file: String, source: String, tests: Vec[FunctionDecl], coverage_on: Bool, coverage_out: String) -> Result[TestFileRun, String]
   let harness_base = file.replace("/", "_").replace(".tg", "") + "_harness"
   let harness_path = "build/.tg_test_harness/" + harness_base + ".tg"
-  match mkdir_p("build/.tg_test_harness".to_string())
-  when Result::Ok(_) then ()
-  when Result::Err(e) then
-    return Result::Err("failed to create test harness directory: " + e.to_string())
-  end
-
-  var harness_src = source.clone()
-  harness_src = harness_src + "\n\n# [generated by `tg test`] per-test dispatch main\n"
-  harness_src = harness_src + "use std::args\n\n"
-  harness_src = harness_src + "def main() -> Int\n"
-  harness_src = harness_src + "  let argv = args::args()\n"
-  harness_src = harness_src + "  if argv.len() < 2 then\n"
-  harness_src = harness_src + "    return 1\n"
-  harness_src = harness_src + "  end\n"
-  harness_src = harness_src + "  let name = argv[1]\n"
+  var test_names: Vec[String] = Vec::new()
   var ti = 0
-  var first = true
   while ti < tests.len() do
-    let t = tests[ti]
-    if first then
-      harness_src = harness_src + "  if name == \"" + t.name + "\" then\n"
-      first = false
-    else
-      harness_src = harness_src + "  elsif name == \"" + t.name + "\" then\n"
-    end
-    harness_src = harness_src + "    " + t.name + "()\n"
+    test_names.push(tests[ti].name.clone())
     ti = ti + 1
-  end
-  harness_src = harness_src + "  else\n"
-  harness_src = harness_src + "    panic(\"unknown test: \" + name)\n"
-  harness_src = harness_src + "  end\n"
-  harness_src = harness_src + "  0\n"
-  harness_src = harness_src + "end\n"
-
-  match write_file(harness_path.clone(), harness_src)
-  when Result::Ok(_) then ()
-  when Result::Err(e) then
-    return Result::Err("failed to write test harness: " + e.to_string())
   end
 
   if !coverage_on then
+    match mkdir_p("build/.tg_test_harness".to_string())
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      return Result::Err("failed to create test harness directory: " + e.to_string())
+    end
+    let harness_src = coverage_harness_source(source.clone(), test_names.clone())
+    match write_file(harness_path.clone(), harness_src)
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      return Result::Err("failed to write test harness: " + e.to_string())
+    end
     match compile_file(opts, harness_path.clone())
     when Result::Ok(_) then ()
     when Result::Err(e) then
@@ -1689,29 +1689,11 @@ def compile_and_run_tests(opts: CompilerOptions, file: String, source: String, t
     return Result::Ok(TestFileRun { results: results })
   end
 
-  # (audit order item 5) the coverage route: compile the harness through the
-  # LIR plan-aware entries, run each test, ingest the traces into the run
-  # snapshot, then persist the snapshot + the mutated lineage store beside
-  # the harness.
+  # (audit order item 5) the coverage route: the shared harness entry
+  # compiles + runs + ingests; then persist the compile-boundary snapshot +
+  # the mutated lineage store beside the harness exactly as before.
   let run_snapshot_path = "build/.tg_test_harness/" + harness_base + ".coverage.snapshot"
-  let compiled = match compile_test_harness_lir(opts, harness_path.clone(), run_snapshot_path.clone(), coverage_out.clone())
-  when Result::Err(e) then
-    return Result::Err("coverage compilation failed: " + e)
-  when Result::Ok(c) then c
-  end
-  let run = run_discovered_tests_coverage(compiled.exe_path.clone(), tests.clone(), compiled.snapshot.clone(), coverage_out.clone())
-  match write_test_run_snapshot(compiled, run_snapshot_path.clone())
-  when Result::Ok(_) then ()
-  when Result::Err(e) then
-    return Result::Err(e)
-  end
-  Result::Ok(TestFileRun {
-    results: run.results.clone(),
-    coverage_rows: run.snapshot.coverage.len(),
-    coverage_traces: run.traces,
-    coverage_missing_traces: run.missing_traces,
-    coverage_artifacts: Vec::from([run_snapshot_path])
-  })
+  run_coverage_harness_cli(opts, harness_path, run_snapshot_path, coverage_out, source, test_names)
 end
 
 # The per-test driver over a compiled harness (no coverage): one process
@@ -1736,84 +1718,22 @@ def run_discovered_tests(exe_path: String, tests: Vec[FunctionDecl]) -> Vec[Test
   results
 end
 
-# The coverage per-test driver's outcome: the updated run snapshot, the
-# per-test results and the trace counters (consumed = a trace was read and
-# ingested; missing = the process wrote no trace).
-struct TestCoverageRun
-  snapshot: SemanticSnapshot
-  results: Vec[TestResult]
-  traces: Int = 0
-  missing_traces: Int = 0
-end
-
-# The coverage per-test driver: run each test (its exit-time dump writes the
-# trace to coverage_out), then read + normalize + ingest. The trace is
-# deleted before each run so a crashed process's missing trace is detected
-# (never a stale ingest of the previous test's trace).
-def run_discovered_tests_coverage(
-  exe_path: String,
-  tests: Vec[FunctionDecl],
-  snapshot: SemanticSnapshot,
-  coverage_out: String
-) -> TestCoverageRun
-  var results: Vec[TestResult] = Vec::new()
-  var current = snapshot
-  var traces = 0
-  var missing = 0
-  var ri = 0
-  while ri < tests.len() do
-    let t = tests[ri]
-    match delete_file(coverage_out.clone())
-    when Result::Ok(_) then ()
-    when Result::Err(_) then ()
-    end
-    var test_args: Vec[String] = Vec::new()
-    test_args.push(t.name.clone())
-    let exit_code = bootstrap_call_argv(exe_path.clone(), test_args)
-    let passed = exit_code == 0
-    var message = if passed then "" else "test exited with code " + exit_code.to_string() end
-    match read_file(coverage_out.clone())
-    when Result::Ok(trace_text) then
-      traces = traces + 1
-      let bound = coverage_trace_bind_stable(current.clone(), trace_text)
-      current = coverage_ingest(current, bound)
-    when Result::Err(_) then
-      missing = missing + 1
-      if passed then
-        message = "test passed but wrote no coverage trace"
-      end
-    end
-    results.push(TestResult {
-      name: t.name.clone(),
-      passed: passed,
-      message: message
-    })
-    ri = ri + 1
-  end
-  TestCoverageRun {
-    snapshot: current,
-    results: results,
-    traces: traces,
-    missing_traces: missing
-  }
-end
-
 # (audit order item 5) The run-snapshot publication: finalize the snapshot
-# (content-addressed revision over the ingested coverage rows + the
+# (content-addressed revision over the compile-boundary coverage +
 # discovery TestRelationship rows) and write it plus the mutated lineage
 # store beside it. Both artifacts are written atomically-or-not at all:
 # the snapshot text first, the lineage store second (the store save itself
 # is atomic).
-def write_test_run_snapshot(compiled: TestHarnessCompiled, run_snapshot_path: String) -> Result[Unit, String]
-  var snapshot = compiled.snapshot.clone()
-  semantic_snapshot_finalize(&mut snapshot)
-  let snapshot_text = semantic_snapshot_serialize(&mut snapshot)
+def write_test_run_snapshot(snapshot: SemanticSnapshot, lineage_store: DeclLineageStore, run_snapshot_path: String) -> Result[Unit, String]
+  var out = snapshot.clone()
+  semantic_snapshot_finalize(&mut out)
+  let snapshot_text = semantic_snapshot_serialize(&mut out)
   match write_file_bytes(run_snapshot_path.clone(), &snapshot_text.bytes())
   when Result::Ok(_) then ()
   when Result::Err(e) then
     return Result::Err("failed to write test run snapshot '" + run_snapshot_path.clone() + "': " + e.message())
   end
-  match stable_lineage_store_save_atomic(run_snapshot_path.clone() + ".lineages", compiled.lineage_store.clone())
+  match stable_lineage_store_save_atomic(run_snapshot_path.clone() + ".lineages", lineage_store.clone())
   when Result::Ok(_) then ()
   when Result::Err(e) then
     return Result::Err("failed to write test run lineage store '" + run_snapshot_path.clone() + ".lineages': " + e.message())
@@ -1824,145 +1744,133 @@ end
 # (audit order item 5 closeout) THE DRIVER-SIDE SYNTHESIS ENTRY. The
 # kernel's typed targeted requests (coverage_graph.test_targeted_for_delta)
 # and the full-library generator (std::test_gen, imported through
-# test_synthesis.tg) meet HERE: given a snapshot, its §31 delta and one
-# module source, return the synthesized test-source text — a concrete
-# @test source for every uncovered-path request the generator can serve
-# (named deterministically from the request's stable id/constraint
-# digest), a comment-only typed request render otherwise. This is the
-# full-compiler call path the kernel closure cannot carry; the CLI does
-# not invoke it yet (the run lane has no §31 delta of its own — the
-# session/agentic layer holding two snapshots calls this entry with
-# semantic_delta_of(a, b)).
+# test_synthesis.tg) meet behind the ONE shared wrapper
+# (test_synthesis.synthesize_delta_suite — the same wrapper the verified-
+# edit transaction calls): given a snapshot, its §31 delta and one module
+# source, return the synthesized test-source text — a concrete @test source
+# for every uncovered-path request the generator can serve (named
+# deterministically from the request's stable id/constraint digest), a
+# comment-only typed request render otherwise. This entry is the
+# full-compiler call path the kernel closure cannot carry; it delegates so
+# the driver and the session can never drift. The CLI does not invoke it
+# yet (the run lane has no §31 delta of its own — the session/agentic layer
+# holding two snapshots calls it with semantic_delta_of(a, b)).
 pub def driver_synthesize_uncovered_tests(
   snapshot: SemanticSnapshot,
   delta: SemanticDelta,
   module_source: String,
   module_name: String
 ) -> String
-  let tests = synthesize_tests_for_delta(snapshot, delta, module_source, module_name)
-  render_synthesized_suite(tests, module_name)
+  synthesize_delta_suite(snapshot, delta, module_source, module_name).source
 end
 
-# (audit order item 5) ONE compiled coverage harness: the executable, the
-# run SemanticSnapshot built from the SAME finalized state the emitter
-# consumed (so coverage rows and discovery rows attach to the revision the
-# binary was compiled from) and the mutated lineage store the run's stable
-# test ids were stamped through.
-struct TestHarnessCompiled
-  exe_path: String
-  snapshot: SemanticSnapshot
-  lineage_store: DeclLineageStore
-end
-
-# Compile a test harness through the canonical LIR host route with the
-# coverage emission plan attached, mirroring compile_lir_route's host
-# slice phase-for-phase (parse -> merge -> analyze -> lower -> verify ->
-# effect/purity/budget -> mono -> tail/SLP stamps -> optimize -> verify)
-# and building the run snapshot at the same finalized boundary the
-# snapshot route uses. Host-only (aarch64) exactly like the LIR coverage
-# emitter; any other host fails closed with the route message.
-def compile_test_harness_lir(
+# The CLI harness runner: the run's persistent lineage store is the sibling
+# convention of the run snapshot (<run_snapshot>.lineages, loaded when
+# present, fresh otherwise — repeated `tg test --coverage` runs keep the
+# test declarations' lineages stable across invocations); the ONE shared
+# harness entry (coverage.tg) builds and executes the harness; the
+# returned compile-boundary snapshot and the mutated store are published
+# beside the harness. `test_names` empty selects the canary file-main
+# shape (the source compiled as-is, run once), exactly the previous CLI
+# route. This is the driver's ONE call site of the shared construction —
+# the CLI keeps its paths and argv, never the pipeline.
+def run_coverage_harness_cli(
   opts: CompilerOptions,
   harness_path: String,
   run_snapshot_path: String,
-  coverage_out: String
-) -> Result[TestHarnessCompiled, String]
-  let source = match read_file(harness_path.clone())
-  when Result::Ok(s) then s
-  when Result::Err(e) then return Result::Err("failed to read " + harness_path.clone() + ": " + e)
-  end
-  var ast = match parse_source_program(source, harness_path.clone())
-  when Result::Ok(p) then p
-  when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
-  end
-  ast = match merge_imported_deps(ast, false)
-  when Result::Ok(a) then a
-  when Result::Err(e) then return Result::Err(e)
-  end
-  var env = type_env_new()
-  let typed = match analyze_program(&mut env, &mut ast, opts.clone())
-  when Result::Ok(tp) then tp
-  when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
-  end
-  var mir = match driver_lower_to_mir(&ast, Option::Some(typed.clone()))
-  when Result::Ok(m) then m
-  when Result::Err(e) then return Result::Err("MIR lowering failed: " + e)
-  end
-  let pre_errs = verify_mir(&mir)
-  if !pre_errs.is_empty() then
-    return Result::Err("MIR verification failed before monomorphization (" + pre_errs.len().to_string() + " error(s))")
-  end
-  let mir_effect_errs = check_effect_class_annotations_mir(&mir, env)
-  if !mir_effect_errs.is_empty() then
-    return Result::Err(join_diagnostics(&type_errors_to_diags(&mir_effect_errs)))
-  end
-  let mir_purity_errs = check_purity_annotations_mir(&mut mir, env)
-  if !mir_purity_errs.is_empty() then
-    return Result::Err(join_diagnostics(&type_errors_to_diags(&mir_purity_errs)))
-  end
-  let mir_budget_errs = check_budget_annotations_mir(&mir, env)
-  if !mir_budget_errs.is_empty() then
-    return Result::Err(join_diagnostics(&type_errors_to_diags(&mir_budget_errs)))
-  end
-  var mono_cache = mono_cache_new(&ast, &typed.resolutions)
-  match monomorphize_program(&mut mir, &mut mono_cache)
-  when Result::Ok(_) then ()
-  when Result::Err(me) then return Result::Err("monomorphization failed with " + me.len().to_string() + " error(s)")
-  end
-  let target_desc = match detect_host_target().arch
-  when Arch::AArch64 then aarch64_desc()
-  when Arch::X86_64 then x86_64_desc()
-  when _ then return Result::Err(coverage_route_message())
-  end
-  stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
-  stamp_slp_vector_facility_desc(&mut mir, target_desc.clone())
-  optimize_mir(&mut mir, opts.opt_level)
-  let post_errs = verify_mir(&mir)
-  if !post_errs.is_empty() then
-    return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
-  end
-  # The run's lineage store: the sibling convention of the run snapshot
-  # (loaded when present, fresh otherwise) so repeated `tg test --coverage`
-  # runs keep the test declarations' lineages stable across invocations.
+  coverage_out: String,
+  module_source: String,
+  test_names: Vec[String]
+) -> Result[TestFileRun, String]
   var lineage_store = stable_lineage_store_new()
-  let lineage_path = run_snapshot_path.clone() + ".lineages"
-  match read_file(lineage_path.clone())
+  match read_file(run_snapshot_path.clone() + ".lineages")
   when Result::Ok(text) then lineage_store = stable_lineage_store_load(text)
   when Result::Err(_) then ()
   end
-  var snapshot = match semantic_snapshot_of_final_state(
-    &env, &typed.typed, &mir, &target_desc, VERSION, semantic_digest_zero(), &mut lineage_store,
-    typed.drop_plan_facts.clone(),
-    # (audit item 16, next tier) the checker's emitted DMA-ownership facts.
-    typed.dma_facts.clone(),
-    snapshot_feature_set_of(opts.clone(), target_desc.clone()),
-    snapshot_semantic_options_of(opts.clone(), target_desc.clone()))
+  let outcome = match coverage_harness_build_and_run(opts, harness_path, module_source,
+    test_names, coverage_out, lineage_store)
+  when Result::Ok(o) then o
   when Result::Err(e) then
-    return Result::Err("semantic snapshot build failed: " + snapshot_error_text(e))
-  when Result::Ok(s) then s
+    return Result::Err("coverage compilation failed: " + driver_coverage_harness_error_text(e))
   end
-  # The coverage emission plan from the SAME finalized MIR the executable is
-  # emitted from; an untracked artifact fails the build closed.
-  let cov_plan = match coverage_emission_plan_of_functions(mir.functions.clone(), coverage_out.clone())
-  when Result::Ok(p) then p
-  when Result::Err(u) then return Result::Err(untracked_artifact_text(u))
+  var results: Vec[TestResult] = Vec::new()
+  for r in outcome.results do
+    results.push(TestResult {
+      name: r.name.clone(),
+      passed: r.passed,
+      message: r.message.clone()
+    })
   end
-  let exe_path = get_output_path(&opts, harness_path.clone(), "")
-  match lir_compile_executable_cov(mir, detect_host_target(), exe_path.clone(), cov_plan, lir_replay_plan_of_bridge(replay_plan_disabled()))
+  match write_test_run_snapshot(outcome.compiled_snapshot.clone(),
+    outcome.lineage_store.clone(), run_snapshot_path.clone())
   when Result::Ok(_) then ()
   when Result::Err(e) then return Result::Err(e)
   end
-  Result::Ok(TestHarnessCompiled {
-    exe_path: exe_path,
-    snapshot: snapshot,
-    lineage_store: lineage_store
+  Result::Ok(TestFileRun {
+    results: results,
+    coverage_rows: outcome.snapshot.coverage.len(),
+    coverage_traces: outcome.traces,
+    coverage_missing_traces: outcome.missing_traces,
+    coverage_artifacts: Vec::from([run_snapshot_path])
   })
+end
+
+# (test-harness dedup) The CLI render of the shared harness-construction
+# failures: the exact route-local messages this driver returned before the
+# dedup (the shared entry owns the sequence, the route owns its message
+# contract).
+def driver_coverage_harness_error_text(e: CoverageHarnessError) -> String
+  match e
+  when CoverageHarnessError::RouteUnsupported then coverage_route_message()
+  when CoverageHarnessError::HarnessDir(detail) then
+    "failed to create test harness directory: " + detail
+  when CoverageHarnessError::HarnessWrite(path, detail) then
+    "failed to write test harness '" + path + "': " + detail
+  when CoverageHarnessError::SourceDiagnostics(rendered) then rendered
+  when CoverageHarnessError::Finalize(failure) then driver_finalize_failure_text(failure)
+  when CoverageHarnessError::Snapshot(error) then
+    "semantic snapshot build failed: " + snapshot_error_text(error)
+  when CoverageHarnessError::UntrackedArtifact(artifact) then untracked_artifact_text(artifact)
+  when CoverageHarnessError::Executable(detail) then detail
+  end
+end
+
+# (the shared finalized-MIR pipeline) ONE renderer for the driver routes'
+# finalization failures: the exact per-stage messages the routes returned
+# before the migration (the shared entry owns the sequence, the route owns
+# its message contract). The annotation stages render their structured
+# diagnostics through the canonical join_diagnostics.
+def driver_finalize_failure_text(f: FinalizeFailure) -> String
+  if f.stage == "lower" then
+    return "MIR lowering failed: " + finalize_failure_detail(f)
+  end
+  if f.stage == "mir-after-lowering" then
+    return "MIR verification failed before monomorphization (" + f.rows.len().to_string() + " error(s))"
+  end
+  if f.stage == "effects" || f.stage == "purity" || f.stage == "budget-annotations" then
+    return join_diagnostics(&f.diagnostics)
+  end
+  if f.stage == "lineage" then
+    return "semantic lineage stamping failed: " + finalize_failure_detail(f)
+  end
+  if f.stage == "mono" then
+    return "monomorphization failed with " + f.rows.len().to_string() + " error(s)"
+  end
+  if f.stage == "post-mono-mir" then
+    return "MIR verification failed after monomorphization (" + f.rows.len().to_string() + " error(s))"
+  end
+  if f.stage == "post-opt-mir" || f.stage == "pre-codegen-mir" then
+    return "MIR verification failed after optimization (" + f.rows.len().to_string() + " error(s))"
+  end
+  "finalized-MIR pipeline failed at " + f.stage.clone() + ": " + finalize_failure_detail(f)
 end
 
 # Files that define their own main (canary convention) are compiled as-is and
 # run once; the process exit code is the test outcome. With coverage_on the
-# file is compiled through the LIR coverage route and the process's trace is
-# ingested into the run snapshot exactly like a generated harness.
+# file is compiled through the ONE shared coverage-harness entry (the
+# canary shape: empty test names — no generated dispatch main) and the
+# process's trace is ingested into the run snapshot exactly like a
+# generated harness.
 def compile_and_run_file_main(opts: CompilerOptions, file: String, coverage_on: Bool, coverage_out: String) -> Result[TestFileRun, String]
   if !coverage_on then
     match compile_file(opts, file.clone())
@@ -1984,52 +1892,14 @@ def compile_and_run_file_main(opts: CompilerOptions, file: String, coverage_on: 
   end
   let main_base = file.replace("/", "_").replace(".tg", "") + "_coverage"
   let run_snapshot_path = "build/.tg_test_harness/" + main_base + ".snapshot"
-  match mkdir_p("build/.tg_test_harness".to_string())
-  when Result::Ok(_) then ()
+  let source = match read_file(file.clone())
+  when Result::Ok(s) then s
   when Result::Err(e) then
-    return Result::Err("failed to create test harness directory: " + e.to_string())
+    return Result::Err("coverage compilation failed: failed to read " + file.clone() + ": " + e.to_string())
   end
-  let compiled = match compile_test_harness_lir(opts, file.clone(), run_snapshot_path.clone(), coverage_out.clone())
-  when Result::Err(e) then
-    return Result::Err("coverage compilation failed: " + e)
-  when Result::Ok(c) then c
-  end
-  var snapshot = compiled.snapshot.clone()
-  match delete_file(coverage_out.clone())
-  when Result::Ok(_) then ()
-  when Result::Err(_) then ()
-  end
-  let exit_code = bootstrap_call_argv(compiled.exe_path.clone(), Vec::new())
-  let passed = exit_code == 0
-  var message = if passed then "" else "test exited with code " + exit_code.to_string() end
-  var traces = 0
-  var missing = 0
-  match read_file(coverage_out.clone())
-  when Result::Ok(trace_text) then
-    traces = 1
-    let bound = coverage_trace_bind_stable(snapshot.clone(), trace_text)
-    snapshot = coverage_ingest(snapshot, bound)
-  when Result::Err(_) then
-    missing = 1
-  end
-  var results: Vec[TestResult] = Vec::new()
-  results.push(TestResult {
-    name: "main".to_string(),
-    passed: passed,
-    message: message
-  })
-  match write_test_run_snapshot(compiled, run_snapshot_path.clone())
-  when Result::Ok(_) then ()
-  when Result::Err(e) then
-    return Result::Err(e)
-  end
-  Result::Ok(TestFileRun {
-    results: results,
-    coverage_rows: snapshot.coverage.len(),
-    coverage_traces: traces,
-    coverage_missing_traces: missing,
-    coverage_artifacts: Vec::from([run_snapshot_path])
-  })
+  var no_dispatch_names: Vec[String] = Vec::new()
+  run_coverage_harness_cli(opts, file.clone(), run_snapshot_path, coverage_out, source,
+    no_dispatch_names)
 end
 
 # 
@@ -3011,67 +2881,38 @@ def compile_to_wasm_route(opts: CompilerOptions, files: Vec[String], output_path
       end
       return Result::Err(join_diagnostics(&diags))
     end
-    var mir = match driver_lower_to_mir(&ast, Option::Some(typed.clone()))
-    when Result::Ok(m) then m
-    when Result::Err(e) then return Result::Err("MIR lowering failed: " + e)
-    end
-    let pre_mono_errs = verify_mir(&mir)
-    if !pre_mono_errs.is_empty() then
-      return Result::Err("MIR verification failed before monomorphization (" + pre_mono_errs.len().to_string() + " error(s))")
-    end
-    # (audit §11 — the effect-class annotations): the @no_alloc /
-    # @no_block / @no_io / @irq_safe / @interrupt claims are PROVEN on the
-    # lowered program — the MIR-derived transitive semantic summaries
-    # classify what executes, compiler-generated lowering sites included.
-    let mir_effect_errs = check_effect_class_annotations_mir(&mir, env)
-    if !mir_effect_errs.is_empty() then
-      let mir_effect_diags = type_errors_to_diags(&mir_effect_errs)
-      for d in mir_effect_diags do
-        emit_diagnostic(&mut emitter, d)
+    # (the shared finalized-MIR pipeline) The wasm route runs the ONE
+    # shared sequence through finalize_verified_mir — including the
+    # unconditional post-mono checkpoint the route used to skip. It is
+    # target-agnostic (no tail/SLP stamps: FinalizeTarget {} +
+    # stamp_tail_abi_plans false) and uses the decision-capturing optimizer
+    # entry (capture_opt_decisions true) for the rationale journal. The
+    # SAME persistent declaration lineage as the native routes is threaded
+    # through the shared entry: the sibling "<out>.lineages" store is
+    # loaded here, stamped pre-mono inside the entry and published once the
+    # module lands.
+    let wasm_lineage_path = driver_lineage_store_path(out_path.clone())
+    var wasm_lineage_store = driver_load_lineage_store(wasm_lineage_path.clone())
+    let finalized = match finalize_verified_mir(
+      env, typed, FinalizeTarget {},
+      FinalizeOptions {
+        compiler: opts.clone(),
+        capture_opt_decisions: true,
+        stamp_tail_abi_plans: false
+      }, &mut wasm_lineage_store)
+    when Result::Ok(v) then v
+    when Result::Err(f) then
+      # The annotation stages render their structured diagnostics through
+      # the route's own emitter (the driver message contract), then the
+      # shared per-stage text.
+      if f.stage == "effects" || f.stage == "purity" || f.stage == "budget-annotations" then
+        for d in f.diagnostics do
+          emit_diagnostic(&mut emitter, d)
+        end
       end
-      return Result::Err(join_diagnostics(&mir_effect_diags))
+      return Result::Err(driver_finalize_failure_text(f))
     end
-    # (third-audit item 25 — the purity theorem): verify the `pure`
-    # declarations on the same lowered program, persist the statuses on
-    # MirProgram.purity and reject a non-ProvenPure `pure` function
-    # (E0234 — Unknown fails closed).
-    let mir_purity_errs = check_purity_annotations_mir(&mut mir, env)
-    if !mir_purity_errs.is_empty() then
-      let mir_purity_diags = type_errors_to_diags(&mir_purity_errs)
-      for d in mir_purity_diags do
-        emit_diagnostic(&mut emitter, d)
-      end
-      return Result::Err(join_diagnostics(&mir_purity_diags))
-    end
-    # (third-audit item 45 — the complete @budget system): the declared
-    # budgets are checked against the MIR derivations on the same lowered
-    # program (E0235 on a static guarantee whose derived bound exceeds its
-    # declared limit).
-    let mir_budget_errs = check_budget_annotations_mir(&mir, env)
-    if !mir_budget_errs.is_empty() then
-      let mir_budget_diags = type_errors_to_diags(&mir_budget_errs)
-      for d in mir_budget_diags do
-        emit_diagnostic(&mut emitter, d)
-      end
-      return Result::Err(join_diagnostics(&mir_budget_diags))
-    end
-    var mono_cache = mono_cache_new(&ast, &typed.resolutions)
-    match monomorphize_program(&mut mir, &mut mono_cache)
-    when Result::Ok(_) then ()
-    when Result::Err(me) then
-      return Result::Err("monomorphization failed with " + me.len().to_string() + " error(s)")
-    end
-  # (the rationale persistence hook) The capturing optimizer entry: the
-  # Option::Some collector is the row-capture switch the audit item 58
-  # journal documents — the optimized MIR is byte-identical to the plain
-  # entry's (capture only gates the decision-row appends), and the rows
-  # land on program.opt_decisions for opt_decisions_of_mir below. The
-  # rationale store's "optimization" records are grounded there.
-  optimize_mir(&mut mir, opts.opt_level, Option::Some(Vec::new()))
-    let post_errs = verify_mir(&mir)
-    if !post_errs.is_empty() then
-      return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
-    end
+    var mir = finalized.mir
     let cfg = wasm_config_for_triple(&opts)
     let bytes = match WasmCompiler::new(cfg).compile(&mir)
     when Result::Ok(b) then b
@@ -3080,6 +2921,11 @@ def compile_to_wasm_route(opts: CompilerOptions, files: Vec[String], output_path
     match write_file_bytes(out_path.clone(), &bytes)
     when Result::Ok(_) then ()
     when Result::Err(e) then return Result::Err("failed to write " + out_path.clone() + ": " + e)
+    end
+    # The artifact landed: publish the mutated declaration lineage beside it.
+    match driver_publish_lineage_store(wasm_lineage_path.clone(), wasm_lineage_store.clone())
+    when Result::Ok(_) then ()
+    when Result::Err(e) then return Result::Err(e)
     end
     if !opts.quiet then
       println("Wasm module: " + out_path)
@@ -4167,6 +4013,51 @@ def lir_route_slp_desc(route_desc: Option[TargetDesc], opts: CompilerOptions) ->
   Option::Some(lir_target_desc())
 end
 
+# ———————————————————————————————————————————————————————————————
+# The LIR route's persistent declaration lineage (persistent identity
+# integration)
+# ———————————————————————————————————————————————————————————————
+# The sibling artifact convention of the snapshot route (<snapshot>
+# .lineages) applied to the artifact-producing codegen routes (LIR /
+# wasm): "<out>.lineages" beside the object/executable/module. Loaded by
+# the route and threaded into the shared finalization entry, which stamps
+# the pre-mono callable lineage view through the loaded store
+# (finalize.tg) so the mono cache's callable declarations are the
+# persisted ones; published atomically once the route's front-end
+# finalized (the wasm route after the module write) so repeated compiles
+# accumulate rename/move-stable declaration identities.
+# An EMPTY out_path (emit modes with no artifact) keeps the build
+# store-less: the view then stamps a fresh in-memory store and nothing is
+# published — still the persistent constructor, never the ephemeral
+# structural fallback.
+def driver_lineage_store_path(out_path: String) -> String
+  if out_path.len() == 0 then
+    return "".to_string()
+  end
+  out_path.clone() + ".lineages"
+end
+
+def driver_load_lineage_store(path: String) -> DeclLineageStore
+  if path.len() == 0 then
+    return stable_lineage_store_new()
+  end
+  match read_file(path.clone())
+  when Result::Ok(text) then stable_lineage_store_load(text)
+  when Result::Err(_) then stable_lineage_store_new()
+  end
+end
+
+def driver_publish_lineage_store(path: String, store: DeclLineageStore) -> Result[Unit, String]
+  if path.len() == 0 then
+    return Result::Ok(())
+  end
+  match stable_lineage_store_save_atomic(path.clone(), store)
+  when Result::Ok(_) then Result::Ok(())
+  when Result::Err(e) then
+    Result::Err("failed to write lineage store '" + path.clone() + "': " + e.message())
+  end
+end
+
 def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: String, route_desc: Option[TargetDesc]) -> Result[Unit, String]
   if files.len() != 1 then
     return Result::Err("the LIR pipeline requires exactly one input file (use --codegen=direct for the direct debug/bootstrap emitter)")
@@ -4198,82 +4089,46 @@ def compile_lir_route(opts: CompilerOptions, files: Vec[String], output_path: St
   when Result::Ok(tp) then tp
   when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
   end
-  var mir = match driver_lower_to_mir(&ast, Option::Some(typed.clone()))
-  when Result::Ok(m) then m
-  when Result::Err(e) then return Result::Err("MIR lowering failed: " + e)
-  end
-  let pre_errs = verify_mir(&mir)
-  if !pre_errs.is_empty() then
-    return Result::Err("MIR verification failed before monomorphization (" + pre_errs.len().to_string() + " error(s))")
-  end
-  # (audit §11 — the effect-class annotations): the @no_alloc /
-  # @no_block / @no_io / @irq_safe / @interrupt claims are PROVEN on the
-  # lowered program — the MIR-derived transitive semantic summaries
-  # classify what executes, compiler-generated lowering sites included.
-  let mir_effect_errs = check_effect_class_annotations_mir(&mir, env)
-  if !mir_effect_errs.is_empty() then
-    let mir_effect_diags = type_errors_to_diags(&mir_effect_errs)
-    return Result::Err(join_diagnostics(&mir_effect_diags))
-  end
-  # (third-audit item 25 — the purity theorem): verify the `pure`
-  # declarations on the same lowered program, persist the statuses on
-  # MirProgram.purity (the optimizer/equivalence/snapshot table) and
-  # reject a non-ProvenPure `pure` function (E0234 — Unknown fails
-  # closed).
-  let mir_purity_errs = check_purity_annotations_mir(&mut mir, env)
-  if !mir_purity_errs.is_empty() then
-    let mir_purity_diags = type_errors_to_diags(&mir_purity_errs)
-    return Result::Err(join_diagnostics(&mir_purity_diags))
-  end
-  # (third-audit item 45 — the complete @budget system): the declared
-  # budgets are checked against the MIR derivations on the same lowered
-  # program (E0235 on a static-proof/static-bound guarantee whose derived
-  # bound exceeds its declared limit; the runtime-measured counters keep
-  # their generated frame checks).
-  let mir_budget_errs = check_budget_annotations_mir(&mir, env)
-  if !mir_budget_errs.is_empty() then
-    let mir_budget_diags = type_errors_to_diags(&mir_budget_errs)
-    return Result::Err(join_diagnostics(&mir_budget_diags))
-  end
-  var mono_cache = mono_cache_new(&ast, &typed.resolutions)
-  match monomorphize_program(&mut mir, &mut mono_cache)
-  when Result::Ok(_) then ()
-  when Result::Err(me) then return Result::Err("monomorphization failed with " + me.len().to_string() + " error(s)")
-  end
-  # (fourth-audit P1-10) the authoritative AbiCallPlan oracle (the host
-  # arch here; cross routes ignore the advisory marker) before the tail pass.
-  stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
-  # (audit item 34 residual) the SLP target-capability stamp on the SAME
-  # seam: the EFFECTIVE route target's desc (never the host), resolved by
-  # lir_route_slp_desc above — a vector-less desc leaves the flag false,
-  # so slp_vectorize never emits __intrinsic_simd_* calls this route's
-  # backend cannot lower.
-  match lir_route_slp_desc(route_desc.clone(), opts.clone())
-  when Option::Some(d) then stamp_slp_vector_facility_desc(&mut mir, d)
-  when Option::None then ()
-  end
+  # (the shared finalized-MIR pipeline) The route's persistent declaration
+  # lineage is loaded here, threaded through the ONE finalization entry —
+  # which stamps the pre-mono callable view through this store, builds the
+  # persistent mono cache, runs the unconditional post-mono checkpoint, the
+  # stamps and the verified optimizer sequence — and published at the
+  # finalized boundary below.
+  let lir_lineage_path = driver_lineage_store_path(out_path.clone())
+  var lir_lineage_store = driver_load_lineage_store(lir_lineage_path.clone())
   # (the differential-corpus lane's structural fallback) --dump-abi-plans:
-  # print the per-function AbiCallPlan signatures the tail-call pass
-  # consumes (the ONE classify_call_plan authority, stamped just above)
-  # and stop — no optimization, no emission. The direct spelling of the
-  # same inspection is dumped by dump_abi_plans_direct below; both read
-  # the SAME stamp authority, so a divergence is a route divergence.
-  match opts.dump_phase
-  when Option::Some("abi-plans") then
+  # the shared entry stops after the post-mono stamps for this inspection
+  # (no optimizer, no post-opt / pre-codegen verification); the route
+  # prints the per-function AbiCallPlan signatures the tail-call pass
+  # consumes (the ONE classify_call_plan authority, stamped inside the
+  # entry) and stops. The direct spelling of the same inspection is dumped
+  # by dump_abi_plans_direct below; both read the SAME stamp authority, so
+  # a divergence is a route divergence.
+  let dump_abi_plans = match opts.dump_phase
+  when Option::Some("abi-plans") then true
+  when _ then false
+  end
+  let finalized = match finalize_verified_mir(
+    env, typed,
+    FinalizeTarget { slp_desc: lir_route_slp_desc(route_desc.clone(), opts.clone()) },
+    FinalizeOptions { compiler: opts.clone(), stop_after_stamps: dump_abi_plans },
+    &mut lir_lineage_store)
+  when Result::Ok(v) then v
+  when Result::Err(f) then return Result::Err(driver_finalize_failure_text(f))
+  end
+  var mir = finalized.mir
+  if dump_abi_plans then
     print_abi_plan_rows(mir)
     return Result::Ok(())
-  when _ then ()
   end
-  optimize_mir(&mut mir, opts.opt_level)
-  # (machine-scheduling slice) the opt-level stamp the LIR pipeline's
-  # machine scheduler gates on (mir.tg's MirProgram.opt_level doc): the
-  # SAME level optimize_mir just consumed, stamped before every backend
-  # arm below — so a route can never schedule at a different level than
-  # the one the MIR optimizer ran at.
-  mir.opt_level = opts.opt_level
-  let post_errs = verify_mir(&mir)
-  if !post_errs.is_empty() then
-    return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
+  # The finalized-MIR boundary: publish the mutated lineage store (the
+  # rename/move numbers the next compile reads back). A publish failure is
+  # a build failure — the persisted identity of this build must not be
+  # silently dropped.
+  match driver_publish_lineage_store(lir_lineage_path.clone(), lir_lineage_store.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err(e)
   end
   let target = detect_host_target()
   # (audit item 39) THE DESC-DRIVEN SELECTOR: the backend is ONE
@@ -4535,7 +4390,11 @@ def dump_abi_plans_direct(opts: CompilerOptions, files: Vec[String]) -> Result[U
   if !pre_errs.is_empty() then
     return Result::Err("MIR verification failed before monomorphization (" + pre_errs.len().to_string() + " error(s))")
   end
-  var mono_cache = mono_cache_new(&ast, &typed.resolutions)
+  # The --dump-abi-plans inspection surface holds no persistent lineage
+  # store and writes no artifact: the EXPLICIT ephemeral constructor
+  # (structural identity) is the documented choice here. The plans printed
+  # below are ABI signatures, not instance identities.
+  var mono_cache = mono_cache_new_ephemeral(&ast, &typed.resolutions)
   match monomorphize_program(&mut mir, &mut mono_cache)
   when Result::Ok(_) then ()
   when Result::Err(me) then return Result::Err("monomorphization failed with " + me.len().to_string() + " error(s)")
@@ -4977,85 +4836,11 @@ def compile_snapshot_serve_route(
   when Result::Ok(tp) then tp
   when Result::Err(diags) then return Result::Err(join_diagnostics(&diags))
   end
-  var mir = match driver_lower_to_mir(&ast, Option::Some(typed.clone()))
-  when Result::Ok(m) then m
-  when Result::Err(e) then return Result::Err("MIR lowering failed: " + e)
-  end
-  let pre_errs = verify_mir(&mir)
-  if !pre_errs.is_empty() then
-    return Result::Err("MIR verification failed before monomorphization (" + pre_errs.len().to_string() + " error(s))")
-  end
-  # (audit §11 — the effect-class annotations): the @no_alloc /
-  # @no_block / @no_io / @irq_safe / @interrupt claims are PROVEN on the
-  # LOWERED program — the MIR-derived transitive semantic summaries
-  # (check_effect_class_annotations_mir) classify what EXECUTES,
-  # compiler-generated lowering sites included. Every other compile route
-  # (compile_file_core, the wasm and LIR routes) runs this check between
-  # the lowering verification and monomorphization — the snapshot route's
-  # documented "same phase shape as the LIR route" includes it, so a
-  # program that violates an effect-class annotation fails HERE exactly as
-  # it fails a normal compile (a snapshot of an uncompilable program would
-  # be a lie). A violation is a compile error (E0232) reported through the
-  # same structured diagnostic channel as the typecheck phase.
-  let mir_effect_errs = check_effect_class_annotations_mir(&mir, env)
-  if !mir_effect_errs.is_empty() then
-    let mir_effect_diags = type_errors_to_diags(&mir_effect_errs)
-    return Result::Err(join_diagnostics(&mir_effect_diags))
-  end
-  # (third-audit item 25 — the purity theorem): verify the `pure`
-  # declarations on the same lowered program, persist the statuses on
-  # MirProgram.purity (the optimizer/equivalence/snapshot table) and
-  # reject a non-ProvenPure `pure` function (E0234 — Unknown fails
-  # closed).
-  let mir_purity_errs = check_purity_annotations_mir(&mut mir, env)
-  if !mir_purity_errs.is_empty() then
-    let mir_purity_diags = type_errors_to_diags(&mir_purity_errs)
-    return Result::Err(join_diagnostics(&mir_purity_diags))
-  end
-  # (third-audit item 45 — the complete @budget system): the declared
-  # budgets are checked against the MIR derivations on the same lowered
-  # program (E0235 on a static-proof/static-bound guarantee whose derived
-  # bound exceeds its declared limit; the runtime-measured counters keep
-  # their generated frame checks).
-  let mir_budget_errs = check_budget_annotations_mir(&mir, env)
-  if !mir_budget_errs.is_empty() then
-    let mir_budget_diags = type_errors_to_diags(&mir_budget_errs)
-    return Result::Err(join_diagnostics(&mir_budget_diags))
-  end
-  var mono_cache = mono_cache_new(&ast, &typed.resolutions)
-  match monomorphize_program(&mut mir, &mut mono_cache)
-  when Result::Ok(_) then ()
-  when Result::Err(me) then return Result::Err("monomorphization failed with " + me.len().to_string() + " error(s)")
-  end
-  # The ONE target resolution of the route: the host arch's canonical
-  # TargetDesc (mirrors the LIR route's host default); the builder stamps
-  # the snapshot's full StableTargetId from it (item 9). Resolved HERE,
-  # before the optimizer, so the SLP target-capability stamp below names
-  # the SAME desc the snapshot later records.
-  var target_desc = match detect_host_target().arch
-  when Arch::AArch64 then aarch64_desc()
-  when Arch::X86_64 then x86_64_desc()
-  when _ then
-    return Result::Err("the TANGERINE_SNAPSHOT route has no TargetDesc for this host (aarch64/x86-64 only) — unset TANGERINE_SNAPSHOT to use the direct emitter")
-  end
-  # (fourth-audit P1-10) the authoritative AbiCallPlan oracle before the tail pass.
-  stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
-  # (audit item 34 residual) the SLP target-capability stamp on the same
-  # seam, keyed on the route's own desc.
-  stamp_slp_vector_facility_desc(&mut mir, target_desc.clone())
-  optimize_mir(&mut mir, opts.opt_level)
-  let post_errs = verify_mir(&mir)
-  if !post_errs.is_empty() then
-    return Result::Err("MIR verification failed after optimization (" + post_errs.len().to_string() + " error(s))")
-  end
   # The persistent declaration-lineage store (third-audit item 11): the
-  # SIBLING artifact of the snapshot file. Loaded when present so repeated
-  # runs of this route (the TANGERINE_SERVER route and `tg server`
-  # included) accumulate lineage history; a fresh empty store otherwise
-  # (first sight bootstraps structurally). One store is threaded through
-  # the whole build. Path resolution (third-audit item 22): an explicit
-  # --store path wins, then the sibling "<snapshot>.lineages" convention
-  # when an artifact path was given; otherwise no store is persisted.
+  # SIBLING artifact of the snapshot file. Path resolution (third-audit
+  # item 22): an explicit --store path wins, then the sibling
+  # "<snapshot>.lineages" convention when an artifact path was given;
+  # otherwise no store is persisted.
   var lineage_path = "".to_string()
   match store_path
   when Option::Some(p) then
@@ -5074,6 +4859,35 @@ def compile_snapshot_serve_route(
     when Result::Err(_) then stable_lineage_store_new()
     end
   end
+  # The ONE target resolution of the route: the host arch's canonical
+  # TargetDesc (mirrors the LIR route's host default); the builder stamps
+  # the snapshot's full StableTargetId from it (item 9). Resolved HERE,
+  # before the finalization entry, so the SLP target-capability stamp
+  # inside it names the SAME desc the snapshot later records.
+  var target_desc = match detect_host_target().arch
+  when Arch::AArch64 then aarch64_desc()
+  when Arch::X86_64 then x86_64_desc()
+  when _ then
+    return Result::Err("the TANGERINE_SNAPSHOT route has no TargetDesc for this host (aarch64/x86-64 only) — unset TANGERINE_SNAPSHOT to use the direct emitter")
+  end
+  # (the shared finalized-MIR pipeline) The ONE verified sequence — lower
+  # -> post-lower verify -> §11 effect / purity / budget annotations -> the
+  # persistent pre-mono lineage view -> mono -> the UNCONDITIONAL post-mono
+  # checkpoint (which this route previously skipped) -> tail/SLP stamps ->
+  # the decision-capturing optimizer -> post-opt verify -> the final
+  # pre-codegen firewall. The lineage store is stamped through the entry
+  # (so every source callable's instance identity is the persisted one)
+  # and re-stamped by the snapshot build below in its own revision.
+  # capture_opt_decisions is true: this route persists the rationale
+  # artifact grounded on the optimizer's decision journal.
+  let finalized = match finalize_verified_mir(
+    env, typed, FinalizeTarget { slp_desc: Option::Some(target_desc.clone()) },
+    FinalizeOptions { compiler: opts.clone(), capture_opt_decisions: true },
+    &mut lineage_store)
+  when Result::Ok(v) then v
+  when Result::Err(f) then return Result::Err(driver_finalize_failure_text(f))
+  end
+  var mir = finalized.mir
   # (the rationale persistence hook — semantic_rationale.tg's stated
   # follow-up) The rationale history's sibling artifact: "<snapshot>
   # .rationale" when an artifact path was given (no store is persisted
@@ -5201,16 +5015,13 @@ def compile_snapshot_serve_route(
   # parse above; resolution_ok / type_ok / access_ok / resource_ok =
   # analyze_program's canonical semantic pass (resolution + type checking +
   # the access/ownership and resource convention checks all succeeded
-  # inside analyze_parsed); mir_verify_ok = the pre-mono verify_mir over
-  # the lowered program; effect_verify_ok = the §11 effect-class annotation
-  # check added above (the stage the route previously could not truthfully
-  # claim); post_opt_mir_verify_ok = the final post-opt verify_mir.
-  # mono_verify_ok stays false with this doc note: the route runs
-  # monomorphization but NO post-mono verifier checkpoint (its sibling
-  # routes run none either — the pre-mono and post-opt verifications bound
-  # the mono transform; compiler_core's compile flows run the unconditional
-  # post-mono checkpoint, so only their evidence may claim the flag).
-  # abi_verify_ok is the REAL result (audit order item 7): the
+  # inside analyze_parsed); the MIR flags are the REAL finalization
+  # evidence (finalize_verified_mir's FinalizeEvidence) — the pre-mono
+  # verify, the §11 effect-class check, the UNCONDITIONAL post-mono
+  # checkpoint and the post-opt verify all ran inside the shared entry.
+  # post-mono-mir is a captured, verified stage now (the driver-route
+  # captured set includes it); the former mono_verify_ok=false placeholder
+  # is gone. abi_verify_ok is the REAL result (audit order item 7): the
   # post-lowering ABI verifier runs over the finalized MIR on the host
   # route's own lowering+allocation pipeline (driver_abi_verify_rows,
   # no emission). Its violation rows are printed on failure; the stage
@@ -5222,9 +5033,9 @@ def compile_snapshot_serve_route(
     end
     let index = build_semantic_index(&snapshot)
     # (fourth-audit P0-16) the captured-stages constructor: this route
-    # CAPTURES parse..effects + the capability/contract surface + abi,
-    # and does NOT capture post-mono-mir (no post-mono checker exists on
-    # this route) — the patch maps that one to Unavailable.
+    # CAPTURES parse..effects + post-mono-mir + the capability/contract
+    # surface + abi — the full stage vocabulary, every flag the real
+    # finalization evidence.
     let route_evidence = verified_compilation_evidence_stages(
       semantic_digest_render(&snapshot.revision),
       true,   # parse_ok — parse_source_program succeeded
@@ -5232,10 +5043,10 @@ def compile_snapshot_serve_route(
       true,   # type_ok — type_check_typed succeeded
       true,   # access_ok — access_check succeeded
       true,   # resource_ok — resource_check succeeded
-      true,   # mir_verify_ok — the pre-mono verify over the lowered program
-      false,  # mono_verify_ok — no post-mono verifier checkpoint on this route
-      true,   # post_opt_mir_verify_ok — the final post-opt verify
-      true,   # effect_verify_ok — the §11 annotation check above
+      finalized.evidence.mir_verify_ok,        # mir_verify_ok — the post-lower verify
+      finalized.evidence.mono_verify_ok,       # mono_verify_ok — the unconditional post-mono checkpoint
+      finalized.evidence.post_opt_mir_verify_ok,  # post_opt_mir_verify_ok — the post-opt verify
+      finalized.evidence.effect_verify_ok,     # effect_verify_ok — the §11 annotation check
       abi_rows.len() == 0,  # abi_verify_ok — the post-lowering ABI verifier's real result (audit order item 7)
       true,   # capability_contract_ok — the checker's contract + capability surface
       verification_stage_names_driver_route())
@@ -9245,13 +9056,19 @@ def handle_lsp_request(inout server: LspServer, body: String) -> Option[String]
         # Group edits by URI
         var changes = Map::new()
         for edit in edits do
-          match changes.get(edit.uri.clone())
+          let uri_key = edit.uri.clone()
+          match changes.get(uri_key.clone())
           when Option::Some(existing) then
+            # (map-held copy persistence): `changes.get` hands back a COPY of
+            # the per-URI edit vector — extend the copy and store it BACK
+            # under the same key. Without the write-back every edit after the
+            # first for a URI was dropped from the rename response.
             existing.push(edit)
+            changes.insert(uri_key, existing)
           when Option::None then
             var first_edits = Vec::new()
             first_edits.push(edit)
-            changes.insert(edit.uri.clone(), first_edits)
+            changes.insert(uri_key, first_edits)
           end
         end
         

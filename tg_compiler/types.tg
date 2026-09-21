@@ -6179,17 +6179,49 @@ def typed_kind_for(inout env: TypeEnv, expr: Expr) -> Option[TypedExprKind]
     else
     match typed_children_of(env, &args)
     when Option::Some(args_typed) then
-      # The resolved variant identity: find_enum_variant_indexed is the
-      # checker's owner + index resolution (the same lookup the check arm
-      # used). An unresolvable "variant" (the Vec::from static-path call
-      # fallback) is the StaticPathCall shape — the MIR resolves the callee
-      # by the qualified path.
+      # The resolved variant identity: the qualified path's OWNER segment
+      # resolves first (get_type_id_by_qualified_name + the owner's own
+      # variant table — the same rule check_enum_variant_construct and the
+      # pattern junction apply), and only an owner-less/unresolvable path
+      # falls back to the unambiguous global scan. The bare global scan
+      # alone resolved `IoError::NotFound(..)` to the FIRST enum declaring
+      # `NotFound` (ErrorKind) and recorded a WRONG VariantId owner that the
+      # MIR aggregate then carried ("assign type mismatch: ErrorKind into
+      # IoError", with the wrong payload arity/layout behind it). An
+      # unresolvable "variant" (the Vec::from static-path call fallback) is
+      # the StaticPathCall shape — the MIR resolves the callee by the
+      # qualified path.
       let variant_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1] else "" end
-      match find_enum_variant_indexed(env, variant_name.clone())
-      when Option::Some((enum_td, _, vidx)) then
-        Option::Some(TypedExprKind::Variant(TypedVariant { variant: VariantId { owner: TypeId { id: enum_td.id.id }, index: vidx as UInt }, args: args_typed }))
-      when Option::None then
-        Option::Some(TypedExprKind::StaticPathCall { path: if path.segments.len() > 0 then path.segments.join("::") else "" end, args: args_typed })
+      let path_enum_name = if path.segments.len() >= 2 then path.segments[path.segments.len() - 2] else "" end
+      var owner_variant_ok = false
+      var owner_variant_tid = -1
+      var owner_variant_idx = -1
+      if path_enum_name != "" then
+        match get_type_id_by_qualified_name(env, path_enum_name.clone(), &env.current_module_path)
+        when Option::Some(owner_tid) then
+          match get_type_by_id_ref(env, &owner_tid)
+          when Option::Some(owner_td) then
+            match find_enum_variant_in_owner_indexed(owner_td, variant_name.clone())
+            when Option::Some((_owner_vi, oidx)) then
+              owner_variant_ok = true
+              owner_variant_tid = owner_tid.id
+              owner_variant_idx = oidx
+            when Option::None then ()
+            end
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      end
+      if owner_variant_ok then
+        Option::Some(TypedExprKind::Variant(TypedVariant { variant: VariantId { owner: TypeId { id: owner_variant_tid }, index: owner_variant_idx as UInt }, args: args_typed }))
+      else
+        match find_enum_variant_indexed(env, variant_name.clone())
+        when Option::Some((enum_td, _, vidx)) then
+          Option::Some(TypedExprKind::Variant(TypedVariant { variant: VariantId { owner: TypeId { id: enum_td.id.id }, index: vidx as UInt }, args: args_typed }))
+        when Option::None then
+          Option::Some(TypedExprKind::StaticPathCall { path: if path.segments.len() > 0 then path.segments.join("::") else "" end, args: args_typed })
+        end
       end
     when Option::None then missing_typed_hir_child_at(env, expr, missing_children_of_desc(env, args.clone()))
     end
@@ -7869,8 +7901,33 @@ def store_type_def(inout env: TypeEnv, inout td: TypeDef, span: Span, module_pat
     else
       # A filled existing definition: allow only legitimate re-registrations.
       if type_def_is_empty_stub(&td) then
-        # Source-level stub of the same type (intrinsic struct stubs) — no-op.
-        return
+        # Source-level stub of the same type (intrinsic struct stubs) — a
+        # no-op re-registration, EXCEPT when the existing entry is a
+        # builtin Opaque PLACEHOLDER and the stub is a nominal declaration:
+        # the std's `struct Map[K: Hash + Eq, V]` / `struct Set[T: Hash
+        # + Eq]` intrinsic stubs declare NO fields, so the empty-stub rule
+        # used to keep the Opaque placeholder — and the Opaque kind carries
+        # no typed field record, so the MIR lowering's field-table lookup
+        # missed ("no typed field table entry for struct 'Map'"). The
+        # empty nominal declaration still supplies the authoritative KIND
+        # (Opaque -> Struct/Enum): fall through to the shape refinement
+        # below so the typed field table records the (empty) nominal shape
+        # the MIR lowering and the field-resolution consumers read. The
+        # builtin keeps its TypeId (the LangItems identity). Non-nominal
+        # stubs (trait/alias) keep the placeholder (the return below).
+        var empty_refines_opaque = false
+        match existing.def_kind
+        when TypeDefKind::Opaque then
+          match td.def_kind
+          when TypeDefKind::Struct(_) then empty_refines_opaque = true
+          when TypeDefKind::Enum(_) then empty_refines_opaque = true
+          when _ then ()
+          end
+        when _ then ()
+        end
+        if !empty_refines_opaque then
+          return
+        end
       end
       if type_defs_identical(env, existing, &td) then
  # re-registration of the SAME declaration —
@@ -10532,6 +10589,18 @@ def collect_enum_type_def(inout env: TypeEnv, e: EnumDecl, module_path: Vec[Stri
     def: Option::None
   }
   store_type_def(env, td, e.span, module_path)
+  # (final-id layout record): the module-local distinct-definition path
+  # mints a FRESH TypeId when the bare first-wins entry belongs to another
+  # declaration (e.g. the std/core `trait Error` vs the std/gfx_errors
+  # `struct Error` collision). The layout record must follow the
+  # DECLARATION's own id — the pre-store insert above lands on the
+  # fallback (foreign) id and the MIR's typed layout table then misses the
+  # real declaration ("no typed layout-attribute record").
+  match get_type_id_by_qualified_name(env, e.name.clone(), module_path)
+  when Option::Some(final_id) then
+    env.layout_attrs.insert(final_id.id, e.layout_attrs.clone())
+  when Option::None then ()
+  end
 end
 
 def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -> Unit
@@ -10605,6 +10674,19 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
       def: Option::None
     }
     store_type_def(env, td, s.span, module_path)
+    # (final-id layout record): the module-local distinct-definition path
+    # mints a FRESH TypeId when the bare first-wins entry belongs to another
+    # declaration (e.g. the std/core `trait Error` vs the std/gfx_errors
+    # `struct Error` collision — the trait registers first). The layout
+    # record must follow the DECLARATION's own id; the pre-store insert
+    # above lands on the fallback (foreign) id and the MIR's typed layout
+    # table then misses the real declaration ("no typed layout-attribute
+    # record for struct 'Error'").
+    match get_type_id_by_qualified_name(env, s.name.clone(), module_path)
+    when Option::Some(final_id) then
+      env.layout_attrs.insert(final_id.id, s.layout_attrs.clone())
+    when Option::None then ()
+    end
   when ItemKind::ItemEnum(e) then
     # store_type_def rejects duplicate definitions; same-named DISTINCT types
  # across modules are no longer merged.
@@ -15455,6 +15537,27 @@ def find_enum_variant_indexed(env: TypeEnv, name: String) -> Option[(TypeDef, Va
     i = i + 1
   end
   Option::None
+end
+
+# Find a variant WITHIN one owner enum (the owner's TypeDef) and report
+# its declaration index: the qualified-path arm of variant resolution —
+# `Enum::Variant` resolves the variant inside ITS OWNER, never by a global
+# bare-name scan (a bare scan would pick the first enum declaring the name:
+# `IOError::Other(..)` must not match `SmallErrorCode::Other`). The index
+# is the VariantId's declaration-order component the typed HIR records.
+def find_enum_variant_in_owner_indexed(td: TypeDef, name: String) -> Option[(VariantInfo, Int)]
+  match td.def_kind
+  when TypeDefKind::Enum(variants) then
+    var j = 0
+    while j < variants.len() do
+      if variants[j].name == name then
+        return Option::Some((variants[j], j))
+      end
+      j = j + 1
+    end
+    Option::None
+  when _ then Option::None
+  end  end
 end
 
 # Find a variant WITHIN one owner enum (the owner's TypeDef): the

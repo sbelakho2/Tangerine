@@ -1,0 +1,176 @@
+# tests/dma_place_key_test.tg — DMA StablePlaceId keying (DMA keying
+# refinement).
+#
+# The DMA ownership facts used to key their places on the canonical
+# binding text only; they now carry a TYPED StablePlaceId derived at
+# fact-commit time (root = the owning function's stable declaration +
+# the stable local/binder identity; projections = the typed field/index
+# chain) and the snapshot builder re-roots it on the PERSISTENT
+# declaration/binder identities, so DMA reasoning survives refactoring
+# exactly like declaration identity:
+#
+#   * inserting an unrelated declaration before the function (changing
+#     the compilation-local def index) keeps the DMA fact's
+#     StablePlaceId — the store-stamped declaration and binder lineages
+#     are insertion-stable;
+#   * renaming the function through an explicit DeclContinuation keeps
+#     it too (the same store the session carried onward);
+#   * a legacy snapshot row without the typed "pid" field parses back
+#     with place_id None — the text key is the fallback, nothing is
+#     fabricated (pinned by the snapshot parse lane's
+#     dma-legacy-place-id-none row);
+#   * ownership.dma_state answers the typed key ("pid:<hi>-<lo>") by
+#     identity.
+#
+# Run with the repo root as the working directory:
+#   tg test tests/dma_place_key_test.tg
+
+use std::core::{Option, Result, Unit, UInt}
+use std::test::*
+
+use tg_compiler::codegen::{detect_host_target}
+use tg_compiler::compiler_core::{default_options}
+use tg_compiler::semantic_model::{SemanticSnapshot, DmaOwnershipFact}
+use tg_compiler::semantic_query::{ownership_dma_state}
+use tg_compiler::semantic_server::{session_compile_source}
+use tg_compiler::semantic_snapshot::{semantic_snapshot_parse_lane_check}
+use tg_compiler::stable_ids::{
+  DeclLineageStore, stable_lineage_store_new, stable_lineage_store_apply_move, DeclMove
+}
+
+# The fixture program: the canonical std::embedded pin -> await -> unpin
+# lifecycle on one buffer local. `prefix` is inserted verbatim before the
+# DMA function (the unrelated-insertion axis); `fn_name` is the function's
+# declared name (the explicit-continuation rename axis).
+def dpk_program(fn_name: String, prefix: String) -> String
+  "use std::core\n" +
+  "use std::embedded::{dma_pin_read, dma_await, dma_unpin}\n" +
+  "\n" +
+  prefix +
+  "def " + fn_name.clone() + "() -> Int\n" +
+  "  var buf: [u8; 16] = [0u8; 16]\n" +
+  "  let pin = dma_pin_read(buf)\n" +
+  "  dma_await(buf)\n" +
+  "  dma_unpin(buf)\n" +
+  "  pin.raw() as Int\n" +
+  "end\n" +
+  "\n" +
+  "def main() -> Int\n" +
+  "  if " + fn_name.clone() + "() != 0 then\n" +
+  "    return 1\n" +
+  "  end\n" +
+  "  0\n" +
+  "end\n"
+end
+
+# Compile one fixture source into (snapshot, the store the session carried
+# onward) — the stamping continuity the refactoring axes need.
+def dpk_compile(source: String, file: String, store: DeclLineageStore) -> (SemanticSnapshot, DeclLineageStore)
+  match session_compile_source(source, file, detect_host_target(), default_options(), store)
+  when Result::Ok(s) then (s.snapshot, s.lineages)
+  when Result::Err(e) then panic("dma place-key compile failed (" + file.clone() + "): " + e)
+  end
+end
+
+# The pinned-read commit row of the snapshot's DMA table (the first
+# committed op of the fixture lifecycle).
+def dpk_pin_row(snapshot: SemanticSnapshot) -> DmaOwnershipFact
+  for dm in snapshot.dma_ownership do
+    if dm.op == "dma-pin-read" then
+      return dm.clone()
+    end
+  end
+  panic("the DMA table carries no dma-pin-read row")
+end
+
+def dpk_place_digest(row: DmaOwnershipFact) -> (UInt, UInt)
+  match row.place_id
+  when Option::Some(p) then (p.digest_hi, p.digest_lo)
+  when Option::None then (0, 0)
+  end
+end
+
+def dpk_place_missing(d: (UInt, UInt)) -> Bool
+  d.0 == 0 && d.1 == 0
+end
+
+def dpk_place_same(a: (UInt, UInt), b: (UInt, UInt)) -> Bool
+  a.0 == b.0 && a.1 == b.1
+end
+
+@test
+def test_snapshot_parse_lane_legacy_dma_row() -> Unit
+  let rows = semantic_snapshot_parse_lane_check()
+  assert(rows.len() == 0, "snapshot parse lane mismatches: " + rows.join("; "))
+end
+
+@test
+def test_dma_place_key_insertion_stable() -> Unit
+  # Compile 1: the fixture function, stamped through a fresh store.
+  let first = dpk_compile(dpk_program("dma_fixture".to_string(), "".to_string()),
+    "dpk_insert_a.tg".to_string(), stable_lineage_store_new())
+  let place_a = dpk_place_digest(dpk_pin_row(first.0.clone()))
+  assert(!dpk_place_missing(place_a),
+    "the committed DMA fact must carry a typed StablePlaceId")
+  # Compile 2: an unrelated function inserted BEFORE the fixture changes
+  # the compilation-local def index; the store the session carried onward
+  # keeps the exact structural keys, so the typed place id must be
+  # byte-identical.
+  let inserted = "def unrelated() -> Int\n  41\nend\n\n"
+  let second = dpk_compile(dpk_program("dma_fixture".to_string(), inserted),
+    "dpk_insert_b.tg".to_string(), first.1)
+  let place_b = dpk_place_digest(dpk_pin_row(second.0.clone()))
+  assert(dpk_place_same(place_a, place_b),
+    "an unrelated insertion before the function must keep the DMA fact's StablePlaceId")
+end
+
+@test
+def test_dma_place_key_rename_continuation_stable() -> Unit
+  # Compile 1, then record the explicit rename continuation on the store
+  # the session carried; compile 2 under the new name must keep the typed
+  # place identity (the persistent declaration lineage is the root).
+  let first = dpk_compile(dpk_program("dma_fixture".to_string(), "".to_string()),
+    "dpk_rename_a.tg".to_string(), stable_lineage_store_new())
+  let place_a = dpk_place_digest(dpk_pin_row(first.0.clone()))
+  assert(!dpk_place_missing(place_a),
+    "the committed DMA fact must carry a typed StablePlaceId")
+  var store = first.1.clone()
+  let moved = stable_lineage_store_apply_move(&mut store, DeclMove {
+    package_key: "".to_string(),
+    old_module_path: "".to_string(),
+    new_module_path: "".to_string(),
+    kind: "Function".to_string(),
+    old_name: "dma_fixture".to_string(),
+    new_name: "dma_renamed".to_string(),
+    reason: "rename".to_string()
+  })
+  assert(moved, "the continuation must be recorded from the stamped store")
+  let second = dpk_compile(dpk_program("dma_renamed".to_string(), "".to_string()),
+    "dpk_rename_b.tg".to_string(), store)
+  let place_b = dpk_place_digest(dpk_pin_row(second.0))
+  assert(dpk_place_same(place_a, place_b),
+    "an explicit rename continuation must keep the DMA fact's StablePlaceId")
+end
+
+@test
+def test_dma_query_answers_typed_key() -> Unit
+  let session = dpk_compile(dpk_program("dma_fixture".to_string(), "".to_string()),
+    "dpk_query.tg".to_string(), stable_lineage_store_new())
+  let snapshot = session.0.clone()
+  let row = dpk_pin_row(snapshot.clone())
+  let pid = match row.place_id
+  when Option::Some(p) then p.digest_hi.to_string() + "-" + p.digest_lo.to_string()
+  when Option::None then ""
+  end
+  assert(pid.len() > 0, "the pinned-read row must carry the typed place key")
+  let answer = ownership_dma_state(snapshot.clone(), "pid:" + pid.clone())
+  assert(answer.keys.len() == 1,
+    "the typed key must answer exactly the row of that place (got " +
+    answer.keys.len().to_string() + " rows)")
+  assert(answer.keys[0].ends_with("|pid:" + pid.clone()),
+    "the answered row must carry the typed key suffix")
+  # The legacy text prefix still answers the same row.
+  let text_answer = ownership_dma_state(snapshot.clone(), row.function.clone() + "|dma|" + row.place.clone())
+  assert(text_answer.keys.len() == 1,
+    "the canonical text key must still answer the same row")
+end

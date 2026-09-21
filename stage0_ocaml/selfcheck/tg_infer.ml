@@ -191,21 +191,35 @@ let () =
           else if lower_merged && not (contains report "MIR_LOWER_END merged") then
             fail
               "the merged lowering stage did not finish (expected MIR_LOWER_END merged)"
+          else if lower_merged && not (contains report "MIR_LOCALCHECK merged pass") then
+            (* (table-persistence regression): every lowered MirFunction
+               must carry its return-place local and its declaration's
+               parameter table. The builder mutates match-bound COPIES of
+               b.current_fn (`match b.current_fn when Option::Some(f) then
+               f.locals.push(...)`) — a missing write-back leaves
+               locals=0/params=0 and lookup_local_type answers Unit for
+               every id (the missing-scrutinee-identity ICE). The MIR_LOCALS
+               row above carries the counts. *)
+            fail
+              "the merged lowering left an empty function local/param table (expected MIR_LOCALCHECK merged pass; see the MIR_LOCALS row above)"
           else if
             (lower || lower_merged)
             && not
                  (List.for_all
                     (fun n ->
                       contains report ("MIR_LOWER " ^ n ^ " functions=")
-                      && contains report ("MIR_RELOWER " ^ n ^ " functions="))
+                      && contains report ("MIR_RELOWER " ^ n ^ " functions=")
+                      && contains report ("MIR_LOCALCHECK " ^ n ^ " pass"))
                     [
                       "lower_arith";
                       "lower_field_chain";
                       "lower_enum_payload";
+                      "lower_enum_assoc_fn";
                       "lower_enum_assign";
                       "lower_match_field";
                       "lower_closure_capture";
                       "lower_for_range";
+                      "lower_const_call_pattern";
                       "lower_array_index";
                       "lower_field_call_recv";
                       "lower_field_bitand";
@@ -214,7 +228,7 @@ let () =
                     ])
           then
             fail
-              "the lowering shape battery did not complete clean on BOTH passes (see the report above)"
+              "the lowering shape battery did not complete clean on BOTH passes with non-empty local/param tables (expected MIR_LOCALCHECK <shape> pass; see the report above)"
           else begin
             restore ();
             Printf.printf

@@ -205,6 +205,11 @@ edits = changes.get(URI, []) if isinstance(changes, dict) else []
 check("rename: returns edits for the document", len(edits) >= 1)
 if edits:
     check("rename: newText carries the new name", edits[0].get("newText") == "renamed_main")
+# The per-URI grouping must persist EVERY edit (the map-held copy-mutation
+# regression): `changes.get(uri)` hands back a COPY of the edit vector, so a
+# push without a write-back dropped every edit after the first for a URI.
+# One edit per reference is the invariant the fixed grouping restores.
+check("rename: one edit per reference in the document", len(edits) == len(refs))
 
 # ── formatting ───────────────────────────────────────────────────────
 resp = c.request("textDocument/formatting", {

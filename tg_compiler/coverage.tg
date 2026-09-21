@@ -6,9 +6,40 @@
 
 use std::core::{Option, Result}
 use std::collections::{Vec, Map}
+use std::fs::{read_file, write_file, mkdir_p, delete_file}
+use std::process::{Command}
 use tg_compiler::token::{Span}
 use tg_compiler::cqs::{BranchPoint, BranchPointKind, sha256}
 use tg_compiler::util::{to_float, pow}
+use tg_compiler::compiler_core::{
+  CompilerOptions, parse_source_program, merge_imported_deps, analyze_program,
+  get_output_path, join_diagnostics
+}
+use tg_compiler::types::{type_env_new}
+# (the shared finalized-MIR pipeline) The ONE harness construction runs the
+# verified sequence through finalize.tg's entry — lower -> verify ->
+# annotations -> lineage -> mono -> post-mono checkpoint -> stamps ->
+# optimizer -> post-opt verify -> pre-codegen firewall — and keeps only the
+# harness-specific phases around it (snapshot build -> coverage emission
+# plan -> LIR executable -> run/ingest).
+use tg_compiler::finalize::{
+  finalize_verified_mir, FinalizeFailure, FinalizeOptions, FinalizeTarget
+}
+use tg_compiler::semantic_model::{SemanticSnapshot, semantic_digest_zero}
+use tg_compiler::semantic_snapshot::{
+  semantic_snapshot_of_final_state, snapshot_feature_set_of,
+  snapshot_semantic_options_of, SnapshotError
+}
+use tg_compiler::stable_ids::{
+  DeclLineageStore, untracked_artifact_text, UntrackedArtifact
+}
+use tg_compiler::codegen::{detect_host_target}
+use tg_compiler::coverage_graph::{
+  coverage_emission_plan_of_functions, coverage_trace_bind_stable, coverage_ingest
+}
+use tg_compiler::lir::{lir_compile_executable_cov, lir_replay_plan_disabled}
+use tg_compiler::target_desc::{Arch, aarch64_desc, x86_64_desc}
+use tg_compiler::version::{VERSION}
 
 # ═══════════════════════════════════════════════════════════════
 # §60 — Coverage Artifact Purpose & Properties
@@ -588,4 +619,489 @@ use std::serde::{Value}
 def json_parse(s: String) -> Result[Value, json::JsonError]
   # Delegates to std::json parser
   json::parse(s.as_str())
+end
+
+# ═══════════════════════════════════════════════════════════════
+# §80 — The coverage-harness execution path
+# ═══════════════════════════════════════════════════════════════
+# ONE harness-construction entry (coverage_harness_build_and_run) owns the
+# whole `tg test --coverage` lane:
+#   1. per-test dispatch main generation (coverage_harness_source);
+#   2. compilation through the SHARED finalize_verified_mir entry (lower ->
+#      verify -> effect/purity/budget -> persistent lineage view -> mono ->
+#      unconditional post-mono checkpoint -> tail/SLP stamps -> optimizer ->
+#      post-opt verify -> pre-codegen firewall);
+#   3. the coverage emission plan + the LIR coverage executable build;
+#   4. per-test execution: one process per test name, argv[1] = the name
+#      (the runtime dump binds it as `test|<name>`);
+#   5. exit-time trace ingest through coverage_trace_bind_stable +
+#      coverage_ingest, the trace deleted before every run (a crashed
+#      process's missing trace is detected, never a stale ingest).
+#
+# BOTH harness call sites run through it and can no longer drift:
+#   * the CLI route (driver.tg: compile_and_run_tests /
+#     compile_and_run_file_main) keeps its CLI-specific paths, argv
+#     dispatch and sibling run-snapshot / lineage-store publication, and
+#     calls this entry;
+#   * the verified-edit transaction (semantic_server.tg:
+#     session_run_affected_tests / session_synthesize_uncovered_tests)
+#     calls the SAME entry in-process.
+# The entry lives HERE because driver.tg imports semantic_server.tg: the
+# transaction cannot import the driver (cycle), and this module imports
+# neither.
+#
+# `test_names` non-empty selects the generated per-test dispatch harness
+# over `module_source`; EMPTY selects the canary convention — the module
+# source is compiled as-is and the file's own main runs once with no argv
+# element, exactly the CLI lane's file-main route.
+#
+# The harness stores nothing beside the executable: the run snapshot is
+# returned in-process (a compile never invents runtime evidence) and the
+# lineage store is THREADED IN by the caller (the transaction passes the
+# session's persisted store, so the harness declarations carry the same
+# stable identities as the transaction snapshot and the delta's affected
+# keys match the run snapshot's coverage index; the CLI passes the store
+# loaded from its sibling path and publishes the returned mutated store).
+#
+# HOST ROUTE: the LIR coverage emitter is host-only exactly like the CLI
+# lane; a target outside aarch64/x86-64 fails closed here (the caller
+# records the documented Unavailable status, never a fabricated pass).
+
+pub struct CoverageHarnessTestResult
+  name: String
+  passed: Bool
+  message: String
+end
+
+pub struct CoverageHarnessCompiled
+  exe_path: String
+  snapshot: SemanticSnapshot
+  lineage_store: DeclLineageStore
+end
+
+pub struct CoverageHarnessRun
+  snapshot: SemanticSnapshot
+  results: Vec[CoverageHarnessTestResult]
+  traces: Int = 0
+  missing_traces: Int = 0
+end
+
+# THE outcome of the ONE harness-construction entry. compiled_snapshot is
+# the finalized compile boundary (the CLI publishes THIS boundary beside
+# the harness exactly as before the dedup); snapshot is that boundary
+# after every ingested exit-time trace (the state the transaction
+# evaluates and the CLI reports its coverage rows from); lineage_store is
+# the mutated store the caller threaded in (the CLI publishes it as the
+# run's sibling).
+pub struct CoverageHarnessOutcome
+  exe_path: String
+  compiled_snapshot: SemanticSnapshot
+  snapshot: SemanticSnapshot
+  lineage_store: DeclLineageStore
+  results: Vec[CoverageHarnessTestResult]
+  traces: Int = 0
+  missing_traces: Int = 0
+end
+
+# THE typed failure vocabulary of the harness construction: the ONE entry
+# never forces one caller's route text on the other — each caller renders
+# it through its own vocabulary (the driver keeps its CLI messages, this
+# module's coverage_harness_error_text renders the lane's).
+pub enum CoverageHarnessError
+  RouteUnsupported
+  HarnessDir(detail: String)
+  HarnessWrite(path: String, detail: String)
+  SourceDiagnostics(rendered: String)
+  Finalize(failure: FinalizeFailure)
+  Snapshot(error: SnapshotError)
+  UntrackedArtifact(artifact: UntrackedArtifact)
+  Executable(detail: String)
+end
+
+# The route-unsupported text (the CLI lane's coverage_route_message
+# mirror — kept here so the module owns its own route vocabulary).
+pub def coverage_harness_route_message() -> String
+  "the coverage harness route is host-only (aarch64 / x86-64)"
+end
+
+# The SnapshotError render (the driver's snapshot_error_text mirror — the
+# harness builder reports the builder's ONE error vocabulary).
+def coverage_harness_snapshot_error_text(e: SnapshotError) -> String
+  match e
+  when SnapshotError::UnstableTypeIdentity(tid) then "unstable type identity (type id " + tid + ")"
+  when SnapshotError::UnstableDefIdentity then "unstable def identity"
+  when SnapshotError::UnstableFieldIdentity then "unstable field identity"
+  when SnapshotError::UnstableVariantIdentity then "unstable variant identity"
+  when SnapshotError::UnstableLocalIdentity then "unstable local identity"
+  when SnapshotError::UnstableClosureIdentity then "unstable closure identity"
+  when SnapshotError::UnstableBlockIdentity then "unstable block identity"
+  when SnapshotError::UnstableInstanceDisplay then "unstable instance display"
+  when SnapshotError::UnstableTarget then "unstable target"
+  when SnapshotError::UntrackedOrigin(api, detail) then
+    "untracked-artifact: " + api + ": " + detail
+  end
+end
+
+# The finalize-failure render (the route-local diagnostic channel): the
+# structured annotation diagnostics when the stage carries them, else the
+# canonical stage word plus the verifier / lowering / mono rows.
+def coverage_harness_finalize_failure_text(f: FinalizeFailure) -> String
+  if !f.diagnostics.is_empty() then
+    join_diagnostics(&f.diagnostics)
+  else
+    "finalization failed at " + f.stage.clone() + ": " + f.rows.join("; ")
+  end
+end
+
+# The shared construction's failure render (the coverage lane's text): the
+# route-unsupported message, the IO texts, the source diagnostics, and the
+# typed pipeline / snapshot / artifact failures.
+pub def coverage_harness_error_text(e: CoverageHarnessError) -> String
+  match e
+  when CoverageHarnessError::RouteUnsupported then coverage_harness_route_message()
+  when CoverageHarnessError::HarnessDir(detail) then
+    "failed to create coverage harness directory: " + detail
+  when CoverageHarnessError::HarnessWrite(path, detail) then
+    "failed to write harness '" + path + "': " + detail
+  when CoverageHarnessError::SourceDiagnostics(rendered) then rendered
+  when CoverageHarnessError::Finalize(failure) then
+    coverage_harness_finalize_failure_text(failure)
+  when CoverageHarnessError::Snapshot(error) then
+    "semantic snapshot build failed: " + coverage_harness_snapshot_error_text(error)
+  when CoverageHarnessError::UntrackedArtifact(artifact) then
+    untracked_artifact_text(artifact)
+  when CoverageHarnessError::Executable(detail) then detail
+  end
+end
+
+# The generated per-test dispatch harness source: the module source plus a
+# generated `main` that dispatches argv[1] to the named @test function —
+# THE ONE generated-main shape both the CLI `tg test` lane and the
+# verified-edit transaction compile (the argv[1] convention the runtime
+# coverage dump binds as `test|<name>`). `use std::args` (and
+# `use std::test::*` when the source asserts) is appended only when the
+# source does not already carry it, so a test file with its own imports
+# compiles unchanged.
+pub def coverage_harness_source(module_source: String, test_names: Vec[String]) -> String
+  var lines: Vec[String] = Vec::new()
+  lines.push(module_source.clone())
+  lines.push("")
+  lines.push("# [generated by the verified-edit transaction] per-test dispatch main")
+  if !module_source.contains("use std::args".to_string()) then
+    lines.push("use std::args")
+  end
+  if module_source.contains("assert".to_string()) &&
+     !module_source.contains("use std::test".to_string()) then
+    lines.push("use std::test::*")
+  end
+  lines.push("")
+  lines.push("def main() -> Int")
+  lines.push("  let argv = args::args()")
+  lines.push("  if argv.len() < 2 then")
+  lines.push("    return 1")
+  lines.push("  end")
+  lines.push("  let name = argv[1]")
+  var first = true
+  for name in test_names do
+    if first then
+      lines.push("  if name == \"" + name.clone() + "\" then")
+      first = false
+    else
+      lines.push("  elsif name == \"" + name.clone() + "\" then")
+    end
+    lines.push("    " + name.clone() + "()")
+  end
+  if first then
+    lines.push("  return 1")
+  else
+    lines.push("  else")
+    lines.push("    panic(\"unknown test: \" + name)")
+    lines.push("  end")
+    lines.push("  0")
+  end
+  lines.push("end")
+  lines.push("")
+  lines.join("\n")
+end
+
+# The parent directory of a harness path: the ONE construction creates it
+# before installing the source (the CLI's build/.tg_test_harness and the
+# transaction's build/.tg_verify_edit share the rule).
+def coverage_harness_parent_dir(path: String) -> String
+  match path.rfind("/")
+  when Option::Some(i) then path.slice(0, i)
+  when Option::None then "."
+  end
+end
+
+# Install the harness source at its path: create the parent directory and
+# write only when the bytes differ (the CLI's canary file-main route passes
+# its own file — the route compiled it in place, never rewriting an
+# identical file).
+def coverage_harness_install_source(path: String, source: String) -> Result[Unit, CoverageHarnessError]
+  match mkdir_p(coverage_harness_parent_dir(path.clone()))
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    return Result::Err(CoverageHarnessError::HarnessDir(e.message()))
+  end
+  match read_file(path.clone())
+  when Result::Ok(existing) then
+    if existing == source then
+      return Result::Ok(())
+    end
+  when Result::Err(_) then ()
+  end
+  match write_file(path.clone(), source)
+  when Result::Ok(_) then Result::Ok(())
+  when Result::Err(e) then
+    Result::Err(CoverageHarnessError::HarnessWrite(path.clone(), e.message()))
+  end
+end
+
+# Compile one harness source through the canonical LIR host coverage route:
+# parse -> merge imports -> analyze -> the SHARED finalize_verified_mir
+# entry (lower -> verify -> effect/purity/budget -> persistent lineage view
+# -> mono -> unconditional post-mono checkpoint -> tail/SLP stamps ->
+# optimizer -> post-opt verify -> pre-codegen firewall) -> snapshot build
+# -> coverage emission plan -> LIR executable. `lineage_store` is the
+# caller's persisted store: the harness declarations are stamped through it
+# (a copy — the caller's store is untouched) so their stable identities
+# agree with the caller's snapshot; the mutated copy rides the returned
+# struct. `harness_path` is both the source file name the parse and
+# diagnostics carry and the executable's base path.
+pub def coverage_harness_compile(
+  opts: CompilerOptions,
+  harness_path: String,
+  harness_source: String,
+  coverage_out: String,
+  lineage_store: DeclLineageStore
+) -> Result[CoverageHarnessCompiled, CoverageHarnessError]
+  var local_opts = opts.clone()
+  # The harness executable path must never alias the caller's own output
+  # artifact (`opts.output_file` names the SESSION's binary): the path is
+  # derived from the harness file alone.
+  local_opts.output_file = Option::None
+  match coverage_harness_install_source(harness_path.clone(), harness_source.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err(e)
+  end
+  var ast = match parse_source_program(harness_source, harness_path.clone())
+  when Result::Ok(p) then p
+  when Result::Err(diags) then
+    return Result::Err(CoverageHarnessError::SourceDiagnostics(join_diagnostics(&diags)))
+  end
+  ast = match merge_imported_deps(ast, false)
+  when Result::Ok(a) then a
+  when Result::Err(e) then return Result::Err(CoverageHarnessError::SourceDiagnostics(e))
+  end
+  var env = type_env_new()
+  let typed = match analyze_program(&mut env, &mut ast, local_opts.clone())
+  when Result::Ok(tp) then tp
+  when Result::Err(diags) then
+    return Result::Err(CoverageHarnessError::SourceDiagnostics(join_diagnostics(&diags)))
+  end
+  # The host route gate and the route's effective target descriptor (the
+  # finalization's SLP stamp seam consumes it).
+  let target_desc = match detect_host_target().arch
+  when Arch::AArch64 then aarch64_desc()
+  when Arch::X86_64 then x86_64_desc()
+  when _ then return Result::Err(CoverageHarnessError::RouteUnsupported)
+  end
+  # The harness identities are stamped through the CALLER's store copy:
+  # the caller/callee declarations the delta names keep the exact stable
+  # ids the caller's snapshot carries, and the synthesized/@test/main
+  # declarations are minted fresh. The SAME store copy threads into the
+  # snapshot build below.
+  var store = lineage_store.clone()
+  let pipeline = match finalize_verified_mir(
+    env, typed,
+    FinalizeTarget { slp_desc: Option::Some(target_desc.clone()) },
+    FinalizeOptions { compiler: local_opts.clone() },
+    &mut store)
+  when Result::Ok(v) then v
+  when Result::Err(f) then return Result::Err(CoverageHarnessError::Finalize(f))
+  end
+  var mir = pipeline.mir
+  var snapshot = match semantic_snapshot_of_final_state(
+    &env, &typed.typed, &mir, &target_desc, VERSION, semantic_digest_zero(), &mut store,
+    typed.drop_plan_facts.clone(), typed.dma_facts.clone(),
+    snapshot_feature_set_of(local_opts.clone(), target_desc.clone()),
+    snapshot_semantic_options_of(local_opts.clone(), target_desc.clone()))
+  when Result::Ok(s) then s
+  when Result::Err(e) then return Result::Err(CoverageHarnessError::Snapshot(e))
+  end
+  let cov_plan = match coverage_emission_plan_of_functions(mir.functions.clone(), coverage_out.clone())
+  when Result::Ok(p) then p
+  when Result::Err(u) then return Result::Err(CoverageHarnessError::UntrackedArtifact(u))
+  end
+  let exe_path = get_output_path(local_opts.clone(), harness_path.clone(), "")
+  match lir_compile_executable_cov(mir, detect_host_target(), exe_path.clone(), cov_plan,
+    lir_replay_plan_disabled())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then return Result::Err(CoverageHarnessError::Executable(e))
+  end
+  Result::Ok(CoverageHarnessCompiled {
+    exe_path: exe_path,
+    snapshot: snapshot,
+    lineage_store: store
+  })
+end
+
+# Run one program with an ARGV vector through the safe std::process::Command
+# API (the driver's bootstrap_call_argv idiom; program and test names are
+# separate argv elements, never a shell string).
+def coverage_harness_call_argv(program: String, args: Vec[String]) -> Int
+  var command = Command::new(program)
+  for a in args do
+    command = command.arg(a.as_str_view())
+  end
+  match command.status()
+  when Result::Ok(code) then code
+  when Result::Err(e) then
+    eprintln("error: cannot run '" + program + "': " + e)
+    127
+  end
+end
+
+# The per-test run + ingest loop (the ONE entry's dispatch shape): each
+# named test runs as its own process with argv[1] = the name (the runtime
+# dump binds it as `test|<name>`), the trace file is deleted before every
+# run (a crashed process's missing trace is detected, never a stale
+# ingest), and every read trace is normalized through the discovery table
+# and ingested into the run snapshot. A test that passed but wrote no
+# trace carries the documented missing-trace note in its message.
+pub def coverage_harness_run(
+  exe_path: String,
+  test_names: Vec[String],
+  snapshot: SemanticSnapshot,
+  coverage_out: String
+) -> CoverageHarnessRun
+  var results: Vec[CoverageHarnessTestResult] = Vec::new()
+  var current = snapshot
+  var traces = 0
+  var missing = 0
+  for name in test_names do
+    match delete_file(coverage_out.clone())
+    when Result::Ok(_) then ()
+    when Result::Err(_) then ()
+    end
+    var test_args: Vec[String] = Vec::new()
+    test_args.push(name.clone())
+    let exit_code = coverage_harness_call_argv(exe_path.clone(), test_args)
+    let passed = exit_code == 0
+    var message = if passed then "" else "test exited with code " + exit_code.to_string() end
+    match read_file(coverage_out.clone())
+    when Result::Ok(trace_text) then
+      traces = traces + 1
+      let bound = coverage_trace_bind_stable(current.clone(), trace_text)
+      current = coverage_ingest(current, bound)
+    when Result::Err(_) then
+      missing = missing + 1
+      if passed then
+        message = "test passed but wrote no coverage trace"
+      end
+    end
+    results.push(CoverageHarnessTestResult {
+      name: name.clone(),
+      passed: passed,
+      message: message
+    })
+  end
+  CoverageHarnessRun {
+    snapshot: current,
+    results: results,
+    traces: traces,
+    missing_traces: missing
+  }
+end
+
+# The canary-convention run (the ONE entry's empty test_names shape): the
+# executable's own main runs once with no argv element; its exit code is
+# the outcome and its exit-time trace is ingested into the caller's
+# snapshot. The result is named "main" and carries no missing-trace note —
+# exactly the CLI lane's file-main route.
+def coverage_harness_run_main(
+  exe_path: String,
+  snapshot: SemanticSnapshot,
+  coverage_out: String
+) -> CoverageHarnessRun
+  match delete_file(coverage_out.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(_) then ()
+  end
+  let exit_code = coverage_harness_call_argv(exe_path.clone(), Vec::new())
+  let passed = exit_code == 0
+  let message = if passed then "" else "test exited with code " + exit_code.to_string() end
+  var current = snapshot
+  var traces = 0
+  var missing = 0
+  match read_file(coverage_out.clone())
+  when Result::Ok(trace_text) then
+    traces = 1
+    let bound = coverage_trace_bind_stable(current.clone(), trace_text)
+    current = coverage_ingest(current, bound)
+  when Result::Err(_) then
+    missing = 1
+  end
+  var results: Vec[CoverageHarnessTestResult] = Vec::new()
+  results.push(CoverageHarnessTestResult {
+    name: "main".to_string(),
+    passed: passed,
+    message: message
+  })
+  CoverageHarnessRun {
+    snapshot: current,
+    results: results,
+    traces: traces,
+    missing_traces: missing
+  }
+end
+
+# THE ONE harness-construction entry. Both callers (the CLI route in
+# driver.tg and the verified-edit transaction in semantic_server.tg) run
+# the SAME construction here:
+#   dispatch-main generation (or the canary source when test_names is
+#   empty) -> compile through finalize_verified_mir + the coverage emission
+#   plan + the LIR coverage executable -> per-test execution -> trace
+#   ingest. The caller supplies and publishes the lineage store (the CLI
+#   loads/persists the sibling store; the transaction threads the session's
+#   store); the returned outcome carries both the compile-boundary snapshot
+#   (the CLI publishes it) and the post-ingest run snapshot (the
+#   transaction evaluates it).
+pub def coverage_harness_build_and_run(
+  opts: CompilerOptions,
+  harness_path: String,
+  module_source: String,
+  test_names: Vec[String],
+  coverage_out: String,
+  lineage_store: DeclLineageStore
+) -> Result[CoverageHarnessOutcome, CoverageHarnessError]
+  let dispatch_names = test_names.clone()
+  let harness_source = if dispatch_names.is_empty() then
+    module_source.clone()
+  else
+    coverage_harness_source(module_source.clone(), dispatch_names.clone())
+  end
+  let compiled = match coverage_harness_compile(opts, harness_path, harness_source,
+    coverage_out.clone(), lineage_store)
+  when Result::Ok(c) then c
+  when Result::Err(e) then return Result::Err(e)
+  end
+  let compiled_snapshot = compiled.snapshot.clone()
+  let run = if dispatch_names.is_empty() then
+    coverage_harness_run_main(compiled.exe_path.clone(), compiled.snapshot.clone(),
+      coverage_out.clone())
+  else
+    coverage_harness_run(compiled.exe_path.clone(), dispatch_names.clone(),
+      compiled.snapshot.clone(), coverage_out.clone())
+  end
+  Result::Ok(CoverageHarnessOutcome {
+    exe_path: compiled.exe_path.clone(),
+    compiled_snapshot: compiled_snapshot,
+    snapshot: run.snapshot.clone(),
+    lineage_store: compiled.lineage_store.clone(),
+    results: run.results.clone(),
+    traces: run.traces,
+    missing_traces: run.missing_traces
+  })
 end

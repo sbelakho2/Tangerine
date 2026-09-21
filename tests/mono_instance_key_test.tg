@@ -25,13 +25,15 @@ use std::collections::{Vec, Map}
 use std::test::assert
 
 use tg_compiler::mono::{
-  mono_cache_new, mono_cache_bind_stable_callable, mono_specialize_function,
+  mono_cache_new_ephemeral, mono_cache_new_persistent, CallableLineageView,
+  callable_lineage_view_new, callable_lineage_view_bind,
+  mono_specialize_function,
   structured_instance_key, type_to_mangled, MonoCache
 }
 use tg_compiler::ast::{Program, Crate, Module}
 use tg_compiler::resolver::{ResolvedNames, stable_id_map_new}
 use tg_compiler::mir::{MirFunction, MirBlockId, MirProgram}
-use tg_compiler::ids::{DefKind, GenericParamId, CallableId, InstanceId, GenericArg, DefId, ModuleId}
+use tg_compiler::ids::{DefKind, GenericParamId, CallableId, InstanceId, GenericArg, DefId, ModuleId, stable_digest_of}
 use tg_compiler::types::{
   Type, ConstExprT, const_sym_tree_fold_identities, const_sym_fold_type,
   const_sym_tree_eq
@@ -41,6 +43,9 @@ use tg_compiler::stable_ids::{
   instance_key_eq, canonical_const_value_of, canonical_const_of_segment,
   canonical_type_key_of, canonical_generic_arg_text,
   stable_decl_id_of_lineage_texts_named,
+  stable_decl_stamp_or_continue, stable_lineage_scope_key,
+  stable_lineage_store_new, stable_lineage_store_begin_revision,
+  stable_lineage_store_finish_revision, stable_lineage_store_add_continuation,
   structural_instance_mangle_text,
   CanonicalGenericArg
 }
@@ -64,7 +69,7 @@ def one_render(render: String) -> Vec[String]
 end
 
 def fresh_cache() -> MonoCache
-  mono_cache_new(
+  mono_cache_new_ephemeral(
     Program { items: Vec::new(), crate: Crate { root: ModuleId { id: 0 }, modules: Map::new() }, span: span_dummy() },
     ResolvedNames {
       expr_resolutions: Map::new(),
@@ -351,7 +356,10 @@ end
 # per-module definition index (and an unrelated `bar` at index 0 when
 # `with_unrelated` is true) — the shape of "insert an unrelated function
 # before foo": the INDEX shifts, the registration key "m::foo" does not.
-def p0_6_cache(foo_index: UInt, with_unrelated: Bool) -> MonoCache
+# The optional view selects the PERSISTENT constructor (every registered
+# symbol must be bound there — the fail-closed contract); Option::None is
+# the explicit ephemeral (structural) cache.
+def p0_6_cache(foo_index: UInt, with_unrelated: Bool, view: Option[CallableLineageView] = Option::None) -> MonoCache
   let module = ModuleId { id: 0 }
   var modules: Map[ModuleId, Module] = Map::new()
   modules.insert(module.clone(), Module {
@@ -368,25 +376,27 @@ def p0_6_cache(foo_index: UInt, with_unrelated: Bool) -> MonoCache
     def_kinds.insert("0::0".to_string(), DefKind::Function)
     module_symbols.insert("m::bar".to_string(), DefId { module: module.clone(), index: 0 })
   end
-  mono_cache_new(
-    Program {
-      items: Vec::new(),
-      crate: Crate { root: module, modules: modules },
-      span: span_dummy()
-    },
-    ResolvedNames {
-      expr_resolutions: Map::new(),
-      type_resolutions: Map::new(),
-      pattern_resolutions: Map::new(),
-      call_targets: Map::new(),
-      type_def_ids: Map::new(),
-      intrinsic_ids: Map::new(),
-      item_defs: Map::new(),
-      module_symbols: module_symbols,
-      def_kinds: def_kinds,
-      stable_ids: stable_id_map_new()
-    }
-  )
+  let program = Program {
+    items: Vec::new(),
+    crate: Crate { root: module, modules: modules },
+    span: span_dummy()
+  }
+  let resolutions = ResolvedNames {
+    expr_resolutions: Map::new(),
+    type_resolutions: Map::new(),
+    pattern_resolutions: Map::new(),
+    call_targets: Map::new(),
+    type_def_ids: Map::new(),
+    intrinsic_ids: Map::new(),
+    item_defs: Map::new(),
+    module_symbols: module_symbols,
+    def_kinds: def_kinds,
+    stable_ids: stable_id_map_new()
+  }
+  match view
+  when Option::Some(v) then mono_cache_new_persistent(&program, &resolutions, v)
+  when Option::None then mono_cache_new_ephemeral(&program, &resolutions)
+  end
 end
 
 # Insert an unrelated function BEFORE generic foo (foo's per-module index
@@ -425,18 +435,22 @@ def test_p0_6_insertion_keeps_instance_ids() -> Unit
   assert(!instance_key_eq(int_after, str_after), "sanity: the post-insert build keeps the two instances distinct")
 end
 
-# The same insertion guarantee with the STORE-BACKED binding installed
-# (the persistent StableDeclId is the authority; the emission base render
-# may even change shape and the instance id does not move).
+# The same insertion guarantee with the PERSISTENT constructor: the
+# view-bound StableDeclId is the authority (mono_cache_new_persistent
+# binds every view entry before any instance enqueues; the emission base
+# render may even change shape and the instance id does not move).
 @test
 def test_p0_6_store_binding_keeps_instance_ids() -> Unit
   let store_decl = stable_decl_id_of_lineage_texts_named(
     "main".to_string(), "m".to_string(), 7, "fn".to_string(), "m::foo".to_string()
   )
-  mut cache_before = p0_6_cache(5, false)
-  mut cache_after = p0_6_cache(6, true)
-  mono_cache_bind_stable_callable(inout cache_before, "m::foo".to_string(), store_decl.clone())
-  mono_cache_bind_stable_callable(inout cache_after, "m::foo".to_string(), store_decl.clone())
+  var view_before = callable_lineage_view_new()
+  callable_lineage_view_bind(&mut view_before, "m::foo".to_string(), store_decl.clone())
+  var view_after = callable_lineage_view_new()
+  callable_lineage_view_bind(&mut view_after, "m::foo".to_string(), store_decl.clone())
+  callable_lineage_view_bind(&mut view_after, "m::bar".to_string(), store_decl.clone())
+  let cache_before = p0_6_cache(5, false, Option::Some(view_before))
+  let cache_after = p0_6_cache(6, true, Option::Some(view_after))
   let key_before = structured_instance_key(cache_before, InstanceId {
     def: CallableId { def: DefId { module: ModuleId { id: 0 }, index: 5 } },
     args: Vec::from([GenericArg::Type(Type::Int)])
@@ -445,7 +459,100 @@ def test_p0_6_store_binding_keeps_instance_ids() -> Unit
     def: CallableId { def: DefId { module: ModuleId { id: 0 }, index: 6 } },
     args: Vec::from([GenericArg::Type(Type::Int)])
   })
-  assert(instance_key_eq(key_before, key_after), "the store-backed callable binding must make insertion stability hold for foo[Int]")
+  assert(instance_key_eq(key_before, key_after), "the persistent callable binding must make insertion stability hold for foo[Int]")
+end
+
+# A one-registration persistent/ephemeral cache for the rename regression:
+# registration key "<module_name>::generic" at index 0 under the module
+# path [module_name].
+def rename_cache_program(module_name: String, name: String) -> Program
+  let module = ModuleId { id: 0 }
+  var modules: Map[ModuleId, Module] = Map::new()
+  modules.insert(module.clone(), Module {
+    id: module.clone(),
+    path: Vec::from([module_name.clone()]),
+    items: Vec::new(),
+    imports: Vec::new()
+  })
+  Program { items: Vec::new(), crate: Crate { root: module, modules: modules }, span: span_dummy() }
+end
+
+def rename_cache_res(module_name: String, name: String) -> ResolvedNames
+  var def_kinds: Map[String, DefKind] = Map::new()
+  def_kinds.insert("0::0".to_string(), DefKind::Function)
+  var module_symbols: Map[String, DefId] = Map::new()
+  module_symbols.insert(module_name.clone() + "::" + name.clone(),
+    DefId { module: ModuleId { id: 0 }, index: 0 })
+  ResolvedNames {
+    expr_resolutions: Map::new(),
+    type_resolutions: Map::new(),
+    pattern_resolutions: Map::new(),
+    call_targets: Map::new(),
+    type_def_ids: Map::new(),
+    intrinsic_ids: Map::new(),
+    item_defs: Map::new(),
+    module_symbols: module_symbols,
+    def_kinds: def_kinds,
+    stable_ids: stable_id_map_new()
+  }
+end
+
+def rename_cache_persistent(module_name: String, name: String, view: CallableLineageView) -> MonoCache
+  mono_cache_new_persistent(
+    &rename_cache_program(module_name.clone(), name.clone()),
+    &rename_cache_res(module_name, name),
+    view)
+end
+
+def rename_cache_ephemeral(module_name: String, name: String) -> MonoCache
+  mono_cache_new_ephemeral(
+    &rename_cache_program(module_name.clone(), name.clone()),
+    &rename_cache_res(module_name, name))
+end
+
+# ———— persistent identity integration: a rename/move with an explicit
+# DeclContinuation keeps the StructuralInstanceId across two compiles
+# under the PERSISTENT path; the ephemeral path keeps the structural
+# (registration-scope) behavior and re-keys.
+@test
+def test_persistent_rename_continuation_keeps_instance_ids() -> Unit
+  # Compile 1: a::generic stamps a fresh persistent lineage.
+  var store = stable_lineage_store_new()
+  stable_lineage_store_begin_revision(&mut store)
+  let sig = "fn()->unit".to_string()
+  let sd = stable_digest_of(&sig)
+  let scope_a = stable_lineage_scope_key("".to_string(), "a".to_string(), "Function".to_string(), "generic".to_string())
+  let decl_a = stable_decl_stamp_or_continue(&mut store, "".to_string(), "a".to_string(),
+    "Function".to_string(), "generic".to_string(), sd.hi, sd.lo, sig.clone(), Vec::from([scope_a.clone()]))
+  stable_lineage_store_finish_revision(&mut store)
+  var view_a = callable_lineage_view_new()
+  callable_lineage_view_bind(&mut view_a, "a::generic".to_string(), decl_a.clone())
+  let instance = InstanceId {
+    def: CallableId { def: DefId { module: ModuleId { id: 0 }, index: 0 } },
+    args: Vec::from([GenericArg::Type(Type::Int)])
+  }
+  let id_a = structured_instance_key(rename_cache_persistent("a".to_string(), "generic".to_string(), view_a), instance.clone())
+  # The explicit rename/move continuation a::generic -> b::generic.
+  let scope_b = stable_lineage_scope_key("".to_string(), "b".to_string(), "Function".to_string(), "generic".to_string())
+  stable_lineage_store_add_continuation(&mut store, decl_a.lineage.lineage, scope_a, scope_b, "rename".to_string())
+  # Compile 2: b::generic claims the recorded lineage BEFORE any instance.
+  stable_lineage_store_begin_revision(&mut store)
+  let decl_b = stable_decl_stamp_or_continue(&mut store, "".to_string(), "b".to_string(),
+    "Function".to_string(), "generic".to_string(), sd.hi, sd.lo, sig.clone(), Vec::from([scope_b.clone()]))
+  stable_lineage_store_finish_revision(&mut store)
+  var view_b = callable_lineage_view_new()
+  callable_lineage_view_bind(&mut view_b, "b::generic".to_string(), decl_b.clone())
+  let id_b = structured_instance_key(rename_cache_persistent("b".to_string(), "generic".to_string(), view_b), instance.clone())
+  assert(instance_key_eq(id_a.clone(), id_b.clone()),
+    "the persisted continuation must keep the StructuralInstanceId byte-identical")
+  assert(id_a.digest_hi == id_b.digest_hi && id_a.digest_lo == id_b.digest_lo,
+    "the StructuralInstanceId digest words must be byte-identical across the rename")
+  # The ephemeral path: the same two compiles without a persistent map are
+  # different registration-scope callables — the instance id re-keys.
+  let e_a = structured_instance_key(rename_cache_ephemeral("a".to_string(), "generic".to_string()), instance.clone())
+  let e_b = structured_instance_key(rename_cache_ephemeral("b".to_string(), "generic".to_string()), instance.clone())
+  assert(!instance_key_eq(e_a, e_b),
+    "the ephemeral registration-scope identity must re-key on a rename")
 end
 
 # The emitted symbol bytes are DERIVED from the record and keep the

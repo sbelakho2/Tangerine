@@ -155,10 +155,12 @@ use std::collections::{Vec, Map, Set}
 use std::fs
 
 use tg_compiler::ids::{StableDigest, stable_digest_of, DefKind, stable_def_id_digested}
-use tg_compiler::ast::{AstContractKind}
+use tg_compiler::ast::{AstContractKind, ItemKind}
 use tg_compiler::types::{TypeEnv, TypedProgram}
 use tg_compiler::mir::{MirProgram}
-use tg_compiler::target_desc::{TargetDesc, Arch}
+use tg_compiler::target_desc::{
+  TargetDesc, Arch, aarch64_desc, x86_64_desc, thumbv7em_cortex_m4f_desc
+}
 use tg_compiler::lir::{abi_verify_program_a64}
 use tg_compiler::backend_x86_64::{verify_abi_program_x86}
 use tg_compiler::parser::{Diagnostic}
@@ -185,7 +187,10 @@ use tg_compiler::semantic_model::{
   SliceCompleteness, slice_completeness_is_complete,
   # (audit order P0-15) the symbol row shape the transaction lane's fixture
   # snapshot carries.
-  SemanticSymbol
+  SemanticSymbol,
+  # (P0 lane import fix) the snapshot constructor lives in semantic_model
+  # (the fixture builder), not semantic_snapshot.
+  semantic_snapshot_new
 }
 # (fourth-audit P0-11/P0-12) the typed stable identity records the v2
 # request protocol carries (StableDeclId / StablePlaceId / StableMirStmtId)
@@ -196,10 +201,13 @@ use tg_compiler::stable_ids::{
   StableMirStmtId, stable_decl_of_key,
   stable_decl_identity_text_of, stable_package_id_of, stable_module_id_of,
   stable_decl_lineage_id_of, stable_mir_stmt_of_key, stable_place_of_text,
-  stable_place_text_of
+  stable_place_text_of,
+  # (P0 identity continuity) the explicit DeclMove continuation seam the
+  # verified-edit transaction applies BEFORE building the new snapshot.
+  stable_lineage_store_apply_move
 }
 use tg_compiler::semantic_snapshot::{
-  semantic_snapshot_digest, semantic_snapshot_parse, semantic_snapshot_new
+  semantic_snapshot_digest, semantic_snapshot_parse
 }
 use tg_compiler::semantic_delta::{
   SemanticDelta, semantic_delta_of, semantic_delta_empty, DeltaStatus,
@@ -240,16 +248,19 @@ use tg_compiler::semantic_diagnostics::{
 # type-import idiom for full-library semantic modules.
 use tg_compiler::proof_patch::{
   VerifiedCompilationEvidence, ProofCarryingPatch, proof_patch_between,
-  # (audit order P0-15) the level-gated proof surface the verified-edit
-  # transaction assembles through: a patch is reportable ONLY at
-  # VerificationLevel::VerifiedFull, and the VerifiedProofPatch wrapper's
-  # ONE constructor refuses every weaker level.
+  # (audit order P0-15; P0 proof-gating) the level-gated proof surface the
+  # verified-edit transaction assembles through: a patch is reportable ONLY
+  # at VerificationLevel::VerifiedFull, and the VerifiedProofPatch wrapper
+  # is the FULLY verified class — its ONE constructor requires ALL
+  # fourteen stage statuses Verified plus an available delta. The weaker
+  # truthful classes are the honest names for partial evidence.
   VerificationLevel, verification_level_word, verification_level_of_word,
   verification_level_rank,
   proof_patch_of_level, VerifiedProofPatch, verified_proof_patch,
+  proof_patch_verified_class_word,
   PatchEvidenceBundle, SourceDelta, VerificationStatus, verification_status_word,
   verification_status_is_verified, proof_patch_verification_rows,
-  verified_compilation_evidence_stages, verification_stage_names_driver_route
+  verified_compilation_evidence_stages, verification_stage_names_all
 }
 use tg_compiler::change_budget::{ChangeBudget, budget_verify_with_equivalence}
 # (audit order P0-15) the verified-edit transaction's full-pipeline
@@ -262,20 +273,30 @@ use tg_compiler::change_budget::{ChangeBudget, budget_verify_with_equivalence}
 # verdict and the equivalence result).
 use tg_compiler::compiler_core::{
   CompilerOptions, default_options, parse_source_program, merge_imported_deps,
-  analyze_program, driver_lower_to_mir, type_errors_to_diags
+  analyze_program
 }
 use tg_compiler::version::{VERSION}
 use tg_compiler::mir::{
-  verify_mir, optimize_mir, check_effect_class_annotations_mir,
-  check_purity_annotations_mir, check_budget_annotations_mir
+  opt_decisions_of_mir
+}
+# (the shared finalized-MIR pipeline) BOTH session pipelines compile
+# through the ONE shared entry (finalize.tg) — lower -> post-lower verify ->
+# effect/purity/budget annotations -> persistent pre-mono lineage view ->
+# mono -> the UNCONDITIONAL post-mono checkpoint -> tail/SLP stamps ->
+# optimize -> post-opt verify -> the final pre-codegen firewall. Neither
+# pipeline re-spells the sequence (scripts/check_finalized_mir_pipeline.sh
+# gates that).
+use tg_compiler::finalize::{
+  finalize_verified_mir, finalize_failure_detail,
+  FinalizeOptions, FinalizeTarget, FinalizeFailure
 }
 use tg_compiler::codegen::{
-  detect_host_target, stamp_tail_abi_plans, stamp_slp_vector_facility_desc
+  detect_host_target
 }
-use tg_compiler::mono::{monomorphize_program, mono_cache_new}
 use tg_compiler::semantic_snapshot::{
   semantic_snapshot_of_final_state, semantic_snapshot_finalize,
-  snapshot_feature_set_of, snapshot_semantic_options_of, SnapshotError
+  snapshot_feature_set_of, snapshot_semantic_options_of,
+  SnapshotError
 }
 use tg_compiler::semantic_edit::{
   SemanticEdit, ResolvedEdit, resolve_edit, apply_edit_to_source_checked_with_origins,
@@ -289,8 +310,23 @@ use tg_compiler::equivalence::{
   equivalence_unknown
 }
 use tg_compiler::coverage_graph::{
-  coverage_graph_of_snapshot, tests_covering_symbol, coverage_points_of_symbol,
+  CoverageGraph, coverage_graph_of_snapshot, tests_covering_symbol,
+  coverage_points_of_symbol, coverage_graph_test_ids,
   uncovered_paths, coverage_graph_has_rows
+}
+# (audit: verified-edit test execution) the coverage-harness execution path
+# and the test-synthesis producer meet the transaction through the ONE
+# shared entries: coverage.tg's harness construction (the exact entry the
+# CLI route calls — driver.tg imports this module, so the transaction
+# cannot import the driver; coverage.tg imports neither) executes the
+# affected tests, and test_synthesis.synthesize_delta_suite is the ONE
+# producer+render wrapper (driver_synthesize_uncovered_tests delegates to
+# it) the bounded synthesis loop calls.
+use tg_compiler::coverage::{
+  coverage_harness_source, coverage_harness_build_and_run, coverage_harness_error_text
+}
+use tg_compiler::test_synthesis::{
+  synthesize_delta_suite
 }
 # (audit order item 6) the replay production bridge: the session-owned
 # decode/compare entry over the compiled executables' self-describing run
@@ -308,7 +344,10 @@ use tg_compiler::semantic_rationale::{
   rationale_store_add_all, rationale_store_len, rationale_subject_of_text,
   rationale_evidence_text, rationale_dependency, rationale_of_delta,
   rationale_of_budget_rows, rationale_of_equivalence, rationale_identity_text,
-  rationale_store_all
+  rationale_store_all,
+  # (audit order item 8) the optimizer decision journal records the
+  # transaction's capturing optimizer run appends.
+  rationale_of_optimization_decision
 }
 use tg_compiler::stable_ids::{DeclLineageStore}
 use tg_compiler::types::{type_env_new}
@@ -770,10 +809,14 @@ end
 #      type -> access -> resource on the regenerated text) and the
 #      planned-set comparison over the reachable front-end rows;
 #   3. the FULL compile of the edited source through the session's own
-#      pipeline: parse -> merge imports -> analyze -> lower -> verify_mir ->
-#      effect/purity/budget annotation checks -> monomorphize -> tail-ABI /
-#      SLP stamps -> optimize_mir -> verify_mir ->
-#      semantic_snapshot_of_final_state -> finalize (final MIR included);
+#      pipeline — (the shared finalized-MIR pipeline) ONE call to
+#      finalize.tg's finalize_verified_mir: lower -> verify_mir (post-
+#      lower) -> effect/purity/budget annotation checks -> the persistent
+#      pre-mono lineage view -> monomorphize -> verify_mir (post-mono,
+#      UNCONDITIONAL) -> tail-ABI / SLP stamps -> optimize (the decision-
+#      capturing entry) -> verify_mir (post-opt) -> the final pre-codegen
+#      verify_mir — then semantic_snapshot_of_final_state -> finalize
+#      (final MIR included);
 #   4. the NEW snapshot built through the session's persistent lineage
 #      store, with a fresh §32 index and the OLD/NEW revision digests;
 #   5. the ACTUAL §31 delta (semantic_delta_of, Complete) of the two
@@ -791,8 +834,11 @@ end
 #      verdict, the equivalence result) appended to the session's rationale
 #      store — the snapshot route's rationale wiring extended beyond the
 #      optimizer-decision journal;
-#   9. the §37 patch through proof_patch_of_level (VerifiedFull ONLY) and
-#      the final proof hash over the transaction's canonical render.
+#   9. the §37 patch through proof_patch_of_level (VerifiedFull ONLY), the
+#      final proof hash over the transaction's canonical render, and — at
+#      VerifiedFull — the truthful verified-class word of the patch's
+#      fourteen statuses (the FULL VerifiedProofPatch wrapper is set only
+#      when every status is Verified).
 #
 # THE HONEST LEVELS (VerificationLevel): VerifiedFull = the whole chain
 # above ran and the authoritative snapshot delta exists; VerifiedFrontend =
@@ -803,13 +849,22 @@ end
 # stage failure, or a snapshot-build failure). At ProvisionalFrontEnd and
 # VerifiedFrontend the actual delta status is Unavailable — never an empty
 # delta a budget could pass — no proof patch is carried, and the
-# VerifiedProofPatch constructor refuses both levels.
+# VerifiedProofPatch constructor refuses both levels. At VerifiedFull the
+# seal additionally requires every compiler verification stage of the
+# level's claim to be Verified and refuses the full wrapper unless all
+# fourteen statuses (tests / equivalence included) are Verified.
 #
 # POLICY (VerificationPolicy): minimum_level is the weakest level the
 # caller accepts (VerifiedFull by default — the full pipeline required);
 # require_delta_agreement / require_budget gate the accepted verdict at
-# VerifiedFull. accepted = the reached level is at or above the minimum, no
-# refusal was recorded, and the required gates passed. A rejected
+# VerifiedFull. (P0 proof-gating) The seal ALSO maps the REACHED level to
+# its required compiler-stage evidence: VerifiedFull (the strict/full
+# policy) demands EVERY compiler verification stage Verified — front-end
+# chain, pre-mono / post-mono / post-opt MIR, effects, capabilities and
+# the REAL ABI verifier outcome — while VerifiedFrontend demands the
+# front-end chain its claim names. accepted = the reached level is at or
+# above the minimum, no refusal was recorded, the required gates passed
+# AND the level's compiler-stage evidence is Verified. A rejected
 # transaction still carries its diagnostics, deltas, budget rows and
 # rationale — the caller sees exactly why.
 
@@ -881,12 +936,20 @@ pub struct VerifiedEditTransaction
   refusal: String = ""
   # Tests / coverage: affected_tests + coverage consequences are filled
   # from the §40 coverage graph where the snapshot carries the rows; a
-  # missing graph stays Unavailable (never fabricated). tests_executed has
-  # no compiler-side test runner — always Unavailable today.
+  # missing graph stays Unavailable (never fabricated). (audit: verified-
+  # edit test execution) tests_executed carries the REAL run evidence of
+  # the affected tests executed through the coverage harness (the
+  # compilation's edited source + a generated dispatch main, run through
+  # the LIR coverage route, traces ingested): Verified with the executed
+  # rows when every affected test executed and passed, Failed when an
+  # executed test failed, Unavailable (never a pass) when the harness
+  # cannot run on the target — the exact reason rides
+  # tests_executed_reason.
   affected_tests: Vec[String] = Vec::new()
   affected_tests_status: VerificationStatus = VerificationStatus::Unavailable
   tests_executed: Vec[String] = Vec::new()
   tests_executed_status: VerificationStatus = VerificationStatus::Unavailable
+  tests_executed_reason: String = ""
   coverage_consequences: Vec[String] = Vec::new()
   coverage_status: VerificationStatus = VerificationStatus::Unavailable
   # The §41 equivalence result computed over the OLD session's final MIR
@@ -897,17 +960,47 @@ pub struct VerifiedEditTransaction
   # Performance changes: no perf run feeds the compiler — Unavailable.
   performance_changes: Vec[String] = Vec::new()
   performance_status: VerificationStatus = VerificationStatus::Unavailable
+  # (P0 proof-gating) THE COMPILER VERIFICATION STAGE STATUSES of THIS
+  # transaction's own pipeline: each is set ONLY where the stage really
+  # ran (a stage that passed -> Verified, a stage that ran and failed ->
+  # Failed, a stage the transaction never reached -> Unavailable). The
+  # strict (VerifiedFull) policy in session_verified_transaction_seal
+  # requires EVERY one of these Verified before accepted=true — an
+  # Unavailable post-mono or ABI stage can no longer ride an accepted
+  # transaction, and abi_status mirrors the REAL verifier outcome
+  # (abi_rows), never a pre-set Verified.
+  parse_status: VerificationStatus = VerificationStatus::Unavailable
+  resolve_status: VerificationStatus = VerificationStatus::Unavailable
+  type_status: VerificationStatus = VerificationStatus::Unavailable
+  access_status: VerificationStatus = VerificationStatus::Unavailable
+  resource_status: VerificationStatus = VerificationStatus::Unavailable
+  # mir-after-lowering: the MIR verifier accepted the lowered program.
+  mir_status: VerificationStatus = VerificationStatus::Unavailable
+  # post-mono mir: the verifier accepted the monomorphized program.
+  post_mono_mir_status: VerificationStatus = VerificationStatus::Unavailable
+  # post-opt mir: the verifier accepted the optimized program.
+  post_opt_mir_status: VerificationStatus = VerificationStatus::Unavailable
+  # effects: the §11 effect-class annotation check.
+  effects_status: VerificationStatus = VerificationStatus::Unavailable
+  # capabilities/contracts: the capability/contract verification surface.
+  capabilities_status: VerificationStatus = VerificationStatus::Unavailable
   # ABI changes: the authoritative snapshot ABI surface diff rows.
   abi_changes: Vec[String] = Vec::new()
+  # abi: the REAL post-lowering ABI verifier outcome (abi_rows empty ->
+  # Verified; violation rows -> Failed) — never pre-set from the level.
   abi_status: VerificationStatus = VerificationStatus::Unavailable
   # The rationale records the transaction appended (edit reason + actual
   # change + budget + equivalence).
   rationale_records: Vec[RationaleRecord] = Vec::new()
   # The §37 patch (populated at VerifiedFull only — and cleared again when
   # the policy verdict rejects) and the gated wrapper. The final proof hash
-  # is the digest over verified_edit_transaction_render.
+  # is the digest over verified_edit_transaction_render. verified_proof is
+  # the FULLY verified class (Option: None whenever any of the fourteen
+  # statuses is not Verified); verified_class names the strongest truthful
+  # class word of the carried patch ("unverified" without one).
   proof_patch: Option[ProofCarryingPatch] = Option::None
   verified_proof: Option[VerifiedProofPatch] = Option::None
+  verified_class: String = "unverified"
   proof_hash: StableDigest
   # The revised session (new snapshot + index + final state + evidence +
   # lineages + rationale store) at VerifiedFull; None on every earlier
@@ -972,13 +1065,71 @@ def session_verified_transaction_new(session: CompilerSession, edit: SemanticEdi
   }
 end
 
+# (P0 proof-gating) One required compiler stage: when the transaction's
+# status is not Verified, the "<stage>:<status word>" requirement row is
+# appended (the exact stage and why it did not qualify).
+def session_stage_require(inout missing: Vec[String], stage: String, status: VerificationStatus) -> Unit
+  if !verification_status_is_verified(status) then
+    missing.push(stage + ":" + verification_status_word(status))
+  end
+  ()
+end
+
+# (P0 proof-gating) THE POLICY-LEVEL EVIDENCE MAP: the compiler
+# verification stages the REACHED level's claim requires, mapped
+# explicitly per level:
+#   VerifiedFull        — the strict/full policy: EVERY compiler
+#                         verification stage Verified (the front-end
+#                         chain, the pre-mono / post-mono / post-opt MIR
+#                         verifications, the effects and capability/
+#                         contract checks, and the REAL ABI verifier
+#                         outcome). An Unavailable stage (e.g. a missing
+#                         post-mono checkpoint) is rejected — an accepted
+#                         transaction can no longer claim VerifiedFull
+#                         while any compiler stage is Failed/Unavailable.
+#   VerifiedFrontend    — the front-end chain only (parse / resolve /
+#                         type / access / resource) — the exact claim
+#                         that level makes.
+#   ProvisionalFrontEnd — no compiler-stage claim (the fail-open-to-
+#                         front-end policy; a blocked transaction can
+#                         never be accepted anyway).
+# Returns the offending "<stage>:<status word>" rows (empty = satisfied).
+def session_evidence_requirement_rows(tx: VerifiedEditTransaction) -> Vec[String]
+  var missing: Vec[String] = Vec::new()
+  if tx.level == VerificationLevel::VerifiedFull then
+    session_stage_require(&mut missing, "parse".to_string(), tx.parse_status)
+    session_stage_require(&mut missing, "resolve".to_string(), tx.resolve_status)
+    session_stage_require(&mut missing, "type".to_string(), tx.type_status)
+    session_stage_require(&mut missing, "access".to_string(), tx.access_status)
+    session_stage_require(&mut missing, "resource".to_string(), tx.resource_status)
+    session_stage_require(&mut missing, "mir-after-lowering".to_string(), tx.mir_status)
+    session_stage_require(&mut missing, "post-mono-mir".to_string(), tx.post_mono_mir_status)
+    session_stage_require(&mut missing, "post-opt-mir".to_string(), tx.post_opt_mir_status)
+    session_stage_require(&mut missing, "effects".to_string(), tx.effects_status)
+    session_stage_require(&mut missing, "capabilities-contracts".to_string(), tx.capabilities_status)
+    session_stage_require(&mut missing, "abi".to_string(), tx.abi_status)
+  elsif tx.level == VerificationLevel::VerifiedFrontend then
+    session_stage_require(&mut missing, "parse".to_string(), tx.parse_status)
+    session_stage_require(&mut missing, "resolve".to_string(), tx.resolve_status)
+    session_stage_require(&mut missing, "type".to_string(), tx.type_status)
+    session_stage_require(&mut missing, "access".to_string(), tx.access_status)
+    session_stage_require(&mut missing, "resource".to_string(), tx.resource_status)
+  end
+  missing
+end
+
 # The accepted verdict + the final proof hash. The proof hash covers the
 # canonical render (verified_edit_transaction_rows — every scalar, delta,
-# budget, rationale and proof status row, proof_hash excluded); it is
-# computed LAST so it commits the entire record. accepted requires the
-# reached level to meet the policy minimum, no refusal, and — at
-# VerifiedFull — the required delta-agreement / budget gates; a rejected
-# transaction never carries a proof patch.
+# budget, stage-status, rationale and proof status row, proof_hash
+# excluded); it is computed LAST so it commits the entire record. accepted
+# requires the reached level to meet the policy minimum, no refusal, the
+# required delta-agreement / budget gates at VerifiedFull, AND (P0
+# proof-gating) the policy-required compiler-stage evidence — the reached
+# level's own claim mapped to its stages by
+# session_evidence_requirement_rows: VerifiedFull (the strict/full policy)
+# demands EVERY compiler verification stage Verified, VerifiedFrontend
+# demands the front-end chain. A rejected transaction never carries a
+# proof patch, a verified-proof wrapper or a verified class word.
 def session_verified_transaction_seal(
   tx: VerifiedEditTransaction, policy: VerificationPolicy
 ) -> VerifiedEditTransaction
@@ -1012,11 +1163,33 @@ def session_verified_transaction_seal(
       ok = false
       out.refusal = "budget-violations:" + out.budget_result.len().to_string()
     end
+    # (P0 proof-gating) THE EVIDENCE REQUIREMENT: the reached level's
+    # compiler stages must actually be Verified. A VerifiedFull
+    # transaction whose post-mono / ABI / any compiler stage is
+    # Failed/Unavailable is rejected here — the level word alone can no
+    # longer buy an accepted verdict.
+    if ok then
+      let missing = session_evidence_requirement_rows(out.clone())
+      if missing.len() > 0 then
+        ok = false
+        out.refusal = "evidence-required: missing verified compiler stage(s): " +
+          missing.join(",")
+      end
+    end
     out.accepted = ok
   end
   if !out.accepted then
     out.proof_patch = Option::None
     out.verified_proof = Option::None
+    out.verified_class = "unverified"
+  elsif out.level == VerificationLevel::VerifiedFull then
+    match out.proof_patch.clone()
+    when Option::Some(p) then
+      # The truthful class word of the carried patch's fourteen statuses
+      # ("fully-verified" only when every stage is Verified).
+      out.verified_class = proof_patch_verified_class_word(&p)
+    when Option::None then ()
+    end
   end
   out.proof_hash = stable_digest_of(&verified_edit_transaction_render(&out))
   if out.accepted && out.level == VerificationLevel::VerifiedFull then
@@ -1117,10 +1290,25 @@ pub def verified_edit_transaction_rows(tx: VerifiedEditTransaction) -> Vec[Strin
   rows.push("budget-status:" + verification_status_word(tx.budget_status))
   rows.push("affected-tests-status:" + verification_status_word(tx.affected_tests_status))
   rows.push("tests-executed-status:" + verification_status_word(tx.tests_executed_status))
+  rows.push("tests-executed-reason:" + tx.tests_executed_reason.clone())
   rows.push("coverage-status:" + verification_status_word(tx.coverage_status))
   rows.push("equivalence-status:" + verification_status_word(tx.equivalence_status))
   rows.push("performance-status:" + verification_status_word(tx.performance_status))
+  # (P0 proof-gating) the compiler stage statuses ride the canonical render
+  # (and therefore the proof hash) so an accepted transaction's proof
+  # commits the exact evidence every required stage was Verified.
+  rows.push("parse-status:" + verification_status_word(tx.parse_status))
+  rows.push("resolve-status:" + verification_status_word(tx.resolve_status))
+  rows.push("type-status:" + verification_status_word(tx.type_status))
+  rows.push("access-status:" + verification_status_word(tx.access_status))
+  rows.push("resource-status:" + verification_status_word(tx.resource_status))
+  rows.push("mir-status:" + verification_status_word(tx.mir_status))
+  rows.push("post-mono-mir-status:" + verification_status_word(tx.post_mono_mir_status))
+  rows.push("post-opt-mir-status:" + verification_status_word(tx.post_opt_mir_status))
+  rows.push("effects-status:" + verification_status_word(tx.effects_status))
+  rows.push("capabilities-status:" + verification_status_word(tx.capabilities_status))
   rows.push("abi-status:" + verification_status_word(tx.abi_status))
+  rows.push("verified-class:" + tx.verified_class.clone())
   match tx.actual_delta_status.clone()
   when DeltaStatus::Complete(_) then rows.push("actual-delta: complete")
   when DeltaStatus::Unavailable(reason) then rows.push("actual-delta: unavailable " + reason)
@@ -1250,6 +1438,349 @@ def session_edit_rationale_records(
   records
 end
 
+# ———————————————————————————————————————————————————————————————
+# (audit: verified-edit test execution) THE TRANSACTION TEST LANE
+# ———————————————————————————————————————————————————————————————
+# The transaction's REAL test execution: the §40 coverage graph decides
+# WHICH tests the authoritative delta affects; THE ONE coverage-harness
+# construction (coverage_harness_build_and_run — the exact entry the CLI
+# `tg test --coverage` route calls; it lives in coverage.tg because
+# driver.tg imports this module) EXECUTES them and ingests every trace
+# into a run snapshot; the bounded synthesis loop then feeds the
+# still-uncovered created-path constraints through the ONE synthesis
+# wrapper (test_synthesis.synthesize_delta_suite — the same wrapper
+# driver_synthesize_uncovered_tests delegates to), compiles + executes the
+# generated tests through the SAME harness and re-evaluates the uncovered
+# edges. Every status is derived from the REAL run outcome: Verified with
+# the executed rows, Failed when an executed test failed, Unavailable
+# (with the recorded reason) when the harness cannot run on the target —
+# never a fabricated pass.
+
+# The documented synthesis-loop cap: at most this many synthesize ->
+# compile -> run -> re-evaluate rounds per transaction; each round consumes
+# the still-uncovered created-path constraints the previous round left.
+const SESSION_TEST_SYNTHESIS_MAX_ROUNDS: Int = 3
+
+# The test-execution outcome of ONE transaction (or of the synthesis-only
+# lane probe): the executed-test evidence rows, the coverage rows the
+# ingested traces established (the executed points of the delta-affected
+# symbols plus the still-uncovered constraints) and the typed status.
+struct SessionTestExecution
+  status: VerificationStatus = VerificationStatus::Unavailable
+  reason: String = ""
+  executed: Vec[String] = Vec::new()
+  coverage_rows: Vec[String] = Vec::new()
+  affected_total: Int = 0
+  affected_executed: Int = 0
+  synthesized_units: Int = 0
+  synthesized_executed: Int = 0
+  resolved_paths: Int = 0
+  coverage_ingested: Bool = false
+end
+
+# Whether the coverage harness has a route for the target: host aarch64 /
+# x86-64 only (the LIR coverage emitter's documented contract).
+def session_test_harness_supported(desc: TargetDesc) -> Bool
+  match desc.arch
+  when Arch::AArch64 then true
+  when Arch::X86_64 then true
+  when _ then false
+  end
+end
+
+# The filesystem paths of one test-execution run: the source file stem plus
+# the run tag (the transaction's new-revision digest render), so concurrent
+# transactions on different files never share a harness or a trace file.
+def session_test_harness_paths(source_file: String, run_tag: String) -> (String, String)
+  let base = source_file.replace("/", "_").replace(".tg", "")
+  let harness_path = "build/.tg_verify_edit/" + base + "-" + run_tag + ".tg"
+  (harness_path, harness_path + ".trace")
+end
+
+# The dispatch names of the affected test keys: the discovery table's
+# key -> declared-name binding (a coverage key with no discovered test name
+# cannot run under the argv[1] convention — the caller records the exact
+# unexecutable count instead of fabricating a pass).
+def session_test_dispatch_names(graph: CoverageGraph, keys: Vec[String]) -> Vec[String]
+  var names: Vec[String] = Vec::new()
+  for t in coverage_graph_test_ids(graph.clone()) do
+    if keys.contains(&t.stable_key) && !names.contains(&t.test_name) then
+      names.push(t.test_name.clone())
+    end
+  end
+  names.sort()
+  names
+end
+
+# The coverage rows of one run snapshot over the delta: the affected
+# symbols' executed coverage points (the coverage.affected answer) plus the
+# still-uncovered created-path constraints (the synthesis hand-off).
+def session_run_coverage_rows(snapshot: SemanticSnapshot, delta: SemanticDelta, affected_keys: Vec[String]) -> Vec[String]
+  let graph = coverage_graph_of_snapshot(&snapshot)
+  var rows: Vec[String] = Vec::new()
+  for key in affected_keys do
+    for p in coverage_points_of_symbol(&graph, key.clone()) do
+      if !rows.contains(&p) then
+        rows.push(p.clone())
+      end
+    end
+  end
+  rows.sort()
+  for u in uncovered_paths(&graph, &snapshot, &delta) do
+    rows.push(u)
+  end
+  rows
+end
+
+# The module name the synthesis render carries: the source file stem (the
+# generator only keys its suite name/comments on it — the declarations call
+# the module's functions by bare name).
+def session_test_module_name(source_file: String) -> String
+  let base = source_file.replace(".tg", "")
+  let parts = base.split("/")
+  if parts.len() > 0 then
+    parts[parts.len() - 1].clone()
+  else
+    base
+  end
+end
+
+# EXECUTE the affected tests through the coverage harness: the affected test
+# keys come from the graph's discovery + ingest union over the delta's
+# affected symbols; the harness source is the edited program + the generated
+# dispatch main; the run ingests every exit-time trace into a run snapshot
+# built through the session's lineage store (the store's copy — the harness
+# declarations keep the transaction snapshot's stable identities, so the
+# delta keys index the run snapshot's coverage rows). The bounded synthesis
+# loop then continues from the run snapshot (or from the compile snapshot
+# when no discovered test covers the delta) so an uncovered created path is
+# still synthesized + executed.
+#
+# Returns Unavailable (with the exact reason) whenever the harness cannot
+# run — an unsupported target, an edited program that defines main, an
+# affected key with no discovered test name, or a harness compile error —
+# and never reports a pass for a test that did not execute. A synthesized
+# test that fails flips the status to Failed (executed evidence).
+def session_run_affected_tests(
+  session: CompilerSession,
+  target_desc: TargetDesc,
+  finalized: SemanticSnapshot,
+  delta: SemanticDelta,
+  affected_keys: Vec[String],
+  edited_source: String,
+  has_main: Bool,
+  run_tag: String,
+  lineage_store: DeclLineageStore
+) -> SessionTestExecution
+  var out = SessionTestExecution {}
+  if !session_test_harness_supported(target_desc.clone()) then
+    out.reason = "coverage-harness-unavailable: the coverage trace harness has no route for target `" +
+      target_desc.name.clone() + "` (host aarch64 / x86-64 only)"
+    return out
+  end
+  if has_main then
+    out.reason = "coverage-harness-unavailable: the edited program defines `main`; the per-test dispatch harness cannot bind a single @test"
+    return out
+  end
+  let graph = coverage_graph_of_snapshot(&finalized)
+  var keys: Vec[String] = Vec::new()
+  for key in affected_keys do
+    for t in tests_covering_symbol(&graph, key.clone()) do
+      if !keys.contains(&t) then
+        keys.push(t.clone())
+      end
+    end
+  end
+  keys.sort()
+  out.affected_total = keys.len()
+  var base_snapshot = finalized.clone()
+  if keys.is_empty() then
+    if delta.affected.len() == 0 then
+      out.status = VerificationStatus::Verified
+      out.reason = "no affected test: the authoritative delta affects no entity"
+    else
+      out.reason = "no affected test: the coverage graph carries no test covering the " +
+        delta.affected.len().to_string() + " affected entity row(s)"
+    end
+  else
+    let names = session_test_dispatch_names(&graph, keys.clone())
+    if names.len() != keys.len() then
+      out.reason = "coverage-harness-unavailable: " +
+        (keys.len() - names.len()).to_string() +
+        " affected test key(s) carry no discovered test name"
+    else
+      let (harness_path, coverage_out) = session_test_harness_paths(session.source_file.clone(), run_tag.clone())
+      match coverage_harness_build_and_run(session.compile_options.clone(), harness_path,
+        edited_source.clone(), names.clone(), coverage_out.clone(), lineage_store.clone())
+      when Result::Ok(run) then
+        var failed = 0
+        for r in run.results do
+          let word = if r.passed then "passed" else "failed" end
+          var row = "affected:" + r.name.clone() + ":" + word
+          if r.message.len() > 0 then
+            row = row + ":" + r.message.clone()
+          end
+          out.executed.push(row)
+          if !r.passed then
+            failed = failed + 1
+          end
+        end
+        out.affected_executed = run.results.len()
+        out.coverage_ingested = run.snapshot.coverage.len() > 0
+        if failed > 0 then
+          out.status = VerificationStatus::Failed
+          out.reason = "test-execution-failed: " + failed.to_string() + " affected test(s) failed"
+        else
+          out.status = VerificationStatus::Verified
+        end
+        out.coverage_rows = session_run_coverage_rows(run.snapshot.clone(), delta.clone(),
+          affected_keys.clone())
+        base_snapshot = run.snapshot.clone()
+      when Result::Err(e) then
+        out.reason = "coverage-harness-unavailable: " + coverage_harness_error_text(e)
+      end
+    end
+  end
+  # The bounded synthesis loop continues from the executed run snapshot (or
+  # from the compile snapshot when the affected run could not produce one):
+  # a delta with no covering test still gets its uncovered created-path
+  # constraints synthesized and executed.
+  let synthesis = session_synthesize_uncovered_tests(session.clone(), target_desc.clone(),
+    base_snapshot, delta.clone(), edited_source.clone(),
+    session_test_module_name(session.source_file.clone()), run_tag.clone(), lineage_store.clone())
+  for row in synthesis.executed do
+    out.executed.push(row.clone())
+  end
+  out.synthesized_units = synthesis.synthesized_units
+  out.synthesized_executed = synthesis.synthesized_executed
+  out.resolved_paths = synthesis.resolved_paths
+  out.coverage_ingested = out.coverage_ingested || synthesis.coverage_ingested
+  if synthesis.synthesized_executed > 0 && out.status == VerificationStatus::Unavailable then
+    # The affected set had no existing test but the synthesized tests ran:
+    # the transaction carries real executed evidence after all.
+    out.status = synthesis.status
+    out.reason = synthesis.reason.clone()
+  end
+  if synthesis.status == VerificationStatus::Failed && synthesis.synthesized_executed > 0 then
+    out.status = VerificationStatus::Failed
+    if synthesis.reason.len() > 0 then
+      out.reason = synthesis.reason.clone()
+    end
+  end
+  var merged_rows: Vec[String] = out.coverage_rows.clone()
+  for row in synthesis.coverage_rows do
+    if !merged_rows.contains(&row) then
+      merged_rows.push(row.clone())
+    end
+  end
+  merged_rows.sort()
+  out.coverage_rows = merged_rows
+  out
+end
+
+# The BOUNDED synthesis loop over the still-uncovered created-path
+# constraints (the documented cap SESSION_TEST_SYNTHESIS_MAX_ROUNDS): each
+# round calls the synthesis producer for the CURRENT run snapshot + delta,
+# compiles the generated @test units through the SAME coverage harness,
+# runs them, ingests their traces and re-evaluates the uncovered edges.
+# Evidence rows name every round's outcome (the executed generated tests,
+# the resolved path count, or the exact unavailability) — a resolution is
+# only claimed when the re-evaluated constraint set really shrank, never
+# fabricated.
+def session_synthesize_uncovered_tests(
+  session: CompilerSession,
+  target_desc: TargetDesc,
+  snapshot: SemanticSnapshot,
+  delta: SemanticDelta,
+  module_source: String,
+  module_name: String,
+  run_tag: String,
+  lineage_store: DeclLineageStore
+) -> SessionTestExecution
+  var out = SessionTestExecution {}
+  if !session_test_harness_supported(target_desc.clone()) then
+    out.reason = "coverage-harness-unavailable: the coverage trace harness has no route for target `" +
+      target_desc.name.clone() + "` (host aarch64 / x86-64 only)"
+    return out
+  end
+  var current = snapshot.clone()
+  let graph0 = coverage_graph_of_snapshot(&current)
+  var remaining = uncovered_paths(&graph0, &current, &delta)
+  if remaining.len() == 0 then
+    out.reason = "no uncovered path: the executed coverage already covers the delta's created paths"
+    return out
+  end
+  var round = 0
+  while remaining.len() > 0 && round < SESSION_TEST_SYNTHESIS_MAX_ROUNDS do
+    round = round + 1
+    # The ONE synthesis wrapper (test_synthesis.synthesize_delta_suite,
+    # the same wrapper driver_synthesize_uncovered_tests delegates to):
+    # producer + render, so this loop and the driver call site can never
+    # drift. `generated_source` is the executable subset only; `units`
+    # carries every request (including the comment-only typed renders the
+    # synthesized_units count reports).
+    let suite = synthesize_delta_suite(current.clone(), delta.clone(),
+      module_source.clone(), module_name.clone())
+    out.synthesized_units = out.synthesized_units + suite.units.len()
+    if suite.generated.is_empty() then
+      out.executed.push("synthesis:no-generator-case:round-" + round.to_string())
+      break
+    end
+    var gen_names: Vec[String] = Vec::new()
+    for g in suite.generated do
+      if !gen_names.contains(&g.test_name) then
+        gen_names.push(g.test_name.clone())
+      end
+    end
+    let before = remaining.len()
+    let harness_source = module_source.clone() + "\n" + suite.generated_source.clone()
+    let (harness_path, coverage_out) = session_test_harness_paths(
+      "synthesis_" + module_name.clone(), run_tag.clone() + "-r" + round.to_string())
+    match coverage_harness_build_and_run(session.compile_options.clone(), harness_path,
+      harness_source, gen_names.clone(), coverage_out.clone(), lineage_store.clone())
+    when Result::Ok(run) then
+      for r in run.results do
+        let word = if r.passed then "passed" else "failed" end
+        out.executed.push("synthesized:" + r.name.clone() + ":" + word)
+        out.synthesized_executed = out.synthesized_executed + 1
+        if !r.passed then
+          out.status = VerificationStatus::Failed
+          if out.reason.len() == 0 then
+            out.reason = "test-execution-failed: a synthesized test failed"
+          end
+        end
+      end
+      out.coverage_ingested = out.coverage_ingested || run.snapshot.coverage.len() > 0
+      current = run.snapshot.clone()
+      let graph1 = coverage_graph_of_snapshot(&current)
+      let after_rows = uncovered_paths(&graph1, &current, &delta)
+      if before > after_rows.len() then
+        out.resolved_paths = out.resolved_paths + (before - after_rows.len())
+      end
+      if after_rows.len() >= before then
+        out.executed.push("synthesis:no-progress:round-" + round.to_string())
+        remaining = after_rows
+        break
+      end
+      remaining = after_rows
+    when Result::Err(e) then
+      out.executed.push("synthesis:harness-unavailable:round-" + round.to_string() + ":" +
+        coverage_harness_error_text(e))
+      break
+    end
+  end
+  if out.status != VerificationStatus::Failed then
+    if out.synthesized_executed > 0 then
+      out.status = VerificationStatus::Verified
+    else
+      out.reason = out.reason + " (no synthesized test executed; " +
+        remaining.len().to_string() + " uncovered path(s) remain)"
+    end
+  end
+  out.coverage_rows = session_run_coverage_rows(current, delta.clone(), delta.affected.clone())
+  out
+end
+
 # ———— THE ENTRY ————
 pub def session_apply_verified_edit(
   session: CompilerSession,
@@ -1303,8 +1834,15 @@ pub def session_apply_verified_edit(
     return session_verified_transaction_seal(tx, policy)
   end
   # The front-end chain (parse -> resolve -> type -> access -> resource)
-  # verified: the transaction's claim floor from here on.
+  # verified: the transaction's claim floor from here on. The five stage
+  # statuses record exactly that evidence (the source rewrite's canonical
+  # re-validation ran every one of them).
   tx.level = VerificationLevel::VerifiedFrontend
+  tx.parse_status = VerificationStatus::Verified
+  tx.resolve_status = VerificationStatus::Verified
+  tx.type_status = VerificationStatus::Verified
+  tx.access_status = VerificationStatus::Verified
+  tx.resource_status = VerificationStatus::Verified
   # 4. The full pipeline needs the compilation's REAL target descriptor.
   match session.target.clone()
   when Option::None then
@@ -1313,6 +1851,144 @@ pub def session_apply_verified_edit(
   when Option::Some(target_desc) then
     return session_verified_edit_full(session, tx, resolved, budget, policy, target_desc)
   end
+end
+
+# (the shared finalized-MIR pipeline) The transaction's stage-status view
+# of ONE finalization evidence flag: a true flag is Verified; a false flag
+# can only be a stage the entry did not run (never produced on success) and
+# is Failed — never a silent pass.
+def session_finalize_stage_status(ok: Bool) -> VerificationStatus
+  if ok then
+    VerificationStatus::Verified
+  else
+    VerificationStatus::Failed
+  end
+end
+
+# (the shared finalized-MIR pipeline) The transaction's diagnostics rows
+# for ONE finalization failure — the exact row shapes the pipeline used
+# before the migration: verifier/lowering rows as-is, annotation
+# diagnostics through session_diag_rows, the lineage and lowering details
+# in their "<stage>:" rows, mono in its counted form.
+def session_finalize_failure_rows(f: FinalizeFailure) -> Vec[String]
+  if f.stage == "effects" || f.stage == "purity" || f.stage == "budget-annotations" then
+    return session_diag_rows(f.diagnostics)
+  end
+  if f.stage == "lineage" then
+    return Vec::from(["snapshot:" + finalize_failure_detail(f)])
+  end
+  if f.stage == "lower" then
+    return Vec::from(["lower:" + finalize_failure_detail(f)])
+  end
+  if f.stage == "mono" then
+    return Vec::from(["mono:" + f.rows.len().to_string() + " error(s)"])
+  end
+  f.rows
+end
+
+# (the shared finalized-MIR pipeline) The transaction's canonical refusal
+# word for ONE finalization failure (the "pipeline-<stage>:" prefix the
+# pipeline documented before the migration).
+def session_finalize_failure_refusal(f: FinalizeFailure) -> String
+  if f.stage == "lower" then
+    return "pipeline-lower:" + finalize_failure_detail(f)
+  end
+  if f.stage == "mir-after-lowering" then
+    return "pipeline-verify-pre:" + finalize_failure_detail(f)
+  end
+  if f.stage == "effects" then
+    return "pipeline-effects:" + finalize_failure_detail(f)
+  end
+  if f.stage == "purity" then
+    return "pipeline-purity:" + finalize_failure_detail(f)
+  end
+  if f.stage == "budget-annotations" then
+    return "pipeline-budget-annotations:" + finalize_failure_detail(f)
+  end
+  if f.stage == "lineage" then
+    return "pipeline-snapshot:" + finalize_failure_detail(f)
+  end
+  if f.stage == "mono" then
+    return "pipeline-mono:" + f.rows.len().to_string() + " error(s)"
+  end
+  if f.stage == "post-mono-mir" then
+    return "pipeline-verify-post-mono:" + finalize_failure_detail(f)
+  end
+  if f.stage == "post-opt-mir" || f.stage == "pre-codegen-mir" then
+    return "pipeline-verify-post:" + finalize_failure_detail(f)
+  end
+  "pipeline-finalize:" + f.stage.clone()
+end
+
+# (the shared finalized-MIR pipeline) The baseline-session constructor's
+# error text for ONE finalization failure — the "<stage>: <first row>"
+# shape this entry has always returned.
+def session_finalize_failure_text(f: FinalizeFailure) -> String
+  if f.stage == "lower" then
+    return "lower: " + finalize_failure_detail(f)
+  end
+  if f.stage == "mir-after-lowering" then
+    return "verify-pre: " + finalize_failure_detail(f)
+  end
+  if f.stage == "effects" then
+    return "effects: " + finalize_failure_detail(f)
+  end
+  if f.stage == "purity" then
+    return "purity: " + finalize_failure_detail(f)
+  end
+  if f.stage == "budget-annotations" then
+    return "budget-annotations: " + finalize_failure_detail(f)
+  end
+  if f.stage == "lineage" then
+    return "snapshot: " + finalize_failure_detail(f)
+  end
+  if f.stage == "mono" then
+    return "mono: " + f.rows.len().to_string() + " error(s)"
+  end
+  if f.stage == "post-mono-mir" then
+    return "verify-post-mono: " + finalize_failure_detail(f)
+  end
+  if f.stage == "post-opt-mir" || f.stage == "pre-codegen-mir" then
+    return "verify-post: " + finalize_failure_detail(f)
+  end
+  "finalize: " + f.stage.clone() + ": " + finalize_failure_detail(f)
+end
+
+# (the shared finalized-MIR pipeline) The pipeline position of ONE
+# finalization stage word, in the documented order the FinalizeFailure
+# vocabulary encodes (lower -> post-lower mirror: 0..1; the annotation
+# checks 2..4; lineage 5; mono 6; post-mono 7; post-opt 8; final 9). A
+# failure at position N proves every stage BEFORE N really ran and passed,
+# so the transaction's partial statuses stay honest.
+def session_finalize_stage_position(stage: String) -> Int
+  if stage == "lower" then
+    return 0
+  end
+  if stage == "mir-after-lowering" then
+    return 1
+  end
+  if stage == "effects" then
+    return 2
+  end
+  if stage == "purity" then
+    return 3
+  end
+  if stage == "budget-annotations" then
+    return 4
+  end
+  if stage == "lineage" then
+    return 5
+  end
+  if stage == "mono" then
+    return 6
+  end
+  if stage == "post-mono-mir" then
+    return 7
+  end
+  if stage == "post-opt-mir" then
+    return 8
+  end
+  9
 end
 
 # The full-pipeline continuation (steps 3-9 of the module doc). Every stop
@@ -1334,6 +2010,7 @@ def session_verified_edit_full(
     tx.blocked = true
     return session_verified_transaction_seal(tx, policy)
   end
+  tx.parse_status = VerificationStatus::Verified
   let ast = match merge_imported_deps(parsed, false)
   when Result::Ok(a) then a
   when Result::Err(e) then
@@ -1351,76 +2028,100 @@ def session_verified_edit_full(
     tx.blocked = true
     return session_verified_transaction_seal(tx, policy)
   end
-  var mir = match driver_lower_to_mir(&ast, Option::Some(analyzed.typed.clone()))
-  when Result::Ok(m) then m
-  when Result::Err(e) then
-    tx.diagnostics = Vec::from(["lower:" + e.clone()])
-    tx.refusal = "pipeline-lower:" + e
+  # The analyzer's canonical semantic pass established the front-end chain
+  # (resolution + type checking + the access/resource convention checks)
+  # and the capability/contract surface: those statuses are REAL evidence
+  # of this pipeline, never level-derived.
+  tx.resolve_status = VerificationStatus::Verified
+  tx.type_status = VerificationStatus::Verified
+  tx.access_status = VerificationStatus::Verified
+  tx.resource_status = VerificationStatus::Verified
+  tx.capabilities_status = VerificationStatus::Verified
+  # (the shared finalized-MIR pipeline) The session's persistent declaration
+  # lineage: the store is cloned and the resolved edit's DeclMove
+  # continuation applied BEFORE the mono cache binds — the shared entry
+  # stamps the pre-mono callable lineage view through this SAME store, so
+  # every source callable (the renamed one included) carries its persisted
+  # declaration before any instance enqueues. The snapshot build below
+  # re-stamps the identical declarations through the SAME store.
+  # capture_opt_decisions is true: the transaction grounds its
+  # "optimization" rationale records on the optimizer's decision journal.
+  var lineage_store = session.lineages.clone()
+  match resolved.decl_move.clone()
+  when Option::Some(decl_move) then
+    let moved = stable_lineage_store_apply_move(&mut lineage_store, decl_move)
+    if !moved then
+      # The old registration scope is unbound in this store (e.g. a
+      # text-built session whose lineages never stamped it): the source
+      # rewrite still applies — the continuation is inert, never
+      # fabricated — and the next build treats the new location as a
+      # fresh declaration (documented fallback).
+      ()
+    end
+  when Option::None then ()
+  end
+  # (the shared finalized-MIR pipeline) THE ONE verified sequence — lower
+  # -> post-lower verify -> §11 effect / purity / budget annotations -> the
+  # persistent pre-mono lineage view above -> mono -> the UNCONDITIONAL
+  # post-mono checkpoint -> tail/SLP stamps -> the decision-capturing
+  # optimizer -> post-opt verify -> the final pre-codegen firewall —
+  # through the shared entry. The failure positions and messages are
+  # unchanged (the helpers above reproduce the pipeline's documented
+  # prefixes).
+  let pipeline = match finalize_verified_mir(
+    env, analyzed, FinalizeTarget { slp_desc: Option::Some(target_desc.clone()) },
+    FinalizeOptions { compiler: opts.clone(), capture_opt_decisions: true },
+    &mut lineage_store)
+  when Result::Ok(v) then v
+  when Result::Err(f) then
+    # The stages BEFORE the failure really ran and passed: record their
+    # statuses (the pre-migration pipeline set each status at its own
+    # checkpoint, so a purity failure still carried a Verified mir/effects
+    # pair — the position preserves exactly that).
+    let failed_at = session_finalize_stage_position(f.stage.clone())
+    if failed_at > 1 then
+      tx.mir_status = VerificationStatus::Verified
+    end
+    if failed_at > 2 then
+      tx.effects_status = VerificationStatus::Verified
+    end
+    if failed_at > 7 then
+      tx.post_mono_mir_status = VerificationStatus::Verified
+    end
+    if failed_at > 8 then
+      tx.post_opt_mir_status = VerificationStatus::Verified
+    end
+    tx.diagnostics = session_finalize_failure_rows(f)
+    tx.refusal = session_finalize_failure_refusal(f)
     tx.blocked = true
     return session_verified_transaction_seal(tx, policy)
   end
-  let pre_errs = verify_mir(&mir)
-  if pre_errs.len() > 0 then
-    tx.diagnostics = pre_errs.clone()
-    tx.refusal = "pipeline-verify-pre:" + session_first_row(pre_errs)
-    tx.blocked = true
-    return session_verified_transaction_seal(tx, policy)
-  end
-  let mir_effect_errs = check_effect_class_annotations_mir(&mir, env)
-  if mir_effect_errs.len() > 0 then
-    tx.diagnostics = session_diag_rows(type_errors_to_diags(&mir_effect_errs))
-    tx.refusal = "pipeline-effects:" + session_first_row(tx.diagnostics.clone())
-    tx.blocked = true
-    return session_verified_transaction_seal(tx, policy)
-  end
-  let mir_purity_errs = check_purity_annotations_mir(&mut mir, env)
-  if mir_purity_errs.len() > 0 then
-    tx.diagnostics = session_diag_rows(type_errors_to_diags(&mir_purity_errs))
-    tx.refusal = "pipeline-purity:" + session_first_row(tx.diagnostics.clone())
-    tx.blocked = true
-    return session_verified_transaction_seal(tx, policy)
-  end
-  let mir_budget_errs = check_budget_annotations_mir(&mir, env)
-  if mir_budget_errs.len() > 0 then
-    tx.diagnostics = session_diag_rows(type_errors_to_diags(&mir_budget_errs))
-    tx.refusal = "pipeline-budget-annotations:" + session_first_row(tx.diagnostics.clone())
-    tx.blocked = true
-    return session_verified_transaction_seal(tx, policy)
-  end
-  var mono_cache = mono_cache_new(&ast, &analyzed.resolutions)
-  match monomorphize_program(&mut mir, &mut mono_cache)
-  when Result::Ok(_) then ()
-  when Result::Err(me) then
-    tx.diagnostics = Vec::from(["mono:" + me.len().to_string() + " error(s)"])
-    tx.refusal = "pipeline-mono:" + me.len().to_string() + " error(s)"
-    tx.blocked = true
-    return session_verified_transaction_seal(tx, policy)
-  end
-  # The route's stamp seams (the authoritative AbiCallPlan + the SLP
-  # target-capability stamp), then the optimizer and the FINAL MIR verify.
-  stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
-  stamp_slp_vector_facility_desc(&mut mir, target_desc.clone())
-  optimize_mir(&mut mir, session.compile_options.opt_level)
-  let post_errs = verify_mir(&mir)
-  if post_errs.len() > 0 then
-    tx.diagnostics = post_errs.clone()
-    tx.refusal = "pipeline-verify-post:" + session_first_row(post_errs)
-    tx.blocked = true
-    return session_verified_transaction_seal(tx, policy)
-  end
+  # The REAL per-stage statuses of THIS transaction's shared pipeline: only
+  # the stages the finalization established are Verified (the unconditional
+  # post-mono checkpoint included — this is no longer a hand-set claim).
+  tx.mir_status = session_finalize_stage_status(pipeline.evidence.mir_verify_ok)
+  tx.effects_status = session_finalize_stage_status(pipeline.evidence.effect_verify_ok)
+  tx.post_mono_mir_status = session_finalize_stage_status(pipeline.evidence.mono_verify_ok)
+  tx.post_opt_mir_status = session_finalize_stage_status(pipeline.evidence.post_opt_mir_verify_ok)
+  var mir = pipeline.mir
   # THE FINALIZED SNAPSHOT (final MIR included) through the persistent
   # lineage store — the boundary the audit's VerifiedFull level names. The
   # builder runs its own begin/finish revision window over the store, so
-  # every unchanged declaration keeps its lineage and number. The resolved
-  # rename DeclMove is deliberately NOT applied here: the P0-15 plan
-  # grammar models a rename as the old-key removal + new-key creation
-  # (expected_delta names the OLD key, expected_write the NEW one), and an
-  # identity-continued signature change reports the NEW key on the
-  # authoritative side, which the plan row could not name — applying the
-  # move would make every rename fail its own plan. The header
+  # every unchanged declaration keeps its lineage and number. (P0 identity
+  # continuity) The resolved edit's DeclMove continuation was applied
+  # BEFORE monomorphization (so the pre-mono lineage view already claims
+  # it), and the SAME store is threaded onward: for a rename the
+  # continuation claims the old registration scope's persistent lineage
+  # for the new location, so the renamed declaration keeps its StableDeclId
+  # (the digest covers package / lineage / kind, never the spelling)
+  # end-to-end. The authoritative delta therefore classifies the rename as
+  # ONE entity-signature-changed row at the NEW registration key instead
+  # of the old-key removal + new-key creation pair; the plan grammar
+  # (semantic_edit.tg's edit_compare_actual_plan) accepts exactly that
+  # through edit_plan_row_matches_move — the exact DeclMove old -> new
+  # mapping — so the planned-set comparison still agrees. The header
   # feature/option rows come from the SESSION's own options record (the
   # same values the baseline header carried).
-  var lineage_store = session.lineages.clone()
   let snapshot_features = snapshot_feature_set_of(opts.clone(), target_desc.clone())
   let snapshot_options = snapshot_semantic_options_of(opts.clone(), target_desc.clone())
   let snapshot = match semantic_snapshot_of_final_state(
@@ -1506,22 +2207,65 @@ def session_verified_edit_full(
     tx.coverage_status = VerificationStatus::Unavailable
   end
   tx.coverage_consequences = coverage_rows.clone()
+  # (audit: verified-edit test execution) EXECUTE the affected tests through
+  # the coverage harness and run the bounded synthesis loop over the
+  # still-uncovered created paths. The executed-test evidence and the
+  # ingested coverage rows ride the transaction and the proof bundle; the
+  # status is the REAL run outcome (Unavailable on a target the harness has
+  # no route for — never a fabricated pass). The run tag is the new
+  # revision's digest, so concurrent transactions never share a harness.
+  var has_main = false
+  for item in ast.items do
+    match item.kind
+    when ItemKind::ItemFunction(func) then
+      if func.name == "main" then
+        has_main = true
+      end
+    when _ then ()
+    end
+  end
+  let run_tag = semantic_digest_render(&stable_digest_of(&tx.new_revision.clone())).replace("-", "_")
+  let execution = session_run_affected_tests(session.clone(), target_desc.clone(), finalized.clone(),
+    delta.clone(), delta.affected.clone(), tx.edited_source.clone(), has_main,
+    run_tag.clone(), lineage_store.clone())
+  tx.tests_executed = execution.executed.clone()
+  tx.tests_executed_status = execution.status
+  tx.tests_executed_reason = execution.reason.clone()
+  if execution.coverage_ingested then
+    tx.coverage_status = VerificationStatus::Verified
+  end
+  for row in execution.coverage_rows do
+    if !coverage_rows.contains(&row) then
+      coverage_rows.push(row.clone())
+    end
+  end
+  coverage_rows.sort()
+  tx.coverage_consequences = coverage_rows.clone()
   # The authoritative ABI surface diff rows.
   tx.abi_changes = semantic_delta_rows_diff(&delta.abi_delta.before.rows,
     &delta.abi_delta.after.rows)
-  tx.abi_status = VerificationStatus::Verified
-  # (audit order item 7) the REAL ABI-verify stage of THIS transaction's
-  # pipeline: the same post-lowering verifier the driver route runs over
-  # the finalized MIR on the host route (driver_abi_verify_rows). Its
-  # violation rows print on failure.
+  # (audit order item 7; P0 proof-gating) the REAL ABI-verify stage of THIS
+  # transaction's pipeline: the same post-lowering verifier the driver
+  # route runs over the finalized MIR on the host route
+  # (driver_abi_verify_rows). abi_status is DERIVED FROM THE VERIFIER'S
+  # REAL OUTCOME — never pre-set from the level: empty rows -> Verified,
+  # violation rows -> Failed. Its violation rows print on failure.
   let abi_rows = session_abi_verify_rows(mir.clone(), target_desc.clone())
+  if abi_rows.len() == 0 then
+    tx.abi_status = VerificationStatus::Verified
+  else
+    tx.abi_status = VerificationStatus::Failed
+  end
   for abi_row in abi_rows do
     eprintln(abi_row)
   end
-  # The REAL verification evidence of THIS transaction's pipeline: the
-  # stages it captured are the driver route's (no post-mono verifier
-  # checkpoint exists — that status stays Unavailable; abi IS captured
-  # since audit order item 7 and carries the verifier's real result).
+  # The REAL verification evidence of THIS transaction's pipeline: every
+  # compiler stage this pipeline ran is captured — the front-end chain and
+  # the MIR flags from the shared finalization's OWN FinalizeEvidence (the
+  # pre-mono verify, the §11 effect check, the UNCONDITIONAL post-mono
+  # checkpoint and the post-opt verify), plus the post-lowering ABI
+  # verifier's real result. The captured set is the FULL stage vocabulary,
+  # so a false flag is Failed, never Unavailable; no flag is hardcoded.
   let evidence = verified_compilation_evidence_stages(
     tx.new_revision.clone(),
     true,   # parse_ok — parse_source_program succeeded
@@ -1529,13 +2273,13 @@ def session_verified_edit_full(
     true,   # type_ok
     true,   # access_ok
     true,   # resource_ok
-    true,   # mir_verify_ok — the pre-mono verify over the lowered program
-    false,  # mono_verify_ok — no post-mono verifier checkpoint
-    true,   # post_opt_mir_verify_ok — the final post-opt verify
-    true,   # effect_verify_ok
+    pipeline.evidence.mir_verify_ok,          # mir_verify_ok — the post-lower verify
+    pipeline.evidence.mono_verify_ok,         # mono_verify_ok — the unconditional post-mono checkpoint
+    pipeline.evidence.post_opt_mir_verify_ok, # post_opt_mir_verify_ok — the post-opt verify
+    pipeline.evidence.effect_verify_ok,       # effect_verify_ok — the §11 annotation check
     abi_rows.len() == 0,  # abi_verify_ok — the post-lowering ABI verifier's real result
     true,   # capability_contract_ok
-    verification_stage_names_driver_route())
+    verification_stage_names_all())
   # The source delta (the two source renders' content hashes).
   var source_delta = SourceDelta {
     changed_files: Vec::from([session.source_file.clone()])
@@ -1544,9 +2288,17 @@ def session_verified_edit_full(
     "old:" + semantic_digest_render(&stable_digest_of(&session.source)),
     "new:" + semantic_digest_render(&stable_digest_of(&tx.edited_source))
   ])
+  # The executed-test evidence rides the patch's affected-tests field beside
+  # the affected test keys (the §37 extension surface), and the ingested
+  # coverage rows ride its coverage-delta field; a patch consumer sees both
+  # the tests the delta affects and the tests that really ran.
+  var affected_evidence: Vec[String] = tests.clone()
+  for row in tx.tests_executed do
+    affected_evidence.push(row.clone())
+  end
   let bundle = PatchEvidenceBundle {
     source_delta: Option::Some(source_delta),
-    affected_tests: tests.clone(),
+    affected_tests: affected_evidence,
     coverage_delta_rows: coverage_rows.clone(),
     equivalence: tx.equivalence.clone()
   }
@@ -1558,6 +2310,16 @@ def session_verified_edit_full(
     tx.new_revision.clone(), tx.edit.clone(), resolved.clone(), delta.clone(),
     tx.planned_delta.clone(), tx.actual_rows.clone(), budget_rows.clone(),
     tx.equivalence.clone(), tx.preconditions.clone())
+  # (audit order item 8; audit: verified-edit test execution) The capturing
+  # optimizer's decision journal becomes the transaction's "optimization"
+  # rationale records — ONE grounded record per captured
+  # OptimizationDecision (the SAME constructor the snapshot route's
+  # rationale hook uses), so the rationale carries the optimizer's
+  # accept/reject causality, not merely the final optimized IR.
+  for decision in opt_decisions_of_mir(mir.clone()) do
+    tx.rationale_records.push(rationale_of_optimization_decision(
+      tx.new_revision.clone(), decision.clone()))
+  end
   var rationale_store = session.rationale_store.clone()
   rationale_store_add_all(&mut rationale_store, tx.rationale_records.clone())
   # The revised session (the caller applies it in-process; the serve loop
@@ -1583,13 +2345,15 @@ end
 
 # ———— The baseline-session constructor (the transaction's counterpart) ————
 # Compile ONE source through the SAME pipeline the transaction runs
-# (parse -> merge imports -> analyze -> lower -> verify -> effect/purity/
-# budget annotations -> mono -> tail-ABI/SLP stamps -> optimize -> verify ->
-# snapshot -> finalize) into a fresh CompilerSession whose source / lineages
-# / rationale slots are the transaction inputs. This is the in-process
-# baseline builder for verified-edit flows (and the lane's full-pipeline
-# fixture); Result::Err is "<stage>: <first diagnostic>". No artifact is
-# written (the driver route owns persistence).
+# (parse -> merge imports -> analyze -> the shared finalize_verified_mir
+# sequence (lower -> post-lower verify -> effect/purity/budget annotations
+# -> persistent pre-mono lineage -> mono -> UNCONDITIONAL post-mono verify
+# -> tails/SLP stamps -> optimize -> post-opt verify -> final pre-codegen
+# verify) -> snapshot -> finalize) into a fresh CompilerSession whose
+# source / lineages / rationale slots are the transaction inputs. This is
+# the in-process baseline builder for verified-edit flows (and the lane's
+# full-pipeline fixture); Result::Err is "<stage>: <first diagnostic>". No
+# artifact is written (the driver route owns persistence).
 pub def session_compile_source(
   source: String,
   source_file: String,
@@ -1613,42 +2377,23 @@ pub def session_compile_source(
   when Result::Err(diags) then
     return Result::Err("analyze: " + session_first_row(session_diag_rows(diags)))
   end
-  var mir = match driver_lower_to_mir(&ast, Option::Some(analyzed.typed.clone()))
-  when Result::Ok(m) then m
-  when Result::Err(e) then return Result::Err("lower: " + e) end
-  let pre_errs = verify_mir(&mir)
-  if pre_errs.len() > 0 then
-    return Result::Err("verify-pre: " + session_first_row(pre_errs))
-  end
-  let effect_errs = check_effect_class_annotations_mir(&mir, env)
-  if effect_errs.len() > 0 then
-    return Result::Err("effects: " +
-      session_first_row(session_diag_rows(type_errors_to_diags(&effect_errs))))
-  end
-  let purity_errs = check_purity_annotations_mir(&mut mir, env)
-  if purity_errs.len() > 0 then
-    return Result::Err("purity: " +
-      session_first_row(session_diag_rows(type_errors_to_diags(&purity_errs))))
-  end
-  let budget_errs = check_budget_annotations_mir(&mir, env)
-  if budget_errs.len() > 0 then
-    return Result::Err("budget-annotations: " +
-      session_first_row(session_diag_rows(type_errors_to_diags(&budget_errs))))
-  end
-  var mono_cache = mono_cache_new(&ast, &analyzed.resolutions)
-  match monomorphize_program(&mut mir, &mut mono_cache)
-  when Result::Ok(_) then ()
-  when Result::Err(me) then
-    return Result::Err("mono: " + me.len().to_string() + " error(s)")
-  end
-  stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
-  stamp_slp_vector_facility_desc(&mut mir, target_desc.clone())
-  optimize_mir(&mut mir, opts.opt_level)
-  let post_errs = verify_mir(&mir)
-  if post_errs.len() > 0 then
-    return Result::Err("verify-post: " + session_first_row(post_errs))
-  end
+  # (the shared finalized-MIR pipeline) The baseline session compiles
+  # through the SAME shared entry the transaction runs — lower -> post-lower
+  # verify -> §11 effect / purity / budget annotations -> the persistent
+  # pre-mono callable lineage view (through the caller's store) -> mono ->
+  # the UNCONDITIONAL post-mono checkpoint -> tail/SLP stamps -> optimizer
+  # -> post-opt verify -> the final pre-codegen firewall. The SAME store
+  # threads onward into the snapshot build. Result::Err is
+  # "<stage>: <first diagnostic>".
   var lineage_store = lineages
+  let pipeline = match finalize_verified_mir(
+    env, analyzed, FinalizeTarget { slp_desc: Option::Some(target_desc.clone()) },
+    FinalizeOptions { compiler: opts.clone() },
+    &mut lineage_store)
+  when Result::Ok(v) then v
+  when Result::Err(f) then return Result::Err(session_finalize_failure_text(f))
+  end
+  var mir = pipeline.mir
   let snapshot_features = snapshot_feature_set_of(opts.clone(), target_desc.clone())
   let snapshot_options = snapshot_semantic_options_of(opts.clone(), target_desc.clone())
   let snapshot = match semantic_snapshot_of_final_state(
@@ -1670,10 +2415,20 @@ pub def session_compile_source(
   for abi_row in abi_rows do
     eprintln(abi_row)
   end
+  # The baseline session's REAL evidence: the SAME shared finalization
+  # evidence the transaction's pipeline establishes (the unconditional
+  # post-mono checkpoint included), so a transaction over this session and
+  # the session's own evidence agree stage for stage — no flag is
+  # hardcoded.
   let evidence = verified_compilation_evidence_stages(
     semantic_digest_render(&finalized.revision),
-    true, true, true, true, true, true, false, true, true, abi_rows.len() == 0, true,
-    verification_stage_names_driver_route())
+    true, true, true, true, true,
+    pipeline.evidence.mir_verify_ok,
+    pipeline.evidence.mono_verify_ok,
+    pipeline.evidence.post_opt_mir_verify_ok,
+    pipeline.evidence.effect_verify_ok,
+    abi_rows.len() == 0, true,
+    verification_stage_names_all())
   Result::Ok(CompilerSession {
     revision: finalized.revision,
     snapshot: finalized,
@@ -1858,6 +2613,138 @@ pub def semantic_verified_edit_lane_check() -> Vec[String]
       tx3.proof_hash.lo == tx3_again.proof_hash.lo), "true")
   session_lane_push(&mut out, "v6-hash-nonzero",
     session_bool_text(tx3.proof_hash.hi != 0 || tx3.proof_hash.lo != 0), "true")
+
+  # ———— V7/V8 (P0 proof-gating): the seal's policy-level evidence map. A
+  # synthetic VerifiedFull transaction whose ELEVEN compiler stages are
+  # all Verified is accepted; flipping ONE stage to Unavailable rejects it
+  # with the exact requirement row, and a rejected transaction carries no
+  # proof and no verified class. ————
+  let full_evidence_tx = session_verified_transaction_new(snapshot.clone(),
+    SemanticEdit::ChangeSignature(k_f.clone(), "fn(x:i64)->Int".to_string()))
+  var sealed = full_evidence_tx.clone()
+  sealed.level = VerificationLevel::VerifiedFull
+  sealed.applied = true
+  sealed.delta_agreement = true
+  sealed.actual_delta_status = DeltaStatus::Complete(semantic_delta_empty())
+  sealed.parse_status = VerificationStatus::Verified
+  sealed.resolve_status = VerificationStatus::Verified
+  sealed.type_status = VerificationStatus::Verified
+  sealed.access_status = VerificationStatus::Verified
+  sealed.resource_status = VerificationStatus::Verified
+  sealed.mir_status = VerificationStatus::Verified
+  sealed.post_mono_mir_status = VerificationStatus::Verified
+  sealed.post_opt_mir_status = VerificationStatus::Verified
+  sealed.effects_status = VerificationStatus::Verified
+  sealed.capabilities_status = VerificationStatus::Verified
+  sealed.abi_status = VerificationStatus::Verified
+  sealed.budget_status = VerificationStatus::Verified
+  let sealed_ok = session_verified_transaction_seal(sealed.clone(), VerificationPolicy {})
+  session_lane_push(&mut out, "v7-all-stages-accepted",
+    session_bool_text(sealed_ok.accepted), "true")
+  sealed.post_mono_mir_status = VerificationStatus::Unavailable
+  let sealed_missing = session_verified_transaction_seal(sealed.clone(), VerificationPolicy {})
+  session_lane_push(&mut out, "v8-missing-stage-rejected",
+    session_bool_text(sealed_missing.accepted), "false")
+  session_lane_push(&mut out, "v8-refusal-names-stage",
+    session_bool_text(sealed_missing.refusal.starts_with("evidence-required:".to_string()) &&
+      sealed_missing.refusal.contains("post-mono-mir:unavailable".to_string())), "true")
+  session_lane_push(&mut out, "v8-no-proof-class-on-reject",
+    session_bool_text(sealed_missing.proof_patch.is_none() &&
+      sealed_missing.verified_proof.is_none() &&
+      sealed_missing.verified_class == "unverified"), "true")
+  # The same gate rejects a CAPTURED-BUT-FAILED stage (the ABI verifier's
+  # Failed outcome is not waived by the level word) and names it exactly.
+  sealed.post_mono_mir_status = VerificationStatus::Verified
+  sealed.abi_status = VerificationStatus::Failed
+  let sealed_failed = session_verified_transaction_seal(sealed.clone(), VerificationPolicy {})
+  session_lane_push(&mut out, "v8-captured-failed-rejected",
+    session_bool_text(sealed_failed.accepted), "false")
+  session_lane_push(&mut out, "v8-refusal-names-failed-stage",
+    session_bool_text(sealed_failed.refusal.contains("abi:failed".to_string())), "true")
+
+  out
+end
+
+# ———— The transaction test-execution lane (self-checking rows) ————
+# T1: the generated dispatch harness carries the @test names and a main.
+# T2: a target the LIR coverage route has no emitter for answers
+#     Unavailable with the documented reason — never a pass.
+# T3: an uncovered created call edge is synthesized + executed through the
+#     SAME coverage harness and the ingested trace re-evaluates the edge to
+#     covered (host-route only: on an unsupported host the row records the
+#     honest Unavailable outcome instead of a fabricated resolution).
+pub def session_test_execution_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+
+  # ———— T1: the dispatch harness source ————
+  let dispatch = coverage_harness_source("def f() -> Int\n  1\nend\n".to_string(),
+    Vec::from(["test_f".to_string()]))
+  session_lane_push(&mut out, "t1-dispatch-main",
+    session_bool_text(dispatch.contains("def main() -> Int".to_string())), "true")
+  session_lane_push(&mut out, "t1-dispatch-name",
+    session_bool_text(dispatch.contains("\"test_f\"".to_string())), "true")
+  session_lane_push(&mut out, "t1-dispatch-call",
+    session_bool_text(dispatch.contains("    test_f()".to_string())), "true")
+
+  # ———— T2: no harness on the target -> Unavailable, never a pass ————
+  let thumb = thumbv7em_cortex_m4f_desc()
+  let offline = new_compiler_session(semantic_snapshot_new("t2".to_string(), session_lane_target()))
+  let no_harness = session_run_affected_tests(offline, thumb, semantic_snapshot_new(
+    "t2".to_string(), session_lane_target()), semantic_delta_empty(), Vec::new(),
+    "".to_string(), false, "lane".to_string(), stable_lineage_store_new())
+  session_lane_push(&mut out, "t2-target-status",
+    verification_status_word(no_harness.status), "unavailable")
+  session_lane_push(&mut out, "t2-target-reason",
+    session_bool_text(no_harness.reason.starts_with("coverage-harness-unavailable".to_string())), "true")
+  session_lane_push(&mut out, "t2-target-no-executed",
+    no_harness.executed.len().to_string(), "0")
+
+  # ———— T3: uncovered created path -> synthesized + executed -> covered ————
+  let host = match detect_host_target().arch
+  when Arch::AArch64 then Option::Some(aarch64_desc())
+  when Arch::X86_64 then Option::Some(x86_64_desc())
+  when _ then Option::None
+  end
+  match host
+  when Option::None then
+    session_lane_push(&mut out, "t3-host-route-unavailable", "true", "true")
+  when Option::Some(target_desc) then
+    let old_src = "def callee(x: Int) -> Int\n  x + 1\nend\n\ndef caller(x: Int) -> Int\n  x\nend\n"
+    let new_src = "def callee(x: Int) -> Int\n  x + 1\nend\n\ndef caller(x: Int) -> Int\n  callee(x)\nend\n"
+    let old_session = match session_compile_source(old_src.to_string(), "lane_synth.tg".to_string(), target_desc.clone())
+    when Result::Ok(s) then s
+    when Result::Err(e) then
+      out.push("t3-old-compile: " + e)
+      return out
+    end
+    let new_session = match session_compile_source(new_src.to_string(), "lane_synth.tg".to_string(), target_desc.clone())
+    when Result::Ok(s) then s
+    when Result::Err(e) then
+      out.push("t3-new-compile: " + e)
+      return out
+    end
+    let delta = semantic_delta_of(&old_session.snapshot, &new_session.snapshot)
+    let graph = coverage_graph_of_snapshot(&new_session.snapshot)
+    let uncovered_before = uncovered_paths(&graph, &new_session.snapshot, &delta)
+    session_lane_push(&mut out, "t3-uncovered-before",
+      session_bool_text(uncovered_before.len() > 0), "true")
+    let synthesis = session_synthesize_uncovered_tests(&new_session, target_desc,
+      new_session.snapshot.clone(), delta.clone(), new_src.to_string(),
+      "lane_synth".to_string(), "lane".to_string(), new_session.lineages.clone())
+    session_lane_push(&mut out, "t3-synthesis-status",
+      verification_status_word(synthesis.status), "verified")
+    session_lane_push(&mut out, "t3-synthesized-executed",
+      session_bool_text(synthesis.synthesized_executed > 0), "true")
+    session_lane_push(&mut out, "t3-resolved-paths",
+      session_bool_text(synthesis.resolved_paths > 0), "true")
+    var remaining_after = 0
+    for row in synthesis.coverage_rows do
+      if row.starts_with("uncovered:".to_string()) then
+        remaining_after = remaining_after + 1
+      end
+    end
+    session_lane_push(&mut out, "t3-uncovered-after", remaining_after.to_string(), "0")
+  end
 
   out
 end

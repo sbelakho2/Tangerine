@@ -58,6 +58,10 @@ SUITES=(
   # std::embedded dma_* op table, the pin/await/unpin transition matrix, the
   # conservative flow join).
   "tests/dma_ownership_lane_test.tg"
+  # (DMA keying refinement) the typed StablePlaceId keying of the DMA
+  # facts: insertion/rename-continuation stability, the typed
+  # ownership.dma_state key and the legacy-row fallback.
+  "tests/dma_place_key_test.tg"
   "tests/wasi/wasi_guest_surface_test.tg"
   "tests/kernel/kernel_primitives_test.tg"
   "tests/hal/hal_software_backend_test.tg"

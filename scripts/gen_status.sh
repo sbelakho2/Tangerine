@@ -430,11 +430,13 @@ fact "thread module re-exports the std::sync types" \
 # @test canonicalization + the restored lanes: `tg test` compiles a file
 # with a generated per-test dispatch main (each @test runs as its own
 # process), and the stdlib/gfx-ui CI lanes were restored to check ->
-# object -> link/import smoke -> native.
+# object -> link/import smoke -> native. The dispatch-main generation is
+# the ONE coverage.tg generator (coverage_harness_source), shared by the
+# driver CLI route and the verified-edit transaction.
 fact "@test per-test dispatch main" \
   'compile_and_run_tests' "$ROOT/tg_compiler/driver.tg"
 fact "@test dispatch is the canonical per-test main" \
-  'per-test dispatch main' "$ROOT/tg_compiler/driver.tg"
+  'per-test dispatch main' "$ROOT/tg_compiler/coverage.tg"
 fact "stdlib verify lane restored (CI job)" \
   'stdlib-new-modules' "$ROOT/.woodpecker/verify-stdlib.yaml"
 fact "gfx-ui lanes restored (CI jobs)" \

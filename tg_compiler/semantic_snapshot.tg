@@ -283,7 +283,8 @@ use std::collections::{Vec, Map, Set}
 
 use tg_compiler::ids::{
   StableDigest, StableDefId, DefId, DefKind, ModuleId, TypeId, EffectId, InstanceId,
-  IntrinsicId, def_id_numeric, generic_arg_type_view, stable_digest_of, stable_def_id_digested
+  IntrinsicId, GenericArg, generic_args_of_types,
+  def_id_numeric, generic_arg_type_view, stable_digest_of, stable_def_id_digested
 }
 use tg_compiler::stable_ids::{
   StableContractId, stable_contract_row_key, StableDeclId, DeclLineageStore,
@@ -300,14 +301,33 @@ use tg_compiler::stable_ids::{
   StableMirEdgeId, stable_mir_cov_edge_of_key,
   StableEffectSiteId, stable_effect_site_of_key, stable_contract_of_key,
   # (fourth-audit P1-3) the durable member-lineage domain the typed member
-  # tables' member_id texts are built from (the documented name-derived
-  # synthetic fallback; the store-backed stamping is the future source).
+  # tables' member_id texts are built from. The store-backed stamping
+  # (stable_member_lineage_stamp) is the source the builder threads in the
+  # declaration revision transaction; the name-derived synthetic fallback
+  # remains ONLY for a member the stamping pass did not see.
   stable_decl_of_key, stable_member_synthetic_lineage, stable_member_lineage_identity_text,
+  MemberLineageId, stable_member_lineage_id_of, stable_member_lineage_stamp,
+  stable_member_scope_key, stable_lineage_store_member_add_continuation,
+  # (fourth-audit P0-4) the binder + HIR-node sections the SAME revision
+  # transaction stamps (binders from the finalized MIR's locals, HIR nodes
+  # from the source statement origins).
+  BinderLineageId, stable_binder_lineage_stamp, stable_binder_scope_key,
+  HirNodeLineageId, stable_hir_lineage_stamp, stable_hir_scope_key,
+  StableHirNodeId, stable_hir_node_identity_text, stable_mir_node_is_generated,
+  # (persistent identity integration) the structural instance identity the
+  # rename/move regression lane pins, plus the index-free registration
+  # constructor the ephemeral comparison builds from.
+  StructuralInstanceId, structural_instance_id_of, stable_structural_callable_decl_of,
   # (audit order item 5) the stable TEST identity: store-backed discovery
   # rows digest the owner declaration lineage + test-kind; the snapshot-text
   # boundary reconstructs from the persisted words + name/attrs cargo.
   StableTestId, stable_test_id_of_decl, stable_test_id_from_row,
-  stable_decl_id_from_digest, stable_decl_with_display
+  stable_decl_id_from_digest, stable_decl_with_display,
+  # (DMA keying refinement) the typed place identity the DMA rows carry:
+  # the commit-time derivation's record plus the binder constructor /
+  # text-boundary reconstruction the builder and the row parser use.
+  StablePlaceId, StableLocalId, stable_place_id_of, stable_binder_id_of,
+  stable_binder_id_with_lineage, stable_place_id_from_digest, stable_place_of_text
 }
 # (fourth-audit P1-5a) The compilation options record the header's
 # feature_set / semantic_options are derived from — the ONE option
@@ -347,7 +367,14 @@ use tg_compiler::target_desc::{
   TargetDesc, Cpu, Endianness, FloatAbi, Fpu, IntegerDiv, UnalignedPolicy, InterruptAbi
 }
 use tg_compiler::token::{parsed_int_to_host, Span}
-use tg_compiler::mono::{mir_fn_abi_signature}
+use tg_compiler::mono::{
+  mir_fn_abi_signature,
+  # (persistent identity integration) the pre-mono callable lineage view
+  # the callable-view builder returns and the mono cache binds from, plus
+  # the typed-arg canonicalizer the instance-identity lane derives from.
+  CallableLineageView, callable_lineage_view_new, callable_lineage_view_bind,
+  callable_lineage_view_len, callable_lineage_view_get, canonical_args_of_typed
+}
 use tg_compiler::layout_engine::{
   LayoutEngine, TargetDescriptor, LayoutFailureClass,
   layout_engine_new, layout_engine_register_types, compute_all_layouts,
@@ -2591,19 +2618,401 @@ end
 # One call per build; the caller threads the same store across builds so
 # numbers survive. Deterministic: the returned vector aligns with the seed
 # vector.
-pub def snapshot_stamp_decls(inout store: DeclLineageStore, seeds: Vec[SnapshotDeclSeed]) -> Vec[StableDeclId]
-  stable_lineage_store_begin_revision(store)
+# The declaration stamping loop of ONE open revision window: stamp every
+# seed through the store, in seed order. The caller owns begin/finish (the
+# walk opens ONE window for declarations, members, binders and HIR nodes;
+# snapshot_stamp_decls below is the standalone one-window convenience the
+# lane tests drive).
+def snapshot_stamp_decl_seeds(inout store: DeclLineageStore, seeds: Vec[SnapshotDeclSeed]) -> Vec[StableDeclId]
   let live = snapshot_live_scope_keys(&seeds)
   var out: Vec[StableDeclId] = Vec::new()
   for s in seeds do
     out.push(stable_decl_stamp_or_continue(store, s.package_key.clone(), s.module_path.clone(), s.kind.clone(),
       s.name.clone(), s.sig_digest_hi, s.sig_digest_lo, s.sig_text.clone(), live.clone()))
   end
+  out
+end
+
+pub def snapshot_stamp_decls(inout store: DeclLineageStore, seeds: Vec[SnapshotDeclSeed]) -> Vec[StableDeclId]
+  stable_lineage_store_begin_revision(store)
+  let out = snapshot_stamp_decl_seeds(store, &seeds)
   stable_lineage_store_finish_revision(store)
   out
 end
 
-def snapshot_walk_defs(ctx: SnapshotBuildCtx, inout store: DeclLineageStore) -> Result[Vec[SnapshotDef], SnapshotError]
+# ———————————————————————————————————————————————————————————————
+# The P0-4 MEMBER / BINDER / HIR-node stamping of the SAME revision
+# transaction (persistent identity integration)
+# ———————————————————————————————————————————————————————————————
+# The snapshot builder's declaration stamping transaction also stamps the
+# three sub-declaration sections the store carries (fourth-audit P0-4):
+#   * MEMBERS — every field / variant / trait method of every stamped
+#     nominal declaration, from the typed def_kind tables;
+#   * BINDERS — every MIR local of every def-keyed lowered function (binder
+#     kind "local", the snapshot local's canonical name; a generic owner's
+#     instances dedup to the FIRST occurrence so instance copies never
+#     fuse);
+#   * HIR NODES — every SOURCE statement origin's canonical HIR identity
+#     (generated origins are excluded; the anchor is
+#     stable_hir_node_identity_text — a lineage-bearing node keeps its
+#     persistent anchor, a lineage-less node binds the documented "H<seq>"
+#     bootstrap locator).
+# All three sections are stamped BETWEEN the same begin_revision /
+# finish_revision the declarations open, so the store's single revision
+# clock tombstones every section consistently and a member/binder/HIR
+# number survives exactly as long as its structural key is re-stamped.
+#
+# The member view is the row producer's identity source: every
+# SemanticField/SemanticVariant/SemanticTraitMethod member_id is derived
+# from the typed MemberLineageId bound in this pass (never re-derived from
+# the name), and member_lineage carries the typed id itself.
+
+# The persistent member lineage view of ONE build: scope key
+# (stable_member_scope_key(package_key, owner_key, member_kind, name)) ->
+# MemberLineageId.
+pub struct MemberLineageView
+  entries: Map[String, MemberLineageId]
+end
+
+pub def member_lineage_view_new() -> MemberLineageView
+  MemberLineageView { entries: Map::new() }
+end
+
+pub def member_lineage_view_bind(inout view: MemberLineageView, scope_key: String, id: MemberLineageId) -> Unit
+  view.entries.insert(scope_key, id)
+  ()
+end
+
+pub def member_lineage_view_get(view: MemberLineageView, scope_key: String) -> Option[MemberLineageId]
+  view.entries.get(&scope_key)
+end
+
+pub def member_lineage_view_len(view: MemberLineageView) -> Int
+  view.entries.len()
+end
+
+# The STABLE owner locator of a member/binder/HIR scope key: the owner
+# declaration's persistent identity-WORDS render. The current module path
+# and name NEVER enter — a member/binder/HIR continuation recorded under
+# one owner spelling is found under another (the owner identity is the
+# digest pair, exactly the store's owner match).
+pub def snapshot_lineage_owner_key(decl: StableDeclId) -> String
+  decl.digest_hi.to_string() + "-" + decl.digest_lo.to_string()
+end
+
+# ONE member seed of the member-stamping pass: the owner's persistent
+# declaration + stable owner locator, the member kind/name structural key
+# and the signature cargo (cargo only — never a matching authority).
+struct SnapshotMemberSeed
+  package_key: String
+  owner_key: String
+  owner_decl: StableDeclId
+  member_kind: String
+  name: String
+  sig_digest_hi: UInt
+  sig_digest_lo: UInt
+  sig_text: String
+end
+
+# ONE binder seed: the owning callable's persistent declaration, the binder
+# kind ("local") and the canonical local name.
+struct SnapshotBinderSeed
+  owner_key: String
+  owner_decl: StableDeclId
+  binder_kind: String
+  name: String
+  sig_digest_hi: UInt
+  sig_digest_lo: UInt
+  sig_text: String
+end
+
+# ONE HIR-node seed: the owning declaration, the canonical content anchor.
+struct SnapshotHirSeed
+  owner_key: String
+  owner_decl: StableDeclId
+  anchor: String
+  sig_digest_hi: UInt
+  sig_digest_lo: UInt
+  sig_text: String
+end
+
+# The member scope key of a seed / row lookup (one render authority).
+def snapshot_member_seed_key(s: SnapshotMemberSeed) -> String
+  stable_member_scope_key(s.package_key.clone(), s.owner_key.clone(), s.member_kind.clone(), s.name.clone())
+end
+
+# Stamp every member seed through the store (the CALLER has opened the
+# revision) and return the scope-key -> MemberLineageId view.
+def snapshot_stamp_members(inout store: DeclLineageStore, seeds: Vec[SnapshotMemberSeed]) -> MemberLineageView
+  var live: Vec[String] = Vec::new()
+  for s in seeds do
+    live.push(snapshot_member_seed_key(s))
+  end
+  var view = member_lineage_view_new()
+  for s in seeds do
+    let id = stable_member_lineage_stamp(store, s.package_key.clone(), s.owner_key.clone(),
+      s.owner_decl.clone(), s.member_kind.clone(), s.name.clone(),
+      s.sig_digest_hi, s.sig_digest_lo, s.sig_text.clone(), live.clone())
+    member_lineage_view_bind(&mut view, snapshot_member_seed_key(s), id)
+  end
+  view
+end
+
+# The canonical signature cargo text of a typed member.
+def snapshot_member_sig_digest(text: String) -> (UInt, UInt)
+  let d = stable_digest_of(&text)
+  (d.hi, d.lo)
+end
+
+# The typed member seeds of every stamped nominal declaration: fields
+# (Struct), variants (Enum) and trait methods (Trait) — exactly the rows
+# snapshot_typed_member_rows emits. A member whose type text cannot be
+# rendered still gets a seed with "" cargo: identity never depends on the
+# render, and the row producer applies its own omission rule.
+def snapshot_member_seeds(ctx: SnapshotBuildCtx, defs: Vec[SnapshotDef]) -> Vec[SnapshotMemberSeed]
+  var out: Vec[SnapshotMemberSeed] = Vec::new()
+  for d in defs do
+    var is_nominal = false
+    match d.kind
+    when DefKind::TypeName then is_nominal = true
+    when DefKind::Trait then is_nominal = true
+    when _ then ()
+    end
+    if is_nominal then
+      match ctx.type_id_of_key.get(d.key.clone())
+      when Option::Some(tid) then
+        match ctx.type_list_index.get(tid)
+        when Option::Some(idx) then
+          if idx >= 0 && idx < ctx.env.type_list.len() then
+            let td = ctx.env.type_list[idx]
+            let owner_key = snapshot_lineage_owner_key(&d.decl)
+            match td.def_kind
+            when TypeDefKind::Struct(fs) then
+              for f in fs do
+                let sig_text = match snapshot_type_text(&ctx, &f.ty)
+                when Result::Ok(t) then t
+                when Result::Err(_) then "".to_string()
+                end
+                let sd = snapshot_member_sig_digest(sig_text.clone())
+                out.push(SnapshotMemberSeed {
+                  package_key: "".to_string(),
+                  owner_key: owner_key.clone(),
+                  owner_decl: d.decl.clone(),
+                  member_kind: "field".to_string(),
+                  name: f.name.clone(),
+                  sig_digest_hi: sd.0,
+                  sig_digest_lo: sd.1,
+                  sig_text: sig_text
+                })
+              end
+            when TypeDefKind::Enum(vs) then
+              for v in vs do
+                var parts: Vec[String] = Vec::new()
+                for fty in v.fields do
+                  match snapshot_type_text(&ctx, &fty)
+                  when Result::Ok(t) then parts.push(t)
+                  when Result::Err(_) then ()
+                  end
+                end
+                let sig_text = parts.join(";")
+                let sd = snapshot_member_sig_digest(sig_text.clone())
+                out.push(SnapshotMemberSeed {
+                  package_key: "".to_string(),
+                  owner_key: owner_key.clone(),
+                  owner_decl: d.decl.clone(),
+                  member_kind: "variant".to_string(),
+                  name: v.name.clone(),
+                  sig_digest_hi: sd.0,
+                  sig_digest_lo: sd.1,
+                  sig_text: sig_text
+                })
+              end
+            when TypeDefKind::Trait(ms) then
+              for m in ms do
+                var parts: Vec[String] = Vec::new()
+                for p in m.params do
+                  match snapshot_param_of_typed(p, &ctx)
+                  when Option::Some(sp) then parts.push(snapshot_param_encoded(&sp))
+                  when Option::None then ()
+                  end
+                end
+                var ret = "".to_string()
+                match snapshot_type_text(&ctx, &m.ret_type)
+                when Result::Ok(rt) then ret = rt
+                when Result::Err(_) then ()
+                end
+                let sig_text = parts.join(";;") + "->" + ret
+                let sd = snapshot_member_sig_digest(sig_text.clone())
+                out.push(SnapshotMemberSeed {
+                  package_key: "".to_string(),
+                  owner_key: owner_key.clone(),
+                  owner_decl: d.decl.clone(),
+                  member_kind: "method".to_string(),
+                  name: m.name.clone(),
+                  sig_digest_hi: sd.0,
+                  sig_digest_lo: sd.1,
+                  sig_text: sig_text
+                })
+              end
+            when _ then ()
+            end
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  out
+end
+
+# The defs row index of every stamped declaration, keyed by its numeric
+# DefId (def_id_numeric) — the callable->owner resolution the binder/HIR
+# stamping reads (an unstamped/synthesized function has no row).
+def snapshot_def_row_index(ctx: SnapshotBuildCtx, defs: Vec[SnapshotDef]) -> Map[Int, Int]
+  var out: Map[Int, Int] = Map::new()
+  var i = 0
+  while i < defs.len() do
+    let n = snapshot_numeric_of_def(ctx, defs[i])
+    if n >= 0 then
+      out.insert(n, i)
+    end
+    i = i + 1
+  end
+  out
+end
+
+# Stamp every BINDER seed of the finalized MIR (one per local of every
+# def-keyed lowered function) in the CALLER's open revision, and return
+# the binder scope key -> BinderLineageId map. The binder kind is "local";
+# the name is the SNAPSHOT LOCAL's canonical name (snapshot_local_name —
+# the declared name, else the "l<id>" locator), and a generic owner's
+# multiple MIR instances dedup to the FIRST occurrence so instance copies
+# can never fuse two live binders. There are no binder continuations: a
+# renamed local is removed+created (the store contract).
+def snapshot_stamp_binders(
+  inout store: DeclLineageStore,
+  ctx: SnapshotBuildCtx,
+  defs: Vec[SnapshotDef]
+) -> Map[String, BinderLineageId]
+  let row_of_numeric = snapshot_def_row_index(ctx, defs)
+  var out: Map[String, BinderLineageId] = Map::new()
+  var seen: Set[String] = Set::new()
+  var fi = 0
+  while fi < ctx.mir.functions.len() do
+    let f = ctx.mir.functions[fi]
+    match f.callable
+    when Option::Some(cid) then
+      let numeric = def_id_numeric(&cid.def)
+      match row_of_numeric.get(numeric)
+      when Option::Some(ri) then
+        let owner = defs[ri].decl.clone()
+        let owner_key = snapshot_lineage_owner_key(&owner)
+        var li = 0
+        while li < f.locals.len() do
+          let name = match snapshot_local_name(ctx, f.clone(), li)
+          when Result::Ok(n) then n
+          when Result::Err(_) then "l" + li.to_string()
+          end
+          let scope = stable_binder_scope_key(owner_key.clone(), "local".to_string(), name.clone())
+          if !seen.contains(&scope) then
+            seen.insert(scope.clone())
+            var sig_text = "".to_string()
+            match snapshot_type_text(&ctx, &f.locals[li].ty)
+            when Result::Ok(t) then sig_text = t
+            when Result::Err(_) then ()
+            end
+            let sd = snapshot_member_sig_digest(sig_text.clone())
+            let id = stable_binder_lineage_stamp(store, owner_key.clone(), owner.clone(),
+              "local".to_string(), name.clone(), sd.0, sd.1, sig_text)
+            out.insert(scope, id)
+          end
+          li = li + 1
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+    fi = fi + 1
+  end
+  out
+end
+
+# Stamp every SOURCE HIR NODE the finalized MIR's statement origins carry,
+# in the CALLER's open revision, and return the HIR scope key ->
+# HirNodeLineageId map. Compiler-GENERATED origins are excluded (the
+# {origin-set, transform-id, role, seq} family owns no HIR node); the
+# anchor is the origin's canonical stable_hir_node_identity_text — a
+# lineage-bearing node keeps its persistent anchor, a lineage-less node
+# binds the documented "H<seq>" bootstrap locator. Multiple MIR instances
+# of one generic owner share the same anchor and dedup to the FIRST
+# occurrence.
+def snapshot_stamp_hir_nodes(
+  inout store: DeclLineageStore,
+  ctx: SnapshotBuildCtx,
+  defs: Vec[SnapshotDef]
+) -> Map[String, HirNodeLineageId]
+  let row_of_numeric = snapshot_def_row_index(ctx, defs)
+  var out: Map[String, HirNodeLineageId] = Map::new()
+  var seen: Set[String] = Set::new()
+  var fi = 0
+  while fi < ctx.mir.functions.len() do
+    let f = ctx.mir.functions[fi]
+    match f.callable
+    when Option::Some(cid) then
+      let numeric = def_id_numeric(&cid.def)
+      match row_of_numeric.get(numeric)
+      when Option::Some(ri) then
+        let owner = defs[ri].decl.clone()
+        let owner_key = snapshot_lineage_owner_key(&owner)
+        var bi = 0
+        while bi < f.blocks.len() do
+          var si = 0
+          while si < f.blocks[bi].statements.len() do
+            match f.blocks[bi].statements[si].origin
+            when Option::Some(node) then
+              if !stable_mir_node_is_generated(node.clone()) then
+                match node.origin
+                when Option::Some(hir) then
+                  let anchor = stable_hir_node_identity_text(&hir)
+                  let scope = stable_hir_scope_key(owner_key.clone(), anchor.clone())
+                  if !seen.contains(&scope) then
+                    seen.insert(scope.clone())
+                    let sd = snapshot_member_sig_digest(anchor.clone())
+                    let id = stable_hir_lineage_stamp(store, owner_key.clone(), owner.clone(),
+                      anchor.clone(), sd.0, sd.1, anchor.clone())
+                    out.insert(scope, id)
+                  end
+                when Option::None then ()
+                end
+              end
+            when Option::None then ()
+            end
+            si = si + 1
+          end
+          bi = bi + 1
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+    fi = fi + 1
+  end
+  out
+end
+
+# ONE completed snapshot def walk: the declaration rows PLUS the P0-4
+# member view the row producer reads its typed member ids from and the
+# binder/HIR maps the same transaction stamped (the threading record; no
+# row persists binder/HIR ids yet).
+pub struct SnapshotWalk
+  defs: Vec[SnapshotDef]
+  members: MemberLineageView
+  binders: Map[String, BinderLineageId]
+  hir_nodes: Map[String, HirNodeLineageId]
+end
+
+def snapshot_pending_defs(ctx: SnapshotBuildCtx) -> Result[Vec[SnapshotPendingDef], SnapshotError]
   let metas_pair = snapshot_walk_metas(&ctx)
   var metas = metas_pair.0
   var clauses = metas_pair.1
@@ -2657,6 +3066,22 @@ def snapshot_walk_defs(ctx: SnapshotBuildCtx, inout store: DeclLineageStore) -> 
     end
   end
 
+  Result::Ok(pending)
+end
+
+# THE STORE SEAM of the snapshot builder: ONE revision window stamps the
+# declaration universe AND the P0-4 member/binder/HIR sections (fourth-audit
+# P0-4), then closes the window so the store's single revision clock
+# tombstones every section consistently. The returned SnapshotWalk carries
+# the declaration rows and the member view the typed member tables read
+# their persistent MemberLineageId from (plus the binder/HIR maps the same
+# transaction stamped).
+pub def snapshot_walk_defs(ctx: SnapshotBuildCtx, inout store: DeclLineageStore) -> Result[SnapshotWalk, SnapshotError]
+  let pending = match snapshot_pending_defs(&ctx)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(p) then p
+  end
+
   # Pass 2 — the persistent declaration identity: one seed per declaration,
   # stamped through the shared store. The signature digest the conservative
   # rename/move rule matches on is the canonical signature TEXT's digest;
@@ -2674,7 +3099,9 @@ def snapshot_walk_defs(ctx: SnapshotBuildCtx, inout store: DeclLineageStore) -> 
       sig_text: p.sig.clone()
     })
   end
-  let decls = snapshot_stamp_decls(store, &seeds)
+
+  stable_lineage_store_begin_revision(store)
+  let decls = snapshot_stamp_decl_seeds(store, &seeds)
 
   # Pass 3 — the rows, rooted on the stamped declaration: the StableDefId
   # digest words ARE the StableDeclId's (stable_def_id_of_decl), so a
@@ -2699,7 +3126,65 @@ def snapshot_walk_defs(ctx: SnapshotBuildCtx, inout store: DeclLineageStore) -> 
     })
     pi = pi + 1
   end
-  Result::Ok(defs)
+
+  # The P0-4 sections of the SAME revision window: members first (the row
+  # producer's identity source), then binders and HIR nodes (kept live and
+  # returned for the thread).
+  let members = snapshot_stamp_members(store, snapshot_member_seeds(&ctx, &defs))
+  let binders = snapshot_stamp_binders(store, &ctx, &defs)
+  let hir_nodes = snapshot_stamp_hir_nodes(store, &ctx, &defs)
+  stable_lineage_store_finish_revision(store)
+  Result::Ok(SnapshotWalk {
+    defs: defs,
+    members: members,
+    binders: binders,
+    hir_nodes: hir_nodes
+  })
+end
+
+# THE PRE-MONO CALLABLE LINEAGE VIEW (persistent identity integration):
+# stamp every build-visible declaration through the shared store seam
+# (snapshot_stamp_decls — the SAME seeds the post-mono def walk re-stamps
+# in its own revision window, so the walk re-derives byte-identical
+# StableDeclIds) and return the registration key -> persistent declaration
+# view the MonoCache binds from. EVERY production entry calls this AFTER
+# lowering/verification and BEFORE monomorphization, then constructs its
+# cache with mono_cache_new_persistent, so every source callable carries
+# its persisted declaration identity before any instance enqueues (a
+# rename/move continuation recorded in the store keeps the
+# StructuralInstanceId byte-identical across builds).
+pub def snapshot_lineage_view_of(
+  env: TypeEnv,
+  typed: TypedProgram,
+  mir_program: MirProgram,
+  inout store: DeclLineageStore
+) -> Result[CallableLineageView, SnapshotError]
+  let ctx = snapshot_build_ctx(env, typed, mir_program)
+  let pending = match snapshot_pending_defs(&ctx)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(p) then p
+  end
+  var seeds: Vec[SnapshotDeclSeed] = Vec::new()
+  for p in pending do
+    let sd = stable_digest_of(&p.sig)
+    seeds.push(SnapshotDeclSeed {
+      package_key: "".to_string(),
+      module_path: p.module_path.clone(),
+      kind: semantic_def_kind_text(&p.kind),
+      name: p.name.clone(),
+      sig_digest_hi: sd.hi,
+      sig_digest_lo: sd.lo,
+      sig_text: p.sig.clone()
+    })
+  end
+  let decls = snapshot_stamp_decls(store, &seeds)
+  var view = callable_lineage_view_new()
+  var i = 0
+  while i < pending.len() do
+    callable_lineage_view_bind(&mut view, pending[i].key.clone(), decls[i].clone())
+    i = i + 1
+  end
+  Result::Ok(view)
 end
 
 def snapshot_numeric_of_def(ctx: SnapshotBuildCtx, d: SnapshotDef) -> Int
@@ -4915,17 +5400,35 @@ end
 # The builder
 # ———————————————————————————————————————————————————————————————
 
-# ———— (fourth-audit P1-3) the typed member/signature table producers ————
+# ———— (fourth-audit P1-3 + P0-4) the typed member/signature table producers ————
 # Every row below is read from TYPED finalized state — env.type_list's
 # def_kind records (FieldInfo / VariantInfo / MethodSig) and the checker's
-# typed FnSignature table — never from a canonical key render. member_id
-# is the durable member-lineage identity text (the documented name-derived
-# synthetic lineage: the persistent store-backed member stamping is the
-# next source; see stable_ids.tg stable_member_*).
-def snapshot_member_identity_text(owner: StableDefId, member_kind: String, name: String) -> String
-  let decl = stable_decl_of_key(&owner.key)
-  let lineage = stable_member_synthetic_lineage(decl.clone(), member_kind.clone(), name)
-  stable_member_lineage_identity_text(decl, member_kind.clone(), lineage)
+# typed FnSignature table — never from a canonical key render.
+#
+# MEMBER IDENTITY: `member_lineage` is the TYPED persistent MemberLineageId
+# the build's snapshot_walk_defs stamped in the SAME revision transaction
+# as the declarations; `member_id` is the durable identity text derived
+# from that SAME typed id. The name-derived synthetic fallback remains ONLY
+# for a member the stamping pass did not see (a producer without a store /
+# a genuinely new member outside the stamped universe) — never as the
+# snapshot builder's normal path.
+
+# The persistent member lineage of ONE member from the build's member view
+# (None = the stamping pass did not see it: the documented fallback).
+def snapshot_member_lineage_of(view: MemberLineageView, owner_decl: StableDeclId, member_kind: String, name: String) -> Option[MemberLineageId]
+  let key = stable_member_scope_key("".to_string(), snapshot_lineage_owner_key(owner_decl), member_kind.clone(), name.clone())
+  member_lineage_view_get(view, key)
+end
+
+# The durable member_id text of one member: the TYPED persistent lineage's
+# identity render when bound, else the name-derived synthetic bootstrap.
+def snapshot_member_identity_text(owner_decl: StableDeclId, member_kind: String, name: String, lineage: Option[MemberLineageId]) -> String
+  match lineage
+  when Option::Some(mid) then stable_member_lineage_identity_text(owner_decl, member_kind.clone(), mid.lineage)
+  when Option::None then
+    let synthetic = stable_member_synthetic_lineage(owner_decl, member_kind.clone(), name)
+    stable_member_lineage_identity_text(owner_decl, member_kind.clone(), synthetic)
+  end
 end
 
 def snapshot_param_of_typed(p: ParamType, ctx: SnapshotBuildCtx) -> Option[SemanticParam]
@@ -4944,9 +5447,13 @@ end
 # whose type text cannot be rendered through the registered-name authority
 # is OMITTED (the documented hard-failure boundary of this data-only
 # table; the type's canonical key still fails closed at its own render).
+# The owner row `d` carries BOTH faces the member view is keyed by: d.sid
+# (the row identity) and d.decl (the persistent declaration whose identity
+# words are the member owner locator).
 def snapshot_typed_member_rows(
   ctx: SnapshotBuildCtx,
-  owner_sid: StableDefId,
+  view: MemberLineageView,
+  d: SnapshotDef,
   tid: Int,
   inout fields: Vec[SemanticField],
   inout variants: Vec[SemanticVariant],
@@ -4960,18 +5467,21 @@ def snapshot_typed_member_rows(
   end
   if idx < 0 || idx >= ctx.env.type_list.len() then return end
   let td = ctx.env.type_list[idx]
+  let owner_sid = d.sid.clone()
   match td.def_kind
   when TypeDefKind::Struct(fs) then
     var fi = 0
     for f in fs do
       match snapshot_type_text(ctx, &f.ty)
       when Result::Ok(ft) then
+        let lineage = snapshot_member_lineage_of(view.clone(), d.decl.clone(), "field".to_string(), f.name.clone())
         fields.push(SemanticField {
           owner: owner_sid.clone(),
           name: f.name.clone(),
           index: fi,
           ty: ft,
-          member_id: snapshot_member_identity_text(owner_sid.clone(), "field".to_string(), f.name.clone()),
+          member_id: snapshot_member_identity_text(d.decl.clone(), "field".to_string(), f.name.clone(), lineage.clone()),
+          member_lineage: lineage,
           is_pub: f.is_public
         })
       when Result::Err(_) then ()
@@ -4988,12 +5498,14 @@ def snapshot_typed_member_rows(
         when Result::Err(_) then ()
         end
       end
+      let lineage = snapshot_member_lineage_of(view.clone(), d.decl.clone(), "variant".to_string(), v.name.clone())
       variants.push(SemanticVariant {
         owner: owner_sid.clone(),
         name: v.name.clone(),
         index: vi,
         payload: payload,
-        member_id: snapshot_member_identity_text(owner_sid.clone(), "variant".to_string(), v.name.clone())
+        member_id: snapshot_member_identity_text(d.decl.clone(), "variant".to_string(), v.name.clone(), lineage.clone()),
+        member_lineage: lineage
       })
       vi = vi + 1
     end
@@ -5012,13 +5524,15 @@ def snapshot_typed_member_rows(
       when Result::Ok(rt) then ret = rt
       when Result::Err(_) then ()
       end
+      let lineage = snapshot_member_lineage_of(view.clone(), d.decl.clone(), "method".to_string(), m.name.clone())
       trait_methods.push(SemanticTraitMethod {
         owner: owner_sid.clone(),
         name: m.name.clone(),
         index: mi,
         params: params,
         ret_type: ret,
-        member_id: snapshot_member_identity_text(owner_sid.clone(), "method".to_string(), m.name.clone())
+        member_id: snapshot_member_identity_text(d.decl.clone(), "method".to_string(), m.name.clone(), lineage.clone()),
+        member_lineage: lineage
       })
       mi = mi + 1
     end
@@ -5504,22 +6018,81 @@ pub def snapshot_drop_plan_facts(resource_facts: Vec[ResourceDropPlanFact]) -> V
   out
 end
 
+# (DMA keying refinement) The builder-side re-keying of a committed DMA
+# fact's typed place: the resource checker's commit-time StablePlaceId is
+# re-rooted on the PERSISTENT identities of the SAME build — the
+# store-stamped declaration row the owner key resolves to (the def walk's
+# StableDeclId, insertion/rename-stable through the lineage store) and the
+# binder lineage the same revision transaction stamped (the
+# scope-key -> BinderLineageId map snapshot_stamp_binders returned). The
+# typed projection chain rides from the carried key (the commit-time
+# derivation); a fact the checker left without a typed key (an unstable
+# chain) or one whose owner key has no resolved def row stays on the
+# carried key — never a fabricated identity.
+def snapshot_dma_place_id(
+  ctx: SnapshotBuildCtx,
+  defs: Vec[SnapshotDef],
+  def_row_of_numeric: Map[Int, Int],
+  binders: Map[String, BinderLineageId],
+  f: ResourceDmaFact
+) -> Option[StablePlaceId]
+  let carried = match f.place_id
+  when Option::Some(p) then p
+  when Option::None then return Option::None
+  end
+  var owner_row = -1
+  match ctx.def_emission_numeric.get(f.function.clone())
+  when Option::Some(numeric) then
+    match def_row_of_numeric.get(numeric)
+    when Option::Some(ri) then owner_row = ri
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+  if owner_row < 0 then
+    return Option::Some(carried)
+  end
+  let owner_decl = defs[owner_row].decl.clone()
+  let owner = structural_instance_id_of(owner_decl.clone(), Vec::new())
+  let root_name = carried.root.display_name.clone()
+  let binder_seq = carried.root.binder.binder_seq
+  var binder = stable_binder_id_of(owner.callable.clone(), binder_seq)
+  let scope = stable_binder_scope_key(snapshot_lineage_owner_key(&owner_decl), "local".to_string(), root_name.clone())
+  match binders.get(scope)
+  when Option::Some(bl) then
+    binder = stable_binder_id_with_lineage(owner_decl.clone(), bl, binder_seq)
+  when Option::None then ()
+  end
+  let root = StableLocalId { owner: owner, binder: binder, display_name: root_name }
+  stable_place_id_of(root, carried.projections.clone())
+end
+
 # (audit item 16, next tier) The builder-boundary mapper: the resource
 # checker's kernel-side DMA facts -> the persisted SemanticSnapshot rows.
 # The state word is parsed STRICTLY (dma_state_of_word): an unrecognized
 # word drops the row — the table never fabricates a state (the kernel's
-# emit vocabulary is closed and the lane covers all five words).
-pub def snapshot_dma_ownership_facts(resource_facts: Vec[ResourceDmaFact]) -> Vec[DmaOwnershipFact]
+# emit vocabulary is closed and the lane covers all five words). The typed
+# place key rides through snapshot_dma_place_id (re-rooted on the
+# persistent declaration/binder when the owner key resolves).
+pub def snapshot_dma_ownership_facts(
+  ctx: SnapshotBuildCtx,
+  defs: Vec[SnapshotDef],
+  def_row_of_numeric: Map[Int, Int],
+  binders: Map[String, BinderLineageId],
+  resource_facts: Vec[ResourceDmaFact]
+) -> Vec[DmaOwnershipFact]
   var out: Vec[DmaOwnershipFact] = Vec::new()
   for f in resource_facts do
     match dma_state_of_word(f.state.clone())
     when Option::Some(st) then
+      let place_id = snapshot_dma_place_id(&ctx, &defs, &def_row_of_numeric, &binders, f.clone())
       out.push(DmaOwnershipFact {
         function: f.function.clone(),
         place: f.place.clone(),
         state: st,
         op: f.op.clone(),
-        site: f.site.clone()
+        site: f.site.clone(),
+        place_id: place_id
       })
     when Option::None then ()
     end
@@ -6039,11 +6612,15 @@ pub def semantic_snapshot_of_final_state(
   let ctx = snapshot_build_ctx(env, typed, mir_program)
   let target_id = stable_target_id_of(&target)
 
-  # 1. The def universe (stamped through the threaded lineage store).
-  let defs = match snapshot_walk_defs(&ctx, lineage_store)
+  # 1. The def universe (stamped through the threaded lineage store) and
+  # the P0-4 member view the typed member rows read their persistent ids
+  # from (stamped in the SAME revision transaction).
+  let walked = match snapshot_walk_defs(&ctx, lineage_store)
   when Result::Err(e) then return Result::Err(e)
-  when Result::Ok(d) then d
+  when Result::Ok(w) then w
   end
+  let defs = walked.defs.clone()
+  let member_view = walked.members.clone()
   var def_row_of_numeric: Map[Int, Int] = Map::new()
   var di = 0
   while di < defs.len() do
@@ -6071,7 +6648,7 @@ pub def semantic_snapshot_of_final_state(
     if is_nominal_kind then
       match ctx.type_id_of_key.get(d.key.clone())
       when Option::Some(tid) then
-        snapshot_typed_member_rows(&ctx, d.sid, tid, &mut typed_fields, &mut typed_variants, &mut typed_trait_methods)
+        snapshot_typed_member_rows(&ctx, member_view.clone(), d, tid, &mut typed_fields, &mut typed_variants, &mut typed_trait_methods)
       when Option::None then ()
       end
     end
@@ -6574,7 +7151,7 @@ pub def semantic_snapshot_of_final_state(
   # (audit item 16, next tier) the persisted DMA-ownership facts (the
   # resource checker's committed-op rows, mapped + sorted; empty when no
   # resource run).
-  snapshot.dma_ownership = snapshot_dma_ownership_facts(resource_dma_facts)
+  snapshot.dma_ownership = snapshot_dma_ownership_facts(&ctx, &defs, &def_row_of_numeric, &walked.binders, resource_dma_facts)
   # The persisted ABI/layout rows (item 18) — the explanatory payload
   # behind abi_hash (which stays the §30 CanonExternal text digest).
   var abi_rows = snapshot_abi_surface_rows(&ctx, &defs, &snapshot.types, &target)
@@ -7141,12 +7718,21 @@ end
 # (audit item 16, next tier) ONE DMA-ownership fact row: the function owner
 # key, the buffer place text, the state word, the canonical op word and the
 # commit site label. Every value escaped (the row grammar convention).
+# (DMA keying refinement) A row carrying the typed place key appends
+# "pid":"<hi>-<lo>" (semantic_dma_ownership_place_id_text — the identity
+# words render); a legacy row omits the field entirely and parses back
+# with the typed key None.
 def snapshot_dma_ownership_line(f: DmaOwnershipFact) -> String
-  "{\"s\":\"dma\",\"f\":\"" + semantic_json_escape(&f.function) + "\"," +
+  var text = "{\"s\":\"dma\",\"f\":\"" + semantic_json_escape(&f.function) + "\"," +
     "\"place\":\"" + semantic_json_escape(&f.place) + "\"," +
     "\"state\":\"" + semantic_json_escape(&dma_state_word(f.state)) + "\"," +
     "\"op\":\"" + semantic_json_escape(&f.op) + "\"," +
-    "\"site\":\"" + semantic_json_escape(&f.site) + "\"}"
+    "\"site\":\"" + semantic_json_escape(&f.site) + "\""
+  let pid = semantic_dma_ownership_place_id_text(&f)
+  if pid.len() > 0 then
+    text = text + ",\"pid\":\"" + semantic_json_escape(&pid) + "\""
+  end
+  text + "}"
 end
 
 # ———— (fourth-audit P1-5/P1-3) the new table row renderers ————
@@ -7230,14 +7816,46 @@ def snapshot_params_encoded(params: Vec[SemanticParam]) -> String
   parts.join(";;")
 end
 
+# The snapshot-text render of a TYPED persistent member lineage
+# (fourth-audit P0-4): "" for the fallback rows (member_lineage = None),
+# else "<member-kind>|<lineage>". The owner identity and the member
+# identity digest words are DERIVED on parse from the row's own owner
+# digest + this render (stable_member_lineage_id_of is deterministic), so
+# the persisted form stays compact and cannot drift from the identity
+# domain. Legacy rows without the field parse back as None.
+def snapshot_member_lineage_encoded(lineage: Option[MemberLineageId]) -> String
+  match lineage
+  when Option::Some(m) then m.member_kind.clone() + "|" + m.lineage.to_string()
+  when Option::None then "".to_string()
+  end
+end
+
+def snapshot_member_lineage_decoded(text: String, owner_digest: StableDigest, tag: String, line_no: Int) -> Result[Option[MemberLineageId], String]
+  if text.len() == 0 then
+    return Result::Ok(Option::None)
+  end
+  let parts = text.split("|")
+  if parts.len() != 2 || parts[0].len() == 0 then
+    return Result::Err(snapshot_line_error(line_no, tag.clone(), "field 'ml' is not a <member-kind>|<lineage> render: '" + text.clone() + "'"))
+  end
+  let lineage = match parts[1].parse_int()
+  when Result::Ok(v) then v
+  when Result::Err(_) then
+    return Result::Err(snapshot_line_error(line_no, tag.clone(), "field 'ml' lineage is not an integer: '" + parts[1].clone() + "'"))
+  end
+  let owner = stable_decl_id_from_digest("".to_string(), owner_digest.hi, owner_digest.lo)
+  Result::Ok(Option::Some(stable_member_lineage_id_of(owner.package.clone(), owner, parts[0].clone(), lineage)))
+end
+
 # One declared field row (owner digest-only; the key hydrates like every
-# def-keyed row).
+# def-keyed row; "ml" is the typed persistent member lineage render).
 def snapshot_field_line(f: SemanticField) -> String
   "{\"s\":\"field\",\"o\":\"" + semantic_digest_render(&semantic_stable_def_id_digest(&f.owner)) + "\"," +
     "\"name\":\"" + semantic_json_escape(&f.name) + "\"," +
     "\"index\":" + f.index.to_string() + "," +
     "\"ty\":\"" + semantic_json_escape(&f.ty) + "\"," +
     "\"member\":\"" + semantic_json_escape(&f.member_id) + "\"," +
+    "\"ml\":\"" + semantic_json_escape(&snapshot_member_lineage_encoded(f.member_lineage.clone())) + "\"," +
     "\"pub\":" + snapshot_bool_text(f.is_pub) + "}"
 end
 
@@ -7247,7 +7865,8 @@ def snapshot_variant_line(v: SemanticVariant) -> String
     "\"name\":\"" + semantic_json_escape(&v.name) + "\"," +
     "\"index\":" + v.index.to_string() + "," +
     "\"payload\":\"" + semantic_json_escape(&snapshot_params_encoded(v.payload.clone())) + "\"," +
-    "\"member\":\"" + semantic_json_escape(&v.member_id) + "\"}"
+    "\"member\":\"" + semantic_json_escape(&v.member_id) + "\"," +
+    "\"ml\":\"" + semantic_json_escape(&snapshot_member_lineage_encoded(v.member_lineage.clone())) + "\"}"
 end
 
 # One callable-signature row (function digest-only; params encoded; the
@@ -7267,7 +7886,8 @@ def snapshot_trait_method_line(m: SemanticTraitMethod) -> String
     "\"index\":" + m.index.to_string() + "," +
     "\"params\":\"" + semantic_json_escape(&snapshot_params_encoded(m.params.clone())) + "\"," +
     "\"ret\":\"" + semantic_json_escape(&m.ret_type) + "\"," +
-    "\"member\":\"" + semantic_json_escape(&m.member_id) + "\"}"
+    "\"member\":\"" + semantic_json_escape(&m.member_id) + "\"," +
+    "\"ml\":\"" + semantic_json_escape(&snapshot_member_lineage_encoded(m.member_lineage.clone())) + "\"}"
 end
 
 # The persisted ABI/layout rows (audit item 18; third-audit items 42/43):
@@ -7628,7 +8248,8 @@ end
 #                   unknown, flags, caps, purity, pevidence
 #   unsafe-fact   — s, i, f, ukind, site
 #   drop-plan     — s, f, place, site, paths, kind
-#   dma           — s, f, place, state, op, site
+#   dma           — s, f, place, state, op, site [, pid] (the typed place
+#                   key's identity words; omitted on legacy rows)
 #   abi-surface   — s, surface, symbol, kind, size, align, args, ret, fields,
 #                   conv, extern, pclasses, plocs, ownin, ownout, null,
 #                   variadic, ext, platform, failure, thread, taint, boundary
@@ -8918,6 +9539,11 @@ end
 # (audit item 16, next tier) ONE DMA row -> the model record. The state
 # word is parsed STRICTLY: an unknown word fails the row closed (the
 # dma_state_of_word vocabulary is the closed set the writer emits).
+# (DMA keying refinement) The OPTIONAL "pid" field carries the typed place
+# key's identity words ("<hi>-<lo>", the semantic_dma_ownership_place_id_text
+# render); a legacy row without it parses back with place_id None — the
+# canonical text key is then the only identity and NOTHING is fabricated.
+# A present-but-malformed pid fails the row closed.
 def snapshot_parse_dma_row(fields: Vec[SnapshotField], line_no: Int) -> Result[DmaOwnershipFact, String]
   let tag = "dma".to_string()
   let function_key = match snapshot_string_field(fields.clone(), "f".to_string(), tag.clone(), line_no)
@@ -8945,12 +9571,25 @@ def snapshot_parse_dma_row(fields: Vec[SnapshotField], line_no: Int) -> Result[D
   when Option::None then
     return Result::Err("row dma: unknown DMA state word `" + state_text + "`")
   end
+  let place_id = match snapshot_field_lookup(fields.clone(), "pid".to_string())
+  when Option::None then Option::None
+  when Option::Some(pf) then
+    if !pf.quoted then
+      return Result::Err(snapshot_line_error(line_no, tag.clone(), "field 'pid' must be a quoted string"))
+    end
+    let d = match snapshot_parse_digest(pf.text.clone(), tag.clone(), "pid".to_string(), line_no)
+    when Result::Err(e) then return Result::Err(e)
+    when Result::Ok(v) then v
+    end
+    Option::Some(stable_place_id_from_digest(place.clone(), d.hi, d.lo))
+  end
   Result::Ok(DmaOwnershipFact {
     function: function_key,
     place: place,
     state: state,
     op: op,
-    site: site
+    site: site,
+    place_id: place_id
   })
 end
 
@@ -9318,6 +9957,16 @@ def snapshot_parse_field_row(fields: Vec[SnapshotField], line_no: Int) -> Result
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(v) then v
   end
+  # (fourth-audit P0-4) the typed persistent member lineage; a legacy row
+  # without the field parses back as None (the synthetic fallback render).
+  let ml_text = match snapshot_optional_string_field(fields.clone(), "ml".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let member_lineage = match snapshot_member_lineage_decoded(ml_text, owner_digest.clone(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
   let is_pub = match snapshot_bool_field(fields.clone(), "pub".to_string(), tag.clone(), line_no)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(v) then v
@@ -9328,6 +9977,7 @@ def snapshot_parse_field_row(fields: Vec[SnapshotField], line_no: Int) -> Result
     index: index,
     ty: ty,
     member_id: member_id,
+    member_lineage: member_lineage,
     is_pub: is_pub
   })
 end
@@ -9354,6 +10004,14 @@ def snapshot_parse_variant_row(fields: Vec[SnapshotField], line_no: Int) -> Resu
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(v) then v
   end
+  let ml_text = match snapshot_optional_string_field(fields.clone(), "ml".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let member_lineage = match snapshot_member_lineage_decoded(ml_text, owner_digest.clone(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
   let payload = match snapshot_params_decoded(payload_text, tag.clone(), line_no)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(v) then v
@@ -9363,7 +10021,8 @@ def snapshot_parse_variant_row(fields: Vec[SnapshotField], line_no: Int) -> Resu
     name: name,
     index: index,
     payload: payload,
-    member_id: member_id
+    member_id: member_id,
+    member_lineage: member_lineage
   })
 end
 
@@ -9428,6 +10087,14 @@ def snapshot_parse_trait_method_row(fields: Vec[SnapshotField], line_no: Int) ->
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(v) then v
   end
+  let ml_text = match snapshot_optional_string_field(fields.clone(), "ml".to_string(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
+  let member_lineage = match snapshot_member_lineage_decoded(ml_text, owner_digest.clone(), tag.clone(), line_no)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(v) then v
+  end
   let params = match snapshot_params_decoded(params_text, tag.clone(), line_no)
   when Result::Err(e) then return Result::Err(e)
   when Result::Ok(v) then v
@@ -9438,7 +10105,8 @@ def snapshot_parse_trait_method_row(fields: Vec[SnapshotField], line_no: Int) ->
     index: index,
     params: params,
     ret_type: ret_type,
-    member_id: member_id
+    member_id: member_id,
+    member_lineage: member_lineage
   })
 end
 
@@ -10208,6 +10876,40 @@ end
 # counts and the key-hydration reconstruction; mismatch rows name the
 # broken invariant.
 
+# A typed persistent member lineage fixture for the snapshot parse lane:
+# built exactly as the builder builds it (the owner declaration record +
+# kind + lineage through stable_member_lineage_id_of), so the "ml" render
+# round-trip is exercised against the real identity domain.
+def snapshot_parse_lane_member_lineage(owner_key: String, member_kind: String, lineage: Int) -> MemberLineageId
+  let decl = stable_decl_of_key(&owner_key)
+  stable_member_lineage_id_of(decl.package.clone(), decl, member_kind, lineage)
+end
+
+def snapshot_parse_lane_ml_num(ml: Option[MemberLineageId]) -> Int
+  match ml
+  when Option::Some(m) then m.lineage
+  when Option::None then -1
+  end
+end
+
+# (DMA keying refinement) The parse lane's typed place fixture: the
+# canonical "buf" place through the text-path constructor — a real
+# StablePlaceId whose identity words the row persists and whose text the
+# parser re-parses verbatim.
+def snapshot_parse_lane_dma_place() -> StablePlaceId
+  match stable_place_of_text("buf".to_string())
+  when Option::Some(p) then p
+  when Option::None then stable_place_id_from_digest("buf".to_string(), 0, 0)
+  end
+end
+
+def snapshot_parse_lane_ml_kind(ml: Option[MemberLineageId]) -> String
+  match ml
+  when Option::Some(m) then m.member_kind.clone()
+  when Option::None then "".to_string()
+  end
+end
+
 def snapshot_parse_lane_def(key: String) -> StableDefId
   stable_def_id_digested(key.clone(), stable_key_name_part(&key))
 end
@@ -10314,6 +11016,7 @@ pub def snapshot_parse_lane_snapshot() -> SemanticSnapshot
         index: 0,
         ty: "T[lane::Box[int]]".to_string(),
         member_id: "member::thing|field|f".to_string(),
+        member_lineage: Option::Some(snapshot_parse_lane_member_lineage("lane::Thing".to_string(), "field".to_string(), 5)),
         is_pub: true
       }
     ]),
@@ -10326,7 +11029,8 @@ pub def snapshot_parse_lane_snapshot() -> SemanticSnapshot
           SemanticParam { convention: AccessConvention::Let, ty: "int".to_string(), name: "a,b(c)" },
           SemanticParam { convention: AccessConvention::Let, ty: "T[lane::Box[int]]".to_string(), name: "".to_string() }
         ]),
-        member_id: "member::thing|variant|A".to_string()
+        member_id: "member::thing|variant|A".to_string(),
+        member_lineage: Option::Some(snapshot_parse_lane_member_lineage("lane::Thing".to_string(), "variant".to_string(), 7))
       }
     ]),
     callable_signatures: Vec::from([
@@ -10532,8 +11236,11 @@ pub def snapshot_parse_lane_snapshot() -> SemanticSnapshot
         kind: "branch-cleanup".to_string()
       }
     ]),
-    # (audit item 16, next tier) the DMA-ownership row carries adversarial
-    # text (quotes / backslashes / pipes) in its place and site.
+    # (audit item 16, next tier) the DMA-ownership rows carry adversarial
+    # text (quotes / backslashes / pipes) in their place and site; (DMA
+    # keying refinement) one row is LEGACY (no typed place key) and one
+    # carries the typed key, so the round trip exercises both the None
+    # fallback and the "pid" identity render.
     dma_ownership: Vec::from([
       DmaOwnershipFact {
         function: f.key.clone(),
@@ -10541,6 +11248,14 @@ pub def snapshot_parse_lane_snapshot() -> SemanticSnapshot
         state: DmaState::PinnedRead,
         op: "dma-pin-read".to_string(),
         site: "lane.tg:4\"2\\|\\".to_string()
+      },
+      DmaOwnershipFact {
+        function: f.key.clone(),
+        place: "buf".to_string(),
+        state: DmaState::PinnedWrite,
+        op: "dma-pin-write".to_string(),
+        site: "lane.tg:9".to_string(),
+        place_id: Option::Some(snapshot_parse_lane_dma_place())
       }
     ]),
     abi_surfaces: Vec::from([
@@ -10711,6 +11426,17 @@ pub def semantic_snapshot_parse_lane_check() -> Vec[String]
   snapshot_parse_lane_row(&mut out, "trait-methods-roundtrip",
     parsed.trait_methods.len() == 1 && parsed.trait_methods[0].name == "run,now" &&
     parsed.trait_methods[0].owner.key == show.key)
+  # (persistent identity integration) the TYPED member lineage rides the
+  # "ml" render: the field's kind|lineage and the variant's kind|lineage
+  # reconstruct through stable_member_lineage_id_of on parse.
+  snapshot_parse_lane_row(&mut out, "field-member-lineage-roundtrip",
+    parsed.fields.len() == 1 && parsed.fields[0].member_lineage.is_some() &&
+    snapshot_parse_lane_ml_kind(parsed.fields[0].member_lineage.clone()) == "field".to_string() &&
+    snapshot_parse_lane_ml_num(parsed.fields[0].member_lineage.clone()) == 5)
+  snapshot_parse_lane_row(&mut out, "variant-member-lineage-roundtrip",
+    parsed.variants.len() == 1 && parsed.variants[0].member_lineage.is_some() &&
+    snapshot_parse_lane_ml_kind(parsed.variants[0].member_lineage.clone()) == "variant".to_string() &&
+    snapshot_parse_lane_ml_num(parsed.variants[0].member_lineage.clone()) == 7)
   snapshot_parse_lane_row(&mut out, "concrete-types-roundtrip",
     parsed.concrete_types.len() == 1 && parsed.concrete_types[0].instance_key == "lane::Box<T[int]>" &&
     parsed.concrete_types[0].size == 8 && parsed.concrete_types[0].layout_status == "ok")
@@ -10796,11 +11522,27 @@ pub def semantic_snapshot_parse_lane_check() -> Vec[String]
   # (audit item 16, next tier) the DMA-ownership row round-trips with its
   # adversarial place/site text and its strict state word.
   snapshot_parse_lane_row(&mut out, "dma-roundtrip",
-    parsed.dma_ownership.len() == 1 &&
+    parsed.dma_ownership.len() == 2 &&
     parsed.dma_ownership[0].place == "b\\uf[0]|\"x" &&
     parsed.dma_ownership[0].state == DmaState::PinnedRead &&
     parsed.dma_ownership[0].op == "dma-pin-read" &&
     parsed.dma_ownership[0].site == "lane.tg:4\"2\\|\\")
+  # (DMA keying refinement) the legacy row (no "pid") parses back with the
+  # typed field None — the text key is the fallback, no place id is
+  # fabricated; the typed row's identity words and place text round-trip
+  # exactly (the "pid" render is the StablePlaceId digest-words render).
+  let legacy_dma_row = parsed.dma_ownership[0].clone()
+  snapshot_parse_lane_row(&mut out, "dma-legacy-place-id-none",
+    legacy_dma_row.place_id.is_none())
+  let want_place = snapshot_parse_lane_dma_place()
+  let typed_dma_row = parsed.dma_ownership[1].clone()
+  let typed_dma_place_ok = match typed_dma_row.place_id
+  when Option::Some(p) then
+    p.digest_hi == want_place.digest_hi && p.digest_lo == want_place.digest_lo
+  when Option::None then false
+  end
+  snapshot_parse_lane_row(&mut out, "dma-typed-place-id-roundtrip",
+    typed_dma_row.place == "buf" && typed_dma_place_ok)
   snapshot_parse_lane_row(&mut out, "abi-negative-size",
     parsed.abi_surfaces.len() > 0 && parsed.abi_surfaces[0].size == -1 &&
     parsed.abi_surfaces[0].alignment == -1)
@@ -10871,6 +11613,30 @@ def snapshot_lineage_row(inout out: Vec[String], name: String, ok: Bool) -> Unit
     out.push(name)
   end
   ()
+end
+
+# A hand-built member seed for the member-continuity lane (the typed
+# finalized state is not constructible from a lane).
+def snapshot_member_seed_fixture(owner_decl: StableDeclId, owner_key: String, member_kind: String, name: String, sig_text: String) -> SnapshotMemberSeed
+  let sd = snapshot_member_sig_digest(sig_text.clone())
+  SnapshotMemberSeed {
+    package_key: "".to_string(),
+    owner_key: owner_key,
+    owner_decl: owner_decl,
+    member_kind: member_kind,
+    name: name,
+    sig_digest_hi: sd.0,
+    sig_digest_lo: sd.1,
+    sig_text: sig_text
+  }
+end
+
+# The bound lineage number of a member scope key (-1 when unbound).
+def snapshot_member_view_num(view: MemberLineageView, key: String) -> Int
+  match member_lineage_view_get(view, key)
+  when Option::Some(m) then m.lineage
+  when Option::None then -1
+  end
 end
 
 def snapshot_lineage_same(a: StableDeclId, b: StableDeclId) -> Bool
@@ -10964,7 +11730,7 @@ pub def snapshot_lineage_lane_check() -> Vec[String]
   let cont_old = stable_lineage_scope_key("".to_string(), "a".to_string(), "Function".to_string(), "foo".to_string())
   let cont_new = stable_lineage_scope_key("".to_string(), "b".to_string(), "Function".to_string(), "renamed".to_string())
   let cont_lineage = stable_lineage_store_lineage_of(cont_store.clone(), "".to_string(), "a".to_string(), "Function".to_string(), "foo".to_string())
-  snapshot_lineage_row(&mut out, "lineage-lookup-of-structural-key", cont_lineage == e1[0].lineage)
+  snapshot_lineage_row(&mut out, "lineage-lookup-of-structural-key", cont_lineage == e1[0].lineage.lineage)
   stable_lineage_store_add_continuation(&mut cont_store, cont_lineage, cont_old, cont_new, "rename".to_string())
   let e2 = snapshot_stamp_decls(&mut cont_store, Vec::from([
     snapshot_lineage_seed("b".to_string(), "Function".to_string(), "renamed".to_string(), "fn(int,int)->int".to_string())
@@ -11136,6 +11902,102 @@ pub def snapshot_lineage_lane_check() -> Vec[String]
     "attr".to_string(), "test_renamed".to_string(), Vec::new())
   snapshot_lineage_row(&mut out, "test-id-rename-fresh",
     !(t3_id.digest_hi == t2_id.digest_hi && t3_id.digest_lo == t2_id.digest_lo))
+
+  # ———— (13) PERSISTENT MONO INSTANCE IDENTITY (persistent identity
+  # integration): under the persistent path a rename/move with an explicit
+  # DeclContinuation keeps the StructuralInstanceId byte-identical; under
+  # the ephemeral structural path the registration-scope identity re-keys.
+  # This lane drives the identity layer directly (the full resolver/typed
+  # Program is not constructible from a test lane), so the check is the
+  # EXACT preimage the mono cache binds and hashes: the persistent
+  # StableDeclId + the canonical typed args.
+  var mono_store = stable_lineage_store_new()
+  let g1 = snapshot_stamp_decls(&mut mono_store, Vec::from([
+    snapshot_lineage_seed("a".to_string(), "Function".to_string(), "generic".to_string(), "fn()->unit".to_string())
+  ]))
+  let inst_args = canonical_args_of_typed(generic_args_of_types(Vec::from([Type::Int])))
+  let inst_persistent_1 = structural_instance_id_of(g1[0].clone(), inst_args.clone())
+  var mono_view = callable_lineage_view_new()
+  callable_lineage_view_bind(&mut mono_view, "a::generic".to_string(), g1[0].clone())
+  snapshot_lineage_row(&mut out, "lineage-view-binds-persistent-decl",
+    callable_lineage_view_len(mono_view.clone()) == 1 &&
+    callable_lineage_view_get(mono_view.clone(), "a::generic".to_string()).is_some())
+  # the explicit rename/move a::generic -> b::generic.
+  let mono_old = stable_lineage_scope_key("".to_string(), "a".to_string(), "Function".to_string(), "generic".to_string())
+  let mono_new = stable_lineage_scope_key("".to_string(), "b".to_string(), "Function".to_string(), "generic".to_string())
+  stable_lineage_store_add_continuation(&mut mono_store, g1[0].lineage.lineage, mono_old, mono_new, "rename".to_string())
+  let g2 = snapshot_stamp_decls(&mut mono_store, Vec::from([
+    snapshot_lineage_seed("b".to_string(), "Function".to_string(), "generic".to_string(), "fn()->unit".to_string())
+  ]))
+  let inst_persistent_2 = structural_instance_id_of(g2[0].clone(), inst_args.clone())
+  snapshot_lineage_row(&mut out, "persistent-rename-keeps-instance-id",
+    inst_persistent_1.digest_hi == inst_persistent_2.digest_hi &&
+    inst_persistent_1.digest_lo == inst_persistent_2.digest_lo)
+  snapshot_lineage_row(&mut out, "persistent-rename-keeps-callable-digest",
+    inst_persistent_2.callable.digest_hi == g1[0].digest_hi &&
+    inst_persistent_2.callable.digest_lo == g1[0].digest_lo)
+  # the EPHEMERAL (structural) path: the registration-scope identity of the
+  # OLD spelling and the NEW spelling are different callable records, so the
+  # structural instance id re-keys (the documented ephemeral behavior).
+  let struct_a = stable_structural_callable_decl_of("".to_string(), "a".to_string(), "fn".to_string(), "generic".to_string(), "a::generic".to_string())
+  let struct_b = stable_structural_callable_decl_of("".to_string(), "b".to_string(), "fn".to_string(), "generic".to_string(), "b::generic".to_string())
+  let inst_ephemeral_1 = structural_instance_id_of(struct_a, inst_args.clone())
+  let inst_ephemeral_2 = structural_instance_id_of(struct_b, inst_args.clone())
+  snapshot_lineage_row(&mut out, "ephemeral-rename-rekeys-instance-id",
+    !(inst_ephemeral_1.digest_hi == inst_ephemeral_2.digest_hi &&
+      inst_ephemeral_1.digest_lo == inst_ephemeral_2.digest_lo))
+
+  # ———— (14) MEMBER LINEAGE continuity (P0-4): an unrelated insertion
+  # keeps a member's lineage, an explicit member continuation keeps it
+  # across a rename, and a rename WITHOUT one is removed+created. The
+  # owner locator is the owner declaration's identity-words render, so the
+  # owner's own rename/move never re-keys its members.
+  var member_store = stable_lineage_store_new()
+  let owner_decl = g1[0].clone()
+  let owner_key = snapshot_lineage_owner_key(&owner_decl)
+  let _mem1 = snapshot_stamp_members(&mut member_store, Vec::from([
+    snapshot_member_seed_fixture(owner_decl.clone(), owner_key.clone(), "field", "a", "i64"),
+    snapshot_member_seed_fixture(owner_decl.clone(), owner_key.clone(), "field", "b", "i64")
+  ]))
+  let mem2 = snapshot_stamp_members(&mut member_store, Vec::from([
+    snapshot_member_seed_fixture(owner_decl.clone(), owner_key.clone(), "field", "x", "i64"),
+    snapshot_member_seed_fixture(owner_decl.clone(), owner_key.clone(), "field", "a", "i64"),
+    snapshot_member_seed_fixture(owner_decl.clone(), owner_key.clone(), "field", "b", "i64")
+  ]))
+  let a_key = stable_member_scope_key("".to_string(), owner_key.clone(), "field".to_string(), "a".to_string())
+  let b_key = stable_member_scope_key("".to_string(), owner_key.clone(), "field".to_string(), "b".to_string())
+  let x_key = stable_member_scope_key("".to_string(), owner_key.clone(), "field".to_string(), "x".to_string())
+  let a_num = snapshot_member_view_num(mem2.clone(), a_key.clone())
+  let b_num = snapshot_member_view_num(mem2.clone(), b_key.clone())
+  let x_num = snapshot_member_view_num(mem2.clone(), x_key.clone())
+  snapshot_lineage_row(&mut out, "member-insertion-keeps-lineage",
+    a_num > 0 && b_num > 0 && a_num != b_num)
+  snapshot_lineage_row(&mut out, "member-insert-is-fresh",
+    x_num > 0 && x_num != a_num && x_num != b_num)
+  # an explicit member rename continuation claims the recorded lineage.
+  let old_loc = stable_member_scope_key("".to_string(), owner_key.clone(), "field".to_string(), "b".to_string())
+  let new_loc = stable_member_scope_key("".to_string(), owner_key.clone(), "field".to_string(), "renamed_b".to_string())
+  stable_lineage_store_member_add_continuation(&mut member_store, b_num, old_loc, new_loc, "rename".to_string())
+  let mem3 = snapshot_stamp_members(&mut member_store, Vec::from([
+    snapshot_member_seed_fixture(owner_decl.clone(), owner_key.clone(), "field", "a", "i64"),
+    snapshot_member_seed_fixture(owner_decl.clone(), owner_key.clone(), "field", "renamed_b", "i64")
+  ]))
+  let renamed_key = stable_member_scope_key("".to_string(), owner_key.clone(), "field".to_string(), "renamed_b".to_string())
+  snapshot_lineage_row(&mut out, "member-rename-continuation-keeps-lineage",
+    snapshot_member_view_num(mem3.clone(), renamed_key.clone()) == b_num)
+  # a rename WITHOUT a continuation is removed+created.
+  let mem4 = snapshot_stamp_members(&mut member_store, Vec::from([
+    snapshot_member_seed_fixture(owner_decl.clone(), owner_key.clone(), "field", "a", "i64"),
+    snapshot_member_seed_fixture(owner_decl.clone(), owner_key.clone(), "field", "unrelated", "i64")
+  ]))
+  let unrelated_key = stable_member_scope_key("".to_string(), owner_key.clone(), "field".to_string(), "unrelated".to_string())
+  let unrelated_num = snapshot_member_view_num(mem4.clone(), unrelated_key.clone())
+  snapshot_lineage_row(&mut out, "member-rename-without-continuation-fresh",
+    unrelated_num > 0 && unrelated_num != b_num && unrelated_num != a_num)
+  # the owner's own rename/move does NOT re-key its members: the view key is
+  # the owner IDENTITY WORDS render, stable across the owner's spelling.
+  snapshot_lineage_row(&mut out, "member-owner-locator-is-identity-words",
+    owner_key == (owner_decl.digest_hi.to_string() + "-" + owner_decl.digest_lo.to_string()))
 
   out
 end
