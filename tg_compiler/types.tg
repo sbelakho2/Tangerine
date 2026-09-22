@@ -11,11 +11,11 @@ use std::collections::{Vec, Map, Set}
 use std::fs::{read_file}
 use tg_compiler::token::{Span, span_dummy, ParsedIntegerLiteral, ParsedFloatLiteral, parsed_int_to_host, parsed_int_fits_host, parsed_int_decimal, parsed_int_is_zero, parsed_float_f32_overflow, parsed_float_f64_overflow}
 use tg_compiler::lexer::{tokenize}
-use tg_compiler::parser::{parse, DiagnosticSemanticData, TypeMismatchData, TraitFailureData, CapabilityDiagnosticData}
+use tg_compiler::parser::{parse, DiagnosticSemanticData, EffectViolationData, TypeMismatchData, TraitFailureData, CapabilityDiagnosticData}
 use tg_compiler::resolver::{ResolvedNames, def_id_of_item, def_kind_of, module_qualified_key}
 use tg_compiler::ids::{
   DefId, DefKind, FieldId, ModuleId, TypeId, TraitId, GenericParamId, GenericParamTable,
-  CallableId, InstanceId, GenericArg, ConstValue, VariantId, LocalId, AccessRoot, ClosureId, EffectId, EffectRegistry,
+  CallableId, InstanceId, GenericArg, ConstValue, VariantId, LocalId, NodeId, AccessRoot, ClosureId, EffectId, EffectRegistry,
   IntrinsicId, FinalizerKind,
   generic_param_table_new, generic_param_id_numeric, generic_param_id_eq,
   fresh_synthetic_owner, intern_generic_param, generic_param_name_of,
@@ -24,14 +24,15 @@ use tg_compiler::ids::{
   effect_registry_new, intern_module_effect,
   effect_id_eq, effect_name_of_id,
   EFFECT_IO, EFFECT_FILE, EFFECT_ASYNC,
-  SYNTHETIC_MODULE_ITEM_FALLBACK, SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK
+  SYNTHETIC_MODULE_ITEM_FALLBACK, SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK, SYNTHETIC_MODULE_INTRINSIC
 }
 use tg_compiler::ast::{
-  Program, Item, ItemKind, FunctionDecl, EnumDecl, ImplDecl,
+  Program, Module, Item, ItemKind, FunctionDecl, FnBody, EnumDecl, ImplDecl,
   AstPath, ExternItem, NominalKind, AccessConvention,
-  Attribute,
+  Attribute, attribute_named,
   TypeExpr, TypeExprKind, Param, GenericParam, GenericParamKind, ConstRange,
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind,
+  BinOp, UnOp, GuardElse, IfStmt, MatchExpr, ClosureParam, WherePredicate,
   BudgetAnnotation, LayoutAttrs,
   expr_is_place_like
 }
@@ -4119,6 +4120,18 @@ struct MethodInfo
   # ["U"] for cast[U] — the ids, not the names; the param-name table holds
   # the display names).
   generic_params: Vec[GenericParamId]
+ # the method DECLARATION's owner DefId (impl_method_owner_def — the
+  # resolver's registered method DefId, or the deterministic module -3
+  # fallback): the owner under which every generic parameter of this
+  # method — the declared ones AND the implicit argument-position
+  # `impl Trait`/`dyn Trait` binders interned by
+  # resolve_declared_param_type — is interned. The conformance
+  # comparison verifies an impl-side binder's identity against THIS owner
+  # (is_implicit_param_binder_of): the contract's binder and the impl's
+  # binder are different GenericParamIds by the seed's per-declaration
+  # keying, so identity is (owner, canonical "$impl$<slot>" name), never
+  # a bare name/position match.
+  owner: DefId
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -4162,6 +4175,17 @@ end
 # the SAME id trait_id_for resolves for the impl side, so two same-named
 # traits in different modules validate against their own declarations).
 struct TraitContract
+ # the trait DECLARATION's owner DefId (collect_type_def's ItemTrait arm:
+  # t_owner = type_decl_owner_def) — the owner under which the trait-level
+  # parameters AND the contract methods' implicit argument-position
+  # `impl Trait`/`dyn Trait` binders are interned (idempotent per
+  # (owner, "$impl$<param index>"), so the MethodSig loop and the contract
+  # loop carry the same ids). The conformance comparison verifies a
+  # contract-side binder's identity against THIS owner
+  # (is_implicit_param_binder_of); the builtin registrations carry the
+  # intrinsic synthetic owner, whose payloads never carry an `impl Trait`
+  # binder, so the check never fires for them.
+  owner: DefId
   generic_params: Vec[GenericParamId]
   self_param_ids: Vec[GenericParamId]
   assoc_types: Vec[String]
@@ -5918,6 +5942,17 @@ def typed_place_of(env: TypeEnv, expr: Expr) -> Option[TypedPlace]
     when Option::None then Option::None
     end
   when ExprKind::ExprAccess(inner) then typed_place_of(env, *inner.get())
+  # (`?` subject — the place of the transfer): the postfix `?` materializes
+  # its subject into a fresh MIR temp with a whole-place move (mir.tg
+  # lr_try_op's `push_assign(sid, MirMove(subj_op))`) and the resource
+  # checker transfer_consumes the subject (resource_check.tg:7488), so the
+  # subject is CONSUMED while its place identity is unchanged: the typed
+  # place of `x?` is the typed place of `x`. The consuming sites (the
+  # `?`-subject record in check_expr_expected; a projected place reached
+  # THROUGH a `?` — `x?.field`, a chained `x??`) derive the chain the move
+  # mask keys on from this arm. A non-place subject (a call, a literal)
+  # still answers Option::None.
+  when ExprKind::ExprTry(inner) then typed_place_of(env, *inner.get())
   when _ then Option::None
   end  end
 end
@@ -6468,6 +6503,7 @@ struct TypedProgram
   # pattern node id. The two domains never collide.
   param_binding_resolutions: Map[String, Vec[Int]]
   pattern_binding_resolutions: Map[Int, Int]
+  pattern_variant_resolutions: Map[Int, (Int, Int)]
  # (partial moves — place-level state): root semantic LocalId -> joined
   # field path -> per-place move state (Live/Consumed) — the frame's
   # per-field states for the projected places, recorded by the checker's
@@ -7033,6 +7069,11 @@ def builtin_trait_contract(env: TypeEnv, methods: Vec[MethodSig]) -> TraitContra
     mi = mi + 1
   end
   TraitContract {
+    # the builtin registrations have no source declaration owner: the
+    # intrinsic synthetic owner stands in (the contract's payloads never
+    # carry an `impl Trait` binder, so the conformance binder check never
+    # matches it).
+    owner: DefId { module: ModuleId { id: SYNTHETIC_MODULE_INTRINSIC }, index: 0 },
     generic_params: generic_params,
     self_param_ids: self_param_ids,
     assoc_types: assoc_types,
@@ -7837,6 +7878,37 @@ def module_path_of_item(program: Program, module_ptr: Int, item_idx: Int) -> (Ve
   panic("internal error: item index " + item_idx.to_string() + " is out of bounds for Program.items (len " + program.items.len().to_string() + ") — the compile path never fabricates a root-module owner")
 end
 
+# (declaration-first registration fill — FINDING 12 extraction): fill the
+# module-qualified forward-declaration placeholder this module
+# pre-registered for a DISTINCT module-local declaration
+# (preregister_declared_type) when store_type_def reaches the declaration's
+# own registration. The placeholder's TypeId IS the declaration's identity
+# (the member types were resolved against it), so the declaration's shape
+# and the resolver def association must land on that SAME entry: the fill
+# replaces it in place and re-points type_id_index at it. The shared guard
+# of the two store_type_def call sites: a module-qualified entry for this
+# key exists AND its id is this declaration's own id; anything else (an
+# entry for another id — a pass-1 placeholder or a foreign registration —
+# or no qualified entry) leaves env untouched. Returns true when the
+# placeholder was filled. Caller outcomes: the empty-stub path returns
+# unconditionally (filled or not — the no-op registration either way), the
+# fresh-TypeId path returns only on a fill and otherwise mints the fresh
+# id below.
+def fill_preregistered_type_def(inout env: TypeEnv, inout td: TypeDef, module_path: Vec[String]) -> Bool
+  match env.module_type_names.get(module_qualified_key(module_path, &td.name))
+  when Option::Some(q_idx) then
+    if env.type_list[q_idx].id.id == td.id.id then
+      # hoisted before the set: the set consumes td.
+      let td_id = td.id.id
+      env.type_list.set(q_idx, td)
+      env.type_id_index.insert(td_id, q_idx)
+      return true
+    end
+  when Option::None then ()
+  end
+  false
+end
+
 # store a collected type definition, REJECTING
 # duplicate definitions instead of merging same-named distinct types. The
 # NOMINAL identity of a type is its DECLARATION: two declarations with the
@@ -7926,6 +7998,13 @@ def store_type_def(inout env: TypeEnv, inout td: TypeDef, span: Span, module_pat
         when _ then ()
         end
         if !empty_refines_opaque then
+          # (declaration-first registration): when this module pre-registered
+          # its own placeholder for a DISTINCT module-local declaration, the
+          # empty stub IS that declaration's shape — fill the placeholder in
+          # place so its TypeId (already the member types' identity) and the
+          # resolver def association land on the declaration, instead of the
+          # no-op return that would leave the pre-registered entry shapeless.
+          let _ = fill_preregistered_type_def(env, td, module_path)
           return
         end
       end
@@ -8015,6 +8094,17 @@ def store_type_def(inout env: TypeEnv, inout td: TypeDef, span: Span, module_pat
       # (the collect path reused the bare first-wins id, which must not leak
       # into a second type). Otherwise it is a same-module duplicate.
       if has_qualified_type_entry(env, &td.name) && !module_is_first_wins_owner(env, &td.name, module_path) then
+        # (declaration-first registration): the collect pass pre-registered
+        # this module-local declaration's own TypeId — a forward-declaration
+        # placeholder under the module-qualified key — BEFORE its member
+        # types were resolved, so a self-referential member type resolved to
+        # the declaration itself. Fill that placeholder IN PLACE: the member
+        # types reference exactly this TypeId, and minting a second fresh id
+        # here would orphan them (the field/variant types would name a
+        # declaration no key ever resolves).
+        if fill_preregistered_type_def(env, td, module_path) then
+          return
+        end
         let fresh_id = TypeId { id: env.type_id_counter }
         env.type_id_counter = env.type_id_counter + 1
         let own_td = TypeDef {
@@ -8076,11 +8166,15 @@ def pop_scope(inout env: TypeEnv) -> Unit
 end
 
 def bind_var(inout env: TypeEnv, name: String, ty: Type) -> Unit
+  bind_var_typed(env, name, ty.clone(), ty)
+end
+
+def bind_var_typed(inout env: TypeEnv, name: String, scope_ty: Type, binding_ty: Type) -> Unit
   if !env.scopes.is_empty() then
     let idx = env.scopes.len() - 1
-    env.scopes[idx].insert(name.clone(), ty.clone())
+    env.scopes[idx].insert(name.clone(), scope_ty.clone())
     env.local_ids[idx].insert(name.clone(), env.local_id_counter)
-    env.typed_local_bindings.insert(env.local_id_counter, LocalBinding { name: name.clone(), ty: ty })
+    env.typed_local_bindings.insert(env.local_id_counter, LocalBinding { name: name.clone(), ty: binding_ty })
     # (gate diagnostics): the binding's owning item rides a parallel map
     # (the LocalBinding record and its channel stay unchanged — see the
     # TypeEnv field note); the gate renders owner + name/id for a local
@@ -10134,7 +10228,7 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
       while j < f.params.len() do
         let p = f.params[j]
         let resolved_ty = match p.ty
-        when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
+        when Option::Some(ty_expr) then resolve_declared_param_type(env, &f_owner, j, &ty_expr, false)
         when Option::None then fresh_type_var(env)
         end
         param_types.push(ParamType { ty: resolved_ty, convention: p.convention })
@@ -10526,6 +10620,80 @@ def is_power_of_two_int(n: Int) -> Bool
   n > 0 && (n & (n - 1)) == 0
 end
 
+# Whether record_module_type_name would actually record the module-qualified
+# entry for this (module_path, name) declaration — the resolver's
+# module_symbols DefKind::TypeName/Trait guard, replicated so the
+# declaration-first pre-registration below never pushes a placeholder that
+# no qualified key would ever reference.
+def can_record_module_type_name(env: TypeEnv, name: String, module_path: Vec[String]) -> Bool
+  match env.resolutions
+  when Option::Some(res) then
+    let key = module_qualified_key(module_path, &name)
+    match res.module_symbols.get(&key)
+    when Option::Some(did) then
+      match def_kind_of(&res, &did)
+      when Option::Some(k) then k == DefKind::TypeName || k == DefKind::Trait
+      when Option::None then false
+      end
+    when Option::None then false
+    end
+  when Option::None then false
+  end
+end
+
+# (declaration-first registration): register a nominal declaration's OWN
+# module-qualified identity BEFORE its member types are resolved, so a
+# SELF-REFERENTIAL member type resolves to the declaration itself — the
+# seed's model (the nominal is registered with an empty shape first and the
+# field/variant types are resolved against that registration). Without it,
+# collect_type_def resolved the fields BEFORE store_type_def recorded the
+# module-qualified entry, so a `struct Error { cause: Option[Box[Error]] }`
+# in a module that is not the bare name's first-wins owner resolved its
+# `Error` to the FIRST-WINS declaration (std/core's `trait Error`): the
+# stored field type was the foreign identity and the MIR materialized the
+# self-referential field/return as the wrong type ("named:276 into
+# named:154").
+#
+# A declaration whose bare name is first-wins-owned by this module (or by
+# no module at all — the builtin/intrinsic adoption, or a pass-1
+# placeholder) needs no placeholder: the bare entry IS the declaration's
+# identity and the ordinary bare-name resolution already finds it. Only a
+# genuinely DISTINCT module-local declaration — a module-qualified entry
+# for the name exists and this module is not the first-wins owner
+# (store_type_def's fresh-TypeId path) — is pre-registered: a forward-
+# declaration placeholder carrying the declaration's own fresh TypeId,
+# recorded under the module-qualified key ONLY (the bare first-wins entry
+# is untouched). store_type_def fills that placeholder in place, so the
+# member types and the stored definition share the SAME TypeId.
+def preregister_declared_type(inout env: TypeEnv, name: String, def_kind: TypeDefKind, generic_params: Vec[GenericParamId], module_path: Vec[String]) -> Unit
+  let key = module_qualified_key(module_path, &name)
+  if env.module_type_names.contains_key(&key) then
+    # already registered (a previous collection of this declaration or a
+    # pass-1 placeholder) — its id is the declaration's identity.
+    return
+  end
+  if !has_qualified_type_entry(env, &name) || module_is_first_wins_owner(env, &name, module_path) then
+    return
+  end
+  if !can_record_module_type_name(env, name.clone(), module_path) then
+    return
+  end
+  let fresh_id = TypeId { id: env.type_id_counter }
+  env.type_id_counter = env.type_id_counter + 1
+  let placeholder = TypeDef {
+    id: fresh_id,
+    name: name.clone(),
+    def_kind: def_kind,
+    generic_params: generic_params,
+    kind: TypeKind::Value
+    def: Option::None
+  }
+  let new_idx = env.type_list.len()
+  env.type_id_index.insert(fresh_id.id, new_idx)
+  env.type_list.push(placeholder)
+  record_module_type_name(env, name.clone(), new_idx, module_path)
+end
+
 def collect_enum_type_def(inout env: TypeEnv, e: EnumDecl, module_path: Vec[String]) -> Unit
   push_scope(env)
   # the enum interns its generic parameters in declaration order
@@ -10534,6 +10702,12 @@ def collect_enum_type_def(inout env: TypeEnv, e: EnumDecl, module_path: Vec[Stri
   let owner = type_decl_owner_def(env, &e.name, module_path)
   let param_ids = intern_generic_params(env, &owner, &e.generic_params)
   bind_generic_params(env, &e.generic_params, &param_ids)
+
+  # (declaration-first registration): the enum's own module-qualified
+  # identity is registered BEFORE the variant payload types are resolved, so
+  # a self-referential payload (`enum Json { Arr(Array[Json]) }`) resolves
+  # to this declaration, never to a same-named first-wins declaration.
+  preregister_declared_type(env, e.name.clone(), TypeDefKind::Enum(Vec::new()), param_ids.clone(), module_path)
 
   let id = match get_type_id_by_qualified_name(env, e.name.clone(), module_path)
   when Option::Some(existing_id) then existing_id
@@ -10619,6 +10793,13 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
     let s_param_ids = intern_generic_params(env, &s_owner, &s.generic_params)
     bind_generic_params(env, &s.generic_params, &s_param_ids)
 
+    # (declaration-first registration): the struct's own module-qualified
+    # identity is registered BEFORE the field types are resolved, so a
+    # self-referential field (`struct Error { cause: Option[Box[Error]] }`)
+    # resolves to this declaration, never to a same-named first-wins
+    # declaration of another module (std/core's `trait Error`).
+    preregister_declared_type(env, s.name.clone(), TypeDefKind::Struct(Vec::new()), s_param_ids.clone(), module_path)
+
     # Reuse pre-registered ID if available
     let id = match get_type_id_by_qualified_name(env, s.name.clone(), module_path)
     when Option::Some(existing_id) then existing_id
@@ -10701,6 +10882,19 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
     let t_param_ids = intern_generic_params(env, &t_owner, &t.generic_params)
     bind_generic_params(env, &t.generic_params, &t_param_ids)
 
+    # (declaration-first registration): the trait's own module-qualified
+    # identity is registered BEFORE its method signatures are resolved, so a
+    # self-referential method signature resolves to this declaration, never
+    # to a same-named first-wins trait of another module. The identical
+    # no-op guard as the struct/enum sites: only a genuinely DISTINCT
+    # module-local declaration (a module-qualified entry for the name exists
+    # and this module is not the first-wins owner) is pre-registered — a
+    # first-wins/builtin trait keeps its bare entry untouched. store_type_def
+    # fills the placeholder in place, so the method signatures and the
+    # stored definition share the SAME TypeId (the trait's final declaration
+    # identity decl_tid).
+    preregister_declared_type(env, t.name.clone(), TypeDefKind::Trait(Vec::new()), t_param_ids.clone(), module_path)
+
     let id = match get_type_id_by_qualified_name(env, t.name.clone(), module_path)
     when Option::Some(existing_id) then existing_id
     when Option::None then
@@ -10715,9 +10909,17 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
       var j = 0
       while j < t.methods[i].sig.params.len() do
         let p = t.methods[i].sig.params[j]
+        # (impl Trait param model — the trait side): the trait-method
+        # parameter uses the SAME conversion as the free-function/impl-
+        # method sites — an argument-position `impl Trait`/`dyn Trait`
+        # parameter becomes an implicit binder interned under the TRAIT's
+        # owner (t_owner), so a trait declaration that erases a parameter
+        # carries a binder like the impl side. register_bound is false:
+        # this is a signature-registration pass (the trait has no
+        # body-checking pass in this checker).
         let resolved_ty = match p.ty
         when Option::Some(ty_expr) then
-          resolve_type_expr(env, &ty_expr)
+          resolve_declared_param_type(env, &t_owner, j, &ty_expr, false)
         when Option::None then
           fresh_type_var(env)
         end
@@ -10752,9 +10954,17 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
       var cj = 0
       while cj < t.methods[ci].sig.params.len() do
         let p = t.methods[ci].sig.params[cj]
+        # (impl Trait param model — the contract side): the SAME
+        # conversion as the MethodSig loop above, under the same trait
+        # owner — the interning is idempotent per (owner, "$impl$<param
+        # index>"), so both loops carry the SAME binder id and the
+        # contract the impl is validated against carries the erased
+        # parameter's binder (check_impl_method_conformance recognizes it
+        # by declaration-relative identity: the trait owner + the
+        # contract's parameter slot — see is_implicit_param_binder_of).
         let resolved_ty = match p.ty
         when Option::Some(ty_expr) then
-          resolve_type_expr(env, &ty_expr)
+          resolve_declared_param_type(env, &t_owner, cj, &ty_expr, false)
         when Option::None then
           fresh_type_var(env)
         end
@@ -10849,6 +11059,11 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
       assoc_names.push(at.name.clone())
     end
     env.trait_contracts.insert(decl_tid.id, TraitContract {
+      # the declaration owner the trait-level parameters AND this
+      # contract's implicit `impl Trait` binders were interned under
+      # (t_owner — the SAME owner the contract loop above passed to
+      # resolve_declared_param_type).
+      owner: t_owner.clone(),
       generic_params: gen_params,
       self_param_ids: Vec::new(),
       assoc_types: assoc_names,
@@ -12186,6 +12401,71 @@ def intern_generic_params(inout env: TypeEnv, owner: DefId, names: Vec[GenericPa
   ids
 end
 
+# (impl Trait param model — the seed's anonymous-signature binders): a
+# parameter declared DIRECTLY as a trait is the argument-position
+# `impl Trait` (the parser desugars `impl Trait` — and `dyn Trait` — to the
+# trait type itself; see parse_type's Impl arm). The seed models it as an
+# ANONYMOUS implicit generic parameter of the function: an appended declared
+# binder whose trait bound is the erased trait reference, never a value of
+# the trait type (there are no trait objects in the language model). The
+# checker interns the binder under the declaration's own owner — idempotent
+# per (owner, "$impl$<param index>"), so every pass and every re-run
+# reconstructs the SAME id — appends it after the declared parameters (the
+# owner's interned count), records the bound so method calls on the binder
+# resolve through the trait contract (resolve_method_type's Param-receiver
+# section), and returns the binder as the parameter's type. The MIR then
+# materializes a type-parameter param/local — monomorphization substitutes
+# the concrete implementor at each call site — instead of a trait-typed
+# value, which has no MIR identity ("Named type with non-canonical TypeId
+# <trait>" — std/taint.tg's `validator: impl Validator[T, Clean]`).
+# `register_bound` is false in the signature-only registration passes: the
+# bound is registered exactly once, in the body-checking pass (a second
+# registration would duplicate the bound in env.param_bounds).
+def resolve_declared_param_type(inout env: TypeEnv, owner: DefId, param_index: Int, te: TypeExpr, register_bound: Bool) -> Type
+  let resolved = resolve_type_expr(env, &te)
+  match resolved
+  when Type::Adt(tid, _) then
+    match get_type_by_id_ref(env, &tid)
+    when Option::Some(td) then
+      if type_def_is_trait(td) then
+        let binder = intern_generic_param(&mut env.generic_param_table, owner, "$impl$" + param_index.to_string())
+        if register_bound then
+          let bkey = generic_param_id_numeric(&binder)
+          env.param_bounds.remove(&bkey)
+          record_param_trait_bound(env, binder.clone(), te)
+        end
+        return Type::Param(binder)
+      end
+    when Option::None then ()
+    end
+    resolved
+  when _ then resolved
+  end
+end
+
+# The full declaration-order generic parameter id list of an owner: the
+# declared ids followed by the checker's implicit binders (the
+# argument-position `impl Trait` parameters), read from the interning
+# table's per-owner count — intern_generic_param appended the binders after
+# the declared parameters, so the table count IS the merged declaration
+# order. The MIR/mono record (env.generic_param_ids) and the merged
+# impl-method list use this list; the declared-only lists (param bounds,
+# const-parameter scopes) keep their own argument.
+def all_generic_param_ids(env: TypeEnv, owner: DefId, declared: Vec[GenericParamId]) -> Vec[GenericParamId]
+  var ids = declared.clone()
+  let owner_key = def_id_numeric(&owner)
+  let count = match env.generic_param_table.counts.get(owner_key)
+  when Option::Some(c) then c as Int
+  when Option::None then 0
+  end
+  var i = ids.len()
+  while i < count do
+    ids.push(generic_param_id_at(owner, i))
+    i = i + 1
+  end
+  ids
+end
+
 # ———————————————————————————————————————————————————————————————
 # Generic-parameter trait bounds 
 # ———————————————————————————————————————————————————————————————
@@ -12643,7 +12923,7 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   while i < f.params.len() do
     let p = f.params[i]
     let ty = match p.ty
-    when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
+    when Option::Some(ty_expr) then resolve_declared_param_type(env, &f_owner, i, &ty_expr, true)
     when Option::None then fresh_type_var(env)
     end
     bind_var(env, p.name, ty)
@@ -12652,11 +12932,15 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
     i = i + 1
   end
   env.param_binding_resolutions.insert(owner_key, param_local_ids)
- # record the function's generic parameter ids under the SAME
+  # record the function's generic parameter ids under the SAME
   # owner key (the MIR builder reconstructs the lowered Type::Param ids
   # from this record, paired positionally with the lowered declaration's
-  # generic list — the substs-order contract).
-  env.generic_param_ids.insert(owner_key, fn_param_ids.clone())
+  # generic list — the substs-order contract). (impl Trait param model):
+  # the implicit binders interned by the parameter loop are part of the
+  # declaration's generic parameter list — append them (the owner's
+  # interned count) so the MIR/mono see the declaration-order list
+  # [declared..., implicit...].
+  env.generic_param_ids.insert(owner_key, all_generic_param_ids(env, f_owner.clone(), fn_param_ids.clone()))
   
   # Get expected return type
   let ret_type = match f.ret_type
@@ -12940,6 +13224,33 @@ def contract_types_conform(inout env: TypeEnv, impl_ty: Type, contract_ty: Type)
   contract_unify_probe(env, impl_ty, contract_ty)
 end
 
+# (impl Trait param model — binder identity): an argument-position
+# `impl Trait`/`dyn Trait` parameter is an implicit binder interned by
+# resolve_declared_param_type's owner-derived rule
+# (owner, "$impl$<param index>") under the DECLARING owner. The trait
+# contract's binder and the impl method's binder are therefore DIFFERENT
+# GenericParamIds (different owners) for the SAME declaration position:
+# the seed keys its anonymous signature binders per DECLARATION
+# (resolve_signature memoizes them in anon_sig_ids under the signature
+# key — the trait method's `Trait::method` vs the impl method's
+# `Target::method`), so no shared id exists to align the two sides to.
+# The conformance comparison therefore recognizes each side by its
+# DECLARATION-RELATIVE IDENTITY: the type must be exactly the implicit
+# binder interned for the compared declaration — its owner must BE that
+# declaration's owner, and its canonical name must be the declaration's
+# parameter slot (`decl_index`: the contract index, or the impl's
+# declaration index after the receiver normalization). The interning is
+# idempotent per (owner, name), so (owner, canonical name) IS the
+# GenericParamId identity; a bare name match is never enough.
+def is_implicit_param_binder_of(env: TypeEnv, ty: Type, owner: DefId, decl_index: Int) -> Bool
+  match ty
+  when Type::Param(gpid) then
+    gpid.owner.module.id == owner.module.id && gpid.owner.index == owner.index &&
+      generic_param_name_of(&env.generic_param_table, &gpid) == "$impl$" + decl_index.to_string()
+  when _ then false
+  end  end
+end
+
 # (impl conformance): the per-method signature comparison — parameter
 # count (d), parameter types (e), access conventions (f), return type (g),
 # method generic arity (h), method generic bounds (i), effects (k) and
@@ -13025,7 +13336,23 @@ def check_impl_method_conformance(inout env: TypeEnv, contract: TraitContract, c
       valid = false
     end
     let contract_ty = contract_ty_subst(env, contract, trait_args, self_type, assoc_types, &cpt.ty)
-    if !contract_types_conform(env, ipt.ty.clone(), contract_ty.clone()) then
+    var param_conforms = contract_types_conform(env, ipt.ty.clone(), contract_ty.clone())
+    if !param_conforms then
+      # (impl Trait param model — identity-aware binder correspondence):
+      # the contract's implicit binder and the impl's implicit binder are
+      # DIFFERENT interned ids (the contract's under the trait owner —
+      # contract.owner — the impl's under impl_method_owner_def —
+      # im.owner) for the SAME declaration position. The aligned pair
+      # conforms only when each side is EXACTLY its own declaration's
+      # implicit binder for that position: identity (owner + canonical
+      # "$impl$<slot>" name), never a bare positional name match. The
+      # impl slot is receiver-normalized (the builtin stub's synthetic
+      # receiver offset).
+      if is_implicit_param_binder_of(env, &contract_ty, &contract.owner, pi) && is_implicit_param_binder_of(env, &ipt.ty, &im.owner, pi + impl_offset) then
+        param_conforms = true
+      end
+    end
+    if !param_conforms then
       # The render names the ARGS (type_display), so a genuine mismatch
       # is visible: `Option[Int]` vs `Option[U]`, never two `Option`s
       # that print identically. The declared side is the SUBSTITUTED
@@ -13430,7 +13757,7 @@ def register_impl_head(inout env: TypeEnv, i: ImplDecl) -> Option[ImplRegState]
         if p_name == "self" && type_expr_is_self_spelling(ty_expr.clone()) then
           self_type.clone()
         else
-          resolve_type_expr(env, &ty_expr)
+          resolve_declared_param_type(env, &m_owner, param_index, &ty_expr, false)
         end
       when Option::None then
         if p_name == "self" then self_type.clone() else fresh_type_var(env) end
@@ -13481,7 +13808,12 @@ def register_impl_head(inout env: TypeEnv, i: ImplDecl) -> Option[ImplRegState]
       ret_type: ret_type.clone(),
       params: param_types.clone(),
       has_self: m.params.len() > 0 && m.params[0].name == "self",
-      generic_params: method_gp_ids
+      generic_params: method_gp_ids,
+      # the declaration owner this method's generic parameters (declared
+      # AND implicit `impl Trait` binders) were interned under — the SAME
+      # owner the parameter loop above passed to
+      # resolve_declared_param_type.
+      owner: m_owner.clone()
     })
 
     method_index = method_index + 1
@@ -13726,7 +14058,7 @@ def check_impl_bodies(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String],
         if p_name == "self" && type_expr_is_self_spelling(ty_expr.clone()) then
           st.self_type.clone()
         else
-          resolve_type_expr(env, &ty_expr)
+          resolve_declared_param_type(env, &m_owner, param_index, &ty_expr, true)
         end
       when Option::None then
         if p_name == "self" then st.self_type.clone() else fresh_type_var(env) end
@@ -13740,12 +14072,23 @@ def check_impl_bodies(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String],
     # MERGED declaration order (impl-level params first, then the method's
     # own) under the SAME owner key — the MIR builder pairs this record
     # positionally with the renamed declaration's merged generic list
-    # (the substs-order contract).
+    # (the substs-order contract). (impl Trait param model): the method's
+    # implicit binders (interned by the parameter loop under m_owner after
+    # the method's declared parameters) close the list.
     var merged_ids = st.impl_param_ids.clone()
     var mgp_idx = 0
     while mgp_idx < m.generic_params.len() do
       merged_ids.push(generic_param_id_at(&m_owner, mgp_idx))
       mgp_idx = mgp_idx + 1
+    end
+    var m_implicit_idx = m.generic_params.len()
+    let m_owner_count = match env.generic_param_table.counts.get(def_id_numeric(&m_owner))
+    when Option::Some(c) then c as Int
+    when Option::None then 0
+    end
+    while m_implicit_idx < m_owner_count do
+      merged_ids.push(generic_param_id_at(&m_owner, m_implicit_idx))
+      m_implicit_idx = m_implicit_idx + 1
     end
     env.generic_param_ids.insert(m_owner_key, merged_ids.clone())
  # record the method's typed signature under the SAME owner key (the
@@ -15034,6 +15377,122 @@ def check_if_stmt(inout env: TypeEnv, if_stmt: IfStmt, is_stmt: Bool) -> FlowRes
   check_if_stmt_expected(env, if_stmt, is_stmt, Option::None)
 end
 
+# The value-position if/elsif/else branch-kind JOIN: an unsuffixed
+# literal branch (the inference-only IntLiteral view) must not pin the
+# join's RECORDED type when another branch determines a concrete integer
+# kind — `if c then 8 else block_size end` where the else branch is UInt
+# records UInt (the literal's coercion already succeeded in unify; this
+# only solves the recorded type). Without the adoption the recorded type
+# stayed Int and every MIR materialization of the if (its result temp and
+# an unannotated let binding) disagreed with the concrete branch value
+# ("assign type mismatch: u64 into int" — Int::checked_mul's
+# `let am = if a_neg then 0 - a else a end`, PoolAllocator's
+# `let min_block = if block_size < 8 then 8 else block_size end`). A
+# concrete branch kind always wins over the literal view;
+# literal-vs-literal keeps the literal (the end-of-check defaulting
+# resolves it to Int).
+#
+# (the branch-join ADOPTION — the same rule for the Adt-argument shape):
+# a join type that is an Adt whose argument resolved to the Never bottom
+# (the sound image of an unsolved branch argument) must not pin the join
+# when the OTHER branch determines the argument concretely —
+# `if c then Option::None else Option::Some(Rc[T] { ptr: self.ptr }) end`
+# in WeakRc/WeakArc::upgrade: the `Option::None` path types its argument
+# Never and `unify(Option[Never], Option[Rc[T]])` succeeds through the
+# bottom rule WITHOUT rebinding anything, so the recorded join keeps
+# `Option[Never]` while the else branch's value is Option[Rc[T]] — the
+# MIR materializes the if's result slot as Option[Never] and a branch
+# value disagrees ("assign type mismatch: unit into option:never"). The
+# seed's check_if joins to the first NORMAL branch's type substituted
+# through the journal; the else arm's concrete argument flows into the
+# join there, and this is the kernel's port of that rule for the one
+# shape the journal cannot repair (Never is not a variable).
+def if_join_adopt_literal_kind(inout env: TypeEnv, current: Type, branch: Type) -> Type
+  if is_int_literal_type(&current) && is_integer_type(&branch) then
+    branch
+  else
+    if_join_adopt_never_adt_arg(env, current, branch)
+  end
+end
+
+# The Adt-argument branch-join adoption: when the current join type is an
+# Adt of the same declaration and arity as the branch, and a current
+# argument resolves to Never while the branch's corresponding argument is
+# CONCRETE, adopt the branch's concrete argument positionally (every other
+# position keeps the current join's argument). Conservative guards:
+#   - the branch argument must be concrete: no inference variable and no
+#     error anywhere inside it (a rigid generic parameter is concrete for
+#     this purpose — it is a real type, not an unsolved variable);
+#   - the unification the checker accepted for the join is ONE-WAY through
+#     the bottom rule (Never absorbs anything), so the adopted shape is
+#     re-checked speculatively in BOTH directions against the branch
+#     (with the substitution rolled back — the probe must not commit
+#     bindings or diagnostics) and only adopted when both hold.
+# With no adoptable position the current type is returned unchanged.
+def if_join_adopt_never_adt_arg(inout env: TypeEnv, current: Type, branch: Type) -> Type
+  match current
+  when Type::Adt(cur_id, cur_args) then
+    match branch
+    when Type::Adt(br_id, br_args) then
+      if cur_id.id != br_id.id || cur_args.len() != br_args.len() then
+        return current
+      end
+      var adopted_args = Vec::new()
+      var adopted_any = false
+      var i = 0
+      while i < cur_args.len() do
+        let cur_arg = resolve_type_var(env, cur_args[i].clone())
+        let br_arg = resolve_type_var(env, br_args[i].clone())
+        if is_never_type(&cur_arg) && !is_never_type(&br_arg) && is_concrete_join_arg(env, &br_arg) then
+          adopted_args.push(br_arg)
+          adopted_any = true
+        else
+          adopted_args.push(cur_args[i].clone())
+        end
+        i = i + 1
+      end
+      if !adopted_any then
+        return current
+      end
+      let adopted = Type::Adt(cur_id, adopted_args)
+      if join_types_unify_both_ways(env, &adopted, &branch) then
+        adopted
+      else
+        current
+      end
+    when _ then current
+    end
+  when _ then current
+  end
+end
+
+# Whether a branch-join argument is CONCRETE: no inference variable and no
+# error anywhere inside it (the established scan_codegen_type deep walk;
+# a generic parameter is allowed — rigid, not unsolved).
+def is_concrete_join_arg(env: TypeEnv, ty: Type) -> Bool
+  var has_error = false
+  var has_var = false
+  var has_param = false
+  scan_codegen_type(env, &resolve_type_var(env, ty.clone()), &mut has_error, &mut has_var, &mut has_param, true)
+  !has_error && !has_var
+end
+
+# The both-ways compatibility probe of the branch-join adoption: the
+# accepted join unification absorbed the Never argument one-way, so the
+# adopted shape must unify with the branch in BOTH directions before it
+# may replace the join's argument. Speculative: the substitution and the
+# diagnostics are rolled back to the pre-probe state, so the probe never
+# commits bindings or errors.
+def join_types_unify_both_ways(inout env: TypeEnv, a: Type, b: Type) -> Bool
+  let snap = subst_snapshot(env)
+  let errors_before = env.errors.len()
+  let ok_fwd = unify(env, a.clone(), b.clone(), Span { file: "", start: 0, end_pos: 0 })
+  let ok_rev = unify(env, b.clone(), a.clone(), Span { file: "", start: 0, end_pos: 0 })
+  subst_restore(env, snap)
+  errors_truncate(env, errors_before)
+  ok_fwd && ok_rev
+end
+
 # The expected-type if entry: a value-position if forwards its expected
 # type into every branch block (the seed's check_if expected threading), so
 # a branch tail is solved from the enclosing context.
@@ -15080,6 +15539,7 @@ def check_if_stmt_expected(inout env: TypeEnv, if_stmt: IfStmt, is_stmt: Bool, e
     # if/elsif/else Result/Option arm chains).
     if !is_stmt then
       unify(env, result_type, eb_flow.normal, ebody.span)
+      result_type = if_join_adopt_literal_kind(env, result_type, eb_flow.normal.clone())
     elsif is_never_type(&result_type) && !is_never_type(&eb_flow.normal) then
       # Statement-if completion value: keep the first completing branch's
       # type, but a branch that completes replaces an all-diverge prefix.
@@ -15101,6 +15561,7 @@ def check_if_stmt_expected(inout env: TypeEnv, if_stmt: IfStmt, is_stmt: Bool, e
     if else_flow.may_throw then may_throw = true end
     if !is_stmt then
       unify(env, result_type, else_flow.normal, else_block.span)
+      result_type = if_join_adopt_literal_kind(env, result_type, else_flow.normal.clone())
     elsif is_never_type(&result_type) && !is_never_type(&else_flow.normal) then
       result_type = else_flow.normal
     elsif !is_never_type(&result_type) && !is_never_type(&else_flow.normal) &&
@@ -15402,6 +15863,19 @@ def check_match_expected(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool, expect
     # Unit arm) are not errors. Value-position matches still unify strictly.
     if !is_stmt then
       unify(env, result_type, arm_flow.normal, arm.span)
+      # (match-arm join — the Never-argument adoption, the match port of
+      # if_join_adopt_never_adt_arg): a join that is an Adt whose argument
+      # resolved to the Never bottom (e.g. a `None` arm) must not pin the
+      # join when this arm determines the argument concretely — adopt the
+      # arm's concrete argument under the helper's guards (concrete arm
+      # argument only, both-way speculative unify with substitution and
+      # diagnostic rollback). The join type is resolved first: with no
+      # expected type the join starts as a fresh variable bound by this
+      # arm's unify, so the rule must read the bound type (the if join's
+      # `current` is the then arm's normal and needs no resolve). The
+      # literal-kind adoption is NOT applied here — the Never-argument rule
+      # is the match join's only addition.
+      result_type = if_join_adopt_never_adt_arg(env, resolve_type_var(env, result_type), arm_flow.normal.clone())
     end
     pop_scope(env)
     i = i + 1
@@ -15956,7 +16430,7 @@ def check_pattern(inout env: TypeEnv, pat: Pattern, expected: Type, source_place
     ()
   when PatternKind::Ident(name, is_mut) then
     let before = env.local_id_counter
-    bind_var(env, name, expected_base)
+    bind_var_typed(env, name, expected_base, expected)
     if env.local_id_counter > before then
       env.pattern_binding_resolutions.insert(pat.node_id, before)
  # record the binding action — a plain binding READS its source;
@@ -17582,8 +18056,7 @@ def is_trivially_copyable_walk(env: TypeEnv, ty: Type, inout visited: Set[String
   # pointer to the interned static bytes — a view, bit-copyable exactly
   # like a raw pointer.
   when Type::StaticStrPtr then true
-  # Closures/functions with environments carry state; refs are borrows with
-  # checker-managed semantics, not bit-copy values.
+  # Closures/functions with environments carry state.
  # (FnPtr/Closure split): a FUNCTION POINTER has no environment — it is
   # a plain code pointer, bit-copyable; a CLOSURE's copy legality derives
   # from its CAPTURE TUPLE (a closure capturing a non-copyable value is not
@@ -17592,7 +18065,12 @@ def is_trivially_copyable_walk(env: TypeEnv, ty: Type, inout visited: Set[String
   when Type::Closure(_, _, _, captures, _) then is_trivially_copyable_walk(env, &captures, visited)
   when Type::Dyn(_) then false
   when Type::Effect(_, _) then false
-  when Type::RefInternal(_, _) then false
+  # An internal reference is scalar — Copy, never dropped (the seed's
+  # structural Copy rule: trait_solver.ml is_copy and type_properties.ml
+  # Ref_internal -> scalar). A borrow bit-copy never duplicates owning
+  # state; a composite containing a ref is Copy exactly when its other
+  # components are.
+  when Type::RefInternal(_, _) then true
   when Type::Var(_) then false
   when Type::Param(_) then false
  # (§20 slice 1): a const generic argument is a compile-time integer
@@ -17883,6 +18361,149 @@ def collect_param_names_from_type(env: TypeEnv, ty: Type, inout out: Vec[Generic
   when Type::Effect(_, inner) then collect_param_names_from_type(env, inner, out)
   when _ then ()
   end  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Shared-core generic-parameter alias identity (FINDING 6 extraction)
+# ———————————————————————————————————————————————————————————————
+#
+# The name-witnessed canonical-binder pairing and the type rewrite built on
+# it — the shared semantic core of the duplicated pair in mono.tg
+# (canonical_param_aliases / rewrite_param_aliases_in_type) and mir.tg
+# (verifier_canonical_param_aliases / verifier_rewrite_param_aliases_in_type).
+# The mono-layer and verifier copies implementing an owner-side-spelling
+# bijection are byte-for-byte the same algorithm (a WARNING-level drift
+# risk: a fix to one copy silently leaves the other stale), so mono.tg's
+# and mir.tg's wrappers delegate HERE — same three-input signature as
+# both originals, same semantics — and a future change lands once.
+#
+# The canonical binder aliases of ONE declaration. `param_names` is the
+# serialized param-name table (numeric GenericParamId -> declared name);
+# `canonical_ids` the declaration's recorded declaration-order binder
+# list; `observed` the parameter ids the declaration's own types actually
+# reference (the collector output — mono.tg's collect_param_ids_in_type /
+# collect_param_ids_in_function, mir.tg's verifier_collect_param_ids_in_*,
+# or types.tg's collect_param_names_from_type; the pairing reads only the
+# ids). Every observed id that is not canonical is paired with the
+# canonical id carrying the same declared name — UNLESS that name is
+# carried by more than one canonical binder (legal shadowing: never pick a
+# side) or by none (an id outside the declaration's scope), in which case
+# the id stays unpaired and the residual-param gates fail closed. Result:
+# alias numeric id -> canonical GenericParamId. An empty result is the
+# fast path (already canonical).
+def generic_param_alias_table(param_names: Map[Int, String], canonical_ids: Vec[GenericParamId], observed: Vec[GenericParamId]) -> Map[Int, GenericParamId]
+  var aliases: Map[Int, GenericParamId] = Map::new()
+  if observed.is_empty() then
+    return aliases
+  end
+  var canonical_set: Set[Int] = Set::new()
+  for gpid in canonical_ids do
+    canonical_set.insert(generic_param_id_numeric(&gpid))
+  end
+  # name -> canonical id, only for names carried by EXACTLY one canonical
+  # binder (a repeated name is shadowing and is removed).
+  var by_name: Map[String, GenericParamId] = Map::new()
+  var ambiguous_names: Set[String] = Set::new()
+  for gpid in canonical_ids do
+    let name = generic_param_name_from(&param_names, &gpid)
+    if !ambiguous_names.contains(&name) then
+      if by_name.contains_key(&name) then
+        by_name.remove(name.clone())
+        ambiguous_names.insert(name)
+      else
+        by_name.insert(name, gpid)
+      end
+    end
+  end
+  for gpid in observed do
+    let num = generic_param_id_numeric(&gpid)
+    if !canonical_set.contains(&num) then
+      let name = generic_param_name_from(&param_names, &gpid)
+      if !ambiguous_names.contains(&name) then
+        match by_name.get(&name)
+        when Option::Some(canonical_gpid) then
+          aliases.insert(num, canonical_gpid.clone())
+        when Option::None then ()
+        end
+      end
+    end
+  end
+  aliases
+end
+
+# Re-point every parameter id of a type through the alias map (an id with
+# no alias is left as-is — the residual gates report it; the alias map is
+# consulted, never iterated for identity). The shared core of mono.tg's
+# rewrite_param_aliases_in_type and mir.tg's
+# verifier_rewrite_param_aliases_in_type: the two originals cover the SAME
+# variant set — Param, ConstParam, FixedArraySym, ConstSym, RefInternal,
+# Ptr, PtrMut, Effect, FixedArray, Tuple, FnPtr, Closure, Adt — and recurse
+# identically; the only textual difference is mir's redundant element
+# clone in the FixedArraySym arm, which this port keeps and which is
+# value-identical. Every other variant (Dyn, Var, Const, literals, ...)
+# falls through to an unchanged clone, exactly as in both originals. Type
+# identity is structural, so the rewritten tree is the canonical spelling.
+def rewrite_generic_param_aliases_in_type(aliases: Map[Int, GenericParamId], ty: Type) -> Type
+  if aliases.len() == 0 then
+    return ty.clone()
+  end
+  match ty
+  when Type::Param(gpid) then
+    match aliases.get(generic_param_id_numeric(&gpid))
+    when Option::Some(canonical) then Type::Param(canonical.clone())
+    when Option::None then ty.clone()
+    end
+  when Type::ConstParam(gpid) then
+    match aliases.get(generic_param_id_numeric(&gpid))
+    when Option::Some(canonical) then Type::ConstParam(canonical.clone())
+    when Option::None then ty.clone()
+    end
+  when Type::FixedArraySym(elem, gpid) then
+    let elem2 = rewrite_generic_param_aliases_in_type(aliases.clone(), elem)
+    match aliases.get(generic_param_id_numeric(&gpid))
+    when Option::Some(canonical) then Type::FixedArraySym(elem2.clone(), canonical.clone())
+    when Option::None then Type::FixedArraySym(elem2.clone(), gpid)
+    end
+  when Type::ConstSym(tree) then
+    # the tree's parameter leaves re-point through the subst-consts view
+    # (a leaf whose id is aliased to a canonical const parameter adopts
+    # the canonical id; literal leaves are untouched)
+    var consts: Map[Int, Type] = Map::new()
+    for (alias_num, canonical) in aliases.entries() do
+      consts.insert(alias_num, Type::ConstParam(canonical.clone()))
+    end
+    Type::ConstSym(const_sym_tree_subst_consts(&tree, consts))
+  when Type::RefInternal(inner, mutable) then Type::RefInternal(rewrite_generic_param_aliases_in_type(aliases.clone(), inner), mutable)
+  when Type::Ptr(inner) then Type::Ptr(rewrite_generic_param_aliases_in_type(aliases.clone(), inner))
+  when Type::PtrMut(inner) then Type::PtrMut(rewrite_generic_param_aliases_in_type(aliases.clone(), inner))
+  when Type::Effect(effects, inner) then Type::Effect(effects.clone(), rewrite_generic_param_aliases_in_type(aliases.clone(), inner))
+  when Type::FixedArray(elem, n) then Type::FixedArray(rewrite_generic_param_aliases_in_type(aliases.clone(), elem), n)
+  when Type::Tuple(elems) then
+    var subs = Vec::new()
+    for e in elems do
+      subs.push(rewrite_generic_param_aliases_in_type(aliases.clone(), e))
+    end
+    Type::Tuple(subs)
+  when Type::FnPtr(params, ret, effects) then
+    var sub_params = Vec::new()
+    for p in params do
+      sub_params.push(ParamType { ty: rewrite_generic_param_aliases_in_type(aliases.clone(), p.ty), convention: p.convention })
+    end
+    Type::FnPtr(sub_params, rewrite_generic_param_aliases_in_type(aliases.clone(), ret), effects.clone())
+  when Type::Closure(cid, params, ret, captures, effects) then
+    var sub_params2 = Vec::new()
+    for p in params do
+      sub_params2.push(ParamType { ty: rewrite_generic_param_aliases_in_type(aliases.clone(), p.ty), convention: p.convention })
+    end
+    Type::Closure(cid.clone(), sub_params2, rewrite_generic_param_aliases_in_type(aliases.clone(), ret), rewrite_generic_param_aliases_in_type(aliases.clone(), captures), effects.clone())
+  when Type::Adt(id, args) then
+    var sub_args = Vec::new()
+    for a in args do
+      sub_args.push(rewrite_generic_param_aliases_in_type(aliases.clone(), a))
+    end
+    Type::Adt(id, sub_args)
+  when _ then ty.clone()
+  end
 end
 
 # (transactional candidate probing): snapshot the unifier's subst
@@ -19299,10 +19920,13 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
     if cp.is_deferred then props.is_deferred = true end
   when Type::Dyn(_) then ()
   when Type::Effect(_, _) then ()
-  # A ref to a capability contains a capability (the borrow does not
-  # transfer it) — capability containment propagates through the ref,
-  # mirroring the checker's containment walk; no other property crosses
-  # the ref boundary.
+  # A bare ref answers the seed's scalar triple (type_properties.ml
+  # Ref_internal -> scalar): the ownership axes stay false (no owns_state,
+  # no drop glue, not linear) and the copy axis is the tail's
+  # is_trivially_copyable query (true for refs). A ref to a capability
+  # still contains a capability (the borrow does not transfer it) —
+  # capability containment propagates through the ref, mirroring the
+  # checker's containment walk.
   when Type::RefInternal(inner, _) then
     let rp = type_props_walk(env, inner, visiting, via_heap)
     if rp.contains_capability then props.contains_capability = true end
@@ -21004,6 +21628,66 @@ def literal_bottom_of_neg_chain(expr: Expr) -> Option[Int]
   end  end
 end
 
+# (the `?` return-channel rule — the MIR lowering's identity check; the
+# seed's mir_lower TryOp check): the failure path stores the failure value
+# into the enclosing function's return place, so the enclosing declared
+# return must carry the matching failure channel:
+#   - a Result subject requires the enclosing return to be a 2-argument
+#     Adt whose error argument is IDENTICAL to the subject's error
+#     argument (the success arguments may differ — the enum-rebrand
+#     lowering);
+#   - an Option subject requires the enclosing return to be a 1-argument
+#     Adt (the subject IS the failure value).
+# A missing enclosing-return context (no enclosing function: const/static
+# initializers, trait default bodies) and an undecided return (an open
+# inference variable) are NOT validated here — the MIR lowering decides
+# on the resolved types, so no false channel diagnostic is recorded.
+# Returns false when the channel is invalid (the precise diagnostic is
+# recorded at the same site).
+def check_try_return_channel(inout env: TypeEnv, is_result: Bool, err_ty: Type, span: Span) -> Bool
+  match env.expected_return
+  when Option::None then true
+  when Option::Some(rt) then
+    let ret = resolve_type_var(env, rt.clone())
+    match ret
+    when Type::Var(_) then true
+    when Type::Adt(_, rargs) then
+      if is_result then
+        if rargs.len() < 2 then
+          type_add_error(env, "`?` on a Result requires the enclosing function to return a Result (found " + type_display(env, &ret) + ")", span)
+          false
+        else
+          let ret_err = resolve_type_var(env, rargs[1].clone())
+          if type_has_unresolved_var(env, err_ty.clone()) || type_has_unresolved_var(env, ret_err.clone()) then
+            # undecided while an inference variable is open — the MIR
+            # lowering decides on the resolved types.
+            true
+          elsif type_identity_key(env, err_ty.clone()) != type_identity_key(env, ret_err.clone()) then
+            type_add_error(env, "`?` error channel mismatch: subject error " + type_display(env, &err_ty) + " vs enclosing return error " + type_display(env, &ret_err), span)
+            false
+          else
+            true
+          end
+        end
+      else
+        if rargs.len() != 1 then
+          type_add_error(env, "`?` on an Option requires the enclosing function to return an Option (found " + type_display(env, &ret) + ")", span)
+          false
+        else
+          true
+        end
+      end
+    when _ then
+      if is_result then
+        type_add_error(env, "`?` on a Result requires the enclosing function to return a Result (found " + type_display(env, &ret) + ")", span)
+      else
+        type_add_error(env, "`?` on an Option requires the enclosing function to return an Option (found " + type_display(env, &ret) + ")", span)
+      end
+      false
+    end
+  end
+end
+
 # The ordinary expression check (no enclosing expected type). The
 # expected-type channel is check_expr_expected — every use site that KNOWS
 # the type the expression must produce (a let annotation, an assignment
@@ -22555,18 +23239,53 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
     end
     fresh_type_var(env)
   when ExprKind::ExprTry(inner) then
- # the postfix `?` operator is NOT an exceptional construct in
-    # this language: no throw/raise expression exists, no error propagation
-    # is modeled at any level, and the resource CFG has no Throw/Unwind
-    # edges for it. Its semantics are ERASURE — the operand's value, typed
-    # here as an unconstrained fresh variable (the value's use sites
-    # constrain it; MIR infers the operand type and lowers it as the
-    # operand). The block exceptional forms (try/catch/finally,
+    # (the seed's Ast.TryOp typing): the postfix `?` unwraps the success
+    # payload of an Option/Result subject — the expression's value is the
+    # Some/Ok payload (the Option's single argument / the Result's Ok
+    # argument, args[0]) — and the failure path early-returns the failure
+    # value from the enclosing function, so the enclosing declared return
+    # is validated against the failure channel exactly like the MIR
+    # lowering (check_try_return_channel; the seed's mir_lower TryOp
+    # identity check). The block exceptional forms (try/catch/finally,
     # handle/with, with) are REJECTED in check_stmt above; `?` must keep
     # type-checking because the compiler kernel itself uses it (e.g.
     # `parse_toml(s)?`).
-    let inner_type = check_expr(env, *inner.get())
-    fresh_type_var(env)
+    let try_subject = *inner.get()
+    let inner_type = resolve_type_var(env, check_expr(env, &try_subject))
+    # (partial moves): the `?` subject is a TRANSFER — the MIR materializes
+    # it into the subject temp with a whole-place move (mir.tg lr_try_op's
+    # `push_assign(sid, MirMove(subj_op))`, mir.tg:14152) and the resource
+    # checker transfer_consumes it (resource_check.tg:7488). A projected
+    # OWNING subject is moved out of its root: record the semantic chain so
+    # the mask reaches TypedProgram.place_move_states and the root's drop
+    # site skips the moved field through the MIR's partial-drop chain. A
+    # non-projected subject records nothing (record_projected_consume
+    # records only chains carrying projections — the whole-root move is the
+    # frame lattice's and the MIR's own moved-local record's business).
+    record_projected_consume(env, &try_subject)
+    match inner_type
+    when Type::Error then Type::Error
+    when Type::Adt(subj_tid, subj_args) then
+      let subj_name = match get_type_by_id_ref(env, &subj_tid)
+      when Option::Some(td) then td.name.clone()
+      when Option::None then "".to_string()
+      end
+      let is_option = subj_tid.id == env.lang_items.option || subj_name == "Option"
+      let is_result = subj_tid.id == env.lang_items.result || subj_name == "Result"
+      if is_option && subj_args.len() == 1 then
+        check_try_return_channel(env, false, subj_args[0].clone(), expr.span)
+        subj_args[0].clone()
+      elsif is_result && subj_args.len() == 2 then
+        check_try_return_channel(env, true, subj_args[1].clone(), expr.span)
+        subj_args[0].clone()
+      else
+        type_add_error(env, "`?` requires an Option or Result, found " + type_display(env, &inner_type), expr.span)
+        Type::Error
+      end
+    when _ then
+      type_add_error(env, "`?` requires an Option or Result, found " + type_display(env, &inner_type), expr.span)
+      Type::Error
+    end
   when ExprKind::ExprCast(inner, ty) then
     check_expr(env, *inner.get())
     resolve_type_expr(env, &ty)
@@ -22626,7 +23345,13 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
     # moves out of its root).
     record_projected_assign(env, &target_expr)
     record_projected_consume(env, &value_expr)
-    value_type
+    # The assignment expression's VALUE is the stored value, so its type is
+    # the TARGET's: the literal's inference-only IntLiteral view must not
+    # leak into the recorded type — `x = 4` on a u64 target is a u64 value
+    # (the MIR's result temp and any enclosing let binding read this
+    # record; the former value_type answer recorded Int and disagreed with
+    # the stored kind).
+    target_type
   when ExprKind::ExprMacroCall(name, args) then
     if name == "vec" then
       # vec![...] — the heap-vector Adt (the same result the MIR's vec
@@ -27747,7 +28472,82 @@ end
 # an accepted program), unresolved Type::Var (a lost substitution) and
 # Type::Param in the channels where a CONCRETE type is required. The
 # scan never mutates the env; the caller reports the findings.
-def scan_codegen_type(inout env: TypeEnv, ty: Type, inout has_error: Bool, inout has_var: Bool, inout has_param: Bool, allow_param: Bool) -> Unit
+#
+# (readiness recursion parity): the SHARED payload-children enumeration for
+# the Type universe — the child Types of `ty` in DECLARATION ORDER that a
+# readiness / concreteness recursion must visit for a wrapper's concrete
+# identity to be judged by its payload. This is the single spelling of the
+# child table shared by the codegen-readiness scan right below
+# (scan_codegen_type) and MIR's concreteness walk
+# (verifier_check_type_concreteness, mir.tg — THE TWIN THIS MUST STAY IN
+# SYNC WITH): a Type variant added or reshaped in the enum above must be
+# reflected in the twin and here together, so the two walks can never
+# disagree about WHICH child Types a wrapper recurses into, or in WHAT
+# ORDER.
+#
+# Contract per variant:
+#   Adt(args), Tuple(fields)               -> the vector's elements, in order
+#   FixedArraySym(elem, _)                 -> the element (the symbolic SIZE
+#                                             is node-level state, not a Type
+#                                             child)
+#   FnPtr(params, ret, _)                  -> parameter types (in order), ret
+#   Closure(_, params, ret, captures, _)   -> parameter types (in order), ret,
+#                                             then the capture tuple
+#   RefInternal(inner, _), Ptr(inner),
+#   PtrMut(inner), Effect(_, inner)        -> the inner Type
+#   every LEAF variant                     -> no children: the primitives,
+#     StaticStrPtr, Never, IntLiteral, Var, Param, Const, ConstParam, ConstSym
+#     (its payload is a ConstExprT tree, not a Type), Error, and Dyn (its
+#     TypeId is an interned identity, not a Type child).
+#
+# DELIBERATE EXCLUSION — Type::FixedArray(elem, _) returns NO children even
+# though its element is a payload: scan_codegen_type (below) recurses the
+# element (layout/codegen read it) while verifier_check_type_concreteness has
+# no FixedArray arm at all and stops at its catch-all, so the two walks
+# disagree about this child. The variant stays SPECIAL-CASED in both walks;
+# do not move it in here without changing the twin in the same change.
+#
+# The enumerator carries no flags and no verdicts: it answers only "which
+# children, in what order", returning fresh clones; each caller recurses
+# them with its own side effects (the has_error/has_var/has_param verdicts
+# vs errors).
+def type_payload_children(ty: Type) -> Vec[Type]
+  match ty
+  when Type::Adt(_, args) then args.clone()
+  when Type::FixedArray(_, _) then
+    # DELIBERATE EXCLUSION (see the doc above): the twin walk has no
+    # FixedArray arm, so this element child is not shared.
+    Vec::new()
+  when Type::FixedArraySym(elem, _) then Vec::from([elem.clone()])
+  when Type::FnPtr(params, ret, _) then
+    var out = Vec::new()
+    var i = 0
+    while i < params.len() do
+      out.push(params[i].ty.clone())
+      i = i + 1
+    end
+    out.push(ret.clone())
+    out
+  when Type::Closure(_, params, ret, captures, _) then
+    var out = Vec::new()
+    var i = 0
+    while i < params.len() do
+      out.push(params[i].ty.clone())
+      i = i + 1
+    end
+    out.push(ret.clone())
+    out.push(captures.clone())
+    out
+  when Type::RefInternal(inner, _) then Vec::from([inner.clone()])
+  when Type::Ptr(inner) then Vec::from([inner.clone()])
+  when Type::PtrMut(inner) then Vec::from([inner.clone()])
+  when Type::Effect(_, inner) then Vec::from([inner.clone()])
+  when Type::Tuple(fields) then fields.clone()
+  when _ then Vec::new()
+  end
+end
+
+def scan_codegen_type(env: TypeEnv, ty: Type, inout has_error: Bool, inout has_var: Bool, inout has_param: Bool, allow_param: Bool) -> Unit
   match ty
   when Type::Error then has_error = true
   when Type::Var(_) then has_var = true
@@ -27759,32 +28559,32 @@ def scan_codegen_type(inout env: TypeEnv, ty: Type, inout has_error: Bool, inout
     # concrete channel is a leak; a literal-only tree cannot exist — resolve
     # folds those to Const).
     if !allow_param && const_sym_tree_has_param(&tree) then has_param = true end
-  when Type::FixedArraySym(elem, _) then
+  when Type::FixedArraySym(_, _) then
+    # the symbolic SIZE is node-level state (checked here); the ELEMENT is
+    # the shared payload child (type_payload_children).
     if !allow_param then has_param = true end
-    scan_codegen_type(env, elem, has_error, has_var, has_param, allow_param)
+    for child in type_payload_children(ty) do
+      scan_codegen_type(env, child, has_error, has_var, has_param, allow_param)
+    end
   when Type::Const(_) then ()
-  when Type::Adt(tid, args) then
-    var ai = 0
-    while ai < args.len() do
-      scan_codegen_type(env, args[ai], has_error, has_var, has_param, allow_param)
-      ai = ai + 1
-    end
-  when Type::Tuple(fields) then
-    var fi = 0
-    while fi < fields.len() do
-      scan_codegen_type(env, fields[fi], has_error, has_var, has_param, allow_param)
-      fi = fi + 1
-    end
   when Type::FixedArray(elem, _) then
+    # EXCLUDED from type_payload_children (see its doc): the MIR twin has no
+    # FixedArray arm, so this element recursion stays special-cased.
     scan_codegen_type(env, elem, has_error, has_var, has_param, allow_param)
-  when Type::FnPtr(params, ret, _) then
-    var pi = 0
-    while pi < params.len() do
-      scan_codegen_type(env, params[pi].ty, has_error, has_var, has_param, allow_param)
-      pi = pi + 1
+  when _ then
+    # The enumerator-handled wrappers — Adt args, Tuple elements, FnPtr
+    # params/ret, Closure params/ret/captures, RefInternal/Ptr/PtrMut/Effect
+    # inner — recurse the SHARED child table with the caller's flags threaded
+    # exactly as before, so the visited set and its order cannot drift from
+    # verifier_check_type_concreteness (mir.tg). A residual Type::Error or
+    # Type::Var inside a raw pointer, a closure's SIGNATURE (parameter and
+    # return types) or CAPTURE TUPLE, or an effect payload is part of the
+    # wrapper's concrete identity (layout/codegen read the payload), so the
+    # walk must not stop at the wrapper. Leaf variants return no children
+    # from the enumerator, so their verdicts are unchanged.
+    for child in type_payload_children(ty) do
+      scan_codegen_type(env, child, has_error, has_var, has_param, allow_param)
     end
-    scan_codegen_type(env, ret, has_error, has_var, has_param, allow_param)
-  when _ then ()
   end
 end
 
@@ -29172,6 +29972,7 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
     const_param_reads: env.const_param_reads.clone(),
     param_binding_resolutions: env.param_binding_resolutions.clone(),
     pattern_binding_resolutions: env.pattern_binding_resolutions.clone(),
+    pattern_variant_resolutions: env.pattern_variant_resolutions.clone(),
     place_move_states: env.place_move_states.clone(),
     deinit_plans: Map::new(),
     aggregate_ownership: Map::new(),
@@ -29219,6 +30020,7 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
     const_param_reads: env.const_param_reads.clone(),
     param_binding_resolutions: env.param_binding_resolutions.clone(),
     pattern_binding_resolutions: env.pattern_binding_resolutions.clone(),
+    pattern_variant_resolutions: env.pattern_variant_resolutions.clone(),
     place_move_states: env.place_move_states.clone(),
     deinit_plans: deinit_plans,
     aggregate_ownership: env.typed_aggregate_ownership.clone(),

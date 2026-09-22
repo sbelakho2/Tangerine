@@ -1,0 +1,240 @@
+# devirtprobe.tg — focused MONO DEVIRTUALIZATION probe (temporary).
+#
+# Runs the kernel front end (parse -> resolve -> typecheck -> the
+# integrated access/resource passes -> lower) over a SMALL self-contained
+# program that reproduces the trait-bound-receiver call shape
+# (`I: Adder` receiver, `it.bump()`), then:
+#   1. dumps every MirCall callee name + instance payload + the calling
+#      function's local table (the devirtualization inputs),
+#   2. runs verify_mir BEFORE mono (the post-lower rows),
+#   3. runs monomorphize_program,
+#   4. dumps the sites again (did the specialized bodies re-dispatch to the
+#      concrete impl method?) and verify_mir AFTER mono (post-mono rows).
+#
+# The output is written to build/devirt_probe.txt.
+use std::core::{Option, Result}
+use std::collections::{Vec, Map, Set}
+use std::fs::{write_file}
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse, diag_has_errors}
+use tg_compiler::ast::{assign_node_ids, Program}
+use tg_compiler::resolver::{resolve_names}
+use tg_compiler::types::{type_env_new, type_check_typed, Type, generic_arg_type_view}
+use tg_compiler::access_check::{access_check}
+use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_context_new, AnalyzedProgram}
+use tg_compiler::mir::{
+  lower_to_mir, verify_mir, MirProgram, MirFunction, MirTerminatorKind,
+  MirOperandKind, MirConstantKind, MirCallValue
+}
+use tg_compiler::mono::{mono_cache_new_ephemeral, monomorphize_program}
+use tg_compiler::stable_ids::{structural_instance_mangle_text}
+use tg_compiler::ids::{def_id_numeric}
+
+const DEV_PROBE_SRC: String = "trait Adder\n  def bump(inout self: Self) -> Int\nend\n\nstruct CA\n  n: Int\nend\n\nstruct CB\n  n: Int\nend\n\nimpl Adder for CA\n  def bump(inout self) -> Int\n    self.n = self.n + 1\n    self.n\n  end\nend\n\nimpl Adder for CB\n  def bump(inout self) -> Int\n    self.n = self.n + 10\n    self.n\n  end\nend\n\nstruct GA[T]\n  v: T\nend\n\nimpl[T] Adder for GA[T]\n  def bump(inout self) -> Int\n    7\n  end\nend\n\nstruct Wrap[I: Adder]\n  inner: I\nend\n\nimpl[I: Adder] Adder for Wrap[I]\n  def bump(inout self) -> Int\n    self.inner.bump() + 100\n  end\nend\n\ndef drive[I: Adder](inout it: I) -> Int\n  it.bump() + it.bump()\nend\n\ndef main() -> Int\n  var a = CA { n: 0 }\n  var b = CB { n: 0 }\n  var g: GA[Int] = GA { v: 1 }\n  var w: Wrap[CA] = Wrap { inner: CA { n: 5 } }\n  drive(&mut a) + drive(&mut b) + drive(&mut g) + drive(&mut w) + a.bump()\nend\n"
+
+def dev_ty_word(ty: Type) -> String
+  match ty
+  when Type::Adt(tid, args) then "Adt#" + tid.id.to_string() + "[" + args.len().to_string() + "]"
+  when Type::RefInternal(inner, _) then "Ref[" + dev_ty_word(inner) + "]"
+  when Type::String then "String"
+  when Type::Unit then "Unit"
+  when Type::Int then "Int"
+  when Type::Bool then "Bool"
+  when Type::Char then "Char"
+  when Type::Tuple(items) then "Tuple[" + items.len().to_string() + "]"
+  when Type::Var(_) then "Var"
+  when Type::Param(g) then "Param"
+  when _ then "other"
+  end  end
+end
+
+def dev_arg_word(a: tg_compiler::ids::GenericArg) -> String
+  dev_ty_word(generic_arg_type_view(a))
+end
+
+def dev_local_type(f: MirFunction, id: Int) -> String
+  for l in f.locals do
+    if l.id.id == id then
+      return dev_ty_word(l.ty)
+    end
+  end
+  "??"
+end
+
+def dev_dump_sites(mir: MirProgram, label: String, inout report: String) -> Unit
+  for f in mir.functions do
+    var local_rows = ""
+    for l in f.locals do
+      local_rows = local_rows + "  LOCAL " + label.clone() + " fn=" + f.name.clone() + " id=" + l.id.id.to_string() + " name=" + l.name.clone() + " ty=" + dev_ty_word(l.ty) + "\n"
+    end
+    report = report + local_rows
+    for b in f.blocks do
+      match b.terminator.kind
+      when MirTerminatorKind::MirCall(dest, callee, args, _, _, _, _) then
+        match callee.kind
+        when MirOperandKind::MirConstant(cv) then
+          match cv.kind
+          when MirConstantKind::MirFnItem(name) then
+            var inst_word = "none"
+            match cv.instance.clone()
+            when Option::Some(inst) then
+              var arg_rows = ""
+              var ia = 0
+              while ia < inst.args.len() do
+                arg_rows = arg_rows + "|" + dev_arg_word(inst.args[ia].clone())
+                ia = ia + 1
+              end
+              inst_word = "some(" + arg_rows + ")"
+            when Option::None then ()
+            end
+            var recv_word = "noargs"
+            if args.len() > 0 then
+              match args[0].value
+              when MirCallValue::Value(op) then
+                match op.kind
+                when MirOperandKind::MirCopy(p) then recv_word = "copy(local=" + p.local.id.to_string() + ",ty=" + dev_local_type(f, p.local.id) + ")"
+                when MirOperandKind::MirMovePlace(p) then recv_word = "move(local=" + p.local.id.to_string() + ")"
+                when MirOperandKind::MirRead(p) then recv_word = "read(local=" + p.local.id.to_string() + ",ty=" + dev_local_type(f, p.local.id) + ")"
+                when MirOperandKind::MirConsume(p) then recv_word = "consume(local=" + p.local.id.to_string() + ")"
+                when _ then recv_word = "other-operand"
+                end
+              when MirCallValue::Place(p) then recv_word = "place(local=" + p.local.id.to_string() + ",ty=" + dev_local_type(f, p.local.id) + ")"
+              end
+            end
+            report = report + "SITE " + label.clone() + " fn=" + f.name.clone() + " bb=" + b.id.id.to_string() + " callee=" + name.clone() + " inst=" + inst_word.clone() + " recv=" + recv_word.clone() + " dest_ty=" + dev_local_type(f, dest.local.id) + "\n"
+          when _ then ()
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+end
+
+pub def main() -> Int
+  var report = ""
+  let label = "devirt"
+  let parsed = parse(tokenize(DEV_PROBE_SRC.clone(), label.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "DEV_PARSE_FAILED\n"
+    let _ = write_file("build/devirt_probe.txt", report.clone())
+    return 2
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    report = report + "DEV_TYPECHECK errors=" + result.errors.len().to_string() + "\n"
+    var ei = 0
+    while ei < result.errors.len() do
+      report = report + "  DEV_TE " + result.errors[ei].message.clone() + "\n"
+      ei = ei + 1
+    end
+    let _ = write_file("build/devirt_probe.txt", report.clone())
+    if result.errors.len() > 0 then
+      return 1
+    end
+    var engine_snapshot = result.program.engine_snapshot
+    let typed = result.program.typed
+    let ast_owned = result.program.ast
+    let resolutions_owned = result.program.resolutions
+    let cfg = build_typed_cfg(&program, &typed)
+    var actx = analysis_context_new()
+    let access_errors = access_check(&program, &typed, &cfg, &mut actx)
+    let res_result = resource_check(&program, &typed, &cfg, &mut actx, &mut engine_snapshot)
+    report = report + "DEV_ANALYZE access=" + access_errors.len().to_string() + " resource=" + res_result.errors.len().to_string() + "\n"
+    let analyzed = AnalyzedProgram {
+      typed: typed,
+      ast: ast_owned,
+      resolutions: resolutions_owned,
+      cfg: res_result.cfg,
+      finalize_plan: res_result.finalize_plan,
+      context: actx,
+      engine_snapshot: engine_snapshot,
+      access_errors: access_errors,
+      resource_errors: res_result.errors
+    }
+    match lower_to_mir(program, analyzed)
+    when Result::Ok(mir0) then
+      report = report + "DEV_LOWER ok functions=" + mir0.functions.len().to_string() + "\n"
+      for (dname, dpair) in mir0.dispatch_methods.entries() do
+        report = report + "  DEV_DISPATCH " + dname.clone() + " def=" + def_id_numeric(&dpair.0).to_string() + " pc=" + dpair.2.to_string() + "\n"
+      end
+      for (did_num, dname2) in mir0.method_names_by_def.entries() do
+        report = report + "  DEV_METHODNAME def=" + did_num.to_string() + " name=" + dname2.clone() + "\n"
+      end
+      dev_dump_sites(mir0.clone(), "pre", &mut report)
+      let pre_rows = verify_mir(mir0.clone())
+      report = report + "DEV_VERIFY_PRE rows=" + pre_rows.len().to_string() + "\n"
+      var pri = 0
+      while pri < pre_rows.len() do
+        report = report + "  DEV_PRE_ROW " + pre_rows[pri].clone() + "\n"
+        pri = pri + 1
+      end
+      let _ = write_file("build/devirt_probe.txt", report.clone())
+      var mir = mir0.clone()
+      var cache = mono_cache_new_ephemeral(&ast_owned, &resolutions_owned)
+      match monomorphize_program(&mut mir, &mut cache)
+      when Result::Ok(()) then
+        report = report + "DEV_MONO ok functions=" + mir.functions.len().to_string() + "\n"
+      when Result::Err(errs) then
+        report = report + "DEV_MONO failed=" + errs.len().to_string() + "\n"
+        var mi2 = 0
+        while mi2 < errs.len() do
+          report = report + "  DEV_MONO_ERR " + errs[mi2].clone() + "\n"
+          mi2 = mi2 + 1
+        end
+      end
+      dev_dump_sites(mir.clone(), "post", &mut report)
+      for (ik, _ibody) in cache.instances.entries() do
+        report = report + "  DEV_INSTANCE " + structural_instance_mangle_text(ik.clone()) + "\n"
+      end
+      for f2 in mir.functions do
+        for b2 in f2.blocks do
+          match b2.terminator.kind
+          when MirTerminatorKind::MirCall(_, callee2, _, _, _, _, _) then
+            match callee2.kind
+            when MirOperandKind::MirConstant(cv2) then
+              match cv2.kind
+              when MirConstantKind::MirFnItem(nm2) then
+                match cv2.instance.clone()
+                when Option::Some(inst2) then
+                  let ks = structured_instance_key(cache, inst2.clone())
+                  report = report + "  DEV_KEY fn=" + f2.name.clone() + " callee=" + nm2.clone() + " key=" + structural_instance_mangle_text(ks.clone()) + " cached=" + cache.instances.contains_key(&ks).to_string() + "\n"
+                when Option::None then ()
+                end
+              when _ then ()
+              end
+            when _ then ()
+            end
+          when _ then ()
+          end
+        end
+      end
+      for err in cache.errors do
+        report = report + "  DEV_CACHE_ERR " + err.clone() + "\n"
+      end
+      let post_rows = verify_mir(mir.clone())
+      report = report + "DEV_VERIFY_POST rows=" + post_rows.len().to_string() + "\n"
+      var poi = 0
+      while poi < post_rows.len() do
+        report = report + "  DEV_POST_ROW " + post_rows[poi].clone() + "\n"
+        poi = poi + 1
+      end
+      let _ = write_file("build/devirt_probe.txt", report.clone())
+      0
+    when Result::Err(e) then
+      report = report + "DEV_LOWER failed=" + e.clone() + "\n"
+      let _ = write_file("build/devirt_probe.txt", report.clone())
+      1
+    end
+  when Result::Err(errs) then
+    report = report + "DEV_RESOLVE_FAILED=" + errs.len().to_string() + "\n"
+    let _ = write_file("build/devirt_probe.txt", report.clone())
+    2
+  end
+end

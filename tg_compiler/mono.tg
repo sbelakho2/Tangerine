@@ -1,7 +1,10 @@
 # Tangerine monomorphization — the ONE monomorphizer.
 # Split out of trait_resolve.tg: the entire
 # monomorphization machinery lives here — the mono cache, the instance
-# identity (InstanceId / instance_key), the exhaustive body specialization
+# identity (InstanceId / instance_key), the canonical generic-parameter
+# identity through owners (canonical_param_aliases — the mono-layer
+# binder bijection the substitution and the devirtualization
+# instance-argument solving consult), the exhaustive body specialization
 # (substitute_type / substitute_rvalue / substitute_operand /
 # substitute_place), the instance WORK QUEUE (monomorphize_program), and
 # the symbol mangling (mangle_name for the INTERNAL single-compilation
@@ -13,15 +16,17 @@
 use std::core::{Option, Result}
 use std::collections::{Vec, Map, Set, VecDeque}
 use tg_compiler::ids::{
-  InstanceId, CallableId, DefId, DefKind, GenericParamId, ClosureId,
+  InstanceId, CallableId, DefId, DefKind, TypeId, GenericParamId, ClosureId,
   GenericArg, ConstValue,
-  generic_param_id_numeric, generic_param_id_eq, generic_param_name_from,
-  generic_arg_type_view, const_value_type_view, generic_args_of_types
+  def_id_numeric, generic_param_id_numeric, generic_param_id_eq, generic_param_name_from,
+  generic_arg_type_view, generic_arg_of_type_view, const_value_type_view,
+  generic_args_of_types
 effect_vec_eq, }
 use tg_compiler::stable_ids::{
   StructuralInstanceId, structural_instance_id_of,
   structural_instance_mangle_text, StableDeclId, stable_callable_decl_of,
   stable_structural_callable_decl_of, stable_key_module, stable_key_name,
+  CanonicalGenericArg, CanonicalConstValue,
   canonical_type_key_of, canonical_const_value_of, canonical_const_sym_of_render,
   stable_mir_node_id_of_generated, stable_mir_block_id_of_control_generated
 }
@@ -32,13 +37,15 @@ use tg_compiler::types::{
   TypeCanonFrame, TypeCanonCtx, type_canon_render, effect_registry_new,
   const_sym_tree_has_param, const_sym_tree_uses_param, const_sym_tree_param_ids,
   const_sym_tree_subst_consts, const_sym_tree_eq, const_sym_fold_type,
-  const_sym_tree_render_numeric
+  const_sym_tree_render_numeric, intrinsic_id_of_call,
+  generic_param_alias_table, rewrite_generic_param_aliases_in_type
 }
 use tg_compiler::mir::{
   MirProgram, MirFunction, MirLocal, MirBlock, MirStatement, MirStatementKind,
   MirRvalue, MirRvalueKind, MirOperand, MirOperandKind, MirConstant, MirConstantKind,
   MirCallArg, MirCallValue, MirTerminator, MirTerminatorKind, AggregateKind,
-  AssertMessage, Place, MirBlockId, MirLocalId, MirContract,
+  AssertMessage, Place, Projection, MirBlockId, MirLocalId, MirContract,
+  MirTypeDef, MirTypeDefKind, MirFieldDef, MirVariantDef,
   mir_origins_check
 }
 
@@ -50,6 +57,14 @@ use tg_compiler::mir::{
 # recursion: it is reported as a resource-limit diagnostic (increase
 # MAX_MONO_INSTANCES), not as a monomorphization-recursion claim.
 const MAX_MONO_INSTANCES: Int = 8192
+
+# The trait-contract devirtualization wave's round bound: each round
+# rewrites at least one call site to a LOWERED emission name, a site the
+# following rounds never reconsider, so a finite program reaches the
+# fixpoint in at most (number of contract call sites + 1) rounds. The
+# bound is a defensive resource limit; exceeding it is a fail-closed
+# diagnostic, never a claim about the seed's semantics.
+const MAX_MONO_DEVIRT_ROUNDS: Int = 64
 
 # ———————————————————————————————————————————————————————————————
 # Data Structures
@@ -610,6 +625,344 @@ end
 # not performed on the program's call graph.
 
 # ———————————————————————————————————————————————————————————————
+# Canonical generic-parameter identity through owners
+# ———————————————————————————————————————————————————————————————
+# ONE logical parameter can be interned under more than one owner: the
+# checker's per-owner interning (ids.tg intern_generic_param — the index
+# IS the declaration order within ONE owner) makes each owner's binder
+# list internally consistent, but the SAME declared parameter reached
+# through two declarations carries DISTINCT GenericParamIds — a def's
+# merged binder list vs its impl's binder list, an impl's trait arguments
+# vs the trait's declared parameters, a nominal's declared field types vs
+# the nominal's re-registered builtin shape. The residual class is the
+# "array(param:A) into array(param:B)" / "constant type: Type::Param(...)"
+# row: two spellings of ONE binder that the structural substitution and
+# the verifier's key comparison cannot reconcile.
+#
+# This section establishes the mono layer's canonical binder identity:
+# for ONE declaration, the CANONICAL binder list is the recorded
+# declaration-order list (MirFunction.generic_params /
+# MirTypeDef.generic_params); an OBSERVED parameter id — an id the
+# declaration's own types reference — that is not canonical is paired
+# with the canonical id carrying the SAME declared name. The pairing
+# mirrors the seed's signature_identity binder bijection (P0-2): a
+# correspondence binds a pair once, and an AMBIGUOUS correspondence (two
+# canonical binders of one name — legal shadowing) fails closed: no alias
+# is derived for that name, so the residual-param gates keep reporting
+# the unpaired id instead of guessing. The identity the substitution
+# writes is always the canonical GenericParamId; the declared name is the
+# correspondence witness only (identity is the id, never the name).
+#
+# Application points (the SAME canonical identity at every boundary):
+#   - specialize_function_keyed: the template's substitution map binds
+#     every alias of a canonical binder to that binder's concrete
+#     argument, so a specialized body's formerly owner-side Param
+#     positions (and every callee InstanceId payload it carries) become
+#     concrete;
+#   - monomorphize_program entry: the program's MirTypeDef field/variant
+#     tables are canonicalized against each def's declared parameter
+#     list, so the declared-field substitution (the verifier's aggregate
+#     check, the layout/deinit consumers) instantiates iterator-adapter
+#     and container typed-field tables to concrete field types;
+#   - the devirtualization candidate index: a template's declared
+#     receiver/return types are canonicalized before the receiver
+#     unification binds their binders, so the solved instance arguments
+#     are the canonical ids.
+
+# Push `gpid` onto `out` unless the id is already present (first-occurrence
+# order — deterministic; the collectors never iterate a Map).
+def param_id_push_unique(inout out: Vec[GenericParamId], gpid: GenericParamId) -> Unit
+  let num = generic_param_id_numeric(&gpid)
+  for existing in out do
+    if generic_param_id_numeric(&existing) == num then
+      return
+    end
+  end
+  out.push(gpid)
+end
+
+# Collect the generic-parameter ids a type references (Type::Param /
+# Type::ConstParam / FixedArraySym's size parameter / a ConstSym tree's
+# parameter leaves), deduplicated in first-occurrence order.
+def collect_param_ids_in_type(ty: Type, inout out: Vec[GenericParamId]) -> Unit
+  match ty
+  when Type::Param(gpid) then param_id_push_unique(out, gpid)
+  when Type::ConstParam(gpid) then param_id_push_unique(out, gpid)
+  when Type::FixedArraySym(elem, gpid) then
+    collect_param_ids_in_type(elem, out)
+    param_id_push_unique(out, gpid)
+  when Type::ConstSym(tree) then
+    for gpid in const_sym_tree_param_ids(&tree) do
+      param_id_push_unique(out, gpid)
+    end
+  when Type::Tuple(elems) then
+    for e in elems do
+      collect_param_ids_in_type(e, out)
+    end
+  when Type::FnPtr(params, ret, _) then
+    for p in params do
+      collect_param_ids_in_type(p.ty, out)
+    end
+    collect_param_ids_in_type(ret, out)
+  when Type::Closure(_, params, ret, captures, _) then
+    for p in params do
+      collect_param_ids_in_type(p.ty, out)
+    end
+    collect_param_ids_in_type(ret, out)
+    collect_param_ids_in_type(captures, out)
+  when Type::Adt(_, args) then
+    for a in args do
+      collect_param_ids_in_type(a, out)
+    end
+  when Type::FixedArray(elem, _) then collect_param_ids_in_type(elem, out)
+  when Type::RefInternal(inner, _) then collect_param_ids_in_type(inner, out)
+  when Type::Ptr(inner) then collect_param_ids_in_type(inner, out)
+  when Type::PtrMut(inner) then collect_param_ids_in_type(inner, out)
+  when Type::Effect(_, inner) then collect_param_ids_in_type(inner, out)
+  when _ then ()
+  end
+end
+
+# Collect the parameter ids a generic argument references: a Type row
+# through the type walk; a Const row through its Param form or its
+# ConstSym tree's parameter leaves.
+def collect_param_ids_in_generic_arg(arg: GenericArg, inout out: Vec[GenericParamId]) -> Unit
+  match arg
+  when GenericArg::Type(ty) then collect_param_ids_in_type(ty, out)
+  when GenericArg::Const(cv) then
+    match cv
+    when ConstValue::Value(_) then ()
+    when ConstValue::Param(gpid) then param_id_push_unique(out, gpid)
+    when ConstValue::Sym(tree) then
+      for gpid in const_sym_tree_param_ids(&tree) do
+        param_id_push_unique(out, gpid)
+      end
+    end
+  end
+end
+
+# Collect the parameter ids an operand references: a constant's carried
+# type and the substitution rows of its callee/deinit instance payload.
+def collect_param_ids_in_operand(op: MirOperand, inout out: Vec[GenericParamId]) -> Unit
+  match op.kind
+  when MirOperandKind::MirConstant(cst) then
+    collect_param_ids_in_type(cst.ty, out)
+    match cst.instance
+    when Option::Some(inst) then
+      for a in inst.args do
+        collect_param_ids_in_generic_arg(a, out)
+      end
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+end
+
+def collect_param_ids_in_assert_message(msg: AssertMessage, inout out: Vec[GenericParamId]) -> Unit
+  match msg
+  when AssertMessage::BoundsCheck(op1, op2) then
+    collect_param_ids_in_operand(op1, out)
+    collect_param_ids_in_operand(op2, out)
+  when _ then ()
+  end
+end
+
+# Collect the parameter ids an rvalue embeds: operand constants, the cast
+# target, and the array aggregate's element type.
+def collect_param_ids_in_rvalue(rvalue: MirRvalue, inout out: Vec[GenericParamId]) -> Unit
+  match rvalue.kind
+  when MirRvalueKind::MirMove(op) then collect_param_ids_in_operand(op, out)
+  when MirRvalueKind::MirRef(_) then ()
+  when MirRvalueKind::MirAggregate(kind, ops) then
+    match kind
+    when AggregateKind::MirArray(ty) then collect_param_ids_in_type(ty, out)
+    when _ then ()
+    end
+    for op in ops do
+      collect_param_ids_in_operand(op, out)
+    end
+  when MirRvalueKind::MirBinOp(_, lhs, rhs) then
+    collect_param_ids_in_operand(lhs, out)
+    collect_param_ids_in_operand(rhs, out)
+  when MirRvalueKind::MirUnOp(_, op) then collect_param_ids_in_operand(op, out)
+  when MirRvalueKind::MirDiscriminant(_) then ()
+  when MirRvalueKind::MirLen(_) then ()
+  when MirRvalueKind::MirCast(_, op, target_ty) then
+    collect_param_ids_in_operand(op, out)
+    collect_param_ids_in_type(target_ty, out)
+  when MirRvalueKind::MirRepeat(op, count) then
+    collect_param_ids_in_operand(op, out)
+    collect_param_ids_in_operand(count, out)
+  when MirRvalueKind::MirPhi(_) then ()
+  end
+end
+
+# The function-wide observed binder collection: the signature types, the
+# local types, and every embedded type position of the body (operand
+# constant types, instance substitution rows, cast targets, aggregate
+# element types, contract/assert operands, deinit instance payloads) —
+# the same positions the verifier's embedded-types walk covers.
+def collect_param_ids_in_function(func: MirFunction, inout out: Vec[GenericParamId]) -> Unit
+  for p in func.params do
+    collect_param_ids_in_type(p.ty, out)
+  end
+  collect_param_ids_in_type(func.ret_type, out)
+  for l in func.locals do
+    collect_param_ids_in_type(l.ty, out)
+  end
+  for block in func.blocks do
+    for stmt in block.statements do
+      match stmt.kind
+      when MirStatementKind::MirAssign(_, rvalue) then collect_param_ids_in_rvalue(rvalue, out)
+      when MirStatementKind::MirContractCheck(contract, op) then
+        collect_param_ids_in_operand(contract.condition, out)
+        collect_param_ids_in_operand(op, out)
+      when MirStatementKind::MirEffectRecord(_, op) then collect_param_ids_in_operand(op, out)
+      when MirStatementKind::MirEffectPerform(_, _, _, payload_ptr, result_ptr) then
+        collect_param_ids_in_operand(payload_ptr, out)
+        collect_param_ids_in_operand(result_ptr, out)
+      when MirStatementKind::MirEffectFrameEnter(_, _, _, _, env_ptr) then collect_param_ids_in_operand(env_ptr, out)
+      when _ then ()
+      end
+    end
+    match block.terminator.kind
+    when MirTerminatorKind::MirCall(_, callee, args, _, _, _, _) then
+      collect_param_ids_in_operand(callee, out)
+      for a in args do
+        match a.value
+        when MirCallValue::Value(op) then collect_param_ids_in_operand(op, out)
+        when MirCallValue::Place(_) then ()
+        end
+      end
+    when MirTerminatorKind::MirAssert(cond, _, msg, _, _) then
+      collect_param_ids_in_operand(cond, out)
+      collect_param_ids_in_assert_message(msg, out)
+    when MirTerminatorKind::MirDeinit(_, deinit_fn, _, _) then
+      for a in deinit_fn.args do
+        collect_param_ids_in_generic_arg(a, out)
+      end
+    when MirTerminatorKind::MirSwitchInt(discr, _, _) then collect_param_ids_in_operand(discr, out)
+    when _ then ()
+    end
+  end
+end
+
+# Collect the parameter ids a type definition's field/variant types
+# reference.
+def collect_param_ids_in_type_def(td: MirTypeDef, inout out: Vec[GenericParamId]) -> Unit
+  match td.kind
+  when MirTypeDefKind::Struct(fields) then
+    for f in fields do
+      collect_param_ids_in_type(f.ty, out)
+    end
+  when MirTypeDefKind::Enum(variants) then
+    for v in variants do
+      for fty in v.fields do
+        collect_param_ids_in_type(fty, out)
+      end
+    end
+  end
+end
+
+# Whether any observed id lies outside the canonical binder list — the
+# cheap guard that keeps the name-table snapshot (and the bijection)
+# off the specialization hot path for declarations whose types are
+# already canonical.
+def has_noncanonical_param_ids(canonical_ids: Vec[GenericParamId], observed: Vec[GenericParamId]) -> Bool
+  for gpid in observed do
+    let num = generic_param_id_numeric(&gpid)
+    var found = false
+    for c in canonical_ids do
+      if generic_param_id_numeric(&c) == num then
+        found = true
+        break
+      end
+    end
+    if !found then
+      return true
+    end
+  end
+  false
+end
+
+# The canonical binder aliases of ONE declaration. `param_names` is the
+# serialized param-name table (numeric GenericParamId -> declared name);
+# `canonical_ids` the declaration's recorded declaration-order binder
+# list; `observed` the parameter ids the declaration's own types
+# reference (the collect_param_ids_* walks above). Every observed id that
+# is not canonical is paired with the canonical id carrying the same
+# declared name — UNLESS that name is carried by more than one canonical
+# binder (legal shadowing: never pick a side) or by none (an id outside
+# the declaration's scope), in which case the id stays unpaired and the
+# residual-param gates fail closed. Result: alias numeric id -> canonical
+# GenericParamId. An empty result is the fast path (already canonical).
+def canonical_param_aliases(param_names: Map[Int, String], canonical_ids: Vec[GenericParamId], observed: Vec[GenericParamId]) -> Map[Int, GenericParamId]
+  # (FINDING 6): the pairing rule lives once, in types.tg's
+  # generic_param_alias_table (identical parameters, identical order);
+  # this wrapper keeps mono.tg's name so every call site is unchanged.
+  generic_param_alias_table(param_names, canonical_ids, observed)
+end
+
+# Re-point every parameter id of a type through the alias map (an id with
+# no alias is left as-is — the residual gates report it; the alias map is
+# consulted, never iterated for identity).
+def rewrite_param_aliases_in_type(aliases: Map[Int, GenericParamId], ty: Type) -> Type
+  # (FINDING 6): delegates to types.tg's
+  # rewrite_generic_param_aliases_in_type (identical parameters) so the
+  # rewrite rule lives once.
+  rewrite_generic_param_aliases_in_type(aliases, ty)
+end
+
+# Canonicalize the program's MirTypeDef field/variant tables: every
+# observed parameter id that is an owner-side spelling of a declared
+# parameter is re-pointed at the def's canonical id, so the def's
+# generic_params list covers every parameter its field types reference
+# (the declared-field substitution at the verifier/layout/deinit
+# boundaries then instantiates the field types to concrete types — the
+# iterator-adapter and container typed-field tables included). A def
+# whose tables are already canonical is untouched (the empty-alias fast
+# path).
+def canonicalize_type_def_binders(inout mir: MirProgram, param_names: Map[Int, String]) -> Unit
+  var ti = 0
+  while ti < mir.types.len() do
+    var td = mir.types[ti]
+    var observed: Vec[GenericParamId] = Vec::new()
+    collect_param_ids_in_type_def(td, &mut observed)
+    let aliases = canonical_param_aliases(param_names.clone(), td.generic_params.clone(), observed)
+    if aliases.len() > 0 then
+      let rewritten = match td.kind
+      when MirTypeDefKind::Struct(fields) then
+        var new_fields: Vec[MirFieldDef] = Vec::new()
+        for f in fields do
+          new_fields.push(MirFieldDef {
+            name: f.name.clone(),
+            ty: rewrite_param_aliases_in_type(aliases.clone(), f.ty)
+          })
+        end
+        MirTypeDefKind::Struct(new_fields)
+      when MirTypeDefKind::Enum(variants) then
+        var new_variants: Vec[MirVariantDef] = Vec::new()
+        for v in variants do
+          var new_field_tys: Vec[Type] = Vec::new()
+          for fty in v.fields do
+            new_field_tys.push(rewrite_param_aliases_in_type(aliases.clone(), fty))
+          end
+          new_variants.push(MirVariantDef {
+            name: v.name.clone(),
+            discriminant: v.discriminant,
+            fields: new_field_tys
+          })
+        end
+        MirTypeDefKind::Enum(new_variants)
+      end
+      td.kind = rewritten
+      mir.types[ti] = td
+    end
+    ti = ti + 1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # Monomorphization Body Specialization
 # ———————————————————————————————————————————————————————————————
 # Given a generic MIR function and concrete type arguments, produce
@@ -634,15 +987,49 @@ end
 # The min-length loop below keeps the EQUAL-length semantics (each
 # declared parameter bound to its aligned argument); a length MISMATCH
 # would silently truncate to the shorter side, so the EXACT-ARITY
-# invariant is enforced by the sole caller (specialize_function_keyed —
-# the arity guard there fires BEFORE this map is ever built, catching
-# BOTH the too-few and the too-many direction).
+# invariant is enforced by the callers (specialize_function_keyed's arity
+# guard fires BEFORE any map is built, catching BOTH the too-few and the
+# too-many direction; devirt_resolve_contract_call solves at the
+# candidate's declared arity — every declaration-order parameter must be
+# solved by the receiver unification).
 def type_subst_new_args(type_param_ids: Vec[GenericParamId], args: Vec[GenericArg]) -> TypeSubstMap
   var params = Map::new()
   var i = 0
   while i < type_param_ids.len() && i < args.len() do
     params.insert(generic_param_id_numeric(&type_param_ids[i]), generic_arg_type_view(args[i].clone()))
     i = i + 1
+  end
+  TypeSubstMap { params: params }
+end
+
+# The alias-aware substitution-map builder: the declaration-order
+# canonical ids bind the concrete arguments POSITIONALLY (the same
+# contract as type_subst_new_args), and every canonical binder's ALIASES
+# (canonical_param_aliases — the owner-side spellings of the same
+# declared binder) bind the SAME concrete argument. A body position
+# spelled through an owner-side binder therefore substitutes exactly like
+# its canonical spelling, and the callee InstanceId payloads the body
+# carries become concrete under the caller's own specialization (zero
+# inference — the arguments are the caller's solved ones).
+def type_subst_new_args_with_aliases(type_param_ids: Vec[GenericParamId], args: Vec[GenericArg], aliases: Map[Int, GenericParamId]) -> TypeSubstMap
+  var params = Map::new()
+  var i = 0
+  while i < type_param_ids.len() && i < args.len() do
+    params.insert(generic_param_id_numeric(&type_param_ids[i]), generic_arg_type_view(args[i].clone()))
+    i = i + 1
+  end
+  if aliases.len() > 0 then
+    var ai = 0
+    while ai < type_param_ids.len() && ai < args.len() do
+      let canonical_num = generic_param_id_numeric(&type_param_ids[ai])
+      let concrete = generic_arg_type_view(args[ai].clone())
+      for (alias_num, canonical) in aliases.entries() do
+        if generic_param_id_numeric(&canonical) == canonical_num then
+          params.insert(alias_num, concrete.clone())
+        end
+      end
+      ai = ai + 1
+    end
   end
   TypeSubstMap { params: params }
 end
@@ -718,7 +1105,22 @@ def specialize_function_keyed(
     return Result::Err("monomorphization of `" + original.name + "` rejected: the instance's arguments still carry a generic parameter (a symbolic const argument cannot produce the concrete per-instance value of a const parameter read; the instance must be re-specialized under the caller's concrete substitutions)")
   end
 
-  let subst = type_subst_new_args(type_param_ids, args)
+  # (canonical binder identity): the template's OWN observed parameter
+  # ids — the ids its signature, locals and embedded body types actually
+  # reference — are paired with the declared (canonical) binders by the
+  # mono-layer binder bijection, and every alias binds the SAME concrete
+  # argument as its canonical spelling. A body position (or a callee
+  # InstanceId payload) spelled through an owner-side interning therefore
+  # substitutes exactly like its canonical spelling; an id the bijection
+  # leaves unpaired keeps its Param form and the residual-param
+  # verification below still fails closed.
+  var observed: Vec[GenericParamId] = Vec::new()
+  collect_param_ids_in_function(original, &mut observed)
+  var aliases: Map[Int, GenericParamId] = Map::new()
+  if has_noncanonical_param_ids(type_param_ids.clone(), observed.clone()) then
+    aliases = canonical_param_aliases(cache.generic_param_names.clone(), type_param_ids.clone(), observed)
+  end
+  let subst = type_subst_new_args_with_aliases(type_param_ids, args, aliases)
   
   # Create specialized function with substituted types. The instantiated
   # body is a CONCRETE codegen instance: it carries no generic parameters
@@ -1453,10 +1855,22 @@ def rewrite_call_sites_in_program(inout mir: MirProgram, inout cache: MonoCache)
     end
   end
 
-  for func in mir.functions do
-    for block in func.blocks do
-      match block.terminator.kind
-      when MirTerminatorKind::MirCall(dest, callee, args, success, unwind, intrinsic, _) then
+  # (copy-mutation): the function/block walk is INDEXED and every rewrite
+  # is written back through mir.functions — `for func in mir.functions`
+  # binds a COPY, so the former `block.terminator.kind = ...` write was
+  # lost and NO call site ever reached its `$`-suffixed instance name (a
+  # call whose structural instance key IS cached still carried the generic
+  # base name). Codegen's resolve_callee_label fails closed on an
+  # unresolved generic base, so the rewrite must land.
+  var fi = 0
+  while fi < mir.functions.len() do
+    var f_out = mir.functions[fi]
+    var f_changed = false
+    var bi = 0
+    while bi < f_out.blocks.len() do
+      var blk = f_out.blocks[bi]
+      match blk.terminator.kind
+      when MirTerminatorKind::MirCall(dest, callee, args, success, unwind, intrinsic, tail) then
         match callee.kind
         when MirOperandKind::MirConstant(const_val) then
           match const_val.kind
@@ -1499,26 +1913,34 @@ def rewrite_call_sites_in_program(inout mir: MirProgram, inout cache: MonoCache)
                     end
                   when Option::None then ()
                   end
-                  if specialized then
-                    # Rewrite the call site to use the mangled name. The
- # rewritten MirFnItem KEEPS the constant's instance
-                    # payload (the semantic callee identity survives the
-                    # emission-key rewrite).
-                    block.terminator.kind = MirTerminatorKind::MirCall(
-                      dest.clone(),
-                      MirOperand {
-                        kind: MirOperandKind::MirConstant(MirConstant {
-                          kind: MirConstantKind::MirFnItem(mangled),
-                          ty: const_val.ty.clone(),
-                          instance: const_val.instance.clone()
-                        })
-                      },
-                      args.clone(),
-                      success.clone(),
-                      unwind.clone(),
-                      intrinsic,
-                      false
-                    )
+                  if specialized && mangled != callee_name then
+                    # Rewrite the call site to use the mangled instance
+                    # name. The rewritten MirFnItem KEEPS the constant's
+                    # instance payload (the semantic callee identity
+                    # survives the emission-key rewrite). The write lands
+                    # in the indexed function/block copy and is stored
+                    # back below.
+                    blk.terminator = MirTerminator {
+                      kind: MirTerminatorKind::MirCall(
+                        dest.clone(),
+                        MirOperand {
+                          kind: MirOperandKind::MirConstant(MirConstant {
+                            kind: MirConstantKind::MirFnItem(mangled),
+                            ty: const_val.ty.clone(),
+                            instance: const_val.instance.clone()
+                          })
+                        },
+                        args.clone(),
+                        success.clone(),
+                        unwind.clone(),
+                        intrinsic,
+                        tail
+                      ),
+                      span: blk.terminator.span.clone(),
+                      origin: blk.terminator.origin.clone(),
+                      provenance: blk.terminator.provenance.clone()
+                    }
+                    f_changed = true
                   end
                   break
                 end
@@ -1530,7 +1952,13 @@ def rewrite_call_sites_in_program(inout mir: MirProgram, inout cache: MonoCache)
         end
       when _ then ()
       end
+      f_out.blocks[bi] = blk
+      bi = bi + 1
     end
+    if f_changed then
+      mir.functions[fi] = f_out
+    end
+    fi = fi + 1
   end
 end
 
@@ -1737,6 +2165,68 @@ def mono_fresh_local_id(f: MirFunction) -> Int
   max_id + 1
 end
 
+# The argument count of the injected dispatch instance: mono_dispatch_fn_operand
+# constructs exactly ONE GenericArg::Type (the concrete key type). The arity
+# guard below compares this count against the template's declared binder list.
+const MONO_DISPATCH_INSTANCE_ARGS: Int = 1
+
+# The dispatch-template ARITY INDEX (FINDING 10): the per-program
+# precomputation of the arity verdict. inject_map_dispatch_calls builds it
+# ONCE (dispatch_template_arity_index) before its per-site injection loop
+# — the guard formerly scanned all of mir.functions at every hash/eq gate,
+# costing O(functions) per dispatch site. The fields the scan read
+# (is_generic_function over the declared binders/signature/local types,
+# and the declared binder count) are INVARIANT under dispatch injection
+# (which only appends fresh concrete-typed locals and blocks and replaces
+# terminators), and no function is added or renamed during the pass — so
+# the precomputed verdict is exactly the old scan's.
+struct DispatchTemplateArity
+  generic: Bool
+  binder_count: Int
+end
+
+# Build the name -> arity-verdict index in mir.functions order. The old
+# linear scan returned on the FIRST function carrying a name, so the
+# index keeps the first occurrence and ignores later namesakes
+# (duplicate-name behavior preserved).
+def dispatch_template_arity_index(mir: MirProgram) -> Map[String, DispatchTemplateArity]
+  var index: Map[String, DispatchTemplateArity] = Map::new()
+  for candidate in mir.functions do
+    if !index.contains_key(&candidate.name) then
+      index.insert(candidate.name.clone(), DispatchTemplateArity {
+        generic: is_generic_function(candidate),
+        binder_count: function_generic_param_names(candidate).len()
+      })
+    end
+  end
+  index
+end
+
+# The dispatch-template ARITY GUARD (mirror of specialize_function_keyed's
+# fail-closed exact-arity check, mono.tg's `type_param_ids.len() !=
+# args.len()`), consulted through the precomputed arity index. The
+# injected instance carries EXACTLY ONE argument (the concrete key type —
+# mono_dispatch_fn_operand's construction), so a GENERIC dispatch template
+# must declare exactly one declaration-order binder for the drain to
+# specialize it: a multi-parameter generic impl (`impl[A, B] Hash for
+# Pair[A, B]`) would otherwise trip the arity error and abort the
+# compilation. A NON-generic template declares no binders and has no
+# specialization path — its emitted body is the call target, so the
+# reachability injection still applies (the arity guard governs ONLY
+# specialize_function_keyed's input). A name ABSENT from the index cannot
+# resolve the injected call at all: fail closed and never inject.
+def mono_dispatch_template_arity_ok(index: Map[String, DispatchTemplateArity], base: String) -> Bool
+  match index.get(&base)
+  when Option::Some(template) then
+    if !template.generic then
+      return true
+    end
+    return template.binder_count == MONO_DISPATCH_INSTANCE_ARGS
+  when Option::None then ()
+  end
+  false
+end
+
 # The injected callee operand: the MirFnItem with the SOLVED instance
 # (resolver DefId + the concrete key type as the typed argument).
 def mono_dispatch_fn_operand(base: String, did: DefId, k_ty: Type) -> MirOperand
@@ -1752,7 +2242,7 @@ end
 # Inject the hash/eq dispatch calls ahead of the map/set intrinsic call at
 # block `site` of `func`. The original call becomes the terminator of a
 # fresh block; the injected calls chain ahead of it.
-def apply_dispatch_injection(mir: MirProgram, inout func: MirFunction, site: Int) -> Unit
+def apply_dispatch_injection(mir: MirProgram, dispatch_arity: Map[String, DispatchTemplateArity], inout func: MirFunction, site: Int) -> Unit
   let block = func.blocks[site]
   match block.terminator.kind
   when MirTerminatorKind::MirCall(dest, callee, args, success, unwind, intrinsic, _) then
@@ -1778,7 +2268,14 @@ def apply_dispatch_injection(mir: MirProgram, inout func: MirFunction, site: Int
         match mir.dispatch_methods.get(&hb)
         when Option::Some((did, _, pc)) then
           if pc == 1 then
-            hash_did = Option::Some(did.clone())
+            # ARITY GATE (mono_dispatch_template_arity_ok): a generic
+            # template must declare exactly one binder for the injected
+            # one-argument instance to specialize; otherwise THIS dispatch
+            # call is not injected (the drain's arity error is never
+            # tripped) — the eq gate below is independent.
+            if mono_dispatch_template_arity_ok(dispatch_arity, &hb) then
+              hash_did = Option::Some(did.clone())
+            end
           end
         when Option::None then ()
         end
@@ -1790,7 +2287,10 @@ def apply_dispatch_injection(mir: MirProgram, inout func: MirFunction, site: Int
         match mir.dispatch_methods.get(&eb)
         when Option::Some((did2, _, pc2)) then
           if pc2 == 2 then
-            eq_did = Option::Some(did2.clone())
+            # ARITY GATE (mono_dispatch_template_arity_ok): same as hash.
+            if mono_dispatch_template_arity_ok(dispatch_arity, &eb) then
+              eq_did = Option::Some(did2.clone())
+            end
           end
         when Option::None then ()
         end
@@ -1932,36 +2432,491 @@ end
 # skipped — their sites become concrete in the specialized bodies) with a
 # key-operating map/set intrinsic call gets the dispatch calls injected.
 def inject_map_dispatch_calls(inout mir: MirProgram) -> Unit
-  for func in mir.functions do
-    if is_generic_function(func) then
+  # (copy-mutation): the walk is INDEXED and the mutated function is
+  # written back through mir.functions — `for func in mir.functions`
+  # binds a COPY, so every write apply_dispatch_injection performed
+  # (the key-ref statement, the fresh locals/blocks, the replaced
+  # terminator) mutated the discarded copy and the whole pass was a
+  # silent no-op. The write-back mirrors rewrite_call_sites_in_program's
+  # indexed walk.
+  # (FINDING 10): the dispatch-template arity index is built ONCE for the
+  # whole program — the hash/eq gates formerly scanned mir.functions per
+  # site; the index is stable across the pass (dispatch_template_arity_index).
+  let dispatch_arity = dispatch_template_arity_index(mir)
+  var fi = 0
+  while fi < mir.functions.len() do
+    var func = mir.functions[fi]
+    if !is_generic_function(func) then
+      var sites: Vec[Int] = Vec::new()
+      var bi = 0
+      while bi < func.blocks.len() do
+        match func.blocks[bi].terminator.kind
+        when MirTerminatorKind::MirCall(_, callee, _, _, _, _, _) then
+          match callee.kind
+          when MirOperandKind::MirConstant(cv) then
+            match cv.kind
+            when MirConstantKind::MirFnItem(name) then
+              if map_key_op_intrinsic_name(&name) then
+                sites.push(bi)
+              end
+            when _ then ()
+            end
+          when _ then ()
+          end
+        when _ then ()
+        end
+        bi = bi + 1
+      end
+      if !sites.is_empty() then
+        for site in sites do
+          apply_dispatch_injection(mir, dispatch_arity, &mut func, site)
+        end
+        mir.functions[fi] = func
+      end
+    end
+    fi = fi + 1
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# Trait-contract devirtualization (the bodyless re-dispatch)
+# ———————————————————————————————————————————————————————————————
+# A call on a generic-bound receiver (`I: Iterator[T]`'s
+# `self.inner.advance()` in the adapters, `self.advance()` in the
+# extension impls) is lowered under the CONTRACT's surface name — the bare
+# method name `advance`: a bounded Param receiver has no owner TypeId, so
+# the lowering's owner-name resolution declines and the concrete impl's
+# method is lowered separately under its `Type__method` emission name
+# (`VecIterator__advance`). Once a body is SPECIALIZED its receiver type
+# is concrete, so the call can be re-dispatched to the concrete impl's
+# method instance — the body the specializer emits — exactly as the
+# seed's Mono.build ~resolve_bodyless (stage0_ocaml/src/mono.ml and
+# driver.ml's mono_bodyless_resolver) re-dispatches a body-less contract
+# instance to the concrete impl's registered method. Without this wave a
+# concrete-specialized caller keeps referencing the contract surface,
+# which no emitted body answers.
+#
+# SELECTION (the seed's rule): the receiver type is the call's FIRST
+# argument — the receiver operand's place local type with the RefInternal
+# ABI wrapper peeled — AFTER substitution; the concrete impl is the
+# lowered template whose method segment matches the callee name and whose
+# DECLARED receiver parameter type (the template's `self` parameter,
+# params[0].ty) unifies with that receiver type. The instance arguments
+# are the template's declaration-order generic parameters bound by that
+# unification; the unification only READS the already-substituted
+# receiver type (ZERO-INFERENCE: nothing is inferred from the call), and
+# an instance argument the receiver type does not solve is never
+# fabricated.
+#
+# FAIL-CLOSED / DEFERRAL (the seed's keep-vs-error split):
+#   - a receiver still carrying generic parameters DEFERS: the caller's
+#     own specialization substitutes the receiver type and this wave
+#     revisits the specialized body (the worklist's shape-2 contract);
+#   - a callee name that is NOT the contract surface (an emission-mangled
+#     name, an intrinsic label, or an already-lowered function) is left
+#     to the class that owns it (keep) — the monomorphizer never guesses
+#     an owner for a name the lowering did not produce from a bound
+#     receiver;
+#   - a bare contract name whose candidate impl templates exist but none
+#     unifies with the concrete receiver (including a candidate whose
+#     declaration-order parameters the receiver type cannot solve) FAILS
+#     CLOSED with the precise caller/callee/receiver context: the
+#     concrete impl the checker's bound resolution promised does not
+#     exist at this instance.
+
+# The method segment of an emission name: the text after the LAST "__"
+# ("VecIterator__advance" -> "advance"). A bare name is returned as-is —
+# the lowering's bound-receiver contract surface (`advance`).
+def devirt_method_segment(name: String) -> String
+  match name.rfind("__")
+  when Option::Some(pos) then name.slice(pos + 2, name.len())
+  when Option::None then name.clone()
+  end
+end
+
+# The receiver type of a call: the first argument's place local type with
+# the RefInternal ABI wrapper peeled (the lowering passes an unborrowed
+# receiver through a ref temp; a borrowed receiver arrives already-ref).
+# None when the first argument is not a place.
+def devirt_receiver_type(inout func: MirFunction, args: Vec[MirCallArg]) -> Option[Type]
+  if args.is_empty() then
+    return Option::None
+  end
+  let place_opt = match args[0].value
+  when MirCallValue::Value(op) then
+    match op.kind
+    when MirOperandKind::MirCopy(p) then Option::Some(p.clone())
+    when MirOperandKind::MirMovePlace(p) then Option::Some(p.clone())
+    when MirOperandKind::MirRead(p) then Option::Some(p.clone())
+    when MirOperandKind::MirConsume(p) then Option::Some(p.clone())
+    when _ then Option::None
+    end
+  when MirCallValue::Place(p) then Option::Some(p.clone())
+  end
+  match place_opt
+  when Option::Some(p) then
+    var peeled = Type::Unit
+    for l in func.locals do
+      if l.id.id == p.local.id then
+        peeled = l.ty.clone()
+        break
+      end
+    end
+    var peel_depth = 0
+    while peel_depth < 4 do
+      match peeled.clone()
+      when Type::RefInternal(inner, _) then
+        peeled = inner
+        peel_depth = peel_depth + 1
+      when _ then break
+      end
+    end
+    Option::Some(peeled)
+  when Option::None then Option::None
+  end
+end
+
+# whether the callee name is a surface the codegen/runtime answers without
+# an emitted body (the intrinsic router's name-only classification — the
+# same test the verifier's accepted-name rule runs first).
+def devirt_intrinsic_surface(name: String) -> Bool
+  if name.len() >= 12 && name.slice(0, 12) == "__intrinsic_" then return true end
+  match intrinsic_id_of_call(&name, &Type::Unit, &"".to_string(), &Type::Unit, &"".to_string(), &name, false, false)
+  when Option::Some(_) then true
+  when Option::None then false
+  end
+end
+
+# Structural head unification of a template's declared receiver parameter
+# type against the concrete receiver type: Type::Param / Type::ConstParam
+# rows BIND (the declaration-order parameter -> the concrete argument),
+# every other row must match structurally. The map is keyed by the
+# parameter's numeric id — the mono substitution's own key space.
+def devirt_unify_head(tmpl_ty: Type, recv_ty: Type, inout bind: Map[Int, Type]) -> Bool
+  match tmpl_ty
+  when Type::Param(gpid) then
+    let key = generic_param_id_numeric(&gpid)
+    match bind.get(key)
+    when Option::Some(prev) then type_eq(&prev, &recv_ty)
+    when Option::None then
+      bind.insert(key, recv_ty.clone())
+      true
+    end
+  when Type::ConstParam(gpid) then
+    let key = generic_param_id_numeric(&gpid)
+    match bind.get(key)
+    when Option::Some(prev) then type_eq(&prev, &recv_ty)
+    when Option::None then
+      bind.insert(key, recv_ty.clone())
+      true
+    end
+  when Type::Adt(tid, args) then
+    match recv_ty
+    when Type::Adt(rtid, rargs) then
+      if tid.id != rtid.id || args.len() != rargs.len() then
+        false
+      else
+        var ok = true
+        var i = 0
+        while i < args.len() do
+          if !devirt_unify_head(args[i].clone(), rargs[i].clone(), &mut bind) then
+            ok = false
+            break
+          end
+          i = i + 1
+        end
+        ok
+      end
+    when _ then false
+    end
+  when Type::Tuple(elems) then
+    match recv_ty
+    when Type::Tuple(relems) then
+      if elems.len() != relems.len() then
+        false
+      else
+        var ok = true
+        var i = 0
+        while i < elems.len() do
+          if !devirt_unify_head(elems[i].clone(), relems[i].clone(), &mut bind) then
+            ok = false
+            break
+          end
+          i = i + 1
+        end
+        ok
+      end
+    when _ then false
+    end
+  when Type::RefInternal(inner, mutable) then
+    match recv_ty
+    when Type::RefInternal(rinner, rmut) then
+      if mutable != rmut then
+        false
+      else
+        devirt_unify_head(inner, rinner, &mut bind)
+      end
+    when _ then devirt_unify_head(inner, recv_ty, &mut bind)
+    end
+  when Type::Ptr(inner) then
+    match recv_ty
+    when Type::Ptr(rinner) then devirt_unify_head(inner, rinner, &mut bind)
+    when _ then false
+    end
+  when Type::PtrMut(inner) then
+    match recv_ty
+    when Type::PtrMut(rinner) then devirt_unify_head(inner, rinner, &mut bind)
+    when _ then false
+    end
+  when Type::FixedArray(elem, n) then
+    match recv_ty
+    when Type::FixedArray(relem, rn) then
+      if n != rn then
+        false
+      else
+        devirt_unify_head(elem, relem, &mut bind)
+      end
+    when _ then false
+    end
+  when _ then type_eq(&tmpl_ty, &recv_ty)
+  end
+end
+
+# ONE devirtualization candidate: the lowered impl-method template whose
+# method segment a contract call may re-dispatch to, with the DECLARED
+# inputs the receiver-type unification reads (the template's `self`
+# parameter type, its declaration-order generic parameters, its declared
+# return type) and the impl method's semantic DefId (the dispatch
+# registry's record — the instance identity's callable face).
+struct DevirtCandidate
+  template_name: String
+  self_ty: Type
+  generic_params: Vec[GenericParamId]
+  ret_type: Type
+  did: DefId
+end
+
+# The per-wave candidate index: method segment -> the impl-method
+# templates carrying it. Only templates that declare a receiver parameter
+# are candidates (a `Type__method` emission name — the non-method surface
+# is never a contract target); the DefId comes from the same dispatch
+# registry the map-key injection reads. The candidate's DECLARED receiver
+# and return types are canonicalized against its own declared binder list
+# before the receiver unification reads them (canonical_param_aliases), so
+# the binders the unification pairs — and the instance arguments it
+# solves — are the canonical ids.
+def devirt_candidate_index(mir: MirProgram, param_names: Map[Int, String]) -> Map[String, Vec[DevirtCandidate]]
+  var index: Map[String, Vec[DevirtCandidate]] = Map::new()
+  for tmpl in mir.functions do
+    if tmpl.params.is_empty() then
       next
     end
-    var sites: Vec[Int] = Vec::new()
+    let segment = devirt_method_segment(tmpl.name.clone())
+    if segment == tmpl.name then
+      next
+    end
+    match mir.dispatch_methods.get(&tmpl.name)
+    when Option::Some((did, _, _)) then
+      var rows = match index.get(&segment)
+      when Option::Some(v) then v.clone()
+      when Option::None then Vec::new()
+      end
+      var observed: Vec[GenericParamId] = Vec::new()
+      collect_param_ids_in_type(tmpl.params[0].ty.clone(), &mut observed)
+      collect_param_ids_in_type(tmpl.ret_type.clone(), &mut observed)
+      var aliases: Map[Int, GenericParamId] = Map::new()
+      if has_noncanonical_param_ids(tmpl.generic_params.clone(), observed.clone()) then
+        aliases = canonical_param_aliases(param_names.clone(), tmpl.generic_params.clone(), observed)
+      end
+      rows.push(DevirtCandidate {
+        template_name: tmpl.name.clone(),
+        self_ty: rewrite_param_aliases_in_type(aliases.clone(), tmpl.params[0].ty.clone()),
+        generic_params: tmpl.generic_params.clone(),
+        ret_type: rewrite_param_aliases_in_type(aliases.clone(), tmpl.ret_type.clone()),
+        did: did.clone()
+      })
+      index.insert(segment, rows)
+    when Option::None then ()
+    end
+  end
+  index
+end
+
+# Resolve ONE bound-receiver contract call to the concrete impl method's
+# instance operand. Returns None when the site is not this wave's class
+# (the caller keeps it). A concrete receiver with candidate impl
+# templates that do not unify records the fail-closed row in `errors`.
+def devirt_resolve_contract_call(
+  inout index: Map[String, Vec[DevirtCandidate]],
+  inout lowered: Set[String],
+  inout func: MirFunction,
+  block_id: Int,
+  callee_name: String,
+  args: Vec[MirCallArg],
+  inout errors: Vec[String]
+) -> Option[MirOperand]
+  # The contract surface is a BARE method name; an emission-mangled name
+  # (or a lowered function / intrinsic label) belongs to another class.
+  if lowered.contains(&callee_name) then
+    return Option::None
+  end
+  let method = devirt_method_segment(callee_name.clone())
+  if method != callee_name then
+    return Option::None
+  end
+  if devirt_intrinsic_surface(callee_name.clone()) then
+    return Option::None
+  end
+  match devirt_receiver_type(&mut func, args)
+  when Option::None then Option::None
+  when Option::Some(recv_ty) then
+    if type_has_params(&recv_ty) then
+      # DEFER: the caller's own specialization substitutes the receiver
+      # type; the wave revisits the specialized body.
+      return Option::None
+    end
+    # (fail-closed scope): only a NOMINAL concrete receiver is a
+    # contract-call shape this wave owns. A fn-pointer / closure receiver
+    # is a value-position call (another lowering class); the receiver Adt
+    # gate keeps the fail-closed row from firing on those.
+    let recv_is_adt = match recv_ty.clone()
+    when Type::Adt(_, _) then true
+    when _ then false
+    end
+    let cands = match index.get(&method)
+    when Option::Some(v) then v.clone()
+    when Option::None then Vec::new()
+    end
+    var matches = 0
+    var found_name = "".to_string()
+    var found_did: Option[DefId] = Option::None
+    var found_args: Vec[GenericArg] = Vec::new()
+    var found_ret = func.ret_type.clone()
+    for cand in cands do
+      # an EXTENSION-impl template (a bare-parameter head, `I__fold`) is
+      # never a concrete selection: the lowering already names those
+      # methods from the registered param-for-type table, so a concrete
+      # receiver selects only a DECLARED head.
+      let head_is_param = match cand.self_ty.clone()
+      when Type::Param(_) then true
+      when Type::ConstParam(_) then true
+      when _ then false
+      end
+      if head_is_param then
+        next
+      end
+      var bind: Map[Int, Type] = Map::new()
+      if !devirt_unify_head(cand.self_ty.clone(), recv_ty.clone(), &mut bind) then
+        next
+      end
+      # every declaration-order parameter must be solved by the receiver
+      # type — an unsolved parameter makes the candidate unselectable
+      # (never a fabricated argument).
+      var solved = true
+      var tmpl_args: Vec[GenericArg] = Vec::new()
+      for gpid in cand.generic_params.clone() do
+        match bind.get(generic_param_id_numeric(&gpid))
+        when Option::Some(bound) then tmpl_args.push(generic_arg_of_type_view(bound.clone()))
+        when Option::None then solved = false
+        end
+      end
+      if !solved then
+        next
+      end
+      if matches == 0 then
+        found_name = cand.template_name.clone()
+        found_did = Option::Some(cand.did.clone())
+        found_args = tmpl_args.clone()
+        let subst = type_subst_new_args(cand.generic_params.clone(), tmpl_args.clone())
+        found_ret = substitute_type(&subst, &cand.ret_type.clone())
+      end
+      matches = matches + 1
+    end
+    if matches == 1 then
+      match found_did
+      when Option::Some(did) then
+        Option::Some(MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirFnItem(found_name.clone()),
+            ty: Type::FnPtr(Vec::new(), found_ret.clone(), Vec::new()),
+            instance: Option::Some(InstanceId { def: CallableId { def: did.clone() }, args: found_args.clone() })
+          })
+        })
+      when Option::None then Option::None
+      end
+    else
+      if matches > 1 && recv_is_adt then
+        let msg = "monomorphization: trait-contract devirtualization for `" + callee_name.clone() + "` on the concrete receiver `" + type_to_mangled(recv_ty.clone()) + "` in `" + func.name.clone() + "` (bb" + block_id.to_string() + ") matched " + matches.to_string() + " impl templates — ambiguous, no rewrite (fail closed)"
+        if !errors.contains(&msg) then
+          errors.push(msg)
+        end
+      elsif cands.len() > 0 && recv_is_adt then
+        let msg = "monomorphization: no impl of `" + callee_name.clone() + "` for the concrete receiver `" + type_to_mangled(recv_ty.clone()) + "` in `" + func.name.clone() + "` (bb" + block_id.to_string() + ") — the bound-contract call has no concrete impl at this instance (fail closed)"
+        if !errors.contains(&msg) then
+          errors.push(msg)
+        end
+      end
+      Option::None
+    end
+  end
+end
+
+# The trait-contract devirtualization wave: rewrite every resolvable
+# bound-receiver contract call in the program's bodies. Returns true when
+# at least one call site was rewritten (the caller re-walks and drains).
+# The lowered emission-name set is the wave's trigger boundary: a callee
+# that already names an emitted function (template or instance) is never
+# a contract surface row. `param_names` is the serialized param-name table
+# the candidate index's canonical binder bijection reads.
+def devirtualize_contract_calls(inout mir: MirProgram, inout errors: Vec[String], param_names: Map[Int, String]) -> Bool
+  var changed = false
+  var lowered: Set[String] = Set::new()
+  for f in mir.functions do
+    lowered.insert(f.name.clone())
+  end
+  var index = devirt_candidate_index(mir, param_names.clone())
+  var fi = 0
+  while fi < mir.functions.len() do
+    var f_out = mir.functions[fi]
     var bi = 0
-    while bi < func.blocks.len() do
-      match func.blocks[bi].terminator.kind
-      when MirTerminatorKind::MirCall(_, callee, _, _, _, _, _) then
+    while bi < f_out.blocks.len() do
+      var rewrite: Option[MirOperand] = Option::None
+      match f_out.blocks[bi].terminator.kind
+      when MirTerminatorKind::MirCall(_, callee, args, _, _, _, _) then
         match callee.kind
         when MirOperandKind::MirConstant(cv) then
           match cv.kind
           when MirConstantKind::MirFnItem(name) then
-            if map_key_op_intrinsic_name(&name) then
-              sites.push(bi)
-            end
+            rewrite = devirt_resolve_contract_call(&mut index, &mut lowered, &mut f_out, bi, name.clone(), args.clone(), &mut errors)
           when _ then ()
           end
         when _ then ()
         end
       when _ then ()
       end
+      match rewrite
+      when Option::Some(new_callee) then
+        var blk = f_out.blocks[bi]
+        match blk.terminator.kind
+        when MirTerminatorKind::MirCall(dest, _, cargs, success, unwind, intrinsic, tail) then
+          blk.terminator = MirTerminator {
+            kind: MirTerminatorKind::MirCall(dest, new_callee, cargs, success, unwind, intrinsic, tail),
+            span: blk.terminator.span.clone(),
+            origin: blk.terminator.origin.clone(),
+            provenance: blk.terminator.provenance.clone()
+          }
+          f_out.blocks[bi] = blk
+          mir.functions[fi] = f_out
+          changed = true
+        when _ then ()
+        end
+      when Option::None then ()
+      end
       bi = bi + 1
     end
-    if !sites.is_empty() then
-      for site in sites do
-        apply_dispatch_injection(mir, func, site)
-      end
-    end
+    fi = fi + 1
   end
+  changed
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -2011,8 +2966,18 @@ end
 pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> Result[Unit, Vec[String]]
  # the param-name table snapshot reaches the cache from the MIR
   # program (the MirBuilder serialized the checker's table at lowering) —
-  # the residual-param and ABI diagnostics render names from it.
+  # the residual-param and ABI diagnostics render names from it, and the
+  # canonical binder bijection (canonical_param_aliases) reads it as the
+  # declared-name correspondence witness.
   cache.generic_param_names = mir.generic_param_names.clone()
+  # (canonical binder identity): the program's typed-field tables are
+  # canonicalized ONCE at the mono boundary — every MirTypeDef's
+  # field/variant types re-point their owner-side binder spellings at the
+  # def's declared (canonical) ids, so the declared-field substitution
+  # (the verifier's aggregate check, the layout/deinit consumers)
+  # instantiates the iterator-adapter and container field tables to
+  # concrete field types.
+  canonicalize_type_def_binders(mir, cache.generic_param_names.clone())
   var pending: VecDeque[(String, InstanceId)] = VecDeque::new()
   var seen: Set[StructuralInstanceId] = Set::new()
   var errors: Vec[String] = Vec::new()
@@ -2061,6 +3026,35 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
     scan_call_sites_in_function(func, mir, cache, &mut pending, &mut seen, &mut errors)
   end
   mono_drain_worklist(mir, cache, &mut pending, &mut seen, &mut errors, &mut specialized_count)
+
+  # Phase 2c: devirtualize the trait-contract calls (the seed's bodyless
+  # re-dispatch). A call on a generic-bound receiver keeps the contract's
+  # bare surface name (`advance`) until the receiver's type is concrete;
+  # the wave selects the concrete impl's method template by the
+  # substituted receiver type, rewrites the callee operand to that
+  # template's emission name + solved instance, and re-drains so the
+  # selected instance is specialized. The wave is re-run until it is a
+  # fixpoint: a specialized body can expose newly-concrete receivers
+  # (the deferral rule) whose own call sites need the next round.
+  var devirt_changed = true
+  var devirt_rounds = 0
+  while devirt_changed do
+    devirt_rounds = devirt_rounds + 1
+    if devirt_rounds > MAX_MONO_DEVIRT_ROUNDS then
+      let msg = "monomorphization: trait-contract devirtualization did not reach a fixpoint after " + MAX_MONO_DEVIRT_ROUNDS.to_string() + " rounds (every round rewrote at least one call site — a non-terminating receiver chain)"
+      if !errors.contains(&msg) then
+        errors.push(msg)
+      end
+      return Result::Err(errors)
+    end
+    devirt_changed = devirtualize_contract_calls(mir, &mut errors, cache.generic_param_names.clone())
+    if devirt_changed then
+      for func in mir.functions do
+        scan_call_sites_in_function(func, mir, cache, &mut pending, &mut seen, &mut errors)
+      end
+      mono_drain_worklist(mir, cache, &mut pending, &mut seen, &mut errors, &mut specialized_count)
+    end
+  end
 
   # Any zero-inference violation or residual-param error recorded during
   # monomorphization aborts the compilation.
@@ -2286,6 +3280,10 @@ pub def mono_specialize_function(
   func_name: String,
   type_args: Vec[Type]
 ) -> Option[String]
+  # the param-name table snapshot (the canonical binder bijection's
+  # declared-name correspondence witness) reaches the cache from the MIR
+  # program — the same seed monomorphize_program performs at its entry.
+  cache.generic_param_names = mir.generic_param_names.clone()
   # Find the generic function
   var found: Option[MirFunction] = Option::None
   for f in mir.functions do
@@ -2377,6 +3375,10 @@ pub def monomorphize_instance(
   inout mir: MirProgram,
   instance: InstanceId
 ) -> Result[Unit, String]
+  # the param-name table snapshot (the canonical binder bijection's
+  # declared-name correspondence witness) reaches the cache from the MIR
+  # program — the same seed monomorphize_program performs at its entry.
+  cache.generic_param_names = mir.generic_param_names.clone()
   let base = fn_owner_key_of_def(&cache.program, &cache.resolutions, &instance.def.def)
   if instance.args.is_empty() then
     return Result::Err("instance " + base + " has empty generic arguments — every generic call carries its solved instance; inference is not performed on the program's call graph")

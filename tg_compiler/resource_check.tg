@@ -7,10 +7,10 @@ use tg_compiler::ast::{
   Block, Stmt, StmtKind, Expr, ExprKind, Pattern, PatternKind, Param,
   AccessConvention, GuardElse, MatchExpr, IfStmt, ForStmt, ClosureParam
 }
-use tg_compiler::types::{Type, TypeKind, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, type_display, TypeDef, TypeDefKind, FieldInfo, VariantInfo, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, is_shared_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, AssignExactDrop, function_cleanup_table_new, crate_module_path_of, def_id_kind_of, ProjectionKey, ProjectionChain, projection_chain_of, projection_key_eq, place_move_path_of, TypedExprKind, effect_handler_synth_key, is_unit_type, FnSignature}
+use tg_compiler::types::{Type, TypeKind, AccessEffect, TypedProgram, TypeId, TypeEnv, type_properties_of, subst_type_args, type_display, TypeDef, TypeDefKind, FieldInfo, VariantInfo, PlaceMoveState, LangItems, ImplInfo, TraitRefTemplate, fn_owner_key, fn_owner_key_of_item, is_trivially_copyable, is_slice_view_type_of, is_shared_view_type_of, finalizer_kind_of_callable, FunctionCleanupTable, FunctionCleanup, ScopeId, DeferId, AssignExactDrop, function_cleanup_table_new, crate_module_path_of, def_id_kind_of, ProjectionKey, ProjectionChain, projection_chain_of, projection_key_eq, place_move_path_of, TypedExprKind, effect_handler_synth_key, is_unit_type, FnSignature}
 use tg_compiler::resolver::{module_path_of_item_resolver, ResolvedNames}
 use tg_compiler::access_check::{AccessError}
-use tg_compiler::ids::{DefId, LocalId, TraitId, FinalizerKind, generic_param_table_new, NodeId, AccessId, CfgEdgeId, CallableId, def_id_numeric}
+use tg_compiler::ids::{DefId, LocalId, TraitId, FinalizerKind, generic_param_table_new, effect_registry_new, NodeId, AccessId, CfgEdgeId, CallableId, def_id_numeric}
 # (DMA keying refinement) The typed stable place identity the committed DMA
 # facts carry: the fact-commit derivation builds a function-scoped
 # StablePlaceId from the owner key + the typed projection chain (the
@@ -329,6 +329,15 @@ end
 #   - Return      a return terminator
 #   - Backedge    the loop body -> header backedge
 #   - GuardElse   a guard's else exit
+#   - Propagate   the `?` failure path — a return-like exit to the function
+#                 exit (the failure value is stored into the return place;
+#                 the seed's TryOp lowering runs the function-level defers
+#                 then Ret). Its cleanup obligation is the Return edge's
+#                 (the defers of every enclosing scope LIFO + the live
+#                 owning locals in reverse drop order); the source is the
+#                 try EXPRESSION's node id (an expression-originated
+#                 transfer — no lexical block record references it, so the
+#                 block-grounded reconciliation does not apply).
 # Convention: source is the semantic node id of the transfer's originator
 # (stmt/cond/loop-stmt node id, or the block's first-statement id for the
 # fallthrough). destination is the static target when one exists: the next
@@ -344,6 +353,7 @@ pub enum CfgEdgeKind
   Return
   Backedge
   GuardElse
+  Propagate
 end
 
 pub struct CfgEdge
@@ -844,6 +854,28 @@ struct AnalysisContext
   # field is the empty env until then.
   access_copy_env: TypeEnv
   access_copy_env_ready: Bool
+  # (the projected-iteration escape context): the stack of the enclosing
+  # projected for-loop escape frames (LoopEscapeFrame). Pushed/popped
+  # lexically by check_loop_body around the loop-body walk, so it is empty
+  # outside every loop body; the transfer sites (return/break values,
+  # assignment targets, guard-else exits, closure captures) read it to
+  # reject a binding value leaving the iteration.
+  loop_escape_stack: Vec[LoopEscapeFrame]
+  # (item 2 — the nested-lexical-block terminator scan): the enclosing
+  # loop body's per-statement scan, installed by check_loop_body for the
+  # duration of the body walk (save/restore — a nested loop stacks its own
+  # over the outer one and restores it afterwards). check_block reads it so
+  # a terminator inside a NESTED lexical block (an if/match arm, an unsafe
+  # or with block, an expression block) is scanned with the same frame
+  # gating as a terminator at the loop body's own statement level. The
+  # stored copy carries the MUTATION half DISABLED (projected_root = -1):
+  # the enclosing statement's plan walk already covers nested blocks, so
+  # re-running the mutation scan at the nested level would duplicate the
+  # diagnostic. check_defer_body clears it around the defer-body run: a
+  # defer body is checked once on a private clone at registration, never
+  # executed in place, so its terminators are not scanned (the pre-existing
+  # behavior — run_cfg_block gets scan=None there).
+  loop_body_scan: Option[LoopBodyScan]
 end
 
 # one fresh context per compilation — the pipeline (analyze_parsed,
@@ -862,7 +894,9 @@ pub def analysis_context_new() -> AnalysisContext
     current_owner_key: "",
     dma_facts: Vec::new(),
     access_copy_env: engine_env_empty(),
-    access_copy_env_ready: false
+    access_copy_env_ready: false,
+    loop_escape_stack: Vec::new(),
+    loop_body_scan: Option::None
   }
 end
 
@@ -1161,6 +1195,7 @@ def resource_drop_edge_word(kind: CfgEdgeKind) -> String
   when CfgEdgeKind::Return then "return"
   when CfgEdgeKind::Backedge then "backedge"
   when CfgEdgeKind::GuardElse then "guard-else"
+  when CfgEdgeKind::Propagate then "propagate"
   end
 end
 
@@ -1178,6 +1213,7 @@ def resource_drop_path_conditions(kind: CfgEdgeKind) -> Vec[String]
   when CfgEdgeKind::Return then out.push("return")
   when CfgEdgeKind::Backedge then out.push("loop-backedge")
   when CfgEdgeKind::GuardElse then out.push("guard-else")
+  when CfgEdgeKind::Propagate then out.push("propagate")
   when CfgEdgeKind::Normal then ()
   end
   out
@@ -1196,6 +1232,9 @@ def resource_drop_kind_word(kind: CfgEdgeKind) -> String
   when CfgEdgeKind::Return then "fn-end"
   when CfgEdgeKind::Backedge then "iteration"
   when CfgEdgeKind::GuardElse then "guard-else"
+  # the `?` propagation edge exits the function like a return — the same
+  # cleanup classification (fn-end).
+  when CfgEdgeKind::Propagate then "fn-end"
   end
 end
 
@@ -2450,7 +2489,14 @@ def cfg_expr(expr: Expr, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock],
   when ExprKind::ExprUnsafe(_, block) then cfg_block(&block, edges, blocks, chain, synth)
   when ExprKind::ExprAsync(block) then cfg_block(&block, edges, blocks, chain, synth)
   when ExprKind::ExprAwait(inner) then cfg_expr(*inner.get(), edges, blocks, chain, synth)
-  when ExprKind::ExprTry(inner) then cfg_expr(*inner.get(), edges, blocks, chain, synth)
+  when ExprKind::ExprTry(inner) then
+    # the `?` failure path is a return-like transfer to the function exit:
+    # ONE propagation edge (source = the try expression's node id,
+    # destination 0 — the dynamic function exit) whose cleanup the state
+    # walk attaches (the defers of every enclosing scope LIFO + the live
+    # owning locals in reverse drop order — the Return-edge obligation).
+    edges.push(CfgEdge { kind: CfgEdgeKind::Propagate, source: expr.node_id, destination: 0, actions: Vec::new() })
+    cfg_expr(*inner.get(), edges, blocks, chain, synth)
   when ExprKind::ExprRange(start, end_, _) then
     match start
     when Option::Some(s) then cfg_expr(*s.get(), edges, blocks, chain, synth)
@@ -2766,6 +2812,7 @@ pub def engine_snapshot_env(typed: TypedProgram) -> TypeEnv
   env.type_list = type_list
   env.type_name_index = name_index
   env.type_id_index = id_index
+  env.pattern_variant_resolutions = typed.pattern_variant_resolutions.clone()
   # LangItems selection: the builtin compound ids by their registered names
   # (the engine's own identity table — Option/Result/Vec/Map/Set/Box/Rc/
   # Array/Slice/String/Ptr/PtrMut are registered builtins; StrView/
@@ -3349,8 +3396,43 @@ end
 # answers deferred = NOT copyable, and the drop-glue axis answers
 # DeinitPlan::Deferred — never Trivial.
 def is_owning_typed(inout env: TypeEnv, ty: Type) -> Bool
+  # (the internal reference ABI — the seed's storage/ownership rule answer
+  # for RefInternal, keyed on the TYPE, never on a declaration name): a
+  # reference VALUE owns nothing. See type_is_ref_internal below.
+  if type_is_ref_internal(ty.clone()) then
+    return false
+  end
   let p = type_properties_of(env, ty)
   p.owns_state || p.is_linear
+end
+
+# THE internal-reference ABI classification — the seed's storage/ownership
+# rule answer for RefInternal, keyed on the TYPE (never on a declaration
+# name). stage0_ocaml's Type_properties answers `Ref_internal _ -> scalar`:
+# a reference value is NON-OWNING and bit-copyable (needs_drop=false,
+# is_copy=true), and the seed's resource checker keys its owned-root filter
+# and its chain-owning rule on exactly that answer
+# (resource_check.ml's `not (Type_properties.is_trivially_copyable ...)`),
+# so a reference local / a binding THROUGH a reference owns nothing: no
+# storage obligation, no consume, no drop.
+#
+# The kernel engine snapshot (types.tg's type_props_walk ref arm) propagates
+# capability containment through the reference and leaves the ownership
+# axis unset; the MIR-side verifier already mirrors the seed by peeling the
+# reference layer itself (mir.tg verifier_type_trivially_copyable /
+# verifier_type_requires_old_drop). This file's engine-query layer applies
+# the SAME peel for the resource checker's storage/ownership rule
+# (is_owning_typed) and for the pattern-binding source classification
+# (bind_pattern) — the classification is the TYPE-level one; the five
+# `__intrinsic_{map,set}_visit_*` declarations are the closed ABI surface
+# whose SIGNATURES the MIR side carves out by name, and their `&K`/`&V`
+# positions are exactly the RefInternal type answered here. Genuine owned
+# values (String, Vec, a resource, a capability) keep the strict rule.
+pub def type_is_ref_internal(ty: Type) -> Bool
+  match ty
+  when Type::RefInternal(_, _) then true
+  when _ then false
+  end  end
 end
 
 # A type that cannot safely sit behind shared ownership: the
@@ -3909,6 +3991,11 @@ def validate_cfg_edges(ctx: AnalysisContext, typed: TypedProgram, finalize_plan:
           has_term = true
         when CfgEdgeKind::Continue then
           has_term = true
+        when CfgEdgeKind::Propagate then
+          # A Propagate edge exits the function: it is terminal like a
+          # Return (no lexical block record references it — the source is
+          # the try expression's node id).
+          has_term = true
         when CfgEdgeKind::Backedge then
           # A Backedge originates in a loop body: it must name the loop
           # body's block key (destination), never the dynamic target 0.
@@ -3976,6 +4063,12 @@ def validate_cfg_edges(ctx: AnalysisContext, typed: TypedProgram, finalize_plan:
     when CfgEdgeKind::Return then grounded = true
     when CfgEdgeKind::Break then grounded = true
     when CfgEdgeKind::Continue then grounded = true
+    # the `?` propagation edge exits the function like a Return — its drop
+    # actions are grounded on the exit frame of its source block. No
+    # lexical block record references it (the source is an expression node
+    # id), so edge_source_block_index answers -1 and the check is inert
+    # until a record references it.
+    when CfgEdgeKind::Propagate then grounded = true
     when _ then ()
     end
     if grounded then
@@ -4173,11 +4266,129 @@ end
 # iteration escape guard and the projected-mutation scan) when the block
 # is a for-loop body.
 struct LoopBodyScan
-  iter_binding_ids: Vec[Int]
-  iter_reported: Vec[Bool]
+  # NOTE: the loop's for-pattern binding ids are NOT carried here — the
+  # terminator scan (check_iter_binding_escape) reads them off the
+  # escape-stack frames (item 3: every enclosing frame the terminator
+  # exits), and the report-once flags live on those frames
+  # (LoopEscapeFrame.reported), so the scan and the transfer sites share
+  # them.
   projected_root: Int
   projected_fields: Vec[String]
+  # NOTE (item 1): the escape guard's gate is NOT a field of this scan — the
+  # terminator scan runs whenever the escape stack holds a projected frame
+  # (loop_escape_has_projected_frame), so a statement inside a nested
+  # NON-projected loop within a projected loop is scanned too. The previous
+  # per-scan `projected` flag gated on the INNERMOST loop and left those
+  # terminators unscanned.
   reported_stmt_id: Int
+end
+
+# (item 2): the copy of a loop body's scan propagated into NESTED lexical
+# blocks (ctx.loop_body_scan). The terminator half is preserved verbatim
+# (the escape-stack frames carry the real report-once/sanctioned state, so
+# the copy shares it); the mutation half is DISABLED (projected_root = -1)
+# because the enclosing statement's plan walk (plan_stmt_mutates_place)
+# already recurses into nested blocks — running the mutation scan again at
+# the nested level would emit the same diagnostic twice.
+def nested_loop_body_scan(scan: LoopBodyScan) -> LoopBodyScan
+  LoopBodyScan {
+    projected_root: -1,
+    projected_fields: Vec::new(),
+    reported_stmt_id: scan.reported_stmt_id
+  }
+end
+
+# (the projected-iteration escape context): one frame per enclosing LOOP,
+# pushed by check_loop_body for the duration of the loop-body walk and
+# popped after it — the stack mirrors the lexical loop nesting, and the
+# `projected` flag marks the PROJECTED loops (the escape surface: only
+# their bindings are the MIR's per-iteration element slots that must not
+# leak; a snapshot/range loop pushes a frame with no bindings and
+# projected = false, so a break inside it can never be mistaken for a
+# break out of an enclosing projected loop). The transfer sites
+# (return/break values, assignment targets, guard-else exits, closure
+# captures) read the stack through the AnalysisContext and report a
+# binding whose value leaves the iteration:
+#   - into a LOOP-PERSISTENT destination place — a place rooted at a local
+#     present in the loop's entry frame, which outlives the loop body (the
+#     loop's own binding slots are excluded: the MIR re-binds them every
+#     header pass, so a store into one is body-local), or
+#   - into a closure environment (the capture moves the value into a value
+#     that may outlive the iteration — the documented capture rejection).
+# The accepted per-iteration sink transfer (`s.insert(item)`,
+# `caps.devices.push(device)`) is NOT an assignment target and not a
+# capture: its destination is a callee, not a place of this frame, so no
+# site checks it.
+struct LoopEscapeFrame
+  # the loop's for-pattern binding ids (raw Int semantic ids — the
+  # LoopBodyScan / IterationPlan domain). EMPTY for a non-projected loop:
+  # its binding is not a per-iteration element slot, so it is never
+  # reported and never staged.
+  binding_ids: Vec[Int]
+  # the loop's projected class (the plan is the PROJECTED class:
+  # AccessEffect::Read, source_kind != 3). The scan gate
+  # (loop_escape_has_projected_frame) reads it: the terminator scan runs
+  # for a statement inside ANY loop nested within a projected loop, not
+  # only when the INNERMOST loop is projected.
+  projected: Bool
+  # the loop's entry-frame locals (raw Int semantic ids): the
+  # LOOP-PERSISTENT set. A destination place rooted here outlives the loop
+  # body (the complement of is_loop_created); a destination NOT in this
+  # set is loop-created (body-local) and keeps the accepted per-iteration
+  # transfer.
+  entry_ids: Vec[Int]
+  # the iterated collection's place key (root local id + field chain; -1
+  # when the iterable is not rootable): the source element place the
+  # bindings are loaded from. A store back into that place is a
+  # write-back — the element returning to its own storage — not an escape.
+  source_root: Int
+  source_fields: Vec[String]
+  # report-once flags, one per binding id, shared by the terminator scan
+  # and the transfer sites so a binding is reported exactly once.
+  reported: Vec[Bool]
+  # (item 1 — the sanctioned-sink provenance): one flag per binding id, set
+  # at a sanctioned per-iteration sink transfer — a Consume argument to a
+  # callee (apply_arg_effect's Consume path). The destination of such a
+  # transfer is the CALLEE's parameter, never a place of this frame, so the
+  # terminator scan must not treat the binding as having left the
+  # iteration. The scan reads the flag through the PRE-TERMINATOR snapshot
+  # (loop_escape_sanctioned_ids), so a consume committed by the
+  # terminator's own value/argument transfer is still reported.
+  sink_consumed: Vec[Bool]
+  # (item 4 — the staged body-local provenance): one destination-id set per
+  # binding id. When the binding's consumed value is stored into a
+  # BODY-LOCAL destination (a loop-created local, or the loop's own
+  # re-bound binding slot — the complement of the outer-place test in
+  # check_projected_escape_store), the destination local ids are recorded
+  # here. The terminator scan accepts the binding's Consumed state as
+  # staged (the value is dropped with the destination at the iteration's
+  # end, so it never left the iteration) only while EVERY recorded
+  # destination is still Live with no moved-out chain in the scan's frame
+  # AND the terminator's value does not mention the destination (the
+  # syntactic mention test — any channel that could carry the value out
+  # must name the place it reads). An EMPTY set is "not staged": the
+  # conservative report stays. A DIRECT store of the binding overwrites the
+  # set at the store/let site (projected_stage_value /
+  # projected_stage_binding), so the mark names the latest body-local place
+#   the directly-stored value lives in; chained staging (a store of an
+#   already-staged destination) deliberately does not follow the chain.
+#   An assignment that overwrites a recorded destination with a value the
+#   RHS walk finds no projected binding in invalidates the mark at that
+#   destination (projected_unstage_dest): the stale provenance can then
+#   neither accept a terminator nor resolve a later store of the
+#   destination to the binding.
+  staged_dests: Vec[Vec[Int]]
+end
+
+# (item 2 — the guard-else path scoping): the snapshot record of every
+# escape frame's PATH-SCOPED scan marks (the sanctioned-sink provenance and
+# the staged body-local destinations) — see loop_escape_path_marks_snapshot
+# / _restore. Declared here with the escape context: the guard arm (check_stmt)
+# snapshots and restores the marks around its divergent else path so a mark
+# it commits cannot suppress a later fallthrough-path scan.
+struct LoopEscapePathMarks
+  sink: Vec[Vec[Bool]]
+  staged: Vec[Vec[Vec[Int]]]
 end
 
 def run_cfg_block(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, stmts: Vec[Stmt], loop_outer: Vec[Int], frame_in: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int], block_key: Int, scan: Option[LoopBodyScan], value_block: Bool) -> (ResFrame, Option[LoopBodyScan])
@@ -4185,11 +4396,18 @@ def run_cfg_block(program: Program, typed: TypedProgram, inout env: TypeEnv, ino
    mut dead = false
    mut carried_scan = scan
    mut ni = 0
+   # (item 1 — the sanctioned-sink snapshot): the pre-terminator
+   # provenance of every enclosing projected loop's bindings. Taken BEFORE
+   # the terminator executes so a consume committed by the terminator's OWN
+   # transfer (`return f(item)`, `return [item]`) is not mistaken for an
+   # earlier sanctioned sink transfer; the terminator scan reads it.
+   mut sanctioned_before = Vec::new()
    while ni < stmts.len() do
      let node = stmts[ni]
      mut executed = false
      if stmt_is_terminator(&node) then
        if !dead then
+         sanctioned_before = loop_escape_sanctioned_ids(ctx)
          check_terminator_stmt(program, typed, env, ctx, &node, loop_outer, &mut bf, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
          dead = true
          executed = true
@@ -4208,10 +4426,26 @@ def run_cfg_block(program: Program, typed: TypedProgram, inout env: TypeEnv, ino
     if executed then
       match carried_scan
       when Option::Some(mut sc) then
-        # the projected-mutation scan (the iterated collection cannot be
-        # mutated inside the loop body under projected iteration), per
-        # loop-body statement — the loop-body walk parity of the pre-CF2
-        # per-statement scan.
+        # the projected-iteration escape guard (reported once per binding,
+        # the first statement after which the binding's state became
+        # Consumed) and the projected-mutation scan (the iterated
+        # collection cannot be mutated inside the loop body under projected
+        # iteration), per loop-body statement — the loop-body walk parity
+        # of the pre-CF2 per-statement scan.
+        # (items 1 + 3): the terminator scan runs for a statement inside
+        # ANY loop nested within a projected loop — the gate reads the
+        # escape stack (loop_escape_has_projected_frame), never the
+        # innermost body's class, so a terminator in a nested
+        # NON-projected loop is scanned too — and walks EVERY enclosing
+        # projected loop's frame the terminator exits (Return: all frames;
+        # Break/Continue: the innermost loop's frame only — a break in a
+        # nested non-projected loop exits just that loop, so it reports
+        # nothing), skipping the bindings whose Consumed state was
+        # committed by a sanctioned sink transfer BEFORE this terminator
+        # (the snapshot).
+        if loop_escape_has_projected_frame(ctx) then
+          check_iter_binding_escape(typed, ctx, &bf, &node, node.span, &sanctioned_before, errors)
+        end
         if sc.projected_root >= 0 && node.node_id != sc.reported_stmt_id then
           if plan_stmt_mutates_place(typed, &node, sc.projected_root, &sc.projected_fields) then
             sc.reported_stmt_id = node.node_id
@@ -4283,7 +4517,7 @@ def check_block(program: Program, typed: TypedProgram, inout env: TypeEnv, inout
   if blk_key != 0 then
     defer_chain.push(blk_key)
   end
- # (one TypedCFG): the block's statements execute through the SAME
+  # (one TypedCFG): the block's statements execute through the SAME
   # per-block machinery (run_cfg_block) that runs over the PRE-BUILT
   # CfgBlock records — the block record with id == blk_key (recorded by
   # the structural pass cfg_block) is the block the state computation
@@ -4291,8 +4525,17 @@ def check_block(program: Program, typed: TypedProgram, inout env: TypeEnv, inout
   # terminator grounding is verified against it, and the cleanup
   # obligations are ATTACHED to the pre-built edges by (kind, source)
   # identity.
+  # (item 2 — the nested-lexical-block terminator scan): when this block is
+  # lexically inside a loop body, the enclosing LoopBodyScan is propagated
+  # (ctx.loop_body_scan, installed by check_loop_body) so a terminator in
+  # THIS nested block is scanned with the same frame gating as one at the
+  # loop body's own statement level. The propagated copy carries the
+  # mutation half disabled (projected_root = -1): the enclosing statement's
+  # plan walk already covers nested blocks. Outside every loop body the
+  # field is None and the call is byte-identical to the pre-item-2 form.
   let entry_frame = res_frame_clone(frame)
-  let (exit_frame, _) = run_cfg_block(program, typed, env, ctx, &block.stmts, loop_outer, &entry_frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain, blk_key, Option::None, value_block)
+  let nested_scan = ctx.loop_body_scan.clone()
+  let (exit_frame, _) = run_cfg_block(program, typed, env, ctx, &block.stmts, loop_outer, &entry_frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain, blk_key, nested_scan, value_block)
   frame_assign(frame, &exit_frame)
   if blk_key != 0 then
     defer_chain.pop()
@@ -4447,6 +4690,10 @@ def verify_terminator_edge_grounding(typed: TypedProgram, finalize_plan: Functio
     when CfgEdgeKind::Return then grounded_kind = true
     when CfgEdgeKind::Break then grounded_kind = true
     when CfgEdgeKind::Continue then grounded_kind = true
+    # the `?` propagation edge exits the function like a Return; the
+    # orig_ids guard below keeps it inert (its source is an expression
+    # node id, never in a lexical block's originating-id set).
+    when CfgEdgeKind::Propagate then grounded_kind = true
     when _ then ()
     end
     if grounded_kind then
@@ -4557,6 +4804,13 @@ def check_return_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv,
   when Option::Some(val) then
     check_expr(program, typed, env, ctx, &val, loop_outer, frame, errors, finalize_plan, edges, blocks, &mut return_entry, defer_chain)
     transfer_consume(env, typed, &val, loop_outer, frame, errors, finalize_plan)
+    # (the projected-iteration escape — the return value): an owning
+    # projected for-binding returned out of the loop body is the binding
+    # leaving the iteration (a return exits every enclosing loop, so the
+    # binding of ANY enclosing projected loop is reported). The guard-else
+    # path reaches this site too — its transfer runs on the private frame
+    # clone, so only the loop-context check can see it.
+    check_projected_escape_value(env, typed, ctx, &val, true, errors)
   when Option::None then ()
   end
  # this function produces the RETURN edge's CleanupAction sequence —
@@ -4663,6 +4917,12 @@ def check_break_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, 
   when Option::Some(val) then
     check_expr(program, typed, env, ctx, &val, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     transfer_consume(env, typed, &val, loop_outer, frame, errors, finalize_plan)
+    # (the projected-iteration escape — the break value): a break carrying
+    # the owning projected binding exits the loop's iteration with the
+    # element — only the INNERMOST loop is exited, so only its binding is
+    # reported (an outer projected loop's binding stays inside the outer
+    # iteration). The guard-else else-break path reaches this site too.
+    check_projected_escape_value(env, typed, ctx, &val, false, errors)
   when Option::None then ()
   end
  # this function produces the BREAK edge's CleanupAction sequence —
@@ -4721,18 +4981,36 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
   when StmtKind::StmtLet(pattern, _, value, _) then
     check_expr(program, typed, env, ctx, &value, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     transfer_consume(env, typed, &value, loop_outer, frame, errors, finalize_plan)
-    bind_pattern(env, typed, &pattern, stmt.span, frame, errors)
- # (channel d): a let-bound RAW view local is registered under
+    # (the internal reference ABI in the storage/ownership rule): the
+    # binding SOURCE type decides the binding's ownership — the seed keys
+    # on the type. `let val_ref = __intrinsic_map_visit_value(..)` binds a
+    # RefInternal value: a borrow with no storage obligation.
+    let binding_source_ty = match typed.expr_types.get(value.node_id)
+    when Option::Some(t) then t.clone()
+    when Option::None then Type::Unit
+    end
+    bind_pattern(env, typed, &pattern, stmt.span, frame, errors, binding_source_ty, false)
+  # (channel d): a let-bound RAW view local is registered under
     # its backing place — live until its scope exits (the scope-boundary
     # cleanup protocol removes it).
     register_slice_view_local(ctx, env, typed, &pattern, &value)
+    # (item 4 — the staged body-local provenance): a let's destination is
+    # ALWAYS loop-created (the fresh locals bound by the pattern), so an
+    # owning projected binding whose value flows into the RHS is staged in
+    # those locals — the accepted `let tmp = item; <non-carrying
+    # terminator>` shape. The marks are consumed by the terminator scan
+    # (projected_staged_body_local); outside every projected loop body the
+    # escape stack is empty and this is a no-op.
+    var let_dest_ids = Vec::new()
+    collect_pattern_binding_ids(typed, &pattern, &mut let_dest_ids)
+    projected_stage_value(env, typed, ctx, &value, let_dest_ids)
   when StmtKind::StmtAssign(target, value) then
  # check_assign_target captures prior_state and validates the
     # target WITHOUT mutating it; the RHS is validated next, then the drop
     # decision (computed from prior_state) is recorded and next_state
     # commits — the store can never look like a replacement of a value that
     # was never there.
-    let assign_trans = check_assign_target(program, typed, env, ctx, &target, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    let assign_trans = check_assign_target(program, typed, env, ctx, &target, &value, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     check_expr(program, typed, env, ctx, &value, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     transfer_consume(env, typed, &value, loop_outer, frame, errors, finalize_plan)
     match assign_trans
@@ -4944,25 +5222,63 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     # (cond-true) frame keeps the local Live. The GuardElse edge's cleanup
     # obligation is recorded from the same clone (identical content at the
     # guard point), so the emitted edge cleanup is unchanged.
+    # (item 3 — the guard-else terminator scan): a guard is NOT a
+    # terminator (stmt_is_terminator is Return/Break/Continue only), so the
+    # loop-body statement scan never sees the else transfer — and the
+    # transfer runs on the private clone, so the real frame's scan could
+    # not see it either. The else arm's transfer is checked HERE with the
+    # same frame gating as the equivalent statement (`if !cond then return
+    # ... end`): the pre-transfer sanctioned snapshot (a Consume committed
+    # by the else arm's own value is not mistaken for an earlier sink
+    # transfer), the clone's post-transfer frame, and the same escape-stack
+    # walk the terminator scan uses. The report-once flag is shared with
+    # the direct value check inside check_return_stmt/check_break_stmt, so
+    # `guard ok else return item` is still reported exactly once.
+    # (item 2 — the guard-else path scoping): the else path diverges
+    # (return/break/continue/panic), so the sanctioned-sink and staged
+    # body-local marks it commits belong to that path only. Snapshot the
+    # marks here and restore them after the else path: a mark set on the
+    # divergent path can then never suppress a later FALLTHROUGH-path scan
+    # (the else path's own scan below runs before the restore and still
+    # reads the marks it just committed).
+    let g_path_marks = loop_escape_path_marks_snapshot(ctx)
     match else_action
     when GuardElse::Return(val_opt) then
  # / GUARD-ELSE edge — the guard's failing-condition
       # exit is ONE pre-built transfer of kind GuardElse (source = the
       # GUARD stmt's id, not an inner return's).
       mut gframe = res_frame_clone(frame)
+      let g_sanctioned = loop_escape_sanctioned_ids(ctx)
+      let g_span = match val_opt
+      when Option::Some(v) then v.span
+      when Option::None then stmt.span
+      end
+      let g_val = val_opt.clone()
       let g_actions = check_return_stmt(program, typed, env, ctx, val_opt, loop_outer, &mut gframe, errors, finalize_plan, edges, blocks, stmt.node_id, defer_chain)
       attach_edge_actions(ctx, edges, CfgEdgeKind::GuardElse, stmt.node_id, g_actions, errors)
+      check_iter_binding_escape_at(typed, ctx, &gframe, true, g_val, g_span, &g_sanctioned, errors)
     when GuardElse::Panic(_) then ()
     when GuardElse::Break(val_opt) then
  # / GUARD-ELSE edge (else-break).
       mut gframe2 = res_frame_clone(frame)
+      let gb_sanctioned = loop_escape_sanctioned_ids(ctx)
+      let gb_span = match val_opt
+      when Option::Some(v) then v.span
+      when Option::None then stmt.span
+      end
+      let gb_val = val_opt.clone()
       let g_actions = check_break_stmt(program, typed, env, ctx, val_opt, loop_outer, &mut gframe2, errors, finalize_plan, edges, blocks, stmt.node_id, current_loop_entry, defer_chain)
       attach_edge_actions(ctx, edges, CfgEdgeKind::GuardElse, stmt.node_id, g_actions, errors)
+      check_iter_binding_escape_at(typed, ctx, &gframe2, false, gb_val, gb_span, &gb_sanctioned, errors)
     when GuardElse::Continue then
  # / GUARD-ELSE edge (else-continue).
       let g_actions = record_exit_edge_plan(typed, frame, current_loop_entry, finalize_plan, defer_chain, true)
       attach_edge_actions(ctx, edges, CfgEdgeKind::GuardElse, stmt.node_id, g_actions, errors)
     end
+    # (item 2): the else path has diverged — restore the path-scoped marks
+    # the snapshot captured so only the else path's own scan (above) ever
+    # saw them; the fallthrough path continues from the unmarked state.
+    loop_escape_path_marks_restore(ctx, g_path_marks)
   when StmtKind::StmtTry(_, _, _) then
  # REJECTED — exceptions are not supported. The resource CFG has
     # no Throw/Unwind/Handler edges, so a try body's throwing path (body ->
@@ -5071,7 +5387,10 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
         let arm_entry = res_frame_new()
         var p_idx = 0
         while p_idx < handlers[h_idx].arms[a_idx].params.len() do
-          bind_pattern(env, typed, &handlers[h_idx].arms[a_idx].params[p_idx], handlers[h_idx].arms[a_idx].span, &mut arm_entry, errors)
+          # (the internal reference ABI): the handler arm's parameter source
+          # type is not carried here — Type::Unit keeps the strict owned
+          # rule (fail closed).
+          bind_pattern(env, typed, &handlers[h_idx].arms[a_idx].params[p_idx], handlers[h_idx].arms[a_idx].span, &mut arm_entry, errors, Type::Unit, false)
           p_idx = p_idx + 1
         end
         let arm_key = block_exit_key(&arm_body)
@@ -5107,7 +5426,16 @@ def check_defer_body(program: Program, typed: TypedProgram, inout env: TypeEnv, 
   # and records the body block's (entry, exit) frames under its record id.
   let body_key = block_exit_key(body)
   let body_entry = res_frame_clone(frame)
+  # (item 2 — the defer-body boundary): a defer body is checked ONCE at
+  # registration on a private clone, never executed in place, so its
+  # terminators are not scanned (the pre-existing behavior: run_cfg_block
+  # gets scan=None here). The enclosing loop body's scan is cleared for the
+  # duration so a NESTED lexical block inside the defer body does not pick
+  # it up through check_block; the saved value is restored afterwards.
+  let saved_scan = ctx.loop_body_scan.clone()
+  ctx.loop_body_scan = Option::None
   let (body_exit, _) = run_cfg_block(program, typed, env, ctx, &body.stmts, loop_outer, &body_entry, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain, body_key, Option::None, false)
+  ctx.loop_body_scan = saved_scan
   frame_assign(frame, &body_exit)
   slice_views_remove_after(ctx, &body_view_keys)
   var ids = Vec::new()
@@ -5346,7 +5674,12 @@ def check_match(program: Program, typed: TypedProgram, inout env: TypeEnv, inout
     # effect in one arm's guard cannot leak into another arm or the join.
     mut arm_pre = res_frame_clone(frame)
     check_pattern(program, typed, env, ctx, &m.arms[i].pattern, loop_outer, &mut arm_pre, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
-    bind_pattern(env, typed, &m.arms[i].pattern, m.arms[i].pattern.span, &mut arm_pre, errors)
+    # (the internal reference ABI in the storage/ownership rule): the
+    # SCRUTINEE type is the binding source — `match self` on a reference
+    # binds through the borrow, and a variant payload that is a reference
+    # (the visit positions' `when Option::Some(key_ref)`) is classified by
+    # the pattern walk in bind_pattern from the TYPE.
+    bind_pattern(env, typed, &m.arms[i].pattern, m.arms[i].pattern.span, &mut arm_pre, errors, scrutinee_ty.clone(), false)
     match m.arms[i].guard_expr
     when Option::Some(g) then check_expr(program, typed, env, ctx, &g, loop_outer, &mut arm_pre, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     when Option::None then ()
@@ -5416,7 +5749,7 @@ def check_loop(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
   when Option::Some(c2) then c2.node_id
   when Option::None then -1
   end
-  let after = check_loop_body(program, typed, env, ctx, body, &entry, &entry_names, &no_iter_binding, -1, &no_projected_fields, errors, finalize_plan, edges, blocks, stmt_node_id, current_loop_entry, defer_chain, cond_source)
+  let after = check_loop_body(program, typed, env, ctx, body, &entry, &entry_names, &no_iter_binding, -1, &no_projected_fields, false, errors, finalize_plan, edges, blocks, stmt_node_id, current_loop_entry, defer_chain, cond_source)
   frame_assign(frame, &after)
   # / THE LOOP-JOIN — the loop's continuation block's (entry, exit)
   # frames: the after-frame (the fixed point check_loop_body computed —
@@ -6527,7 +6860,13 @@ def check_for(program: Program, typed: TypedProgram, inout env: TypeEnv, inout c
     pre_entry_names.push(lid.id)
   end
   check_pattern(program, typed, env, ctx, &for_stmt.pattern, &pre_entry_names, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
-  bind_pattern(env, typed, &for_stmt.pattern, for_stmt.span, frame, errors)
+  # (the internal reference ABI in the storage/ownership rule): the
+  # iteration binding's source type is the iterable's ELEMENT type (the
+  # typed classification, refs peeled) — a reference element binds through
+  # the borrow and owns nothing; every other element keeps the strict rule
+  # (the projected-vs-consuming decision below is unchanged).
+  let (_, iter_elem_ty) = for_iterable_kind(typed, &for_stmt.iter)
+  bind_pattern(env, typed, &for_stmt.pattern, for_stmt.span, frame, errors, iter_elem_ty, false)
   check_expr(program, typed, env, ctx, &for_stmt.iter, &pre_entry_names, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
  # record the pattern binding's id(s) — under the current projected
   # iteration the MIR binds elements by REFERENCE (it never consumes them),
@@ -6564,9 +6903,16 @@ def check_for(program: Program, typed: TypedProgram, inout env: TypeEnv, inout c
   # (plan_stmt_mutates_place) reports the conflict.
   var projected_root = -1
   var projected_fields = Vec::new()
+  # the escape guard's gate: the plan is the PROJECTED class. Unlike the
+  # mutation rule below this needs no rootable place — the guard applies to
+  # every projected loop (a self-rooted iterable like `self.items` has no
+  # local root, but its binding is still the MIR's per-iteration element
+  # slot).
+  var projected_iteration = false
   match for_iteration_plan(typed, env, for_stmt, &iter_binding_ids)
   when Option::Some(p) then
     if p.access == AccessEffect::Read && p.source_kind != 3 then
+      projected_iteration = true
       match expr_root_id(typed, &for_stmt.iter)
       when Option::Some(rid) then
         projected_root = rid
@@ -6589,7 +6935,7 @@ def check_for(program: Program, typed: TypedProgram, inout env: TypeEnv, inout c
   for lid in res_frame_names_clone(&entry) do
     entry_names.push(lid.id)
   end
-  let after = check_loop_body(program, typed, env, ctx, &for_stmt.body, &entry, &entry_names, &iter_binding_ids, projected_root, &projected_fields, errors, finalize_plan, edges, blocks, stmt_node_id, current_loop_entry, defer_chain, -1)
+  let after = check_loop_body(program, typed, env, ctx, &for_stmt.body, &entry, &entry_names, &iter_binding_ids, projected_root, &projected_fields, projected_iteration, errors, finalize_plan, edges, blocks, stmt_node_id, current_loop_entry, defer_chain, -1)
   frame_assign(frame, &after)
   # / THE FOR-JOIN — the for loop's continuation block's (entry,
   # exit) frames: the after-frame (the fixed point check_loop_body
@@ -6617,7 +6963,7 @@ end
 # check_loop_body exempts the binding ids (a conditionally consumed binding
 # is likewise per-iteration state, refreshed at the next header).
 
-def check_loop_body(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, body: Block, entry: ResFrame, entry_names: Vec[Int], iter_binding_ids: Vec[Int], projected_root: Int, projected_fields: Vec[String], inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], loop_stmt_id: Int, inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int], exit_source: Int) -> ResFrame
+def check_loop_body(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, body: Block, entry: ResFrame, entry_names: Vec[Int], iter_binding_ids: Vec[Int], projected_root: Int, projected_fields: Vec[String], projected_iteration: Bool, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], loop_stmt_id: Int, inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int], exit_source: Int) -> ResFrame
  # (single-shot loops): when the body's FIRST DIRECT terminator is a
   # Break or Return (not a Continue), the fallthrough to the backedge is
   # UNREACHABLE — the loop executes at most once. The backedge then
@@ -6674,21 +7020,55 @@ def check_loop_body(program: Program, typed: TypedProgram, inout env: TypeEnv, i
   # gap (loop-body blocks with no recorded exit frames) is CLOSED: the
   # terminator grounding reconciliation and the validate_cfg_edges
   # grounding checks now apply to every loop-body-originated edge.
-  mut iter_reported = Vec::new()
   mut ri = 0
-  while ri < iter_binding_ids.len() do
-    iter_reported.push(false)
-    ri = ri + 1
-  end
   var body_scan = LoopBodyScan {
-    iter_binding_ids: iter_binding_ids.clone(),
-    iter_reported: iter_reported,
     projected_root: projected_root,
     projected_fields: projected_fields.clone(),
     reported_stmt_id: -1
   }
+  # (the projected-iteration escape context): push the loop's escape frame
+  # for the duration of the body walk — the transfer sites (return/break
+  # values, assignment targets, guard-else exits, closure captures) read
+  # it through ctx. EVERY loop pushes: the stack mirrors the lexical loop
+  # nesting, so a break/continue inside a nested loop resolves to THAT
+  # loop's frame (the innermost), never to an enclosing projected loop's.
+  # The frame's `projected` flag marks the escape surface — only a
+  # projected loop's binding is the MIR's per-iteration element slot, so a
+  # snapshot/range loop's frame carries no binding ids and is inert in
+  # every walk (the sanctioned/staged vectors stay empty). Nested loops
+  # stack their own frames on top.
+  let esc_ids = if projected_iteration then iter_binding_ids.clone() else Vec::new() end
+  var esc_reported = Vec::new()
+  var esc_sink = Vec::new()
+  var esc_staged = Vec::new()
+  while ri < esc_ids.len() do
+    esc_reported.push(false)
+    esc_sink.push(false)
+    esc_staged.push(Vec::new())
+    ri = ri + 1
+  end
+  ctx.loop_escape_stack.push(LoopEscapeFrame {
+    binding_ids: esc_ids.clone(),
+    projected: projected_iteration,
+    entry_ids: entry_names.clone(),
+    source_root: projected_root,
+    source_fields: projected_fields.clone(),
+    reported: esc_reported,
+    sink_consumed: esc_sink,
+    staged_dests: esc_staged
+  })
+  # (item 2 — the nested-lexical-block terminator scan): install the
+  # body's per-statement scan for the duration of the body walk so
+  # check_block propagates it into nested lexical blocks (with the
+  # mutation half disabled — the enclosing statement's plan walk already
+  # covers nested blocks). Nested loops save/restore their own over this
+  # one; a defer body clears it (check_defer_body).
+  let saved_body_scan = ctx.loop_body_scan.clone()
+  ctx.loop_body_scan = Option::Some(nested_loop_body_scan(&body_scan))
   let body_entry = res_frame_clone(&bf)
   let (body_exit, _) = run_cfg_block(program, typed, env, ctx, &body.stmts, &body_loop_outer, &body_entry, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain, body_key, Option::Some(body_scan), false)
+  ctx.loop_body_scan = saved_body_scan
+  ctx.loop_escape_stack.pop()
   bf = body_exit
   slice_views_remove_after(ctx, &body_view_keys)
   if body_key != 0 then
@@ -6909,9 +7289,84 @@ def check_pattern(program: Program, typed: TypedProgram, inout env: TypeEnv, ino
   end  end
 end
 
+# The i-th element source type of a tuple / array pattern position —
+# Type::Unit (the fail-closed default) when the source type does not
+# expose element i.
+def pattern_element_source_type(ty: Type, index: Int) -> Type
+  match ty
+  when Type::Tuple(elems) then
+    if index >= 0 && index < elems.len() then
+      return elems[index].clone()
+    end
+  when Type::FixedArray(elem, _) then
+    return elem
+  when Type::FixedArraySym(elem, _) then
+    return elem
+  when _ then ()
+  end
+  Type::Unit
+end
+
+# The enum type arguments of a variant-pattern source: the source's Adt args
+# when it is the SAME nominal the pattern resolved to; empty otherwise (the
+# declared field types then stay symbolic — fail closed).
+def pattern_enum_args(source_ty: Type, tid: Int) -> Vec[Type]
+  match source_ty
+  when Type::Adt(atid, aargs) then
+    if atid.id == tid then
+      return aargs
+    end
+  when _ then ()
+  end
+  Vec::new()
+end
+
+# The payload source type of a variant pattern position `index`: the
+# pattern's resolved variant identity (the checker's
+# pattern_variant_resolutions record on the TypeEnv — the SAME record the
+# type layer and every other consumer resolve variant identity through,
+# never a re-scan of the source spelling) + the declared field type
+# substituted with the source enum's concrete args. Type::Unit (fail
+# closed) when any typed table entry is missing. The record is threaded
+# from bind_pattern's inout env: the resource checker's env is the engine
+# snapshot (engine_snapshot_env), which now carries the checker's
+# pattern_variant_resolutions table (populated from the TypedProgram), so
+# the recorded identity is recovered; a payload whose declared shape is
+# still not recoverable stays at the documented fail-closed default — a
+# genuine owner is never fabricated from a variant name.
+def pattern_variant_source_type(inout env: TypeEnv, typed: TypedProgram, pat_node_id: Int, index: Int, source_ty: Type) -> Type
+  match env.pattern_variant_resolutions.get(pat_node_id)
+  when Option::Some((tid, vidx)) then
+    match typed.type_variants.get(tid)
+    when Option::Some(variants) then
+      if vidx >= 0 && vidx < variants.len() then
+        let fields = variants[vidx].1.clone()
+        if index >= 0 && index < fields.len() then
+          let params = match typed.type_params.get(tid)
+          when Option::Some(ps) then ps
+          when Option::None then Vec::new()
+          end
+          let args = pattern_enum_args(source_ty, tid)
+          return subst_type_args(&fields[index], &params, args)
+        end
+      end
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
+  Type::Unit
+end
+
 # Register a single pattern-bound identifier in the frame (Live availability,
-# OwnedLocal permission — pattern bindings own their value).
-def bind_pattern_ident(inout env: TypeEnv, typed: TypedProgram, node_id: Int, span: Span, inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
+# OwnedLocal permission — pattern bindings own their value). A binding
+# reached THROUGH the internal reference ABI (borrowed=true, classified by
+# bind_pattern from the binding SOURCE type) is a BORROW: it creates NO
+# storage obligation — no frame entry, no drop — the seed's
+# storage/ownership rule answer for RefInternal (keyed on the TYPE, never on
+# a declaration name). The capability flag is not marked either: a borrow of
+# a capability is not the capability, and res_frame_mark_cap is a no-op
+# without the entry, so no state is fabricated.
+def bind_pattern_ident(inout env: TypeEnv, typed: TypedProgram, node_id: Int, span: Span, inout frame: ResFrame, inout errors: Vec[ResourceError], borrowed: Bool) -> Unit
   match typed.pattern_binding_resolutions.get(node_id)
   when Option::Some(id) then
     match typed.local_bindings.get(id)
@@ -6923,7 +7378,7 @@ def bind_pattern_ident(inout env: TypeEnv, typed: TypedProgram, node_id: Int, sp
       # never collide with a parameter id at the key type.
       let lid = tg_compiler::ids::LocalId { id: id }
       reject_rc_resource(env, typed, &lb.ty, span, errors)
-      if is_owning_typed(env, &lb.ty) then
+      if !borrowed && is_owning_typed(env, &lb.ty) then
         res_frame_set(frame, lid, ResourceState::Live)
         res_frame_set_span(frame, &lid, span)
         res_frame_set_origin(frame, &lid, ParamOrigin::OwnedLocal)
@@ -6941,29 +7396,52 @@ end
 # struct, enum-variant, or-patterns) so destructuring binds every inner
 # resource ident — previously only a top-level Ident was registered, so
 # `let (a, b) = pair` lost ownership of resource components.
-def bind_pattern(inout env: TypeEnv, typed: TypedProgram, pat: Pattern, span: Span, inout frame: ResFrame, inout errors: Vec[ResourceError]) -> Unit
+#
+# The binding SOURCE is threaded through the recursion (source_ty + the
+# via_ref flag): the seed's storage/ownership rule keys on the TYPE, and a
+# binding reached through the internal reference ABI (Type::RefInternal —
+# the visit positions' `&K`/`&V`) is a borrow that owns nothing. A reference
+# source peels to its pointee ONCE and marks the whole subtree borrowed; a
+# non-reference source leaves the strict owned rule in place. A shape whose
+# element/payload types cannot be recovered from the typed tables fails
+# CLOSED to the strict rule (a genuine owner is never downgraded).
+def bind_pattern(inout env: TypeEnv, typed: TypedProgram, pat: Pattern, span: Span, inout frame: ResFrame, inout errors: Vec[ResourceError], source_ty: Type, via_ref: Bool) -> Unit
+  let borrowed = via_ref || type_is_ref_internal(source_ty.clone())
+  let peeled_ty = match source_ty
+  when Type::RefInternal(inner, _) then inner
+  when _ then source_ty
+  end
   match pat.kind
   when PatternKind::Ident(_, _) then
-    bind_pattern_ident(env, typed, pat.node_id, span, frame, errors)
+    bind_pattern_ident(env, typed, pat.node_id, span, frame, errors, borrowed)
   when PatternKind::Tuple(pats) then
-    for p in pats do
-      bind_pattern(env, typed, &p, span, frame, errors)
+    var i = 0
+    while i < pats.len() do
+      let sub_ty = pattern_element_source_type(peeled_ty.clone(), i)
+      bind_pattern(env, typed, &pats[i], span, frame, errors, sub_ty, borrowed)
+      i = i + 1
     end
   when PatternKind::Array(pats) then
-    for p in pats do
-      bind_pattern(env, typed, &p, span, frame, errors)
+    var i = 0
+    while i < pats.len() do
+      let sub_ty = pattern_element_source_type(peeled_ty.clone(), i)
+      bind_pattern(env, typed, &pats[i], span, frame, errors, sub_ty, borrowed)
+      i = i + 1
     end
   when PatternKind::Struct(_, fields) then
     for f in fields do
-      bind_pattern(env, typed, &f.1, span, frame, errors)
+      bind_pattern(env, typed, &f.1, span, frame, errors, peeled_ty.clone(), borrowed)
     end
   when PatternKind::Variant(_, pats) then
-    for p in pats do
-      bind_pattern(env, typed, &p, span, frame, errors)
+    var i = 0
+    while i < pats.len() do
+      let sub_ty = pattern_variant_source_type(env, typed, pat.node_id, i, peeled_ty.clone())
+      bind_pattern(env, typed, &pats[i], span, frame, errors, sub_ty, borrowed)
+      i = i + 1
     end
   when PatternKind::Or(alts) then
     for p in alts do
-      bind_pattern(env, typed, &p, span, frame, errors)
+      bind_pattern(env, typed, &p, span, frame, errors, peeled_ty.clone(), borrowed)
     end
   when _ then ()
   end  end
@@ -7001,6 +7479,874 @@ def collect_pattern_binding_ids(typed: TypedProgram, pat: Pattern, inout out: Ve
       collect_pattern_binding_ids(typed, &p, out)
     end
   when _ then ()
+  end  end
+end
+
+# (the projected-iteration escape guard): under projected iteration the
+# for-binding is the element the MIR re-binds on every iteration (the
+# checker's Read plan; lower_for_projected stores the element into the
+# binding local each header pass), so the binding is a per-iteration owned
+# slot. The per-iteration ownership TRANSFER into a callee/container
+# (`s.insert(item)`, `out.push(item)` — a Consume argument taking the
+# element) is the documented, pinned pattern the MIR supports and stays
+# accepted (canary_pos_set_init_string; std/device.tg's
+# `for gpu in gpu_list do devices.push(gpu) end`). What the projected plan
+# does NOT cover is the binding's value LEAVING the iteration through a
+# control-flow exit: a return/break/continue that carries the binding moves
+# the element out of the loop body — the consuming iteration the checker
+# does not plan for ("cannot move the iteration binding out of the loop
+# body under projected iteration"). Called after EVERY loop-body statement
+# whose loop nest holds a projected loop (loop_escape_has_projected_frame),
+# reported once per binding: the first EXITING statement after which the
+# binding's state became Consumed.
+#
+# The scan is the CATCH-ALL half of the guard: it sees every Consumed
+# binding after a terminator (the terminator's transfer_consume commits on
+# the REAL frame before this scan runs), including the indirect consumes
+# (`return f(item)`) the direct transfer-site checks below cannot root.
+# The transfer-site checks add the destinations the frame cannot
+# distinguish: an outer-place store, a guard-else exit (evaluated on a
+# private frame clone — see the StmtGuard arm), a nested-arm exit (hidden
+# by the branch join), and a closure capture. All of them report through
+# the same loop-escape context and share one report-once flag per binding.
+#
+# (items 3 + 1 — the nested-loop frames): the scan runs against EVERY
+# enclosing projected loop's frame that the terminator exits — a Return
+# exits every frame (a binding of ANY enclosing projected loop leaving the
+# function is an escape), a Break/Continue exits only the INNERMOST loop's
+# frame (the loop whose body block this is; the value stays inside the
+# outer iteration, so an outer loop's binding is not reported by an inner
+# break/continue). The escape stack mirrors the lexical loop nesting
+# (EVERY loop pushes a frame, projected or not), so "innermost" is
+# positional: a break inside a nested NON-projected loop resolves to that
+# loop's binding-less frame and reports nothing, while a return in the same
+# loop reports every enclosing projected binding. The transfer-site checks
+# are gated the same way: a direct `return item` reports from any depth, a
+# direct `break item` only when the binding belongs to the innermost loop
+# (check_projected_escape_value's exits_all; report-once is shared).
+#
+# (item 1 — the sanctioned-sink signal): a binding whose Consumed state
+# was committed by a sanctioned per-iteration sink transfer — a Consume
+# argument to a callee, recorded on the frame at the transfer site
+# (loop_escape_mark_sink) — in an EARLIER statement of this iteration is
+# NOT an escape: that transfer's destination was the callee's parameter,
+# never a place of this frame, so the terminator that follows does not
+# carry the value out. The caller snapshots the marks BEFORE the
+# terminator executes (loop_escape_sanctioned_ids), so a consume committed
+# by the terminator's OWN transfer (`return f(item)`, `return [item]`) is
+# not in the snapshot and is still reported.
+def check_iter_binding_escape(typed: TypedProgram, inout ctx: AnalysisContext, frame: ResFrame, stmt: Stmt, span: Span, sanctioned: Vec[Int], inout errors: Vec[ResourceError]) -> Unit
+  if !stmt_is_terminator(&stmt) then
+    return
+  end
+  match stmt.kind
+  when StmtKind::StmtReturn(v) then
+    check_iter_binding_escape_at(typed, ctx, frame, true, v, span, sanctioned, errors)
+  when StmtKind::StmtBreak(v) then
+    check_iter_binding_escape_at(typed, ctx, frame, false, v, span, sanctioned, errors)
+  when _ then
+    check_iter_binding_escape_at(typed, ctx, frame, false, Option::None, span, sanctioned, errors)
+  end
+end
+
+# (items 1 + 3 + 4): the frame walk shared by the loop-body statement scan
+# and the guard-else scan (the StmtGuard arm calls it directly on the
+# private clone, with exits_all = true for an else-return and false for an
+# else-break). `value` is the terminator's carried value (None for a bare
+# return/break/continue): the item-4 staged-destination mention test reads
+# it. A Return exits EVERY enclosing loop, so every frame is walked; a
+# Break/Continue exits only the INNERMOST loop, so only that loop's frame
+# is walked (loop_escape_frame_is_innermost) — a break inside a nested
+# non-projected loop exits just that loop, whose frame carries no binding
+# ids, and must never report an enclosing projected loop's binding.
+def check_iter_binding_escape_at(typed: TypedProgram, inout ctx: AnalysisContext, frame: ResFrame, exits_all: Bool, value: Option[Expr], span: Span, sanctioned: Vec[Int], inout errors: Vec[ResourceError]) -> Unit
+  var fi = ctx.loop_escape_stack.len()
+  while fi > 0 do
+    fi = fi - 1
+    if exits_all || loop_escape_frame_is_innermost(ctx, fi) then
+      let ids = ctx.loop_escape_stack[fi].binding_ids.clone()
+      var i = 0
+      while i < ids.len() do
+        if !loop_escape_reported(ctx, ids[i]) && !sanctioned.contains(&ids[i]) then
+          # boundary: iter_binding_ids are raw Int semantic ids (they also
+          # serialize into the IterationPlan the MIR consumes); the frame is
+          # LocalId-keyed.
+          match res_frame_get(&frame, &tg_compiler::ids::LocalId { id: ids[i] })
+          when Option::Some(ResourceState::Consumed) then
+            if !projected_staged_body_local(typed, ctx, frame, fi, i, &value) then
+              loop_escape_report(ctx, ids[i], span, errors)
+            end
+          when _ then ()
+          end
+        end
+        i = i + 1
+      end
+    end
+  end
+end
+
+# (item 4 — the staged body-local acceptance): whether the Consumed binding
+# at (frame index fi, binding index i) is verifiably still staged in a
+# body-local destination. The conditions, all required:
+#   - the binding has a recorded staged destination set (the store/let
+#     sites wrote it; an empty set keeps the conservative report);
+#   - EVERY destination is still Live in the scan's frame and carries no
+#     moved-out chain (a destination that was consumed — by a sink call, a
+#     move into another place, a closure capture — or partially moved out
+#     means the value may have left the body-local storage: fail closed);
+#   - the destination has a resolvable source name (an unnamed local
+#     cannot be checked by the syntactic mention test: fail closed);
+#   - the terminator's value does not MENTION any destination (the
+#     syntactic mention walk — conservative: any channel that could carry
+#     the value out, including the ones the ownership-flow walk does not
+#     model, must name the place it reads; a bare/borrowed read also fails
+#     closed).
+def projected_staged_body_local(typed: TypedProgram, ctx: AnalysisContext, frame: ResFrame, fi: Int, i: Int, value: Option[Expr]) -> Bool
+  let dests = ctx.loop_escape_stack[fi].staged_dests[i].clone()
+  if dests.len() == 0 then
+    return false
+  end
+  var di = 0
+  while di < dests.len() do
+    let d = dests[di]
+    let dlid = tg_compiler::ids::LocalId { id: d }
+    match res_frame_get(&frame, &dlid)
+    when Option::Some(ResourceState::Live) then ()
+    when _ then
+      return false
+    end
+    if root_has_moves(frame, dlid) then
+      return false
+    end
+    let dname = binding_name(typed, d)
+    if dname.len() == 0 then
+      return false
+    end
+    match value
+    when Option::Some(v) then
+      if plan_expr_mentions_binding(typed, dname, &v) then
+        return false
+      end
+    when Option::None then ()
+    end
+    di = di + 1
+  end
+  true
+end
+
+# (the projected-iteration escape context — the transfer-site authority):
+# the index of the innermost escape frame whose loop binds `binding_id`, or
+# None when the id is not a projected for-binding of an enclosing loop.
+def loop_escape_frame_index(ctx: AnalysisContext, binding_id: Int) -> Option[Int]
+  var i = ctx.loop_escape_stack.len()
+  while i > 0 do
+    i = i - 1
+    if ctx.loop_escape_stack[i].binding_ids.contains(&binding_id) then
+      return Option::Some(i)
+    end
+  end
+  Option::None
+end
+
+# (item 1 — the scan gate): whether ANY enclosing loop is projected. The
+# escape stack holds one frame per enclosing loop, so a projected frame on
+# the stack is exactly "this statement is inside a loop nested within a
+# projected loop" — the gate the terminator scan runs under. (The previous
+# gate read the INNERMOST body's projected class, so a terminator inside a
+# nested non-projected loop within a projected loop was never scanned.)
+def loop_escape_has_projected_frame(ctx: AnalysisContext) -> Bool
+  var fi = 0
+  while fi < ctx.loop_escape_stack.len() do
+    if ctx.loop_escape_stack[fi].projected then
+      return true
+    end
+    fi = fi + 1
+  end
+  false
+end
+
+# (item 1 — the innermost-loop test): whether the escape frame at `fi` is
+# the frame of the INNERMOST enclosing loop — the ONE loop a break/continue
+# exits. The stack mirrors the lexical loop nesting (every loop pushes a
+# frame), so positional identity is the test; a frame deeper in the stack
+# belongs to an enclosing loop that a break/continue does NOT exit (only a
+# Return exits every frame).
+def loop_escape_frame_is_innermost(ctx: AnalysisContext, fi: Int) -> Bool
+  fi == ctx.loop_escape_stack.len() - 1
+end
+
+# The report-once flag of `binding_id` (the shared flag the terminator scan
+# and the transfer sites both consult).
+def loop_escape_reported(ctx: AnalysisContext, binding_id: Int) -> Bool
+  match loop_escape_frame_index(ctx, binding_id)
+  when Option::Some(fi) then
+    let ids = ctx.loop_escape_stack[fi].binding_ids.clone()
+    var j = 0
+    while j < ids.len() do
+      if ids[j] == binding_id then
+        return ctx.loop_escape_stack[fi].reported[j]
+      end
+      j = j + 1
+    end
+    false
+  when Option::None then false
+  end  end
+end
+
+def loop_escape_mark_reported(inout ctx: AnalysisContext, binding_id: Int) -> Unit
+  match loop_escape_frame_index(ctx, binding_id)
+  when Option::Some(fi) then
+    let ids = ctx.loop_escape_stack[fi].binding_ids.clone()
+    var j = 0
+    while j < ids.len() do
+      if ids[j] == binding_id then
+        ctx.loop_escape_stack[fi].reported[j] = true
+        return
+      end
+      j = j + 1
+    end
+  when Option::None then ()
+  end  end
+end
+
+# (item 1 — the sanctioned-sink provenance): mark `binding_id` on the
+# enclosing projected loop's escape frame as consumed by a sanctioned
+# per-iteration sink transfer — a Consume argument to a callee
+# (apply_arg_effect's Consume path; the value's destination is the callee's
+# parameter, never a place of this frame). The terminator scan skips such
+# a binding (through the pre-terminator snapshot) because the value never
+# entered a loop-persistent place. A binding that is not an enclosing
+# projected loop's is a no-op.
+def loop_escape_mark_sink(inout ctx: AnalysisContext, binding_id: Int) -> Unit
+  match loop_escape_frame_index(ctx, binding_id)
+  when Option::Some(fi) then
+    let ids = ctx.loop_escape_stack[fi].binding_ids.clone()
+    var j = 0
+    while j < ids.len() do
+      if ids[j] == binding_id then
+        ctx.loop_escape_stack[fi].sink_consumed[j] = true
+        return
+      end
+      j = j + 1
+    end
+  when Option::None then ()
+  end  end
+end
+
+# (item 1): the sanctioned-sink bindings of EVERY frame on the escape
+# stack — the snapshot the terminator scan reads. Taken BEFORE the
+# terminator executes (run_cfg_block), so a sanctioned consume committed by
+# the terminator's own transfer is not suppressed.
+def loop_escape_sanctioned_ids(ctx: AnalysisContext) -> Vec[Int]
+  var out = Vec::new()
+  var fi = 0
+  while fi < ctx.loop_escape_stack.len() do
+    let ids = ctx.loop_escape_stack[fi].binding_ids.clone()
+    var j = 0
+    while j < ids.len() do
+      if ctx.loop_escape_stack[fi].sink_consumed[j] then
+        out.push(ids[j])
+      end
+      j = j + 1
+    end
+    fi = fi + 1
+  end
+  out
+end
+
+# (item 2 — the guard-else path scoping): the snapshot of every escape
+# frame's PATH-SCOPED scan marks — the sanctioned-sink provenance
+# (sink_consumed) and the staged body-local destinations (staged_dests).
+# The guard-else arm evaluates its transfer on a private frame clone and
+# DIVERGES (return/break/continue/panic), so a mark it commits belongs to
+# that divergent path only: left on the shared escape frames it would
+# suppress a LATER fallthrough-path scan (loop_escape_sanctioned_ids and
+# projected_staged_body_local read the marks with no path identity). The
+# arm snapshots the marks BEFORE the else path runs and restores them
+# after it — the pre-terminator snapshot discipline extended to the whole
+# mark state. The report-once flags stay SHARED (deliberately): the same
+# binding's escape is reported once per loop, whichever path observed it.
+def loop_escape_path_marks_snapshot(ctx: AnalysisContext) -> LoopEscapePathMarks
+  var sink = Vec::new()
+  var staged = Vec::new()
+  var fi = 0
+  while fi < ctx.loop_escape_stack.len() do
+    sink.push(ctx.loop_escape_stack[fi].sink_consumed.clone())
+    staged.push(ctx.loop_escape_stack[fi].staged_dests.clone())
+    fi = fi + 1
+  end
+  LoopEscapePathMarks { sink: sink, staged: staged }
+end
+
+# (item 2): restore the snapshot above onto the escape frames. The else
+# path cannot change the stack SHAPE (a nested loop inside it pushes and
+# pops in balance), so the restore is positional; the bounds checks keep a
+# shape mismatch from indexing out of range (fail safe: a frame with no
+# snapshot entry keeps its marks).
+def loop_escape_path_marks_restore(inout ctx: AnalysisContext, marks: LoopEscapePathMarks) -> Unit
+  var fi = 0
+  while fi < ctx.loop_escape_stack.len() do
+    if fi < marks.sink.len() then
+      ctx.loop_escape_stack[fi].sink_consumed = marks.sink[fi].clone()
+    end
+    if fi < marks.staged.len() then
+      ctx.loop_escape_stack[fi].staged_dests = marks.staged[fi].clone()
+    end
+    fi = fi + 1
+  end
+end
+
+# (item 4 — the staged body-local provenance): record on the enclosing
+# projected loop's escape frame that `binding_id`'s consumed value now
+# lives in the body-local destination set `dest_ids` (raw Int semantic
+# ids). The mark REPLACES any earlier destination: the value moved, and
+# the terminator scan reads only the last body-local place holding it. A
+# binding that is not an enclosing projected loop's is a no-op.
+def projected_stage_binding(inout ctx: AnalysisContext, binding_id: Int, dest_ids: Vec[Int]) -> Unit
+  match loop_escape_frame_index(ctx, binding_id)
+  when Option::Some(fi) then
+    let ids = ctx.loop_escape_stack[fi].binding_ids.clone()
+    var j = 0
+    while j < ids.len() do
+      if ids[j] == binding_id then
+        ctx.loop_escape_stack[fi].staged_dests[j] = dest_ids.clone()
+        return
+      end
+      j = j + 1
+    end
+  when Option::None then ()
+  end
+end
+
+# (item 4 — the staged-destination invalidation): the assignment destination
+# `dest_id` was overwritten by a value the RHS walk found no projected
+# binding in, so every recorded staged mark naming `dest_id` is stale — the
+# value the mark named was dropped by the store (or replaced). Remove
+# `dest_id` from every frame/binding's staged set; an emptied set is "not
+# staged", so the terminator scan's conservative report resumes and a later
+# store of the destination no longer resolves the one-hop provenance to the
+# binding (`let tmp = item; tmp = other; escaped = tmp` stops reporting
+# item). The write mirrors projected_stage_binding's discipline exactly: it
+# mutates the shared ctx escape frames, so it is escape-frame-global like
+# the mark itself (the guard-else divergent path's
+# loop_escape_path_marks_snapshot/_restore covers it — the restore puts the
+# whole staged_dests vectors back). The caller passes only a
+# WHOLE-destination store (expr_is_plain): a projected store
+# (`tmp.field = other`) destroys only part of the value, so the mark stays
+# (fail open — the remaining value can still escape through a later whole
+# `escaped = tmp`). A destination not recorded anywhere is a no-op.
+def projected_unstage_dest(inout ctx: AnalysisContext, dest_id: Int) -> Unit
+  var fi = 0
+  while fi < ctx.loop_escape_stack.len() do
+    let ids = ctx.loop_escape_stack[fi].binding_ids.clone()
+    var j = 0
+    while j < ids.len() do
+      if ctx.loop_escape_stack[fi].staged_dests[j].contains(&dest_id) then
+        var kept = Vec::new()
+        let dests = ctx.loop_escape_stack[fi].staged_dests[j].clone()
+        var di = 0
+        while di < dests.len() do
+          if dests[di] != dest_id then
+            kept.push(dests[di])
+          end
+          di = di + 1
+        end
+        ctx.loop_escape_stack[fi].staged_dests[j] = kept
+      end
+      j = j + 1
+    end
+    fi = fi + 1
+  end
+end
+
+# (item 4 — the store/let staging site): a value stored into a BODY-LOCAL
+# destination stages every projected binding whose owned value flows into
+# it — the bindings the RHS ownership-flow walk finds (projected_escape_flow
+# — the same walk the store check uses, so the variant-payload channel is
+# included). The staging is deliberately ONE HOP: a binding already staged
+# in some destination is NOT re-staged by a later store that merely
+# mentions it (`let t2 = tmp`), so a chained staging stays conservatively
+# reported (the destination the mark names is Consumed at the terminator
+# and the guard fails closed). A DIRECT store of the binding overwrites the
+# mark (`let t2 = item`), so the mark tracks the latest body-local place a
+# directly-stored value lives in. The caller must have established that the
+# destination is genuinely body-local (loop-created, or the loop's own
+# re-bound binding slot): a loop-persistent destination is the escape case
+# and is reported instead (check_projected_escape_store), never staged.
+def projected_stage_value(inout env: TypeEnv, typed: TypedProgram, inout ctx: AnalysisContext, value: Expr, dest_ids: Vec[Int]) -> Unit
+  if dest_ids.len() == 0 || ctx.loop_escape_stack.len() == 0 then
+    return
+  end
+  # (item 3): the STAGING walk follows NO staged hop — the one-hop
+  # provenance stays one hop (a chained `let t2 = tmp` must not re-stage
+  # the binding; the empty table makes the walk see only direct roots).
+  var staged_hop: Vec[(Int, Int)] = Vec::new()
+  var bids = Vec::new()
+  projected_escape_flow(env, typed, ctx, staged_hop, value, &mut bids)
+  var bi = 0
+  while bi < bids.len() do
+    projected_stage_binding(ctx, bids[bi], dest_ids.clone())
+    bi = bi + 1
+  end
+end
+
+# The ONE escape diagnostic — reported once per binding through the shared
+# flag, so the first site that observes the transfer wins (a store, a
+# return/break value, a guard-else exit, a closure capture, or the
+# terminator scan's catch-all).
+def loop_escape_report(inout ctx: AnalysisContext, binding_id: Int, span: Span, inout errors: Vec[ResourceError]) -> Unit
+  if loop_escape_reported(ctx, binding_id) then
+    return
+  end
+  errors.push(ResourceError {
+    message: "cannot move the iteration binding out of the loop body under projected iteration (consuming iteration is not supported yet)",
+    span: span.clone()
+  })
+  loop_escape_mark_reported(ctx, binding_id)
+end
+
+# The OWNING projected for-binding a transfer value roots at (a whole
+# value or a projection of the binding). A Copy-typed value (no ownership
+# transfer), a reference value (owns nothing), or a non-binding root is not
+# an escape. env is inout because the ownership query memoizes through the
+# engine.
+def projected_escape_value_root(inout env: TypeEnv, typed: TypedProgram, ctx: AnalysisContext, value: Expr) -> Option[Int]
+  if !expr_type_has_resource(env, typed, value) then
+    return Option::None
+  end
+  match expr_root_id(typed, value)
+  when Option::Some(id) then
+    match loop_escape_frame_index(ctx, id)
+    when Option::Some(_) then Option::Some(id)
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end  end
+end
+
+# (the projected-iteration escape — a RETURN/BREAK value): the terminator's
+# value is an owning projected binding (or a projection of it) — the
+# transfer carries the element out of the iteration. The terminator scan
+# remains the catch-all for indirect consumes (`return f(item)`); the
+# report-once flag is shared, so the direct form is reported exactly once.
+# `exits_all` is the terminator's loop-exit class (item 1): a return exits
+# every enclosing loop, so a binding of ANY enclosing projected loop is
+# reported; a break exits only the INNERMOST loop, so a binding of an
+# OUTER projected loop carried by a break inside a nested loop stays
+# inside the outer iteration and is NOT an escape (the same gating the
+# terminator scan applies).
+def check_projected_escape_value(inout env: TypeEnv, typed: TypedProgram, inout ctx: AnalysisContext, value: Expr, exits_all: Bool, inout errors: Vec[ResourceError]) -> Unit
+  match projected_escape_value_root(env, typed, ctx, value)
+  when Option::Some(bid) then
+    match loop_escape_frame_index(ctx, bid)
+    when Option::Some(fi) then
+      if exits_all || loop_escape_frame_is_innermost(ctx, fi) then
+        loop_escape_report(ctx, bid, value.span, errors)
+      end
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# (item 2 — the store-RHS value-flow walk): the loop bindings whose owned
+# value flows INTO `expr` through the store RHS ownership channels. The
+# walk is the RHS authority for the store escape check: `escaped = [item]`,
+# `escaped = f(item)` and `escaped = if c then item else other end` do not
+# root at the binding through expr_root_id, but the binding is an owned
+# component / a transferred argument / a result-arm value of the stored
+# value. Channels:
+#   - the place spine: a value rooted at a loop binding (the whole binding
+#     or a projection of it) — the direct form the root test covers;
+#   - aggregate elements: the children the typed ownership record marks as
+#     OWNED transfers (array/tuple/struct/map literals);
+#   - call/method arguments with a Consume access effect (the receiver
+#     included when its recorded effect is Consume — `item.into_inner()`);
+#   - if/match result arms: each arm block's value-position tail;
+#   - enum-variant payloads: the payload arguments of a variant
+#     construction (`escaped = Option::Some(item)`), gated by the payload
+#     transfer rule (the recorded per-argument effect is the authority —
+#     the resource checker's own ExprEnumVariant arm consumes exactly the
+#     Consume arguments) and by the aggregate-element ownership rule
+#     (typed.aggregate_ownership; variant nodes carry no record, so the
+#     fail-closed default is owned) plus the recursion's owning-child gate.
+#     The channel was previously disabled because the compiler's own
+#     sources stored the projected binding directly through a variant
+#     (tg_compiler/layout_engine.tg's `type_def = Option::Some(td)`,
+#     tests/cqs_pipeline_test.tg's `broken_report = Option::Some(sr)`,
+#     std/package.tg's `best = Option::Some(pkg)`); the sibling source
+#     migration clones/restructures those sites, so the store check now
+#     catches the genuine `escaped = Option::Some(item)` escape.
+# Every channel is followed only when the value being examined is OWNING
+# (a Copy value carries no ownership into the destination) and the channel
+# itself is an owned transfer (the aggregate ownership record / the
+# Consume effect); a Read argument or a Copy element transfers nothing.
+def projected_escape_flow(inout env: TypeEnv, typed: TypedProgram, ctx: AnalysisContext, staged_hop: Vec[(Int, Int)], expr: Expr, inout out: Vec[Int]) -> Unit
+  if !expr_type_has_resource(env, typed, expr) then
+    return
+  end
+  # the place spine — a value rooted at a loop binding (the whole binding
+  # or a projection of it) is the binding flowing into the value. (item 3)
+  # A value rooted at a LIVE STAGED body-local destination is the STAGING
+  # binding flowing through that destination (one hop, resolved against
+  # the walk's frame by projected_staged_hop_table) — the
+  # `let tmp = item; escaped = tmp` shape the direct root test cannot see.
+  # The table is empty on the staging walk, so only the store check
+  # follows the hop.
+  match expr_root_id(typed, expr)
+  when Option::Some(id) then
+    match loop_escape_frame_index(ctx, id)
+    when Option::Some(_) then
+      out.push(id)
+    when Option::None then
+      var hi = 0
+      while hi < staged_hop.len() do
+        if staged_hop[hi].0 == id then
+          out.push(staged_hop[hi].1)
+        end
+        hi = hi + 1
+      end
+    end
+    return
+  when Option::None then ()
+  end
+  match expr.kind
+  when ExprKind::ExprArrayLit(elems) then
+    var i = 0
+    while i < elems.len() do
+      if projected_flow_child_owned(typed, expr, i) then
+        projected_escape_flow(env, typed, ctx, staged_hop, &elems[i], out)
+      end
+      i = i + 1
+    end
+  when ExprKind::ExprArrayRepeat(elem, _) then
+    if projected_flow_child_owned(typed, expr, 0) then
+      projected_escape_flow(env, typed, ctx, staged_hop, *elem.get(), out)
+    end
+  when ExprKind::ExprTupleLit(elems) then
+    var i = 0
+    while i < elems.len() do
+      if projected_flow_child_owned(typed, expr, i) then
+        projected_escape_flow(env, typed, ctx, staged_hop, &elems[i], out)
+      end
+      i = i + 1
+    end
+  when ExprKind::ExprStructLit(_, fields) then
+    var i = 0
+    while i < fields.len() do
+      if projected_flow_child_owned(typed, expr, i) then
+        projected_escape_flow(env, typed, ctx, staged_hop, &fields[i].1, out)
+      end
+      i = i + 1
+    end
+  when ExprKind::ExprMapLit(entries) then
+    var i = 0
+    while i < entries.len() do
+      if projected_flow_child_owned(typed, expr, i * 2) then
+        projected_escape_flow(env, typed, ctx, staged_hop, &entries[i].0, out)
+      end
+      if projected_flow_child_owned(typed, expr, i * 2 + 1) then
+        projected_escape_flow(env, typed, ctx, staged_hop, &entries[i].1, out)
+      end
+      i = i + 1
+    end
+  when ExprKind::ExprEnumVariant(_, _, args) then
+    # (the enum-variant payload channel): the payload arguments of a
+    # variant construction are owned transfers into the variant — the
+    # resource checker's own ExprEnumVariant arm consumes exactly the
+    # arguments whose recorded effect is Consume (default Consume when no
+    # record), so the same effect gate is the transfer authority here; the
+    # aggregate-element ownership rule applies on top (no aggregate record
+    # is written for variant nodes, so the fail-closed default is owned)
+    # and the recursion keeps the owning-child gate. A Read/borrowed
+    # payload (`String::from_utf8_range(&buf, ..)`'s access marker)
+    # transfers no ownership and is not followed.
+    var i = 0
+    while i < args.len() do
+      let arg_eff = match typed.access_effects.get(args[i].node_id)
+      when Option::Some(e) then e
+      when Option::None then AccessEffect::Consume
+      end
+      if arg_eff == AccessEffect::Consume && projected_flow_child_owned(typed, expr, i) then
+        projected_escape_flow(env, typed, ctx, staged_hop, &args[i], out)
+      end
+      i = i + 1
+    end
+  when ExprKind::ExprCall(_, args) then
+    projected_escape_flow_args(env, typed, ctx, staged_hop, &args, out)
+  when ExprKind::ExprMethodCall(receiver, _, _, args) then
+    let recv_eff = match typed.access_effects.get(receiver.node_id)
+    when Option::Some(e) then e
+    when Option::None then AccessEffect::Read
+    end
+    if recv_eff == AccessEffect::Consume then
+      projected_escape_flow(env, typed, ctx, staged_hop, *receiver.get(), out)
+    end
+    projected_escape_flow_args(env, typed, ctx, staged_hop, &args, out)
+  when ExprKind::ExprIf(if_stmt) then
+    projected_escape_flow_if(env, typed, ctx, staged_hop, &if_stmt, out)
+  when ExprKind::ExprMatch(m) then
+    var i = 0
+    while i < m.arms.len() do
+      projected_escape_flow_block(env, typed, ctx, staged_hop, &m.arms[i].body, out)
+      i = i + 1
+    end
+  when ExprKind::ExprBlock(block) then
+    projected_escape_flow_block(env, typed, ctx, staged_hop, &block, out)
+  when ExprKind::ExprUnsafe(_, block) then
+    projected_escape_flow_block(env, typed, ctx, staged_hop, &block, out)
+  when ExprKind::ExprAsync(block) then
+    projected_escape_flow_block(env, typed, ctx, staged_hop, &block, out)
+  when ExprKind::ExprComptime(block) then
+    projected_escape_flow_block(env, typed, ctx, staged_hop, &block, out)
+  when ExprKind::ExprFieldAccess(base, _) then
+    projected_escape_flow(env, typed, ctx, staged_hop, *base.get(), out)
+  when ExprKind::ExprIndex(base, _) then
+    projected_escape_flow(env, typed, ctx, staged_hop, *base.get(), out)
+  when ExprKind::ExprRawDeref(inner) then
+    projected_escape_flow(env, typed, ctx, staged_hop, *inner.get(), out)
+  when ExprKind::ExprAccess(inner) then
+    projected_escape_flow(env, typed, ctx, staged_hop, *inner.get(), out)
+  when ExprKind::ExprCast(inner, _) then
+    projected_escape_flow(env, typed, ctx, staged_hop, *inner.get(), out)
+  when ExprKind::ExprTry(inner) then
+    projected_escape_flow(env, typed, ctx, staged_hop, *inner.get(), out)
+  when ExprKind::ExprPipe(lhs, rhs) then
+    projected_escape_flow(env, typed, ctx, staged_hop, *lhs.get(), out)
+    projected_escape_flow(env, typed, ctx, staged_hop, *rhs.get(), out)
+  when _ then ()
+  end  end
+end
+
+# (item 2): the Consume-argument channel — every argument whose typed
+# access effect is Consume is an ownership transfer into the callee, so a
+# loop binding at its root flows into the call's (owning) result.
+def projected_escape_flow_args(inout env: TypeEnv, typed: TypedProgram, ctx: AnalysisContext, staged_hop: Vec[(Int, Int)], args: Vec[Expr], inout out: Vec[Int]) -> Unit
+  var i = 0
+  while i < args.len() do
+    let eff = match typed.access_effects.get(args[i].node_id)
+    when Option::Some(e) then e
+    when Option::None then AccessEffect::Read
+    end
+    if eff == AccessEffect::Consume then
+      projected_escape_flow(env, typed, ctx, staged_hop, &args[i], out)
+    end
+    i = i + 1
+  end
+end
+
+# (item 2): the if-result channel — each arm block's value-position tail
+# (the expression the arm evaluates to). A block that ends in a terminator
+# has no value.
+def projected_escape_flow_if(inout env: TypeEnv, typed: TypedProgram, ctx: AnalysisContext, staged_hop: Vec[(Int, Int)], if_stmt: IfStmt, inout out: Vec[Int]) -> Unit
+  projected_escape_flow_block(env, typed, ctx, staged_hop, &if_stmt.then_block, out)
+  var i = 0
+  while i < if_stmt.elsif_branches.len() do
+    projected_escape_flow_block(env, typed, ctx, staged_hop, &if_stmt.elsif_branches[i].1, out)
+    i = i + 1
+  end
+  match if_stmt.else_block
+  when Option::Some(b) then
+    projected_escape_flow_block(env, typed, ctx, staged_hop, &b, out)
+  when Option::None then ()
+  end
+end
+
+# (item 2): a block's value-position tail — the last statement when the
+# block falls through and the tail is an expression (or a value-position
+# if/match statement, whose arms are then the values).
+def projected_escape_flow_block(inout env: TypeEnv, typed: TypedProgram, ctx: AnalysisContext, staged_hop: Vec[(Int, Int)], block: Block, inout out: Vec[Int]) -> Unit
+  if block.stmts.len() == 0 then
+    return
+  end
+  if block_ends_with_terminator(block) then
+    return
+  end
+  match block.stmts[block.stmts.len() - 1].kind
+  when StmtKind::StmtExpr(e) then
+    projected_escape_flow(env, typed, ctx, staged_hop, &e, out)
+  when StmtKind::StmtIf(if_stmt) then
+    projected_escape_flow_if(env, typed, ctx, staged_hop, &if_stmt, out)
+  when StmtKind::StmtMatch(m) then
+    var i = 0
+    while i < m.arms.len() do
+      projected_escape_flow_block(env, typed, ctx, staged_hop, &m.arms[i].body, out)
+      i = i + 1
+    end
+  when _ then ()
+  end
+end
+
+# (item 2): whether the i-th child of an aggregate literal is an OWNED
+# transfer into the aggregate, per the typed ownership-effect record. A
+# missing record for a typed aggregate is treated as owned (fail closed —
+# check_expr's own aggregate arm reports the missing-record internal error;
+# the walk must not duplicate it). Mirrors aggregate_child_owned without
+# the diagnostic.
+def projected_flow_child_owned(typed: TypedProgram, expr: Expr, i: Int) -> Bool
+  match typed.aggregate_ownership.get(expr.node_id)
+  when Option::Some(owned) then
+    if i < owned.len() then owned[i] else true end
+  when Option::None then true
+  end  end
+end
+
+# (item 3 — the live staged-hop table): (destination local id, staging
+# binding id) for every recorded staged destination (LoopEscapeFrame's
+# staged_dests, item 4) that is still Live with no moved-out chain in the
+# STORE's frame — the item-4 liveness discipline applied at the store
+# site. The store-RHS walk consults this table at its place-spine root
+# test: `escaped = tmp` where `let tmp = item` staged the binding does not
+# root at the binding, but the table resolves tmp to item, so the walk
+# follows ONE hop into the stored value. The table is deliberately
+# one-hop: it is built from the recorded destinations only and never
+# chased further (a chained `let t2 = tmp` names no binding and is not
+# followed, exactly as item 4's acceptance does not follow the chain). A
+# destination that is Consumed or partially moved fails the liveness
+# discipline and yields no hop (the walk then sees no binding, as before).
+# The item-4 NAME condition is deliberately NOT applied: there it gates an
+# ACCEPTANCE (fail closed = report), while here the hop only ADDS a
+# candidate binding for the destination test — dropping unnamed
+# destinations would lose reports (fail open), so they stay in.
+def projected_staged_hop_table(ctx: AnalysisContext, frame: ResFrame) -> Vec[(Int, Int)]
+  var out = Vec::new()
+  var fi = 0
+  while fi < ctx.loop_escape_stack.len() do
+    let ids = ctx.loop_escape_stack[fi].binding_ids.clone()
+    var j = 0
+    while j < ids.len() do
+      let dests = ctx.loop_escape_stack[fi].staged_dests[j].clone()
+      var di = 0
+      while di < dests.len() do
+        let d = dests[di]
+        let dlid = tg_compiler::ids::LocalId { id: d }
+        match res_frame_get(&frame, &dlid)
+        when Option::Some(ResourceState::Live) then
+          if !root_has_moves(frame, dlid) then
+            out.push((d, ids[j]))
+          end
+        when _ then ()
+        end
+        di = di + 1
+      end
+      j = j + 1
+    end
+    fi = fi + 1
+  end
+  out
+end
+
+# (the projected-iteration escape — an outer-place store): `dest = <value>`
+# where the destination place outlives the loop body and the stored value
+# carries an owning projected for-binding (the whole binding, a projection
+# of it, a binding flowing through an ownership channel — item 2's
+# projected_escape_flow walk — or (item 3) a binding staged into a still-live
+# body-local destination the value roots at, the one-hop provenance). THE
+# DESTINATION TEST:
+# the target's root local is LOOP-PERSISTENT — present in the loop's entry
+# frame (LoopEscapeFrame.entry_ids, the complement of is_loop_created) —
+# and is not the loop's own per-iteration binding slot (the MIR re-binds
+# it every header pass, so a store into it is body-local). A destination
+# NOT in entry_ids is loop-created: it is dropped at the iteration's
+# backedge, so `let tmp = item` / `tmp = item` keep the accepted
+# per-iteration transfer — and (item 4) the store RECORDS the body-local
+# staging on the escape frame (projected_stage_binding), so the terminator
+# scan can accept a following terminator while the value is still there.
+# (item 3) That same record is what the store check now reads back: a
+# LATER store whose RHS roots at the recorded destination
+# (`let tmp = item; escaped = tmp`) resolves the hop to the staging
+# binding, so the move through the body-local into a loop-persistent
+# place is reported even without a following terminator. A
+# whole-destination store that the RHS walk finds no projected binding in
+# INVALIDATES the record (projected_unstage_dest), so
+# `let tmp = item; tmp = other; escaped = tmp` no longer resolves tmp to
+# item — the value the mark named was overwritten.
+# A store back into the binding's source element place (the iterated
+# collection) is a write-back, not an escape. The
+# accepted sink transfer (`s.insert(item)`, `caps.devices.push(device)`)
+# never reaches this site: its destination is a callee, not an assignment
+# target.
+#
+# NOTE (the source migration): the if/match arm channel flagged std/fs.tg's
+# `canonical = if path_is_absolute(path) then "/" + part else part end`
+# (path_canonicalize's second loop — an else-arm move of the projected
+# binding into a loop-persistent local); the sibling source migration
+# clones the else arm, so the genuine escape stays rejected while the
+# accepted shape compiles.
+def check_projected_escape_store(inout env: TypeEnv, typed: TypedProgram, inout ctx: AnalysisContext, frame: ResFrame, target: Expr, value: Expr, inout errors: Vec[ResourceError]) -> Unit
+  # the RHS value-flow walk (item 2): every loop binding whose owned value
+  # flows into the stored value, PLUS (item 3) every binding whose value
+  # was staged into a still-live body-local destination the RHS roots at —
+  # the one-hop provenance resolved against THIS frame's liveness
+  # (projected_staged_hop_table). Each binding is reported once through the
+  # shared report-once flag.
+  let staged_hop = projected_staged_hop_table(ctx, frame)
+  var bids = Vec::new()
+  projected_escape_flow(env, typed, ctx, staged_hop, value, &mut bids)
+  # (item 4 — the staged-destination invalidation): the store OVERWRITES
+  # its destination, so a recorded staged mark naming it is stale unless
+  # this same store re-stages the binding there. Clear the destination
+  # BEFORE the empty-bids early return, so a store whose RHS carries no
+  # projected binding at all still invalidates (`let tmp = item;
+  # tmp = other; escaped = tmp` must not resolve tmp to item). A store
+  # whose RHS DOES flow a binding into the destination re-stages it in the
+  # body-local arm below (projected_stage_binding replaces the set), so
+  # the clear and the re-stage compose to the fresh mark; a projected
+  # destination keeps the mark (projected_unstage_dest).
+  if expr_is_plain(target) then
+    match expr_root_id(typed, target)
+    when Option::Some(did) then
+      projected_unstage_dest(ctx, did)
+    when Option::None then ()
+    end
+  end
+  if bids.len() == 0 then
+    return
+  end
+  match expr_root_id(typed, target)
+  when Option::Some(did) then
+    var i = 0
+    while i < bids.len() do
+      let bid = bids[i]
+      match loop_escape_frame_index(ctx, bid)
+      when Option::Some(fi) then
+        let esc = ctx.loop_escape_stack[fi]
+        if esc.entry_ids.contains(&did) && !esc.binding_ids.contains(&did) then
+          var source_place = false
+          if esc.source_root >= 0 && did == esc.source_root then
+            source_place = plan_place_key_matches(typed, target, esc.source_root, esc.source_fields.clone())
+          end
+          if !source_place then
+            loop_escape_report(ctx, bid, target.span, errors)
+          end
+        else
+          # (item 4): the destination is genuinely body-local — the
+          # loop-created complement, or the loop's own re-bound binding
+          # slot. Stage the binding there (the terminator scan accepts a
+          # following terminator while the value is still in it); the mark
+          # is not an escape.
+          projected_stage_binding(ctx, bid, Vec::from([did]))
+        end
+      when Option::None then ()
+      end
+      i = i + 1
+    end
+  when Option::None then ()
+  end
+end
+
+# (the projected-iteration escape — a closure capture): the capture
+# transfer moves the per-iteration binding into the closure environment.
+# Any capture of the binding is rejected — the closure may outlive the
+# iteration, and the checker has no closure-lifetime analysis to accept the
+# non-escaping case (the documented capture channel; fail closed exactly
+# where docs/current/memory_model.md §10 rejects).
+def check_projected_escape_capture(inout ctx: AnalysisContext, cap_id: Int, span: Span, inout errors: Vec[ResourceError]) -> Unit
+  match loop_escape_frame_index(ctx, cap_id)
+  when Option::Some(_) then
+    loop_escape_report(ctx, cap_id, span, errors)
+  when Option::None then ()
   end  end
 end
 
@@ -7174,6 +8520,13 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
               res_frame_set_origin(&mut cframe, &cap_lid, ParamOrigin::OwnedLocal)
             when _ then ()
             end
+            # (the projected-iteration escape — a closure capture): the
+            # capture transfer above moved the per-iteration binding into
+            # the closure environment. The loop-context check reports it —
+            # any capture of the binding is rejected (the closure may
+            # outlive the iteration; the checker has no closure-lifetime
+            # analysis to accept the non-escaping case).
+            check_projected_escape_capture(ctx, cap_id, expr.span, errors)
           end
           if type_kind_contains_capability(env, &lb.ty) then
             res_frame_mark_cap(&mut cframe, &cap_lid)
@@ -7213,13 +8566,39 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
   when ExprKind::ExprAsync(block) then
     check_block(program, typed, env, ctx, &block, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain, true)
   when ExprKind::ExprAwait(inner) then check_expr(program, typed, env, ctx, *inner.get(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
- # `expr?` is ERASURE — no throwing path exists for it (no throw
-  # expression, no error propagation, no Throw/Unwind CFG edge). The
-  # operand is checked as a pure expression, the same treatment the type
-  # checker and MIR give it. Only the block exceptional forms are rejected
-  # (see check_stmt above); the compiler kernel itself uses `?` and must
-  # keep compiling.
-  when ExprKind::ExprTry(inner) then check_expr(program, typed, env, ctx, *inner.get(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+  when ExprKind::ExprTry(inner) then
+    # `expr?`: the SUBJECT is a TRANSFER — the MIR's lr_try_op materializes
+    # the subject into a fresh subject local with a whole-place MOVE
+    # (`push_assign(sid, MirMove(subj_op))`, mir.tg:14110), and the MIR's
+    # own whole-moved-local record counts the lowering's
+    # MirMove(MirCopy(place)) form of a bare owning local as a move of that
+    # local (mir_operand_whole_moved_local — the "source is dead" rule the
+    # verifier's MirMove exemption relies on). The walk must therefore
+    # transfer_consume the operand exactly like the MIR move: a live owning
+    # local subject is Consumed here, its scope-exit drop plan is
+    # suppressed, and a later use of it is a use-after-consume. Without
+    # the transfer the frame kept the subject Live while the MIR had moved
+    # it (the phantom scope-exit drop / accepted use-after-move class).
+    # The operand is checked first (the subject read/move validation), then
+    # transferred.
+    let try_subject = *inner.get()
+    check_expr(program, typed, env, ctx, &try_subject, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    transfer_consume(env, typed, &try_subject, loop_outer, frame, errors, finalize_plan)
+    # The failure path is a return-like exit — the function-level defers
+    # (LIFO) and the live owning locals drop on the PROPAGATION edge,
+    # exactly like a return edge (the seed's TryOp lowering runs
+    # emit_defers then Ret; the MIR's lr_try_op consumes this edge's
+    # plan). The plan is composed AFTER the subject transfer, so the moved
+    # subject is Consumed in the frame and the derivation
+    # (block_grounded_drop_ids — Live Sink/OwnedLocal only) excludes it:
+    # the failure value it carried now lives in the MIR's subject local /
+    # the return slot, and a Drop of the source place would be the
+    # double-drop class. Only the block exceptional forms are rejected
+    # (see check_stmt above); the compiler kernel itself uses `?` and must
+    # keep compiling.
+    var prop_exclude = Vec::new()
+    let prop_actions = record_exit_edge_plan(typed, frame, &prop_exclude, finalize_plan, defer_chain, false)
+    attach_edge_actions(ctx, edges, CfgEdgeKind::Propagate, expr.node_id, prop_actions, errors)
   when ExprKind::ExprRange(start, end_, _) then
     match start
     when Option::Some(s) then check_expr(program, typed, env, ctx, *s.get(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
@@ -7269,7 +8648,7 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     # transparent to the Expr it holds).
     let target_expr = *target.get()
     let value_expr = *value.get()
-    let assign_trans = check_assign_target(program, typed, env, ctx, &target_expr, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
+    let assign_trans = check_assign_target(program, typed, env, ctx, &target_expr, &value_expr, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     check_expr(program, typed, env, ctx, &value_expr, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     transfer_consume(env, typed, &value_expr, loop_outer, frame, errors, finalize_plan)
     match assign_trans
@@ -7487,7 +8866,15 @@ end
 # — no drop) and the next_state the caller commits after the RHS is
 # validated and the store happens. The caller commits; this function never
 # writes the target's record.
-def check_assign_target(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, target: Expr, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Option[AssignmentTransition]
+def check_assign_target(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, target: Expr, value: Expr, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Option[AssignmentTransition]
+  # (the projected-iteration escape — outer-place stores): a store of an
+  # owning projected for-binding into a loop-persistent place is the
+  # binding leaving the iteration (check_projected_escape_store is the
+  # destination-test authority; item 3's one-hop staged provenance is
+  # resolved against this frame). A static place/ownership test — the
+  # target's own transition below is unchanged; the caller commits the
+  # transfer.
+  check_projected_escape_store(env, typed, ctx, frame, target, value, errors)
   match expr_root_id(typed, target)
   when Option::Some(id) then
  # boundary: the frame is LocalId-keyed; expr_root_id yields the raw
@@ -7651,7 +9038,7 @@ def check_assign_target(program: Program, typed: TypedProgram, inout env: TypeEn
   end  end
 end
 
-def apply_arg_effect(program: Program, typed: TypedProgram, inout env: TypeEnv, ctx: AnalysisContext, arg: Expr, effect: AccessEffect, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
+def apply_arg_effect(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, arg: Expr, effect: AccessEffect, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int]) -> Unit
   match expr_root_id(typed, arg)
   when Option::Some(id) then
  # boundary: the frame is LocalId-keyed; expr_root_id yields the raw
@@ -7660,7 +9047,15 @@ def apply_arg_effect(program: Program, typed: TypedProgram, inout env: TypeEnv, 
     if res_frame_has(frame, &lid) then
       if expr_is_plain(arg) then
         match effect
-        when AccessEffect::Consume then apply_consume(env, typed, id, arg.span, loop_outer, frame, errors)
+        when AccessEffect::Consume then
+          apply_consume(env, typed, id, arg.span, loop_outer, frame, errors)
+          # (item 1 — the sanctioned-sink signal): the transfer's
+          # destination is the CALLEE's parameter (a per-iteration sink
+          # transfer under projected iteration), so record the provenance
+          # on the enclosing projected loop's escape frame. The terminator
+          # scan reads it through the pre-terminator snapshot and does not
+          # report the binding as having left the iteration.
+          loop_escape_mark_sink(ctx, id)
         when AccessEffect::Initialize then apply_set(typed, frame, lid, arg.span, errors)
         when _ then
           # (partial moves — the whole-value boundary): a whole-value READ
