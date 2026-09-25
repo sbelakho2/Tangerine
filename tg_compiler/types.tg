@@ -873,9 +873,58 @@ end
 # callable's identity is a StableDeclId (store binding or the index-free
 # registration scope — stable_ids' structural callable), so inserting an
 # unrelated declaration before a generic never re-keys its instances.
+# (module identity recovery): the module identity of a DECLARATION — the
+# physical source file (one file = one module) — used only when the merged
+# program's crate table lost the path component (all dependency items
+# stamped onto the root module, whose path is empty). The compiled
+# program's OWN file is the root module (empty path). This restores
+# per-module identity for same-named declarations across files (std::io's
+# `stdin` vs std::fs's `stdin`, std::core's `Error` trait vs
+# std::gfx_errors' `Error` struct) so the module-qualified keys — the
+# typed-signature table, the module type-name table and the resolver's
+# per-module authority — stop collapsing onto one key.
+def item_source_module_path(program: Program, item_idx: Int) -> Vec[String]
+  if item_idx < 0 || item_idx >= program.items.len() then
+    return Vec::new()
+  end
+  let file = program.items[item_idx].span.file
+  if file.is_empty() || file == program.span.file then
+    return Vec::new()
+  end
+  var segments = Vec::new()
+  let parts = file.split("/")
+  var pi = 0
+  while pi < parts.len() do
+    var seg = parts[pi].clone()
+    if pi == parts.len() - 1 && seg.ends_with(".tg") then
+      seg = seg.slice(0, seg.len() - 3)
+    end
+    if !seg.is_empty() then
+      segments.push(seg)
+    end
+    pi = pi + 1
+  end
+  segments
+end
+
 pub def fn_owner_key_of_def(program: Program, res: ResolvedNames, did: DefId) -> String
   let module_path = crate_module_path_of(program, &did.module)
-  fn_owner_key(module_path.join("::"), did.index, def_id_kind_of(res, did))
+  var module_key = module_path.join("::")
+  if module_key.is_empty() && did.module.id != 0 then
+    # (module-table identity): a NON-root module whose recorded path renders
+    # EMPTY has no path component — the ModuleId is then the only unique
+    # module identity. Without the fallback, two different modules'
+    # same-position definitions render the SAME "<empty>::<index>::fn" key:
+    # the typed-signature table, fn_ret_types and the emission-name table
+    # collided (std::io's `stdin`/`buf_reader_new` took std::fs's signature,
+    # std::env's `current_dir` took std::fs's Result[String, IoError]
+    # return, gfx_errors' Error methods took the core trait's) — the
+    # cross-module type mismatches the MIR verifier reported. Exactly
+    # one render per DefId: every consumer (checker signature keys, MIR
+    # emission names, mono, codegen labels) derives from this function.
+    module_key = "mod" + did.module.id.to_string()
+  end
+  fn_owner_key(module_key, did.index, def_id_kind_of(res, did))
 end
 
 # the module-path-qualified name-based owner key — the SHARED no-DefId
@@ -3623,6 +3672,31 @@ struct TypeEnv
   # performs no call-site inference (fail-closed). MIR pairs this with
   # typed_call_targets to fill the call instance's args.
   typed_call_instances: Map[Int, Vec[GenericArg]]
+  # (P0-4/P0-5) call expr node id -> the bound-receiver contract-call
+  # record (the contract method token + the already-solved method-level
+  # values). Recorded at resolve_method_type's bound-Param section; the
+  # MIR lowering stamps it onto the callee operand's InstanceId and the
+  # monomorphizer's devirtualization wave consumes it. A call with no
+  # record and no typed target carries no contract identity and is never
+  # devirtualized by a method-name guess (fail closed).
+  typed_contract_calls: Map[Int, ContractCallRecord] = Map::new()
+  # (P0-4) "trait_name::method_name" (the SOURCE contract-method identity)
+  # -> the method's contract identity record. Recorded at impl
+  # registration for every conformance-validated trait-impl method whose
+  # trait carries a contract; the MIR stamps each matching template's
+  # MirFunction and the monomorphizer's candidate index keys by the token.
+  # The source key (not the method DefId) is the identity here: two traits
+  # with the same method name on one type have colliding method DefIds
+  # (the resolver's first-wins per-type registration), and only the trait
+  # distinguishes them.
+  typed_trait_contract_methods: Map[String, ImplContractMethod] = Map::new()
+  # (P0-4) source keys whose contract identity CONFLICTED (two DISTINCT
+  # trait declarations with the same name — and same method name — whose
+  # module-qualified resolution still collided in the bare-name key): the
+  # key is removed and never re-added, and the MIR publishes no identity
+  # for it, so the affected templates are never devirtualization
+  # candidates (fail closed, never a wrong selection).
+  typed_trait_contract_conflicts: Set[String] = Set::new()
   typed_field_targets: Map[Int, FieldId]
   typed_local_bindings: Map[Int, LocalBinding]
   # ———————————————————————————————————————————————
@@ -3927,6 +4001,9 @@ impl Clone for TypeEnv
       typed_call_targets: self.typed_call_targets.clone(),
       variadic_extern_dids: self.variadic_extern_dids.clone(),
       typed_call_instances: self.typed_call_instances.clone(),
+      typed_contract_calls: self.typed_contract_calls.clone(),
+      typed_trait_contract_methods: self.typed_trait_contract_methods.clone(),
+      typed_trait_contract_conflicts: self.typed_trait_contract_conflicts.clone(),
       typed_field_targets: self.typed_field_targets.clone(),
       typed_local_bindings: self.typed_local_bindings.clone(),
       typed_node_spans: self.typed_node_spans.clone(),
@@ -4191,6 +4268,133 @@ struct TraitContract
   assoc_types: Vec[String]
   assoc_param_ids: Vec[GenericParamId]
   methods: Vec[TraitMethodContract]
+end
+
+# ———————————————————————————————————————————————————————————————
+# TRAIT-CONTRACT CALL IDENTITY (P0-4 / P0-5)
+# ———————————————————————————————————————————————————————————————
+# The devirtualization identity of a bound-receiver contract call and of
+# the trait-impl methods that may answer it. The carrier is the CONTRACT
+# METHOD TOKEN — (the trait declaration's TraitId, the method's declaration
+# index in the trait's contract) flattened into a DefId in the dedicated
+# synthetic contract-method module band. The token is what makes the
+# identity SEMANTIC rather than a method-name string: candidates from a
+# different trait that happens to declare the same method name carry
+# different tokens and can never be selected (or counted as ambiguous) for
+# this call.
+#
+# The band is negative (compiler-synthetic; source modules are >= 0) and
+# distinct from the resolver fallback / intrinsic-owner bands, so
+# def_kind_of never resolves a token and the callee's emission name is
+# never derived from it. The trait id is the checker's TraitId value (the
+# declaration identity — globally unique per compilation); the method
+# index is the contract's declaration position. A trait declaring more
+# than 65535 methods would overflow the index field — the checker's
+# declaration interning already bounds declarations far below that.
+const SYNTHETIC_MODULE_CONTRACT_METHOD: Int = -4
+
+# The contract-method identity token of (trait declaration id, method
+# declaration index). Both the bound-contract call site (the checker's
+# recorded trait id + method index) and the trait-impl method (the
+# registered impl's trait id + the contract method's index) derive the
+# SAME token.
+pub def contract_method_token(trait_id_num: Int, method_index: Int) -> DefId
+  DefId {
+    module: ModuleId { id: SYNTHETIC_MODULE_CONTRACT_METHOD },
+    index: ((trait_id_num as UInt) << 16) + (method_index as UInt)
+  }
+end
+
+# Whether a DefId is a contract-method token (the dedicated synthetic
+# band). The monomorphizer's call scans use this to keep a token payload
+# out of the specialization work queue (the devirtualization wave owns
+# those call sites; a token is never a generic template identity).
+pub def is_contract_method_token(did: DefId) -> Bool
+  did.module.id == SYNTHETIC_MODULE_CONTRACT_METHOD
+end
+
+# The declaration index of `method` in the trait's declared contract, or
+# -1 when the contract declares no such method.
+def trait_contract_method_index(contract: TraitContract, method: String) -> Int
+  var ci = 0
+  while ci < contract.methods.len() do
+    if contract.methods[ci].name == method then return ci end
+    ci = ci + 1
+  end
+  -1
+end
+
+# Record the bound-receiver contract-call identity for `call_node_id`
+# (P0-4/P0-5): the contract method token — (trait declaration id, the
+# method's contract declaration index) — plus the already-solved values of
+# the contract method's own generic parameters, in declaration order. A
+# still-unsolved position is recorded as its symbolic Type::Var (never a
+# fabricated value); the monomorphizer rejects symbolic rows. No-op when
+# the bound trait has no registered contract or declares no such method —
+# the call then carries no contract identity and the devirtualizer never
+# selects an impl for it by method-name guess (fail closed).
+def record_bound_contract_call(
+  inout env: TypeEnv,
+  call_node_id: Int,
+  trait_id: TraitId,
+  trait_name: String,
+  method_name: String,
+  method_args: Vec[GenericArg]
+) -> Unit
+  match env.trait_contracts.get(trait_id.id)
+  when Option::Some(tcontract) then
+    let method_index = trait_contract_method_index(tcontract.clone(), method_name.clone())
+    if method_index >= 0 then
+      env.typed_contract_calls.insert(call_node_id, ContractCallRecord {
+        trait_name: trait_name,
+        method_name: method_name,
+        contract_method: contract_method_token(trait_id.id, method_index),
+        method_args: method_args
+      })
+    end
+  when Option::None then ()
+  end
+end
+
+# ONE bound-receiver contract call (P0-4/P0-5): recorded by the checker at
+# the call node (the MIR lowering reads it by the same node id and stamps
+# it onto the callee operand's InstanceId; the monomorphizer's
+# devirtualization wave selects the concrete impl by `contract_method`
+# FIRST and unifies the receiver second). `method_args` are the
+# already-solved values of the CONTRACT METHOD's own (method-level)
+# generic parameters in DECLARATION ORDER — the checker's argument
+# unification solved them; a position no context solved stays a symbolic
+# Type::Var (never a fabricated value), and the monomorphizer rejects any
+# still-symbolic row instead of guessing.
+pub struct ContractCallRecord
+  trait_name: String
+  method_name: String
+  contract_method: DefId
+  method_args: Vec[GenericArg] = Vec::new()
+end
+
+# ONE trait-impl method's contract identity (P0-4/P0-5), published by the
+# checker at impl registration and stamped by the MIR onto the lowered
+# template's MirFunction. The publication is keyed by the SOURCE identity
+# `trait_name::method_name`: two traits declaring the same method name (a
+# legal program — the traits are distinct declarations) publish DISTINCT
+# entries even when both are implemented for one type, where the
+# resolver's first-wins per-type method registration makes their method
+# DefIds collide. `fallback_did` is the resolver DefId the checker
+# resolved for the impl method (possibly the shadowing first registration
+# of the same `Type::method` key); the MIR prefers the template's OWN
+# callable and uses the fallback only for a NON-GENERIC template whose
+# registration was shadowed (a generic template without its own callable
+# identity is never a candidate — fail closed). `impl_param_count` /
+# `method_param_count` are the binder split the devirtualizer reads; the
+# MIR recomputes them from the impl declaration (the checker's values on a
+# share-keyed publication cannot be per-impl) and overwrites them on the
+# stamped record.
+pub struct ImplContractMethod
+  contract_method: DefId
+  fallback_did: DefId
+  impl_param_count: Int = 0
+  method_param_count: Int = 0
 end
 
 struct TypeError
@@ -6463,6 +6667,15 @@ struct TypedProgram
   # performs no call-site inference (fail-closed). MIR pairs this with
   # call_targets to fill the call instance's args.
   call_instances: Map[Int, Vec[GenericArg]]
+  # (P0-4/P0-5) the bound-receiver contract-call records (call node id ->
+  # ContractCallRecord) and the source-keyed trait-impl method contract
+  # identities ("trait::method" -> ImplContractMethod) — the checker's
+  # typed carrier into the MIR and the monomorphizer. Defaulted so every
+  # existing TypedProgram construction stays unchanged; populated at
+  # type_check_typed's tail from the env tables.
+  contract_calls: Map[Int, ContractCallRecord] = Map::new()
+  trait_contract_methods: Map[String, ImplContractMethod] = Map::new()
+  trait_contract_conflicts: Set[String] = Set::new()
   field_targets: Map[Int, FieldId]
   access_effects: Map[Int, AccessEffect]
  # (, phase 2): the Typed HIR — per expression node
@@ -7869,6 +8082,17 @@ def module_path_of_item(program: Program, module_ptr: Int, item_idx: Int) -> (Ve
       var owner_path = Vec::new()
       for seg in info.path do
         owner_path.push(seg.clone())
+      end
+      # (module identity recovery): when the owner module's recorded path
+      # is empty (the merged program's dependency stamping lost the module
+      # table's path component), the DECLARATION's source file is the
+      # module identity — definitions from one file are one module. This
+      # restores per-module authority for the checker's module-local
+      # shadowing (`Error` in std/gfx_errors resolves to the file's own
+      # struct, not std/core's trait; std::io's `stdin` is not std::fs's).
+      # The compiled program's own file IS the root module (empty path).
+      if owner_path.is_empty() then
+        owner_path = item_source_module_path(program, item_idx)
       end
       return (owner_path, owner.id)
     when Option::None then
@@ -9931,8 +10155,13 @@ def occurs_check(inout env: TypeEnv, id: TypeVarId, ty: Type, span: Span) -> Boo
   occurs_check_with_depth(env, id, ty, 0, span)
 end
 
-# Maximum recursion depth for type checking (prevents stack overflow)
-def MAX_TYPE_DEPTH() -> Int = 100
+# Maximum recursion depth for type checking (prevents stack overflow).
+# (P1-1): raised from 100 to 1024 so the 128-layer nested-adapter
+# devirtualization fixture (and legitimately deep adapter/iterator chains)
+# can bind their concrete receiver types to inference variables — the
+# occurs check visits one frame per type level, so a 128-deep type needs
+# > 128 frames. The guard still catches genuinely infinite types.
+def MAX_TYPE_DEPTH() -> Int = 1024
 
 def occurs_check_with_depth(inout env: TypeEnv, id: TypeVarId, ty: Type, depth: Int, span: Span) -> Bool
   # Guard against infinite recursion
@@ -10435,6 +10664,10 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
   # analyzer in std::effects is tooling).
   env.check_ctx = "effect-set-check"
   check_effect_sets(env)
+  # (effect-summary reconciliation): see reconcile_effect_summaries — the
+  # typed signatures carry declared ∪ computed so the MIR's local effect
+  # rule holds for every checker-accepted call.
+  reconcile_effect_summaries(program, env)
   
   # (audit P1-2 + §11 — the effect-class annotations): the claim tables
   # above (fn_class_claims / fn_class_names — the def-keyed annotation
@@ -10903,8 +11136,25 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
       new_id
     end
     var methods = Vec::new()
+    # (P0-5 — method-level contract generics): each trait method's OWN
+    # generic parameters are interned under a synthetic per-method owner
+    # and bound in a per-method scope WHILE its signature resolves, so a
+    # contract method like `def map[U](value: U) -> U` carries Type::Param
+    # binders (previously `U` was an unknown type: the trait registration
+    # bound only the trait-level parameters). The SAME ids feed the
+    # MethodSig loop and the TraitMethodContract loop, so the two views of
+    # one declaration never diverge.
+    var trait_method_gp_ids: Vec[Vec[GenericParamId]] = Vec::new()
+    var tmgi = 0
+    while tmgi < t.methods.len() do
+      let tm_owner = fresh_synthetic_owner(&mut env.generic_param_table)
+      trait_method_gp_ids.push(intern_generic_params(env, &tm_owner, t.methods[tmgi].sig.generic_params))
+      tmgi = tmgi + 1
+    end
     var i = 0
     while i < t.methods.len() do
+      push_scope(env)
+      bind_generic_params(env, &t.methods[i].sig.generic_params, &trait_method_gp_ids[i])
       var param_types = Vec::new()
       var j = 0
       while j < t.methods[i].sig.params.len() do
@@ -10936,6 +11186,7 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
         ret_type: ret_ty,
         is_method: true
       })
+      pop_scope(env)
       i = i + 1
     end
 
@@ -10950,6 +11201,8 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
     var contract_methods = Vec::new()
     var ci = 0
     while ci < t.methods.len() do
+      push_scope(env)
+      bind_generic_params(env, &t.methods[ci].sig.generic_params, &trait_method_gp_ids[ci])
       var cparams = Vec::new()
       var cj = 0
       while cj < t.methods[ci].sig.params.len() do
@@ -11005,6 +11258,7 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
         generic_param_bounds: mg_bounds,
         declared_effects: c_effects
       })
+      pop_scope(env)
       ci = ci + 1
     end
 
@@ -11347,6 +11601,74 @@ end
 #   - a declared effect the function never uses is a LINT (a warning,
 #     reported through the checker's warnings channel) — an unused
 #     declaration is informational, never a rejection.
+# (effect-summary reconciliation): the MIR-level effect rule (mir.tg's
+# verifier: "a call to an effectful callee in a function without the
+# declared effect is an error") is the lowered mirror of the checker's
+# transitive discipline (check_effect_sets: computed = the callees'
+# closure over the recorded call graph). The checker EXEMPTS the std
+# module's own functions from the *diagnostic* (std is the trusted base —
+# its internal calls implement its declared effects), but the MIR
+# verifier has no std exemption: it compares the caller's carried effect
+# set against the callee's carried effect set verbatim. The typed
+# signatures must therefore carry the EFFECTIVE summary — declared ∪
+# computed — for every function; otherwise activating the std effectful
+# seeds (once module identity is intact) turns every panic/bounds-check
+# call inside a std function body into a post-lower verifier error.
+def reconcile_effect_summaries(program: Program, inout env: TypeEnv) -> Unit
+  let res = match env.resolutions
+  when Option::Some(r) then r.clone()
+  when Option::None then return
+  end
+  var i = 0
+  while i < program.items.len() do
+    var mcount = match program.items[i].kind
+    when ItemKind::ItemFunction(_) then 1
+    when ItemKind::ItemImpl(imp) then imp.methods.len()
+    when _ then 0
+    end
+    var mi = 0
+    while mi < mcount do
+      match res.item_defs.get(i)
+      when Option::Some(dids) then
+        if mi < dids.len() then
+          let did = dids[mi].clone()
+          let ekey = fn_effect_def_key(env, &did)
+          var eff = match env.fn_declared_effects.get(&ekey)
+          when Option::Some(d) then d.clone()
+          when Option::None then Vec::new()
+          end
+          match env.fn_computed_effects.get(&ekey)
+          when Option::Some(c) then
+            let _ = effect_set_append(&mut eff, c.clone())
+          when Option::None then ()
+          end
+          if !eff.is_empty() then
+            let okey = fn_owner_key_of_def(program, res.clone(), did.clone())
+            match env.typed_fn_signatures.get(&okey)
+            when Option::Some(sig) then
+              if sig.declared_effects.len() != eff.len() then
+                env.typed_fn_signatures.insert(okey, FnSignature {
+                  params: sig.params.clone(),
+                  ret_type: sig.ret_type.clone(),
+                  variadic: sig.variadic,
+                  declared_effects: eff,
+                  declared_budget: sig.declared_budget.clone(),
+                  effect_annotations: sig.effect_annotations.clone(),
+                  is_pure: sig.is_pure
+                })
+              end
+            when Option::None then ()
+            end
+          end
+        end
+      when Option::None then ()
+      end
+      mi = mi + 1
+    end
+    i = i + 1
+  end
+end
+
 def check_effect_sets(inout env: TypeEnv) -> Unit
   # 1. transitive closure: computed[caller] += declared[callee] ∪
   #    computed[callee] over every recorded call-graph edge, to fixpoint.
@@ -13951,6 +14273,54 @@ def register_impl_head(inout env: TypeEnv, i: ImplDecl) -> Option[ImplRegState]
     }
   })
 
+  # (P0-4) publish each trait-impl method's contract identity — the
+  # CONTRACT METHOD token (trait declaration id + contract method index)
+  # and the checker's fallback DefId — keyed by the SOURCE identity
+  # "trait_name::method_name". The MIR stamps every lowered impl template
+  # from this table (with the template's local binder split) and the
+  # monomorphizer's candidate index keys by the token, so same-named
+  # methods of DIFFERENT traits never mix even when the resolver's
+  # first-wins per-type registration makes their method DefIds collide.
+  # Only conformance-validated impls reach here (invalid impls returned
+  # above) and only traits with a registered contract have tokens. A key
+  # whose value CONFLICTS (two distinct trait declarations sharing a bare
+  # name) is poisoned: the entry is removed and never re-added, so the
+  # affected templates fail closed (no identity) rather than risk a wrong
+  # contract selection.
+  if trait_id.id != -1 then
+    match env.trait_contracts.get(trait_id.id)
+    when Option::Some(tcontract_impl) then
+      let new_impl_idx = env.impls.len() - 1
+      var imc = 0
+      while imc < env.impls[new_impl_idx].methods.len() do
+        let imethod = env.impls[new_impl_idx].methods[imc]
+        let cmi = trait_contract_method_index(tcontract_impl.clone(), imethod.name.clone())
+        if cmi >= 0 then
+          let source_key = trait_name.clone() + "::" + imethod.name.clone()
+          let record = ImplContractMethod {
+            contract_method: contract_method_token(trait_id.id, cmi),
+            fallback_did: imethod.owner.clone(),
+            impl_param_count: imp_gp_ids.len(),
+            method_param_count: tcontract_impl.methods[cmi].generic_param_names.len()
+          }
+          match env.typed_trait_contract_methods.get(source_key.clone())
+          when Option::Some(prev) then
+            if def_id_numeric(&prev.contract_method) != def_id_numeric(&record.contract_method) then
+              env.typed_trait_contract_conflicts.insert(source_key.clone())
+              env.typed_trait_contract_methods.remove(&source_key)
+            end
+          when Option::None then
+            if !env.typed_trait_contract_conflicts.contains(&source_key) then
+              env.typed_trait_contract_methods.insert(source_key, record)
+            end
+          end
+        end
+        imc = imc + 1
+      end
+    when Option::None then ()
+    end
+  end
+
   # Index impl methods for O(1) resolution: receiver TypeId -> method name -> impl indices.
   # Candidates are inserted in source order so first-hit selection stays deterministic.
   # (C3): the registration keys are the receiver index domain — the
@@ -14676,7 +15046,19 @@ def check_stmt_expected(inout env: TypeEnv, stmt: Stmt, expected: Option[Type], 
       unify(env, value_type, declared, stmt.span)
       declared
     when Option::None then
-      value_type
+      # (suffixed-literal binding): an UNANNOTATED binding whose
+      # initializer is a literal with an EXPLICIT integer suffix takes the
+      # suffix's type — the literal's own type is inference-only
+      # (Type::IntLiteral) and the end-of-check default would otherwise
+      # record the binding as the default Int (the seed binds the suffix's
+      # kind). Without this the binding type and the value's uses disagree
+      # with the literal's lowered kind (`mut width = 0u` bound Int while
+      # every use was UInt — the display_width "int into uint" class).
+      match int_literal_explicit_type_of(&value)
+      when Option::Some(explicit_ty) then
+        if is_int_literal_type(value_type.clone()) then explicit_ty else value_type end
+      when Option::None then value_type
+      end
     end
     # (audit §12): a LET binding of an OWNING value sourced from a live
     # with-scoped access is a move out of the accessed place — the access
@@ -17897,6 +18279,37 @@ def record_intrinsic_classification(
   end
 end
 
+# Whether an IntrinsicId is a checker-REJECTED surface — the frontend names
+# record_intrinsic_classification classifies only to reject with an explicit
+# "unsupported: use X instead" diagnostic (the ids whose codegen arms are
+# the defensive last line). Such an id is NOT a valid intrinsic BINDING: a
+# checked source call never reaches codegen with it. A NAME-FALLBACK
+# classification can still land on one — the type-MANGLED method spelling
+# canonicalizes onto the rejected frontend name (`String__is_empty` ->
+# `string_is_empty`, `String__chars` -> `string_chars`) — and the call must
+# then resolve to its COMPILED method body, exactly the TC_user
+# classification the seed's method_intrinsic_of answers when the
+# `__intrinsic_<owner>_<method>` registry binding does not exist
+# (stage0_ocaml's typecheck.ml: String::is_empty has a std body and no
+# registered intrinsic).
+pub def intrinsic_id_is_rejected_surface(id: IntrinsicId) -> Bool
+  match id
+  when IntrinsicId::SplitOnce then true
+  when IntrinsicId::StringIsEmptyChars then true
+  when IntrinsicId::MapJoinCollect then true
+  when IntrinsicId::SplitLinesTrim then true
+  when IntrinsicId::TrimMatches then true
+  when IntrinsicId::ToLowercase then true
+  when IntrinsicId::ArrayJoin then true
+  when IntrinsicId::ArrayReplace then true
+  when IntrinsicId::Status then true
+  when IntrinsicId::Output then true
+  when IntrinsicId::StdoutString then true
+  when IntrinsicId::StderrString then true
+  when _ then false
+  end  end
+end
+
 # The effective classification for a PREFIXED intrinsic name: the
 # __intrinsic_ prefix is stripped (the same normalization codegen's
 # bare_intrinsic_name applies) and the bare name runs the semantic
@@ -18408,10 +18821,10 @@ def generic_param_alias_table(param_names: Map[Int, String], canonical_ids: Vec[
     let name = generic_param_name_from(&param_names, &gpid)
     if !ambiguous_names.contains(&name) then
       if by_name.contains_key(&name) then
-        by_name.remove(name.clone())
-        ambiguous_names.insert(name)
+        let _ = by_name.remove(name.clone())
+        let _ = ambiguous_names.insert(name)
       else
-        by_name.insert(name, gpid)
+        let _ = by_name.insert(name, gpid)
       end
     end
   end
@@ -21439,6 +21852,28 @@ def integer_literal_suffix_type(sfx: String) -> Option[Type]
   end  end
 end
 
+# The CONCRETE type of an integer-literal expression with an explicit
+# suffix (`0u` -> UInt, `-1i32` -> I32); Option::None for every other
+# expression (including an unsuffixed literal, whose type stays
+# inference-only). Consumed by the unannotated-binding rule: a suffixed
+# literal's kind is authoritative even though the literal's own recorded
+# type is the inference fact IntLiteral.
+def int_literal_explicit_type_of(expr: Expr) -> Option[Type]
+  match expr.kind
+  when ExprKind::ExprIntLit(p) then
+    match p.explicit_suffix
+    when Option::Some(sfx) then integer_literal_suffix_type(sfx)
+    when Option::None then Option::None
+    end
+  when ExprKind::ExprUnaryOp(op, inner) then
+    match op
+    when UnOp::Neg then int_literal_explicit_type_of(*inner.get())
+    when _ then Option::None
+    end
+  when _ then Option::None
+  end  end
+end
+
 # The (lo, hi) bounds of an integer type as DECIMAL strings (the
 # arbitrary-precision comparison bounds — Int is the 64-bit host type,
 # UInt/usize/isize are 64-bit).
@@ -21697,6 +22132,140 @@ def check_expr(inout env: TypeEnv, expr: Expr) -> Type
   check_expr_expected(env, expr, Option::None)
 end
 
+# (the bare-name callable target recovery): recover a bare identifier
+# callee's DefId from the module-qualified symbol tables when the
+# resolver's recorded call target is missing (a registration-shape gap —
+# a source call in a generic impl body). The current module's own
+# definition wins, then a single qualified candidate; two distinct
+# candidates stay unresolved (the resolver's ambiguity diagnostic owns
+# that case). Kind metadata (Function) is preferred but a single
+# unclassified entry is accepted (the metadata table is not the
+# registration authority).
+def bare_callable_def_recovery(env: TypeEnv, name: String) -> Option[DefId]
+  match env.resolutions
+  when Option::None then return Option::None
+  when Option::Some(res) then
+    let own_key = module_qualified_key(&env.current_module_path, &name)
+    var own_did: Option[DefId] = Option::None
+    var foreign: Vec[DefId] = Vec::new()
+    var unclassified: Vec[DefId] = Vec::new()
+    let suffix = "::" + name.clone()
+    for (key, did) in res.module_symbols.entries() do
+      if key == name.clone() || key.ends_with(suffix.clone()) then
+        if key == own_key then
+          own_did = Option::Some(did.clone())
+        else
+          match def_kind_of(&res, &did)
+          when Option::Some(k) then
+            if k == DefKind::Function then foreign.push(did.clone()) end
+          when Option::None then unclassified.push(did.clone())
+          end
+        end
+      end
+    end
+    match own_did
+    when Option::Some(d) then Option::Some(d)
+    when Option::None then
+      if foreign.len() == 1 then
+        Option::Some(foreign[0].clone())
+      elsif foreign.len() == 0 && unclassified.len() == 1 then
+        Option::Some(unclassified[0].clone())
+      else
+        Option::None
+      end
+    end
+  end  end
+end
+
+# (the static-path mangled-free-function alias — the seed's check_call
+# fallback for `Type::method`): resolve the source-level mangled free
+# function `lowercase(Owner)_method`
+# (`Box::new` -> `box_new`) — the seed's check_call alias convention the
+# MIR's resolve_static_path_callee_name mirrors. Returns the resolved
+# declaration's type (a FnPtr) and its DefId: the strong call target the
+# solved instance is built from. Fires only when the owner names a
+# REGISTERED TYPE; the current module's own definition wins, then the
+# single qualified candidate (the resolver's 0/1/>1 discipline). Option
+# ::None for the frontend-intrinsic surface (string_new/... — no source
+# DefId; the name alone resolves at codegen) and for every unmatched name.
+def mangled_free_fn_target(env: TypeEnv, owner: String, method: String) -> Option[(Type, DefId)]
+  match get_type_by_name_ref(env, &owner)
+  when Option::None then return Option::None
+  when Option::Some(_) then ()
+  end
+  let free_name = owner.to_lowercase() + "_" + method
+  let own_key = module_qualified_key(&env.current_module_path, &free_name)
+  var ty_opt: Option[Type] = Option::None
+  var matched_key = ""
+  match env.module_callable_types.get(own_key.clone())
+  when Option::Some(ty) then
+    ty_opt = Option::Some(ty.clone())
+    matched_key = own_key.clone()
+  when Option::None then ()
+  end
+  if matched_key == "" then
+    let suffix = "::" + free_name.clone()
+    for (key, ty) in env.module_callable_types.entries() do
+      if matched_key == "" then
+        if key == free_name.clone() || key.ends_with(suffix.clone()) then
+          ty_opt = Option::Some(ty.clone())
+          matched_key = key.clone()
+        end
+      end
+    end
+  end
+  match ty_opt
+  when Option::None then Option::None
+  when Option::Some(fn_ty) then
+    # the DefId under the SAME qualified key (Function kind — the
+    # resolver's def_kinds metadata).
+    var did_opt: Option[DefId] = Option::None
+    match env.resolutions
+    when Option::Some(res) then
+      for (key, did) in res.module_symbols.entries() do
+        if did_opt.is_none() && key == matched_key then
+          match def_kind_of(&res, &did)
+          when Option::Some(k) then
+            if k == DefKind::Function then did_opt = Option::Some(did.clone()) end
+          when Option::None then ()
+          end
+        end
+      end
+    when Option::None then ()
+    end
+    match did_opt
+    when Option::Some(did_v) then Option::Some((fn_ty, did_v))
+    when Option::None then Option::None
+    end
+  end  end
+end
+
+# The mangled-free-function alias at a bare callee path (see
+# mangled_free_fn_target for the resolution; the frontend-intrinsic
+# surface resolves by registered signature alone).
+def mangled_free_fn_fallback(inout env: TypeEnv, callee: Expr, call_node_id: Int) -> Option[Type]
+  match callee.kind
+  when ExprKind::ExprPath(path) then
+    if path.segments.len() < 2 then return Option::None end
+    let owner = path.segments[path.segments.len() - 2].clone()
+    let method = path.segments[path.segments.len() - 1].clone()
+    let free_name = owner.to_lowercase() + "_" + method
+    # the frontend-intrinsic surface (string_new/...): typed from the
+    # registered signature, resolved by name at codegen.
+    match frontend_intrinsic_fn_type(free_name.clone())
+    when Option::Some(fn_ty) then return Option::Some(fn_ty)
+    when Option::None then ()
+    end
+    match mangled_free_fn_target(env, owner.clone(), method.clone())
+    when Option::Some(pair) then
+      env.typed_call_targets.insert(call_node_id, pair.1.clone())
+      Option::Some(pair.0)
+    when Option::None then Option::None
+    end
+  when _ then Option::None
+  end  end
+end
+
 # The expected-type entry — the kernel's mirror of the seed's
 # `check_expr env scope expected e`. EXPECTED is the type the expression's
 # value must have (None in inference-only positions). The rule engine is
@@ -21762,7 +22331,7 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
   when ExprKind::ExprStringLit(_) then Type::String
   when ExprKind::ExprCharLit(_) then Type::Char
   when ExprKind::ExprBoolLit(_) then Type::Bool
-  when ExprKind::ExprNilLit then builtin_adt(env, "Option".to_string(), [fresh_type_var(env)])
+  when ExprKind::ExprNilLit then Type::Unit
   when ExprKind::ExprIdent(name) then
     match lookup_var(env, name)
     when Option::Some(ty) then
@@ -21928,6 +22497,21 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
       when Option::Some(base_expr) then check_expr(env, &base_expr)
       when Option::None then check_expr(env, &func_expr)
       end
+# (the static-path mangled-free-function alias — the seed's check_call
+    # fallback): `Type::method` dispatches to the free function
+    # `type_method` (`Box::new` -> `box_new`, `String::new` ->
+    # `string_new`) when no `Type__method` / associated declaration
+    # resolves. Without it the callee typed as the TYPE value (the struct
+    # as an Adt), so the call recorded NO call target and NO solved
+    # instance: the lowered call (the MIR resolves the alias by name) then
+    # reached the monomorphizer without its instance payload. The
+    # resolution order and shapes mirror the MIR's
+    # resolve_static_path_callee_name.
+    let alias_ty_opt = mangled_free_fn_fallback(env, &func_expr, expr.node_id)
+    match alias_ty_opt
+    when Option::Some(alias_ty) then func_type = alias_ty
+    when Option::None then ()
+    end
  # (FnPtr/Closure split): the call-shape analysis below keys on the
     # FnPtr signature form; a Closure callee NORMALIZES to it (the
     # signature is identical — the call-shape semantics are the same for a
@@ -21979,6 +22563,26 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
     # registrations (DefKind::Intrinsic — the names the runtime does NOT
     # provide, the gate's target).
     record_typed_call_target(env, &func_expr, expr.node_id)
+    # (the bare-name callable target recovery): the resolver records the
+    # call target for a bare identifier callee; a registration-shape miss
+    # leaves the call with no semantic target, so the MIR operand carries
+    # no instance and the monomorphizer fails closed on a generic callee.
+    # Recover the target from the same module-qualified symbol tables the
+    # resolver's bare-name rule reads (the current module's own definition
+    # first, then a single qualified candidate; ambiguity stays unresolved
+    # — the resolver's own diagnostic owns that case). For the source call
+    # sites the resolver DID record, this is a no-op.
+    if !env.typed_call_targets.contains_key(&expr.node_id) then
+      match callee_ident_name(&func_expr)
+      when Option::Some(cname) then
+        match bare_callable_def_recovery(env, &cname)
+        when Option::Some(rec_did) then
+          env.typed_call_targets.insert(expr.node_id, rec_did.clone())
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
     match callee_ident_name(&func_expr)
     when Option::Some(cname) then
       let call_recv = if arg_types.len() > 0 then arg_types[0].clone() else Type::Unit end
@@ -22282,6 +22886,25 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
       # dropped).
       if call_was_generic then
         var decl_names: Vec[GenericParamId] = Vec::new()
+        # (declaration-order contract — signature-invisible parameters):
+        # the callee's DECLARED generic parameters in declaration order come
+        # FIRST, from the same authority the turbofish pre-binding uses
+        # (callee_decl_generic_params — the call target's interned parameter
+        # count, signature-invisible parameters included). The former
+        # signature-appearance enumeration missed a parameter declared in
+        # the binder list but appearing nowhere in the signature
+        # (`def layout_for[T]() -> Layout` / `layout_array[T](count)`): its
+        # turbofish bound gvar_map but no decl_names entry existed, the
+        # substitution came out EMPTY, and the monomorphizer failed closed
+        # on every call to such a function. The signature walk stays as the
+        # fallback for an owner the target table does not cover, preserving
+        # the established order for the covered owners.
+        let decl_from_target = callee_decl_generic_params(env, expr.node_id, &func_type)
+        var dni = 0
+        while dni < decl_from_target.len() do
+          decl_names.push(decl_from_target[dni].clone())
+          dni = dni + 1
+        end
         var dsi = 0
         while dsi < sig_param_names.len() do
           let sp = sig_param_names[dsi]
@@ -22299,7 +22922,7 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
             end
             var oci = 0
             while oci < owner_count do
-              decl_names.push(GenericParamId { owner: sp.owner.clone(), index: oci as UInt })
+              decl_names.push(generic_param_id_at(sp.owner.clone(), oci))
               oci = oci + 1
             end
           end
@@ -22450,7 +23073,12 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
     var arg_types = Vec::new()
     var i = 0
     while i < args.len() do
-      arg_types.push(check_expr(env, &args[i]))
+      # (builtin pointer method arg expectation): the compiler-builtin
+      # pointer methods (write) have no declared param table, so the
+      # instantiated-parameter expectation the seed threads into every
+      # method argument comes from the receiver's pointee here.
+      let arg_exp = builtin_method_arg_expected(env, recv_type.clone(), method.clone(), i)
+      arg_types.push(check_expr_expected(env, &args[i], arg_exp))
       i = i + 1
     end
     env.access_marker_depth = env.access_marker_depth - 1
@@ -23915,6 +24543,81 @@ def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, 
             end
           end
         end
+        # (the mangled free-function alias — the seed's check_call fallback):
+        # no owner impl and no builtin constructor matched — `Owner::method`
+        # dispatches to the free function `lowercase(owner)_method`
+        # (`Box::new` -> `box_new`), the SAME resolution the MIR's
+        # resolve_static_path_callee_name applies. The call is typed from
+        # the resolved declaration's signature (the declared generic
+        # parameters instantiated with fresh variables, the payload args
+        # unified against the instantiated parameters), the call target is
+        # recorded, and the solved substitution reaches the MIR's instance
+        # through typed_call_instances. Without this the call carried no
+        # instance payload and the monomorphizer failed closed.
+        if static_ret.is_none() then
+          match mangled_free_fn_target(env, owner_type_name.clone(), variant_name.clone())
+          when Option::Some(alias_pair) then
+            let alias_ty = alias_pair.0.clone()
+            let alias_did = alias_pair.1.clone()
+            match alias_ty
+            when Type::FnPtr(f_params, f_ret, _) then
+              env.typed_call_targets.insert(expr.node_id, alias_did.clone())
+              let alias_decl = callee_decl_generic_params(env, expr.node_id, alias_ty.clone())
+              var a_names: Vec[GenericParamId] = Vec::new()
+              var a_vars: Vec[Type] = Vec::new()
+              var a_i = 0
+              while a_i < alias_decl.len() do
+                a_names.push(alias_decl[a_i].clone())
+                a_vars.push(fresh_type_var(env))
+                a_i = a_i + 1
+              end
+              var a_params: Vec[Type] = Vec::new()
+              var a_pi = 0
+              while a_pi < f_params.len() do
+                a_params.push(subst_type_args(f_params[a_pi].ty.clone(), a_names.clone(), a_vars.clone()))
+                a_pi = a_pi + 1
+              end
+              var a_ret = subst_type_args(f_ret.clone(), a_names.clone(), a_vars.clone())
+              var a_ok = true
+              var a_ai = 0
+              while a_ai < args.len() && a_ai < a_params.len() do
+                if !try_head_unify(env, arg_tys[a_ai].clone(), a_params[a_ai].clone()) then
+                  a_ok = false
+                end
+                a_ai = a_ai + 1
+              end
+              if a_ok then
+                match expected
+                when Option::Some(exp) then
+                  let _alias_adopt = expected_adopt(env, a_ret.clone(), exp)
+                when Option::None then ()
+                end
+                var a_all_solved = true
+                var a_solved: Vec[Type] = Vec::new()
+                var a_si = 0
+                while a_si < a_vars.len() do
+                  let a_rv = resolve_type_var(env, a_vars[a_si].clone())
+                  if type_has_unresolved_var(env, a_rv.clone()) then
+                    a_all_solved = false
+                  else
+                    a_solved.push(a_rv)
+                  end
+                  a_si = a_si + 1
+                end
+                if a_all_solved then
+                  let a_typed = typed_args_of_solved(env, a_names.clone(), a_solved, expr.span)
+                  env.typed_call_instances.insert(expr.node_id, a_typed)
+                  env.pending_call_instances.remove(&expr.node_id)
+                elsif a_names.len() > 0 then
+                  env.pending_call_instances.insert(expr.node_id, (a_names.clone(), a_vars, expr.span))
+                end
+                static_ret = Option::Some(resolve_type_var(env, a_ret))
+              end
+            when _ then ()
+            end
+          when Option::None then ()
+          end
+        end
       end
       match static_ret
       when Option::Some(rt) then rt
@@ -24559,7 +25262,10 @@ def instantiate_param_bound_method(
     # as PanicInfo: the whole Named#158-vs-Param(T/K/V) family
     # (`Option::Some(key)`/`Result::Ok(v)`/body-vs-return in every
     # Clone-bounded generic method). Only a head that still CARRIES the
-    # bound param (a blanket impl on the bound) is instantiable here.
+    # bound param as a DECLARED generic (a blanket impl on the bound) is
+    # instantiable here; the instantiated head's own fresh variables are
+    # not a receiver match — the contract fallback solves method-level
+    # generics from the call arguments instead (P0-5).
     if !type_has_generic_param(env, &head_inst) then
       return Option::None
     end
@@ -24678,6 +25384,21 @@ def instantiate_param_bound_method(
     wpi = wpi + 1
   end
   validate_type_const_args(env, inst_ret, span)
+  # (P0-4/P0-5) record the bound-contract call identity: the contract
+  # method token + the values the argument/expected-type unification
+  # solved for the impl method's own generic parameters, in declaration
+  # order (the impl method's method-level binders correspond positionally
+  # to the contract method's — impl conformance validates the arity and
+  # the bounds). A still-unsolved position stays symbolic
+  # (Type::Var) — the monomorphizer rejects it instead of fabricating a
+  # value.
+  var contract_method_args: Vec[GenericArg] = Vec::new()
+  var cmv = 0
+  while cmv < method_vars.len() do
+    contract_method_args.push(generic_arg_of_type_view(resolve_type_var(env, method_vars[cmv].clone())))
+    cmv = cmv + 1
+  end
+  record_bound_contract_call(env, call_node_id, imp.trait_id.clone(), imp.trait_name.clone(), m.name.clone(), contract_method_args)
   Option::Some(resolve_type_var(env, inst_ret))
 end
 
@@ -25395,27 +26116,75 @@ end
 # This is the seed's trait-bound resolution (its generic trait-contract
 # method table): a declared bound proves exactly the bound trait's own
 # method surface.
-def param_bound_contract_method_ret(env: TypeEnv, bound: ParamTraitBound, recv: Type, method: String) -> Option[Type]
+def param_bound_contract_method_ret(
+  inout env: TypeEnv,
+  bound: ParamTraitBound,
+  recv: Type,
+  method: String,
+  arg_types: Vec[Type],
+  method_type_args: Vec[Type],
+  call_node_id: Int,
+  span: Span,
+  record: Bool
+) -> Option[Type]
+  # (P0-4) EVERY answered bound call records its contract identity — the
+  # builtin fast paths included, so a Clone/Eq/Hash/Drop/Display/Ord/
+  # Iterator-bound call still carries the semantic token into the MIR
+  # (these builtin surfaces declare no method-level generics, so their
+  # recorded method-level payload is exactly empty).
   if bound.trait_id.id == env.lang_items.clone_trait then
-    if method == "clone" then return Option::Some(recv.clone()) end
+    if method == "clone" then
+      if record then
+        record_bound_contract_call(env, call_node_id, bound.trait_id.clone(), bound.trait_name.clone(), method.clone(), Vec::new())
+      end
+      return Option::Some(recv.clone())
+    end
   end
   if bound.trait_id.id == env.lang_items.eq_trait then
-    if method == "eq" || method == "ne" then return Option::Some(Type::Bool) end
+    if method == "eq" || method == "ne" then
+      if record then
+        record_bound_contract_call(env, call_node_id, bound.trait_id.clone(), bound.trait_name.clone(), method.clone(), Vec::new())
+      end
+      return Option::Some(Type::Bool)
+    end
   end
   if bound.trait_id.id == env.lang_items.hash_trait then
-    if method == "hash" then return Option::Some(Type::Int) end
+    if method == "hash" then
+      if record then
+        record_bound_contract_call(env, call_node_id, bound.trait_id.clone(), bound.trait_name.clone(), method.clone(), Vec::new())
+      end
+      return Option::Some(Type::Int)
+    end
   end
   if bound.trait_id.id == env.lang_items.drop_trait then
-    if method == "drop" then return Option::Some(Type::Unit) end
+    if method == "drop" then
+      if record then
+        record_bound_contract_call(env, call_node_id, bound.trait_id.clone(), bound.trait_name.clone(), method.clone(), Vec::new())
+      end
+      return Option::Some(Type::Unit)
+    end
   end
   if bound.trait_name == "Display" then
-    if method == "to_string" || method == "fmt" then return Option::Some(Type::String) end
+    if method == "to_string" || method == "fmt" then
+      if record then
+        record_bound_contract_call(env, call_node_id, bound.trait_id.clone(), bound.trait_name.clone(), method.clone(), Vec::new())
+      end
+      return Option::Some(Type::String)
+    end
   end
   if bound.trait_name == "Ord" then
-    if method == "cmp" then return Option::Some(Type::Int) end
+    if method == "cmp" then
+      if record then
+        record_bound_contract_call(env, call_node_id, bound.trait_id.clone(), bound.trait_name.clone(), method.clone(), Vec::new())
+      end
+      return Option::Some(Type::Int)
+    end
   end
   if bound.trait_name == "Iterator" then
     if method == "next" then
+      if record then
+        record_bound_contract_call(env, call_node_id, bound.trait_id.clone(), bound.trait_name.clone(), method.clone(), Vec::new())
+      end
       let inner = if bound.args.len() >= 1 then bound.args[0].clone() else fresh_type_var(env) end
       return Option::Some(builtin_adt(env, "Option".to_string(), [inner]))
     end
@@ -25433,25 +26202,102 @@ def param_bound_contract_method_ret(env: TypeEnv, bound: ParamTraitBound, recv: 
     while ci < contract.methods.len() do
       let cm = contract.methods[ci]
       if cm.name == method then
-        let ret = contract_ty_subst(env, &contract, bound.args.clone(), recv.clone(), Vec::new(), cm.ret_type.clone())
-        let resolved = resolve_type_var(env, ret)
-        var is_var = false
-        match resolved
-        when Type::Var(_) then is_var = true
-        when _ then ()
-        end
-        if is_var then
-          # A source contract's Self occurrence (resolve_type_expr's
-          # "Self" -> fresh var): when the method owns NO method-level
-          # generic parameters, every remaining var is that Self — the
-          # receiver Param is the value. A method with its own generics is
-          # refused (its vars are not distinguishable from Self here).
-          if cm.generic_param_names.len() == 0 then
+        let ret0 = contract_ty_subst(env, &contract, bound.args.clone(), recv.clone(), Vec::new(), cm.ret_type.clone())
+        if cm.generic_param_names.len() == 0 then
+          # (legacy Self-free flow): no method-level generics — the
+          # contract's declared return with Self -> receiver; a remaining
+          # var IS the Self occurrence and is replaced by the receiver.
+          let resolved = resolve_type_var(env, ret0)
+          var is_var = false
+          match resolved
+          when Type::Var(_) then is_var = true
+          when _ then ()
+          end
+          if is_var then
+            if record then
+              record_bound_contract_call(env, call_node_id, bound.trait_id.clone(), bound.trait_name.clone(), method.clone(), Vec::new())
+            end
             return Option::Some(replace_type_vars_with(resolved, recv.clone(), 0))
           end
+          if record then
+            record_bound_contract_call(env, call_node_id, bound.trait_id.clone(), bound.trait_name.clone(), method.clone(), Vec::new())
+          end
+          return Option::Some(resolved)
+        end
+        # (P0-5 — method-level contract generics): instantiate the
+        # contract method's OWN generic parameters (the Param ids the
+        # trait registration interned for this method's declaration, in
+        # the declared name order) with the explicit type arguments or
+        # fresh variables, substitute them into the contract signature
+        # (Self and the trait-level args already substituted), and SOLVE
+        # them from the call's argument types. The solved values are the
+        # already-solved payload the bound-contract record publishes for
+        # the monomorphizer's merge. A generic no argument solves stays
+        # symbolic (rejected downstream, never fabricated); a return that
+        # still carries an unresolved variable is refused exactly like
+        # the legacy flow (the caller reports the no-method diagnostic).
+        var present_ids: Vec[GenericParamId] = Vec::new()
+        collect_param_names_from_type(env, cm.ret_type.clone(), &mut present_ids)
+        for p in cm.params do
+          collect_param_names_from_type(env, p.ty.clone(), &mut present_ids)
+        end
+        # the method's OWN ids only: the trait-level parameters are
+        # substituted from the bound args by contract_ty_subst.
+        var method_ids: Vec[GenericParamId] = Vec::new()
+        for gpid in present_ids do
+          var is_trait_level = false
+          for tgp in contract.generic_params do
+            if generic_param_id_eq(&tgp, &gpid) then is_trait_level = true end
+          end
+          for agp in contract.assoc_param_ids do
+            if generic_param_id_eq(&agp, &gpid) then is_trait_level = true end
+          end
+          if !is_trait_level then method_ids.push(gpid.clone()) end
+        end
+        var ordered_ids: Vec[GenericParamId] = Vec::new()
+        var ordered_vals: Vec[Type] = Vec::new()
+        var nmi = 0
+        while nmi < cm.generic_param_names.len() do
+          var val = fresh_type_var(env)
+          if nmi < method_type_args.len() then val = method_type_args[nmi].clone() end
+          var mi2 = 0
+          while mi2 < method_ids.len() do
+            if generic_param_name_of(&env.generic_param_table, &method_ids[mi2]) == cm.generic_param_names[nmi] then
+              ordered_ids.push(method_ids[mi2].clone())
+              ordered_vals.push(val.clone())
+            end
+            mi2 = mi2 + 1
+          end
+          nmi = nmi + 1
+        end
+        let ret_ty = subst_type_args(&ret0, &ordered_ids, &ordered_vals)
+        # unify the call's arguments against the substituted contract
+        # parameters (the receiver position excluded) — the SAME
+        # zero-inference discipline as the impl-based solver: the
+        # argument types are the only source of method-level values.
+        let self_offset = if cm.has_receiver && cm.receiver_in_params then 1 else 0 end
+        var pai = self_offset
+        while pai < cm.params.len() do
+          let pty0 = contract_ty_subst(env, &contract, bound.args.clone(), recv.clone(), Vec::new(), cm.params[pai].ty.clone())
+          let pty = subst_type_args(&pty0, &ordered_ids, &ordered_vals)
+          let arg_idx = pai - self_offset
+          if arg_idx < arg_types.len() then
+            unify(env, arg_types[arg_idx].clone(), pty, span)
+          end
+          pai = pai + 1
+        end
+        let resolved_m = resolve_type_var(env, ret_ty)
+        if type_has_unresolved_var(env, resolved_m.clone()) then
           return Option::None
         end
-        return Option::Some(resolved)
+        if record then
+          var method_args: Vec[GenericArg] = Vec::new()
+          for val in ordered_vals do
+            method_args.push(generic_arg_of_type_view(resolve_type_var(env, val.clone())))
+          end
+          record_bound_contract_call(env, call_node_id, bound.trait_id.clone(), bound.trait_name.clone(), method.clone(), method_args)
+        end
+        return Option::Some(resolved_m)
       end
       ci = ci + 1
     end
@@ -25609,6 +26455,42 @@ def derived_mint_ret(env: TypeEnv, recv_ty: Type, method: String) -> Option[Type
     end
   end
   Option::None
+end
+
+# (the builtin pointer method surface's ARGUMENT expectation): the
+# compiler-builtin pointer methods (write) exist only in the builtin table —
+# no source impl carries a declared param list — so the ordinary
+# method-argument check has no expected type for their value slot. The
+# seed's check_method_call threads the INSTANTIATED declared parameter
+# types into every argument; for the pointer family the expected value type
+# is the receiver's pointee. Without it an unannotated generic call in the
+# value slot (Ptr::null() into a write(Ptr[u8]...) slot) kept its unsolved
+# parameter and finalized to the Never bottom — the lowered store then read
+# "assign type mismatch: *never into *u8" (the seed solved the parameter
+# from the expected argument type and materialized Ptr[u8]).
+def builtin_method_arg_expected(env: TypeEnv, recv_type: Type, method: String, arg_index: Int) -> Option[Type]
+  if arg_index != 0 then return Option::None end
+  if method != "write" then return Option::None end
+  let recv = resolve_type_var(env, recv_type)
+  let base = match recv
+  when Type::RefInternal(inner, _) then resolve_type_var(env, inner)
+  when _ then recv
+  end
+  match base
+  when Type::Ptr(inner) then Option::Some(inner.clone())
+  when Type::PtrMut(inner) then Option::Some(inner.clone())
+  when Type::Adt(tid, args) then
+    let nn = match get_type_by_id_ref(env, &tid)
+    when Option::Some(td) then td.name.clone()
+    when Option::None then ""
+    end
+    if (tid.id == env.lang_items.ptr || nn == "Ptr" || tid.id == env.lang_items.ptr_mut || nn == "PtrMut") && args.len() >= 1 then
+      Option::Some(args[0].clone())
+    else
+      Option::None
+    end
+  when _ then Option::None
+  end  end
 end
 
 def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg_types: Vec[Type], method_type_args: Vec[Type], call_node_id: Int, span: Span, expected: Option[Type]) -> Type
@@ -25915,7 +26797,7 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
       match td_tr.def_kind
       when TypeDefKind::Trait(_) then
         let tr_bound = ParamTraitBound { trait_id: TraitId { id: tid.id }, trait_name: td_tr.name.clone(), args: args.clone() }
-        match param_bound_contract_method_ret(env, &tr_bound, &resolved_base, method.clone())
+        match param_bound_contract_method_ret(env, &tr_bound, &resolved_base, method.clone(), arg_types.clone(), method_type_args.clone(), call_node_id, span.clone(), false)
         when Option::Some(tr_ret) then return tr_ret
         when Option::None then ()
         end
@@ -26243,8 +27125,15 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
         # (the seed's trait-contract surface) — Clone/Eq/Hash/Display/Ord
         # by the bound trait identity (LangItems ids for Clone/Copy/Eq/
         # Hash; the trait name for the rest, retained on the bound record).
-        match param_bound_contract_method_ret(env, &pbound, &resolved_base, method.clone()) 
-        when Option::Some(ret_ty2) then return ret_ty2
+        # (P0-4/P0-5) the fallback RECORDS the call's contract identity and
+        # the method-level values it solves from the call's argument types
+        # (record=true); a contract method with its own generics is solved
+        # from the arguments, never guessed. What stays unsolved is
+        # recorded symbolically and rejected downstream by the
+        # devirtualizer's declared-arity/concreteness checks.
+        match param_bound_contract_method_ret(env, &pbound, &resolved_base, method.clone(), arg_types.clone(), method_type_args.clone(), call_node_id, span.clone(), true)
+        when Option::Some(ret_ty2) then
+          return ret_ty2
         when Option::None then ()
         end
         pbi = pbi + 1
@@ -26466,28 +27355,29 @@ def check_binary_op(inout env: TypeEnv, op: BinOp, left: Expr, right: Expr, span
       Type::String
     else
       unify(env, left_type, right_type, span)
-      left_type
+      arith_result_kind(left_type, right_type)
     end
   when BinOp::Sub then
     unify(env, left_type, right_type, span)
-    left_type
+    arith_result_kind(left_type, right_type)
   when BinOp::Mul then
     unify(env, left_type, right_type, span)
-    left_type
+    arith_result_kind(left_type, right_type)
   when BinOp::Div then
     unify(env, left_type, right_type, span)
-    left_type
+    arith_result_kind(left_type, right_type)
   when BinOp::Mod then
     # (seed's arithmetic arm — Add/Sub/Mul/Div/Mod share it): the operands
     # must match (Int/UInt kinds mix only against literals, which the
-    # unifier's literal coercion binds), and the result carries the LEFT
-    # operand's kind — so `u % 8` with u: UInt is UInt, not the former
-    # forced-Int mismatch.
+    # unifier's literal coercion binds), and the result carries the
+    # CONCRETE operand's kind — so `u % 8` with u: UInt is UInt, not the
+    # former forced-Int mismatch, and `0 - a` with a: u64 is u64 (the
+    # literal-left case recorded Int and diverged from its use-site slot).
     unify(env, left_type, right_type, span)
-    left_type
+    arith_result_kind(left_type, right_type)
   when BinOp::Pow then
     unify(env, left_type, right_type, span)
-    left_type
+    arith_result_kind(left_type, right_type)
   when BinOp::Eq then
     unify(env, left_type, right_type, span)
     Type::Bool
@@ -26521,6 +27411,22 @@ def check_binary_op(inout env: TypeEnv, op: BinOp, left: Expr, right: Expr, span
   when BinOp::Shr then bitwise_result(env, left_type, right_type, span)
   when _ then left_type
   end
+end
+
+# The arithmetic result kind (the seed's arithmetic arm): the result
+# carries the CONCRETE operand's kind — the left operand's kind when it is
+# not an inference-only literal, else the right's concrete kind, else the
+# left's IntLiteral default. The former `return left_type` recorded Int
+# for a literal-left expression even when the right operand fixed the kind
+# (`0 - a` with a: u64), so the recorded type disagreed with every
+# use-site slot and the MIR lowering emitted the operation in the wrong
+# width (the "int into u64" checked-arithmetic class).
+def arith_result_kind(left_type: Type, right_type: Type) -> Type
+  if is_int_literal_type(left_type.clone()) && is_integer_type(&right_type) then
+    right_type.clone()
+  else
+    left_type
+  end  end
 end
 
 # (seed's bitwise operator typing — check_binary's BitOr/BitXor/BitAnd/
@@ -27859,8 +28765,15 @@ def resolve_type_expr(inout env: TypeEnv, te: TypeExpr) -> Type
         builtin_adt(env, "UnsafeSlice".to_string(), [fresh_type_var(env)])
       end
     elsif name == "Any" then
-      # Any is a top type — use a fresh type variable that unifies with everything
-      fresh_type_var(env)
+      # Any is the TOP type: it resolves to the builtin opaque nominal's
+      # TypeId (the registration above), never to a bare fresh variable —
+      # a variable's unconstrained residue is finalized to its sound image
+      # (Never) in value positions, and in a DECLARATION position
+      # (`Box[Any]` in a struct/enum field) it would reach concrete MIR as
+      # Type::Var, which the MIR verifier rejects ("Type::Var reaches
+      # concrete MIR"). The nominal identity is also what the seed's
+      # checker answers for the same source.
+      builtin_adt(env, "Any".to_string(), Vec::new())
     # Type aliases: capitalized forms used by stdlib (Int8 → I8, UInt8 → U8, etc.)
     elsif name == "Int8" then Type::I8
     elsif name == "Int16" then Type::I16
@@ -28448,6 +29361,26 @@ def resolve_pending_int_literals(inout env: TypeEnv) -> Unit
     new_instances.insert(node_id, new_args)
   end
   env.typed_call_instances = new_instances
+  # (P0-4/P0-5) the bound-contract call channel: the contract method-level
+  # values ride the same IntLiteral defaulting (the Type payloads; Const
+  # payloads are values).
+  var new_contract_calls: Map[Int, ContractCallRecord] = Map::new()
+  for (c_node, c_rec) in env.typed_contract_calls do
+    var c_args: Vec[GenericArg] = Vec::new()
+    for a in c_rec.method_args do
+      match a
+      when GenericArg::Type(t) then c_args.push(GenericArg::Type(default_int_literal_type(env, &t)))
+      when GenericArg::Const(cv) then c_args.push(GenericArg::Const(cv))
+      end
+    end
+    new_contract_calls.insert(c_node, ContractCallRecord {
+      trait_name: c_rec.trait_name,
+      method_name: c_rec.method_name,
+      contract_method: c_rec.contract_method,
+      method_args: c_args
+    })
+  end
+  env.typed_contract_calls = new_contract_calls
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -29576,6 +30509,27 @@ def finalize_typed_channels(inout env: TypeEnv) -> Unit
     new_instances.insert(node, rewritten)
   end
   env.typed_call_instances = new_instances
+  # (P0-4/P0-5): the bound-contract call channel rides the same final
+  # chase — a method-level value no unification ever bound becomes its
+  # sound image (Never) before the MIR snapshot, and the monomorphizer's
+  # devirtualizer rejects it (never a fabricated argument).
+  var new_contract_calls: Map[Int, ContractCallRecord] = Map::new()
+  for (node, rec) in env.typed_contract_calls do
+    var rewritten_cargs: Vec[GenericArg] = Vec::new()
+    for a in rec.method_args do
+      match a.clone()
+      when GenericArg::Type(ty) then rewritten_cargs.push(GenericArg::Type(finalize_chase_type(env, ty)))
+      when _ then rewritten_cargs.push(a.clone())
+      end
+    end
+    new_contract_calls.insert(node, ContractCallRecord {
+      trait_name: rec.trait_name,
+      method_name: rec.method_name,
+      contract_method: rec.contract_method,
+      method_args: rewritten_cargs
+    })
+  end
+  env.typed_contract_calls = new_contract_calls
   var new_sigs: Map[String, FnSignature] = Map::new()
   for (key, sig_rec) in env.typed_fn_signatures do
     var chased_params: Vec[ParamType] = Vec::new()
@@ -29626,6 +30580,9 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
   env.local_ids.clear()
   env.typed_call_targets.clear()
   env.typed_call_instances.clear()
+  env.typed_contract_calls.clear()
+  env.typed_trait_contract_methods.clear()
+  env.typed_trait_contract_conflicts.clear()
   env.typed_field_targets.clear()
   env.typed_local_bindings.clear()
   env.typed_node_spans.clear()
@@ -29958,6 +30915,9 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
     expr_types: env.typed_expr_types.clone(),
     call_targets: env.typed_call_targets.clone(),
     call_instances: env.typed_call_instances.clone(),
+    contract_calls: env.typed_contract_calls.clone(),
+    trait_contract_methods: env.typed_trait_contract_methods.clone(),
+    trait_contract_conflicts: env.typed_trait_contract_conflicts.clone(),
     field_targets: env.typed_field_targets.clone(),
     access_effects: env.typed_access_effects.clone(),
     typed_exprs: env.typed_exprs.clone(),
@@ -30006,6 +30966,9 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
     expr_types: env.typed_expr_types.clone(),
     call_targets: env.typed_call_targets.clone(),
     call_instances: env.typed_call_instances.clone(),
+    contract_calls: env.typed_contract_calls.clone(),
+    trait_contract_methods: env.typed_trait_contract_methods.clone(),
+    trait_contract_conflicts: env.typed_trait_contract_conflicts.clone(),
     field_targets: env.typed_field_targets.clone(),
     access_effects: env.typed_access_effects.clone(),
     typed_exprs: env.typed_exprs.clone(),

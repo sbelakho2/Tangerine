@@ -1,15 +1,29 @@
 # devirtprobe.tg — focused MONO DEVIRTUALIZATION probe (temporary).
 #
 # Runs the kernel front end (parse -> resolve -> typecheck -> the
-# integrated access/resource passes -> lower) over a SMALL self-contained
-# program that reproduces the trait-bound-receiver call shape
-# (`I: Adder` receiver, `it.bump()`), then:
+# integrated access/resource passes -> lower) over SMALL self-contained
+# programs that reproduce the trait-bound-receiver call shapes, then:
 #   1. dumps every MirCall callee name + instance payload + the calling
 #      function's local table (the devirtualization inputs),
 #   2. runs verify_mir BEFORE mono (the post-lower rows),
 #   3. runs monomorphize_program,
 #   4. dumps the sites again (did the specialized bodies re-dispatch to the
 #      concrete impl method?) and verify_mir AFTER mono (post-mono rows).
+#
+# The fixture cases (audit P0-4/P0-5/P1-1):
+#   main (legacy)      — the Adder contract fixture: concrete CA/CB, the
+#                        blanket GA[T] impl and the Wrap[I] adapter chain;
+#                        the concrete-bound calls re-dispatch to the impls.
+#   same_name_traits   — (P0-4) two traits IncA/IncB both declaring
+#                        `step`, both implemented for `Both`: the IncA-bound
+#                        and IncB-bound calls must select their OWN trait's
+#                        impl — never "ambiguous", never the other trait.
+#   method_level_generic — (P0-5) `apply[U](value: U) -> U` on a generic
+#                        bound receiver: U is solved from the argument and
+#                        merged with the receiver-solved impl parameter.
+#   nested_adapters    — (P1-1) 128 nested Wrap2 adapter layers: the wave
+#                        needs one fixpoint round per layer and must run
+#                        unbounded (the former 64-round cap aborted here).
 #
 # The output is written to build/devirt_probe.txt.
 use std::core::{Option, Result}
@@ -26,11 +40,40 @@ use tg_compiler::mir::{
   lower_to_mir, verify_mir, MirProgram, MirFunction, MirTerminatorKind,
   MirOperandKind, MirConstantKind, MirCallValue
 }
-use tg_compiler::mono::{mono_cache_new_ephemeral, monomorphize_program}
+use tg_compiler::mono::{mono_cache_new_ephemeral, monomorphize_program, devirt_candidate_index}
 use tg_compiler::stable_ids::{structural_instance_mangle_text}
 use tg_compiler::ids::{def_id_numeric}
 
 const DEV_PROBE_SRC: String = "trait Adder\n  def bump(inout self: Self) -> Int\nend\n\nstruct CA\n  n: Int\nend\n\nstruct CB\n  n: Int\nend\n\nimpl Adder for CA\n  def bump(inout self) -> Int\n    self.n = self.n + 1\n    self.n\n  end\nend\n\nimpl Adder for CB\n  def bump(inout self) -> Int\n    self.n = self.n + 10\n    self.n\n  end\nend\n\nstruct GA[T]\n  v: T\nend\n\nimpl[T] Adder for GA[T]\n  def bump(inout self) -> Int\n    7\n  end\nend\n\nstruct Wrap[I: Adder]\n  inner: I\nend\n\nimpl[I: Adder] Adder for Wrap[I]\n  def bump(inout self) -> Int\n    self.inner.bump() + 100\n  end\nend\n\ndef drive[I: Adder](inout it: I) -> Int\n  it.bump() + it.bump()\nend\n\ndef main() -> Int\n  var a = CA { n: 0 }\n  var b = CB { n: 0 }\n  var g: GA[Int] = GA { v: 1 }\n  var w: Wrap[CA] = Wrap { inner: CA { n: 5 } }\n  drive(&mut a) + drive(&mut b) + drive(&mut g) + drive(&mut w) + a.bump()\nend\n"
+
+# (P0-4) TWO traits declaring the SAME method name, both implemented for
+# the SAME type `Both`, plus a second type `Other` implementing IncB. The
+# IncA-bound and IncB-bound calls must select their own trait's impl: the
+# contract identity is (trait declaration, method), not the method name.
+const DEV_FIXTURE_A_SRC: String = "trait IncA\n  def step(inout self: Self) -> Int\nend\n\ntrait IncB\n  def step(inout self: Self) -> Int\nend\n\nstruct Both\n  n: Int\nend\n\nstruct Other\n  n: Int\nend\n\nimpl IncA for Both\n  def step(inout self) -> Int\n    self.n + 1\n  end\nend\n\nimpl IncB for Both\n  def step(inout self) -> Int\n    self.n + 2\n  end\nend\n\nimpl IncB for Other\n  def step(inout self) -> Int\n    self.n + 20\n  end\nend\n\ndef use_a[X: IncA](inout x: X) -> Int\n  x.step()\nend\n\ndef use_b[Y: IncB](inout y: Y) -> Int\n  y.step()\nend\n\ndef main() -> Int\n  var b = Both { n: 0 }\n  var o = Other { n: 0 }\n  use_a(&mut b) + use_b(&mut o) + use_b(&mut b)\nend\n"
+
+# (P0-5) A contract method with its OWN method-level generic solved from an
+# argument (`apply[U](value: U) -> U`), dispatched on a generic-bound
+# receiver: U comes from the call's already-solved payload and the impl
+# parameter T comes from receiver unification — the merged instance has
+# both.
+const DEV_FIXTURE_B_SRC: String = "trait Mapper\n  def apply[U](inout self: Self, value: U) -> U\nend\n\nstruct MBox[T]\n  v: T\nend\n\nimpl[T] Mapper for MBox[T]\n  def apply[U](inout self, value: U) -> U\n    value\n  end\nend\n\ndef map_it[T: Mapper](inout x: T, value: Int) -> Int\n  x.apply(value)\nend\n\ndef main() -> Int\n  var mb: MBox[Int] = MBox { v: 1 }\n  map_it(&mut mb, 7)\nend\n"
+
+# (P1-1) `depth` nested Wrap2 adapter layers over a concrete CA2 leaf. The
+# devirtualization wave exposes ONE newly-concrete receiver per fixpoint
+# round (chain -> Wrap2^depth -> ... -> CA2), so the program needs `depth`
+# rounds — the former MAX_MONO_DEVIRT_ROUNDS=64 aborted at depth 128.
+def dev_build_nested_src(depth: Int) -> String
+  var ty = "CA2".to_string()
+  var val = "CA2 { n: 0 }".to_string()
+  var d = 0
+  while d < depth do
+    ty = "Wrap2[" + ty + "]"
+    val = "Wrap2 { inner: " + val + " }"
+    d = d + 1
+  end
+  "trait Adder2\n  def bump2(inout self: Self) -> Int\nend\n\nstruct CA2\n  n: Int\nend\n\nimpl Adder2 for CA2\n  def bump2(inout self) -> Int\n    self.n + 1\n  end\nend\n\nstruct Wrap2[I: Adder2]\n  inner: I\nend\n\nimpl[I: Adder2] Adder2 for Wrap2[I]\n  def bump2(inout self) -> Int\n    self.inner.bump2() + 1\n  end\nend\n\ndef chain[I: Adder2](inout w: I) -> Int\n  w.bump2()\nend\n\ndef main() -> Int\n  var w: " + ty + " = " + val + "\n  chain(&mut w)\nend\n"
+end
 
 def dev_ty_word(ty: Type) -> String
   match ty
@@ -45,7 +88,7 @@ def dev_ty_word(ty: Type) -> String
   when Type::Var(_) then "Var"
   when Type::Param(g) then "Param"
   when _ then "other"
-  end  end
+  end
 end
 
 def dev_arg_word(a: tg_compiler::ids::GenericArg) -> String
@@ -112,41 +155,187 @@ def dev_dump_sites(mir: MirProgram, label: String, inout report: String) -> Unit
   end
 end
 
-pub def main() -> Int
-  var report = ""
-  let label = "devirt"
-  let parsed = parse(tokenize(DEV_PROBE_SRC.clone(), label.clone()))
+# compact per-call dump for the fixture cases: functions whose name
+# CONTAINS `filter` (all when the filter is empty), one line per call.
+def dev_dump_sites_compact(mir: MirProgram, tag: String, filter: String, inout report: String) -> Unit
+  for f in mir.functions do
+    if filter.len() > 0 && !f.name.contains(filter.clone()) then
+      next
+    end
+    for b in f.blocks do
+      match b.terminator.kind
+      when MirTerminatorKind::MirCall(_, callee, _, _, _, _, _) then
+        match callee.kind
+        when MirOperandKind::MirConstant(cv) then
+          match cv.kind
+          when MirConstantKind::MirFnItem(name) then
+            var inst_word = "none"
+            match cv.instance.clone()
+            when Option::Some(inst) then
+              var arg_rows = ""
+              var ia = 0
+              while ia < inst.args.len() do
+                arg_rows = arg_rows + "|" + dev_arg_word(inst.args[ia].clone())
+                ia = ia + 1
+              end
+              inst_word = "some(" + arg_rows + ")"
+            when Option::None then ()
+            end
+            report = report + "  DEV_SITE " + tag.clone() + " fn=" + f.name.clone() + " bb=" + b.id.id.to_string() + " callee=" + name.clone() + " inst=" + inst_word.clone() + "\n"
+          when _ then ()
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+end
+
+# whether ANY post-mono call's callee name contains `needle`.
+def dev_has_callee_containing(mir: MirProgram, needle: String) -> Bool
+  for f in mir.functions do
+    for b in f.blocks do
+      match b.terminator.kind
+      when MirTerminatorKind::MirCall(_, callee, _, _, _, _, _) then
+        match callee.kind
+        when MirOperandKind::MirConstant(cv) then
+          match cv.kind
+          when MirConstantKind::MirFnItem(name) then
+            if name.contains(needle.clone()) then
+              return true
+            end
+          when _ then ()
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+  false
+end
+
+# count the post-mono calls whose callee name DIFFERS from `bare` and
+# whose instance carries at least `min_args` args (the fixture B merged
+# receiver+method payload check).
+def dev_count_merged_calls(mir: MirProgram, bare: String, min_args: Int) -> Int
+  var n = 0
+  for f in mir.functions do
+    for b in f.blocks do
+      match b.terminator.kind
+      when MirTerminatorKind::MirCall(_, callee, _, _, _, _, _) then
+        match callee.kind
+        when MirOperandKind::MirConstant(cv) then
+          match cv.kind
+          when MirConstantKind::MirFnItem(name) then
+            if name != bare then
+              match cv.instance.clone()
+              when Option::Some(inst) then
+                if inst.args.len() >= min_args then
+                  n = n + 1
+                end
+              when Option::None then ()
+              end
+            end
+          when _ then ()
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+  end
+  n
+end
+
+# Run ONE fixture through the full kernel pipeline and report.
+#
+# Parameters:
+#   src              — the program source.
+#   tag              — the report tag.
+#   legacy           — print the legacy exact lines (DEV_TYPECHECK /
+#                      DEV_MONO ok / DEV_VERIFY_POST rows=N) the tg_devirt
+#                      lane greps for.
+#   full_dump        — dump every site + local table pre and post.
+#   site_filter      — compact per-call dump filter ("" = no compact dump).
+#   expect_callees   — every substring must appear in some post-mono callee.
+#   reject_ambiguous — no mono error may contain "ambiguous"/"no impl of".
+#   merged_bare      — fixture-B check: bare surface that must have been
+#                      rewritten, with >= merged_min_args instance args.
+#   merged_min_args  — see merged_bare.
+#   min_instances    — the cache must hold at least this many instances.
+# Returns 0 only when every check passed.
+def dev_run_case(
+  src: String,
+  tag: String,
+  legacy: Bool,
+  full_dump: Bool,
+  site_filter: String,
+  expect_callees: Vec[String],
+  reject_ambiguous: Bool,
+  merged_bare: String,
+  merged_min_args: Int,
+  min_instances: Int,
+  inout report: String
+) -> Int
+  let parsed = parse(tokenize(src.clone(), tag.clone()))
   if diag_has_errors(&parsed.diagnostics) then
-    report = report + "DEV_PARSE_FAILED\n"
-    let _ = write_file("build/devirt_probe.txt", report.clone())
+    report = report + "DEV_CASE " + tag.clone() + " PARSE_FAILED\n"
     return 2
   end
   var program = parsed.program
   assign_node_ids(&mut program)
   match resolve_names(program)
+  when Result::Err(errs) then
+    report = report + "DEV_CASE " + tag.clone() + " RESOLVE_FAILED=" + errs.len().to_string() + "\n"
+    2
   when Result::Ok(res) then
+    var status = 0
     var env = type_env_new()
     env.strict_resolution = true
     let result = type_check_typed(&mut env, &program, &res)
-    report = report + "DEV_TYPECHECK errors=" + result.errors.len().to_string() + "\n"
+    if legacy then
+      report = report + "DEV_TYPECHECK errors=" + result.errors.len().to_string() + "\n"
+    else
+      report = report + "DEV_CASE " + tag.clone() + " typecheck_errors=" + result.errors.len().to_string() + "\n"
+    end
     var ei = 0
     while ei < result.errors.len() do
-      report = report + "  DEV_TE " + result.errors[ei].message.clone() + "\n"
+      report = report + "  DEV_TE " + tag.clone() + " " + result.errors[ei].message.clone() + "\n"
       ei = ei + 1
     end
-    let _ = write_file("build/devirt_probe.txt", report.clone())
     if result.errors.len() > 0 then
       return 1
     end
     var engine_snapshot = result.program.engine_snapshot
     let typed = result.program.typed
+    # (P0-4/P0-5) the checker's contract identity tables: the per-impl
+    # source-keyed records and the per-call records (token + solved
+    # method-level values).
+    for (skey, srec) in typed.trait_contract_methods.entries() do
+      report = report + "  DEV_CONTRACT_IMPL " + tag.clone() + " key=" + skey.clone() + " token=" + def_id_numeric(&srec.contract_method).to_string() + " impl_params=" + srec.impl_param_count.to_string() + " method_params=" + srec.method_param_count.to_string() + "\n"
+    end
+    for (cnode, crec) in typed.contract_calls.entries() do
+      report = report + "  DEV_CONTRACT_CALL " + tag.clone() + " node=" + cnode.to_string() + " trait=" + crec.trait_name.clone() + " method=" + crec.method_name.clone() + " token=" + def_id_numeric(&crec.contract_method).to_string() + " method_args=" + crec.method_args.len().to_string() + "\n"
+    end
+    for (tnode, tdid) in typed.call_targets.entries() do
+      report = report + "  DEV_CALL_TARGET " + tag.clone() + " node=" + tnode.to_string() + " def=" + def_id_numeric(&tdid).to_string() + "\n"
+    end
+    for (inode, iargs) in typed.call_instances.entries() do
+      report = report + "  DEV_CALL_INSTANCE " + tag.clone() + " node=" + inode.to_string() + " args=" + iargs.len().to_string() + "\n"
+    end
     let ast_owned = result.program.ast
     let resolutions_owned = result.program.resolutions
     let cfg = build_typed_cfg(&program, &typed)
     var actx = analysis_context_new()
     let access_errors = access_check(&program, &typed, &cfg, &mut actx)
     let res_result = resource_check(&program, &typed, &cfg, &mut actx, &mut engine_snapshot)
-    report = report + "DEV_ANALYZE access=" + access_errors.len().to_string() + " resource=" + res_result.errors.len().to_string() + "\n"
+    if legacy then
+      report = report + "DEV_ANALYZE access=" + access_errors.len().to_string() + " resource=" + res_result.errors.len().to_string() + "\n"
+    else
+      report = report + "DEV_CASE " + tag.clone() + " analyze access=" + access_errors.len().to_string() + " resource=" + res_result.errors.len().to_string() + "\n"
+    end
     let analyzed = AnalyzedProgram {
       typed: typed,
       ast: ast_owned,
@@ -159,82 +348,191 @@ pub def main() -> Int
       resource_errors: res_result.errors
     }
     match lower_to_mir(program, analyzed)
+    when Result::Err(e) then
+      report = report + "DEV_CASE " + tag.clone() + " LOWER_FAILED " + e.clone() + "\n"
+      1
     when Result::Ok(mir0) then
-      report = report + "DEV_LOWER ok functions=" + mir0.functions.len().to_string() + "\n"
-      for (dname, dpair) in mir0.dispatch_methods.entries() do
-        report = report + "  DEV_DISPATCH " + dname.clone() + " def=" + def_id_numeric(&dpair.0).to_string() + " pc=" + dpair.2.to_string() + "\n"
+      if legacy then
+        report = report + "DEV_LOWER ok functions=" + mir0.functions.len().to_string() + "\n"
+        for (dname, dpair) in mir0.dispatch_methods.entries() do
+          report = report + "  DEV_DISPATCH " + dname.clone() + " def=" + def_id_numeric(&dpair.0).to_string() + " pc=" + dpair.2.to_string() + "\n"
+        end
+        for (did_num, dname2) in mir0.method_names_by_def.entries() do
+          report = report + "  DEV_METHODNAME def=" + did_num.to_string() + " name=" + dname2.clone() + "\n"
+        end
+      else
+        report = report + "DEV_CASE " + tag.clone() + " lower_ok functions=" + mir0.functions.len().to_string() + "\n"
       end
-      for (did_num, dname2) in mir0.method_names_by_def.entries() do
-        report = report + "  DEV_METHODNAME def=" + did_num.to_string() + " name=" + dname2.clone() + "\n"
+      # (P0-4) per-template contract identity stamps + the candidate index.
+      for f3 in mir0.functions do
+        var call_word = "none"
+        match f3.callable
+        when Option::Some(c) then call_word = def_id_numeric(&c.def).to_string()
+        when Option::None then ()
+        end
+        var cid_word = "none"
+        match f3.contract_identity
+        when Option::Some(cid3) then
+          cid_word = def_id_numeric(&cid3.contract_method).to_string() + "/" + cid3.impl_param_count.to_string() + "/" + cid3.method_param_count.to_string()
+        when Option::None then ()
+        end
+        var disp3 = false
+        match mir0.dispatch_methods.get(&f3.name)
+        when Option::Some(_) then disp3 = true
+        when Option::None then ()
+        end
+        report = report + "  DEV_FN " + tag.clone() + " name=" + f3.name.clone() + " callable=" + call_word.clone() + " contract=" + cid_word.clone() + " params=" + f3.params.len().to_string() + " disp=" + disp3.to_string() + "\n"
       end
-      dev_dump_sites(mir0.clone(), "pre", &mut report)
+      let poke_index = devirt_candidate_index(mir0.clone(), mir0.generic_param_names.clone())
+      report = report + "  DEV_CAND_INDEX " + tag.clone() + " keys=" + poke_index.len().to_string() + "\n"
+      for (pk, pv) in poke_index.entries() do
+        var cand_names = ""
+        for pc in pv do
+          cand_names = cand_names + "[" + pc.template_name.clone() + "]"
+        end
+        report = report + "  DEV_CAND " + tag.clone() + " key=" + pk.to_string() + " rows=" + pv.len().to_string() + " names=" + cand_names.clone() + "\n"
+      end
+      if full_dump then
+        dev_dump_sites(mir0.clone(), "pre", &mut report)
+      end
       let pre_rows = verify_mir(mir0.clone())
-      report = report + "DEV_VERIFY_PRE rows=" + pre_rows.len().to_string() + "\n"
-      var pri = 0
-      while pri < pre_rows.len() do
-        report = report + "  DEV_PRE_ROW " + pre_rows[pri].clone() + "\n"
-        pri = pri + 1
+      if legacy then
+        report = report + "DEV_VERIFY_PRE rows=" + pre_rows.len().to_string() + "\n"
+      else
+        report = report + "DEV_CASE " + tag.clone() + " verify_pre_rows=" + pre_rows.len().to_string() + "\n"
       end
-      let _ = write_file("build/devirt_probe.txt", report.clone())
+      if pre_rows.len() > 0 then
+        status = 1
+        var pri = 0
+        while pri < pre_rows.len() do
+          report = report + "  DEV_PRE_ROW " + tag.clone() + " " + pre_rows[pri].clone() + "\n"
+          pri = pri + 1
+        end
+      end
       var mir = mir0.clone()
       var cache = mono_cache_new_ephemeral(&ast_owned, &resolutions_owned)
+      var mono_errs: Vec[String] = Vec::new()
       match monomorphize_program(&mut mir, &mut cache)
       when Result::Ok(()) then
-        report = report + "DEV_MONO ok functions=" + mir.functions.len().to_string() + "\n"
+        if legacy then
+          report = report + "DEV_MONO ok functions=" + mir.functions.len().to_string() + "\n"
+        else
+          report = report + "DEV_CASE " + tag.clone() + " mono_ok functions=" + mir.functions.len().to_string() + "\n"
+        end
       when Result::Err(errs) then
-        report = report + "DEV_MONO failed=" + errs.len().to_string() + "\n"
+        status = 1
+        if legacy then
+          report = report + "DEV_MONO failed=" + errs.len().to_string() + "\n"
+        else
+          report = report + "DEV_CASE " + tag.clone() + " mono_failed=" + errs.len().to_string() + "\n"
+        end
         var mi2 = 0
         while mi2 < errs.len() do
-          report = report + "  DEV_MONO_ERR " + errs[mi2].clone() + "\n"
+          report = report + "  DEV_MONO_ERR " + tag.clone() + " " + errs[mi2].clone() + "\n"
+          mono_errs.push(errs[mi2].clone())
           mi2 = mi2 + 1
         end
       end
-      dev_dump_sites(mir.clone(), "post", &mut report)
-      for (ik, _ibody) in cache.instances.entries() do
-        report = report + "  DEV_INSTANCE " + structural_instance_mangle_text(ik.clone()) + "\n"
+      for err in cache.errors do
+        report = report + "  DEV_CACHE_ERR " + tag.clone() + " " + err.clone() + "\n"
+        mono_errs.push(err.clone())
       end
-      for f2 in mir.functions do
-        for b2 in f2.blocks do
-          match b2.terminator.kind
-          when MirTerminatorKind::MirCall(_, callee2, _, _, _, _, _) then
-            match callee2.kind
-            when MirOperandKind::MirConstant(cv2) then
-              match cv2.kind
-              when MirConstantKind::MirFnItem(nm2) then
-                match cv2.instance.clone()
-                when Option::Some(inst2) then
-                  let ks = structured_instance_key(cache, inst2.clone())
-                  report = report + "  DEV_KEY fn=" + f2.name.clone() + " callee=" + nm2.clone() + " key=" + structural_instance_mangle_text(ks.clone()) + " cached=" + cache.instances.contains_key(&ks).to_string() + "\n"
-                when Option::None then ()
-                end
-              when _ then ()
-              end
-            when _ then ()
-            end
-          when _ then ()
-          end
+      if full_dump then
+        dev_dump_sites(mir.clone(), "post", &mut report)
+        for (ik, _ibody) in cache.instances.entries() do
+          report = report + "  DEV_INSTANCE " + structural_instance_mangle_text(ik.clone()) + "\n"
         end
       end
-      for err in cache.errors do
-        report = report + "  DEV_CACHE_ERR " + err.clone() + "\n"
+      if site_filter.len() > 0 || !full_dump then
+        dev_dump_sites_compact(mir.clone(), tag.clone(), site_filter.clone(), &mut report)
+      end
+      # checks
+      for needle in expect_callees do
+        let found = dev_has_callee_containing(mir.clone(), needle.clone())
+        report = report + "  DEV_CHECK " + tag.clone() + " callee_contains[" + needle.clone() + "]=" + found.to_string() + "\n"
+        if !found then
+          status = 1
+        end
+      end
+      if reject_ambiguous then
+        var bad = false
+        for merr in mono_errs do
+          if merr.contains("ambiguous") || merr.contains("no impl of") then
+            bad = true
+            report = report + "  DEV_CHECK " + tag.clone() + " REJECTED_ERR " + merr.clone() + "\n"
+          end
+        end
+        if bad then
+          status = 1
+        end
+      end
+      if merged_bare.len() > 0 then
+        let merged = dev_count_merged_calls(mir.clone(), merged_bare.clone(), merged_min_args)
+        report = report + "  DEV_CHECK " + tag.clone() + " merged_calls[" + merged_bare.clone() + "]=" + merged.to_string() + "\n"
+        if merged < 1 then
+          status = 1
+        end
+      end
+      if min_instances > 0 then
+        report = report + "  DEV_CHECK " + tag.clone() + " instances=" + cache.instances.len().to_string() + " (min " + min_instances.to_string() + ")\n"
+        if cache.instances.len() < min_instances then
+          status = 1
+        end
       end
       let post_rows = verify_mir(mir.clone())
-      report = report + "DEV_VERIFY_POST rows=" + post_rows.len().to_string() + "\n"
-      var poi = 0
-      while poi < post_rows.len() do
-        report = report + "  DEV_POST_ROW " + post_rows[poi].clone() + "\n"
-        poi = poi + 1
+      if legacy then
+        report = report + "DEV_VERIFY_POST rows=" + post_rows.len().to_string() + "\n"
+      else
+        report = report + "DEV_CASE " + tag.clone() + " verify_post_rows=" + post_rows.len().to_string() + "\n"
       end
-      let _ = write_file("build/devirt_probe.txt", report.clone())
-      0
-    when Result::Err(e) then
-      report = report + "DEV_LOWER failed=" + e.clone() + "\n"
-      let _ = write_file("build/devirt_probe.txt", report.clone())
-      1
+      if post_rows.len() > 0 then
+        status = 1
+        var poi = 0
+        while poi < post_rows.len() do
+          report = report + "  DEV_POST_ROW " + tag.clone() + " " + post_rows[poi].clone() + "\n"
+          poi = poi + 1
+        end
+      end
+      if status == 0 then
+        report = report + "DEV_CASE " + tag.clone() + " PASS\n"
+      else
+        report = report + "DEV_CASE " + tag.clone() + " FAIL\n"
+      end
+      status
     end
-  when Result::Err(errs) then
-    report = report + "DEV_RESOLVE_FAILED=" + errs.len().to_string() + "\n"
-    let _ = write_file("build/devirt_probe.txt", report.clone())
-    2
   end
+end
+
+pub def main() -> Int
+  var report = ""
+  var status = 0
+  # Case 1 (legacy fixture): the Adder contract suite. The tg_devirt lane
+  # greps this case's exact DEV_MONO ok / DEV_VERIFY_POST rows=0 lines.
+  if dev_run_case(DEV_PROBE_SRC.clone(), "main", true, true, "", Vec::new(), false, "", 0, 0, &mut report) != 0 then
+    status = 1
+  end
+  let _ = write_file("build/devirt_probe.txt", report.clone())
+  # Case 2 (P0-4): same method name from two traits on one type.
+  var expect_a: Vec[String] = Vec::new()
+  expect_a.push("Both__step".to_string())
+  expect_a.push("Other__step".to_string())
+  if dev_run_case(DEV_FIXTURE_A_SRC.clone(), "same_name_traits", false, false, "fn$", expect_a, true, "", 0, 0, &mut report) != 0 then
+    status = 1
+  end
+  let _ = write_file("build/devirt_probe.txt", report.clone())
+  # Case 3 (P0-5): method-level generic solved from an argument.
+  var expect_b: Vec[String] = Vec::new()
+  if dev_run_case(DEV_FIXTURE_B_SRC.clone(), "method_level_generic", false, false, "fn$", expect_b, true, "apply", 2, 0, &mut report) != 0 then
+    status = 1
+  end
+  let _ = write_file("build/devirt_probe.txt", report.clone())
+  # Case 4 (P1-1): 128 nested adapter layers (one devirt round per layer).
+  let nested_src = dev_build_nested_src(128)
+  var expect_d: Vec[String] = Vec::new()
+  expect_d.push("CA2__bump2".to_string())
+  if dev_run_case(nested_src, "nested_adapters_128", false, false, "fn$", expect_d, true, "", 0, 128, &mut report) != 0 then
+    status = 1
+  end
+  let _ = write_file("build/devirt_probe.txt", report.clone())
+  status
 end

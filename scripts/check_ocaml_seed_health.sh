@@ -83,6 +83,17 @@ EVIDENCE_TIMEOUT_S=1920
 TG_INFER_TIMEOUT_S=900
 TG_INFER_MERGED_TIMEOUT_S=1200
 
+# Devirt-probe calibration (the tg_devirt probe: the devirtprobe_mini
+# closure carries mir.tg + mono.tg, so its closure front end is larger
+# than the identity probe's). Provisional: the lane is currently red on
+# the closure's front-end gate (the probe VM has not run yet, so no
+# green-path measurement exists); the front-end-only wall measured 429 s
+# under concurrent host load (299 s CPU) on 2026-09-22, above the generic
+# 420 s bound. Cap 900 s (the same provisional bound as tg_infer's closure
+# build); re-measure once the closure is green. A cap is a bound, never a
+# skip.
+TG_DEVIRT_TIMEOUT_S=900
+
 if [ -f scripts/check_ocaml_toolchain.sh ]; then
   scripts/check_ocaml_toolchain.sh
 fi
@@ -143,6 +154,9 @@ for name in $NAMES; do
   fi
   if [ "$name" = "tg_infer" ]; then
     SC_TIMEOUT_S="$TG_INFER_TIMEOUT_S"
+  fi
+  if [ "$name" = "tg_devirt" ]; then
+    SC_TIMEOUT_S="$TG_DEVIRT_TIMEOUT_S"
   fi
   if ! timeout "$SC_TIMEOUT_S" "_build/default/selfcheck/${name}.exe" >"/tmp/ocaml_sc_${name}.out" 2>&1; then
     echo "check_ocaml_seed_health: FAIL — selfcheck ${name} exited non-zero"

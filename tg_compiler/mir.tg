@@ -60,7 +60,11 @@ use tg_compiler::types::{
   # enumerator the concreteness walk recurses.
   generic_param_alias_table, rewrite_generic_param_aliases_in_type,
   is_pointer_width_int_pair, type_payload_children,
-  MAX_FIXED_ARRAY_ELEMS
+  MAX_FIXED_ARRAY_ELEMS,
+  # (P0-4/P0-5) the checker's bound-contract identity carriers: the
+  # per-call contract records and the per-impl-method contract identities
+  # (the tokens the devirtualization candidate index keys by).
+  ContractCallRecord, ImplContractMethod, is_contract_method_token
 }
 use tg_compiler::ids::{
   FieldId, VariantId, DefId, DefKind, CallableId, InstanceId, ModuleId,
@@ -85,6 +89,17 @@ use tg_compiler::stable_ids::{
   StableDeclId, StableHirNodeId, StableMirNodeId, StableMirBlockId, MirNodeOrigin,
   StructuralInstanceId,
   stable_decl_of_key, stable_hir_node_id_of, stable_hir_node_identity_text,
+  # (P1-2) the PRE-LOWERING persistent HIR-node view: the store-backed
+  # StableHirNodeId of every source node the pre-lowering stamp assigned,
+  # keyed by the parse locator (origin_node_seq). The lowering's
+  # mir_origin_hir_node consults it so every source-derived MIR node is
+  # born with MirNodeOrigin::FromHir(persistent_hir_id, ...); a miss keeps
+  # the documented sequence-derived bootstrap fallback.
+  HirNodeLineageView, hir_node_lineage_view_new, hir_node_lineage_view_get,
+  hir_node_lineage_view_bind,
+  HirNodeLineageId, stable_hir_lineage_id_of,
+  stable_hir_node_id_with_lineage,
+  StableSemanticNodeId, stable_semantic_node_id_of_origin, stable_semantic_node_key_text,
   stable_mir_node_id_of_source, stable_mir_node_id_of_generated,
   stable_mir_node_id_of_source_sibling, stable_mir_node_id_of_derived,
   stable_mir_node_id_of_compiler_generated,
@@ -198,6 +213,16 @@ struct MirProgram
   # emission label through this table — the DefId is the identity, the name
   # is only the symbol-mangling boundary.
   method_names_by_def: Map[Int, String] = Map::new()
+  # (instance labels): mir_instance_identity_key(def_id_numeric(def),
+  # args) -> the SPECIALIZED instance's emission label. Filled by the
+  # monomorphizer (one row per specialized instance). Codegen's MirDeinit
+  # FINALIZER resolution reads it: a generic Drop impl's finalizer is only
+  # ever the concrete INSTANCE — the template is a declaration and is never
+  # emitted — and the InstanceId payload carries no rendered name, so the
+  # identity-keyed row is the only bridge from the semantic payload to the
+  # emitted label. A finalizer identity without a row is a non-generic
+  # finalizer (the template itself is the emitted function).
+  instance_labels: Map[String, String] = Map::new()
   # The engine snapshot TypeEnv (the typed
   # program's serialized engine tables — engine_snapshot_env, built once
   # per lowering and repaired for aliases) carried on the PROGRAM so the
@@ -430,6 +455,15 @@ struct MirFunction
   # @irq_safe/@interrupt CLAIM records
   # (TypeEnv.fn_class_claims) for the lowered function.
   callable: Option[CallableId] = Option::None
+  # (P0-4) the template's CONTRACT identity when it is a trait-impl method
+  # (None for inherent methods, free functions and IR-synthesized
+  # functions): the contract method token + the template's binder split.
+  # Stamped at lowering from the checker's typed_impl_contract_methods
+  # (keyed by the method's resolver DefId); the monomorphizer's
+  # devirtualization candidate index keys by contract_method instead of
+  # the bare method name, so candidates from a different trait that
+  # happens to declare the same method name are never selected.
+  contract_identity: Option[ImplContractMethod] = Option::None
   span: Span
 end
 
@@ -438,6 +472,13 @@ struct MirStatic
   ty: Type
   init: Option[MirOperand]
   is_mut: Bool
+  # The resolver DefId the static's MirStaticRef / MirStaticAddr reference
+  # constants carry (static_def_ids — the module_symbols identity). The
+  # backend's static label table pairs reference -> static through THIS id;
+  # pairing by value TYPE alone is ambiguous the moment two statics share a
+  # type (`static label table: reference type U8 is claimed by 2 DefId(s)
+  # and matched by 2 static(s)`). Option::None only for hand-built MIR.
+  def_id: Option[DefId]
 end
 
 struct MirTypeDef
@@ -1038,6 +1079,12 @@ def duplicate_function(func: MirFunction) -> MirFunction
     attr_cold: func.attr_cold,
     attr_interrupt: func.attr_interrupt,
     fp_fast: func.fp_fast,
+    callable: func.callable.clone(),
+    # (P0-4) the template's CONTRACT identity — an enumerated field, so a
+    # clone that omitted it would silently strip every trait-impl method's
+    # devirtualization identity (the candidate index then sees no
+    # templates). Keep in lockstep with MirFunction.
+    contract_identity: func.contract_identity.clone(),
     span: func.span.clone()
   }
 end
@@ -1132,7 +1179,8 @@ impl Clone for MirStatic
       name: self.name.clone(),
       ty: self.ty.clone(),
       init: self.init.clone(),
-      is_mut: self.is_mut
+      is_mut: self.is_mut,
+      def_id: self.def_id.clone()
     }
   end
 end
@@ -1786,6 +1834,15 @@ struct MirBuilder
   # start_function. The FromHir provenance stamps each node's ordinal
   # within its (HIR node, role) pair from here.
   origin_sibling_counts: Map[String, Int] = Map::new()
+  # (P1-2) PRE-LOWERING PERSISTENT HIR IDENTITY: the view the finalize
+  # pipeline stamps BEFORE lowering (declaration + HIR lineage identities
+  # through the shared DeclLineageStore). mir_origin_hir_node consults it,
+  # so every source-derived node's FromHir provenance carries the
+  # STORE-BACKED StableHirNodeId (persistent owner identity | lineage
+  # number) instead of the post-hoc sequence-derived record. The empty
+  # default (kernel/bootstrap/dump-abi and hand-built MIR) keeps the
+  # documented stable_hir_node_id_of fallback.
+  hir_lineage_view: HirNodeLineageView = hir_node_lineage_view_new()
   # The explicit generated-origin ANCHOR (the origin-set) for the next
   # generated node; "" derives it from the current HIR node / function key.
   origin_generated_anchor: String = ""
@@ -2017,6 +2074,31 @@ struct MirBuilder
   # synthesized/unsolved calls — mir_call_instance fills the instance's
   # args from this map; absent entries keep empty args.
   call_instances: Map[Int, Vec[GenericArg]]
+  # (P0-4/P0-5) the checker's bound-receiver contract-call records (call
+  # expr node id -> ContractCallRecord: the contract method token + the
+  # already-solved method-level values). The method-call lowering stamps
+  # the token into the callee operand's InstanceId (mir's
+  # contract_call_instance) and the monomorphizer's devirtualization wave
+  # consumes it — a call with no record carries no contract identity and
+  # is never resolved by a method-name guess.
+  contract_calls: Map[Int, ContractCallRecord] = Map::new()
+  # (P0-4) the checker's trait-impl method contract identities
+  # ("trait::method" source key -> ImplContractMethod — source-keyed, not
+  # DefId-keyed: two traits with the same method name on one type have
+  # colliding method DefIds under the resolver's first-wins registration).
+  # The impl method lowering stamps the record onto the template's
+  # MirFunction (with the local binder split); the monomorphizer's
+  # candidate index reads the stamp.
+  trait_contract_methods: Map[String, ImplContractMethod] = Map::new()
+  # (P0-4) source keys whose contract identity conflicted (distinct trait
+  # declarations sharing a bare name): no template gets a stamp from a
+  # poisoned key (fail closed).
+  trait_contract_conflicts: Set[String] = Set::new()
+  # (P0-4) the impl-method contract identity of the function currently
+  # being lowered (set by the ItemImpl arm before lower_function, cleared
+  # after; stamped onto the MirFunction alongside current_callable).
+  # Inherent/struct methods and IR-synthesized functions carry None.
+  current_contract_identity: Option[ImplContractMethod] = Option::None
  # (IntrinsicId through MirCall): the checker's per-call semantic
   # intrinsic classification (TypedProgram.typed_intrinsics — call expr
   # node id -> IntrinsicId, attached at call-recording time). The lowering
@@ -2224,7 +2306,7 @@ struct PendingClosure
   # checker's resolved types; never TypeExpr). The closure function's MIR
   # parameters are built from this record.
   param_types: Vec[Type]
-  captures: Vec<String>
+  captures: Vec[String]
   capture_types: Vec[Type]
   body: Expr
   ret_type: Type
@@ -2324,6 +2406,10 @@ def builder_new() -> MirBuilder
     item_defs: Map::new(),
     call_def_ids: Map::new(),
     call_instances: Map::new(),
+    contract_calls: Map::new(),
+    trait_contract_methods: Map::new(),
+    trait_contract_conflicts: Set::new(),
+    current_contract_identity: Option::None,
     typed_intrinsics: Map::new(),
     ident_resolutions: Map::new(),
     const_param_reads: Map::new(),
@@ -3014,6 +3100,37 @@ def mir_type_identity_key(ty: Type) -> String
   when Type::Dyn(id) then "Dyn#" + id.id.to_string()
   when Type::Error then "Error"
   end  end
+end
+
+# The mir-level render of ONE generic argument (the identity vocabulary of
+# mir_instance_identity_key): a Type row reuses mir_type_identity_key (the
+# same concrete render the type tables use); a const row renders its value /
+# parameter / symbolic tree numerically. Identity only — never a symbol.
+def mir_generic_arg_identity_text(arg: GenericArg) -> String
+  match arg
+  when GenericArg::Type(ty) then mir_type_identity_key(&ty)
+  when GenericArg::Const(cv) then
+    match cv
+    when ConstValue::Value(v) then "c" + v.to_string()
+    when ConstValue::Param(gpid) then "p" + generic_param_id_numeric(&gpid).to_string()
+    when ConstValue::Sym(tree) then "s" + const_sym_tree_render_numeric(&tree)
+    end
+  end
+end
+
+# The identity text of a MIR InstanceId — def_id_numeric(def) plus every
+# generic-argument row — the shared key between the monomorphizer's
+# instance-label registration (MirProgram.instance_labels) and codegen's
+# MirDeinit finalizer resolution. A pure render: both sides compute the
+# same text from the same payload, so no string stage is re-introduced as
+# a semantic key (the label VALUE is a symbol name; this KEY is the
+# identity).
+pub def mir_instance_identity_key(instance: InstanceId) -> String
+  var out = def_id_numeric(&instance.def.def).to_string()
+  for a in instance.args do
+    out = out + "|" + mir_generic_arg_identity_text(a)
+  end
+  out
 end
 
 # Compute (and cache) the deinit plan for every CONCRETE plan-shape carrier
@@ -5405,8 +5522,18 @@ def mir_origin_function_decl(b: MirBuilder) -> StableDeclId
 end
 
 # The HIR node record of a node seq under the current function's owner.
+# (P1-2) The PRE-LOWERING persistent view wins: the parse locator seq hit
+# carries the STORE-BACKED StableHirNodeId (persistent owner declaration +
+# lineage number), so the FromHir provenance every source-derived node is
+# born with is the persistent identity — never a post-hoc sequence-derived
+# one. A miss (no view: kernel/bootstrap/dump-abi paths; or a node the
+# pre-lowering walk did not see: closures, imported dependency bodies,
+# hand-built MIR) keeps the documented synthetic bootstrap fallback.
 def mir_origin_hir_node(b: MirBuilder, node_seq: Int) -> StableHirNodeId
-  stable_hir_node_id_of(mir_origin_function_decl(b), node_seq)
+  match hir_node_lineage_view_get(b.hir_lineage_view, node_seq)
+  when Option::Some(id) then id
+  when Option::None then stable_hir_node_id_of(mir_origin_function_decl(b), node_seq)
+  end
 end
 
 # The SOURCE provenance variant of the current HIR context and lowering
@@ -5770,8 +5897,64 @@ end
 # pending-closure body), the boundary performs an explicit DEEP clone
 # through the pointee's own Clone surface, never a move out of the
 # borrowed tree.
-def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProgram, String]
+# The EMPTY MirProgram (the pre-lowering identity views' build context):
+# the declaration/HIR stamping needs only the typed tables, so the context
+# is built before any lowering exists.
+pub def mir_program_empty() -> MirProgram
+  MirProgram {
+    functions: Vec::new(),
+    statics: Vec::new(),
+    types: Vec::new(),
+    lang_items: mir_origin_lane_lang_items()
+  }
+end
+
+# Collect every Type::Adt TypeId a MIR type mentions (deduplicated through
+# `seen`, in first-occurrence order). The completeness walk of lower_program's
+# post-lowering type-table pass: every mentioned Adt id must have a
+# MirTypeDef because every name-keyed layout authority is def-driven.
+def collect_adt_type_ids(ty: Type, inout out: Vec[Int], inout seen: Set[Int]) -> Unit
+  match ty
+  when Type::Adt(tid, args) then
+    if !seen.contains(&tid.id) then
+      seen.insert(tid.id)
+      out.push(tid.id)
+    end
+    for a in args do
+      collect_adt_type_ids(a, out, seen)
+    end
+  when Type::Tuple(fields) then
+    for f in fields do
+      collect_adt_type_ids(f, out, seen)
+    end
+  when Type::FixedArray(elem, _) then collect_adt_type_ids(elem, out, seen)
+  when Type::RefInternal(inner, _) then collect_adt_type_ids(inner, out, seen)
+  when Type::Ptr(inner) then collect_adt_type_ids(inner, out, seen)
+  when Type::PtrMut(inner) then collect_adt_type_ids(inner, out, seen)
+  when Type::Effect(_, inner) then collect_adt_type_ids(inner, out, seen)
+  when Type::FnPtr(params, ret, _) then
+    for p in params do
+      collect_adt_type_ids(p.ty.clone(), out, seen)
+    end
+    collect_adt_type_ids(ret, out, seen)
+  when Type::Closure(_, params, ret, captures, _) then
+    for p in params do
+      collect_adt_type_ids(p.ty.clone(), out, seen)
+    end
+    collect_adt_type_ids(ret, out, seen)
+    collect_adt_type_ids(captures, out, seen)
+  when _ then ()
+  end  end
+end
+
+def lower_program(program: Program, analyzed: AnalyzedProgram, hir_view: HirNodeLineageView) -> Result[MirProgram, String]
   var b = builder_new()
+  # (P1-2) the pre-lowering persistent HIR-node view the caller stamped
+  # BEFORE this call (declaration + HIR lineage identities through the
+  # shared store): every source-derived node below is born with its
+  # store-backed FromHir provenance. The empty default is the documented
+  # bootstrap fallback.
+  b.hir_lineage_view = hir_view
  # (ONE AnalyzedProgram): the semantic analysis artifact reaches this
   # builder WHOLE — the typed iteration records (analyzed.context.
   # typed_iterations), the ONE TypedCFG with its serialized CleanupEdge
@@ -5830,11 +6013,16 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
   b.typed_type_variants = analyzed.typed.type_variants.clone()
   b.call_def_ids = analyzed.typed.call_targets.clone()
   b.call_instances = analyzed.typed.call_instances.clone()
- # (IntrinsicId through MirCall): the  # (IntrinsicId through MirCall): the checker's per-call semantic
+  b.contract_calls = analyzed.typed.contract_calls.clone()
+  b.trait_contract_methods = analyzed.typed.trait_contract_methods.clone()
+  b.trait_contract_conflicts = analyzed.typed.trait_contract_conflicts.clone()
+ # (IntrinsicId through MirCall): the checker's per-call semantic
   # classification - the stamping source for the SOURCE MirCall sites
   # (lr_call / lr_static_path_call / the method-call arm). The kernel's
   # TypedProgram carries no typed_intrinsics record, so the builder's
-  # table stays empty and codegen falls back to the semantic router.
+  # table stays empty and codegen falls back to the semantic router (whose
+  # rejected-surface collisions are deferred to the compiled method bodies
+  # in codegen_call; see intrinsic_id_is_rejected_surface).
 
   b.ident_resolutions = analyzed.typed.ident_resolutions.clone()
   b.const_param_reads = analyzed.typed.const_param_reads.clone()
@@ -6344,7 +6532,6 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
     end
   end
 
-  eprintln("[lprog] total_items=" + total_items.to_string() + " fn_items=" + fn_items.to_string() + " impl_items=" + impl_items.to_string())
   var dbg_skipped = 0
   var dbg_none = 0
 
@@ -6390,6 +6577,7 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
  # the SEMANTIC callable identity for the function-end cleanup
       # lookup (the checker's item_callable mirror).
       b.current_callable = mir_fn_callable(b, item_idx2)
+      b.current_contract_identity = Option::None
       b.current_closure_node = Option::None
  # the MirFunction's emission name is the DefId-derived base
       # (fn_owner_key_of_def "<module path>::<index>::<kind>") — the
@@ -6449,6 +6637,7 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
       end
       b.current_fn_key = ""
       b.current_callable = Option::None
+      b.current_contract_identity = Option::None
       b.current_closure_node = Option::None
       # (P1-18): clear the pending hint state — an impl method (whose
       # declaration cannot carry item attributes) or IR-synthesized
@@ -6563,9 +6752,37 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
           span: method.span
         }
         b.current_fn_key = mir_item_owner_key(b, item_idx2, method_idx)
- # the SEMANTIC callable identity for the function-end cleanup
+  # the SEMANTIC callable identity for the function-end cleanup
         # lookup (the checker's item_method_callable mirror).
         b.current_callable = mir_item_callable(b, item_idx2, method_idx)
+        # (P0-4) the template's CONTRACT identity — the checker's record
+        # keyed by the SOURCE identity "trait::method" (the trait name is
+        # part of the key, so same-named methods of different traits stay
+        # distinct even when the resolver's first-wins per-type
+        # registration gives them one DefId). The binder split is computed
+        # LOCALLY from the declaration (the shared source key cannot carry
+        # per-impl counts): leading impl binders, trailing method binders.
+        # A poisoned key (a bare-name trait collision) stamps nothing —
+        # the template is never a candidate (fail closed).
+        var impl_method_cid: Option[ImplContractMethod] = Option::None
+        match impl_decl.trait_name
+        when Option::Some(tn) then
+          let source_key = tn.clone() + "::" + method.name.clone()
+          if !b.trait_contract_conflicts.contains(&source_key) then
+            match b.trait_contract_methods.get(source_key)
+            when Option::Some(rec) then
+              impl_method_cid = Option::Some(ImplContractMethod {
+                contract_method: rec.contract_method.clone(),
+                fallback_did: rec.fallback_did.clone(),
+                impl_param_count: impl_decl.generic_params.len(),
+                method_param_count: method.generic_params.len()
+              })
+            when Option::None then ()
+            end
+          end
+        when Option::None then ()
+        end
+        b.current_contract_identity = impl_method_cid
         b.current_closure_node = Option::None
         match lower_function(&mut b, &renamed_method, renamed_method.name.clone())
         when Option::Some(mir_fn) then
@@ -6594,6 +6811,7 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
         end
         b.current_fn_key = ""
         b.current_callable = Option::None
+        b.current_contract_identity = Option::None
         b.current_closure_node = Option::None
         method_idx = method_idx + 1
       end
@@ -6671,6 +6889,7 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
  # the SEMANTIC callable identity for the function-end cleanup
         # lookup (the checker's item_method_callable mirror).
         b.current_callable = mir_item_callable(b, item_idx2, sm_idx)
+        b.current_contract_identity = Option::None
         b.current_closure_node = Option::None
         match lower_function(&mut b, &renamed_method, renamed_method.name.clone())
         when Option::Some(mir_fn) then
@@ -6680,7 +6899,7 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
         end
         b.current_fn_key = ""
         b.current_callable = Option::None
-        b.current_closure_node = Option::None
+        b.current_contract_identity = Option::None
         sm_idx = sm_idx + 1
       end
     when ItemKind::ItemExternBlock(ext) then
@@ -6694,8 +6913,10 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
           when Option::Some(abi) then abi.clone()
           when Option::None then "C"
           end
-          let extern_fn = lower_extern_fn(&mut b, &ef, abi_tag)
-          functions.push(extern_fn)
+          match lower_extern_fn(&mut b, &ef, abi_tag)
+          when Option::Some(extern_fn) then functions.push(extern_fn)
+          when Option::None then ()
+          end
         when ExternItem::Static(es) then
  # the extern static's DECLARED type comes from the typed
           # table (the checker's resolved declaration record — never
@@ -6723,7 +6944,6 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
     item_idx2 = item_idx2 + 1
   end
   
-  eprintln("[lprog] lowered_fns=" + functions.len().to_string() + " skipped=" + dbg_skipped.to_string() + " none=" + dbg_none.to_string())
 
   # Emit any closures that were queued during lowering
  # build the map/set dispatch metadata from the method tables —
@@ -6821,6 +7041,109 @@ def lower_program(program: Program, analyzed: AnalyzedProgram) -> Result[MirProg
         layout: layout_attrs_plain(span_dummy())
       })
     end
+  end
+
+  # PASS 3 — the type-table COMPLETENESS pass (the seed's canonical_defs
+  # mirror, generalized to EVERY mentioned id): every Type::Adt TypeId the
+  # finished program mentions — function signatures/locals (including the
+  # just-appended drop-glue bodies), static types, and the defs' own
+  # fields/variants — must have a MirTypeDef. Every name-keyed layout and
+  # classification authority is def-driven (lookup_type_name → type_repr's
+  # builtin rows, container_repr_for_name / container_field_offset,
+  # is_slice_view_tid, engine_has_type_def), so a mention of a def-less id
+  # (the checker registers builtin nominals — Array, Any, ... — with NO
+  # source declaration for PASS 1 to lower, and a cfg-eliminated item's
+  # type can still be mentioned) would fail closed in codegen's
+  # concrete-instance layout on a perfectly concrete handle/view type
+  # ("ICE: unresolved type reached codegen: type#<id>"). Emit one def per
+  # uncovered mentioned id: the checker's registered field/variant shape
+  # when the typed tables carry one, else the empty Struct form the Opaque
+  # registration declares. Name, binders (and the enum discriminants) come
+  # from the typed tables — no id is ever minted here. The UnsafeSlice
+  # synthesis above ran first; this pass covers every remaining id (it is
+  # a no-op when the item-backed table is already complete).
+  var all_tids: Vec[Int] = Vec::new()
+  var all_tids_seen: Set[Int] = Set::new()
+  for fnc3 in result.functions do
+    collect_adt_type_ids(fnc3.ret_type.clone(), &mut all_tids, &mut all_tids_seen)
+    for pm3 in fnc3.params do
+      collect_adt_type_ids(pm3.ty.clone(), &mut all_tids, &mut all_tids_seen)
+    end
+    for lc3 in fnc3.locals do
+      collect_adt_type_ids(lc3.ty.clone(), &mut all_tids, &mut all_tids_seen)
+    end
+  end
+  for stc3 in result.statics do
+    collect_adt_type_ids(stc3.ty.clone(), &mut all_tids, &mut all_tids_seen)
+  end
+  for tdd3 in result.types do
+    match tdd3.kind
+    when MirTypeDefKind::Struct(flds3) then
+      for f3 in flds3 do
+        collect_adt_type_ids(f3.ty.clone(), &mut all_tids, &mut all_tids_seen)
+      end
+    when MirTypeDefKind::Enum(vars3) then
+      for v3 in vars3 do
+        for fty3 in v3.fields do
+          collect_adt_type_ids(fty3.clone(), &mut all_tids, &mut all_tids_seen)
+        end
+      end
+    end
+  end
+  var t3i = 0
+  while t3i < all_tids.len() do
+    let mid = all_tids[t3i]
+    var mid_covered = false
+    for tdd4 in result.types do
+      if tdd4.id.id == mid then mid_covered = true end
+    end
+    if !mid_covered then
+      let mid_name = match b.typed_type_names.get(mid)
+      when Option::Some(nm3) then nm3.clone()
+      when Option::None then "unknown_" + mid.to_string()
+      end
+      var mid_kind = MirTypeDefKind::Struct(Vec::new())
+      match b.typed_type_fields.get(mid)
+      when Option::Some(tfs3) then
+        var mid_fields = Vec::new()
+        for (fname3, fty3b) in tfs3 do
+          mid_fields.push(MirFieldDef {
+            name: fname3.clone(),
+            ty: fty3b.clone()
+          })
+        end
+        mid_kind = MirTypeDefKind::Struct(mid_fields)
+      when Option::None then
+        match b.typed_type_variants.get(mid)
+        when Option::Some(tvs3) then
+          var mid_variants = Vec::new()
+          var mvi3 = 0
+          while mvi3 < tvs3.len() do
+            mid_variants.push(MirVariantDef {
+              name: tvs3[mvi3].0.clone(),
+              discriminant: tvs3[mvi3].2,
+              fields: tvs3[mvi3].1.clone()
+            })
+            mvi3 = mvi3 + 1
+          end
+          mid_kind = MirTypeDefKind::Enum(mid_variants)
+        when Option::None then ()
+        end
+      end
+      var mid_params = Vec::new()
+      match b.typed_type_params.get(mid)
+      when Option::Some(gids3) then mid_params = gids3.clone()
+      when Option::None then ()
+      end
+      result.types.push(MirTypeDef {
+        id: TypeId { id: mid },
+        name: mid_name,
+        kind: mid_kind,
+        generic_params: mid_params,
+        layout: layout_attrs_plain(span_dummy())
+      })
+    end
+    t3i = t3i + 1
   end
 
   # Search MIR functions for cmd_compile
@@ -6965,6 +7288,10 @@ def lower_function(inout b: MirBuilder, f: FunctionDecl, emission_name: String) 
   match b.current_fn
   when Option::Some(fn_ref_c) then
     fn_ref_c.callable = b.current_callable.clone()
+    # (P0-4) the template's CONTRACT identity — the checker's per-impl-method
+    # record (contract method token + binder split) for a trait-impl method;
+    # None everywhere else. The devirtualization candidate index keys by it.
+    fn_ref_c.contract_identity = b.current_contract_identity.clone()
     b.current_fn = Option::Some(fn_ref_c)
   when Option::None then ()
   end
@@ -7500,11 +7827,16 @@ def lower_static(inout b: MirBuilder, s: StaticDecl) -> MirStatic
   end
   let init_val = lower_static_init_operand(b, &s.value, resolved_ty.clone())
 
+  # The static's resolver DefId (the same identity its reference constants
+  # carry) — the backend's label table pairs by this id.
+  let st_def_id = b.static_def_ids.get(s.name.clone())
+
   MirStatic {
     name: s.name,
     ty: resolved_ty,
     init: init_val,
-    is_mut: s.is_mut
+    is_mut: s.is_mut,
+    def_id: st_def_id
   }
 end
 
@@ -7521,15 +7853,41 @@ def lower_const(inout b: MirBuilder, c: ConstDecl) -> MirStatic
   end
   let init_val = lower_static_init_operand(b, &c.value, resolved_ty.clone())
 
+  # The const's resolver DefId (lowered as a static; the same identity its
+  # reference constants carry).
+  let c_def_id = b.static_def_ids.get(c.name.clone())
+
   MirStatic {
     name: c.name,
     ty: resolved_ty,
     init: init_val,
-    is_mut: false
+    is_mut: false,
+    def_id: c_def_id
   }
 end
 
-def lower_extern_fn(inout b: MirBuilder, ef: ExternFn, abi: String) -> MirFunction
+def lower_extern_fn(inout b: MirBuilder, ef: ExternFn, abi: String) -> Option[MirFunction]
+  # (generic externs — the runtime intrinsic surfaces): every generic
+  # `__intrinsic_*` extern declaration in the kernel sources is a
+  # compiler/runtime intrinsic (`__intrinsic_array_pop[T]`,
+  # `__intrinsic_set_drain_one[T]`, `__intrinsic_try_invoke[T]`, ...).
+  # Their calls are resolved BY NAME at codegen (the runtime intrinsic
+  # router) and by the verifier's intrinsic-name rule; they are never
+  # specialized. Registering a template record for them contradicts the
+  # ZERO-INFERENCE inventory ("none of these names is a generic MIR
+  # function"): the record's signature carries the declaration's generic
+  # parameters, so the monomorphizer classified calls to it as generic and
+  # failed closed twice — an IR-synthesized call without an instance
+  # payload (the drain/destroy glue), and a source call whose solved
+  # instance was then enqueued against a template with no declaration-order
+  # generic ids. The other generic externs (the `size_of[T]`/`align_of[T]`
+  # type queries) keep their records: their declared signature is
+  # Param-free, so the monomorphizer classifies them non-generic (no
+  # instance is ever demanded), and the verifier's lowered-name rule needs
+  # the record for the synthesized query calls.
+  if ef.generic_params.len() > 0 && ef.name.starts_with("__intrinsic_") then
+    return Option::None
+  end
   # Create an extern function declaration.
   # This has no body — codegen will emit a relocation against the symbol name.
  # (audit P1-13 — ownership metadata across the extern boundary): the
@@ -7595,7 +7953,7 @@ def lower_extern_fn(inout b: MirBuilder, ef: ExternFn, abi: String) -> MirFuncti
     ef.name.clone()
   end
   
-  MirFunction {
+  Option::Some(MirFunction {
     name: mangled_name,
     params: params.clone(),
     ret_type: ret_type,
@@ -7614,7 +7972,7 @@ def lower_extern_fn(inout b: MirBuilder, ef: ExternFn, abi: String) -> MirFuncti
     extern_abi: abi,
     contracts: Vec::new(),
     span: ef.span
-  }
+  })
 end
 
 def lower_extern_static(b: MirBuilder, es: ExternStatic) -> MirStatic
@@ -7632,7 +7990,8 @@ def lower_extern_static(b: MirBuilder, es: ExternStatic) -> MirStatic
     name: es.name.clone(),
     ty: st_ty,
     init: Option::None,
-    is_mut: es.is_mut
+    is_mut: es.is_mut,
+    def_id: b.static_def_ids.get(es.name.clone())
   }
 end
 
@@ -8343,8 +8702,22 @@ def lower_call_arg(inout b: MirBuilder, callee: Option[Expr], callee_name: Optio
     when _ then ()
     end
   elsif effect == AccessEffect::Consume then
+    # (the seed's `Sink + Copy -> Consume / Copy` rule): a SINK argument of
+    # a trivially-copyable place is the by-value BITCOPY — the caller's
+    # place stays live (the callee received a copy of the bits). Passing
+    # the place itself (the former unconditional Place form) recorded a
+    # real ownership transfer in the moved-lattice, so the caller's own
+    # later read of the same local flagged as a use-after-move
+    # (Map::insert(k, i) followed by `i = i + 1` — the OrderedMap::remove
+    # class). A non-copyable sink source keeps the by-place transfer.
     if expr_is_place_like(arg_expr) then
-      value = MirCallValue::Place(lower_place(b, arg_expr))
+      let consume_place = lower_place(b, arg_expr)
+      let consume_pty = mir_place_type(consume_place.clone(), b)
+      if verifier_type_trivially_copyable(&mut b.engine_env, consume_pty) then
+        value = MirCallValue::Value(operand_copy(consume_place))
+      else
+        value = MirCallValue::Place(consume_place)
+      end
     else
       value = MirCallValue::Value(mir_lower_arg_value(b, arg_expr, arg_expect.clone(), span))
     end
@@ -8431,6 +8804,13 @@ def mir_builtin_intrinsic_label(mangled: String) -> String
   when Option::None then ()
   end
   if prefix == "Vec" || prefix == "Array" || prefix == "UnsafeSlice" then
+    # the `__intrinsic_`-prefixed spelling for len: `array_len` is a REAL
+    # generic source function in std/collections.tg — the name-only label
+    # would be re-mapped by the emission table (fn_emission_by_source) to
+    # its emission name and the monomorphizer would then demand an
+    # instance for a call codegen inlines.
+    if bare == "len" then return "__intrinsic_array_len" end
+    if bare == "is_empty" then return "array_is_empty" end
     if bare == "resize" then return "array_resize" end
     if bare == "truncate" then return "array_truncate" end
     if bare == "as_ptr_address" then return "array_as_ptr_address" end
@@ -8515,7 +8895,7 @@ def mir_current_fn_generic_params(b: MirBuilder) -> Vec[GenericParamId]
   end  end
 end
 
-def mir_fn_operand_with_instance(b: MirBuilder, fn_name: String, instance: Option<InstanceId>) -> MirOperand
+def mir_fn_operand_with_instance(b: MirBuilder, fn_name: String, instance: Option[InstanceId]) -> MirOperand
   let emission_name = mir_callee_emission_name(b, fn_name.clone(), instance.clone())
   var ret_type = mir_lookup_fn_ret_type(b, emission_name.clone())
   # the callee's DECLARED generic params substituted with the CALL's solved
@@ -10453,7 +10833,19 @@ def lower_stmt_impl(inout b: MirBuilder, stmt: Stmt) -> Unit
         when Option::None then
           match lower_expr_to_rvalue(b, &value, stmt.span)
           when Result::Ok(rvalue) then
-            let inferred_ty = mir_source_expr_ty(b, &value)
+            # the binding's type is the CHECKER's resolved binding record
+            # (typed_local_bindings) — the typed table is the authority for
+            # every binding form, annotated or not. The initializer's
+            # expression type is the fallback only when the checker recorded
+            # no binding for the pattern. Without this an unannotated
+            # suffixed-literal binding recorded UInt in the typed table
+            # (`mut width = 0u`) while the local was typed by the
+            # initializer's defaulted Int — the display_width
+            # "int into uint / uint into int" class.
+            let inferred_ty = match typed_let_binding_type(b, &pattern)
+            when Option::Some(t) then t
+            when Option::None then mir_source_expr_ty(b, &value)
+            end
             # (the seed's ref_binding_source): a reference-typed initializer
             # that is a whole-place move/copy of another reference local
             # ALIASES the source local — the binding name resolves there and
@@ -11366,6 +11758,15 @@ def mir_literal_expect_kind(expect: Option[Type]) -> Option[Type]
 end
 
 def lower_expr_impl(inout b: MirBuilder, expr: Expr, span: Span) -> MirOperand
+  # A nil literal is the parser's NO-OP statement placeholder (`use` /
+  # `budget` statement forms) — it has no value and materializes no temp:
+  # the former temp (typed Option[Var] by the checker, finalized to
+  # Option[Never]) made every `use` statement emit a spurious
+  # "assign unit into option:never". The checker types the node Unit (its
+  # actual semantics) and the lowering returns the unit constant directly.
+  if expr_kind_name(&expr.kind) == "ExprNilLit" then
+    return operand_unit()
+  end
   var inferred_ty = mir_source_expr_ty(b, expr)
   # (literal temp alignment — the destination-kind rule): an UNSUFFIXED
   # integer literal in a concretely-typed slot takes the slot's kind for
@@ -11521,6 +11922,15 @@ end
 def lr_self_ref(inout b: MirBuilder) -> MirRvalue
   match lookup_current_local_id_by_name(b, "self")
   when Option::Some(local_id) then
+    # An inout `self`'s local HOLDS the ABI reference (the same RefInternal
+    # shape mir_local_is_inout_param reports): a value read of `self` is the
+    # read THROUGH the reference — the pointee place — exactly like lr_ident's
+    # inout-parameter arm. Copying the reference itself into a value slot
+    # (e.g. an aggregate field `LineIterator { reader: self }`) is the
+    # ref-escape / "&mut T into T" class the ref-ABI whitelist forbids.
+    if mir_local_is_inout_param(b, local_id) then
+      return move_rvalue(mir_owned_read_operand(b, MirOperand { kind: MirOperandKind::MirCopy(place_deref(place_local(local_id))) }))
+    end
     move_rvalue(operand_copy_local(local_id))
   when Option::None then
     move_rvalue(operand_unit())
@@ -12121,12 +12531,42 @@ def mir_emit_shift_rvalue(inout b: MirBuilder, mir_op: MirBinOp, result_ty: Type
     when Option::Some(count_op) then
       MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, count_op) }
     when Option::None then
-      let mask_op = mir_typed_int_operand(mask, result_ty.clone())
-      let count_local = add_temp(b, result_ty, span)
+      # The mask temp must be TYPE-HOMOGENEOUS with the count operand: the
+      # count may be a smaller/other integer kind than the shift result
+      # (`b << (i * 8)` shifts a u64 by an Int), so the masked count local
+      # takes the COUNT's kind — typing it by the result kind was the
+      # "int into u64" class (a u64-typed temp receiving an Int-typed
+      # BitAnd). The masked count then feeds the shift directly; the
+      # verifier derives a shift's type from its LEFT (result-typed)
+      # operand, so the mixed-kind count stays sound.
+      var count_ty = result_ty.clone()
+      match mir_operand_declared_type(b, &right_op)
+      when Option::Some(cty) then
+        if mir_int_type_width(&cty) > 0 then
+          count_ty = cty.clone()
+        end
+      when Option::None then ()
+      end
+      let mask_op = mir_typed_int_operand(mask, count_ty.clone())
+      let count_local = add_temp(b, count_ty, span)
       push_assign(b, place_local(count_local), MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::BitAnd, right_op, mask_op) }, span)
       MirRvalue { kind: MirRvalueKind::MirBinOp(mir_op, left_op, operand_copy_local(count_local)) }
     end
   end
+end
+
+# The declared type of a value operand — the place's result type for the
+# place forms, the constant's own type for a literal. The lowering-side
+# mirror of verifier_operand_static_type (argument alignment, literal
+# adoption and the shift-count mask all read it).
+def mir_operand_declared_type(b: MirBuilder, op: MirOperand) -> Option[Type]
+  match op.kind
+  when MirOperandKind::MirCopy(place) then Option::Some(mir_place_type(place.clone(), b))
+  when MirOperandKind::MirMovePlace(place) then Option::Some(mir_place_type(place.clone(), b))
+  when MirOperandKind::MirRead(place) then Option::Some(mir_place_type(place.clone(), b))
+  when MirOperandKind::MirConsume(place) then Option::Some(mir_place_type(place.clone(), b))
+  when MirOperandKind::MirConstant(c) then Option::Some(c.ty.clone())
+  end  end
 end
 
 # The single typed->MIR dispatch for source binary operations: plain
@@ -14542,6 +14982,22 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
         # below (its compiled std methods: Slice__len, Slice__get, ...).
         if method_named == "UnsafeSlice" || method_named == "Array" then
           resolved_method = "Vec__" + normalized_method_name.clone()
+          # (the untargeted raw-view/array method fold): when the checker
+          # recorded NO call target for this method call (the raw-view
+          # receiver's methods have no impl — UnsafeSlice's len/is_empty are
+          # compiler builtins — and Array's resolve through the impl), the
+          # call carries no instance and the monomorphizer fails closed on
+          # the Vec__name template. The runtime-routed builtin spelling
+          # (array_len/array_is_empty) names the SAME operation with no
+          # template demand; codegen resolves it against the receiver's
+          # representation (slice-view word vs heap header), which is
+          # exactly what a raw view needs.
+          if !b.call_def_ids.contains_key(&expr.node_id) then
+            let fold_label = mir_builtin_intrinsic_label(&resolved_method)
+            if fold_label != "" then
+              resolved_method = fold_label
+            end
+          end
         elsif method_named == "Option" then
           resolved_method = "Option__" + normalized_method_name.clone()
         elsif method_named == "Result" then
@@ -14724,7 +15180,29 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       # DefKind::Function) — the finalizer and registered-Drop identities
       # depend on the method names; only top-level function names migrate to
       # DefId-derived emission names.
-      let callee_op = mir_fn_operand_with_instance(b, resolved_method.clone(), mir_call_instance(b, expr.node_id))
+      let typed_call_instance = mir_call_instance(b, expr.node_id)
+      var callee_op = mir_fn_operand_with_instance(b, resolved_method.clone(), typed_call_instance.clone())
+      # (P0-4/P0-5) a bound-receiver contract call: the checker recorded
+      # the call's SEMANTIC contract identity (the contract method token)
+      # and the already-solved method-level values. The token rides the
+      # callee operand's InstanceId def and the values its args, in the
+      # contract method's declared order; the monomorphizer's
+      # devirtualization wave selects the concrete impl by the token and
+      # merges the values — never by the bare method name. Only when the
+      # call has NO registered-method instance (a registered method's
+      # solved instance is the stronger identity and stays authoritative).
+      match typed_call_instance
+      when Option::Some(_) then ()
+      when Option::None then
+        match b.contract_calls.get(expr.node_id)
+        when Option::Some(crec) then
+          callee_op = mir_fn_operand_with_instance(b, resolved_method.clone(), Option::Some(InstanceId {
+            def: CallableId { def: crec.contract_method },
+            args: crec.method_args.clone()
+          }))
+        when Option::None then ()
+        end
+      end
 
       # Lower arguments: receiver first, then explicit args. The receiver's
       # effect is the TypedCall's receiver_effect (typed_arg_idx = -1); the
@@ -14944,7 +15422,17 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       # stay owned by the borrowed tree. A non-place base materializes
       # into a temp (see lower_chain_base_place).
       let base_place = lower_chain_base_place(b, *base_expr.get(), span)
+      # The index expression's OWN expectation is the index kind (Int) —
+      # never an expectation that leaks from the enclosing site (an enum
+      # payload's element type, a struct field's type). Without the pinned
+      # expectation a literal index inherited the element expectation and
+      # lowered as its kind (`buf[0]` in a u8 payload lowered the 0 as u8),
+      # which then mismatched the Int-typed index temp — the
+      # "u8 into int" File::read_byte class.
+      let saved_idx_expect = b.pending_literal_expect.clone()
+      b.pending_literal_expect = Option::Some(Type::Int)
       let idx_op = lower_expr(b, *index_expr.get(), span)
+      b.pending_literal_expect = saved_idx_expect.clone()
       # Store index into a temp so we can reference it as a MirLocalId
       let idx_tmp = add_temp(b, Type::Int, span)
       push_stmt(b, MirStatementKind::MirAssign(place_local(idx_tmp), MirRvalue {
@@ -17080,7 +17568,19 @@ end
 # destination temp is typed Int (mir_call_result_temp_type), so storing its
 # move would be the spurious "int into unit" mismatch.
 def mir_store_rvalue_to_place(inout b: MirBuilder, dest: Place, dest_ty: Type, rvalue: MirRvalue, span: Span) -> Unit
+ # a Unit-typed destination has NOTHING to store (the effects already
+  # executed). A Never-typed RETURN PLACE (local 0) is the same: the
+  # divergent tail (panic's `__intrinsic_abort()` call temp — the
+  # Int-typed by-convention result of a Unit-returning call) must not be
+  # stored into `-> Never` (the former unconditional store was the
+  # `assign type mismatch: int into never` panic class). The skip is
+  # RETURN-PLACE-ONLY: an ordinary Never-typed temp still receives its
+  # store (skipping those left the temp unassigned — the
+  # "use of possibly-uninitialized local" Error::with_cause regression).
   if dest_ty == Type::Unit then
+    return
+  end
+  if dest_ty == Type::Never && dest.local.id == 0 && dest.projections.is_empty() then
     return
   end
   push_assign(b, dest, rvalue, span)
@@ -18375,13 +18875,29 @@ def lower_for_projected(inout b: MirBuilder, pat: Pattern, iter: Expr, body: Blo
   # substs, and the resolver's method DefId (method_def_ids — the same
   # DefId the checker records for source len() calls) makes the instance
   # key byte-identical to the checker-solved instances, so the
-  # monomorphizer cache stays single-sourced. A callee with no registered
-  # DefId keeps the name-only form (a non-generic or missing target — the
-  # monomorphizer's fail-closed check then reports it).
-  let len_instance = match b.method_def_ids.get(&len_callee)
+  # monomorphizer cache stays single-sourced. The vec/array alias is
+  # folded (the impl's for_type may be registered under either spelling;
+  # mir_impl_owner_type_name already normalizes Array -> Vec) with the
+  # RESOLVED spelling becoming the call name, so a miss on the routed name
+  # cannot leave the synthesized call without its instance ("generic call
+  # ... without a solved instance").
+  var len_callee_resolved = len_callee.clone()
+  var len_instance: Option[InstanceId] = Option::None
+  match b.method_def_ids.get(&len_callee_resolved)
   when Option::Some(did) then
-    Option::Some(InstanceId { def: CallableId { def: did.clone() }, args: generic_args_of_types(Vec::from([elem_ty.clone()])) })
-  when Option::None then Option::None
+    len_instance = Option::Some(InstanceId { def: CallableId { def: did.clone() }, args: generic_args_of_types(Vec::from([elem_ty.clone()])) })
+  when Option::None then
+    let alias_callee = if len_callee == "Vec__len" then "Array__len"
+      elsif len_callee == "Array__len" then "Vec__len"
+      else "" end
+    if alias_callee != "" then
+      match b.method_def_ids.get(alias_callee)
+      when Option::Some(did) then
+        len_callee_resolved = alias_callee.clone()
+        len_instance = Option::Some(InstanceId { def: CallableId { def: did.clone() }, args: generic_args_of_types(Vec::from([elem_ty.clone()])) })
+      when Option::None then ()
+      end
+    end
   end
   let len_ret = add_temp(b, Type::Int, span)
   let len_success = create_block(b)
@@ -18389,7 +18905,7 @@ def lower_for_projected(inout b: MirBuilder, pat: Pattern, iter: Expr, body: Blo
   len_args.push(MirCallArg { effect: AccessEffect::Read, value: MirCallValue::Value(recv_op) })
   set_terminator(b, MirTerminatorKind::MirCall {
     dest: place_local(len_ret),
-    func: mir_fn_operand_with_instance(b, len_callee.clone(), len_instance),
+    func: mir_fn_operand_with_instance(b, len_callee_resolved.clone(), len_instance),
     args: len_args,
     success: len_success,
     intrinsic: Option::None,
@@ -19240,8 +19756,8 @@ end
 def mir_variant_payload_type(b: MirBuilder, vid: VariantId, pj: Int) -> Option[Type]
   match b.typed_type_variants.get(vid.owner.id)
   when Option::Some(vars) then
-    if vid.index >= 0 && vid.index < vars.len() then
-      let payloads = vars[vid.index].1
+    if vid.index >= 0 && vid.index as Int < vars.len() then
+      let payloads = vars[vid.index as Int].1
       if pj >= 0 && pj < payloads.len() then
         return Option::Some(payloads[pj].clone())
       end
@@ -28415,6 +28931,132 @@ pub def mir_origin_insertion_lane_check() -> Vec[String]
 end
 
 # ———————————————————————————————————————————————————————————————
+# (P1-2) The pre-lowering persistent HIR-lineage lane
+# ———————————————————————————————————————————————————————————————
+# The persistent view the finalize pipeline stamps BEFORE lowering is
+# threaded into the SAME builder funnel the real lowering uses: a source
+# node whose (parse locator) view entry exists is born with
+# FromHir(the STORE-BACKED StableHirNodeId, role, sibling) — never the
+# post-hoc sequence-derived record. The lane builds two "builds" of the
+# SAME source node: build A binds its store-backed record at the original
+# locator (202), build B binds the SAME record at a renumbered locator
+# (999 — the unrelated-insertion shift), and asserts the node's
+# StableMirNodeId, typed provenance and StableSemanticNodeId are identical
+# across the two builds (the identity is the persistent lineage, not the
+# locator). The synthetic fallback projection is asserted DIFFERENT, so
+# the row cannot pass vacuously.
+
+def mir_origin_lane_lower_with_view(view: HirNodeLineageView, call_seq: Int) -> MirFunction
+  var b = builder_new()
+  b.hir_lineage_view = view
+  start_function(b, "lane_persistent_hir".to_string(), Type::Unit, span_dummy())
+  let _ret = add_local(b, "l0".to_string(), Type::Int, false, span_dummy())
+  let bb1 = create_block(b)
+  let bb2 = create_block(b)
+  let bb3 = create_block(b)
+  switch_to_block(b, MirBlockId { id: 0 })
+  b.origin_node_seq = 101
+  b.origin_sibling_counts = Map::new()
+  set_terminator(b, MirTerminatorKind::MirGoto(MirBlockId { id: bb1.id }), span_dummy())
+  switch_to_block(b, bb1)
+  b.origin_node_seq = call_seq
+  b.origin_sibling_counts = Map::new()
+  set_terminator(b, mir_origin_lane_call_kind(0, "lane_persistent_b".to_string(), bb2.id), span_dummy())
+  switch_to_block(b, bb2)
+  b.origin_node_seq = 303
+  b.origin_sibling_counts = Map::new()
+  set_terminator(b, mir_origin_lane_call_kind(0, "lane_persistent_c".to_string(), bb3.id), span_dummy())
+  switch_to_block(b, bb3)
+  b.origin_node_seq = 404
+  b.origin_sibling_counts = Map::new()
+  set_terminator(b, MirTerminatorKind::MirReturn, span_dummy())
+  match finish_function(b)
+  when Option::Some(f) then f
+  when Option::None then
+    panic("mir_origin_lane_lower_with_view: finish_function returned None")
+  end
+end
+
+# The semantic-id text of the block-1 terminator's typed provenance.
+def mir_origin_lane_semantic_text(f: MirFunction, fn_key: String) -> String
+  match mir_origin_insertion_lane_provenance(f)
+  when Option::Some(prov) then
+    stable_semantic_node_key_text(
+      stable_semantic_node_id_of_origin(fn_key.clone(), prov, "call".to_string(), "".to_string(), Vec::new())
+    )
+  when Option::None then "".to_string()
+  end
+end
+
+pub def mir_origin_persistent_hir_lane_check() -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  let fn_key = "lane_persistent_hir".to_string()
+  let owner = stable_decl_of_key(&fn_key)
+  let hl = stable_hir_lineage_id_of(owner.clone(), 7)
+  let hir_id = stable_hir_node_id_with_lineage(owner.clone(), hl, 202)
+
+  # build A: the node's locator is 202; the view binds the persistent
+  # record there.
+  var view_a = hir_node_lineage_view_new()
+  hir_node_lineage_view_bind(&mut view_a, 202, hir_id.clone())
+  let f_a = mir_origin_lane_lower_with_view(view_a, 202)
+
+  # build B: an unrelated source/HIR node inserted before it renumbers the
+  # locator to 999; the SAME persistent record is bound at the new
+  # locator. The identity must be byte-identical.
+  var view_b = hir_node_lineage_view_new()
+  hir_node_lineage_view_bind(&mut view_b, 999, hir_id.clone())
+  let f_b = mir_origin_lane_lower_with_view(view_b, 999)
+
+  let key_a = mir_origin_insertion_lane_key(f_a.clone())
+  let key_b = mir_origin_insertion_lane_key(f_b.clone())
+  mir_alias_lane_expect(&mut out, "P1-2-persistent-key-nonempty", key_a.len() > 0)
+  mir_alias_lane_expect(&mut out, "P1-2-renumbered-locator-keeps-key", key_a == key_b)
+
+  let prov_a = mir_origin_insertion_lane_provenance_text(f_a.clone())
+  let prov_b = mir_origin_insertion_lane_provenance_text(f_b.clone())
+  mir_alias_lane_expect(&mut out, "P1-2-persistent-provenance-from-hir", prov_a.starts_with("from-hir|"))
+  mir_alias_lane_expect(&mut out, "P1-2-renumbered-locator-keeps-provenance", prov_a == prov_b)
+
+  # The stamped provenance projects back to the SAME persistent record the
+  # view bound (owner + lineage), and is NOT the sequence-derived fallback.
+  let persistent_key = stable_mir_node_key_of(
+    mir_node_origin_stable_id(fn_key.clone(), MirNodeOrigin::FromHir(hir_id.clone(), "call".to_string(), 0))
+  )
+  let synthetic_key = stable_mir_node_key_of(
+    stable_mir_node_id_of_source(fn_key.clone(),
+      stable_hir_node_id_of(owner.clone(), 202), "call".to_string())
+  )
+  mir_alias_lane_expect(&mut out, "P1-2-provenance-is-the-view-record", key_a == persistent_key)
+  mir_alias_lane_expect(&mut out, "P1-2-provenance-not-sequence-derived", key_a != synthetic_key)
+
+  # The semantic node id (the semantic slice's primary derivation) is
+  # identical across the renumbering: it folds the HIR identity text (the
+  # persistent lineage), not the locator.
+  let sid_a = mir_origin_lane_semantic_text(f_a.clone(), fn_key.clone())
+  let sid_b = mir_origin_lane_semantic_text(f_b.clone(), fn_key.clone())
+  let sid_synth = mir_origin_lane_semantic_text(mir_origin_insertion_lane_function(), fn_key.clone())
+  mir_alias_lane_expect(&mut out, "P1-2-renumbered-locator-keeps-semantic-id", sid_a == sid_b)
+  mir_alias_lane_expect(&mut out, "P1-2-persistent-semantic-id-not-synthetic", sid_a != sid_synth)
+
+  # Through the O2 optimizer with an unrelated MIR node inserted before it:
+  # the persistent origin/provenance survive.
+  var program = mir_origin_lane_program(Vec::from([f_a.clone()]))
+  var f_ins = program.functions[0]
+  mir_origin_lane_insert_call_before(f_ins, 1)
+  program.functions[0] = f_ins
+  program.origins_enforced = true
+  optimize_mir(&mut program, 2, Option::None)
+  let opt_key = mir_origin_insertion_lane_key(program.functions[0].clone())
+  let opt_prov = mir_origin_insertion_lane_provenance_text(program.functions[0].clone())
+  mir_alias_lane_expect(&mut out, "P1-2-O2-keeps-persistent-key", opt_key == key_a)
+  mir_alias_lane_expect(&mut out, "P1-2-O2-keeps-persistent-provenance", opt_prov == prov_a)
+  mir_alias_lane_expect(&mut out, "P1-2-O2-provenance-verify-clean", verify_mir_provenance(program.clone()).is_empty())
+
+  out
+end
+
+# ———————————————————————————————————————————————————————————————
 # Post-mono lane helpers (third-audit item 37's next pieces)
 # ———————————————————————————————————————————————————————————————
 
@@ -36868,37 +37510,62 @@ end
 # Public API
 # ———————————————————————————————————————————————————————————————
 
+# The shared lowering boundary tail (recovery + the fail-closed origin /
+# provenance gates). Both the empty-view entry and the pre-lowering
+# persistent-view entry funnel through it, so the strict checks are the
+# SAME on both paths.
+def mir_lowering_boundary(result0: MirProgram) -> Result[MirProgram, String]
+  var result = result0
+  # (fourth-audit P0-7): the lowered program enforces the persistent
+  # origin invariant; the recovery closes any synthesized site that did
+  # not stamp an origin (the documented deterministic generated origin).
+  mir_origins_recover(&mut result)
+  # (P0-7 provenance extension) then every tracked node gets its typed
+  # provenance variant (the lowering stamps it on the push_stmt /
+  # set_terminator funnel; the recovery closes hand-built/synthesized
+  # sites deterministically from the stable id).
+  mir_provenance_recover(&mut result)
+  result.origins_enforced = true
+  # (audit order item 1 closeout) FAIL CLOSED at the lowering boundary:
+  # even after recovery a node without a persistent origin is a compiler
+  # defect — the caller receives the precise stage context, never a
+  # locator-identified artifact.
+  match mir_origins_check(&result, "lowering".to_string())
+  when Result::Ok(()) then ()
+  when Result::Err(e) then return Result::Err(e)
+  end
+  let prov_errors = verify_mir_provenance(result.clone())
+  if !prov_errors.is_empty() then
+    var msg = "finalized MIR at stage 'lowering' carries invalid provenance:"
+    for e in prov_errors do
+      msg = msg + "\n  " + e
+    end
+    return Result::Err(msg)
+  end
+  Result::Ok(result)
+end
+
+
+
+
 def lower_to_mir(program: Program, analyzed: AnalyzedProgram) -> Result[MirProgram, String]
-  match lower_program(program, analyzed)
+  match lower_program(program, analyzed, hir_node_lineage_view_new())
   when Result::Err(e) then Result::Err(e)
   when Result::Ok(result) then
-    # (fourth-audit P0-7): the lowered program enforces the persistent
-    # origin invariant; the recovery closes any synthesized site that did
-    # not stamp an origin (the documented deterministic generated origin).
-    mir_origins_recover(&mut result)
-    # (P0-7 provenance extension) then every tracked node gets its typed
-    # provenance variant (the lowering stamps it on the push_stmt /
-    # set_terminator funnel; the recovery closes hand-built/synthesized
-    # sites deterministically from the stable id).
-    mir_provenance_recover(&mut result)
-    result.origins_enforced = true
-    # (audit order item 1 closeout) FAIL CLOSED at the lowering boundary:
-    # even after recovery a node without a persistent origin is a compiler
-    # defect — the caller receives the precise stage context, never a
-    # locator-identified artifact.
-    match mir_origins_check(&result, "lowering".to_string())
-    when Result::Ok(()) then ()
-    when Result::Err(e) then return Result::Err(e)
-    end
-    let prov_errors = verify_mir_provenance(result.clone())
-    if !prov_errors.is_empty() then
-      var msg = "finalized MIR at stage 'lowering' carries invalid provenance:"
-      for e in prov_errors do
-        msg = msg + "\n  " + e
-      end
-      return Result::Err(msg)
-    end
-    Result::Ok(result)
+    mir_lowering_boundary(result)
+  end
+end
+
+# (P1-2) The pre-lowering persistent HIR-lineage entry: the caller stamped
+# the view through the shared store BEFORE this call (declaration + HIR
+# lineage identities), so every source-derived MIR node is born with
+# MirNodeOrigin::FromHir(the store-backed id, role, sibling). An empty view
+# is exactly the lower_to_mir path (the documented bootstrap fallback).
+pub def lower_to_mir_with_hir_lineage(program: Program, analyzed: AnalyzedProgram, hir_view: HirNodeLineageView) -> Result[MirProgram, String]
+  match lower_program(program, analyzed, hir_view)
+  when Result::Err(e) then Result::Err(e)
+  when Result::Ok(result) then
+    mir_lowering_boundary(result)
   end
 end
 
@@ -37494,6 +38161,82 @@ pub def verify_mir(mir: MirProgram) -> Vec[String]
       fn_effects.insert(f.name.clone(), f.declared_effects.clone())
     end
   end
+ # (MIR-level effect closure): the carried effect sets closed over the
+  # MIR's ACTUAL call edges. The checker's own closure (check_effect_sets)
+  # walks ITS call graph; for CONTRACT/derived calls (e.g. `e.to_string()`
+  # on a generic T, which the MIR pre-devirt names with the resolved
+  # concrete callee) the checker's edge targets the contract method while
+  # the MIR callee operand names the resolved callee — so the caller's
+  # carried set can lack an effect of a callee the MIR actually calls.
+  # Closing over the MIR graph makes the local effect rule's premise hold
+  # for every call this program contains (the rule itself is unchanged:
+  # the caller's set must contain the callee's carried effects).
+  var fn_effects_closure: Map[String, Vec[EffectId]] = Map::new()
+  for f in mir.functions do
+    fn_effects_closure.insert(f.name.clone(), f.declared_effects.clone())
+  end
+  # the MIR call graph, collected ONCE (caller emission name -> callee
+  # emission names) — the propagation then runs over the edges, not the
+  # blocks.
+  var mir_call_edges: Map[String, Vec[String]] = Map::new()
+  var feg = 0
+  while feg < mir.functions.len() do
+    let fegf = mir.functions[feg]
+    var cne: Vec[String] = Vec::new()
+    var beg = 0
+    while beg < fegf.blocks.len() do
+      match fegf.blocks[beg].terminator.kind
+      when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic, tail } then
+        match func.kind
+        when MirOperandKind::MirConstant(c3) then
+          match c3.kind
+          when MirConstantKind::MirFnItem(n3) then cne.push(n3.clone())
+          when _ then ()
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+      beg = beg + 1
+    end
+    if !cne.is_empty() then
+      mir_call_edges.insert(fegf.name.clone(), cne)
+    end
+    feg = feg + 1
+  end
+  var edge_keys = mir_call_edges.entries()
+  var eff_changed = true
+  while eff_changed do
+    eff_changed = false
+    var eki = 0
+    while eki < edge_keys.len() do
+      let (ecaller, ecallees) = edge_keys[eki]
+      var caller_effs = match fn_effects_closure.get(&ecaller)
+      when Option::Some(v) then v.clone()
+      when Option::None then Vec::new()
+      end
+      for eckey in ecallees do
+        match fn_effects_closure.get(&eckey)
+        when Option::Some(ce3) then
+          for e3 in ce3 do
+            var has3 = false
+            var di5 = 0
+            while di5 < caller_effs.len() do
+              if caller_effs[di5].id == e3.id then has3 = true end
+              di5 = di5 + 1
+            end
+            if !has3 then
+              caller_effs.push(e3.clone())
+              eff_changed = true
+            end
+          end
+        when Option::None then ()
+        end
+      end
+      fn_effects_closure.insert(ecaller.clone(), caller_effs)
+      eki = eki + 1
+    end
+  end
  # every MirTypeDef must be concrete — no Type::Param / Type::Var in
   # field or variant types (generic struct fields resolve to the Named(0)
   # placeholder, which is checked separately), and every Named type inside a
@@ -37548,7 +38291,7 @@ pub def verify_mir(mir: MirProgram) -> Vec[String]
   var func_idx = 0
   while func_idx < mir.functions.len() do
     let func = mir.functions[func_idx]
-    verify_function_v2(&type_index, &plans, &fn_names, &deinit_instances, &mir.drop_glue_fns, &pnames, func, &fn_effects, &mut engine_env, &mut errors)
+    verify_function_v2(&type_index, &plans, &fn_names, &deinit_instances, &mir.drop_glue_fns, &pnames, func, &fn_effects, &fn_effects_closure, &mut engine_env, &mut errors)
     func_idx = func_idx + 1
   end
   # (fourth-audit P0-7) the persistent-origin invariant: enforced on a
@@ -38447,6 +39190,24 @@ def verifier_owner_def_variant_payload(type_index: Map[Int, MirTypeDef], inout a
   end  end
 end
 
+# The TypeId of the type def whose DECLARED generic-parameter list carries
+# `gpid` — the binder's declaring type def, recovered from the verifier's
+# OWN type index. A GenericParamId's owner is a DefId, never a TypeId, so
+# the declaring def is found by binder IDENTITY (the type def declaring the
+# parameter); flattening the owner DefId would index a DIFFERENT id domain
+# ("never an arbitrary def"). A function-owned binder has no type def —
+# Option::None, the fail-closed answer the recovery below documents.
+def verifier_param_declaring_type_id(type_index: Map[Int, MirTypeDef], gpid: GenericParamId) -> Option[Int]
+  for (tid, td) in type_index do
+    for p in td.generic_params do
+      if generic_param_id_eq(&p, &gpid) then
+        return Option::Some(tid)
+      end
+    end
+  end
+  Option::None
+end
+
 # (alias-aware declared-binder recovery): a Field projection on a declared
 # Type::Param whose recorded FieldId owner def is UNRESOLVABLE in the
 # verifier's type index. The pre-mono template spells the same nominal
@@ -38466,10 +39227,16 @@ def verifier_declared_binder_field_type(type_index: Map[Int, MirTypeDef], inout 
     verifier_owner_def_field_type(type_index, aliases, owner_id, index)
   when Option::None then
     var candidates: Vec[Int] = Vec::new()
-    candidates.push(gpid.owner.id)
+    match verifier_param_declaring_type_id(type_index, gpid)
+    when Option::Some(cid) then candidates.push(cid)
+    when Option::None then ()
+    end
     match observed
     when Option::Some(orig) then
-      if orig.owner.id != gpid.owner.id then candidates.push(orig.owner.id) end
+      match verifier_param_declaring_type_id(type_index, orig)
+      when Option::Some(oid) then candidates.push(oid)
+      when Option::None then ()
+      end
     when Option::None then ()
     end
     var ci = 0
@@ -38491,10 +39258,16 @@ def verifier_declared_binder_variant_payload(type_index: Map[Int, MirTypeDef], i
     verifier_owner_def_variant_payload(type_index, aliases, owner_id, index)
   when Option::None then
     var candidates: Vec[Int] = Vec::new()
-    candidates.push(gpid.owner.id)
+    match verifier_param_declaring_type_id(type_index, gpid)
+    when Option::Some(cid) then candidates.push(cid)
+    when Option::None then ()
+    end
     match observed
     when Option::Some(orig) then
-      if orig.owner.id != gpid.owner.id then candidates.push(orig.owner.id) end
+      match verifier_param_declaring_type_id(type_index, orig)
+      when Option::Some(oid) then candidates.push(oid)
+      when Option::None then ()
+      end
     when Option::None then ()
     end
     var ci = 0
@@ -38800,6 +39573,31 @@ def verifier_check_place_state(type_index: Map[Int, MirTypeDef], inout aliases: 
             when Option::None then ()
             end
           when _ then ()
+          end
+          # (builtin raw pointer nominal): a FieldId whose owner is the
+          # std Ptr/PtrMut nominal on a `Type::Ptr` / `Type::PtrMut` base.
+          # The checker resolves the pointer's declared field against its
+          # nominal view (builtin_ptr_nominal_ty) while the MIR keeps the
+          # builtin pointer form, so verifier_named_tid's pointee peel
+          # answers None for a non-nominal pointee (`sv_cptr.address` on a
+          # Ptr[u8] read "FieldId projection on a non-nominal type"). The
+          # owner def's declared field — substituted with the pointee as
+          # the owner's single generic argument — is the resolved chain
+          # (verifier_field_type_at's pointer arm already types it).
+          if !declared_binder_field then
+            match cur_ty
+            when Type::Ptr(pointee) then
+              match verifier_ptr_field_type_at(type_index, aliases, pointee.clone(), fid.owner.id, fid.index)
+              when Option::Some(_) then declared_binder_field = true
+              when Option::None then ()
+              end
+            when Type::PtrMut(pointee) then
+              match verifier_ptr_field_type_at(type_index, aliases, pointee.clone(), fid.owner.id, fid.index)
+              when Option::Some(_) then declared_binder_field = true
+              when Option::None then ()
+              end
+            when _ then ()
+            end
           end
           if !declared_binder_field then
             errors.push(ctx.clone() + ": FieldId projection on a non-nominal type on local _" + pid.to_string())
@@ -40259,7 +41057,7 @@ def verifier_check_call(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeD
   end
 end
 
-def verifier_check_terminator(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, inout aliases: Map[Int, GenericParamId], term: MirTerminator, running: Set[Int], live: Set[Int], inout moved: Map[Int, Set[String]], inout destroyed: Map[Int, Set[String]], fn_effects: Map[String, Vec[EffectId]], ctx: String, inout errors: Vec[String]) -> Unit
+def verifier_check_terminator(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, inout aliases: Map[Int, GenericParamId], term: MirTerminator, running: Set[Int], live: Set[Int], inout moved: Map[Int, Set[String]], inout destroyed: Map[Int, Set[String]], fn_effects: Map[String, Vec[EffectId]], fn_effects_closure: Map[String, Vec[EffectId]], ctx: String, inout errors: Vec[String]) -> Unit
   match term.kind
   when MirTerminatorKind::MirGoto(target) then
     if !verifier_block_exists(func, target.id) then
@@ -40350,6 +41148,20 @@ def verifier_check_terminator(inout engine_env: TypeEnv, type_index: Map[Int, Mi
           while di2 < func.declared_effects.len() do
             if func.declared_effects[di2].id == eff.id then declared_has = true end
             di2 = di2 + 1
+          end
+          if !declared_has then
+            # the caller's CLOSED set (see the MIR-level effect closure
+            # above) also satisfies the rule — the metadata closure, not a
+            # relaxation of the rule.
+            match fn_effects_closure.get(&func.name)
+            when Option::Some(ce) then
+              var di4 = 0
+              while di4 < ce.len() do
+                if ce[di4].id == eff.id then declared_has = true end
+                di4 = di4 + 1
+              end
+            when Option::None then ()
+            end
           end
           if !declared_has then
             errors.push(ctx.clone() + ": call to effectful function " + callee_name.clone() + " requires a declared effect (the function declares none)")
@@ -40786,7 +41598,7 @@ end
 # on entry to every block, then a per-block linear pass that checks uses of
 # possibly-uninitialized locals, projection typing, rvalue typing, and call
 # invariants in program order.
-def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, inout aliases: Map[Int, GenericParamId], fn_effects: Map[String, Vec[EffectId]], inout errors: Vec[String]) -> Unit
+def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, inout aliases: Map[Int, GenericParamId], fn_effects: Map[String, Vec[EffectId]], fn_effects_closure: Map[String, Vec[EffectId]], inout errors: Vec[String]) -> Unit
   let fn_ctx = "fn " + func.name.clone()
   let entry_id = func.entry_block.id
 
@@ -41030,7 +41842,7 @@ def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTy
       for lid in all_local_ids do lt.insert(lid.clone()) end
       lt
     end
-    verifier_check_block_stmts(engine_env, type_index, func, aliases, b, &bin, &blive, &bmoved, &bdestroyed, &fn_effects, &bb_ctx, errors)
+    verifier_check_block_stmts(engine_env, type_index, func, aliases, b, &bin, &blive, &bmoved, &bdestroyed, &fn_effects, &fn_effects_closure, &bb_ctx, errors)
     bi = bi + 1
   end
 end
@@ -41473,7 +42285,7 @@ def verifier_compute_live_dataflow(func: MirFunction, block_map: Map[Int, MirBlo
   live_in
 end
 
-def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, inout aliases: Map[Int, GenericParamId], block: MirBlock, block_in: Set[Int], live_in: Set[Int], moved_in: Map[Int, Set[String]], destroyed_in: Map[Int, Set[String]], fn_effects: Map[String, Vec[EffectId]], ctx: String, inout errors: Vec[String]) -> Unit
+def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, inout aliases: Map[Int, GenericParamId], block: MirBlock, block_in: Set[Int], live_in: Set[Int], moved_in: Map[Int, Set[String]], destroyed_in: Map[Int, Set[String]], fn_effects: Map[String, Vec[EffectId]], fn_effects_closure: Map[String, Vec[EffectId]], ctx: String, inout errors: Vec[String]) -> Unit
   # `running` = values definitely initialized in this block so far.
   # `live` = storage that exists (the frame-model liveness lattice). These
   # are deliberately separate: storage existing does NOT imply a valid value.
@@ -41603,7 +42415,7 @@ def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, M
     end
   end
 
-  verifier_check_terminator(engine_env, type_index, func, aliases, &block.terminator, &running, &live, &mut moved, &mut destroyed, &fn_effects, ctx, errors)
+  verifier_check_terminator(engine_env, type_index, func, aliases, &block.terminator, &running, &live, &mut moved, &mut destroyed, &fn_effects, &fn_effects_closure, ctx, errors)
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -41851,7 +42663,7 @@ def verifier_call_receiver_is_param(type_index: Map[Int, MirTypeDef], inout alia
 end
 
 # Top-level per-function verification driver.
-def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, DeinitPlan], fn_names: Set[String], deinit_instances: Set[Int], drop_glue_fns: Map[Int, String], param_names: Map[Int, String], func_in: MirFunction, fn_effects: Map[String, Vec[EffectId]], inout engine_env: TypeEnv, inout errors: Vec[String]) -> Unit
+def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, DeinitPlan], fn_names: Set[String], deinit_instances: Set[Int], drop_glue_fns: Map[Int, String], param_names: Map[Int, String], func_in: MirFunction, fn_effects: Map[String, Vec[EffectId]], fn_effects_closure: Map[String, Vec[EffectId]], inout engine_env: TypeEnv, inout errors: Vec[String]) -> Unit
  # (generic-template posture — the canonical binder identity): a function
   # declaring generic binders is a template. Its declared binders are the
   # canonical ones; every observed spelling of the same declared name
@@ -42010,7 +42822,7 @@ def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, Dein
   # monomorphic functions keep the strict check.
   verifier_check_callees(type_index, &mut func_aliases, func, fn_names, deinit_instances, drop_glue_fns, !func.generic_params.is_empty(), &fn_ctx, errors)
 
-  verifier_dataflow_init(engine_env, type_index, func, &mut func_aliases, &fn_effects, errors)
+  verifier_dataflow_init(engine_env, type_index, func, &mut func_aliases, &fn_effects, &fn_effects_closure, errors)
 end
 
 # (item 11 — the switch-discriminant contract):

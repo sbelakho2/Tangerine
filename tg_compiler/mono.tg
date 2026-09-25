@@ -20,8 +20,9 @@ use tg_compiler::ids::{
   GenericArg, ConstValue,
   def_id_numeric, generic_param_id_numeric, generic_param_id_eq, generic_param_name_from,
   generic_arg_type_view, generic_arg_of_type_view, const_value_type_view,
-  generic_args_of_types
-effect_vec_eq, }
+  generic_args_of_types,
+  effect_vec_eq,
+}
 use tg_compiler::stable_ids::{
   StructuralInstanceId, structural_instance_id_of,
   structural_instance_mangle_text, StableDeclId, stable_callable_decl_of,
@@ -38,7 +39,10 @@ use tg_compiler::types::{
   const_sym_tree_has_param, const_sym_tree_uses_param, const_sym_tree_param_ids,
   const_sym_tree_subst_consts, const_sym_tree_eq, const_sym_fold_type,
   const_sym_tree_render_numeric, intrinsic_id_of_call,
-  generic_param_alias_table, rewrite_generic_param_aliases_in_type
+  generic_param_alias_table, rewrite_generic_param_aliases_in_type,
+  # (P0-4/P0-5) the contract identity vocabulary the devirtualization wave
+  # consumes: the semantic token predicate and the per-impl-method record.
+  is_contract_method_token, ImplContractMethod
 }
 use tg_compiler::mir::{
   MirProgram, MirFunction, MirLocal, MirBlock, MirStatement, MirStatementKind,
@@ -58,13 +62,15 @@ use tg_compiler::mir::{
 # MAX_MONO_INSTANCES), not as a monomorphization-recursion claim.
 const MAX_MONO_INSTANCES: Int = 8192
 
-# The trait-contract devirtualization wave's round bound: each round
-# rewrites at least one call site to a LOWERED emission name, a site the
-# following rounds never reconsider, so a finite program reaches the
-# fixpoint in at most (number of contract call sites + 1) rounds. The
-# bound is a defensive resource limit; exceeding it is a fail-closed
-# diagnostic, never a claim about the seed's semantics.
-const MAX_MONO_DEVIRT_ROUNDS: Int = 64
+# (P1-1) The trait-contract devirtualization wave has NO round bound. The
+# wave is MONOTONIC: every rewrite replaces a bare contract-surface call
+# with a LOWERED emission name — a site the wave never reconsiders (the
+# lowered set is recomputed each pass and a rewritten name is in it) — and
+# a bare surface can only appear in a body that exists, so newly exposed
+# sites come only from newly specialized instances, which MAX_MONO_INSTANCES
+# already bounds. Exceeding the INSTANCE limit is reported as the
+# resource-limit diagnostic it is; the wave itself always runs to its
+# fixpoint.
 
 # ———————————————————————————————————————————————————————————————
 # Data Structures
@@ -223,6 +229,30 @@ pub def mono_cache_new_ephemeral(program: Program, res: ResolvedNames) -> MonoCa
   cache
 end
 
+# The persistent-cache construction failure (P1-5): the lineage view
+# carries no persistent declaration binding for at least one
+# resolver-registered symbol of the program. `missing_keys` holds the
+# registration keys ("path::name") of EVERY unbound symbol, in the
+# resolver's registration order — the structured carrier of the missing
+# lineage, never a panic string.
+pub struct MonoIdentityError
+  missing_keys: Vec[String] = Vec::new()
+end
+
+# The human-readable render of a MonoIdentityError: the first missing
+# registration key plus the remaining count (a complete list of thousands
+# of symbols would drown the stage diagnostic).
+pub def mono_identity_error_text(e: MonoIdentityError) -> String
+  if e.missing_keys.is_empty() then
+    return "persistent lineage view missing for a resolver-registered symbol"
+  end
+  var text = "internal error: mono_cache_new_persistent requires a persistent declaration binding for every resolver-registered symbol; `" + e.missing_keys[0].clone() + "` is missing from the lineage view"
+  if e.missing_keys.len() > 1 then
+    text = text + " (and " + (e.missing_keys.len() - 1).to_string() + " more)"
+  end
+  text + " (build the view with semantic_snapshot.tg snapshot_lineage_view_of, or use mono_cache_new_ephemeral explicitly for a bootstrap/test cache)"
+end
+
 # The PRODUCTION monomorphization setup boundary: every production entry
 # (the LIR compile, the semantic snapshot build, the semantic server, the
 # verified-edit transaction, the coverage harness) constructs its cache
@@ -233,13 +263,16 @@ end
 #
 # The view is a MANDATORY input: construction BINDS every view entry
 # (mono_cache_bind_stable_callable) over the structural seeds, then FAILS
-# CLOSED when any resolver-registered symbol lacks a view binding — a
-# production cache can never silently fall back to the seeded structural
-# identity for a declaration whose persistent identity exists. The
-# persistent bindings consult first (stable_callables is a map insert; the
-# view entries overwrite the seeds), so instances the monomorphizer emits
-# carry the persistent, rename/move-stable StructuralInstanceId.
-pub def mono_cache_new_persistent(program: Program, res: ResolvedNames, view: CallableLineageView) -> MonoCache
+# CLOSED with a structured `Result::Err(MonoIdentityError)` when any
+# resolver-registered symbol lacks a view binding — a production cache can
+# never silently fall back to the seeded structural identity for a
+# declaration whose persistent identity exists, and the failure carries
+# the missing-lineage information (the unbound registration keys) instead
+# of aborting the process. The persistent bindings consult first
+# (stable_callables is a map insert; the view entries overwrite the
+# seeds), so instances the monomorphizer emits carry the persistent,
+# rename/move-stable StructuralInstanceId.
+pub def mono_cache_new_persistent(program: Program, res: ResolvedNames, view: CallableLineageView) -> Result[MonoCache, MonoIdentityError]
   var cache = mono_cache_new_ephemeral(program, res)
   for (key, decl) in view.decls.entries() do
     mono_cache_bind_stable_callable(&mut cache, key.clone(), decl)
@@ -247,14 +280,20 @@ pub def mono_cache_new_persistent(program: Program, res: ResolvedNames, view: Ca
   # Fail closed: EVERY resolver-registered symbol of this program must
   # carry a persistent binding. The view builder (snapshot_lineage_view_of)
   # stamps the full registered set, so a missing key is a broken
-  # construction path — never a silently structural fallback.
+  # construction path — never a silently structural fallback. The
+  # structured error names the missing keys; the caller propagates it
+  # through its own failure stage (finalize.tg's "lineage").
+  var missing: Vec[String] = Vec::new()
   let entries = cache.resolutions.module_symbols.entries()
   for (key, _did) in entries do
     if !view.decls.contains_key(&key) then
-      panic("internal error: mono_cache_new_persistent requires a persistent declaration binding for every resolver-registered symbol; `" + key + "` is missing from the lineage view (build the view with semantic_snapshot.tg snapshot_lineage_view_of, or use mono_cache_new_ephemeral explicitly for a bootstrap/test cache)")
+      missing.push(key.clone())
     end
   end
-  cache
+  if !missing.is_empty() then
+    return Result::Err(MonoIdentityError { missing_keys: missing })
+  end
+  Result::Ok(cache)
 end
 
 # The resolver REGISTRATION key ("path::name") of a DefId — the
@@ -1875,8 +1914,11 @@ def rewrite_call_sites_in_program(inout mir: MirProgram, inout cache: MonoCache)
         when MirOperandKind::MirConstant(const_val) then
           match const_val.kind
           when MirConstantKind::MirFnItem(callee_name) then
-            # Only process calls to known generic functions
-            if generic_names.contains(&callee_name) then
+            # Only process calls to known generic functions. (P0-4) a
+            # bound-contract call's instance is the contract identity
+            # payload, NOT a solved specialization; the devirtualization
+            # wave owns that site and this rewrite never touches it.
+            if generic_names.contains(&callee_name) && !devirt_contract_payload(&const_val) then
               # Look up the function definition in the program
               for candidate in mir.functions do
                 if candidate.name == callee_name then
@@ -2496,17 +2538,33 @@ end
 # concrete-specialized caller keeps referencing the contract surface,
 # which no emitted body answers.
 #
-# SELECTION (the seed's rule): the receiver type is the call's FIRST
-# argument — the receiver operand's place local type with the RefInternal
-# ABI wrapper peeled — AFTER substitution; the concrete impl is the
-# lowered template whose method segment matches the callee name and whose
-# DECLARED receiver parameter type (the template's `self` parameter,
+# SELECTION (P0-4, replacing the seed's method-name rule): the call must
+# carry a SEMANTIC CONTRACT IDENTITY — the callee operand's InstanceId.def
+# is the CONTRACT METHOD TOKEN (types.tg contract_method_token: the trait
+# declaration id + the method's contract declaration index, flattened into
+# the dedicated synthetic band). The checker recorded the token at the
+# bound-receiver resolution site and the MIR lowering stamped it; the
+# candidate index is keyed by the SAME token — a template's
+# MirFunction.contract_identity (published from the checker's
+# typed_impl_contract_methods at impl registration). A callee with no
+# token (a name-only call, a synthetic dispatch) is NEVER a candidate for
+# a method-name guess: candidates from a different trait that happens to
+# declare the same method name carry different tokens and can never be
+# selected or counted as ambiguous (fail closed).
+#
+# The receiver type is the call's FIRST argument — the receiver operand's
+# place local type with the RefInternal ABI wrapper peeled — AFTER
+# substitution; the concrete impl is the token-matched lowered template
+# whose DECLARED receiver parameter type (the template's `self` parameter,
 # params[0].ty) unifies with that receiver type. The instance arguments
-# are the template's declaration-order generic parameters bound by that
-# unification; the unification only READS the already-substituted
-# receiver type (ZERO-INFERENCE: nothing is inferred from the call), and
-# an instance argument the receiver type does not solve is never
-# fabricated.
+# are merged from the TWO solved sources (P0-5): the implementation
+# parameters the receiver unification binds structurally, and the
+# contract method's own method-level values the checker already solved
+# (the callee instance's args, in the contract method's declared order,
+# mapped onto the template's TRAILING binders via the published binder
+# split). The merge rejects conflicting bindings and any still-symbolic
+# value; nothing is inferred from the remaining call operands
+# (ZERO-INFERENCE: no value is ever fabricated).
 #
 # FAIL-CLOSED / DEFERRAL (the seed's keep-vs-error split):
 #   - a receiver still carrying generic parameters DEFERS: the caller's
@@ -2517,12 +2575,20 @@ end
 #     to the class that owns it (keep) — the monomorphizer never guesses
 #     an owner for a name the lowering did not produce from a bound
 #     receiver;
-#   - a bare contract name whose candidate impl templates exist but none
-#     unifies with the concrete receiver (including a candidate whose
-#     declaration-order parameters the receiver type cannot solve) FAILS
-#     CLOSED with the precise caller/callee/receiver context: the
-#     concrete impl the checker's bound resolution promised does not
-#     exist at this instance.
+#   - a bare contract name with NO contract identity is KEPT (another
+#     class owns it — a name-only synthesized call is never rewritten by
+#     a name guess);
+#   - a bare contract token whose candidate impl templates exist but none
+#     unifies with the concrete receiver, carries the declared method
+#     arity, or accepts the merged bindings FAILS CLOSED with the precise
+#     caller/callee/receiver context: the concrete impl the checker's
+#     bound resolution promised does not exist at this instance.
+#
+# (P1-1) The wave has NO round bound: each round rewrites at least one
+# site from the contract surface to a lowered emission name, and a
+# rewritten site is never a candidate again (the lowered set is
+# recomputed per pass), so the fixpoint is reached for every finite
+# program; specialization growth is bounded by MAX_MONO_INSTANCES alone.
 
 # The method segment of an emission name: the text after the LAST "__"
 # ("VecIterator__advance" -> "advance"). A bare name is returned as-is —
@@ -2682,31 +2748,80 @@ def devirt_unify_head(tmpl_ty: Type, recv_ty: Type, inout bind: Map[Int, Type]) 
   end
 end
 
-# ONE devirtualization candidate: the lowered impl-method template whose
-# method segment a contract call may re-dispatch to, with the DECLARED
-# inputs the receiver-type unification reads (the template's `self`
-# parameter type, its declaration-order generic parameters, its declared
-# return type) and the impl method's semantic DefId (the dispatch
-# registry's record — the instance identity's callable face).
-struct DevirtCandidate
+# ONE devirtualization candidate: the lowered impl-method template a
+# contract-identified call may re-dispatch to, with the DECLARED inputs the
+# receiver-type unification reads (the template's `self` parameter type,
+# its declaration-order generic parameters, its declared return type), the
+# impl method's semantic DefId, and the CONTRACT IDENTITY it answers
+# (P0-4): the contract method token — the same DefId the call's instance
+# carries — plus the binder split (P0-5): `impl_param_count` leading
+# declaration-order binders are the impl's (solved by receiver
+# unification), the trailing `method_param_count` are the contract
+# method's own (their values come from the call's already-solved payload).
+pub struct DevirtCandidate
   template_name: String
   self_ty: Type
   generic_params: Vec[GenericParamId]
   ret_type: Type
   did: DefId
+  contract_method: DefId
+  impl_param_count: Int
+  method_param_count: Int
 end
 
-# The per-wave candidate index: method segment -> the impl-method
-# templates carrying it. Only templates that declare a receiver parameter
-# are candidates (a `Type__method` emission name — the non-method surface
-# is never a contract target); the DefId comes from the same dispatch
-# registry the map-key injection reads. The candidate's DECLARED receiver
-# and return types are canonicalized against its own declared binder list
-# before the receiver unification reads them (canonical_param_aliases), so
-# the binders the unification pairs — and the instance arguments it
-# solves — are the canonical ids.
-def devirt_candidate_index(mir: MirProgram, param_names: Map[Int, String]) -> Map[String, Vec[DevirtCandidate]]
-  var index: Map[String, Vec[DevirtCandidate]] = Map::new()
+# (P0-4) whether a callee constant carries the devirtualization wave's
+# contract-identity payload: its InstanceId.def is a contract method token
+# (never a specialization template identity). The specialization scans
+# (enqueue / rewrite) keep such call sites out of their queues — the wave
+# rewrites them to the concrete impl's instance first.
+def devirt_contract_payload(cv: MirConstant) -> Bool
+  match cv.instance.clone()
+  when Option::Some(inst) then is_contract_method_token(inst.def.def.clone())
+  when Option::None then false
+  end
+end
+
+# (P0-5) whether a contract method-level value is FULLY CONCRETE — the
+# only values the devirtualizer accepts for a candidate's method-level
+# binders. A still-symbolic row (an inference variable, the caller's own
+# parameter, a const parameter or a param-carrying const tree) is
+# REJECTED: the wave never guesses a value, and a candidate it cannot
+# fully solve is unselectable (fail closed).
+def devirt_method_value_concrete(arg: GenericArg) -> Option[Type]
+  match arg
+  when GenericArg::Type(ty) then
+    if type_has_params(&ty) then
+      Option::None
+    elsif type_has_unresolved_var(ty.clone()) then
+      Option::None
+    else
+      match ty
+      when Type::Never then Option::None
+      when Type::Error then Option::None
+      when _ then Option::Some(ty.clone())
+      end
+    end
+  when GenericArg::Const(cv) then
+    match cv
+    when ConstValue::Value(v) then Option::Some(Type::Const(v))
+    when _ then Option::None
+    end
+  end
+end
+
+# The per-wave candidate index: contract method token (flattened
+# def_id_numeric) -> the impl-method templates carrying it. Only templates
+# that declare a receiver parameter AND a contract identity are
+# candidates: an inherent/extension method, a free function, a synthesized
+# or intrinsic template, and a specialized instance (whose name is not a
+# registered template name) all carry no identity and are NEVER targets —
+# selection by bare method name is not part of the model (P0-4). The
+# candidate's DECLARED receiver and return types are canonicalized against
+# its own declared binder list before the receiver unification reads them
+# (canonical_param_aliases), so the binders the unification pairs — and
+# the instance arguments it solves — are the canonical ids.
+pub def devirt_candidate_index(mir: MirProgram, param_names: Map[Int, String]) -> Map[Int, Vec[DevirtCandidate]]
+  var index: Map[Int, Vec[DevirtCandidate]] = Map::new()
   for tmpl in mir.functions do
     if tmpl.params.is_empty() then
       next
@@ -2715,28 +2830,78 @@ def devirt_candidate_index(mir: MirProgram, param_names: Map[Int, String]) -> Ma
     if segment == tmpl.name then
       next
     end
-    match mir.dispatch_methods.get(&tmpl.name)
-    when Option::Some((did, _, _)) then
-      var rows = match index.get(&segment)
-      when Option::Some(v) then v.clone()
-      when Option::None then Vec::new()
-      end
-      var observed: Vec[GenericParamId] = Vec::new()
-      collect_param_ids_in_type(tmpl.params[0].ty.clone(), &mut observed)
-      collect_param_ids_in_type(tmpl.ret_type.clone(), &mut observed)
-      var aliases: Map[Int, GenericParamId] = Map::new()
-      if has_noncanonical_param_ids(tmpl.generic_params.clone(), observed.clone()) then
-        aliases = canonical_param_aliases(param_names.clone(), tmpl.generic_params.clone(), observed)
-      end
-      rows.push(DevirtCandidate {
-        template_name: tmpl.name.clone(),
-        self_ty: rewrite_param_aliases_in_type(aliases.clone(), tmpl.params[0].ty.clone()),
-        generic_params: tmpl.generic_params.clone(),
-        ret_type: rewrite_param_aliases_in_type(aliases.clone(), tmpl.ret_type.clone()),
-        did: did.clone()
-      })
-      index.insert(segment, rows)
+    # only a registered template (the dispatch registry's key space) is a
+    # candidate; a specialized instance's name is not registered.
+    if !mir.dispatch_methods.contains_key(&tmpl.name) then
+      next
+    end
+    # (P0-4) a template WITHOUT a contract identity is never a candidate.
+    var tmpl_has_contract = false
+    match tmpl.contract_identity
+    when Option::Some(_) then tmpl_has_contract = true
     when Option::None then ()
+    end
+    if !tmpl_has_contract then
+      next
+    end
+    match tmpl.contract_identity
+    when Option::None then ()
+    when Option::Some(cid) then
+      var impl_did_opt: Option[DefId] = Option::None
+      match tmpl.callable
+      when Option::Some(c) then impl_did_opt = Option::Some(c.def.clone())
+      when Option::None then
+        # The dispatch registry's DefId for the registered template name —
+        # the same resolver DefId the checker records, and the only
+        # authoritative source that survives a MirFunction clone (the
+        # explicit Clone's field list does not carry `callable`, so a
+        # cloned template's callable is None). Two same-named templates of
+        # different traits share this DefId (the resolver's first-wins
+        # per-type registration); their CONTRACT TOKENS differ, so the
+        # selection is still exact, and a generic same-name pair is not
+        # selectable by name alone.
+        match mir.dispatch_methods.get(&tmpl.name)
+        when Option::Some((did, _, _)) then impl_did_opt = Option::Some(did.clone())
+        when Option::None then ()
+        end
+      end
+      # (P0-4) an identity-less (shadowed generic) template is not a
+      # candidate.
+      var has_impl_did = false
+      match impl_did_opt
+      when Option::Some(_) then has_impl_did = true
+      when Option::None then ()
+      end
+      if !has_impl_did then
+        next
+      end
+      match impl_did_opt
+      when Option::None then ()
+      when Option::Some(impl_did) then
+        let key = def_id_numeric(&cid.contract_method)
+        var rows = match index.get(&key)
+        when Option::Some(v) then v.clone()
+        when Option::None then Vec::new()
+        end
+        var observed: Vec[GenericParamId] = Vec::new()
+        collect_param_ids_in_type(tmpl.params[0].ty.clone(), &mut observed)
+        collect_param_ids_in_type(tmpl.ret_type.clone(), &mut observed)
+        var aliases: Map[Int, GenericParamId] = Map::new()
+        if has_noncanonical_param_ids(tmpl.generic_params.clone(), observed.clone()) then
+          aliases = canonical_param_aliases(param_names.clone(), tmpl.generic_params.clone(), observed)
+        end
+        rows.push(DevirtCandidate {
+          template_name: tmpl.name.clone(),
+          self_ty: rewrite_param_aliases_in_type(aliases.clone(), tmpl.params[0].ty.clone()),
+          generic_params: tmpl.generic_params.clone(),
+          ret_type: rewrite_param_aliases_in_type(aliases.clone(), tmpl.ret_type.clone()),
+          did: impl_did,
+          contract_method: cid.contract_method.clone(),
+          impl_param_count: cid.impl_param_count,
+          method_param_count: cid.method_param_count
+        })
+        index.insert(key, rows)
+      end
     end
   end
   index
@@ -2744,17 +2909,22 @@ end
 
 # Resolve ONE bound-receiver contract call to the concrete impl method's
 # instance operand. Returns None when the site is not this wave's class
-# (the caller keeps it). A concrete receiver with candidate impl
-# templates that do not unify records the fail-closed row in `errors`.
+# (the caller keeps it). A concrete receiver carrying the call's contract
+# token whose candidate impl templates do not resolve records the
+# fail-closed row in `errors`.
 def devirt_resolve_contract_call(
-  inout index: Map[String, Vec[DevirtCandidate]],
+  inout index: Map[Int, Vec[DevirtCandidate]],
   inout lowered: Set[String],
   inout func: MirFunction,
   block_id: Int,
-  callee_name: String,
+  callee_constant: MirConstant,
   args: Vec[MirCallArg],
   inout errors: Vec[String]
 ) -> Option[MirOperand]
+  let callee_name = match callee_constant.kind
+  when MirConstantKind::MirFnItem(n) then n
+  when _ then return Option::None
+  end
   # The contract surface is a BARE method name; an emission-mangled name
   # (or a lowered function / intrinsic label) belongs to another class.
   if lowered.contains(&callee_name) then
@@ -2766,6 +2936,15 @@ def devirt_resolve_contract_call(
   end
   if devirt_intrinsic_surface(callee_name.clone()) then
     return Option::None
+  end
+  # (P0-4) the call's SEMANTIC contract identity: the callee operand's
+  # instance def must be a contract method token (stamped by the MIR
+  # lowering from the checker's bound-contract record). A name-only call
+  # carries no identity — kept, never resolved by a method-name guess.
+  let contract_inst = match callee_constant.instance.clone()
+  when Option::Some(i) then
+    if is_contract_method_token(i.def.def.clone()) then i else return Option::None end
+  when Option::None then return Option::None
   end
   match devirt_receiver_type(&mut func, args)
   when Option::None then Option::None
@@ -2783,7 +2962,8 @@ def devirt_resolve_contract_call(
     when Type::Adt(_, _) then true
     when _ then false
     end
-    let cands = match index.get(&method)
+    let key = def_id_numeric(&contract_inst.def.def)
+    let cands = match index.get(&key)
     when Option::Some(v) then v.clone()
     when Option::None then Vec::new()
     end
@@ -2809,15 +2989,51 @@ def devirt_resolve_contract_call(
       if !devirt_unify_head(cand.self_ty.clone(), recv_ty.clone(), &mut bind) then
         next
       end
-      # every declaration-order parameter must be solved by the receiver
-      # type — an unsolved parameter makes the candidate unselectable
-      # (never a fabricated argument).
+      # (P0-5) the call's ALREADY-SOLVED method-level values pair the
+      # candidate's TRAILING binders (declaration order; impl conformance
+      # aligns the method arity). The payload's declared arity must match
+      # the candidate's, every value must be fully concrete, and a value
+      # the receiver unification already bound must agree (a conflict
+      # rejects the candidate — never a silent overwrite).
       var solved = true
+      if contract_inst.args.len() != cand.method_param_count then
+        solved = false
+      else
+        var mvi = 0
+        while mvi < contract_inst.args.len() do
+          match devirt_method_value_concrete(contract_inst.args[mvi].clone())
+          when Option::None then
+            solved = false
+            break
+          when Option::Some(value) then
+            let pos = cand.impl_param_count + mvi
+            if pos < 0 || pos >= cand.generic_params.len() then
+              solved = false
+              break
+            end
+            let gkey = generic_param_id_numeric(&cand.generic_params[pos])
+            match bind.get(gkey)
+            when Option::Some(prev) then
+              if !type_eq(&prev, &value) then
+                solved = false
+                break
+              end
+            when Option::None then bind.insert(gkey, value)
+            end
+          end
+          mvi = mvi + 1
+        end
+      end
+      # every declaration-order parameter must be solved by the merge — an
+      # unsolved parameter makes the candidate unselectable (never a
+      # fabricated argument).
       var tmpl_args: Vec[GenericArg] = Vec::new()
-      for gpid in cand.generic_params.clone() do
-        match bind.get(generic_param_id_numeric(&gpid))
-        when Option::Some(bound) then tmpl_args.push(generic_arg_of_type_view(bound.clone()))
-        when Option::None then solved = false
+      if solved then
+        for gpid in cand.generic_params.clone() do
+          match bind.get(generic_param_id_numeric(&gpid))
+          when Option::Some(bound) then tmpl_args.push(generic_arg_of_type_view(bound.clone()))
+          when Option::None then solved = false
+          end
         end
       end
       if !solved then
@@ -2886,8 +3102,11 @@ def devirtualize_contract_calls(inout mir: MirProgram, inout errors: Vec[String]
         match callee.kind
         when MirOperandKind::MirConstant(cv) then
           match cv.kind
-          when MirConstantKind::MirFnItem(name) then
-            rewrite = devirt_resolve_contract_call(&mut index, &mut lowered, &mut f_out, bi, name.clone(), args.clone(), &mut errors)
+          when MirConstantKind::MirFnItem(_) then
+            # (P0-4/P0-5) the whole constant travels: the callee name is
+            # the surface gate and the constant's InstanceId carries the
+            # contract identity and the solved method-level payload.
+            rewrite = devirt_resolve_contract_call(&mut index, &mut lowered, &mut f_out, bi, cv.clone(), args.clone(), &mut errors)
           when _ then ()
           end
         when _ then ()
@@ -3029,24 +3248,24 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
 
   # Phase 2c: devirtualize the trait-contract calls (the seed's bodyless
   # re-dispatch). A call on a generic-bound receiver keeps the contract's
-  # bare surface name (`advance`) until the receiver's type is concrete;
-  # the wave selects the concrete impl's method template by the
-  # substituted receiver type, rewrites the callee operand to that
+  # bare surface name (`advance`) plus the checker's contract identity
+  # until the receiver's type is concrete; the wave selects the concrete
+  # impl's method template BY THE CONTRACT TOKEN (P0-4) with the merged
+  # receiver/method bindings (P0-5), rewrites the callee operand to that
   # template's emission name + solved instance, and re-drains so the
   # selected instance is specialized. The wave is re-run until it is a
-  # fixpoint: a specialized body can expose newly-concrete receivers
-  # (the deferral rule) whose own call sites need the next round.
+  # fixpoint: a specialized body can expose newly-concrete receivers (the
+  # deferral rule) whose own call sites need the next round.
+  #
+  # (P1-1) NO round bound: the wave is MONOTONIC — every rewrite replaces
+  # a contract surface with a LOWERED name that the next pass's lowered
+  # set contains, so a rewritten site is never a candidate again, and new
+  # contract surfaces appear only in newly specialized bodies (bounded by
+  # MAX_MONO_INSTANCES). A finite program therefore always reaches the
+  # fixpoint; the instance limit reports the resource diagnostic it is,
+  # never a "non-terminating" claim.
   var devirt_changed = true
-  var devirt_rounds = 0
   while devirt_changed do
-    devirt_rounds = devirt_rounds + 1
-    if devirt_rounds > MAX_MONO_DEVIRT_ROUNDS then
-      let msg = "monomorphization: trait-contract devirtualization did not reach a fixpoint after " + MAX_MONO_DEVIRT_ROUNDS.to_string() + " rounds (every round rewrote at least one call site — a non-terminating receiver chain)"
-      if !errors.contains(&msg) then
-        errors.push(msg)
-      end
-      return Result::Err(errors)
-    end
     devirt_changed = devirtualize_contract_calls(mir, &mut errors, cache.generic_param_names.clone())
     if devirt_changed then
       for func in mir.functions do
@@ -3104,14 +3323,45 @@ def mono_drain_worklist(
       # map key.
       let key_struct = structured_instance_key(cache, &inst)
       let key = structural_instance_mangle_text(key_struct.clone())
+      # (instance labels): register the identity -> emission-label row for
+      # this instance (cache hits included — an earlier pop appended the
+      # body). Codegen's MirDeinit finalizer resolution reads it through
+      # MirProgram.instance_labels; a failed specialization aborts the
+      # whole mono (fail-closed errors), so no row outlives a missing body.
+      mir.instance_labels.insert(mir_instance_identity_key(&inst), key.clone())
       # Cache hit (specialized by an earlier pop or by the external APIs):
       # nothing to do — the body is already in the program.
       if !cache.instances.contains_key(&key_struct) then
         var found: Option[MirFunction] = Option::None
+        # (P0-4): template identity is SEMANTIC — an instance whose def is
+        # an impl method's DefId selects the template carrying that
+        # callable. Two same-named templates from different traits (their
+        # emission names collide: `Both__bump` from trait A and from trait
+        # B) therefore specialize their OWN bodies; first-by-name alone
+        # would specialize whichever was lowered first under the other's
+        # identity. Instances whose def is not a template callable (the
+        # bare-name fallback) keep the first-by-name lookup.
         for f in mir.functions do
-          if f.name == callee_name then
-            found = Option::Some(f)
-            break
+          match f.callable
+          when Option::Some(c) then
+            if f.name == callee_name && def_id_numeric(&c.def) == def_id_numeric(&inst.def.def) then
+              found = Option::Some(f)
+              break
+            end
+          when Option::None then ()
+          end
+        end
+        var drain_found = false
+        match found
+        when Option::Some(_) then drain_found = true
+        when Option::None then ()
+        end
+        if !drain_found then
+          for f in mir.functions do
+            if f.name == callee_name then
+              found = Option::Some(f)
+              break
+            end
           end
         end
         match found
@@ -3181,9 +3431,70 @@ def scan_call_sites_in_function(
   for block in func.blocks do
     match block.terminator.kind
     when MirTerminatorKind::MirCall(dest, callee, args, _, _, _, _) then
-      enqueue_call_instance(callee, mir, cache, pending, seen, errors)
+      enqueue_call_instance(callee, func.name.clone(), mir, cache, pending, seen, errors)
+    when MirTerminatorKind::MirDeinit(_, deinit_fn, _, _) then
+      enqueue_deinit_instance(deinit_fn, mir, cache, pending, seen, errors)
     when _ then ()
     end
+  end
+end
+
+# Enqueue ONE MirDeinit FINALIZER instance: the payload is a SEMANTIC
+# InstanceId (the finalizer method's DefId + the solved concrete args — never
+# a name). The finalizer template's name comes from the MIR's
+# method_names_by_def (DefId -> mangled "Type__drop" / "Type__deinit"); a
+# NON-generic finalizer is itself the emitted function and needs no
+# instance. A GENERIC finalizer with a concrete payload is specialized
+# exactly like a call instance (same queue, same structured key, same drain
+# naming), so codegen's MirDeinit label resolution finds a real INSTANCE
+# label (MirProgram.instance_labels) instead of the never-emitted template
+# — the generic-Drop-impl class (Box/Rc/UniquePtr/BufWriter drops) whose
+# template bodies carry the impl's Params and must never be emitted. A
+# payload still carrying the caller's Params DEFERS (the caller's
+# specialization substitutes it and the re-walk enqueues the concrete
+# instance); an EMPTY payload on a generic finalizer is the same
+# compiler-internal gap enqueue_call_instance records.
+def enqueue_deinit_instance(
+  instance: InstanceId,
+  mir: MirProgram,
+  cache: MonoCache,
+  inout pending: VecDeque[(String, InstanceId)],
+  inout seen: Set[StructuralInstanceId],
+  inout errors: Vec[String]
+) -> Unit
+  var base = "".to_string()
+  match mir.method_names_by_def.get(def_id_numeric(&instance.def.def))
+  when Option::Some(nm) then base = nm.clone()
+  when Option::None then return
+  end
+  var template: Option[MirFunction] = Option::None
+  for candidate in mir.functions do
+    if candidate.name == base then
+      template = Option::Some(candidate)
+      break
+    end
+  end
+  match template
+  when Option::Some(tf) then
+    if !is_generic_function(tf) then
+      return
+    end
+    if instance.args.is_empty() then
+      let msg = "generic finalizer `" + base + "` reached the monomorphizer without a solved deinit instance — every MirDeinit finalizer carries its solved instance; inference is not performed"
+      if !errors.contains(&msg) then
+        errors.push(msg)
+      end
+      return
+    end
+    if has_any_param_args(&instance.args) then
+      return
+    end
+    let key = structured_instance_key(cache, &instance)
+    if !seen.contains(&key) then
+      seen.insert(key)
+      pending.push_back((base, instance))
+    end
+  when Option::None then ()
   end
 end
 
@@ -3198,6 +3509,7 @@ end
 # is never performed).
 def enqueue_call_instance(
   callee: MirOperand,
+  site_fn: String,
   mir: MirProgram,
   cache: MonoCache,
   inout pending: VecDeque[(String, InstanceId)],
@@ -3208,6 +3520,18 @@ def enqueue_call_instance(
   when MirOperandKind::MirConstant(cv) then
     match cv.kind
     when MirConstantKind::MirFnItem(callee_name) then
+      # (P0-4) a bound-contract call's payload is the SEMANTIC contract
+      # identity (the devirtualization wave owns the site; it rewrites the
+      # callee to the concrete impl's instance). It is never a
+      # specialization template — enqueueing it would fabricate a
+      # template relationship from a name.
+      match cv.instance.clone()
+      when Option::Some(inst) then
+        if is_contract_method_token(inst.def.def.clone()) then
+          return
+        end
+      when Option::None then ()
+      end
       # Look up the callee in the program — is it generic?
       var is_generic = false
       for candidate in mir.functions do

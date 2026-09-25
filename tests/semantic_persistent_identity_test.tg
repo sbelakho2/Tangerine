@@ -14,6 +14,12 @@
 #       driven by snapshot_lineage_lane_check (tg_compiler/semantic_snapshot.tg).
 #   (2) TYPED MEMBER LINEAGE: the "ml" render round-trips through the
 #       snapshot text (semantic_snapshot_parse_lane_check).
+#   (3) PERSISTENT HIR IDENTITY (P1-2): the pre-lowering HIR stamp runs
+#       BEFORE MIR lowering, so an unrelated source/HIR node inserted
+#       before an existing call statement (renumbering its parse locator)
+#       leaves the call's StableSemanticNodeId — derived from the
+#       store-backed FromHir provenance — byte-identical across the two
+#       compiles on the same lineage store.
 #
 # Run with the repo root as the working directory:
 #   tg test tests/semantic_persistent_identity_test.tg
@@ -24,13 +30,15 @@ use std::test::*
 
 use tg_compiler::codegen::{detect_host_target}
 use tg_compiler::compiler_core::{default_options}
+use tg_compiler::mir::{MirProgram, MirTerminatorKind}
 use tg_compiler::semantic_model::{SemanticSnapshot}
 use tg_compiler::semantic_server::{session_compile_source}
 use tg_compiler::semantic_snapshot::{
   snapshot_lineage_lane_check, semantic_snapshot_parse_lane_check
 }
 use tg_compiler::stable_ids::{
-  stable_lineage_store_new, stable_lineage_store_apply_move, DeclMove
+  stable_lineage_store_new, stable_lineage_store_apply_move, DeclMove,
+  stable_semantic_node_id_of_origin, stable_semantic_node_key_text
 }
 
 # The digest words of the snapshot symbol row whose declared name matches
@@ -125,4 +133,84 @@ def test_rename_without_continuation_rekeys_declaration_identity() -> Unit
     "both declarations must be present")
   assert(before != after,
     "without a continuation the renamed declaration must re-key (removed+created)")
+end
+
+# ———————————————————————————————————————————————————————————————
+# (P1-2) PERSISTENT HIR IDENTITY ACROSS AN UNRELATED INSERTION
+# ———————————————————————————————————————————————————————————————
+# The compiled fixture: pid_hir_host contains ONE call statement to
+# pid_hir_callee. `insert` adds an unrelated `let` statement BEFORE it —
+# the parse/assign_node_ids pass renumbers the call's locator from one
+# build to the next. The call terminator's FromHir provenance must carry
+# the store-backed HIR identity (stamped BEFORE lowering), so the
+# StableSemanticNodeId derived from it is byte-identical across the two
+# compiles on the SAME lineage store.
+def pid_hir_source(insert: Bool) -> String
+  var body = ""
+  if insert then
+    body = "  let unrelated_marker = 1\n"
+  end
+  "def pid_hir_callee(x: Int) -> Int\n" +
+  "  x\n" +
+  "end\n" +
+  "\n" +
+  "def pid_hir_host(a: Int) -> Int\n" +
+  body +
+  "  pid_hir_callee(a)\n" +
+  "  0\n" +
+  "end\n" +
+  "\n" +
+  "def main() -> Int\n" +
+  "  pid_hir_host(1)\n" +
+  "end\n"
+end
+
+# The canonical semantic-id texts of every CALL terminator's typed
+# provenance, sorted — the cross-build invariant surface. Only call
+# terminators are compared: the inserted `let` legitimately adds its own
+# (new) statement identity, but no EXISTING call node may re-key.
+def pid_semantic_call_texts(mir_opt: Option[MirProgram]) -> Vec[String]
+  var out: Vec[String] = Vec::new()
+  match mir_opt
+  when Option::Some(mir) then
+    for f in mir.functions do
+      for blk in f.blocks do
+        match blk.terminator.kind
+        when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic, tail } then
+          match blk.terminator.provenance
+          when Option::Some(prov) then
+            let sid = stable_semantic_node_id_of_origin(
+              f.name.clone(), prov, "call".to_string(), "".to_string(), Vec::new())
+            out.push(stable_semantic_node_key_text(sid))
+          when Option::None then ()
+          end
+        when _ then ()
+        end
+      end
+    end
+  when Option::None then ()
+  end
+  out.sort()
+  out
+end
+
+@test
+def test_persistent_hir_identity_survives_unrelated_insertion() -> Unit
+  var store = stable_lineage_store_new()
+  let session_a = match session_compile_source(pid_hir_source(false),
+    "pid_hir_a.tg".to_string(), detect_host_target(), default_options(), store.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then panic("HIR insertion lane compile A failed: " + e)
+  end
+  let ids_a = pid_semantic_call_texts(session_a.final_mir.clone())
+  assert(ids_a.len() > 0,
+    "the HIR insertion lane fixture must lower at least one call terminator")
+  let session_b = match session_compile_source(pid_hir_source(true),
+    "pid_hir_b.tg".to_string(), detect_host_target(), default_options(), store.clone())
+  when Result::Ok(s) then s
+  when Result::Err(e) then panic("HIR insertion lane compile B failed: " + e)
+  end
+  let ids_b = pid_semantic_call_texts(session_b.final_mir.clone())
+  assert(ids_a.len() == ids_b.len() && ids_a.join("\n") == ids_b.join("\n"),
+    "an unrelated source/HIR insertion must not re-key any existing call node's StableSemanticNodeId")
 end

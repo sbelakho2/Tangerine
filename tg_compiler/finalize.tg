@@ -50,7 +50,7 @@ use tg_compiler::parser::{Diagnostic}
 use tg_compiler::types::{TypeEnv}
 use tg_compiler::resource_check::{AnalyzedProgram}
 use tg_compiler::compiler_core::{
-  CompilerOptions, driver_lower_to_mir, type_errors_to_diags, mir_verify_everything
+  CompilerOptions, driver_lower_to_mir_with_hir_lineage, type_errors_to_diags, mir_verify_everything
 }
 use tg_compiler::mir::{
   MirProgram, MirBlockId, verify_mir,
@@ -60,8 +60,11 @@ use tg_compiler::mir::{
 use tg_compiler::codegen::{
   detect_host_target, stamp_tail_abi_plans, stamp_slp_vector_facility_desc
 }
-use tg_compiler::mono::{monomorphize_program, mono_cache_new_persistent}
-use tg_compiler::semantic_snapshot::{snapshot_lineage_view_of, SnapshotError}
+use tg_compiler::mono::{
+  monomorphize_program, mono_cache_new_persistent,
+  MonoIdentityError, mono_identity_error_text
+}
+use tg_compiler::semantic_snapshot::{snapshot_pre_lower_views_of, SnapshotError}
 use tg_compiler::stable_ids::{DeclLineageStore}
 use tg_compiler::target_desc::{TargetDesc}
 
@@ -104,6 +107,13 @@ pub struct FinalizeOptions
   # The compiler options of this compile: opt_level, mode /
   # verify_everything, target triple.
   compiler: CompilerOptions
+  # (P1-2) The compiled source text when the caller has it (the session /
+  # driver routes). The pre-lowering HIR stamping slices each source node's
+  # content from it to build the persistent HIR anchors, so an unrelated
+  # insertion never re-keys a node. "" (kernel/bootstrap/dump-abi/default
+  # callers) stamps no HIR nodes — the documented sequence-derived
+  # bootstrap fallback stays in force.
+  source_text: String = ""
   # Capture the optimizer's decision rows on program.opt_decisions (the
   # rationale artifact's grounding). True only where this build persists a
   # rationale store fed from opt_decisions_of_mir (the snapshot route and
@@ -258,30 +268,39 @@ end
 # ———————————————————————————————————————————————————————————————
 # finalize_verified_mir — the ONE finalized-MIR pipeline. Owns, in order:
 #
-#   1. lowering (driver_lower_to_mir over the analyzed artifact);
-#   2. the post-lower verify_mir;
-#   3. the §11 effect-class, purity and @budget annotation checks (each a
+#   1. THE PRE-LOWERING PERSISTENT IDENTITY VIEWS: the declaration lineage
+#      view (the persistent mono cache's binding) AND the HIR-node lineage
+#      view are stamped through `lineage_store` BEFORE any MIR exists
+#      (snapshot_pre_lower_views_of) — the MirBuilder receives the
+#      persistent HIR ids, so every source-derived node is born with
+#      MirNodeOrigin::FromHir(store-backed id, role, sibling) (P1-2);
+#   2. lowering (driver_lower_to_mir over the analyzed artifact, with the
+#      HIR lineage view);
+#   3. the post-lower verify_mir;
+#   4. the §11 effect-class, purity and @budget annotation checks (each a
 #      structured-diagnostic compile error, E0232/E0234/E0235);
-#   4. the pre-mono callable lineage view stamped through `lineage_store`
-#      (snapshot_lineage_view_of) and the PERSISTENT mono cache
-#      (mono_cache_new_persistent);
-#   5. monomorphization;
-#   6. the UNCONDITIONAL post-mono verify_mir (the audited missing stage);
-#   7. the AbiCallPlan + SLP target stamps;
-#   8. the optimizer — optimize_mir_verified under the options' one
+#   5. the PERSISTENT mono cache (mono_cache_new_persistent over the
+#      pre-lowering callable view);
+#   6. monomorphization;
+#   7. the UNCONDITIONAL post-mono verify_mir (the audited missing stage);
+#   8. the AbiCallPlan + SLP target stamps;
+#   9. the optimizer — optimize_mir_verified under the options' one
 #      verify-everything policy, or optimize_mir_with_decisions when the
 #      route captures rationale rows; the machine scheduler's opt-level
 #      stamp follows the same level the optimizer consumed;
-#   9. the post-opt verify_mir;
-#  10. the final pre-codegen verify_mir firewall over the exact IR the
+#  10. the post-opt verify_mir;
+#  11. the final pre-codegen verify_mir firewall over the exact IR the
 #      route consumes.
 #
 # `env` is the analyzer's live TypeEnv (the annotation checks and the
-# lineage view consume the checker's resolution / claim tables — NOT the
+# lineage views consume the checker's resolution / claim tables — NOT the
 # reduced engine snapshot carried inside AnalyzedProgram). `lineage_store`
-# is the caller's persistent store: the entry stamps the view through it
+# is the caller's persistent store: the entry stamps the views through it
 # (mutating the store's revision state) and the caller threads the SAME
-# store into the snapshot build / publication afterwards.
+# store into the snapshot build / publication afterwards. `options.
+# source_text` (when the caller has it) is the content source of the HIR
+# anchors; a text-less caller stamps no HIR nodes and keeps the documented
+# sequence-derived bootstrap fallback.
 #
 # The kernel/bootstrap routes never call this entry (see the module doc);
 # every full-library production route calls it exactly once.
@@ -294,10 +313,29 @@ pub def finalize_verified_mir(
 ) -> Result[VerifiedFinalMir, FinalizeFailure]
   let opts = options.compiler.clone()
 
-  # 1. Lowering. The analyzed artifact's own AST is the lowered program's
+  # 1. THE PRE-LOWERING PERSISTENT IDENTITY VIEWS (P1-2). The declaration
+  # lineage view the persistent mono cache binds from AND the HIR-node view
+  # are stamped through `lineage_store` BEFORE lowering: every source node
+  # gets its persistent store-backed HIR identity, so the MirBuilder below
+  # is born with MirNodeOrigin::FromHir(persistent id, role, sibling) on
+  # every source-derived node — never a post-hoc sequence-derived record.
+  # The declaration seeds are the same registration rows the post-mono def
+  # walk re-stamps, so both re-derive byte-identical StableDeclIds.
+  let pre_views = match snapshot_pre_lower_views_of(
+    &env, &analyzed.typed, &analyzed.ast, options.source_text.clone(), &mut lineage_store)
+  when Result::Ok(v) then v
+  when Result::Err(e) then
+    return Result::Err(FinalizeFailure {
+      stage: "lineage".to_string(),
+      rows: Vec::from([finalize_snapshot_error_text(e)])
+    })
+  end
+
+  # 2. Lowering. The analyzed artifact's own AST is the lowered program's
   # source (analyze_parsed stores typed.ast; the kernel convenience entry
-  # lowers the same face) — no route re-threads a separate AST.
-  var mir = match driver_lower_to_mir(&analyzed.ast, Option::Some(analyzed.clone()))
+  # lowers the same face) — no route re-threads a separate AST. The
+  # pre-lowering HIR lineage view reaches the builder here.
+  var mir = match driver_lower_to_mir_with_hir_lineage(&analyzed.ast, Option::Some(analyzed.clone()), pre_views.hir.clone())
   when Result::Ok(m) then m
   when Result::Err(e) then
     return Result::Err(FinalizeFailure {
@@ -306,7 +344,7 @@ pub def finalize_verified_mir(
     })
   end
 
-  # 2. The post-lower verification boundary.
+  # 3. The post-lower verification boundary.
   let post_lower_errs = verify_mir(&mir)
   if !post_lower_errs.is_empty() then
     return Result::Err(FinalizeFailure {
@@ -315,7 +353,7 @@ pub def finalize_verified_mir(
     })
   end
 
-  # 3. The annotation checks (the same structured-diagnostic channel the
+  # 4. The annotation checks (the same structured-diagnostic channel the
   # routes used: the failure carries the typed diagnostics and the route
   # renders them through its own emitter / row helper).
   let mir_effect_errs = check_effect_class_annotations_mir(&mir, env)
@@ -340,21 +378,17 @@ pub def finalize_verified_mir(
     })
   end
 
-  # 4. The persistent declaration-lineage view (stamped AFTER lowering /
-  # verification and BEFORE monomorphization, so every source callable
-  # carries its persisted declaration before any instance enqueues) and
-  # the persistent mono cache.
-  let lineage_view = match snapshot_lineage_view_of(&env, &analyzed.typed, &mir, &mut lineage_store)
-  when Result::Ok(v) then v
+  # 5. The persistent mono cache (the declaration view stamped in step 1).
+  var mono_cache = match mono_cache_new_persistent(&analyzed.ast, &analyzed.resolutions, pre_views.callables)
+  when Result::Ok(c) then c
   when Result::Err(e) then
     return Result::Err(FinalizeFailure {
       stage: "lineage".to_string(),
-      rows: Vec::from([finalize_snapshot_error_text(e)])
+      rows: Vec::from([mono_identity_error_text(e)])
     })
   end
-  var mono_cache = mono_cache_new_persistent(&analyzed.ast, &analyzed.resolutions, lineage_view)
 
-  # 5. Monomorphization.
+  # 6. Monomorphization.
   match monomorphize_program(&mut mir, &mut mono_cache)
   when Result::Ok(_) then ()
   when Result::Err(me) then
@@ -370,7 +404,7 @@ pub def finalize_verified_mir(
   when FinalizeProbe::Clean then ()
   end
 
-  # 6. THE UNCONDITIONAL POST-MONO CHECKPOINT: the generic substitution is
+  # 7. THE UNCONDITIONAL POST-MONO CHECKPOINT: the generic substitution is
   # a transformative boundary every build must re-prove.
   let post_mono_errs = verify_mir(&mir)
   if !post_mono_errs.is_empty() then
@@ -380,7 +414,7 @@ pub def finalize_verified_mir(
     })
   end
 
-  # 7. The route's stamp seams: the authoritative AbiCallPlan oracle
+  # 8. The route's stamp seams: the authoritative AbiCallPlan oracle
   # before the tail pass, then the SLP target-capability stamp keyed on
   # the route's effective target descriptor.
   if options.stamp_tail_abi_plans then
@@ -408,7 +442,7 @@ pub def finalize_verified_mir(
     })
   end
 
-  # 8. The optimizer under the ONE verify-everything policy the kernel
+  # 9. The optimizer under the ONE verify-everything policy the kernel
   # pipeline also derives (mir_verify_everything: Dev/Strict builds verify
   # after every transformative pass). The decision-capturing sibling
   # stores the rationale rows on the program; the optimized MIR is
@@ -422,7 +456,7 @@ pub def finalize_verified_mir(
   end
   mir.opt_level = opts.opt_level
 
-  # 9. The post-opt verification boundary.
+  # 10. The post-opt verification boundary.
   let post_opt_errs = verify_mir(&mir)
   if !post_opt_errs.is_empty() then
     return Result::Err(FinalizeFailure {
@@ -431,7 +465,7 @@ pub def finalize_verified_mir(
     })
   end
 
-  # 10. The FINAL pre-codegen firewall: the verifier re-proves the exact
+  # 11. The FINAL pre-codegen firewall: the verifier re-proves the exact
   # IR instance the route hands to codegen / the snapshot builder.
   let pre_codegen_errs = verify_mir(&mir)
   if !pre_codegen_errs.is_empty() then

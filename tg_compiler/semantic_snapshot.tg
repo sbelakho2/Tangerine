@@ -314,6 +314,11 @@ use tg_compiler::stable_ids::{
   BinderLineageId, stable_binder_lineage_stamp, stable_binder_scope_key,
   HirNodeLineageId, stable_hir_lineage_stamp, stable_hir_scope_key,
   StableHirNodeId, stable_hir_node_identity_text, stable_mir_node_is_generated,
+  # (P1-2) the PRE-LOWERING persistent HIR-node view the finalize pipeline
+  # stamps before lowering and threads into the MirBuilder, plus the
+  # store-backed node stamp the same revision window binds.
+  HirNodeLineageView, hir_node_lineage_view_new, hir_node_lineage_view_bind,
+  stable_hir_node_lineage_stamp,
   # (persistent identity integration) the structural instance identity the
   # rename/move regression lane pins, plus the index-free registration
   # constructor the ephemeral comparison builds from.
@@ -341,7 +346,7 @@ use tg_compiler::resource_check::{ResourceDropPlanFact, ResourceDmaFact}
 use tg_compiler::ast::{
   Item, ItemKind, ModuleDecl, Visibility, ExternItem, ContractClause, AstContractKind,
   AccessConvention, Expr, ExprKind, BinOp, UnOp, Block, Stmt, StmtKind, Pattern, PatternKind,
-  TypeExpr, TypeExprKind, GuardElse, IfStmt, MatchExpr
+  TypeExpr, TypeExprKind, GuardElse, IfStmt, MatchExpr, FunctionDecl, FnBody
 }
 use tg_compiler::types::{
   Type, TypeEnv, TypedProgram, TypeDefKind, EffectSummary, CapabilityId, FnSignature,
@@ -395,6 +400,9 @@ use tg_compiler::mir::{
   MirConstantKind, MirRvalue, MirRvalueKind, MirTypeDefKind, MirTypeDef, CastKind, Place, Projection,
   MirEffectState, mir_effect_scan_function, MirCallArg, MirCallValue,
   MirTerminator, AssertMessage, MirBinOp,
+  # (P1-2) the empty program the pre-lowering identity views' build context
+  # carries (the declaration/HIR stamping needs only the typed tables).
+  mir_program_empty,
   # (audit order item 1 closeout) the untracked-artifact detector: a
   # persistent snapshot is never built from origin-less MIR.
   mir_untracked_artifact,
@@ -2938,15 +2946,16 @@ def snapshot_stamp_binders(
   out
 end
 
-# Stamp every SOURCE HIR NODE the finalized MIR's statement origins carry,
-# in the CALLER's open revision, and return the HIR scope key ->
-# HirNodeLineageId map. Compiler-GENERATED origins are excluded (the
-# {origin-set, transform-id, role, seq} family owns no HIR node); the
-# anchor is the origin's canonical stable_hir_node_identity_text — a
-# lineage-bearing node keeps its persistent anchor, a lineage-less node
-# binds the documented "H<seq>" bootstrap locator. Multiple MIR instances
-# of one generic owner share the same anchor and dedup to the FIRST
-# occurrence.
+# Stamp every SOURCE HIR NODE the finalized MIR's statement AND TERMINATOR
+# origins carry (P1-2: calls/branches/returns live in terminators, so the
+# terminator origins are stamped in the same pass), in the CALLER's open
+# revision, and return the HIR scope key -> HirNodeLineageId map.
+# Compiler-GENERATED origins are excluded (the {origin-set, transform-id,
+# role, seq} family owns no HIR node); the anchor is the origin's canonical
+# stable_hir_node_identity_text — a lineage-bearing node (the pre-lowering
+# store-backed path) keeps its persistent anchor, a lineage-less node binds
+# the documented "H<seq>" bootstrap locator. Multiple MIR instances of one
+# generic owner share the same anchor and dedup to the FIRST occurrence.
 def snapshot_stamp_hir_nodes(
   inout store: DeclLineageStore,
   ctx: SnapshotBuildCtx,
@@ -2974,7 +2983,16 @@ def snapshot_stamp_hir_nodes(
               if !stable_mir_node_is_generated(node.clone()) then
                 match node.origin
                 when Option::Some(hir) then
-                  let anchor = stable_hir_node_identity_text(&hir)
+                  # (P1-2) a store-backed origin carries the content anchor
+                  # its row was keyed on; the sequence-derived fallback has
+                  # none and anchors on its identity text (the "H<seq>"
+                  # locator). Either way the post-mono walk re-signs the
+                  # EXACT row the pre-lowering stamp created.
+                  let anchor = if hir.content_anchor.len() > 0 then
+                    hir.content_anchor.clone()
+                  else
+                    stable_hir_node_identity_text(&hir)
+                  end
                   let scope = stable_hir_scope_key(owner_key.clone(), anchor.clone())
                   if !seen.contains(&scope) then
                     seen.insert(scope.clone())
@@ -2990,6 +3008,32 @@ def snapshot_stamp_hir_nodes(
             end
             si = si + 1
           end
+          # (P1-2) the TERMINATOR origin of the block: calls, branches and
+          # returns are lowered terminators — their HIR nodes are source
+          # nodes of the owner exactly like the statement origins above.
+          match f.blocks[bi].terminator.origin
+          when Option::Some(tnode) then
+            if !stable_mir_node_is_generated(tnode.clone()) then
+              match tnode.origin
+              when Option::Some(hir) then
+                let anchor = if hir.content_anchor.len() > 0 then
+                  hir.content_anchor.clone()
+                else
+                  stable_hir_node_identity_text(&hir)
+                end
+                let scope = stable_hir_scope_key(owner_key.clone(), anchor.clone())
+                if !seen.contains(&scope) then
+                  seen.insert(scope.clone())
+                  let sd = snapshot_member_sig_digest(anchor.clone())
+                  let id = stable_hir_lineage_stamp(store, owner_key.clone(), owner.clone(),
+                    anchor.clone(), sd.0, sd.1, anchor.clone())
+                  out.insert(scope, id)
+                end
+              when Option::None then ()
+              end
+            end
+          when Option::None then ()
+          end
           bi = bi + 1
         end
       when Option::None then ()
@@ -2999,6 +3043,471 @@ def snapshot_stamp_hir_nodes(
     fi = fi + 1
   end
   out
+end
+
+# ———————————————————————————————————————————————————————————————
+# The PRE-LOWERING persistent identity views (P1-2)
+# ———————————————————————————————————————————————————————————————
+# finalize_verified_mir stamps these BEFORE MIR lowering: the declaration
+# identity transaction (the SAME seeds the post-mono def walk re-stamps, so
+# both re-derive byte-identical StableDeclIds) PLUS the HIR-node section of
+# every source node the lowering can turn into an origin. The HIR anchor is
+# the node's canonical CONTENT digest (its source slice — never the parse
+# locator), so an unrelated source/HIR insertion before the node never
+# re-keys the persistent number; every source-derived MIR node is then born
+# with MirNodeOrigin::FromHir(the store-backed identity, lowering_role,
+# sibling). Nodes the walk cannot see (imported dependency bodies —
+# their span.file is not the compiled source; closures; a text-less
+# caller) are simply absent from the view: the documented
+# stable_hir_node_id_of bootstrap fallback applies.
+
+# The pre-lowering view pair: the callable declaration view the persistent
+# mono cache binds from and the HIR node view the MirBuilder consults.
+pub struct PreLowerIdentityViews
+  callables: CallableLineageView
+  hir: HirNodeLineageView
+end
+
+# ONE collected HIR node of the pre-lowering walk: the parse/assign_node_ids
+# locator, the node kind word ("stmt" / "expr" — the anchor domain
+# separator) and the node's source span.
+struct SnapshotHirNodeRef
+  node_id: Int
+  kind_word: String
+  span: Span
+end
+
+def snapshot_hir_ref_push(inout out: Vec[SnapshotHirNodeRef], node_id: Int, kind_word: String, span: Span) -> Unit
+  if node_id > 0 then
+    out.push(SnapshotHirNodeRef {
+      node_id: node_id,
+      kind_word: kind_word,
+      span: span
+    })
+  end
+  ()
+end
+
+def snapshot_hir_option_expr_refs(e_opt: Option[Expr], inout out: Vec[SnapshotHirNodeRef]) -> Unit
+  match e_opt
+  when Option::Some(e) then snapshot_hir_expr_refs(e, &mut out)
+  when Option::None then ()
+  end
+  ()
+end
+
+def snapshot_hir_guard_refs(g: GuardElse, inout out: Vec[SnapshotHirNodeRef]) -> Unit
+  match g
+  when GuardElse::Return(e) then snapshot_hir_option_expr_refs(e, &mut out)
+  when GuardElse::Break(e2) then snapshot_hir_option_expr_refs(e2, &mut out)
+  when GuardElse::Panic(_) then ()
+  when GuardElse::Continue then ()
+  end
+  ()
+end
+
+def snapshot_hir_type_refs(te: TypeExpr, inout out: Vec[SnapshotHirNodeRef]) -> Unit
+  match te.kind
+  when TypeExprKind::Named(_, args) then
+    for a in args do snapshot_hir_type_refs(a.clone(), &mut out) end
+  when TypeExprKind::ConstExpr(e) then snapshot_hir_expr_refs(e, &mut out)
+  when TypeExprKind::Tuple(items) then
+    for it in items do snapshot_hir_type_refs(it.clone(), &mut out) end
+  when TypeExprKind::Array(elem, size_opt) then
+    snapshot_hir_type_refs(elem, &mut out)
+    snapshot_hir_option_expr_refs(size_opt, &mut out)
+  when TypeExprKind::Slice(elem2) then snapshot_hir_type_refs(elem2, &mut out)
+  when TypeExprKind::Ptr(elem3) then snapshot_hir_type_refs(elem3, &mut out)
+  when TypeExprKind::PtrMut(elem4) then snapshot_hir_type_refs(elem4, &mut out)
+  when TypeExprKind::Ref(elem5, _) then snapshot_hir_type_refs(elem5, &mut out)
+  when TypeExprKind::Fn(params, ret) then
+    for p in params do
+      snapshot_hir_type_refs(p.ty.clone(), &mut out)
+    end
+    snapshot_hir_type_refs(ret, &mut out)
+  when TypeExprKind::Async(inner) then snapshot_hir_type_refs(inner, &mut out)
+  when TypeExprKind::Effect(_, inner2) then snapshot_hir_type_refs(inner2, &mut out)
+  when _ then ()
+  end
+  ()
+end
+
+def snapshot_hir_pattern_refs(p: Pattern, inout out: Vec[SnapshotHirNodeRef]) -> Unit
+  match p.kind
+  when PatternKind::Literal(e) then snapshot_hir_expr_refs(e, &mut out)
+  when PatternKind::Tuple(items) then
+    for it in items do snapshot_hir_pattern_refs(it.clone(), &mut out) end
+  when PatternKind::Array(items2) then
+    for it2 in items2 do snapshot_hir_pattern_refs(it2.clone(), &mut out) end
+  when PatternKind::Struct(_, fields) then
+    for f in fields do snapshot_hir_pattern_refs(f.1.clone(), &mut out) end
+  when PatternKind::Variant(_, items3) then
+    for it3 in items3 do snapshot_hir_pattern_refs(it3.clone(), &mut out) end
+  when PatternKind::Or(items4) then
+    for it4 in items4 do snapshot_hir_pattern_refs(it4.clone(), &mut out) end
+  when PatternKind::Range(start, end_, _) then
+    snapshot_hir_option_expr_refs(start, &mut out)
+    snapshot_hir_option_expr_refs(end_, &mut out)
+  when _ then ()
+  end
+  ()
+end
+
+def snapshot_hir_block_refs(blk: Block, inout out: Vec[SnapshotHirNodeRef]) -> Unit
+  for st in blk.stmts do
+    snapshot_hir_stmt_refs(st.clone(), &mut out)
+  end
+end
+
+def snapshot_hir_if_refs(i: IfStmt, inout out: Vec[SnapshotHirNodeRef]) -> Unit
+  snapshot_hir_expr_refs(i.cond, &mut out)
+  snapshot_hir_block_refs(i.then_block, &mut out)
+  for br in i.elsif_branches do
+    snapshot_hir_expr_refs(br.0.clone(), &mut out)
+    snapshot_hir_block_refs(br.1.clone(), &mut out)
+  end
+  match i.else_block
+  when Option::Some(b) then snapshot_hir_block_refs(b, &mut out)
+  when Option::None then ()
+  end
+end
+
+def snapshot_hir_match_refs(m: MatchExpr, inout out: Vec[SnapshotHirNodeRef]) -> Unit
+  snapshot_hir_expr_refs(m.scrutinee, &mut out)
+  for arm in m.arms do
+    snapshot_hir_pattern_refs(arm.pattern.clone(), &mut out)
+    snapshot_hir_option_expr_refs(arm.guard_expr.clone(), &mut out)
+    snapshot_hir_block_refs(arm.body.clone(), &mut out)
+  end
+end
+
+def snapshot_hir_stmt_refs(st: Stmt, inout out: Vec[SnapshotHirNodeRef]) -> Unit
+  snapshot_hir_ref_push(&mut out, st.node_id, "stmt".to_string(), st.span.clone())
+  match st.kind
+  when StmtKind::StmtLet(pat, ty_opt, value, _) then
+    snapshot_hir_pattern_refs(pat, &mut out)
+    match ty_opt
+    when Option::Some(te) then snapshot_hir_type_refs(te, &mut out)
+    when Option::None then ()
+    end
+    snapshot_hir_expr_refs(value, &mut out)
+  when StmtKind::StmtAssign(target, value2) then
+    snapshot_hir_expr_refs(target, &mut out)
+    snapshot_hir_expr_refs(value2, &mut out)
+  when StmtKind::StmtCompoundAssign(_, target2, value3) then
+    snapshot_hir_expr_refs(target2, &mut out)
+    snapshot_hir_expr_refs(value3, &mut out)
+  when StmtKind::StmtIf(i) then snapshot_hir_if_refs(i, &mut out)
+  when StmtKind::StmtMatch(m) then snapshot_hir_match_refs(m, &mut out)
+  when StmtKind::StmtWhile(cond, body) then
+    snapshot_hir_expr_refs(cond, &mut out)
+    snapshot_hir_block_refs(body, &mut out)
+  when StmtKind::StmtFor(fs) then
+    snapshot_hir_pattern_refs(fs.pattern, &mut out)
+    snapshot_hir_expr_refs(fs.iter, &mut out)
+    snapshot_hir_block_refs(fs.body, &mut out)
+  when StmtKind::StmtLoop(b) then snapshot_hir_block_refs(b, &mut out)
+  when StmtKind::StmtReturn(e) then snapshot_hir_option_expr_refs(e, &mut out)
+  when StmtKind::StmtBreak(e2) then snapshot_hir_option_expr_refs(e2, &mut out)
+  when StmtKind::StmtContinue then ()
+  when StmtKind::StmtExpr(e3) then snapshot_hir_expr_refs(e3, &mut out)
+  when StmtKind::StmtUnsafe(_, b2) then snapshot_hir_block_refs(b2, &mut out)
+  when StmtKind::StmtDefer(b3) then snapshot_hir_block_refs(b3, &mut out)
+  when StmtKind::StmtGuard(cond2, else_) then
+    snapshot_hir_expr_refs(cond2, &mut out)
+    snapshot_hir_guard_refs(else_, &mut out)
+  when StmtKind::StmtTry(b4, catches, fin) then
+    snapshot_hir_block_refs(b4, &mut out)
+    for ca in catches do
+      snapshot_hir_pattern_refs(ca.pattern.clone(), &mut out)
+      snapshot_hir_block_refs(ca.body.clone(), &mut out)
+    end
+    match fin
+    when Option::Some(fb) then snapshot_hir_block_refs(fb, &mut out)
+    when Option::None then ()
+    end
+  when StmtKind::StmtWith(expr, pat2, body2) then
+    snapshot_hir_expr_refs(expr, &mut out)
+    snapshot_hir_pattern_refs(pat2, &mut out)
+    snapshot_hir_block_refs(body2, &mut out)
+  when StmtKind::StmtHandleWith(expr2, handlers) then
+    snapshot_hir_expr_refs(expr2, &mut out)
+    for h in handlers do
+      for ha in h.arms do
+        for hp in ha.params do
+          snapshot_hir_pattern_refs(hp.clone(), &mut out)
+        end
+        snapshot_hir_block_refs(ha.body.clone(), &mut out)
+      end
+    end
+  end
+  ()
+end
+
+def snapshot_hir_expr_refs(e: Expr, inout out: Vec[SnapshotHirNodeRef]) -> Unit
+  snapshot_hir_ref_push(&mut out, e.node_id, "expr".to_string(), e.span.clone())
+  match e.kind
+  when ExprKind::ExprArrayLit(elems) then
+    for el in elems do snapshot_hir_expr_refs(el.clone(), &mut out) end
+  when ExprKind::ExprArrayRepeat(el2, count2) then
+    snapshot_hir_expr_refs(*el2.get(), &mut out)
+    snapshot_hir_expr_refs(*count2.get(), &mut out)
+  when ExprKind::ExprTupleLit(elems2) then
+    for el3 in elems2 do snapshot_hir_expr_refs(el3.clone(), &mut out) end
+  when ExprKind::ExprStructLit(_, fields) then
+    for f in fields do snapshot_hir_expr_refs(f.1.clone(), &mut out) end
+  when ExprKind::ExprMapLit(pairs) then
+    for pr in pairs do
+      snapshot_hir_expr_refs(pr.0.clone(), &mut out)
+      snapshot_hir_expr_refs(pr.1.clone(), &mut out)
+    end
+  when ExprKind::ExprBinaryOp(_, left, right) then
+    snapshot_hir_expr_refs(*left.get(), &mut out)
+    snapshot_hir_expr_refs(*right.get(), &mut out)
+  when ExprKind::ExprUnaryOp(_, inner) then
+    snapshot_hir_expr_refs(*inner.get(), &mut out)
+  when ExprKind::ExprFieldAccess(base, _) then
+    snapshot_hir_expr_refs(*base.get(), &mut out)
+  when ExprKind::ExprMethodCall(base2, _, _, margs) then
+    snapshot_hir_expr_refs(*base2.get(), &mut out)
+    for ma in margs do snapshot_hir_expr_refs(ma.clone(), &mut out) end
+  when ExprKind::ExprIndex(b3, idx) then
+    snapshot_hir_expr_refs(*b3.get(), &mut out)
+    snapshot_hir_expr_refs(*idx.get(), &mut out)
+  when ExprKind::ExprCall(callee, cargs) then
+    snapshot_hir_expr_refs(*callee.get(), &mut out)
+    for ca in cargs do snapshot_hir_expr_refs(ca.clone(), &mut out) end
+  when ExprKind::ExprClosure(cparams, _, body) then
+    for cp in cparams do snapshot_hir_pattern_refs(cp.pat.clone(), &mut out) end
+    snapshot_hir_expr_refs(*body.get(), &mut out)
+  when ExprKind::ExprAccess(inner2) then snapshot_hir_expr_refs(*inner2.get(), &mut out)
+  when ExprKind::ExprRawDeref(inner3) then snapshot_hir_expr_refs(*inner3.get(), &mut out)
+  when ExprKind::ExprIf(i) then snapshot_hir_if_refs(i, &mut out)
+  when ExprKind::ExprMatch(m) then snapshot_hir_match_refs(m, &mut out)
+  when ExprKind::ExprBlock(b4) then snapshot_hir_block_refs(b4, &mut out)
+  when ExprKind::ExprUnsafe(_, b5) then snapshot_hir_block_refs(b5, &mut out)
+  when ExprKind::ExprAsync(b6) then snapshot_hir_block_refs(b6, &mut out)
+  when ExprKind::ExprAwait(inner4) then snapshot_hir_expr_refs(*inner4.get(), &mut out)
+  when ExprKind::ExprTry(inner5) then snapshot_hir_expr_refs(*inner5.get(), &mut out)
+  when ExprKind::ExprRange(start, end_, _) then
+    match start
+    when Option::Some(se) then snapshot_hir_expr_refs(*se.get(), &mut out)
+    when Option::None then ()
+    end
+    match end_
+    when Option::Some(ee) then snapshot_hir_expr_refs(*ee.get(), &mut out)
+    when Option::None then ()
+    end
+  when ExprKind::ExprCast(inner6, t6) then
+    snapshot_hir_expr_refs(*inner6.get(), &mut out)
+    snapshot_hir_type_refs(t6, &mut out)
+  when ExprKind::ExprTypeCheck(inner7, t7) then
+    snapshot_hir_expr_refs(*inner7.get(), &mut out)
+    snapshot_hir_type_refs(t7, &mut out)
+  when ExprKind::ExprComptime(b7) then snapshot_hir_block_refs(b7, &mut out)
+  when ExprKind::ExprEnumVariant(_, targs, vargs) then
+    for ta in targs do snapshot_hir_type_refs(ta.clone(), &mut out) end
+    for va in vargs do snapshot_hir_expr_refs(va.clone(), &mut out) end
+  when ExprKind::ExprAssign(target3, value4) then
+    snapshot_hir_expr_refs(*target3.get(), &mut out)
+    snapshot_hir_expr_refs(*value4.get(), &mut out)
+  when ExprKind::ExprPipe(lhs, rhs) then
+    snapshot_hir_expr_refs(*lhs.get(), &mut out)
+    snapshot_hir_expr_refs(*rhs.get(), &mut out)
+  when ExprKind::ExprMacroCall(_, margs2) then
+    for ma2 in margs2 do snapshot_hir_expr_refs(ma2.clone(), &mut out) end
+  when _ then ()
+  end
+  ()
+end
+
+def snapshot_hir_function_refs(f: FunctionDecl, inout out: Vec[SnapshotHirNodeRef]) -> Unit
+  for p in f.params do
+    snapshot_hir_option_expr_refs(p.default, &mut out)
+  end
+  for c in f.contracts do
+    snapshot_hir_expr_refs(c.expr, &mut out)
+  end
+  match f.body
+  when FnBody::FnBlock(b) then snapshot_hir_block_refs(b, &mut out)
+  when FnBody::FnExpr(e) then snapshot_hir_expr_refs(e, &mut out)
+  when FnBody::FnExtern(_) then ()
+  when FnBody::FnNone then ()
+  end
+  ()
+end
+
+# The persistent HIR-node stamping of ONE owner's collected nodes: the
+# anchor is the node's content digest (kind word | source-slice digest)
+# plus the occurrence ordinal among the owner's identical anchors, so an
+# unrelated insertion before the node never re-keys it while two live
+# identical nodes never fuse to one lineage. Nodes outside the compiled
+# source file / with an out-of-range span are skipped (the documented
+# fallback).
+def snapshot_hir_stamp_owner(
+  inout store: DeclLineageStore,
+  inout view: HirNodeLineageView,
+  owner_key: String,
+  owner: StableDeclId,
+  source_file: String,
+  source: String,
+  refs: Vec[SnapshotHirNodeRef]
+) -> Unit
+  if source.len() == 0 then return end
+  var seen: Map[String, Int] = Map::new()
+  for node_ref in refs do
+    let span_ok = node_ref.span.file == source_file &&
+      node_ref.span.start >= 0 && node_ref.span.end_pos <= source.len() &&
+      node_ref.span.start <= node_ref.span.end_pos
+    if span_ok then
+      let text = source.slice(node_ref.span.start, node_ref.span.end_pos)
+      let d = stable_digest_of(&text)
+      let ckey = node_ref.kind_word.clone() + "|" + d.hi.to_string() + "-" + d.lo.to_string()
+      var occ = 0
+      match seen.get(ckey.clone())
+      when Option::Some(c) then occ = c
+      when Option::None then occ = 0
+      end
+      seen.insert(ckey.clone(), occ + 1)
+      let anchor = ckey + "|O" + occ.to_string()
+      let id = stable_hir_node_lineage_stamp(store, owner.clone(), owner_key.clone(),
+        node_ref.node_id, anchor, d.hi, d.lo, text)
+      hir_node_lineage_view_bind(view, node_ref.node_id, id)
+    end
+  end
+  ()
+end
+
+# THE PRE-LOWERING VIEW SEAM: ONE store revision window stamps the
+# declaration universe (the same seeds — and therefore the same persistent
+# numbers — the post-mono def walk re-stamps) AND the HIR-node section of
+# every source function/method/static/const body whose owner registered a
+# persistent declaration. The returned HirNodeLineageView is threaded into
+# the MirBuilder BEFORE lowering; the callable view feeds the persistent
+# mono cache. A text-less caller (source_text "") or an item whose body
+# lives in an imported file simply stamps no HIR nodes — the lowering's
+# documented bootstrap fallback covers those.
+pub def snapshot_pre_lower_views_of(
+  env: TypeEnv,
+  typed: TypedProgram,
+  ast: Program,
+  source_text: String,
+  inout store: DeclLineageStore
+) -> Result[PreLowerIdentityViews, SnapshotError]
+  let ctx = snapshot_build_ctx(env, typed, mir_program_empty())
+  let pending = match snapshot_pending_defs(&ctx)
+  when Result::Err(e) then return Result::Err(e)
+  when Result::Ok(p) then p
+  end
+  var seeds: Vec[SnapshotDeclSeed] = Vec::new()
+  for p in pending do
+    let sd = stable_digest_of(&p.sig)
+    seeds.push(SnapshotDeclSeed {
+      package_key: "".to_string(),
+      module_path: p.module_path.clone(),
+      kind: semantic_def_kind_text(&p.kind),
+      name: p.name.clone(),
+      sig_digest_hi: sd.hi,
+      sig_digest_lo: sd.lo,
+      sig_text: p.sig.clone()
+    })
+  end
+
+  stable_lineage_store_begin_revision(store)
+  let decls = snapshot_stamp_decl_seeds(store, &seeds)
+  var view = callable_lineage_view_new()
+  var owner_of_numeric: Map[Int, StableDeclId] = Map::new()
+  var i = 0
+  while i < pending.len() do
+    callable_lineage_view_bind(&mut view, pending[i].key.clone(), decls[i].clone())
+    match ctx.numeric_of_key.get(pending[i].key.clone())
+    when Option::Some(numeric) then owner_of_numeric.insert(numeric, decls[i].clone())
+    when Option::None then ()
+    end
+    i = i + 1
+  end
+
+  # The HIR-node section of the SAME revision window: the source nodes of
+  # every def-keyed body (functions, impl methods, statics, consts).
+  var hir_view = hir_node_lineage_view_new()
+  let source_file = ast.span.file.clone()
+  var item_idx = 0
+  while item_idx < ast.items.len() do
+    let item = ast.items[item_idx]
+    match item.kind
+    when ItemKind::ItemFunction(f) then
+      match typed.resolutions.item_defs.get(item_idx)
+      when Option::Some(dids) then
+        if dids.len() > 0 then
+          match owner_of_numeric.get(def_id_numeric(&dids[0]))
+          when Option::Some(owner) then
+            var refs: Vec[SnapshotHirNodeRef] = Vec::new()
+            snapshot_hir_function_refs(f, &mut refs)
+            snapshot_hir_stamp_owner(store, &mut hir_view, snapshot_lineage_owner_key(&owner),
+              owner, source_file.clone(), source_text.clone(), refs)
+          when Option::None then ()
+          end
+        end
+      when Option::None then ()
+      end
+    when ItemKind::ItemImpl(im) then
+      match typed.resolutions.item_defs.get(item_idx)
+      when Option::Some(dids) then
+        var mi = 0
+        while mi < im.methods.len() do
+          if mi < dids.len() then
+            match owner_of_numeric.get(def_id_numeric(&dids[mi]))
+            when Option::Some(owner) then
+              var refs: Vec[SnapshotHirNodeRef] = Vec::new()
+              snapshot_hir_function_refs(im.methods[mi], &mut refs)
+              snapshot_hir_stamp_owner(store, &mut hir_view, snapshot_lineage_owner_key(&owner),
+                owner, source_file.clone(), source_text.clone(), refs)
+            when Option::None then ()
+            end
+          end
+          mi = mi + 1
+        end
+      when Option::None then ()
+      end
+    when ItemKind::ItemStatic(s) then
+      match typed.resolutions.item_defs.get(item_idx)
+      when Option::Some(dids) then
+        if dids.len() > 0 then
+          match owner_of_numeric.get(def_id_numeric(&dids[0]))
+          when Option::Some(owner) then
+            var refs: Vec[SnapshotHirNodeRef] = Vec::new()
+            snapshot_hir_expr_refs(s.value, &mut refs)
+            snapshot_hir_stamp_owner(store, &mut hir_view, snapshot_lineage_owner_key(&owner),
+              owner, source_file.clone(), source_text.clone(), refs)
+          when Option::None then ()
+          end
+        end
+      when Option::None then ()
+      end
+    when ItemKind::ItemConst(c) then
+      match typed.resolutions.item_defs.get(item_idx)
+      when Option::Some(dids) then
+        if dids.len() > 0 then
+          match owner_of_numeric.get(def_id_numeric(&dids[0]))
+          when Option::Some(owner) then
+            var refs: Vec[SnapshotHirNodeRef] = Vec::new()
+            snapshot_hir_expr_refs(c.value, &mut refs)
+            snapshot_hir_stamp_owner(store, &mut hir_view, snapshot_lineage_owner_key(&owner),
+              owner, source_file.clone(), source_text.clone(), refs)
+          when Option::None then ()
+          end
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
+    item_idx = item_idx + 1
+  end
+  stable_lineage_store_finish_revision(store)
+  Result::Ok(PreLowerIdentityViews {
+    callables: view,
+    hir: hir_view
+  })
 end
 
 # ONE completed snapshot def walk: the declaration rows PLUS the P0-4

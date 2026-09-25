@@ -94,6 +94,10 @@ SUITES=(
   # (insertion/rename stability, per-function binder numbering, the v2
   # store's member/binder/HIR sections and their save-load round trip).
   "tests/stable_member_lineage_test.tg"
+  # persistent identity integration: the session pipeline's mono declaration
+  # identity across an explicit rename continuation (byte-identical
+  # StableDeclId) + the snapshot lineage / typed member-lineage parse lanes.
+  "tests/semantic_persistent_identity_test.tg"
   # fourth-audit P0-7/P0-8/P1-10: the persistent MIR origins + the semantic
   # re-key lane (origin stability across the O2 optimizer, PGO v3
   # round-trip + fail-closed v2 conversion, structural tail eligibility,

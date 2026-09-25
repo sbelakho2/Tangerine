@@ -57,7 +57,7 @@ use tg_compiler::mir::{
   MirBinOp, MirUnOp, CastKind,
   AggregateKind,
   Place, Projection, MirBlockId,
-  mir_type_identity_key
+  mir_type_identity_key, mir_type_has_deferred, mir_instance_identity_key
 }
 use tg_compiler::asm::{
   CodeBuffer, buf_new, buf_pos, emit8, emit32_le, emit64_le,
@@ -84,10 +84,10 @@ use tg_compiler::asm::{
 use tg_compiler::object::{ObjectFile, build_object}
 use tg_compiler::linker::{LinkerInput, link_executable}
 use tg_compiler::runtime::{emit_all_runtime, runtime_ctx_new}
-use tg_compiler::mono::{type_to_mangled}
+use tg_compiler::mono::{type_to_mangled, type_has_params, is_generic_function}
 use tg_compiler::asm::{merge_code_buffer}
 use tg_compiler::ids::{IntrinsicId}
-use tg_compiler::types::{intrinsic_id_of_call, classify_intrinsic_call}
+use tg_compiler::types::{intrinsic_id_of_call, classify_intrinsic_call, intrinsic_id_is_rejected_surface}
 use tg_compiler::types::{
   SimdIntrinsicKind, SimdLane,
   simd_intrinsic_kind_of, simd_intrinsic_lane_of,
@@ -364,6 +364,13 @@ struct CodegenCtx
   # emission label through this table — the DefId is the identity, the name
   # is only the symbol-mangling boundary.
   method_names_by_def: Map[Int, String]
+  # (instance labels): mir_instance_identity_key(InstanceId) -> the
+  # SPECIALIZED instance's emission label (copied from
+  # MirProgram.instance_labels). MirDeinit FINALIZER resolution prefers
+  # this row: a generic Drop impl's finalizer is only ever the concrete
+  # instance (the template is a declaration and is never emitted — see
+  # codegen_function_emitable), and the payload carries no rendered name.
+  instance_labels: Map[String, String]
  # map/set Hash/Eq dispatch metadata — impl method mangled base
   # name ("MyKey__hash") -> (the DefId's fn_owner_key_of_def instance-base
   # render, the declared parameter count). Copied from
@@ -449,6 +456,36 @@ def align_up_int(v: Int, align: Int) -> Int
   ((v + align - 1) / align) * align
 end
 
+# Whether a MirTypeDef's declared fields/variant payloads still reference a
+# generic parameter anywhere while its binder list is empty: such a def is a
+# TEMPLATE shape whose binder list was lost in synthesis — it must receive NO
+# nominal (empty-args) layout entry, exactly like a def with declared generic
+# parameters. Its concrete instantiations are laid out by the
+# concrete-instances loop with their args substituted; a nominal layout would
+# substitute nothing and fail closed on the residual Param (an ICE, not a
+# program fact).
+def mir_type_def_has_params(td: MirTypeDef) -> Bool
+  match td.kind
+  when MirTypeDefKind::Struct(fields) then
+    var found = false
+    for f in fields do
+      if type_has_params(&f.ty) then found = true; break end
+    end
+    found
+  when MirTypeDefKind::Enum(variants) then
+    var found = false
+    var vi = 0
+    while vi < variants.len() do
+      for fty in variants[vi].fields do
+        if type_has_params(&fty) then found = true; break end
+      end
+      if found then break end
+      vi = vi + 1
+    end
+    found
+  end
+end
+
 # Build type layout map using the centralized LayoutEngine.
 # This ensures single source of truth for all type sizes.
 # Also computes field-level offsets and sizes in one pass to avoid
@@ -473,8 +510,13 @@ def build_all_layouts(inout engine: LayoutEngine, types: Vec[MirTypeDef], concre
   compute_all_layouts(engine)
 
   # The nominal entries: non-generic defs only (their fields are concrete).
+  # A def whose binder list is empty while its fields/payloads still carry a
+  # generic parameter is a TEMPLATE shape (its binders were lost in
+  # synthesis): it gets no nominal entry, exactly like a def with declared
+  # generic parameters, and its concrete instantiations are laid out by the
+  # loop below with their args substituted.
   for td in types do
-    if td.generic_params.is_empty() then
+    if td.generic_params.is_empty() && !mir_type_def_has_params(td.clone()) then
       let cty = Type::Adt(td.id.clone(), Vec::new())
       let ckey = mir_type_identity_key(&cty)
       match layout_of_concrete(engine, &cty)
@@ -541,7 +583,7 @@ def build_all_layouts(inout engine: LayoutEngine, types: Vec[MirTypeDef], concre
         let ckey = mir_type_identity_key(&cty)
         match layout_of_concrete(engine, &cty)
         when Result::Ok(l) then layout.insert(ckey.clone(), l.size)
-        when Result::Err(e) then panic("ICE: unresolved type reached codegen: " + e.type_name)
+        when Result::Err(e) then panic("ICE: unresolved type reached codegen: " + e.type_name + " for instance " + ckey.clone() + " of type def '" + lookup_type_name(engine, tid.id) + "' (a concrete instance whose substituted fields still contain an unresolved type — the def's binder list does not cover a field's parameter)")
         end
         var found_def = false
         for td in types do
@@ -549,18 +591,34 @@ def build_all_layouts(inout engine: LayoutEngine, types: Vec[MirTypeDef], concre
             found_def = true
             match td.kind
             when MirTypeDefKind::Struct(fields) then
-              var field_offsets = Vec::new()
-              var field_sizes = Vec::new()
-              var i = 0
-              while i < fields.len() do
-                let off = field_offset(engine, &cty, i)
-                field_offsets.push(off)
-                let sz = field_size(engine, &cty, i)
-                field_sizes.push(sz)
-                i = i + 1
+              # Per-field tables exist only for INLINE-stored aggregates.
+              # The pointer/handle-represented nominals (Box/Rc -> RawPtr,
+              # Vec/Array -> HeapVecHeader, Map/Set -> header handles) are
+              # single-word handles: their declared fields describe the
+              # pointee / the heap header, NEVER inline storage, and the
+              # layout engine resolves the value's shape from the
+              # representation authority (type_repr / container_field_offset
+              # / pointer deref) — whose record carries no field entries.
+              # The layout ENGINE is the single storage-shape authority, so
+              # the inline test is type_repr == Repr::Inline (the Array /
+              # UnsafeSlice name special case above is the same rule's
+              # pre-existing spelling; a builtin Vec/Box/Rc def reaching
+              # here has the builtin field list recorded while its VALUE is
+              # the handle).
+              if type_repr(engine, &cty) == Repr::Inline then
+                var field_offsets = Vec::new()
+                var field_sizes = Vec::new()
+                var i = 0
+                while i < fields.len() do
+                  let off = field_offset(engine, &cty, i)
+                  field_offsets.push(off)
+                  let sz = field_size(engine, &cty, i)
+                  field_sizes.push(sz)
+                  i = i + 1
+                end
+                offsets_map.insert(ckey.clone(), field_offsets)
+                sizes_map.insert(ckey.clone(), field_sizes)
               end
-              offsets_map.insert(ckey.clone(), field_offsets)
-              sizes_map.insert(ckey.clone(), field_sizes)
             when MirTypeDefKind::Enum(variants) then
               var field_offsets = Vec::new()
               var field_sizes = Vec::new()
@@ -612,6 +670,48 @@ def build_all_layouts(inout engine: LayoutEngine, types: Vec[MirTypeDef], concre
       end
       offsets_map.insert(ckey.clone(), field_offsets)
       sizes_map.insert(ckey.clone(), field_sizes)
+    when Type::Tuple(_) then
+      # Tuple aggregate: the tuple layout's own field entries (the engine's
+      # single tuple authority — the same record projected_tuple_offset
+      # reads). The aggregate emission's size/offset lookups and the
+      # positional field stores resolve through this registration.
+      let tkey = mir_type_identity_key(&inst)
+      match layout_of_concrete(engine, &inst)
+      when Result::Ok(tl) then
+        layout.insert(tkey.clone(), tl.size)
+        var t_offs = Vec::new()
+        var t_sizes = Vec::new()
+        var ti = 0
+        while ti < tl.fields.len() do
+          t_offs.push(tl.fields[ti].offset)
+          t_sizes.push(tl.fields[ti].size)
+          ti = ti + 1
+        end
+        offsets_map.insert(tkey.clone(), t_offs)
+        sizes_map.insert(tkey.clone(), t_sizes)
+      when Result::Err(e) then panic("ICE: unresolved tuple type reached codegen: " + e.type_name)
+      end
+    when Type::FixedArray(_, _) then
+      # Fixed-array aggregate: element-wise storage (the MirArray aggregate
+      # path computes strides from the element layout directly; the
+      # registered size/field entries keep the general aggregate path and
+      # any layout query resolvable).
+      let akey = mir_type_identity_key(&inst)
+      match layout_of_concrete(engine, &inst)
+      when Result::Ok(al) then
+        layout.insert(akey.clone(), al.size)
+        var a_offs = Vec::new()
+        var a_sizes = Vec::new()
+        var ai = 0
+        while ai < al.fields.len() do
+          a_offs.push(al.fields[ai].offset)
+          a_sizes.push(al.fields[ai].size)
+          ai = ai + 1
+        end
+        offsets_map.insert(akey.clone(), a_offs)
+        sizes_map.insert(akey.clone(), a_sizes)
+      when Result::Err(e) then panic("ICE: unresolved fixed-array type reached codegen: " + e.type_name)
+      end
     when _ then ()
     end
   end
@@ -628,10 +728,54 @@ def capture_tuple_len(captures: Type) -> Int
   end  end
 end
 
-# Collect every concrete Type::Adt instance reachable in a MIR type
-# (post-mono: function param/local/return types and static types are fully
-# substituted) — the population source for the concrete-keyed layout tables.
-# (the closure {code, env} ABI): every Type::Closure instance is
+# Whether a MIR function is an EMISSION unit. A GENERIC TEMPLATE (declared
+# binders, or a Param-carrying signature/local — is_generic_function, the
+# monomorphizer's own classifier) is a DECLARATION, never an emission unit:
+# monomorphization appends one concrete instance body per solved call site
+# and leaves the template in mir.functions as the template-lookup key.
+# Bootstrap mode emits ALL functions (compute_reachable's emit-all
+# contract), so the template filter must sit HERE — emitting a template
+# body would run its Param-typed parameters/locals through the fail-closed
+# layout queries (layout_of_strict on Type::Param is an ICE, by design).
+# Specialized instances carry generic_params = [] and concrete
+# signatures/locals (see specialize_function_keyed), so every real call
+# target still emits; a call that still names a template after mono is the
+# instance-identity leak resolve_callee_label fails closed on.
+def codegen_function_emitable(func: MirFunction) -> Bool
+  !is_generic_function(func)
+end
+
+# Whether a MIR type is a CONCRETE layout subject: no generic-parameter
+# reference (Type::Param / Type::ConstParam / the symbolic const and
+# fixed-array-size forms), no inference variable, and — via
+# type_has_params — no such reference inside a closure type's children
+# (mir_type_has_deferred does not descend into Type::Closure). The
+# post-mono program legitimately still contains the lowered generic
+# TEMPLATES (monomorphization appends the specialized instances; it does
+# not remove the templates), and a template's Param-carrying Adt mention
+# (e.g. Option::map[U]'s declared `Option[U]`) is a TEMPLATE SHAPE, not a
+# concrete instance: laying it out would substitute nothing at the
+# outermost Adt and fail closed on the residual Param. Only the concrete
+# instantiations (Option[String], ...) carry concrete-keyed layout
+# entries; the template shapes are deferred exactly like the generic
+# MirTypeDefs the nominal loop skips.
+def concrete_instance_type(ty: Type) -> Bool
+  !mir_type_has_deferred(ty.clone()) && !type_has_params(ty)
+end
+
+# Collect every concrete layouted shape reachable in a MIR type
+# (post-mono: the SPECIALIZED function param/local/return types and static
+# types are fully substituted; the surviving generic TEMPLATES legally
+# carry Type::Param positions) — the population source for the
+# concrete-keyed layout tables: Type::Adt instances, Type::Tuple and
+# Type::FixedArray values (the aggregate emission keys their size/field
+# lookups by the same concrete identity), and Type::Closure objects.
+# A mention that still carries a generic parameter/inference position is a
+# template shape and is NOT collected as an instance
+# (concrete_instance_type); its args/children are still walked so nested
+# concrete instances (`Option[Vec[Int]]` inside a template) keep their
+# entries.
+# (the closure {code, env} ABI): every CONCRETE Type::Closure instance is
 # collected TOO — the closure OBJECT's layout ({ code @ 0, env:
 # capture-tuple }) is registered by the ClosureId-keyed concrete identity in
 # build_all_layouts, so the aggregate emission and the closure-call dispatch
@@ -639,15 +783,23 @@ end
 def collect_concrete_adt_types(ty: Type, inout out: Vec[Type]) -> Unit
   match ty
   when Type::Adt(tid, args) then
-    out.push(ty.clone())
+    if concrete_instance_type(ty.clone()) then
+      out.push(ty.clone())
+    end
     for a in args do
       collect_concrete_adt_types(a, out)
     end
   when Type::Tuple(fields) then
+    if concrete_instance_type(ty.clone()) then
+      out.push(ty.clone())
+    end
     for f in fields do
       collect_concrete_adt_types(f, out)
     end
   when Type::FixedArray(elem, _) then
+    if concrete_instance_type(ty.clone()) then
+      out.push(ty.clone())
+    end
     collect_concrete_adt_types(elem, out)
   when Type::FnPtr(params, ret, _) then
     for p in params do
@@ -655,7 +807,9 @@ def collect_concrete_adt_types(ty: Type, inout out: Vec[Type]) -> Unit
     end
     collect_concrete_adt_types(ret, out)
   when Type::Closure(_, params, ret, captures, _) then
-    out.push(ty.clone())
+    if concrete_instance_type(ty.clone()) then
+      out.push(ty.clone())
+    end
     for p in params do
       collect_concrete_adt_types(&p.ty, out)
     end
@@ -1260,6 +1414,7 @@ def codegen_new(target: AsmTarget) -> CodegenCtx
     drop_glue_fns: Map::new(),
     drop_glue_instances: Map::new(),
     method_names_by_def: Map::new(),
+    instance_labels: Map::new(),
     static_labels: Map::new(),
     string_abi_unwrap: false
   }
@@ -1678,21 +1833,31 @@ def place_final_static_offset(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: 
     match proj
     when Projection::ProjDeref then
       current_ty = project_deref_type(ctx, &current_ty)
+      downcast_variant = Option::None
     when Projection::Variant(vid) then
       downcast_variant = Option::Some(vid)
     when Projection::Field(fid) then
       last_static = projected_field_offset(ctx, &fid, &downcast_variant, &current_ty)
       current_ty = projected_field_type(ctx, &fid, &downcast_variant, &current_ty)
+      # The downcast is CONSUMED by the payload-field extraction it
+      # authorized: subsequent projections navigate inside the payload's own
+      # type (a fused chain [Variant(E), Field(E, payload), Field(P, f)] —
+      # field access on a matched enum payload), so a stale downcast would
+      # reject the next Field's owner (E != P).
+      downcast_variant = Option::None
     when Projection::TupleIndex(idx) then
       last_static = projected_tuple_offset(ctx, &current_ty, idx)
       current_ty = projected_tuple_type(ctx, &current_ty, idx)
+      downcast_variant = Option::None
     when Projection::ProjConstantIndex(_) then
       current_ty = project_index_type(ctx, &current_ty)
+      downcast_variant = Option::None
     when Projection::ProjIndex(_) then
       # A dynamic final index: the element offset is runtime — the
       # alignment cannot be decided statically.
       has_static_last = false
       current_ty = project_index_type(ctx, &current_ty)
+      downcast_variant = Option::None
     end
   end
   if has_static_last then last_static else -1 end
@@ -4321,10 +4486,17 @@ def project_deref_type(ctx: CodegenCtx, ty: Type) -> Type
   when Type::Ptr(inner) then inner.clone()
   when Type::PtrMut(inner) then inner.clone()
   when Type::Adt(tid, args) then
- # Adt form of Box/Rc mirrors the canonical unwrap arms
-    # (pointee via the Adt args); anything else passes through unchanged.
+ # Adt form of Box/Rc and of the raw-pointer nominals mirrors the canonical
+    # unwrap arms (pointee via the Adt args). The checker's pointer identity
+    # is bimorphic: structural Type::Ptr/PtrMut in resolved type expressions
+    # and the nominal Ptr/PtrMut Adt (builtin_ptr_nominal_ty) wherever a
+    # declaration's identity form is carried — a `*p` through the nominal
+    # form must unwrap its pointee exactly like the structural arms, or the
+    # following Field(owner = the POINTEE's TypeId, index = its field) lands
+    # on the pointer nominal's own def (field index out of range). Anything
+    # else passes through unchanged.
     let pdt_named = bare_name_from_qualified(type_name_by_id(ctx, tid.id))
-    if (pdt_named == "Box" || pdt_named == "Rc") && !args.is_empty() then
+    if (pdt_named == "Box" || pdt_named == "Rc" || pdt_named == "Ptr" || pdt_named == "PtrMut") && !args.is_empty() then
       args[0].clone()
     else
       ty.clone()
@@ -4458,7 +4630,20 @@ def projected_field_offset(inout ctx: CodegenCtx, fid: FieldId, downcast_variant
     end
     enum_payload_base(ctx, &value_ty) + enum_field_offset_for_variant_index(ctx, &value_ty, vid.index as Int, fid.index)
   when Option::None then
-    field_offset(&mut ctx.layout_engine, &value_ty, fid.index)
+    # Pointer-wrapper nominals (Box/Rc — the engine's Repr::RawPtr row):
+    # the handle's single declared field (`ptr`, index 0) IS the value word
+    # — its declared field type (Ptr[T] / Ptr[RcInner[T]]) still comes from
+    # the def via projected_field_type. The projection offset is therefore
+    # 0, never a def-field-table walk: the wrapper def's `ptr` entry
+    # describes the POINTEE, and the engine's record for the wrapper is the
+    # fieldless pointer layout. Any other field index on a
+    # pointer-represented nominal is malformed and stays fail-closed
+    # through field_offset.
+    if fid.index == 0 && codegen_type_repr(ctx, &value_ty) == Repr::RawPtr then
+      0
+    else
+      field_offset(&mut ctx.layout_engine, &value_ty, fid.index)
+    end
   end
 end
 
@@ -4513,16 +4698,24 @@ def place_type(ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place) -> Type
     match proj
     when Projection::ProjDeref then
       current_ty = project_deref_type(ctx, &current_ty)
+      downcast_variant = Option::None
     when Projection::Variant(vid) then
       downcast_variant = Option::Some(vid)
     when Projection::Field(fid) then
       current_ty = projected_field_type(ctx, &fid, &downcast_variant, &current_ty)
+      # The downcast is CONSUMED by the payload-field extraction it
+      # authorized (see place_final_static_offset): clear it so a fused
+      # chain's later fields resolve against the payload's own type.
+      downcast_variant = Option::None
     when Projection::TupleIndex(idx) then
       current_ty = projected_tuple_type(ctx, &current_ty, idx)
+      downcast_variant = Option::None
     when Projection::ProjIndex(_) then
       current_ty = project_index_type(ctx, &current_ty)
+      downcast_variant = Option::None
     when Projection::ProjConstantIndex(_) then
       current_ty = project_index_type(ctx, &current_ty)
+      downcast_variant = Option::None
     end
   end
   current_ty
@@ -5586,6 +5779,7 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
       if is_ref_like_type(&current_ty) then
         emit_load_mem(ctx, reg, reg, 0)
         current_ty = project_deref_type(ctx, &current_ty)
+        downcast_variant = Option::None
       end
     end
     match proj
@@ -5593,6 +5787,7 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
       last_deref_unwrapped_ref = is_ref_like_type(&current_ty)
       emit_load_mem(ctx, reg, reg, 0)
       current_ty = project_deref_type(ctx, &current_ty)
+      downcast_variant = Option::None
     when Projection::Field(fid) then
  # the offset comes from the layout engine, resolved through
  # the CONCRETE projected type (— the place's current type
@@ -5613,6 +5808,10 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
       end
       current_ty = field_ty
       last_deref_unwrapped_ref = false
+      # The downcast is CONSUMED by the payload-field extraction it
+      # authorized (see place_final_static_offset): clear it so a fused
+      # chain's later fields resolve against the payload's own type.
+      downcast_variant = Option::None
     when Projection::TupleIndex(idx) then
  # positional tuple element access — the offset comes from the
       # layout engine's tuple layout.
@@ -5632,6 +5831,7 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
       end
       current_ty = field_ty
       last_deref_unwrapped_ref = false
+      downcast_variant = Option::None
     when Projection::ProjIndex(local_id) then
       let idx_reg = scratch2_reg(ctx.target.arch)
       load_place(ctx, fctx, &Place { local: local_id, projections: Vec::new() }, idx_reg)
@@ -5685,6 +5885,7 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
       end
       current_ty = elem_ty
       last_deref_unwrapped_ref = false
+      downcast_variant = Option::None
     when Projection::ProjConstantIndex(ci) then
       let is_byte_indexed = is_string_like_type(ctx, &current_ty)
       let elem_ty2 = project_index_type(ctx, &current_ty)
@@ -5732,6 +5933,7 @@ def apply_projections(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, p
       end
       current_ty = elem_ty2
       last_deref_unwrapped_ref = false
+      downcast_variant = Option::None
     when Projection::Variant(vid) then
       downcast_variant = Option::Some(vid)
       # The payload-access rule comes from the enum's EnumLayout (the single
@@ -5952,6 +6154,7 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
           emit_load_mem(ctx, base, base, 0)
           niched_store_addr_known = false
           current_ty = project_deref_type(ctx, &current_ty)
+          downcast_variant = Option::None
         when Projection::Field(fid) then
  # the offset comes from the layout engine, resolved through
  # the CONCRETE projected type (— the place's current type
@@ -5962,11 +6165,15 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
           # enum field's storage lives exactly there.
           niched_store_addr_known = true
           current_ty = projected_field_type(ctx, &fid, &downcast_variant, &current_ty)
+          # The downcast is CONSUMED by the payload-field extraction it
+          # authorized (see place_final_static_offset).
+          downcast_variant = Option::None
         when Projection::TupleIndex(idx) then
           let field_off = projected_tuple_offset(ctx, &current_ty, idx)
           emit_add_ri(ctx, base, field_off as i32)
           niched_store_addr_known = true
           current_ty = projected_tuple_type(ctx, &current_ty, idx)
+          downcast_variant = Option::None
         when Projection::Variant(vid) then
           downcast_variant = Option::Some(vid)
           # Payload addressing via the EnumLayout (the single
@@ -6023,6 +6230,7 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
           emit_load_mem(ctx, base, base, 0)
           niched_store_addr_known = false
           current_ty = project_index_type(ctx, &current_ty)
+          downcast_variant = Option::None
         when Projection::ProjConstantIndex(ci) then
           if is_heap_collection_type(ctx, &current_ty) then
             emit_load_mem(ctx, base, base, 0)
@@ -6033,6 +6241,7 @@ def store_place(inout ctx: CodegenCtx, fctx: FnCodegenCtx, place: Place, src: Ph
           emit_load_mem(ctx, base, base, 0)
           niched_store_addr_known = false
           current_ty = project_index_type(ctx, &current_ty)
+          downcast_variant = Option::None
         when _ then ()
         end
         i = i + 1
@@ -7078,6 +7287,7 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
             emit_load_mem(ctx, dst, dst, 0)
           end
           current_ty = project_deref_type(ctx, &current_ty)
+          downcast_variant = Option::None
         end
       end
       match proj
@@ -7087,6 +7297,7 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
         end
         niched_addr_known = false
         current_ty = project_deref_type(ctx, &current_ty)
+        downcast_variant = Option::None
       when Projection::Field(fid) then
  # the offset comes from the layout engine, resolved through
  # the CONCRETE projected type.
@@ -7112,6 +7323,9 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
           end
         end
         current_ty = addr_field_ty
+        # The downcast is CONSUMED by the payload-field extraction it
+        # authorized (see place_final_static_offset).
+        downcast_variant = Option::None
       when Projection::TupleIndex(idx) then
         let offset = projected_tuple_offset(ctx, &current_ty, idx)
         let addr_tuple_ty = projected_tuple_type(ctx, &current_ty, idx)
@@ -7133,6 +7347,7 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
           end
         end
         current_ty = addr_tuple_ty
+        downcast_variant = Option::None
       when Projection::ProjIndex(local_id) then
         let is_byte_indexed = is_string_like_type(ctx, &current_ty)
         if is_heap_collection_type(ctx, &current_ty) then
@@ -7161,6 +7376,7 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
         end
         niched_addr_known = false
         current_ty = project_index_type(ctx, &current_ty)
+        downcast_variant = Option::None
       when Projection::ProjConstantIndex(ci) then
         let is_byte_indexed = is_string_like_type(ctx, &current_ty)
         if is_heap_collection_type(ctx, &current_ty) then
@@ -7188,6 +7404,7 @@ def emit_place_address(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, place: P
         end
         niched_addr_known = false
         current_ty = project_index_type(ctx, &current_ty)
+        downcast_variant = Option::None
       when Projection::Variant(vid) then
         downcast_variant = Option::Some(vid)
         # Same layout-driven payload rule as apply_projections: the
@@ -7539,6 +7756,21 @@ def codegen_aggregate(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, kind: Agg
     panic("internal error: struct-literal aggregate of type `" + type_name + "` has no concrete K/V layout to derive the map layout from")
   else if type_name == "Set" || type_name == "HashSet" then
     panic("internal error: struct-literal aggregate of type `" + type_name + "` has no concrete element layout to derive the map layout from")
+  end
+
+  # Pointer-wrapper nominals (Box/Rc — the engine's Repr::RawPtr row): the
+  # constructed VALUE IS its single `ptr` operand. `Box { ptr: p }` produces
+  # p itself — the box/rc handle IS that raw pointer; there is no heap
+  # image, no field placement and no bump allocation. The representation
+  # authority decides (type_repr on the CONCRETE agg_ty), never a name:
+  # extract_named_type_id deliberately unwraps Box/Rc to the pointee, so
+  # the wrapper def's declared field table is not consulted here.
+  if codegen_type_repr(ctx, agg_ty) == Repr::RawPtr then
+    if operands.len() != 1 then
+      panic("internal error: Box/Rc aggregate expects exactly one `ptr` operand, got " + operands.len().to_string())
+    end
+    load_operand_aggregate_item(ctx, fctx, &operands[0], dst)
+    return
   end
 
   # A NICHED enum aggregate: the constructed VALUE is the payload word (or
@@ -8491,6 +8723,15 @@ def resolve_callee_label(ctx: CodegenCtx, name: String) -> String
     if ctx.reachable_fns.contains(name) || ctx.extern_fns.contains(name) then
       name.clone()
     else
+      # The runtime's fixed-ABI generic-`__intrinsic_*` helpers (the
+      # map/set record-visit family): lower_extern_fn deliberately does NOT
+      # lower their generic extern declarations as MIR functions ("their
+      # calls are resolved BY NAME at codegen"), and the semantic router has
+      # no IntrinsicId row for them — the runtime emits each label
+      # unconditionally (emit_all_runtime), so the NAME itself is the label.
+      if is_runtime_emitted_intrinsic_label(name) then
+        return name.clone()
+      end
       if ctx.generic_instance_bases.contains(name) then
         panic("internal error: call to `" + name + "` is an unresolved generic BASE name; the monomorphizer must rewrite this call site to a `$`-suffixed instance name (InstanceId { def, args } replaces this string stage) — no instance label exists")
       end
@@ -8507,6 +8748,22 @@ end
 def is_visit_runtime_enum_name(name: String) -> Bool
   name == "__intrinsic_map_visit_begin" ||
     name == "__intrinsic_map_visit_next" ||
+    name == "__intrinsic_set_visit_begin" ||
+    name == "__intrinsic_set_visit_next"
+end
+
+# The runtime-emitted generic-`__intrinsic_*` helpers whose SOURCE calls
+# resolve BY NAME to the runtime label: lower_extern_fn deliberately never
+# lowers their generic extern declarations as MIR functions (the ZERO-
+# INFERENCE inventory — they are runtime surfaces, never templates), the
+# semantic router has no IntrinsicId row for them, and emit_all_runtime
+# emits each label unconditionally (the fixed runtime ABI; the visit
+# family's pre-niche tagged return is decoded by the
+# is_visit_runtime_enum_name niched-destination path in codegen_call).
+def is_runtime_emitted_intrinsic_label(name: String) -> Bool
+  name == "__intrinsic_map_visit_begin" ||
+    name == "__intrinsic_map_visit_next" ||
+    name == "__intrinsic_map_visit_value" ||
     name == "__intrinsic_set_visit_begin" ||
     name == "__intrinsic_set_visit_next"
 end
@@ -8880,13 +9137,33 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
       # (intrinsic_id_of_call over the typed operand facts) is the
       # fallback ONLY for the compiler-SYNTHESIZED calls, which construct
       # their own names and carry Option::None here.
-      let intr_opt = match intrinsic
+      var intr_opt = match intrinsic
       when Option::Some(stamped_id) then Option::Some(stamped_id)
       when Option::None then intrinsic_id_of_call(&intr_name, &recv_ty0, &recv_named0, &needle_ty0, &needle_named0, &resolved_fn_name, recv_is_string0, needle_is_string0)
       end
       let has_real_body =
         ctx.extern_fns.contains(&resolved_fn_name) ||
         ctx.reachable_fns.contains(&resolved_fn_name)
+ # (the rejected-surface deferral): a FALLBACK classification that lands on a
+      # checker-REJECTED intrinsic surface is not a valid intrinsic BINDING —
+      # the checker would have rejected the source call, so the id can only
+      # come from canonicalizing a type-MANGLED method name onto the
+      # rejected frontend spelling (String__is_empty -> string_is_empty). The
+      # source call is a method call on a type whose std method has a real
+      # body: resolve the compiled method (the seed's TC_user answer when no
+      # __intrinsic_<owner>_<method> registry binding exists), never the
+      # defensive intrinsic panic. The STAMPED path (a checked source
+      # classification) is never deferred: the checker records an id only
+      # for a supported surface or an explicit error.
+      if intrinsic.is_none() then
+        match intr_opt
+        when Option::Some(fb_id) then
+          if intrinsic_id_is_rejected_surface(fb_id) && has_real_body then
+            intr_opt = Option::None
+          end
+        when Option::None then ()
+        end
+      end
  # boundary between the two call-identity authorities: has_real_body
       # is the intrinsic path's PRESENCE test against the compiled-callable
       # namespace (reachable_fns/extern_fns). It deliberately does NOT resolve
@@ -8958,7 +9235,7 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
               did_sret = true
             end
           end
-          intrinsic_did_materialize = codegen_intrinsic(ctx, fctx, intr_name, &arg_ops, args, resolved_fn_name, &dest_ty, dest)
+          intrinsic_did_materialize = codegen_intrinsic(ctx, fctx, intr_name, &arg_ops, args, resolved_fn_name, &dest_ty, dest, intrinsic.clone())
           # The drain helpers wrote the enum IMAGE at &dest; re-encode it as
           # the TaggedPtr VALUE word (codegen_drain_result_materialize) so
           # every consumer — MirDiscriminant, is_some, the Variant payload
@@ -8970,7 +9247,7 @@ def codegen_call(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, dest: Place, c
           end
         when Option::None then
           if fallback_clone_intrinsic then
-            intrinsic_did_materialize = codegen_intrinsic(ctx, fctx, "clone", &arg_ops, args, resolved_fn_name, &dest_ty, dest)
+            intrinsic_did_materialize = codegen_intrinsic(ctx, fctx, "clone", &arg_ops, args, resolved_fn_name, &dest_ty, dest, Option::None)
           else if ctx.extern_fns.contains(&resolved_fn_name) then
             # (audit P1-13/§26 — C variadic externs): a VARIADIC extern
             # call reaching this arm has more FIXED parameters than the
@@ -9178,11 +9455,22 @@ def codegen_deinit_label(ctx: CodegenCtx, instance: InstanceId) -> String
       glue_name.clone()
     end
   when Option::None then
-    match ctx.method_names_by_def.get(inst_key)
-    when Option::Some(finalizer_name) then
-      resolve_callee_label(ctx, &finalizer_name)
+    # A FINALIZER instance: prefer the SPECIALIZED instance label
+    # (MirProgram.instance_labels — the monomorphizer registers one row per
+    # specialized instance). A generic Drop impl's template is a
+    # declaration and is never emitted, so the template name below
+    # resolves only for NON-generic finalizers (the template itself IS the
+    # emitted function).
+    match ctx.instance_labels.get(&mir_instance_identity_key(&instance))
+    when Option::Some(inst_label) then
+      resolve_callee_label(ctx, &inst_label)
     when Option::None then
-      panic("internal error: MirDeinit instance is neither a generated drop-glue function nor a registered finalizer identity (def_id_numeric " + inst_key.to_string() + ")")
+      match ctx.method_names_by_def.get(inst_key)
+      when Option::Some(finalizer_name) then
+        resolve_callee_label(ctx, &finalizer_name)
+      when Option::None then
+        panic("internal error: MirDeinit instance is neither a generated drop-glue function nor a registered finalizer identity (def_id_numeric " + inst_key.to_string() + ")")
+      end
     end
   end
 end
@@ -9381,7 +9669,7 @@ def codegen_string_intrinsic_reload_arg(inout ctx: CodegenCtx, fctx: FnCodegenCt
   end
 end
 
-def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, args: Vec[MirOperand], call_args: Vec[MirCallArg], orig_fn_name: String, dest_ty: Type, dest: Place) -> Bool
+def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, args: Vec[MirOperand], call_args: Vec[MirCallArg], orig_fn_name: String, dest_ty: Type, dest: Place, stamped: Option[IntrinsicId]) -> Bool
   let arch = ctx.target.arch
   let rr = ret_reg(arch)
  # (THE SIMD GATE): a SIMD intrinsic name (the __intrinsic_simd_<op>_<lane>
@@ -9406,8 +9694,14 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
  # (IntrinsicId at check time): the classification comes from the ONE
   # semantic router (types.tg's classify_intrinsic_call — the same
   # classification the type checker attaches at call-recording time) over
-  # the TYPED operand facts; codegen holds no name table. Fail-closed: a
-  # name the semantic router does not recognize is an internal error.
+  # the TYPED operand facts; codegen holds no name table. For a SOURCE call
+  # the caller passes the checker's STAMPED id (MirCall.intrinsic) — the
+  # authority, so a type-MANGLED method name never re-enters a different
+  # router row (String__is_empty → the rejected frontend name
+  # string_is_empty — the stamp is the bare-method classification). The
+  # name-based router is the fallback for compiler-SYNTHESIZED calls
+  # (stamped Option::None). Fail-closed: a name the semantic router does
+  # not recognize is an internal error.
   let recv_ty = if args.len() > 0 then strip_ref_like_type(&operand_type(ctx, fctx, &args[0])) else Type::Unit end
   let recv_named = match recv_ty
   when Type::Adt(ri_tid, _) then bare_name_from_qualified(type_name_by_id(ctx, ri_tid.id))
@@ -9426,7 +9720,10 @@ def codegen_intrinsic(inout ctx: CodegenCtx, fctx: FnCodegenCtx, name: String, a
   else
     false
   end
-  let id = classify_intrinsic_call(&name, &recv_ty, &recv_named, &needle_ty, &needle_named, &orig_fn_name, recv_is_string, needle_is_string)
+  let id = match stamped
+  when Option::Some(sid) then sid
+  when Option::None then classify_intrinsic_call(&name, &recv_ty, &recv_named, &needle_ty, &needle_named, &orig_fn_name, recv_is_string, needle_is_string)
+  end
 
  # the String-ABI discriminator — "string_*" canonical names
   # carry the owned String-object ABI (receivers are headers); "str_*"
@@ -12587,20 +12884,41 @@ def resolve_static_label(ctx: CodegenCtx, did: DefId) -> String
   end  end
 end
 
-# collect every (DefId, constant type) pair a MirStaticRef /
-# MirStaticAddr constant carries, from one operand. The MirStaticRef
-# constant's type is the static's type (set at lowering); the MirStaticAddr
-# constant's type is the Ptr(Unit) of its address temp and takes no part in
-# the type join below — its DefId resolves through the same table entry the
-# static's other references register.
+# collect every (DefId, static value type) pair a MirStaticRef /
+# MirStaticAddr constant carries, from one operand. The reference constants
+# carry their stamped type (verifier_constant_type): MirStaticRef the
+# static's VALUE type, MirStaticAddr the POINTER to it (the lowering stamps
+# Type::Ptr(static_ty) — see lower_place's static-address temp). The label
+# table's join key is the STATIC's own type, so an address reference
+# contributes its POINTEE and pairs exactly like a value reference. A
+# legacy Ptr(Unit)-stamped address constant (the pre-stamp convention)
+# keeps its type verbatim for the addr-only fallback below.
+def static_reference_join_type(cst: MirConstant) -> Type
+  var join_ty = cst.ty.clone()
+  match cst.kind
+  when MirConstantKind::MirStaticAddr(_) then
+    match cst.ty
+    when Type::Ptr(inner) then
+      if !type_is_unit(inner.clone()) then join_ty = inner.clone() end
+    when Type::PtrMut(inner) then
+      if !type_is_unit(inner.clone()) then join_ty = inner.clone() end
+    when Type::RefInternal(inner, _) then
+      if !type_is_unit(inner.clone()) then join_ty = inner.clone() end
+    when _ then ()
+    end
+  when _ then ()
+  end
+  join_ty
+end
+
 def collect_static_refs_from_operand(op: MirOperand, inout out: Vec[(DefId, Type)]) -> Unit
   match op.kind
   when MirOperandKind::MirConstant(cst) then
     match cst.kind
     when MirConstantKind::MirStaticRef(did) then
-      out.push((DefId { module: ModuleId { id: did.module.id }, index: did.index }, cst.ty.clone()))
+      out.push((DefId { module: ModuleId { id: did.module.id }, index: did.index }, static_reference_join_type(cst.clone())))
     when MirConstantKind::MirStaticAddr(did) then
-      out.push((DefId { module: ModuleId { id: did.module.id }, index: did.index }, cst.ty.clone()))
+      out.push((DefId { module: ModuleId { id: did.module.id }, index: did.index }, static_reference_join_type(cst.clone())))
     when _ then ()
     end
   when _ then ()
@@ -12674,18 +12992,20 @@ end
 # emission label — from the program's statics and the DefIds its reference
 # constants carry. Each MirStatic's emission label is its name-side
 # registration (st.name — the label codegen_static emits at the symbol
-# table); the DefId is recovered by joining the reference constants (whose
-# MirStaticRef constant type IS the static's type) against the statics by
-# type identity — the pairing the lowering established (static_def_ids:
-# source name -> the resolver's DefId). The join must be UNIQUE: a
-# reference type matching several same-typed statics is an internal error
-# (fail-closed — the emission label must never be derived from an
-# unverifiable pairing).
+# table). The pairing is DefId-FIRST: MirStatic carries its resolver DefId
+# (def_id — the same static_def_ids identity the reference constants
+# carry), so same-typed statics pair exactly. The DefId-LESS remainder
+# (hand-built MIR) falls back to joining the reference constants (whose
+# join type is the static's value type: MirStaticRef directly, MirStaticAddr
+# through its stamped pointer's pointee) against the statics by type
+# identity; that join must be UNIQUE — a reference type matching several
+# same-typed statics is an internal error (fail-closed — the emission label
+# must never be derived from an unverifiable pairing).
 #
-# MirStaticAddr-only DefIds (a static referenced ONLY through its address —
-# method receivers, write sites — whose constant type is Ptr(Unit) and can
-# take no part in the type join) pair with the single unclaimed static
-# when the counts are both exactly one; anything richer fails closed.
+# Legacy MirStaticAddr-only DefIds (a static referenced ONLY through its
+# address whose constant still carries the pre-stamp Ptr(Unit) type) pair
+# with the single unclaimed DefId-less static when the counts are both
+# exactly one; anything richer fails closed.
 def build_static_label_table(program: MirProgram, inout out: Map[String, String]) -> Unit
   var refs: Vec[(DefId, Type)] = Vec::new()
   for func in program.functions do
@@ -12701,15 +13021,36 @@ def build_static_label_table(program: MirProgram, inout out: Map[String, String]
     end
   end
 
-  # Ref-side join: every MirStaticRef constant's type IS its static's type
-  # (set at lowering) — the DefIds per reference type. The same DefId
-  # repeated is one claim.
+  # DefId-side pairing (the AUTHORITATIVE route): a MirStatic that carries
+  # its resolver DefId registers its emission label under exactly that key —
+  # no type-side inference, and no ambiguity between same-typed statics
+  # (`reference type U8 is claimed by 2 DefId(s) and matched by 2 statics`).
+  # The type join below still validates and pairs the DefId-LESS remainder
+  # (hand-built MIR), keeping its fail-closed uniqueness rules.
+  var did_registered: Set[String] = Set::new()
+  for st in program.statics do
+    match st.def_id
+    when Option::Some(sdid) then
+      let sd_key = static_def_id_key(&sdid)
+      if !did_registered.contains(&sd_key) then
+        did_registered.insert(sd_key.clone())
+        out.insert(sd_key.clone(), st.name.clone())
+      end
+    when Option::None then ()
+    end
+  end
+
+  # Ref-side join (DefId-less remainder): every reference constant's JOIN
+  # type IS its static's value type — MirStaticRef carries it directly,
+  # MirStaticAddr's stamped pointer is stripped to its pointee by
+  # static_reference_join_type — the DefIds per reference type. The same
+  # DefId repeated is one claim.
   var type_dids: Map[String, Vec[String]] = Map::new()
   var seen_did: Map[String, Int] = Map::new()
   for (did, ty) in refs do
     let ty_key = mir_type_identity_key(&ty)
-    if ty_key != mir_type_identity_key(&Type::Ptr(Type::Unit)) then
-      let did_key = static_def_id_key(&did)
+    let did_key = static_def_id_key(&did)
+    if ty_key != mir_type_identity_key(&Type::Ptr(Type::Unit)) && !did_registered.contains(&did_key) then
       if !seen_did.contains_key(&did_key) then
         seen_did.insert(did_key.clone(), 1)
         match type_dids.get(ty_key.clone())
@@ -12726,29 +13067,33 @@ def build_static_label_table(program: MirProgram, inout out: Map[String, String]
     end
   end
 
-  # ADDRESS-ONLY references: a MirStaticAddr whose DefId never appears in a
-  # MirStaticRef anywhere — the static is used only through its address
-  # (method receivers, write sites). The Addr constant's type is the
-  # Ptr(Unit) of its address temp, so these DefIds take part in no type
-  # join; they need the unclaimed pairing below.
+  # LEGACY ADDRESS-ONLY references: a Ptr(Unit)-stamped MirStaticAddr (the
+  # pre-lowering-stamp convention) takes part in no type join; these DefIds
+  # need the unclaimed pairing below. Current lowering stamps the pointer to
+  # the static's recorded type, so addressed statics now pair through the
+  # DefId route or the type join above like every other reference; this
+  # remains as the fail-closed fallback for the legacy stamp.
   var addr_only: Vec[String] = Vec::new()
   for (did, ty) in refs do
     let ty_key = mir_type_identity_key(&ty)
     let did_key = static_def_id_key(&did)
-    if ty_key == mir_type_identity_key(&Type::Ptr(Type::Unit)) && !seen_did.contains_key(&did_key) && !addr_only.contains(&did_key) then
+    if ty_key == mir_type_identity_key(&Type::Ptr(Type::Unit)) && !seen_did.contains_key(&did_key) && !did_registered.contains(&did_key) && !addr_only.contains(&did_key) then
       addr_only.push(did_key.clone())
     end
   end
 
   # The join must be UNIQUE: a claimed reference type must match exactly
-  # one static and carry exactly one DefId — otherwise the pairing is
-  # unverifiable and the emission label must never be guessed (fail-closed).
+  # one DefId-less static and carry exactly one DefId — otherwise the
+  # pairing is unverifiable and the emission label must never be guessed
+  # (fail-closed).
   var static_count_by_type: Map[String, Int] = Map::new()
   for st in program.statics do
-    let st_ty_key = mir_type_identity_key(&st.ty)
-    match static_count_by_type.get(st_ty_key.clone())
-    when Option::Some(c) then static_count_by_type.insert(st_ty_key.clone(), c + 1)
-    when Option::None then static_count_by_type.insert(st_ty_key.clone(), 1)
+    if st.def_id.is_none() then
+      let st_ty_key = mir_type_identity_key(&st.ty)
+      match static_count_by_type.get(st_ty_key.clone())
+      when Option::Some(c) then static_count_by_type.insert(st_ty_key.clone(), c + 1)
+      when Option::None then static_count_by_type.insert(st_ty_key.clone(), 1)
+      end
     end
   end
   for (ty_key, dids) in type_dids do
@@ -12757,18 +13102,20 @@ def build_static_label_table(program: MirProgram, inout out: Map[String, String]
     when Option::None then 0
     end
     if st_count != 1 || dids.len() != 1 then
-      panic("ICE: static label table: reference type `" + ty_key.clone() + "` is claimed by " + dids.len().to_string() + " DefId(s) and matched by " + st_count.to_string() + " static(s) — the statics' DefId-side registration (MirStatic.def_id) is required for a unique pairing")
+      panic("ICE: static label table: reference type `" + ty_key.clone() + "` is claimed by " + dids.len().to_string() + " DefId(s) and matched by " + st_count.to_string() + " DefId-less static(s) — the statics' DefId-side registration (MirStatic.def_id) is required for a unique pairing")
     end
   end
 
-  # Register each claimed static's label (the name-side symbol-table
-  # registration) under its reference DefId.
+  # Register each claimed DefId-less static's label (the name-side
+  # symbol-table registration) under its reference DefId.
   for st in program.statics do
-    let st_ty_key = mir_type_identity_key(&st.ty)
-    match type_dids.get(st_ty_key)
-    when Option::Some(dids) then
-      if dids.len() == 1 then out.insert(dids[0].clone(), st.name.clone()) end
-    when Option::None then ()
+    if st.def_id.is_none() then
+      let st_ty_key = mir_type_identity_key(&st.ty)
+      match type_dids.get(st_ty_key)
+      when Option::Some(dids) then
+        if dids.len() == 1 then out.insert(dids[0].clone(), st.name.clone()) end
+      when Option::None then ()
+      end
     end
   end
 
@@ -12778,9 +13125,11 @@ def build_static_label_table(program: MirProgram, inout out: Map[String, String]
   # unique — the only sound pairing available. Anything richer fails closed.
   var unclaimed: Vec[String] = Vec::new()
   for st in program.statics do
-    let st_ty_key = mir_type_identity_key(&st.ty)
-    if !type_dids.contains_key(&st_ty_key) then
-      unclaimed.push(st.name.clone())
+    if st.def_id.is_none() then
+      let st_ty_key = mir_type_identity_key(&st.ty)
+      if !type_dids.contains_key(&st_ty_key) then
+        unclaimed.push(st.name.clone())
+      end
     end
   end
   if !addr_only.is_empty() then
@@ -16652,6 +17001,7 @@ def codegen_program(inout ctx: CodegenCtx, program: MirProgram) -> Result[Unit, 
   ctx.drop_glue_fns = program.drop_glue_fns.clone()
   ctx.drop_glue_instances = program.drop_glue_instances.clone()
   ctx.method_names_by_def = program.method_names_by_def.clone()
+  ctx.instance_labels = program.instance_labels.clone()
  # the map/set dispatch metadata (impl method base name ->
   # (instance-base render, declared parameter count)) — the map-op label
   # resolution authority.
@@ -16801,6 +17151,7 @@ def codegen_program(inout ctx: CodegenCtx, program: MirProgram) -> Result[Unit, 
 
   # Emit reachable functions + all extern stubs + closures
   # Closures (names starting with _closure) are always emitted if referenced
+  # (and not generic templates — see codegen_function_emitable)
   # Build set of functions with compiled bodies (non-extern, has blocks)
   # This is used by codegen_call to prefer direct calls over intrinsic inlining
   var has_body_fns: Set[String] = Set::new()
@@ -16809,7 +17160,7 @@ def codegen_program(inout ctx: CodegenCtx, program: MirProgram) -> Result[Unit, 
     let func = functions[fi]
     let func_name = func.name.clone()
     let is_closure = func_name.starts_with("_closure")
-    let should_emit = reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure
+    let should_emit = (reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure) && codegen_function_emitable(func)
     if should_emit && !func.is_extern && func.blocks.len() > 0 then
       has_body_fns.insert(func_name)
     end
@@ -16822,7 +17173,7 @@ def codegen_program(inout ctx: CodegenCtx, program: MirProgram) -> Result[Unit, 
     let func = functions[fi]
     let func_name = func.name.clone()
     let is_closure = func_name.starts_with("_closure")
-    let should_emit = reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure
+    let should_emit = (reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure) && codegen_function_emitable(func)
     if should_emit then
       ctx.fn_alias.insert(func_name.clone(), ".Lfn_entry." + fi.to_string())
     end
@@ -16863,10 +17214,11 @@ def codegen_program(inout ctx: CodegenCtx, program: MirProgram) -> Result[Unit, 
   fi = 0
   while fi < functions.len() do
     let func = functions[fi]
-    # Emit if: reachable OR _start OR extern OR closure (closures are always emitted when present)
+    # Emit if: (reachable OR _start OR extern OR closure) AND not a generic
+    # template (templates are declarations; their instances are emitted)
     let func_name = func.name.clone()
     let is_closure = func_name.starts_with("_closure")
-    let should_emit = reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure
+    let should_emit = (reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure) && codegen_function_emitable(func)
     if should_emit && !func.attr_cold then
       codegen_function(ctx, func)
     end
@@ -16908,7 +17260,7 @@ def codegen_program(inout ctx: CodegenCtx, program: MirProgram) -> Result[Unit, 
     let func = functions[fi]
     let func_name = func.name.clone()
     let is_closure = func_name.starts_with("_closure")
-    let should_emit = reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure
+    let should_emit = (reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure) && codegen_function_emitable(func)
     if should_emit && func.attr_cold then
       has_cold = true
     end
@@ -16921,7 +17273,7 @@ def codegen_program(inout ctx: CodegenCtx, program: MirProgram) -> Result[Unit, 
       let func = functions[fi]
       let func_name = func.name.clone()
       let is_closure = func_name.starts_with("_closure")
-      let should_emit = reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure
+      let should_emit = (reachable.contains(&func_name) || func_name == "_start" || func.is_extern || is_closure) && codegen_function_emitable(func)
       if should_emit && func.attr_cold then
         codegen_function(ctx, func)
       end
@@ -17108,9 +17460,10 @@ end
 #     payload bytes handed out minus total bytes freed (free-list blocks
 #     count as freed the moment _tg_mem_free links them in). Exposed to
 #     tests through _tg_allocator_outstanding_bytes.
-#   * _tg_alloc_fail_next — single-shot fault-injection flag: when
+#   * _tg_alloc_fail_next_flag — single-shot fault-injection flag: when
 #     nonzero, the next _tg_mem_alloc large-path request returns 0 without
-#     calling mmap (deterministic OOM simulation; see _tg_alloc_fail_next).
+#     calling mmap (deterministic OOM simulation; armed by the
+#     _tg_alloc_fail_next() test hook).
 #
 # All slots are zero-initialized in .data — the first small allocation
 # seeds each class from the bump arena, and the first large allocation
@@ -17150,17 +17503,19 @@ def emit_allocator_runtime_data(inout ctx: CodegenCtx) -> Unit
   def_label(&mut ctx.data, "_tg_alloc_outstanding".to_string())
   emit64_le(&mut ctx.data, 0)
 
-  # _tg_alloc_fail_next (8 bytes, initialized to 0)
+  # _tg_alloc_fail_next_flag (8 bytes, initialized to 0). The FLAG cell is
+  # distinct from the _tg_alloc_fail_next() test hook FUNCTION (same-object
+  # defined-global uniqueness).
   let fail_off = buf_pos(&ctx.data)
   add_symbol(&mut ctx.data, AsmSymbol {
-    name: "_tg_alloc_fail_next".to_string(),
+    name: "_tg_alloc_fail_next_flag".to_string(),
     section: Section::Data,
     offset: fail_off,
     size: 8,
     binding: SymBinding::Global,
     kind: SymKind::Data
   })
-  def_label(&mut ctx.data, "_tg_alloc_fail_next".to_string())
+  def_label(&mut ctx.data, "_tg_alloc_fail_next_flag".to_string())
   emit64_le(&mut ctx.data, 0)
 
   # _tg_alloc_locks (13 × 1 byte — one spin-lock per size class,

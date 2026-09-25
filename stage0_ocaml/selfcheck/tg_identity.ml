@@ -42,11 +42,11 @@ let () =
       match stages.Driver.bs_vm_code with
       | Some 0 ->
           Printf.printf
-            "tg_identity: PASS — persistent rename keeps the StructuralInstanceId, ephemeral re-keys, member lineage survives insertion + continuation (VM exit 0)\n";
+            "tg_identity: PASS — persistent rename keeps the StructuralInstanceId, ephemeral re-keys, member lineage survives insertion + continuation, persistent HIR lineage keeps StableSemanticNodeId across an unrelated insertion (VM exit 0)\n";
           exit 0
       | Some code ->
           fail
-            "probe check %d failed (persistent rename must keep the StructuralInstanceId, ephemeral must re-key, member lineage must survive insertion + continuation)"
+            "probe check %d failed (persistent rename must keep the StructuralInstanceId, ephemeral must re-key, member lineage must survive insertion + continuation, persistent HIR lineage must keep StableSemanticNodeId across an unrelated insertion)"
             code
       | None ->
           fail

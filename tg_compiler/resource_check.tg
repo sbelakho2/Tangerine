@@ -5749,7 +5749,7 @@ def check_loop(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
   when Option::Some(c2) then c2.node_id
   when Option::None then -1
   end
-  let after = check_loop_body(program, typed, env, ctx, body, &entry, &entry_names, &no_iter_binding, -1, &no_projected_fields, false, errors, finalize_plan, edges, blocks, stmt_node_id, current_loop_entry, defer_chain, cond_source)
+  let after = check_loop_body(program, typed, env, ctx, body, &entry, &entry_names, &no_iter_binding, -1, &no_projected_fields, false, false, errors, finalize_plan, edges, blocks, stmt_node_id, current_loop_entry, defer_chain, cond_source)
   frame_assign(frame, &after)
   # / THE LOOP-JOIN — the loop's continuation block's (entry, exit)
   # frames: the after-frame (the fixed point check_loop_body computed —
@@ -5851,7 +5851,15 @@ def for_iter_type_kind(typed: TypedProgram, ty: Type) -> (Int, Type)
     if ((li.vec != -1 && tid.id == li.vec) || (li.array != -1 && tid.id == li.array) || (li.slice != -1 && tid.id == li.slice)) && args.len() > 0 then
       (0, args[0].clone())
     elsif li.map != -1 && tid.id == li.map && args.len() >= 2 then
-      (1, args[1].clone())
+      # The map drain yields ENTRY TUPLES: __intrinsic_map_drain_one
+      # returns Option[(K, V)] (the MIR's for-consume desugar projects
+      # Variant(Some).Field(0) to reach the tuple). The plan's element
+      # type must therefore be the tuple — the former `args[1]` (the
+      # value type alone) typed the drained Option temp Option[V] and
+      # every destructured component after it (the `for (k, v) in map`
+      # chain resolved to a 1-tuple of V and the tuple-index reads of the
+      # entry checked "invalid projection chain").
+      (1, Type::Tuple([args[0].clone(), args[1].clone()]))
     elsif li.set != -1 && tid.id == li.set && args.len() > 0 then
       (2, args[0].clone())
     else
@@ -6909,6 +6917,11 @@ def check_for(program: Program, typed: TypedProgram, inout env: TypeEnv, inout c
   # local root, but its binding is still the MIR's per-iteration element
   # slot).
   var projected_iteration = false
+  # (the CONSUMING for-binding): the iteration plan's Consume access means
+  # the MIR drains an OWNED element into the binding each iteration
+  # (lower_for_consume_place), so the binding is per-iteration owned state
+  # that must be finalized at the loop's backedge (see check_loop_created).
+  var binding_consumed = false
   match for_iteration_plan(typed, env, for_stmt, &iter_binding_ids)
   when Option::Some(p) then
     if p.access == AccessEffect::Read && p.source_kind != 3 then
@@ -6919,6 +6932,9 @@ def check_for(program: Program, typed: TypedProgram, inout env: TypeEnv, inout c
         collect_place_field_chain(typed, &for_stmt.iter, &mut projected_fields)
       when Option::None then ()
       end
+    end
+    if p.access == AccessEffect::Consume then
+      binding_consumed = true
     end
     record_iteration_plan(ctx, stmt_node_id, p)
  # (phase 2): the typed iteration record is produced at the SAME
@@ -6935,7 +6951,7 @@ def check_for(program: Program, typed: TypedProgram, inout env: TypeEnv, inout c
   for lid in res_frame_names_clone(&entry) do
     entry_names.push(lid.id)
   end
-  let after = check_loop_body(program, typed, env, ctx, &for_stmt.body, &entry, &entry_names, &iter_binding_ids, projected_root, &projected_fields, projected_iteration, errors, finalize_plan, edges, blocks, stmt_node_id, current_loop_entry, defer_chain, -1)
+  let after = check_loop_body(program, typed, env, ctx, &for_stmt.body, &entry, &entry_names, &iter_binding_ids, projected_root, &projected_fields, projected_iteration, binding_consumed, errors, finalize_plan, edges, blocks, stmt_node_id, current_loop_entry, defer_chain, -1)
   frame_assign(frame, &after)
   # / THE FOR-JOIN — the for loop's continuation block's (entry,
   # exit) frames: the after-frame (the fixed point check_loop_body
@@ -6963,7 +6979,7 @@ end
 # check_loop_body exempts the binding ids (a conditionally consumed binding
 # is likewise per-iteration state, refreshed at the next header).
 
-def check_loop_body(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, body: Block, entry: ResFrame, entry_names: Vec[Int], iter_binding_ids: Vec[Int], projected_root: Int, projected_fields: Vec[String], projected_iteration: Bool, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], loop_stmt_id: Int, inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int], exit_source: Int) -> ResFrame
+def check_loop_body(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, body: Block, entry: ResFrame, entry_names: Vec[Int], iter_binding_ids: Vec[Int], projected_root: Int, projected_fields: Vec[String], projected_iteration: Bool, binding_consumed: Bool, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], loop_stmt_id: Int, inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int], exit_source: Int) -> ResFrame
  # (single-shot loops): when the body's FIRST DIRECT terminator is a
   # Break or Return (not a Continue), the fallthrough to the backedge is
   # UNREACHABLE — the loop executes at most once. The backedge then
@@ -7122,7 +7138,7 @@ def check_loop_body(program: Program, typed: TypedProgram, inout env: TypeEnv, i
       end
     end
   end
-  let to_forget = check_loop_created(ctx, entry, entry_names, &bf, typed, errors, finalize_plan, edges, loop_stmt_id, body_key, single_shot, exit_source)
+  let to_forget = check_loop_created(ctx, entry, entry_names, &bf, iter_binding_ids, binding_consumed, typed, errors, finalize_plan, edges, loop_stmt_id, body_key, single_shot, exit_source)
  # the BACKEDGE JOIN — the fixed point of the loop dataflow. The
   # per-iteration frame (bf — the ITERATION-LOCAL state: the loop-created
   # locals) and the loop entry frame (entry — the LOOP-PERSISTENT state:
@@ -7151,11 +7167,25 @@ def check_loop_body(program: Program, typed: TypedProgram, inout env: TypeEnv, i
   if single_shot then
     res_frame_clone(&bf)
   else
-    res_frame_clone(entry)
+    var after_frame = res_frame_clone(entry)
+    # (the consuming for-binding is iteration-local): the binding must not
+    # survive into the loop's after-frame — the ENCLOSING loop's
+    # loop-created scan would otherwise schedule its drop on the OUTER
+    # backedge (the stale placement the per-iteration backedge drop above
+    # replaces). The binding is out of scope after the loop by
+    # construction.
+    if binding_consumed then
+      var fbi = 0
+      while fbi < iter_binding_ids.len() do
+        res_frame_forget(&mut after_frame, LocalId { id: iter_binding_ids[fbi] })
+        fbi = fbi + 1
+      end
+    end
+    after_frame
   end
 end
 
-def check_loop_created(inout ctx: AnalysisContext, entry: ResFrame, entry_names: Vec[Int], bf: ResFrame, typed: TypedProgram, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], loop_stmt_id: Int, loop_body_key: Int, single_shot: Bool, exit_source: Int) -> Vec[tg_compiler::ids::LocalId]
+def check_loop_created(inout ctx: AnalysisContext, entry: ResFrame, entry_names: Vec[Int], bf: ResFrame, iter_binding_ids: Vec[Int], binding_consumed: Bool, typed: TypedProgram, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], loop_stmt_id: Int, loop_body_key: Int, single_shot: Bool, exit_source: Int) -> Vec[tg_compiler::ids::LocalId]
   mut to_forget = Vec::new()
  # the BACKEDGE edge's CleanupAction sequence — the loop body
   # scope's defers as RunDefer actions (LIFO) and the loop-created owning
@@ -7211,7 +7241,50 @@ def check_loop_created(inout ctx: AnalysisContext, entry: ResFrame, entry_names:
     when _ then ()
     end
   end
- # / the backedge obligation is ATTACHED to the pre-built
+  # (the CONSUMING for-loop binding — the per-iteration owned element):
+  # bind_pattern ran BEFORE check_for's entry snapshot, so the
+  # loop-created scan above never finalizes the iteration binding (the
+  # documented projected-iteration posture: a reference binding owns
+  # nothing). A CONSUMING iteration (the MIR's lower_for_consume_place)
+  # MOVES a fresh element into the binding every iteration: an OWNING
+  # binding still Live at the body's end must be finalized at the
+  # BACKEDGE like any other loop-created local — without this the value
+  # first leaks per iteration, and the ENCLOSING loop's plan then
+  # schedules the drop on its OWN backedge (the stale outer-backedge
+  # deinit: uninitialized on the never-drained path, duplicate deinit on
+  # the drain path). The binding is forgotten from the iteration frame in
+  # every state — it is re-bound at the next drain.
+  if binding_consumed then
+    var ibi = 0
+    while ibi < iter_binding_ids.len() do
+      let bid_num = iter_binding_ids[ibi]
+      for (id, ls) in bf.locals do
+        if id.id == bid_num then
+          var already = false
+          var tfi = 0
+          while tfi < to_forget.len() do
+            if to_forget[tfi].id == id.id then already = true end
+            tfi = tfi + 1
+          end
+          if !already then
+            match ls.availability
+            when ResourceState::Live then
+              # A capability binding is never auto-finalized (the same rule
+              # as the loop-created scan above): it must be consumed by the
+              # body; the binding is forgotten regardless.
+              if !ls.is_capability then
+                backedge_actions.push(CleanupAction::Drop(id))
+              end
+            when _ then ()
+            end
+            to_forget.push(id)
+          end
+        end
+      end
+      ibi = ibi + 1
+    end
+  end
+  # / the backedge obligation is ATTACHED to the pre-built
   # BACKEDGE edge record (the "backedge::<loop stmt id>" string-key
   # serialization is are not part of the model). An empty obligation means the CleanupEdge's
   # actions stay empty — the edge record still exists (the transfer
@@ -8076,7 +8149,7 @@ def projected_escape_flow(inout env: TypeEnv, typed: TypedProgram, ctx: Analysis
   when ExprKind::ExprCall(_, args) then
     projected_escape_flow_args(env, typed, ctx, staged_hop, &args, out)
   when ExprKind::ExprMethodCall(receiver, _, _, args) then
-    let recv_eff = match typed.access_effects.get(receiver.node_id)
+    let recv_eff = match typed.access_effects.get((*receiver.get()).node_id)
     when Option::Some(e) then e
     when Option::None then AccessEffect::Read
     end
