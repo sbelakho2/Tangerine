@@ -3335,6 +3335,62 @@ end
 # Type Environment
 # ———————————————————————————————————————————————————————————————
 
+# ── the type-query typed channel (size_of[T]() / align_of[T]()) ─────
+# The seed's check_call classifies a query-sig resolution into
+# TC_type_query (kind, solved type args); the kernel records the SAME
+# typed fact per call node: the query KIND plus the SOLVED type argument
+# (a concrete type, or the enclosing declaration's Type::Param in a
+# generic body — substituted by monomorphization like every other
+# embedded type). The typed record is the AUTHORITY the MIR lowering
+# reads to emit the compile-time query placeholder instead of an
+# ordinary extern call; the post-mono fold resolves it through the
+# layout engine.
+enum TypeQueryKind
+  SizeOf
+  AlignOf
+end
+
+def type_query_kind_name(k: TypeQueryKind) -> String
+  match k
+  when TypeQueryKind::SizeOf then "size_of"
+  when TypeQueryKind::AlignOf then "align_of"
+  end  end
+end
+
+def type_query_kind_of_name(n: String) -> Option[TypeQueryKind]
+  if n == "size_of" then return Option::Some(TypeQueryKind::SizeOf) end
+  if n == "align_of" then return Option::Some(TypeQueryKind::AlignOf) end
+  Option::None
+end
+
+struct TypeQueryRecord
+  kind: TypeQueryKind
+  arg: Type
+end
+
+# The callee SHAPE of a query call: the call's callee is an indexed
+# callee `size_of[T]` (the kernel AST's turbofish form) whose base is the
+# bare identifier or a path whose LAST segment names the query. The
+# seed's special form is name-based on the direct Name callee; the kernel
+# mirrors it over the indexed spelling and accepts the module-qualified
+# path (`std::core::size_of[T]()`).
+def type_query_kind_of_callee(callee: Expr) -> Option[TypeQueryKind]
+  match callee.kind
+  when ExprKind::ExprIndex(base, _) then
+    match (*base.get()).kind
+    when ExprKind::ExprIdent(name) then type_query_kind_of_name(name)
+    when ExprKind::ExprPath(path) then
+      if path.segments.len() == 0 then
+        Option::None
+      else
+        type_query_kind_of_name(path.segments[path.segments.len() - 1].clone())
+      end
+    when _ then Option::None
+    end
+  when _ then Option::None
+  end  end
+end
+
 struct TypeEnv
   type_list: Vec[TypeDef]              # Single source of truth, insertion order
   type_name_index: Map[String, Int]    # name -> index into type_list
@@ -3938,6 +3994,12 @@ struct TypeEnv
   # the typed program carries the classification per call for the
   # MIR/codegen consumers.
   typed_intrinsics: Map[Int, IntrinsicId]
+  # (the type-query typed channel): call expr node id -> the query record
+  # (kind + SOLVED type argument) the checker attaches at the call site
+  # of the special form `size_of[T]()` / `align_of[T]()`. Carried into
+  # the TypedProgram snapshot (type_queries) and read by the MIR lowering
+  # — the query NEVER lowers to an ordinary extern call.
+  typed_type_queries: Map[Int, TypeQueryRecord] = Map::new()
 end
 
 # The TypeEnv clone: every field duplicates through its own surface — the
@@ -4046,6 +4108,7 @@ impl Clone for TypeEnv
       type_prop_cache: self.type_prop_cache.clone(),
       effects: self.effects.clone(),
       typed_intrinsics: self.typed_intrinsics.clone(),
+      typed_type_queries: self.typed_type_queries.clone(),
     }
   end
 end
@@ -6667,6 +6730,12 @@ struct TypedProgram
   # performs no call-site inference (fail-closed). MIR pairs this with
   # call_targets to fill the call instance's args.
   call_instances: Map[Int, Vec[GenericArg]]
+  # (the type-query typed channel): call expr node id -> the query record
+  # (kind + SOLVED type argument) for `size_of[T]()` / `align_of[T]()` —
+  # the typed carrier the MIR lowering reads so the query never lowers to
+  # an ordinary extern call. Defaulted so every existing TypedProgram
+  # construction stays unchanged.
+  type_queries: Map[Int, TypeQueryRecord] = Map::new()
   # (P0-4/P0-5) the bound-receiver contract-call records (call node id ->
   # ContractCallRecord) and the source-keyed trait-impl method contract
   # identities ("trait::method" -> ImplContractMethod) — the checker's
@@ -22493,6 +22562,29 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
       end
     when _ then ()
     end
+    # (the type-query typed channel): the special form
+    # `size_of[T]()` / `align_of[T]()` — record the query KIND and the
+    # SOLVED type argument for the MIR lowering (the query never lowers
+    # to an ordinary extern call; the post-mono fold resolves it through
+    # the layout engine). Fail closed on a malformed query shape: exactly
+    # one type argument and no runtime arguments. The seed's special form
+    # is name-based on the direct callee; the kernel mirrors it over the
+    # indexed (turbofish) spelling.
+    match type_query_kind_of_callee(&func_expr)
+    when Option::Some(qkind) then
+      if turbofish_types.len() == 0 then
+        # not the turbofish spelling (the base is not a direct callable):
+        # the ordinary index/call path owns the shape.
+        ()
+      elsif turbofish_types.len() != 1 then
+        type_add_error(env, type_query_kind_name(qkind) + "[T]() takes exactly one type argument, found " + turbofish_types.len().to_string(), expr.span)
+      elsif args.len() != 0 then
+        type_add_error(env, type_query_kind_name(qkind) + "[T]() takes no runtime arguments, found " + args.len().to_string(), expr.span)
+      else
+        env.typed_type_queries.insert(expr.node_id, TypeQueryRecord { kind: qkind, arg: turbofish_types[0].clone() })
+      end
+    when Option::None then ()
+    end
     var func_type = match turbofish_callee
       when Option::Some(base_expr) then check_expr(env, &base_expr)
       when Option::None then check_expr(env, &func_expr)
@@ -30915,6 +31007,7 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
     expr_types: env.typed_expr_types.clone(),
     call_targets: env.typed_call_targets.clone(),
     call_instances: env.typed_call_instances.clone(),
+    type_queries: env.typed_type_queries.clone(),
     contract_calls: env.typed_contract_calls.clone(),
     trait_contract_methods: env.typed_trait_contract_methods.clone(),
     trait_contract_conflicts: env.typed_trait_contract_conflicts.clone(),
@@ -30966,6 +31059,7 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
     expr_types: env.typed_expr_types.clone(),
     call_targets: env.typed_call_targets.clone(),
     call_instances: env.typed_call_instances.clone(),
+    type_queries: env.typed_type_queries.clone(),
     contract_calls: env.typed_contract_calls.clone(),
     trait_contract_methods: env.typed_trait_contract_methods.clone(),
     trait_contract_conflicts: env.typed_trait_contract_conflicts.clone(),

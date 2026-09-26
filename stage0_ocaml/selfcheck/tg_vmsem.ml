@@ -751,7 +751,7 @@ let check_serialization () =
         Vm_value.Bool true;
         Vm_value.Char (Uchar.of_int 0x1F600);
         Vm_value.String "h\195\169llo";
-        Vm_value.Array [| Vm_value.Float64 0x3FF0000000000000L; Vm_value.Unit |];
+        Vm_value.array [| Vm_value.Float64 0x3FF0000000000000L; Vm_value.Unit |];
         Vm_value.Enum (1, [| Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true 42L) |]);
       |]
   in
@@ -1348,7 +1348,7 @@ let check_array_set_ownership () =
   let seed_vec (_vm : Vm.t) (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
     frame.locals.(1) <-
       Vm_value.Live
-        (Vm_value.Array [| ref_of res.(0); ref_of res.(1); ref_of res.(2) |]);
+        (Vm_value.array [| ref_of res.(0); ref_of res.(1); ref_of res.(2) |]);
     frame.locals.(2) <- Vm_value.Live (int64_value 1L);
     frame.locals.(3) <- Vm_value.Live (ref_of res.(3))
   in
@@ -1361,9 +1361,10 @@ let check_array_set_ownership () =
          [ run.sres.(0); run.sres.(2); run.sres.(3) ];
        (match run.sframe.locals.(1) with
         | Vm_value.Live (Vm_value.Array elems)
-          when Array.length elems = 3 && Vm_value.equal elems.(0) (ref_of run.sres.(0))
-               && Vm_value.equal elems.(1) (ref_of run.sres.(3))
-               && Vm_value.equal elems.(2) (ref_of run.sres.(2)) ->
+          when Vm_value.arr_length elems = 3
+               && Vm_value.equal (Vm_value.arr_get elems 0) (ref_of run.sres.(0))
+               && Vm_value.equal (Vm_value.arr_get elems 1) (ref_of run.sres.(3))
+               && Vm_value.equal (Vm_value.arr_get elems 2) (ref_of run.sres.(2)) ->
             pass
               "array_set(1,R4): the displaced R2 dropped exactly once at the call (R1/R3/R4 drops=0), the writeback installed [R1,R4,R3]"
         | other ->
@@ -1409,7 +1410,7 @@ let check_array_set_oob () =
   let seed (_vm : Vm.t) (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
     frame.locals.(1) <-
       Vm_value.Live
-        (Vm_value.Array [| ref_of res.(0); ref_of res.(1); ref_of res.(2) |]);
+        (Vm_value.array [| ref_of res.(0); ref_of res.(1); ref_of res.(2) |]);
     frame.locals.(2) <- Vm_value.Live (int64_value 3L);
     frame.locals.(3) <- Vm_value.Live (ref_of res.(3))
   in
@@ -1433,7 +1434,7 @@ let check_array_set_oob () =
 let check_array_pop_ownership () =
   let seed_vec (_vm : Vm.t) (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
     frame.locals.(1) <-
-      Vm_value.Live (Vm_value.Array [| ref_of res.(0); ref_of res.(1) |])
+      Vm_value.Live (Vm_value.array [| ref_of res.(0); ref_of res.(1) |])
   in
   let prog_transfer =
     main_prog [| Type_repr.Unit; vec_ty; string_ty; string_ty |]
@@ -1454,7 +1455,8 @@ let check_array_pop_ownership () =
          [ run.sres.(0); run.sres.(1) ];
        (match (run.sframe.locals.(1), run.sframe.locals.(2)) with
         | Vm_value.Live (Vm_value.Array elems), Vm_value.Live (Vm_value.Enum (0, [| v |]))
-          when Array.length elems = 1 && Vm_value.equal elems.(0) (ref_of run.sres.(0))
+          when Vm_value.arr_length elems = 1
+               && Vm_value.equal (Vm_value.arr_get elems 0) (ref_of run.sres.(0))
                && Vm_value.equal v (ref_of run.sres.(1)) ->
             pass
               "pop: the popped R2 is NOT dropped by the host — it transfers into the returned Option (vec holds [R1])"
@@ -1499,8 +1501,7 @@ let check_clear_ownership () =
   let seed_vec (_vm : Vm.t) (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
     frame.locals.(1) <-
       Vm_value.Live
-        (Vm_value.Array
-           [| ref_of res.(0); ref_of res.(1); ref_of res.(2) |])
+        (Vm_value.array [| ref_of res.(0); ref_of res.(1); ref_of res.(2) |])
   in
   (match seeded_run prog_arr seed_vec 3 with
    | Setup_error m -> fail "array_clear: entry setup: %s" m
@@ -1508,7 +1509,7 @@ let check_clear_ownership () =
    | Ran_ok run ->
        expect_dropped run.svm "array_clear" (Array.to_list run.sres);
        (match run.sframe.locals.(1) with
-        | Vm_value.Live (Vm_value.Array elems) when Array.length elems = 0 ->
+        | Vm_value.Live (Vm_value.Array elems) when Vm_value.arr_length elems = 0 ->
             pass
               "array_clear: every prior member (R1,R2,R3) drops exactly once and the writeback installs the empty vec"
         | other -> fail "array_clear: the vec local is not empty: %s" (Vm_value.slot_state other)));
@@ -1619,9 +1620,9 @@ let check_map_insert_ownership () =
   let seed (_vm : Vm.t) (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
     frame.locals.(1) <- Vm_value.Live Vm_value.map_empty;
     frame.locals.(2) <- Vm_value.Live (Vm_value.String "a");
-    frame.locals.(3) <- Vm_value.Live (Vm_value.Array [| ref_of res.(0); ref_of res.(1) |]);
+    frame.locals.(3) <- Vm_value.Live (Vm_value.array [| ref_of res.(0); ref_of res.(1) |]);
     frame.locals.(5) <- Vm_value.Live (Vm_value.String "a");
-    frame.locals.(6) <- Vm_value.Live (Vm_value.Array [| ref_of res.(2) |])
+    frame.locals.(6) <- Vm_value.Live (Vm_value.array [| ref_of res.(2) |])
   in
   let prog_no_drops =
     { prog with
@@ -1661,10 +1662,10 @@ let check_map_insert_ownership () =
              match Vm_value.map_pairs store with
              | [ (k, Vm_value.Array v2) ]
                when Vm_value.equal k (Vm_value.String "a")
-                    && Array.length v2 = 1 && Array.length v1 = 2
-                    && Vm_value.equal v2.(0) (ref_of run.sres.(2))
-                    && Vm_value.equal v1.(0) (ref_of run.sres.(0))
-                    && Vm_value.equal v1.(1) (ref_of run.sres.(1)) ->
+                    && Vm_value.arr_length v2 = 1 && Vm_value.arr_length v1 = 2
+                    && Vm_value.equal (Vm_value.arr_get v2 0) (ref_of run.sres.(2))
+                    && Vm_value.equal (Vm_value.arr_get v1 0) (ref_of run.sres.(0))
+                    && Vm_value.equal (Vm_value.arr_get v1 1) (ref_of run.sres.(1)) ->
                  pass
                    "map_insert replace: old V returned in the Option (not dropped internally), new V stored exactly once"
              | _ ->
@@ -1701,13 +1702,13 @@ let check_nested_set_ownership () =
     ignore res;
     frame.locals.(1) <-
       Vm_value.Live
-        (Vm_value.Array
+        (Vm_value.array
            [|
-             Vm_value.Array [| Vm_value.String "x"; Vm_value.String "y" |];
-             Vm_value.Array [| Vm_value.String "z" |];
+             Vm_value.array [| Vm_value.String "x"; Vm_value.String "y" |];
+             Vm_value.array [| Vm_value.String "z" |];
            |]);
     frame.locals.(2) <- Vm_value.Live (int64_value 1L);
-    frame.locals.(3) <- Vm_value.Live (Vm_value.Array [| Vm_value.String "w" |])
+    frame.locals.(3) <- Vm_value.Live (Vm_value.array [| Vm_value.String "w" |])
   in
   (match seeded_run prog_set seed_str 0 with
    | Setup_error m -> fail "nested Vec[Vec[String]]: entry setup: %s" m
@@ -1715,24 +1716,24 @@ let check_nested_set_ownership () =
    | Ran_ok run -> (
        match run.sframe.locals.(1) with
        | Vm_value.Live (Vm_value.Array elems)
-         when Array.length elems = 2
-              && Vm_value.equal elems.(0)
-                   (Vm_value.Array [| Vm_value.String "x"; Vm_value.String "y" |])
-              && Vm_value.equal elems.(1)
-                   (Vm_value.Array [| Vm_value.String "w" |]) ->
+         when Vm_value.arr_length elems = 2
+              && Vm_value.equal (Vm_value.arr_get elems 0)
+                   (Vm_value.array [| Vm_value.String "x"; Vm_value.String "y" |])
+              && Vm_value.equal (Vm_value.arr_get elems 1)
+                   (Vm_value.array [| Vm_value.String "w" |]) ->
            pass
              "nested Vec[Vec[String]]: set(1, [w]) replaces the inner vec — retained inner vec shared, displaced inner vec [z] dropped once, no double drop"
        | _ -> fail "nested Vec[Vec[String]]: wrong outer-vec shape after the call"));
   let seed_owned (_vm : Vm.t) (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
     frame.locals.(1) <-
       Vm_value.Live
-        (Vm_value.Array
+        (Vm_value.array
            [|
-             Vm_value.Array [| ref_of res.(0); ref_of res.(1) |];
-             Vm_value.Array [| ref_of res.(2) |];
+             Vm_value.array [| ref_of res.(0); ref_of res.(1) |];
+             Vm_value.array [| ref_of res.(2) |];
            |]);
     frame.locals.(2) <- Vm_value.Live (int64_value 1L);
-    frame.locals.(3) <- Vm_value.Live (Vm_value.Array [| ref_of res.(3) |])
+    frame.locals.(3) <- Vm_value.Live (Vm_value.array [| ref_of res.(3) |])
   in
   (match seeded_run prog_set seed_owned 4 with
    | Setup_error m -> fail "nested Vec[Vec[Owned]]: entry setup: %s" m
@@ -2059,6 +2060,67 @@ let check_unwind_pair () =
         pass "try_invoke rejects a non-function argument (deterministic VM trap)"
       else fail "try_invoke non-function: wrong trap text: %s" m
 
+(* the in-place element-write fast path (the growable-array cell's
+   `owned` flag): a by-value (Read) parameter gives the callee a second
+   holder while the caller's binding stays live.  The callee moves the
+   parameter into a local and writes element 0 through a projected
+   Assign; the caller's array must keep its old content (the write
+   forks a private cell).  A leaked in-place write would show here. *)
+let check_inplace_set_alias () =
+  let prog =
+    { Seed_mir.functions =
+        [|
+          { Seed_mir.name = "main";
+            instance = instance 0;
+            params = [||];
+            locals = [| string_ty; vec_ty |];
+            blocks =
+              [|
+                { id = 0;
+                  statements =
+                    [ Seed_mir.Assign
+                        ( local 1,
+                          Seed_mir.Aggregate
+                            (Seed_mir.ArrayAgg, [ Seed_mir.Constant (Seed_mir.String "seed") ]) ) ];
+                  terminator =
+                    Seed_mir.Call
+                      ( local 0, Seed_mir.User (instance 1),
+                        [| read_arg 1 |], 1, None ) };
+                { id = 1; statements = []; terminator = Seed_mir.Ret } |];
+            entry = 0 };
+          { Seed_mir.name = "move_set";
+            instance = instance 1;
+            params = [| { pt_convention = Access_effect.Let; pt_type = vec_ty } |];
+            locals = [| string_ty; vec_ty; vec_ty |];
+            blocks =
+              [|
+                { id = 0;
+                  statements =
+                    [ Seed_mir.Assign (local 2, Seed_mir.Use (Seed_mir.Move (local 1)));
+                      Seed_mir.Assign
+                        ( { root = Seed_mir.Local 2; projections = [ Seed_mir.ConstantIndex 0 ] },
+                          Seed_mir.Use (Seed_mir.Constant (Seed_mir.String "mutated")) );
+                      Seed_mir.Assign
+                        ( local 0, Seed_mir.Use (Seed_mir.Constant (Seed_mir.String "")) ) ];
+                  terminator = Seed_mir.Ret } |];
+            entry = 0 } |];
+      statics = [||];
+      types = [||] }
+  in
+  (match seeded_run prog (fun _ _ _ -> ()) 0 with
+   | Setup_error m -> fail "in-place set alias: entry setup: %s" m
+   | Ran_error (m, _) -> fail "in-place set alias: %s" m
+   | Ran_ok run -> (
+       match run.sframe.locals.(1) with
+       | Vm_value.Live (Vm_value.Array elems)
+         when Vm_value.arr_length elems = 1
+              && Vm_value.equal (Vm_value.arr_get elems 0) (Vm_value.String "seed") ->
+           pass
+             "in-place set alias: the callee's element write forked — the caller's by-value argument kept [seed]"
+       | other ->
+           fail "in-place set alias: the caller's argument changed: %s"
+             (Vm_value.slot_state other)))
+
 let () =
   Printf.printf "Seed VM kernel-closure primitive self-check\n";
   check_dyn_index ();
@@ -2075,6 +2137,7 @@ let () =
   check_set_remove_ownership ();
   check_map_insert_ownership ();
   check_nested_set_ownership ();
+  check_inplace_set_alias ();
   check_unwind_pair ();
   if !failures = 0 then begin
     Printf.printf "ALL PASS\n";

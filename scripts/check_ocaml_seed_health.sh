@@ -94,6 +94,20 @@ TG_INFER_MERGED_TIMEOUT_S=1200
 # skip.
 TG_DEVIRT_TIMEOUT_S=900
 
+# Kernel-native link/codesign lane calibration (the tg_linkprobe probe:
+# the linkprobe_mini closure is the FULL kernel closure plus the probe).
+# Measured on the Darwin/arm64 host:
+#   - cold (program cache absent, closure front end + mono + linkobj VM):
+#     ~11.6 min under concurrent host load (~350 s front end alone when
+#     the machine is otherwise idle);
+#   - warm (prepared-VM program cache hit, linkobj mode): ~1.0 s;
+#   - --mode full (the REAL kernel compile entry) is minutes-scale
+#     because the seed VM's copy-on-push Array model makes the kernel's
+#     byte-at-a-time Mach-O emission quadratic — kept opt-in.
+# Cap 1800 s (provisional, comfortably above the measured cold wall); a
+# cap is a bound, never a skip.
+TG_LINKPROBE_TIMEOUT_S=1800
+
 if [ -f scripts/check_ocaml_toolchain.sh ]; then
   scripts/check_ocaml_toolchain.sh
 fi
@@ -157,6 +171,9 @@ for name in $NAMES; do
   fi
   if [ "$name" = "tg_devirt" ]; then
     SC_TIMEOUT_S="$TG_DEVIRT_TIMEOUT_S"
+  fi
+  if [ "$name" = "tg_linkprobe" ]; then
+    SC_TIMEOUT_S="$TG_LINKPROBE_TIMEOUT_S"
   fi
   if ! timeout "$SC_TIMEOUT_S" "_build/default/selfcheck/${name}.exe" >"/tmp/ocaml_sc_${name}.out" 2>&1; then
     echo "check_ocaml_seed_health: FAIL — selfcheck ${name} exited non-zero"

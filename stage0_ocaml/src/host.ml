@@ -140,7 +140,7 @@ and t = {
      linked region is mirrored into the element array in place, so the
      guest's own Vec value observes the C-ABI write (the seed value model
      has no addressable Vec storage; the link is the materialization). *)
-  array_links : (int, Vm_value.t array) Hashtbl.t;
+  array_links : (int, Vm_value.arr) Hashtbl.t;
   (* The guest-function invocation channel: a host adapter cannot execute
      guest code by itself, so the VM installs this callback before running
      (Vm.entry_frame_of_li for the inspect path, Vm.run_li for the run
@@ -531,15 +531,15 @@ let arena_link_mirror (t : t) (p : Vm_memory.pointer) (b : Bytes.t) : unit =
   match Hashtbl.find_opt t.array_links p.Vm_memory.region with
   | None -> ()
   | Some elems ->
-      let n = Array.length elems in
+      let n = Vm_value.arr_length elems in
       if n = 0 then ()
       else (
-        match scalar_of_value elems.(0) with
+        match scalar_of_value (Vm_value.arr_get elems 0) with
         | None -> ()
         | Some s ->
             if
               not
-                (Array.for_all
+                (Vm_value.arr_for_all
                    (fun e -> scalar_of_value e = Some s)
                    elems)
             then ()
@@ -550,11 +550,11 @@ let arena_link_mirror (t : t) (p : Vm_memory.pointer) (b : Bytes.t) : unit =
                 let idx = abs / w in
                 if idx >= 0 && idx < n then begin
                   let within = abs mod w in
-                  match Raw_memory.encode_with s elems.(idx) with
+                  match Raw_memory.encode_with s (Vm_value.arr_get elems idx) with
                   | Some img when Bytes.length img = w && within < w ->
                       Bytes.set img within (Bytes.get b i);
                       (match Raw_memory.decode_with s img 0 with
-                       | Some (v, _) -> elems.(idx) <- v
+                       | Some (v, _) -> elems.Vm_value.cell.Vm_value.data.(idx) <- v
                        | None -> ())
                   | _ -> ()
                 end
@@ -615,38 +615,63 @@ let ptr_of_int_arg (v : Vm_value.t) : Vm_memory.pointer =
   | Vm_value.Null -> { Vm_memory.region = -1; offset = 0 }
   | _ -> { Vm_memory.region = -1; offset = 0 }
 
+(* The pointer-like C-ABI view of a collection element: an already-crossed
+   RawPtr/Null, or the guest's `Ptr`/`PtrMut` HANDLE struct (`Ptr {
+   address: UInt }` — one Int-width field, the nominal's declared raw
+   layout).  In the direct kernel all of these are the same 8-byte address
+   word, so a C-ABI array of pointers (an argv vector built by
+   `vec.push(v.as_ptr()); vec.push(Ptr::null())`) is a flat pointer array
+   whose elements must not be rejected as a heterogeneous mix. *)
+let raw_image_scalar (v : Vm_value.t) : Raw_memory.scalar option =
+  match v with
+  | Vm_value.RawPtr _ | Vm_value.Null -> Some Raw_memory.SPtr
+  | Vm_value.Struct [| Vm_value.Int i |] when i.Int_value.width <= 64 ->
+      (* the `Ptr { address }` handle: exactly one 8-byte address word *)
+      Some Raw_memory.SPtr
+  | _ -> scalar_of_value v
+
+(* The element-image encoder under the same view: a handle struct packs
+   its address word, every other scalar uses the shared encoder. *)
+let encode_raw_image (s : Raw_memory.scalar) (v : Vm_value.t) : Bytes.t option =
+  match s, v with
+  | Raw_memory.SPtr, Vm_value.Struct [| Vm_value.Int i |] ->
+      let b = Bytes.make 8 '\000' in
+      Raw_memory.put_u64_le b 0 8 (Int_value.to_int64 i);
+      Some b
+  | _ -> Raw_memory.encode_with s v
+
 (* Materialize a Vec/Array as raw storage: every element's scalar raw
    image, packed at the scalar stride (the C-ABI view of the collection).
    A non-scalar element image has no flat machine layout in the value
    model — the adapter reports the boundary, never a fabricated block
    layout. *)
-let array_raw_image (elems : Vm_value.t array) : (Bytes.t, string) result =
-  if Array.length elems = 0 then Ok Bytes.empty
+let array_raw_image (elems : Vm_value.arr) : (Bytes.t, string) result =
+  if Vm_value.arr_length elems = 0 then Ok Bytes.empty
   else
-    match scalar_of_value elems.(0) with
+    match raw_image_scalar (Vm_value.arr_get elems 0) with
     | None ->
         Error
           "collection as_ptr: the element image has no flat raw layout in the seed \
            value model"
     | Some s ->
-        if not (Array.for_all (fun e -> scalar_of_value e = Some s) elems) then
+        if not (Vm_value.arr_for_all (fun e -> raw_image_scalar e = Some s) elems) then
           Error
             "collection as_ptr: heterogeneous element widths have no uniform stride in \
              the seed value model"
         else begin
           let w = Raw_memory.scalar_size s in
-          let buf = Bytes.make (Array.length elems * w) '\000' in
+          let buf = Bytes.make (Vm_value.arr_length elems * w) '\000' in
           let ok = ref true in
-          Array.iteri
+          Vm_value.arr_iteri
             (fun i e ->
-              match Raw_memory.encode_with s e with
+              match encode_raw_image s e with
               | Some img when Bytes.length img = w -> Bytes.blit img 0 buf (i * w) w
               | _ -> ok := false)
             elems;
           if !ok then Ok buf else Error "collection as_ptr: element image encode failed"
         end
 
-let array_link_register (t : t) (p : Vm_memory.pointer) (elems : Vm_value.t array) : unit =
+let array_link_register (t : t) (p : Vm_memory.pointer) (elems : Vm_value.arr) : unit =
   Hashtbl.replace t.array_links p.Vm_memory.region elems
 
 (* ── The host descriptor table ──────────────────────────────────────
@@ -1644,11 +1669,11 @@ let vm_char_of_byte (b : int) : Vm_value.t =
 (* UTF-8-compose a Vec[Char] into a String (the inverse of the source's
    scalar processing — the native from_chars contract; ASCII chars
    encode to their byte). *)
-let vm_string_of_chars (elems : Vm_value.t array) :
+let vm_string_of_chars (elems : Vm_value.arr) :
     (Vm_value.t, string) result =
-  let b = Buffer.create (Array.length elems) in
+  let b = Buffer.create (Vm_value.arr_length elems) in
   let ok = ref true in
-  Array.iter
+  Vm_value.arr_iter
     (fun v ->
       match v with
       | Vm_value.Char c -> Buffer.add_bytes b (Utf8.encode_scalar c)
@@ -1659,12 +1684,12 @@ let vm_string_of_chars (elems : Vm_value.t array) :
 
 (* the raw-byte String constructor (the native _tg_string_from_bytes
    copies the Vec[u8] bytes). *)
-let vm_string_of_bytes (elems : Vm_value.t array) :
+let vm_string_of_bytes (elems : Vm_value.arr) :
     (Vm_value.t, string) result =
-  let n = Array.length elems in
+  let n = Vm_value.arr_length elems in
   let b = Bytes.create n in
   let ok = ref true in
-  Array.iteri
+  Vm_value.arr_iteri
     (fun i v ->
       match v with
       | Vm_value.Int i8 ->
@@ -1692,9 +1717,10 @@ let rec vm_sort_compare (a : Vm_value.t) (b : Vm_value.t) : int option =
   | Vm_value.Char x, Vm_value.Char y -> Some (Uchar.compare x y)
   | Vm_value.String x, Vm_value.String y -> Some (String.compare x y)
   | Vm_value.Tuple xs, Vm_value.Tuple ys
-  | Vm_value.Struct xs, Vm_value.Struct ys
-  | Vm_value.Array xs, Vm_value.Array ys ->
+  | Vm_value.Struct xs, Vm_value.Struct ys ->
       vm_sort_compare_seq (Array.to_list xs) (Array.to_list ys)
+  | Vm_value.Array xs, Vm_value.Array ys ->
+      vm_sort_compare_seq (Vm_value.arr_to_list xs) (Vm_value.arr_to_list ys)
   | Vm_value.Enum (i, xs), Vm_value.Enum (j, ys) ->
       if i <> j then Some (compare i j)
       else vm_sort_compare_seq (Array.to_list xs) (Array.to_list ys)
@@ -2042,7 +2068,8 @@ let binding_manifest : binding list =
       (adapter_raw (lets [ set_of p0 ]) (vec_of p0) (fun _ args ->
            match args with
            | [| Vm_value.Set store |] ->
-               Ok (Vm_value.Array (Array.of_list (Vm_value.set_elems store)))
+               List.iter Vm_value.arr_mark_shared_value (Vm_value.set_elems store);
+               Ok (Vm_value.Array (Vm_value.arr_of_list (Vm_value.set_elems store)))
            | _ -> arg_mismatch "(Set)"));
     intrinsic_binding "__intrinsic_set_drain_one"
       (adapter_raw_wb [ (Access_effect.Inout, set_of p0) ] (option_of p0)
@@ -2065,6 +2092,7 @@ let binding_manifest : binding list =
                          [ { arg_index = 0; replacement = Vm_value.Set store';
                              removed = [] } ] }
                | Some x, store' ->
+                   Vm_value.arr_mark_shared_value x;
                    Ok
                      { value = Vm_value.Enum (0, [| x |]);
                        writebacks =
@@ -2103,6 +2131,7 @@ let binding_manifest : binding list =
            | [| Vm_value.Map store; key |] -> (
                match Vm_value.map_find store key with
                | Some (_, v) ->
+                   Vm_value.arr_mark_shared_value v;
                    Ok (Vm_value.Enum (0, [| v |]))
                | None -> Ok (Vm_value.Enum (1, [||])))
            | _ -> arg_mismatch "(Map, key)"));
@@ -2144,7 +2173,9 @@ let binding_manifest : binding list =
                Ok
                  { value =
                      (match old with
-                      | Some v -> Vm_value.Enum (0, [| v |])
+                      | Some v ->
+                          Vm_value.arr_mark_shared_value v;
+                          Vm_value.Enum (0, [| v |])
                       | None -> Vm_value.Enum (1, [||]));
                    writebacks =
                      [ { arg_index = 0; replacement = Vm_value.Map store';
@@ -2166,9 +2197,12 @@ let binding_manifest : binding list =
            | [| Vm_value.Map store |] ->
                Ok
                  (Vm_value.Array
-                    (Array.of_list
+                    (Vm_value.arr_of_list
                        (List.map
-                          (fun (k, v) -> Vm_value.Tuple [| k; v |])
+                          (fun (k, v) ->
+                            Vm_value.arr_mark_shared_value k;
+                            Vm_value.arr_mark_shared_value v;
+                            Vm_value.Tuple [| k; v |])
                           (Vm_value.map_pairs store))))
            | _ -> arg_mismatch "(Map)"));
     (* ── The Vec/Array host surface (the growable-array family) ──────
@@ -2194,17 +2228,17 @@ let binding_manifest : binding list =
        `removed`; a failed bounds check consumes NOTHING (error before
        any writeback). *)
     intrinsic_binding "__intrinsic_array_new"
-      (adapter_raw [] (vec_of p0) (fun _ args ->
-           match args with
-           | [||] -> Ok (Vm_value.Array [||])
-           | _ -> arg_mismatch "no arguments"));
+       (adapter_raw [] (vec_of p0) (fun _ args ->
+            match args with
+            | [||] -> Ok (Vm_value.Array Vm_value.arr_empty)
+            | _ -> arg_mismatch "no arguments"));
     intrinsic_binding "__intrinsic_array_with_capacity"
       (adapter_raw (lets [ ty_int ]) (vec_of p0) (fun _ args ->
            (* the preallocation hint is advisory: the seed's implicit
               growth makes capacity a query-only quantity, so the
               empty result is the full semantic *)
            match args with
-           | [| Vm_value.Int _ |] -> Ok (Vm_value.Array [||])
+           | [| Vm_value.Int _ |] -> Ok (Vm_value.Array Vm_value.arr_empty)
            | _ -> arg_mismatch "(Int)"));
     intrinsic_binding "__intrinsic_array_len"
       (adapter_raw (lets [ vec_of p0 ]) ty_int (fun _ args ->
@@ -2213,7 +2247,7 @@ let binding_manifest : binding list =
                Ok
                  (Vm_value.Int
                     (Int_value.of_int64 ~width:64 ~signed:true
-                       (Int64.of_int (Array.length elems))))
+                       (Int64.of_int (Vm_value.arr_length elems))))
            | _ -> arg_mismatch "(Array)"));
     intrinsic_binding "__intrinsic_array_capacity"
       (adapter_raw (lets [ vec_of p0 ]) ty_int (fun _ args ->
@@ -2223,28 +2257,30 @@ let binding_manifest : binding list =
                Ok
                  (Vm_value.Int
                     (Int_value.of_int64 ~width:64 ~signed:true
-                       (Int64.of_int (Array.length elems))))
+                       (Int64.of_int (Vm_value.arr_length elems))))
            | _ -> arg_mismatch "(Array)"));
     intrinsic_binding "__intrinsic_array_push"
       (adapter_raw_wb
          [ (Access_effect.Inout, vec_of p0); (Access_effect.Sink, p0) ]
          Type_repr.Unit (fun _ args ->
-          (* take-not-copy: the sink item arrives MOVED (the caller's
-             slot is already consumed) — the exact value object is
-             appended and becomes the new last element; the writeback
-             array shares the retained elements with the (now dead)
-             old array value, so no element is ever held by two live
-             values.  Nothing here copies the item. *)
-           match args with
-           | [| Vm_value.Array elems; item |] ->
-               Ok
-                 { value = Vm_value.Unit;
-                   writebacks =
-                     [ { arg_index = 0;
-                         replacement =
-                           Vm_value.Array (Array.append elems [| item |]);
-                         removed = [] } ] }
-           | _ -> Error "argument mismatch: expected (Array, item)"));
+           (* take-not-copy: the sink item arrives MOVED (the caller's
+              slot is already consumed) — the exact value object is
+              appended and becomes the new last element; the writeback
+              shares the retained elements with the (now dead) old
+              array value, so no element is ever held by two live
+              values.  Nothing here copies the item, and the append is
+              amortized O(1) through the growable cell. *)
+            match args with
+            | [| Vm_value.Array elems; item |] ->
+                incr Vm_value.prof_pushes;
+                Vm_value.prof_copies := !Vm_value.prof_copies + Vm_value.arr_length elems;
+                Ok
+                  { value = Vm_value.Unit;
+                    writebacks =
+                      [ { arg_index = 0;
+                          replacement = Vm_value.Array (Vm_value.arr_push elems item);
+                          removed = [] } ] }
+            | _ -> Error "argument mismatch: expected (Array, item)"));
     intrinsic_binding "__intrinsic_array_pop"
       (adapter_raw_wb [ (Access_effect.Inout, vec_of p0) ] (option_of p0)
          (fun _ args ->
@@ -2257,24 +2293,22 @@ let binding_manifest : binding list =
               sharing the remaining elements) never contains it and
               the writeback's `removed` list never lists it (audit
               P0-3). *)
-           match args with
-           | [| Vm_value.Array elems |] ->
-               let n = Array.length elems in
-               if n = 0 then
-                 Ok
-                   { value = Vm_value.Enum (1, [||]);
-                     writebacks =
-                       [ { arg_index = 0; replacement = Vm_value.Array elems;
-                           removed = [] } ] }
-               else
-                 Ok
-                   { value = Vm_value.Enum (0, [| elems.(n - 1) |]);
-                     writebacks =
-                       [ { arg_index = 0;
-                           replacement =
-                             Vm_value.Array (Array.sub elems 0 (n - 1));
-                           removed = [] } ] }
-           | _ -> Error "argument mismatch: expected (Array)"));
+            match args with
+            | [| Vm_value.Array elems |] -> (
+                match Vm_value.arr_pop elems with
+                | None, replacement ->
+                    Ok
+                      { value = Vm_value.Enum (1, [||]);
+                        writebacks =
+                          [ { arg_index = 0; replacement = Vm_value.Array replacement;
+                              removed = [] } ] }
+                | Some last, replacement ->
+                    Ok
+                      { value = Vm_value.Enum (0, [| last |]);
+                        writebacks =
+                          [ { arg_index = 0; replacement = Vm_value.Array replacement;
+                              removed = [] } ] })
+            | _ -> Error "argument mismatch: expected (Array)"));
     intrinsic_binding "__intrinsic_array_get"
       (adapter_raw (lets [ vec_of p0; ty_int ]) p0 (fun _ args ->
            (* VALUE ABI, CHECKED: out-of-range is the std's defined OOB
@@ -2282,16 +2316,20 @@ let binding_manifest : binding list =
               failed check consumes NOTHING.  A successful get is a
               pure READ (surface-bound T: Copy — the value aliases the
               array's stored element only for copy payloads). *)
-           match args with
-           | [| Vm_value.Array elems; Vm_value.Int i |] ->
-               let idx = Int64.to_int (Int_value.to_int64 i) in
-               if idx < 0 || idx >= Array.length elems then
-                 Error
-                   (Printf.sprintf
-                      "__intrinsic_array_get: index %d out of bounds (len %d)" idx
-                      (Array.length elems))
-               else Ok elems.(idx)
-           | _ -> arg_mismatch "(Array, Int)"));
+            match args with
+            | [| Vm_value.Array elems; Vm_value.Int i |] ->
+                let idx = Int64.to_int (Int_value.to_int64 i) in
+                if idx < 0 || idx >= Vm_value.arr_length elems then
+                  Error
+                    (Printf.sprintf
+                       "__intrinsic_array_get: index %d out of bounds (len %d)" idx
+                       (Vm_value.arr_length elems))
+                else begin
+                  let v = Vm_value.arr_get elems idx in
+                  Vm_value.arr_mark_shared_value v;
+                  Ok v
+                end
+            | _ -> arg_mismatch "(Array, Int)"));
     intrinsic_binding "__intrinsic_array_set"
       (adapter_raw_wb
          [ (Access_effect.Inout, vec_of p0); (Access_effect.Let, ty_int);
@@ -2310,25 +2348,24 @@ let binding_manifest : binding list =
              double-destroy the retained elements it shares with the
              replacement (the exact leak/double-drop the removed
              channel closes). *)
-          match args with
-          | [| Vm_value.Array elems; Vm_value.Int i; value |] ->
-              let idx = Int64.to_int (Int_value.to_int64 i) in
-              if idx < 0 || idx >= Array.length elems then
-                Error
-                  (Printf.sprintf
-                     "__intrinsic_array_set: index %d out of bounds (len %d)" idx
-                     (Array.length elems))
-              else begin
-                let old = elems.(idx) in
-                let new_elems = Array.copy elems in
-                new_elems.(idx) <- value;
-                Ok
-                  { value = Vm_value.Unit;
-                    writebacks =
-                      [ { arg_index = 0; replacement = Vm_value.Array new_elems;
-                          removed = [ old ] } ] }
-              end
-          | _ -> Error "argument mismatch: expected (Array, Int, value)"));
+           match args with
+           | [| Vm_value.Array elems; Vm_value.Int i; value |] ->
+               let idx = Int64.to_int (Int_value.to_int64 i) in
+               if idx < 0 || idx >= Vm_value.arr_length elems then
+                 Error
+                   (Printf.sprintf
+                      "__intrinsic_array_set: index %d out of bounds (len %d)" idx
+                      (Vm_value.arr_length elems))
+               else begin
+                 let old = Vm_value.arr_get elems idx in
+                 let new_elems = Vm_value.arr_set elems idx value in
+                 Ok
+                   { value = Vm_value.Unit;
+                     writebacks =
+                       [ { arg_index = 0; replacement = Vm_value.Array new_elems;
+                           removed = [ old ] } ] }
+               end
+           | _ -> Error "argument mismatch: expected (Array, Int, value)"));
     intrinsic_binding "__intrinsic_array_remove"
       (adapter_raw_wb
          [ (Access_effect.Inout, vec_of p0); (Access_effect.Let, ty_int) ]
@@ -2341,25 +2378,24 @@ let binding_manifest : binding list =
               retained prefix/suffix and the writeback's `removed`
               list never lists it (audit P0-3).  The bounds check runs
               FIRST — a failed check consumes NOTHING. *)
-           match args with
-           | [| Vm_value.Array elems; Vm_value.Int i |] ->
-               let idx = Int64.to_int (Int_value.to_int64 i) in
-               let n = Array.length elems in
-               if idx < 0 || idx >= n then
-                 Error
-                   (Printf.sprintf
-                      "__intrinsic_array_remove: index %d out of bounds (len %d)" idx n)
-               else
-                 Ok
-                   { value = elems.(idx);
-                     writebacks =
-                       [ { arg_index = 0;
-                           replacement =
-                             Vm_value.Array
-                               (Array.append (Array.sub elems 0 idx)
-                                  (Array.sub elems (idx + 1) (n - idx - 1)));
-                           removed = [] } ] }
-           | _ -> Error "argument mismatch: expected (Array, Int)"));
+            match args with
+            | [| Vm_value.Array elems; Vm_value.Int i |] ->
+                let idx = Int64.to_int (Int_value.to_int64 i) in
+                let n = Vm_value.arr_length elems in
+                if idx < 0 || idx >= n then
+                  Error
+                    (Printf.sprintf
+                       "__intrinsic_array_remove: index %d out of bounds (len %d)" idx n)
+                else begin
+                  Vm_value.arr_mark_shared_value (Vm_value.arr_get elems idx);
+                  Ok
+                    { value = Vm_value.arr_get elems idx;
+                      writebacks =
+                        [ { arg_index = 0;
+                            replacement = Vm_value.Array (Vm_value.arr_remove elems idx);
+                            removed = [] } ] }
+                end
+            | _ -> Error "argument mismatch: expected (Array, Int)"));
     intrinsic_binding "__intrinsic_array_insert"
       (adapter_raw_wb
          [ (Access_effect.Inout, vec_of p0); (Access_effect.Let, ty_int);
@@ -2371,26 +2407,23 @@ let binding_manifest : binding list =
              is placed at the index and the writeback shares only the
              retained elements (nothing left the container — the
              writeback's `removed` list is empty). *)
-          match args with
-          | [| Vm_value.Array elems; Vm_value.Int i; item |] ->
-              let idx = Int64.to_int (Int_value.to_int64 i) in
-              let n = Array.length elems in
-              if idx < 0 || idx > n then
-                Error
-                  (Printf.sprintf
-                     "__intrinsic_array_insert: index %d out of bounds (len %d)" idx n)
-              else
-                Ok
-                  { value = Vm_value.Unit;
-                    writebacks =
-                      [ { arg_index = 0;
-                          replacement =
-                            Vm_value.Array
-                              (Array.append (Array.sub elems 0 idx)
-                                 (Array.append [| item |]
-                                    (Array.sub elems idx (n - idx))));
-                          removed = [] } ] }
-          | _ -> Error "argument mismatch: expected (Array, Int, item)"));
+           match args with
+           | [| Vm_value.Array elems; Vm_value.Int i; item |] ->
+               let idx = Int64.to_int (Int_value.to_int64 i) in
+               let n = Vm_value.arr_length elems in
+               if idx < 0 || idx > n then
+                 Error
+                   (Printf.sprintf
+                      "__intrinsic_array_insert: index %d out of bounds (len %d)" idx n)
+               else
+                 Ok
+                   { value = Vm_value.Unit;
+                     writebacks =
+                       [ { arg_index = 0;
+                           replacement =
+                             Vm_value.Array (Vm_value.arr_insert elems idx item);
+                           removed = [] } ] }
+           | _ -> Error "argument mismatch: expected (Array, Int, item)"));
     intrinsic_binding "__intrinsic_array_clear"
       (adapter_raw_wb [ (Access_effect.Inout, vec_of p0) ] Type_repr.Unit (fun _ args ->
            (* every prior member leaves the caller's container exactly
@@ -2403,8 +2436,8 @@ let binding_manifest : binding list =
                Ok
                  { value = Vm_value.Unit;
                    writebacks =
-                     [ { arg_index = 0; replacement = Vm_value.Array [||];
-                         removed = Array.to_list elems } ] }
+                     [ { arg_index = 0; replacement = Vm_value.Array Vm_value.arr_empty;
+                         removed = Vm_value.arr_to_list elems } ] }
            | _ -> Error "argument mismatch: expected (Array)"));
     intrinsic_binding "__intrinsic_array_contains"
       (adapter_raw (lets [ vec_of p0; p0 ]) ty_bool (fun _ args ->
@@ -2412,7 +2445,9 @@ let binding_manifest : binding list =
               resource-containing element is never reported Eq *)
            match args with
            | [| Vm_value.Array elems; item |] ->
-               Ok (Vm_value.Bool (Array.exists (fun e -> lookup_eq e item) elems))
+               Ok
+                 (Vm_value.Bool
+                    (Vm_value.arr_exists (fun e -> lookup_eq e item) elems))
            | _ -> arg_mismatch "(Array, item)"));
     intrinsic_binding "print"
       (adapter_string_ret_unit (fun t s -> emit_stdout t s));
@@ -2652,7 +2687,7 @@ let binding_manifest : binding list =
            | [| Vm_value.String s; Vm_value.String sep |] ->
                Ok
                  (Vm_value.Array
-                    (Array.of_list
+                    (Vm_value.arr_of_list
                        (List.map vm_string (string_split s sep))))
            | _ -> arg_mismatch "(String, String)"));
     intrinsic_binding "__intrinsic_string_lines"
@@ -2661,7 +2696,7 @@ let binding_manifest : binding list =
            | [| Vm_value.String s |] ->
                Ok
                  (Vm_value.Array
-                    (Array.of_list
+                    (Vm_value.arr_of_list
                        (List.map vm_string (string_split s "\n"))))
            | _ -> arg_mismatch "String"));
     intrinsic_binding "__intrinsic_string_as_bytes"
@@ -2669,12 +2704,13 @@ let binding_manifest : binding list =
          (fun _ args ->
            match args with
            | [| Vm_value.String s |] ->
-               Ok
-                 (Vm_value.Array
-                    (Array.init (String.length s) (fun i ->
-                         Vm_value.Int
-                           (Int_value.of_int64 ~width:8 ~signed:false
-                              (Int64.of_int (Char.code s.[i]))))))
+               let bytes =
+                 Array.init (String.length s) (fun i ->
+                     Vm_value.Int
+                       (Int_value.of_int64 ~width:8 ~signed:false
+                          (Int64.of_int (Char.code s.[i]))))
+               in
+               Ok (Vm_value.Array (Vm_value.arr_of_array bytes))
            | _ -> arg_mismatch "String"));
     (* The raw-pointer wrappers: materialize the value's bytes as a stable
        Raw arena region and hand the guest its (region, offset) handle.
@@ -2758,8 +2794,8 @@ let binding_manifest : binding list =
                Ok
                  { value = Vm_value.Unit;
                    writebacks =
-                     [ { arg_index = 0; replacement = Vm_value.Array [||];
-                         removed = Array.to_list elems } ] }
+                     [ { arg_index = 0; replacement = Vm_value.Array Vm_value.arr_empty;
+                         removed = Vm_value.arr_to_list elems } ] }
            | _ -> Error "argument mismatch: expected (Array)"));
     intrinsic_binding "__intrinsic_array_extend"
       (adapter_raw_wb
@@ -2774,25 +2810,27 @@ let binding_manifest : binding list =
                  { value = Vm_value.Unit;
                    writebacks =
                      [ { arg_index = 0;
-                         replacement = Vm_value.Array (Array.append elems other);
+                         replacement = Vm_value.Array (Vm_value.arr_append elems other);
                          removed = [] } ] }
            | _ -> Error "argument mismatch: expected (Array, Array)"));
     intrinsic_binding "__intrinsic_array_from_list"
       (adapter_raw (lets [ vec_of p0 ]) (vec_of p0) (fun _ args ->
            match args with
-           | [| Vm_value.Array _ as a |] -> Ok a
+           | [| Vm_value.Array _ as a |] ->
+               Vm_value.arr_mark_shared_value a;
+               Ok a
            | _ -> arg_mismatch "Array"));
     intrinsic_binding "__intrinsic_array_slice"
       (adapter_raw (lets [ vec_of p0; ty_int; ty_int ]) (vec_of p0)
          (fun _ args ->
            match args with
            | [| Vm_value.Array elems; Vm_value.Int a; Vm_value.Int b |] ->
-               let n = Array.length elems in
+               let n = Vm_value.arr_length elems in
                let start = Int64.to_int (Int_value.to_int64 a) in
                let stop = Int64.to_int (Int_value.to_int64 b) in
                let start = if start < 0 then 0 else if start > n then n else start in
                let stop = if stop < start then start else if stop > n then n else stop in
-               Ok (Vm_value.Array (Array.sub elems start (stop - start)))
+               Ok (Vm_value.Array (Vm_value.arr_sub elems start (stop - start)))
            | _ -> arg_mismatch "(Array, Int, Int)"));
     (* The collection views: every element's scalar raw image is packed
        at its stride into a fresh Raw region; the region is LINKED to the
@@ -2846,6 +2884,7 @@ let binding_manifest : binding list =
                    (* the old value transfers to the Option return; the
                       discarded stored key leaves the container and is
                       enumerated in `removed` for the single drop *)
+                   Vm_value.arr_mark_shared_value v;
                    Ok
                      { value = Vm_value.Enum (0, [| v |]);
                        writebacks =
@@ -2887,6 +2926,8 @@ let binding_manifest : binding list =
                          [ { arg_index = 0; replacement = Vm_value.Map store';
                              removed = [] } ] }
                | (Some (k, v), store') ->
+                   Vm_value.arr_mark_shared_value k;
+                   Vm_value.arr_mark_shared_value v;
                    Ok
                      { value = Vm_value.Enum (0, [| Vm_value.Tuple [| k; v |] |]);
                        writebacks =
@@ -3157,22 +3198,30 @@ let binding_manifest : binding list =
       (adapter_raw (lets [ vec_of p0 ]) ty_bool (fun _ args ->
            match args with
            | [| Vm_value.Array elems |] ->
-               Ok (Vm_value.Bool (Array.length elems = 0))
+               Ok (Vm_value.Bool (Vm_value.arr_length elems = 0))
            | _ -> arg_mismatch "(Array)"));
     intrinsic_binding "__intrinsic_array_first"
       (adapter_raw (lets [ vec_of p0 ]) (option_of p0) (fun _ args ->
            match args with
            | [| Vm_value.Array elems |] ->
-               if Array.length elems = 0 then Ok (Vm_value.Enum (1, [||]))
-               else Ok (Vm_value.Enum (0, [| elems.(0) |]))
+               if Vm_value.arr_length elems = 0 then Ok (Vm_value.Enum (1, [||]))
+               else begin
+                 let v = Vm_value.arr_get elems 0 in
+                 Vm_value.arr_mark_shared_value v;
+                 Ok (Vm_value.Enum (0, [| v |]))
+               end
            | _ -> arg_mismatch "(Array)"));
     intrinsic_binding "__intrinsic_array_last"
       (adapter_raw (lets [ vec_of p0 ]) (option_of p0) (fun _ args ->
            match args with
            | [| Vm_value.Array elems |] ->
-               let n = Array.length elems in
+               let n = Vm_value.arr_length elems in
                if n = 0 then Ok (Vm_value.Enum (1, [||]))
-               else Ok (Vm_value.Enum (0, [| elems.(n - 1) |]))
+               else begin
+                 let v = Vm_value.arr_get elems (n - 1) in
+                 Vm_value.arr_mark_shared_value v;
+                 Ok (Vm_value.Enum (0, [| v |]))
+               end
            | _ -> arg_mismatch "(Array)"));
     intrinsic_binding "__intrinsic_array_resize"
       (adapter_raw_wb
@@ -3186,46 +3235,46 @@ let binding_manifest : binding list =
               once (P0-3); the grow path shares the fill value
               structurally, like every value-model aggregate. *)
            match args with
-           | [| Vm_value.Array elems; Vm_value.Int n; value |] ->
-               let new_len = Int64.to_int (Int_value.to_int64 n) in
-               let cur = Array.length elems in
-               if new_len < 0 then
-                 Error
-                   (Printf.sprintf
-                      "__intrinsic_array_resize: negative new_len %d" new_len)
-               else if new_len <= cur then
-                 Ok
-                   { value = Vm_value.Unit;
-                     writebacks =
-                       [ { arg_index = 0;
-                           replacement =
-                             Vm_value.Array (Array.sub elems 0 new_len);
-                           removed =
-                             Array.to_list
-                               (Array.sub elems new_len (cur - new_len)) } ] }
-               else
-                 Ok
-                   { value = Vm_value.Unit;
-                     writebacks =
-                       [ { arg_index = 0;
-                           replacement =
-                             Vm_value.Array
-                               (Array.append elems
-                                  (Array.make (new_len - cur) value));
-                           removed = [] } ] }
-           | _ -> Error "argument mismatch: expected (Array, Int, value)"));
+            | [| Vm_value.Array elems; Vm_value.Int n; value |] ->
+                let new_len = Int64.to_int (Int_value.to_int64 n) in
+                let cur = Vm_value.arr_length elems in
+                if new_len < 0 then
+                  Error
+                    (Printf.sprintf
+                       "__intrinsic_array_resize: negative new_len %d" new_len)
+                else if new_len <= cur then
+                  Ok
+                    { value = Vm_value.Unit;
+                      writebacks =
+                        [ { arg_index = 0;
+                            replacement =
+                              Vm_value.Array (Vm_value.arr_sub elems 0 new_len);
+                            removed =
+                              Vm_value.arr_to_list
+                                (Vm_value.arr_sub elems new_len (cur - new_len)) } ] }
+                else
+                  Ok
+                    { value = Vm_value.Unit;
+                      writebacks =
+                        [ { arg_index = 0;
+                            replacement =
+                              Vm_value.Array
+                                (Vm_value.arr_append elems
+                                   (Vm_value.arr_make (new_len - cur) value));
+                            removed = [] } ] }
+            | _ -> Error "argument mismatch: expected (Array, Int, value)"));
     intrinsic_binding "__intrinsic_array_sort"
       (adapter_raw_wb [ (Access_effect.Inout, vec_of p0) ] Type_repr.Unit
          (fun _ args ->
            match args with
            | [| Vm_value.Array elems |] -> (
-               match vm_sort_elems elems with
+               match vm_sort_elems (Vm_value.arr_to_array elems) with
                | Ok sorted ->
                    Ok
                      { value = Vm_value.Unit;
                        writebacks =
                          [ { arg_index = 0;
-                             replacement = Vm_value.Array sorted;
+                             replacement = Vm_value.Array (Vm_value.arr_of_array sorted);
                              removed = [] } ] }
                | Error m -> Error ("__intrinsic_array_sort: " ^ m))
            | _ -> Error "argument mismatch: expected (Array)"));
@@ -3237,30 +3286,30 @@ let binding_manifest : binding list =
               the dropped elements are enumerated in `removed` so the VM
               drops each exactly once (P0-3) *)
            match args with
-           | [| Vm_value.Array elems; Vm_value.Int n |] ->
-               let new_len = Int64.to_int (Int_value.to_int64 n) in
-               let cur = Array.length elems in
-               if new_len < 0 then
-                 Error
-                   (Printf.sprintf
-                      "__intrinsic_array_truncate: negative new_len %d" new_len)
-               else if new_len >= cur then
-                 Ok
-                   { value = Vm_value.Unit;
-                     writebacks =
-                       [ { arg_index = 0; replacement = Vm_value.Array elems;
-                           removed = [] } ] }
-               else
-                 Ok
-                   { value = Vm_value.Unit;
-                     writebacks =
-                       [ { arg_index = 0;
-                           replacement =
-                             Vm_value.Array (Array.sub elems 0 new_len);
-                           removed =
-                             Array.to_list
-                               (Array.sub elems new_len (cur - new_len)) } ] }
-           | _ -> Error "argument mismatch: expected (Array, Int)"));
+            | [| Vm_value.Array elems; Vm_value.Int n |] ->
+                let new_len = Int64.to_int (Int_value.to_int64 n) in
+                let cur = Vm_value.arr_length elems in
+                if new_len < 0 then
+                  Error
+                    (Printf.sprintf
+                       "__intrinsic_array_truncate: negative new_len %d" new_len)
+                else if new_len >= cur then
+                  Ok
+                    { value = Vm_value.Unit;
+                      writebacks =
+                        [ { arg_index = 0; replacement = Vm_value.Array elems;
+                            removed = [] } ] }
+                else
+                  Ok
+                    { value = Vm_value.Unit;
+                      writebacks =
+                        [ { arg_index = 0;
+                            replacement =
+                              Vm_value.Array (Vm_value.arr_sub elems 0 new_len);
+                            removed =
+                              Vm_value.arr_to_list
+                                (Vm_value.arr_sub elems new_len (cur - new_len)) } ] }
+            | _ -> Error "argument mismatch: expected (Array, Int)"));
 
     (* String char/iteration/construction surface. *)
     intrinsic_binding "__intrinsic_string_char_at"
@@ -3282,8 +3331,9 @@ let binding_manifest : binding list =
            | [| Vm_value.String s |] ->
                Ok
                  (Vm_value.Array
-                    (Array.init (String.length s) (fun i ->
-                         vm_char_of_byte (Char.code s.[i]))))
+                    (Vm_value.arr_of_array
+                       (Array.init (String.length s) (fun i ->
+                            vm_char_of_byte (Char.code s.[i])))))
            | _ -> arg_mismatch "String"));
     intrinsic_binding "string_new"
       (adapter_raw [] Type_repr.String (fun _ args ->
@@ -3413,7 +3463,7 @@ let binding_manifest : binding list =
                  Error
                    (Printf.sprintf
                       "__intrinsic_vec_filled: negative count %d" count)
-               else Ok (Vm_value.Array (Array.make count value))
+               else Ok (Vm_value.Array (Vm_value.arr_make count value))
            | _ -> arg_mismatch "(Int, value)"));
 
     (* the source `extern` declarations of the allocator/atomic surface. *)
@@ -3497,13 +3547,13 @@ let binding_manifest : binding list =
                 let n = Int64.to_int (Int_value.to_int64 count) in
                 let n =
                   if n <= 0 then 0
-                  else if n > Array.length elems then Array.length elems
+                  else if n > Vm_value.arr_length elems then Vm_value.arr_length elems
                   else n
                 in
                 let bytes = Bytes.create n in
                 for i = 0 to n - 1 do
                   let b =
-                    match elems.(i) with
+                    match Vm_value.arr_get elems i with
                     | Vm_value.Int v ->
                         Int64.to_int (Int64.logand (Int_value.to_int64 v) 0xFFL)
                     | _ -> 0
@@ -3645,17 +3695,48 @@ let binding_manifest : binding list =
                                  | Error e -> Error ("execvp: " ^ e)
                                  | Ok s -> gather (i + 1) (s :: acc))
                        in
-                       match gather 0 [] with
-                       | Error e -> Error e
-                       | Ok argv -> (
-                           match argv with
-                           | [] -> Error "execvp: empty argv vector"
-                           | _ -> (
-                               try Unix.execvp path (Array.of_list argv)
-                               with
-                               | Unix.Unix_error (e, _, _) ->
-                                   Ok (vm_i32 (-errno_of_unix_error e))
-                               | Failure m -> Error ("execvp: " ^ m))))))
+                        match gather 0 [] with
+                        | Error e -> Error e
+                        | Ok argv -> (
+                            match argv with
+                            | [] -> Error "execvp: empty argv vector"
+                            | _ -> (
+                                (* The executed image must inherit the
+                                   GUEST's virtual cwd (Host_fs.cwd,
+                                   rooted at the canonical repo root), not
+                                   the seed process's real directory:
+                                   every guest-relative path host binding
+                                   resolves through Host_fs, so a spawned
+                                   tool that resolves a guest-supplied
+                                   relative path (the linker's
+                                   output.tmp -> codesign step) must see
+                                   the same directory.  execvp never
+                                   returns on success; on failure the
+                                   real cwd is restored so the caller's
+                                   subsequent host calls are unaffected. *)
+                                let guest_cwd_real =
+                                  Host_fs.join_root t.fs (Host_fs.cwd t.fs)
+                                in
+                                let restore =
+                                  try
+                                    let old = Unix.getcwd () in
+                                    Unix.chdir guest_cwd_real;
+                                    Some old
+                                  with Unix.Unix_error _ -> None
+                                in
+                                let restore_cwd () =
+                                  match restore with
+                                  | Some old -> (try Unix.chdir old with _ -> ())
+                                  | None -> ()
+                                in
+                                try Unix.execvp path (Array.of_list argv)
+                                with
+                                | Unix.Unix_error (e, _, _) ->
+                                    restore_cwd ();
+                                    Ok (vm_i32 (-errno_of_unix_error e))
+                                | Failure m ->
+                                    restore_cwd ();
+                                    Error ("execvp: " ^ m))))))
            | _ -> arg_mismatch "(Ptr[u8], Ptr[Ptr[u8]])"));
     extern_binding "c_waitpid"
       (adapter_raw (lets [ ty_i32; ptrmut_named ty_int; ty_i32 ]) ty_i32

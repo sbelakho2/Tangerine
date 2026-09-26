@@ -1435,6 +1435,50 @@ and lower_argument ?(expect : Type_repr.t option) (env : func_env) (st : lower_s
       | _ -> { Seed_mir.effect_ = Access_effect.Consume; value = op })
   | Access_effect.Initialize -> { Seed_mir.effect_ = Access_effect.Initialize; value = op }
 
+(* The sanctioned inout-address wrappers (std/ffi.tg's `address_of` /
+   `address_of_mut` — the two names whose DECLARED contract is "the
+   address of the caller's place").  The seed VM represents every other
+   `inout` parameter as a by-value copy with a Modify writeback channel
+   (lower_argument), so inside such a callee the parameter local holds
+   the caller's VALUE and `v as Ptr[_]`/`v as PtrMut[_]` can only rebrand
+   that value — never reach the caller's storage (the `Ptr { address: 0 }`
+   class).  These two names instead receive a real `Ref` to the caller's
+   place:
+     - the argument expression's borrow is stripped (`&mut x`/`&x` -> the
+       place `x`; a bare inout place argument is used directly),
+     - the place is materialized and a `Ref` rvalue assigns it to a fresh
+       ref-typed local (exactly the `&place`-at-a-raw-pointer-parameter
+       adaptation the checker's ref_to_raw_ptr already plans),
+     - the local is passed through the SAME Modify channel the declared
+       Inout convention requires, so the callee's body — unchanged — reads
+       the Ref and its `v as Ptr[T]` cast hits the VM's raw-pointer-handle
+       cast (which passes a `Vm_value.Ref` through: the address rebrand).
+       The post-call writeback writes the Ref back into the synthesized
+       temp, never into the caller's place.
+   This makes `address_of(&mut x)`/`address_of_mut(&mut x)` yield a
+   reference to x's place, which the VM's host boundary then crosses as
+   the pointee's arena image WITH copy-out — the exact semantics the
+   direct kernel's by-address inout ABI gives them. *)
+and lower_inout_address_argument (env : func_env) (st : lower_state)
+    (a : Ast.call_arg) : Seed_mir.call_arg =
+  let inner, mutable_ =
+    match a.Ast.ca_value with
+    | Ast.Unary (_, Ast.Borrow, inner, _) -> (inner, false)
+    | Ast.Unary (_, Ast.BorrowMut, inner, _) -> (inner, true)
+    (* a bare inout place argument (`address_of_mut(x)`) is a writable
+       place by the declared convention *)
+    | e -> (e, true)
+  in
+  let io, it = lower_expr env st inner in
+  let p = materialize_place st io in
+  let ref_ty =
+    Type_repr.Ref_internal
+      ((if mutable_ then Type_repr.Mutable else Type_repr.Immutable), it)
+  in
+  let rid = fresh_local st ref_ty in
+  emit st (Seed_mir.Assign (cur_place st rid, Seed_mir.Ref p));
+  { Seed_mir.effect_ = Access_effect.Modify; value = Seed_mir.Copy (cur_place st rid) }
+
 (* Returns (place-or-constant operand, type).  [expect] is the optional
    SOLVED context type at positions whose checker kind the expression's
    own node did not retain (an unsuffixed literal ctor payload: the
@@ -5099,18 +5143,36 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                  Sink->Consume, Set->Initialize), so ownership semantics
                  survive into MIR and the verifier can enforce exactness *)
               let ce_params = entry.ce_params in
+              (* the sanctioned address wrappers (see
+                 lower_inout_address_argument): the lowering env keys a
+                 bare name AND its qualified spellings, so the test is on
+                 the final `::` segment, never the raw spelling *)
+              let sanctioned_address_wrapper =
+                let base =
+                  match String.rindex_opt n ':' with
+                  | Some i -> String.sub n (i + 1) (String.length n - i - 1)
+                  | None -> n
+                in
+                base = "address_of" || base = "address_of_mut"
+              in
               let arg_vals =
                 Array.of_list
                   (List.mapi
                      (fun i a ->
-                       lower_argument env st
-                         ?expect:
-                           (if i < Array.length ce_params then Some ce_params.(i).Type_repr.pt_type
-                            else None)
-                         (if i < Array.length ce_params then
+                       let conv =
+                         if i < Array.length ce_params then
                            ce_params.(i).Type_repr.pt_convention
-                         else Access_effect.Let)
-                         a.Ast.ca_value)
+                         else Access_effect.Let
+                       in
+                       if sanctioned_address_wrapper && conv = Access_effect.Inout then
+                         lower_inout_address_argument env st a
+                       else
+                         lower_argument env st
+                           ?expect:
+                             (if i < Array.length ce_params then
+                                Some ce_params.(i).Type_repr.pt_type
+                              else None)
+                           conv a.Ast.ca_value)
                      args)
               in
                let next_b = new_block st in

@@ -167,15 +167,38 @@ let find_fn (vm : t) (inst : Instance_id.t) : int option =
 let mk_error vm kind message =
   { kind; message; trace = List.rev (List.map (fun f -> Printf.sprintf "_%d bb%d" f.fn f.block) vm.frames) }
 
+(* per-host-binding call counts and cumulative wall time (diagnostic;
+   populated only when TANGERINE_DEBUG_STEPS is set) *)
+let host_prof : (string, int * float) Hashtbl.t = Hashtbl.create 256
+
 let step_limit (vm : t) : unit =
   vm.steps <- vm.steps + 1;
-  (if Array.length vm.step_hist > 0 then
-     match vm.frames with
-     | f :: _ when f.fn >= 0 && f.fn < Array.length vm.step_hist ->
-         vm.step_hist.(f.fn) <- vm.step_hist.(f.fn) + 1
-     | _ -> ());
+  (if Array.length vm.step_hist > 0 then begin
+     (match vm.frames with
+      | f :: _ when f.fn >= 0 && f.fn < Array.length vm.step_hist ->
+          vm.step_hist.(f.fn) <- vm.step_hist.(f.fn) + 1
+      | _ -> ());
+     if vm.steps mod 100_000_000 = 0 then
+       let st = Gc.quick_stat () in
+       Printf.eprintf
+         "VM BEACON steps=%d host=%d pushes=%d push_copies=%d set_copies=%d map_scans=%d set_scans=%d regions=%d live_mb=%.0f\n%!"
+         vm.steps vm.host_calls !Vm_value.prof_pushes !Vm_value.prof_push_copies
+         !Vm_value.prof_set_copies !Vm_value.prof_map_scans !Vm_value.prof_set_scans
+         !Vm_memory.prof_regions
+         (float_of_int st.Gc.live_words *. 8. /. 1048576.)
+   end);
   if vm.steps > vm.limits.max_steps then begin
     (if Array.length vm.step_hist > 0 then begin
+       let entries = Hashtbl.fold (fun k v acc -> (k, v) :: acc) host_prof [] in
+       let entries =
+         List.sort (fun (_, (_, a)) (_, (_, b)) -> compare b a) entries
+       in
+       Printf.eprintf "HOST PROFILE (top 15 by cumulative time):\n";
+       List.iteri
+         (fun rank (name, (c, tt)) ->
+           if rank < 15 then
+             Printf.eprintf "  %8.2fs %10d calls  %s\n" tt c name)
+         entries;
        Printf.eprintf "STEP HISTOGRAM (top 15 of %d steps):\n" vm.steps;
        let idx = Array.init (Array.length vm.step_hist) (fun i -> i) in
        Array.sort
@@ -426,7 +449,7 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
       | Seed_mir.Enum (vi, _) ->
           Vm_value.Enum (Ids.Variant_index.to_int vi, [||])
       | Seed_mir.Struct _ -> Vm_value.Struct [||]
-      | Seed_mir.Array _ -> Vm_value.Array [||]
+      | Seed_mir.Array _ -> Vm_value.Array Vm_value.arr_empty
       | Seed_mir.Map _ -> Vm_value.map_empty
       | Seed_mir.Set _ -> Vm_value.set_empty)
   | Seed_mir.Copy p | Seed_mir.Read p -> (
@@ -446,6 +469,11 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
           | Ok v -> v
           | Error e -> err_trap vm (Vm_value.slot_error_string e)
         in
+        (* the moved component can remain reachable through another
+           holder of the containing aggregate (a Read-bound parent, a
+           forked parent): a direct element write through the extracted
+           value must not alias *)
+        Vm_value.arr_mark_shared_value v;
         write_place vm frame p Vm_value.MovedOut;
         v
       end
@@ -550,8 +578,8 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
        | Seed_mir.ConstantIndex i -> (
            match base with
            | Vm_value.Array elems ->
-               if i < 0 || i >= Array.length elems then err_trap vm "index out of bounds"
-               else recurse elems.(i)
+               if i < 0 || i >= Vm_value.arr_length elems then err_trap vm "index out of bounds"
+               else recurse (Vm_value.arr_get elems i)
            | Vm_value.Tuple elems ->
                if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds"
                else recurse elems.(i)
@@ -566,8 +594,8 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
            let i = index_of_local vm frame li in
            match base with
            | Vm_value.Array elems ->
-               if i < 0 || i >= Array.length elems then err_trap vm "index out of bounds"
-               else recurse elems.(i)
+               if i < 0 || i >= Vm_value.arr_length elems then err_trap vm "index out of bounds"
+               else recurse (Vm_value.arr_get elems i)
            | Vm_value.Tuple elems ->
                if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds"
                else recurse elems.(i)
@@ -770,7 +798,7 @@ and write_place (vm : t) (frame : frame) (p : Seed_mir.place) (v : Vm_value.t) :
         | Error e -> err_trap vm (Vm_value.slot_error_string e)
       in
       let base_ty = type_of_local vm frame.fn (Seed_mir.root_key p.Seed_mir.root) in
-      let updated = update_place vm frame base base_ty projs v in
+      let updated = update_place ~direct:true vm frame base base_ty projs v in
       if Seed_mir.root_is_static p.Seed_mir.root then
         match Vm_value.write_slot (statics_slot ()) updated with
         | Ok s -> frame.statics.(Seed_mir.root_static_index p.Seed_mir.root) <- s
@@ -780,8 +808,8 @@ and write_place (vm : t) (frame : frame) (p : Seed_mir.place) (v : Vm_value.t) :
         | Ok s -> frame.locals.((Seed_mir.root_key p.Seed_mir.root)) <- s
       | Error e -> err_trap vm (Vm_value.slot_error_string e))
 
-and update_place (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_repr.t)
-    (projs : Seed_mir.projection list) (v : Vm_value.t) : Vm_value.t =
+and update_place ?(direct = false) (vm : t) (frame : frame) (base : Vm_value.t)
+    (base_ty : Type_repr.t) (projs : Seed_mir.projection list) (v : Vm_value.t) : Vm_value.t =
   match projs with
   | [] -> v
   | proj :: rest -> (
@@ -831,10 +859,13 @@ and update_place (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
       | Seed_mir.ConstantIndex i -> (
           match base with
           | Vm_value.Array elems ->
-              if i < 0 || i >= Array.length elems then err_trap vm "index out of bounds";
-              let copy = Array.copy elems in
-              copy.(i) <- update_place vm frame elems.(i) next_ty rest v;
-              Vm_value.Array copy
+              if i < 0 || i >= Vm_value.arr_length elems then err_trap vm "index out of bounds";
+              let updated = update_place vm frame (Vm_value.arr_get elems i) next_ty rest v in
+              let elems' =
+                if direct then Vm_value.arr_set_direct elems i updated
+                else Vm_value.arr_set elems i updated
+              in
+              Vm_value.Array elems'
           | Vm_value.Tuple elems ->
               if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds";
               let copy = Array.copy elems in
@@ -858,10 +889,13 @@ and update_place (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
           let i = index_of_local vm frame li in
           match base with
           | Vm_value.Array elems ->
-              if i < 0 || i >= Array.length elems then err_trap vm "index out of bounds";
-              let copy = Array.copy elems in
-              copy.(i) <- update_place vm frame elems.(i) next_ty rest v;
-              Vm_value.Array copy
+              if i < 0 || i >= Vm_value.arr_length elems then err_trap vm "index out of bounds";
+              let updated = update_place vm frame (Vm_value.arr_get elems i) next_ty rest v in
+              let elems' =
+                if direct then Vm_value.arr_set_direct elems i updated
+                else Vm_value.arr_set elems i updated
+              in
+              Vm_value.Array elems'
           | Vm_value.Tuple elems ->
               if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds";
               let copy = Array.copy elems in
@@ -1010,9 +1044,9 @@ and drop_node (vm : t) (ty : Type_repr.t) (node : Drop_plan.plan_node)
          recursion re-enters drop_value_typed under the ELEMENT type *)
       match ty with
       | Type_repr.Fixed_array (elem_ty, _) ->
-          let n = min count (Array.length elems) in
+          let n = min count (Vm_value.arr_length elems) in
           for i = 0 to n - 1 do
-            drop_value_typed vm elem_ty elems.(i)
+            drop_value_typed vm elem_ty (Vm_value.arr_get elems i)
           done
       | _ -> Vm_value.drop_glue vm.memory v)
   | _ -> Vm_value.drop_glue vm.memory v
@@ -1058,9 +1092,14 @@ let drop_old_value_at (vm : t) (frame : frame) (p : Seed_mir.place) : unit =
                       | Vm_value.MovedOut -> None
                       | fv -> leaf_value fv rest
                     else None)
-                | Seed_mir.ConstantIndex k, (Vm_value.Tuple elems | Vm_value.Array elems)
+                | Seed_mir.ConstantIndex k, Vm_value.Tuple elems
                   when k >= 0 && k < Array.length elems -> (
                     match elems.(k) with
+                    | Vm_value.MovedOut -> None
+                    | ev -> leaf_value ev rest)
+                | Seed_mir.ConstantIndex k, Vm_value.Array elems
+                  when k >= 0 && k < Vm_value.arr_length elems -> (
+                    match Vm_value.arr_get elems k with
                     | Vm_value.MovedOut -> None
                     | ev -> leaf_value ev rest)
                 | Seed_mir.Downcast _, Vm_value.Enum (_, payload) ->
@@ -1221,7 +1260,7 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
       let vals = Array.of_list (List.map (eval_operand vm frame) ops) in
       (match kind with
        | Seed_mir.TupleAgg -> Vm_value.Tuple vals
-       | Seed_mir.ArrayAgg -> Vm_value.Array vals
+       | Seed_mir.ArrayAgg -> Vm_value.Array (Vm_value.arr_of_array vals)
        | Seed_mir.StructCtor _ -> Vm_value.Struct vals
        | Seed_mir.EnumCtor (_, vid) -> Vm_value.Enum (Ids.Variant_index.to_int vid, vals)
        | Seed_mir.ClosureAgg inst -> Vm_value.Closure (inst, vals))
@@ -1313,7 +1352,7 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
       | _ -> err_trap vm "discriminant on non-enum")
   | Seed_mir.Len p -> (
       match read_place vm frame p with
-      | Ok (Vm_value.Array a) -> Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int (Array.length a)))
+      | Ok (Vm_value.Array a) -> Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int (Vm_value.arr_length a)))
       | Ok (Vm_value.String s) -> Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int (String.length s)))
       | Ok (Vm_value.Tuple t) -> Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int (Array.length t)))
       | _ -> err_trap vm "len on unsupported value")
@@ -1566,12 +1605,26 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                   through UNCHANGED: a Box-typed argument only ever meets
                   a Box-typed parameter (nominal identity), so there is no
                   transparent wrapper load at the call boundary. *)
-               let all_args = Array.append arg_vals caps in
-              Array.iteri
-                (fun i _slot ->
-                  if i < Array.length args
-                     && args.(i).Seed_mir.effect_ = Access_effect.Initialize
-                  then callee_frame.locals.(i + 1) <- Vm_value.Uninitialized
+                let all_args = Array.append arg_vals caps in
+               (* a Read (by-value borrow) parameter or a closure capture
+                  gives the callee a second holder of the value while the
+                  caller's binding stays live: in-place element writes
+                  through it would be observable, so the cell loses its
+                  owned status (a Modify parameter is the caller's
+                  authorized mutation channel — it does NOT clear it) *)
+               Array.iteri
+                 (fun i v ->
+                   if i < Array.length args then (
+                     match args.(i).Seed_mir.effect_ with
+                     | Access_effect.Read -> Vm_value.arr_mark_shared_value v
+                     | _ -> ()))
+                 arg_vals;
+               Array.iter Vm_value.arr_mark_shared_value caps;
+               Array.iteri
+                 (fun i _slot ->
+                   if i < Array.length args
+                      && args.(i).Seed_mir.effect_ = Access_effect.Initialize
+                   then callee_frame.locals.(i + 1) <- Vm_value.Uninitialized
                   else callee_frame.locals.(i + 1) <- Vm_value.Live all_args.(i))
                 (Array.sub all_args 0 (Array.length fn.Seed_mir.params));
               run_frame vm callee_frame
@@ -1795,10 +1848,24 @@ and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Ho
              b.Host.name
              (Array.length b.Host.declared.Signature_identity.sig_params)
              (Array.length args));
-      (match b.Host.invoke vm.host args with
-       | Ok r -> r
-       | Error msg ->
-           err_trap vm (Printf.sprintf "host call %s: %s" b.Host.name msg))
+      let prof = Array.length vm.step_hist > 0 in
+      let t0 = if prof then Unix.gettimeofday () else 0.0 in
+      let r =
+        match b.Host.invoke vm.host args with
+        | Ok r -> r
+        | Error msg ->
+            err_trap vm (Printf.sprintf "host call %s: %s" b.Host.name msg)
+      in
+      (if prof then begin
+         let dt = Unix.gettimeofday () -. t0 in
+         let c, tt =
+           match Hashtbl.find_opt host_prof b.Host.name with
+           | Some (c, tt) -> (c, tt)
+           | None -> (0, 0.0)
+         in
+         Hashtbl.replace host_prof b.Host.name (c + 1, tt +. dt)
+       end);
+      r
 
 and run_frame (vm : t) (frame : frame) : unit =
   let fn = vm.program.Seed_mir.functions.(frame.fn) in
@@ -1839,6 +1906,12 @@ and run_frame (vm : t) (frame : frame) : unit =
     in
     raise (Failure (Printf.sprintf "%s [fn %d %s %s]" msg frame.fn (fn_tag ()) where))
 
+and mark_read_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : unit =
+  match op with
+  | Seed_mir.Read p | Seed_mir.Copy p ->
+      Vm_value.arr_mark_shared_value (eval_operand vm frame (Seed_mir.Copy p))
+  | Seed_mir.Move _ | Seed_mir.Consume _ | Seed_mir.Constant _ -> ()
+
 and exec_statement (vm : t) (frame : frame) (st : Seed_mir.statement) : unit =
   step_limit vm;
   match st with
@@ -1857,9 +1930,17 @@ and exec_statement (vm : t) (frame : frame) (st : Seed_mir.statement) : unit =
          explicit Drop terminators for the scope-end glue; this is the
          overwrite boundary the verifier's destroyed-lattice models as
          destroyed-by-assignment. *)
-      drop_old_value_at vm frame dest;
-      let v = eval_rvalue vm frame rv in
-      write_place vm frame dest v
+       drop_old_value_at vm frame dest;
+       (* a Read/Copy operand stored into another place creates a second
+          holder of the value while the source place stays live — an
+          in-place element write through it would alias *)
+       (match rv with
+        | Seed_mir.Use op -> mark_read_operand vm frame op
+        | Seed_mir.Aggregate (_, ops) -> List.iter (mark_read_operand vm frame) ops
+        | Seed_mir.Cast (op, _) -> mark_read_operand vm frame op
+        | _ -> ());
+       let v = eval_rvalue vm frame rv in
+       write_place vm frame dest v
   | Seed_mir.StorageLive l ->
       if l >= 0 && l < Array.length frame.locals then frame.locals.(l) <- Vm_value.Uninitialized
   | Seed_mir.StorageDead l ->
@@ -1989,6 +2070,7 @@ and invoke_guest_value (vm : t) (statics : Vm_value.slot array) (fv : Vm_value.t
                   stmt = 0;
                 }
               in
+              Array.iter Vm_value.arr_mark_shared_value caps;
               Array.iteri
                 (fun i v ->
                   if i + 1 < Array.length callee_frame.locals then
@@ -2084,7 +2166,7 @@ let statics_initial_values (program : Seed_mir.program) : Vm_value.slot array =
           | Seed_mir.Enum (vi, _) ->
               Vm_value.Live (Vm_value.Enum (Ids.Variant_index.to_int vi, [||]))
           | Seed_mir.Struct _ -> Vm_value.Live (Vm_value.Struct [||])
-          | Seed_mir.Array _ -> Vm_value.Live (Vm_value.Array [||])
+          | Seed_mir.Array _ -> Vm_value.Live (Vm_value.Array Vm_value.arr_empty)
           | Seed_mir.Map _ -> Vm_value.Live Vm_value.map_empty
           | Seed_mir.Set _ -> Vm_value.Live Vm_value.set_empty))
     program.Seed_mir.statics
@@ -2219,14 +2301,20 @@ let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
       (try
          run_frame vm entry_frame;
          (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
-            Printf.eprintf "VM STEPS: %d (limit %d), host calls: %d (limit %d)\n"
-              vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls);
+            Printf.eprintf
+              "VM STEPS: %d (limit %d), host calls: %d (limit %d), push copies: %d (%d pushes), map replace scans: %d, set replace scans: %d\n"
+              vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls
+              !Vm_value.prof_copies !Vm_value.prof_pushes !Vm_value.prof_map_scans
+              !Vm_value.prof_set_scans);
          Ok (entry_exit_code entry_frame)
        with
       | Failure msg ->
           (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
-             Printf.eprintf "VM STEPS: %d (limit %d), host calls: %d (limit %d)\n"
-               vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls);
+             Printf.eprintf
+               "VM STEPS: %d (limit %d), host calls: %d (limit %d), push copies: %d (%d pushes), map replace scans: %d, set replace scans: %d\n"
+               vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls
+               !Vm_value.prof_copies !Vm_value.prof_pushes !Vm_value.prof_map_scans
+               !Vm_value.prof_set_scans);
           Error { kind = Trap msg; message = msg; trace = List.rev vm.trace }
       | Exit ->
           (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then

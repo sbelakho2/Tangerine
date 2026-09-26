@@ -1,0 +1,225 @@
+# spawnprobe.tg — the child-process/exec/stderr boundary micro-repro.
+#
+# The kernel-native codesign failure reports `codesign failed: ` with an
+# EMPTY detail.  `run_command` (std/process.tg) builds its error from the
+# child's stderr, so an empty detail means one of:
+#   (a) the child never ran codesign (execvp failed -> _exit(127),
+#       empty stderr), or
+#   (b) the child ran but the VM's pipe read/poll never captured stderr, or
+#   (c) codesign really exited nonzero without writing to stderr.
+# This probe exercises exactly the same std path through the seed VM's
+# fork/pipe/poll/read/waitpid host bindings on three known commands:
+#
+#   1. `/bin/echo VMSPAWN`      -> Ok, stdout captured (status 0);
+#   2. `/bin/sh -c 'echo VME 1>&2; exit 7'`
+#                               -> Err carrying the child's stderr text
+#                                  and a nonzero status (7);
+#   3. `/usr/bin/codesign --verify <missing>` -> Err carrying codesign's
+#                                  own stderr message (the tool's real
+#                                  diagnostic for a missing file).
+#
+# main returns 0 only when all three behaved; the report file
+# (build/spawnprobe_report.txt) and the SPAWNPROBE markers carry the raw
+# observed strings so a failing lane prints the actual evidence.
+
+use std::collections::{Vec}
+use std::process::{run_command, Command, ProcessResult, c_fork, c_waitpid, _exit, WIFEXITED, WEXITSTATUS, execvp, string_vec_to_argv, pipe, dup2, libc_close, libc_read}
+use std::ffi::{address_of_mut, Ptr}
+use std::fs::{write_file}
+use std::io::{println}
+
+def spawnprobe_check_status0(inout report: String) -> Bool
+  var args: Vec[String] = Vec::new()
+  args.push("VMSPAWN".to_string())
+  match run_command("/bin/echo", args)
+  when Result::Ok(out) then
+    report = report + "ECHO ok out=[" + out.trim() + "]\n"
+    out.contains("VMSPAWN")
+  when Result::Err(e) then
+    report = report + "ECHO FAILED err=[" + e + "]\n"
+    false
+  end
+end
+
+def spawnprobe_check_stderr(inout report: String) -> Bool
+  var args: Vec[String] = Vec::new()
+  args.push("-c".to_string())
+  args.push("echo VME 1>&2; exit 7".to_string())
+  match run_command("/bin/sh", args)
+  when Result::Ok(out) then
+    report = report + "SH unexpected Ok out=[" + out.trim() + "]\n"
+    false
+  when Result::Err(e) then
+    report = report + "SH err=[" + e.trim() + "]\n"
+    e.contains("VME")
+  end
+end
+
+# The granular spawn/wait evidence: a bare Command::new("/bin/echo").spawn()
+# with inherited stdio, then Child::wait().  This separates "fork/exec
+# failed" (spawn Err) from "the child ran but the parent's waitpid/status
+# channel failed" (spawn Ok + wait Err) from "the status came back wrong"
+# (spawn Ok + wait Ok <unexpected result>).
+def spawnprobe_check_spawn_wait(inout report: String) -> Bool
+  var cmd = Command::new("/bin/echo")
+  cmd = cmd.arg("SPAWNED".as_str_view())
+  match cmd.spawn()
+  when Result::Ok(child) then
+    report = report + "SPAWN ok pid=" + child.pid.to_string() + "\n"
+    match child.wait()
+    when Result::Ok(r) then
+      match r
+      when ProcessResult::Exited(code) then
+        report = report + "WAIT ok Exited(" + code.to_string() + ")\n"
+        code == 0
+      when ProcessResult::Signaled(sig) then
+        report = report + "WAIT Signaled(" + sig.to_string() + ")\n"
+        false
+      when ProcessResult::Stopped(sig) then
+        report = report + "WAIT Stopped(" + sig.to_string() + ")\n"
+        false
+      when _ then
+        report = report + "WAIT other\n"
+        false
+      end
+    when Result::Err(e) then
+      report = report + "WAIT err=[" + e + "]\n"
+      false
+    end
+  when Result::Err(e) then
+    report = report + "SPAWN err=[" + e + "]\n"
+    false
+  end
+end
+
+def spawnprobe_check_codesign(inout report: String) -> Bool
+  var args: Vec[String] = Vec::new()
+  args.push("--verify".to_string())
+  args.push("/nonexistent-spawnprobe-file".to_string())
+  match run_command("/usr/bin/codesign", args)
+  when Result::Ok(out) then
+    report = report + "CODESIGN unexpected Ok out=[" + out.trim() + "]\n"
+    false
+  when Result::Err(e) then
+    report = report + "CODESIGN err=[" + e.trim() + "]\n"
+    # the real codesign diagnostic names the path; an empty detail here is
+    # the exact kernel-native failure shape and must fail this probe
+    e.len() > 0
+  end
+end
+
+# Child cwd inheritance: a guest-relative path written through the guest
+# filesystem (resolved under the virtual root) must name the SAME file to
+# a spawned host process.  The kernel's linker passes a guest-relative
+# output.tmp to codesign exactly this way, so a child that inherits the
+# seed's real cwd instead of the guest's virtual cwd fails here.
+def spawnprobe_check_child_cwd(inout report: String) -> Bool
+  let marker = "build/spawnprobe_cwd_marker.txt"
+  let _ = write_file(marker, "CWDOK\n")
+  var args: Vec[String] = Vec::new()
+  args.push(marker.to_string())
+  match run_command("/bin/cat", args)
+  when Result::Ok(out) then
+    report = report + "CWD cat ok out=[" + out.trim() + "]\n"
+    out.contains("CWDOK")
+  when Result::Err(e) then
+    report = report + "CWD cat err=[" + e.trim() + "]\n"
+    false
+  end
+end
+
+# Rawest fork/VM-continuation evidence: c_fork directly.  The child must
+# continue the VM, write its evidence file, then _exit(23); the parent
+# must reap it through c_waitpid with a status word whose WEXITSTATUS is
+# 23.  This isolates the fork/wait/status channel from exec and stdio.
+def spawnprobe_check_raw_fork(inout report: String) -> Bool
+  let pid = c_fork()
+  if pid == 0 then
+    let _ = write_file("/tmp/spawnprobe_child.txt", "child reached VM continuation\n")
+    _exit(23)
+  end
+  if pid < 0 then
+    report = report + "RAWFORK c_fork err=" + pid.to_string() + "\n"
+    return false
+  end
+  var status: Int = 0
+  let w = c_waitpid(pid, address_of_mut(&mut status), 0)
+  report = report + "RAWFORK parent pid=" + pid.to_string() + " wait=" + w.to_string() + " status=" + status.to_string() + " wifexited=" + WIFEXITED(status).to_string() + " exit=" + WEXITSTATUS(status).to_string() + "\n"
+  w == pid && WIFEXITED(status) && WEXITSTATUS(status) == 23
+end
+
+# Raw exec evidence: the same argv construction Command::spawn uses
+# (string_vec_to_argv) + a bare execvp in a c_fork child.  If this works,
+# the failure is in Command::spawn's stdio handling; if not, it is the
+# execvp/argv materialization.
+def spawnprobe_check_raw_exec(inout report: String) -> Bool
+  let pid = c_fork()
+  if pid == 0 then
+    var strings: Vec[String] = Vec::new()
+    strings.push("/bin/echo".to_string())
+    strings.push("RAWEXEC".to_string())
+    var c_strings: Vec[Vec[u8]] = Vec::new()
+    let argv = string_vec_to_argv(strings, &mut c_strings)
+    let _ = write_file("/tmp/spawnprobe_child_exec.txt", "before execvp c_strings=" + c_strings.len().to_string() + " argv=" + argv.len().to_string() + "\n")
+    execvp(c_strings[0].as_ptr(), argv.as_ptr())
+    let _ = write_file("/tmp/spawnprobe_child_exec.txt", "after execvp returned\n")
+    _exit(25)
+  end
+  var status: Int = 0
+  let w = c_waitpid(pid, address_of_mut(&mut status), 0)
+  report = report + "RAWEXEC parent wait=" + w.to_string() + " status=" + status.to_string() + " exit=" + WEXITSTATUS(status).to_string() + "\n"
+  WIFEXITED(status) && WEXITSTATUS(status) == 0
+end
+
+# Raw pipe/dup2 evidence: the exact redirect sequence Command::spawn runs
+# in the child for piped stdio, without exec.  A trap here (empty pipes in
+# the parent) is indistinguishable from exec failure at the run_command
+# level, so it is isolated.
+def spawnprobe_check_raw_pipe(inout report: String) -> Bool
+  var fds: Vec[Int] = Vec::new()
+  fds.resize(2, 0)
+  if pipe(fds.as_mut_ptr()) != 0 then
+    report = report + "RAWPIPE pipe failed\n"
+    return false
+  end
+  let pid = c_fork()
+  if pid == 0 then
+    let _ = write_file("/tmp/spawnprobe_child_pipe.txt", "child fds=" + fds[0].to_string() + "," + fds[1].to_string() + "\n")
+    libc_close(fds[0])
+    let d = dup2(fds[1], 1)
+    let _ = write_file("/tmp/spawnprobe_child_pipe.txt", "after dup2 rc=" + d.to_string() + "\n")
+    _exit(0)
+  end
+  libc_close(fds[1])
+  var buf: Vec[u8] = Vec::new()
+  buf.resize(64, 0)
+  let n = libc_read(fds[0], buf.as_mut_ptr(), 64)
+  libc_close(fds[0])
+  var status: Int = 0
+  let w = c_waitpid(pid, address_of_mut(&mut status), 0)
+  report = report + "RAWPIPE read=" + n.to_string() + " wait=" + w.to_string() + " exit=" + WEXITSTATUS(status).to_string() + "\n"
+  WIFEXITED(status) && WEXITSTATUS(status) == 0
+end
+
+def main() -> Int
+  var report = ""
+  let f = spawnprobe_check_raw_pipe(&mut report)
+  let e = spawnprobe_check_raw_fork(&mut report)
+  let g = spawnprobe_check_raw_exec(&mut report)
+  let d = spawnprobe_check_spawn_wait(&mut report)
+  let a = spawnprobe_check_status0(&mut report)
+  let b = spawnprobe_check_stderr(&mut report)
+  let c = spawnprobe_check_codesign(&mut report)
+  let h = spawnprobe_check_child_cwd(&mut report)
+  let summary = "SPAWNPROBE rawpipe=" + f.to_string() + " rawfork=" + e.to_string() + " rawexec=" + g.to_string() + " spawnwait=" + d.to_string() + " echo=" + a.to_string() + " stderr=" + b.to_string() + " codesign=" + c.to_string() + " childcwd=" + h.to_string() + "\n"
+  report = report + summary
+  let _ = write_file("build/spawnprobe_report.txt", report.clone())
+  println(summary.trim())
+  if e && a && b && c && h then
+    println("SPAWNPROBE PASS")
+    0
+  else
+    println("SPAWNPROBE FAIL")
+    1
+  end
+end

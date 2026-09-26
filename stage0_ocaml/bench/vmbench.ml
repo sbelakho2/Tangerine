@@ -13,7 +13,13 @@
               time in.
    Reports wall time, step count and ns/step.  The step count must be
    IDENTICAL before and after any interpreter optimisation (the step
-   accounting is semantic); the ns/step is the tuning metric. *)
+   accounting is semantic); the ns/step is the tuning metric.
+
+   push   — a hot loop calling the REAL `__intrinsic_array_push` host
+            binding on a local Vec, N times (the kernel's
+            CodeBuffer/emit8 shape).  Reports the total element copy
+            count the growth path performed (sum of pre-push lengths)
+            so the quadratic copy cost is visible directly. *)
 
 let iterations = ref 1_000_000
 let mode = ref "arith"
@@ -211,6 +217,235 @@ let fields_program () : Seed_mir.program =
   in
   { Seed_mir.functions = [| main_fn; hot_fn |]; statics = [||]; types }
 
+(* ── push: the real __intrinsic_array_push host binding in a hot loop ─ *)
+
+let push_id () : int =
+  match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name:"__intrinsic_array_push" with
+  | Some (id, _) -> Intrinsic_registry.Id.to_int id
+  | None -> failwith "vmbench: __intrinsic_array_push is not registered"
+
+let push_program () : Seed_mir.program =
+  let i64 = Type_repr.Int Type_repr.Int in
+  let vec_t = Intrinsic_registry.vec_of i64 in
+  let main_fn =
+    { Seed_mir.name = "main";
+      instance = instance 0;
+      params = [||];
+      locals = [| i64; vec_t; i64; Type_repr.Bool |];
+      blocks =
+        [| (* bb0: v = []; i = 0; goto bb1 *)
+           { Seed_mir.id = 0;
+             statements =
+               [ assign 1 (Seed_mir.Aggregate (Seed_mir.ArrayAgg, []));
+                 assign 2 (Seed_mir.Use (int_op 0)) ];
+             terminator = Seed_mir.Goto 1 };
+           (* bb1: v.push(i) — the Modify writeback channel *)
+           { Seed_mir.id = 1;
+             statements = [];
+             terminator =
+               Seed_mir.Call
+                 ( loc 0,
+                   Seed_mir.Intrinsic (push_id (), [| i64 |]),
+                   [| { Seed_mir.effect_ = Access_effect.Modify; value = copy 1 };
+                      { Seed_mir.effect_ = Access_effect.Consume; value = Seed_mir.Constant (Seed_mir.Integer (Int_value.of_int64 ~width:64 ~signed:true 1L)) } |],
+                   2,
+                   None ) };
+           (* bb2: i = i + 1; cond = i < n; loop *)
+           { Seed_mir.id = 2;
+             statements =
+               [ assign 2 (Seed_mir.BinaryOp (Seed_mir.Add, copy 2, int_op 1));
+                 assign 3 (Seed_mir.BinaryOp (Seed_mir.Lt, copy 2, int_op !iterations)) ];
+             terminator = Seed_mir.SwitchInt (copy 3, [ (1L, 1) ], 3) };
+           (* bb3: _0 = len(v); Ret *)
+           { Seed_mir.id = 3;
+             statements = [ assign 0 (Seed_mir.Len (loc 1)) ];
+             terminator = Seed_mir.Ret } |];
+      entry = 0 }
+  in
+  { Seed_mir.functions = [| main_fn |]; statics = [||]; types = [||] }
+
+(* ── sets: the byte-at-a-time fill loop (`v[i] = x`), the read_to_vec
+   shape.  After a resize grows the vec to N, N direct element writes
+   run; `sets_shared` first passes the vec to a Read host call (len),
+   which clears the cell's owned status — the old whole-array copy per
+   write. *)
+
+let sets_program (shared : bool) : Seed_mir.program =
+  let i64 = Type_repr.Int Type_repr.Int in
+  let vec_t = Intrinsic_registry.vec_of i64 in
+  let intrin name =
+    match Intrinsic_registry.lookup Intrinsic_registry.manifest ~name with
+    | Some (id, _) -> Intrinsic_registry.Id.to_int id
+    | None -> failwith ("vmbench: " ^ name ^ " is not registered")
+  in
+  let resize_id = intrin "__intrinsic_array_resize" in
+  let vec_param : Type_repr.param_type =
+    { pt_convention = Access_effect.Let; pt_type = vec_t }
+  in
+  let touch_fn =
+    { Seed_mir.name = "touch";
+      instance = instance 1;
+      params = [| vec_param |];
+      locals = [| i64; vec_t |];
+      blocks =
+        [| { Seed_mir.id = 0;
+             statements = [ assign 0 (Seed_mir.Use (int_op 0)) ];
+             terminator = Seed_mir.Ret } |];
+      entry = 0 }
+  in
+  let main_fn =
+    { Seed_mir.name = "main";
+      instance = instance 0;
+      params = [||];
+      locals = [| i64; vec_t; i64; i64; Type_repr.Bool |];
+      blocks =
+        [| (* bb0: v = []; v.resize(N, 0) *)
+           { Seed_mir.id = 0;
+             statements = [ assign 1 (Seed_mir.Aggregate (Seed_mir.ArrayAgg, [])) ];
+             terminator =
+               Seed_mir.Call
+                 ( loc 0,
+                   Seed_mir.Intrinsic (resize_id, [| i64 |]),
+                   [| { Seed_mir.effect_ = Access_effect.Modify; value = copy 1 };
+                      { Seed_mir.effect_ = Access_effect.Read; value = int_op !iterations };
+                      { Seed_mir.effect_ = Access_effect.Consume;
+                        value = Seed_mir.Constant
+                                  (Seed_mir.Integer
+                                     (Int_value.of_int64 ~width:64 ~signed:true 0L)) } |],
+                   1,
+                   None ) };
+           (* bb1: (optional shared-marking len read) ; i = 0 *)
+           { Seed_mir.id = 1;
+             statements = [];
+             terminator =
+               (if shared then
+                  Seed_mir.Call
+                    ( loc 0,
+                      Seed_mir.User (instance 1),
+                      [| { Seed_mir.effect_ = Access_effect.Read; value = copy 1 } |],
+                      2,
+                      None )
+                else Seed_mir.Goto 2) };
+           (* bb2: i = 0; goto bb3 *)
+           { Seed_mir.id = 2;
+             statements = [ assign 2 (Seed_mir.Use (int_op 0)) ];
+             terminator = Seed_mir.Goto 3 };
+           (* bb3: v[i] = i (the direct element write) ; i = i + 1 *)
+           { Seed_mir.id = 3;
+             statements =
+               [ Seed_mir.Assign
+                   ( { Seed_mir.root = Seed_mir.Local 1;
+                       projections = [ Seed_mir.Index 2 ] },
+                     Seed_mir.Use (copy 2) );
+                 assign 2 (Seed_mir.BinaryOp (Seed_mir.Add, copy 2, int_op 1));
+                 assign 4 (Seed_mir.BinaryOp (Seed_mir.Lt, copy 2, int_op !iterations)) ];
+             terminator = Seed_mir.SwitchInt (copy 4, [ (1L, 3) ], 4) };
+           (* bb4: _0 = v.len(); Ret *)
+           { Seed_mir.id = 4;
+             statements = [ assign 0 (Seed_mir.Len (loc 1)) ];
+             terminator = Seed_mir.Ret } |];
+      entry = 0 }
+  in
+  { Seed_mir.functions = [| main_fn; touch_fn |]; statics = [||]; types = [||] }
+
+(* ── arrcheck: randomized differential check of the growable-array
+   algebra against a list model.  Every live view's content is compared
+   after every operation, so an in-place mutation leaking into a view
+   that must keep its old content is caught. *)
+
+let arrcheck () : unit =
+  let st = Random.State.make [| 20260926 |] in
+  let views : (int, (Vm_value.arr * Vm_value.t list)) Hashtbl.t = Hashtbl.create 64 in
+  let next_id = ref 0 in
+  let add (a : Vm_value.arr) (model : Vm_value.t list) : int =
+    incr next_id;
+    Hashtbl.replace views !next_id (a, model);
+    !next_id
+  in
+  let live () = Hashtbl.fold (fun k v acc -> (k, v) :: acc) views [] in
+  let check_all (what : string) : unit =
+    List.iter
+      (fun (k, (a, model)) ->
+        let got = Vm_value.arr_to_list a in
+        if got <> model then begin
+          Printf.printf "ARRCHECK FAIL after %s: view %d content mismatch\n" what k;
+          exit 1
+        end)
+      (live ())
+  in
+  let pick () =
+    let l = live () in
+    fst (List.nth l (Random.State.int st (List.length l)))
+  in
+  let int i = Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int i)) in
+  let tag (v : Vm_value.t) : int =
+    match v with Vm_value.Int i -> Int64.to_int (Int_value.to_int64 i) | _ -> -1
+  in
+  let ensure () = Hashtbl.replace views (pick ()) (Hashtbl.find views (pick ())) in
+  ignore ensure;
+  let root = add (Vm_value.arr_empty) [] in
+  ignore root;
+  for step = 1 to 200_000 do
+    (match Random.State.int st 10 with
+     | 0 | 1 | 2 ->
+         let k = pick () in
+         let a, model = Hashtbl.find views k in
+         let v = int step in
+         Hashtbl.replace views k (Vm_value.arr_push a v, model @ [ v ])
+     | 3 ->
+         let k = pick () in
+         let a, model = Hashtbl.find views k in
+         (match Vm_value.arr_pop a with
+          | None, a' ->
+              if model <> [] then failwith "arrcheck: pop empty model";
+              Hashtbl.replace views k (a', model)
+          | Some v, a' -> (
+              match List.rev model with
+              | last :: rest ->
+                  if tag v <> tag last then failwith "arrcheck: pop element mismatch";
+                  Hashtbl.replace views k (a', List.rev rest)
+              | [] -> failwith "arrcheck: pop from empty view"))
+     | 4 | 5 ->
+         let k = pick () in
+         let a, model = Hashtbl.find views k in
+         let n = Vm_value.arr_length a in
+         if n > 0 then begin
+           let i = Random.State.int st n in
+           let v = int (step + 1000000) in
+           let model' = List.mapi (fun j x -> if j = i then v else x) model in
+           Hashtbl.replace views k (Vm_value.arr_set a i v, model')
+         end
+     | 6 ->
+         (* a snapshot: a second holder of the same value — the VM marks
+            the cell shared at every Read binding; model it *)
+         let k = pick () in
+         let a, model = Hashtbl.find views k in
+         Vm_value.arr_mark_shared a;
+         ignore (add a model)
+     | 7 ->
+         let k = pick () in
+         let a, model = Hashtbl.find views k in
+         let n = Vm_value.arr_length a in
+         if n > 0 then begin
+           let i = Random.State.int st n in
+           let v = int (step + 2000000) in
+           let model' = List.mapi (fun j x -> if j = i then v else x) model in
+           Hashtbl.replace views k (Vm_value.arr_set_direct a i v, model')
+         end
+     | 8 ->
+         let k = pick () in
+         let a, model = Hashtbl.find views k in
+         let b = Vm_value.arr_sub a 0 (Vm_value.arr_length a) in
+         ignore (add b model)
+     | _ ->
+         let k = pick () in
+         let a, model = Hashtbl.find views k in
+         Hashtbl.replace views k (a, model));
+    if step mod 1000 = 0 then check_all (Printf.sprintf "step %d" step)
+  done;
+  check_all "final";
+  Printf.printf "ARRCHECK PASS (200000 ops)\n"
+
 let () =
   let args = Array.to_list Sys.argv in
   (match args with
@@ -229,21 +464,36 @@ let () =
   (match Sys.getenv_opt "VMBENCH_BOXES" with
    | Some s -> ( match int_of_string_opt s with Some x -> boxes := x | None -> ())
    | None -> ());
-  let prog = if !mode = "fields" then fields_program () else arith_program () in
-  let limits : Vm.limits = { Vm.default_limits with max_steps = max_int } in
+  if !mode = "arrcheck" then begin
+    arrcheck ();
+    exit 0
+  end;
+  let prog =
+    if !mode = "fields" then fields_program ()
+    else if !mode = "push" then push_program ()
+    else if !mode = "sets" then sets_program false
+    else if !mode = "sets_shared" then sets_program true
+    else arith_program ()
+  in
+  let limits : Vm.limits =
+    { Vm.default_limits with max_steps = max_int; max_host_calls = max_int }
+  in
   match
     Vm.entry_frame_of_li ~limits ~lang_items:Lang_items.seed_defaults ~program:prog
       ~entry:(instance 0) ~argv:[||]
   with
   | Error m -> Printf.printf "setup error: %s\n" m; exit 1
-  | Ok (vm, frame) ->
-      let t0 = Unix.gettimeofday () in
-      (match Vm.run_inspect vm frame with
-       | Ok r -> Printf.printf "ret=%s " r
-       | Error m -> Printf.printf "trap=%s " m);
-      let dt = Unix.gettimeofday () -. t0 in
-      let steps = vm.Vm.steps in
-      Printf.printf
-        "mode=%s iterations=%d blocks=%d boxes=%d dummy_types=%d steps=%d wall=%.3fs ns/step=%.1f\n"
-        !mode !iterations !dummy_blocks !boxes !dummy_types steps dt
-        (dt *. 1e9 /. float_of_int steps)
+   | Ok (vm, frame) ->
+       let alloc0 = Gc.allocated_bytes () in
+       let t0 = Unix.gettimeofday () in
+       (match Vm.run_inspect vm frame with
+        | Ok r -> Printf.printf "ret=%s " r
+        | Error m -> Printf.printf "trap=%s " m);
+       let dt = Unix.gettimeofday () -. t0 in
+       let alloc = Gc.allocated_bytes () -. alloc0 in
+       let steps = vm.Vm.steps in
+       Printf.printf
+         "mode=%s iterations=%d blocks=%d boxes=%d dummy_types=%d steps=%d wall=%.3fs ns/step=%.1f alloc=%.1fMB set_copies=%d\n"
+         !mode !iterations !dummy_blocks !boxes !dummy_types steps dt
+         (dt *. 1e9 /. float_of_int steps) (alloc /. 1048576.)
+         !Vm_value.prof_set_copies

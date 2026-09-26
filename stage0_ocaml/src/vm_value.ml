@@ -11,6 +11,17 @@
    trees stay freely shareable. *)
 module Int_map = Map.Make (Int)
 
+(* ── Byte-copy instrumentation (diagnostic; TANGERINE_DEBUG_STEPS) ──
+   Counts the element copies the growable-array and store-rewrite paths
+   perform, so a profile can name the quadratic copy volume.  The
+   counters are pure accounting: they never influence evaluation. *)
+let prof_copies = ref 0
+let prof_push_copies = ref 0
+let prof_set_copies = ref 0
+let prof_pushes = ref 0
+let prof_map_scans = ref 0
+let prof_set_scans = ref 0
+
 type t =
   | Unit
   | Bool of bool
@@ -22,7 +33,7 @@ type t =
   | Tuple of t array
   | Struct of t array
   | Enum of int * t array          (* variant index, payload *)
-  | Array of t array
+  | Array of arr
   | Set of set_store               (* the runtime Set: order + hash index *)
   | Map of map_store               (* the runtime Map: order + hash index *)
   | Function of Instance_id.t
@@ -34,7 +45,32 @@ type t =
   (* re-audit P12: the partial-move HOLE — the projected component of a
      moved-out aggregate.  Reads of the hole trap (defense-in-depth —
      the verifier's moved lattice already blocks the path), and the
-     drop glue skips it, so a moved-out field never double-drops. *)
+     drop glue skips it, so a moved-out field never double-drops.
+
+     ── The growable array (the push/append amortization) ────────────
+     A value is { cell; len }: the logical content is cell.data[0..len)
+     and `cell.high` is the highest logical length any view of this
+     cell has written.  Appending to a view whose len = cell.high writes
+     at index high and bumps high (the spare capacity makes it amortized
+     O(1)); appending to a shorter view FORKS a private cell (the slots
+     >= len may be another view's content — never overwritten).  Since
+     every view reads only indices < its own len and the frontier write
+     lands at high >= every view's len, no alias can ever observe an
+     in-place append: value semantics is preserved with NO uniqueness
+     analysis.  Element writes / insert / remove / slice / clone fork a
+     private cell, exactly the old whole-array copy. *)
+and arr = { cell : arr_cell; len : int }
+and arr_cell = {
+  mutable data : t array;
+  mutable high : int;              (* written frontier: len <= high <= capacity *)
+  (* `owned` is false as soon as a second holder of this cell may exist
+     (a Read/borrow binding, a Read/Copy operand that stores the value,
+     a closure-capture binding, a projected move out of an aggregate).
+     An owned cell's only holder is the place a direct element write
+     reads and writes back, so the write may mutate `data` in place —
+     no other binding can observe it.  Forked cells start owned. *)
+  mutable owned : bool;
+}
 
 (* ── The hash-indexed Map/Set stores ─────────────────────────────────
    The runtime Map/Set keep their INSERTION ORDER as the iteration
@@ -94,13 +130,156 @@ and frame = {
   mutable stmt : int;
 }
 
-(* ── Slot-state ownership (audit §31) ──────────────────────────── *)
-
 and slot =
   | Uninitialized
   | Live of t
   | Moved
   | Dropped
+
+(* ── The growable-array surface ─────────────────────────────────────
+   All access goes through these helpers so no caller can read a slot at
+   or beyond a view's logical length (the frontier invariant at the type
+   note above).  `arr_push` is the ONLY operation that may grow in
+   place; it writes at the shared cell's written frontier, which is at
+   or beyond every view's logical length, so no other view can observe
+   it.  Element writes, insert/remove/slice/clone fork a private cell
+   (the same whole-array copy the previous representation performed). *)
+
+let arr_length (a : arr) : int = a.len
+
+let arr_get (a : arr) (i : int) : t = a.cell.data.(i)
+
+let arr_of_array (xs : t array) : arr =
+  { cell = { data = xs; high = Array.length xs; owned = true };
+    len = Array.length xs }
+
+(* mark a value as possibly held by a second binding: in-place writes
+   through the top-level array become illegal (they would alias) *)
+let arr_mark_shared_value (v : t) : unit =
+  match v with Array a -> a.cell.owned <- false | _ -> ()
+
+let arr_mark_shared (a : arr) : unit = a.cell.owned <- false
+
+let arr_empty : arr = arr_of_array [||]
+
+let arr_of_list (xs : t list) : arr = arr_of_array (Array.of_list xs)
+
+(* value constructors for the array payload (the ergonomic shorthand) *)
+let array (xs : t array) : t = Array (arr_of_array xs)
+
+let array_of_list (xs : t list) : t = Array (arr_of_list xs)
+
+let arr_to_list (a : arr) : t list =
+  let rec go i acc = if i < 0 then acc else go (i - 1) (a.cell.data.(i) :: acc) in
+  go (a.len - 1) []
+
+let arr_to_array (a : arr) : t array = Array.sub a.cell.data 0 a.len
+
+let arr_iter (f : t -> unit) (a : arr) : unit =
+  for i = 0 to a.len - 1 do
+    f a.cell.data.(i)
+  done
+
+let arr_iteri (f : int -> t -> unit) (a : arr) : unit =
+  for i = 0 to a.len - 1 do
+    f i a.cell.data.(i)
+  done
+
+let arr_exists (f : t -> bool) (a : arr) : bool =
+  let rec go i = i < a.len && (f a.cell.data.(i) || go (i + 1)) in
+  go 0
+
+let arr_for_all (f : t -> bool) (a : arr) : bool =
+  let rec go i = i >= a.len || (f a.cell.data.(i) && go (i + 1)) in
+  go 0
+
+let arr_equal_seq (eq : t -> t -> bool) (a : arr) (b : arr) : bool =
+  a.len = b.len
+  &&
+  let rec go i = i >= a.len || (eq a.cell.data.(i) b.cell.data.(i) && go (i + 1)) in
+  go 0
+
+let arr_fold_left (f : 'a -> t -> 'a) (init : 'a) (a : arr) : 'a =
+  let acc = ref init in
+  for i = 0 to a.len - 1 do
+    acc := f !acc a.cell.data.(i)
+  done;
+  !acc
+
+(* frontier append: in place when this view owns the written frontier
+   (len = high), else a private fork of the prefix *)
+let arr_push (a : arr) (v : t) : arr =
+  let c = a.cell in
+  if a.len = c.high then begin
+    if c.high >= Array.length c.data then begin
+      let cap = max 4 (2 * Array.length c.data) in
+      let data' = Array.make cap v in
+      Array.blit c.data 0 data' 0 c.high;
+      prof_copies := !prof_copies + c.high;
+      prof_push_copies := !prof_push_copies + c.high;
+      c.data <- data'
+    end
+    else c.data.(c.high) <- v;
+    c.high <- c.high + 1;
+    { cell = c; len = a.len + 1 }
+  end
+  else begin
+    let data' = Array.make (a.len + 1) v in
+    Array.blit c.data 0 data' 0 a.len;
+    prof_copies := !prof_copies + a.len;
+    prof_push_copies := !prof_push_copies + a.len;
+    { cell = { data = data'; high = a.len + 1; owned = true }; len = a.len + 1 }
+  end
+
+let arr_pop (a : arr) : t option * arr =
+  if a.len = 0 then (None, a)
+  else begin
+    let last = a.cell.data.(a.len - 1) in
+    (* the element leaves the container: another holder of the
+       container still holds it under value semantics *)
+    arr_mark_shared_value last;
+    (Some last, { cell = a.cell; len = a.len - 1 })
+  end
+
+let arr_set (a : arr) (i : int) (v : t) : arr =
+  let data = Array.sub a.cell.data 0 a.len in
+  prof_copies := !prof_copies + a.len;
+  prof_set_copies := !prof_set_copies + a.len;
+  data.(i) <- v;
+  { cell = { data; high = a.len; owned = true }; len = a.len }
+
+(* The direct element write: an owned cell has exactly one holder — the
+   place the write reads and writes back — so the element may be
+   replaced in `data` with no observable alias.  A non-owned cell takes
+   the fork path (the old whole-array copy). *)
+let arr_set_direct (a : arr) (i : int) (v : t) : arr =
+  if a.cell.owned then begin
+    a.cell.data.(i) <- v;
+    a
+  end
+  else arr_set a i v
+
+let arr_append (a : arr) (b : arr) : arr =
+  let n = a.len and m = b.len in
+  let data = Array.make (n + m) (if n > 0 then a.cell.data.(0) else Unit) in
+  Array.blit a.cell.data 0 data 0 n;
+  Array.blit b.cell.data 0 data n m;
+  arr_of_array data
+
+let arr_sub (a : arr) (pos : int) (n : int) : arr =
+  arr_of_array (Array.sub a.cell.data pos n)
+
+let arr_make (n : int) (v : t) : arr = arr_of_array (Array.make n v)
+
+let arr_truncate (a : arr) (n : int) : arr = arr_sub a 0 n
+
+let arr_remove (a : arr) (i : int) : arr =
+  let n = a.len in
+  arr_append (arr_sub a 0 i) (arr_sub a (i + 1) (n - i - 1))
+
+let arr_insert (a : arr) (i : int) (v : t) : arr =
+  let n = a.len in
+  arr_append (arr_sub a 0 i) (arr_append (arr_of_array [| v |]) (arr_sub a i (n - i)))
 
 type slot_error =
   | ReadMoved
@@ -174,8 +353,9 @@ let rec equal (a : t) (b : t) : bool =
   | Float64 x, Float64 y -> Int64.compare x y = 0
   | Char x, Char y -> Uchar.equal x y
   | String x, String y -> x = y
-  | Tuple x, Tuple y | Struct x, Struct y | Array x, Array y ->
+  | Tuple x, Tuple y | Struct x, Struct y ->
       Array.length x = Array.length y && Array.for_all2 equal x y
+  | Array x, Array y -> arr_equal_seq equal x y
   | Enum (i, x), Enum (j, y) -> i = j && Array.length x = Array.length y && Array.for_all2 equal x y
   | Function a, Function b -> Instance_id.compare a b = 0
   | Closure (a, ca), Closure (b, cb) ->
@@ -215,7 +395,8 @@ let rec value_hash (v : t) : int =
   | Float64 f -> mix 7 (Int64.to_int f)
   | Char c -> mix 11 (Uchar.to_int c)
   | String s -> mix 13 (Hashtbl.hash s)
-  | Tuple elems | Struct elems | Array elems -> mix 17 (array_hash elems)
+  | Tuple elems | Struct elems -> mix 17 (array_hash elems)
+  | Array elems -> mix 17 (arr_hash elems)
   | Enum (tag, payload) -> mix 19 (mix tag (array_hash payload))
   | RawPtr p -> mix 29 (mix p.Vm_memory.region p.Vm_memory.offset)
   | Ref (Region p) -> mix 31 (mix p.Vm_memory.region p.Vm_memory.offset)
@@ -226,6 +407,11 @@ let rec value_hash (v : t) : int =
 and array_hash (elems : t array) : int =
   let h = ref 23 in
   Array.iter (fun e -> h := mix !h (value_hash e)) elems;
+  !h
+
+and arr_hash (elems : arr) : int =
+  let h = ref 23 in
+  arr_iter (fun e -> h := mix !h (value_hash e)) elems;
   !h
 
 (* ── The collection-lookup equality (audit P0-11) ─────────────────────
@@ -240,8 +426,9 @@ and array_hash (elems : t array) : int =
    in its tree (fail-closed).  Non-resource values compare structurally. *)
 let rec has_owned_ref (v : t) : bool =
   match v with
-  | Tuple elems | Struct elems | Array elems | Enum (_, elems) ->
+  | Tuple elems | Struct elems | Enum (_, elems) ->
       Array.exists has_owned_ref elems
+  | Array elems -> arr_exists has_owned_ref elems
   | Set s ->
       List.exists has_owned_ref s.set_front || List.exists has_owned_ref s.set_back
   | Map m ->
@@ -283,6 +470,8 @@ let map_insert_entry (m : map_store) (key : t) (value : t) : t option * map_stor
   let bucket = match Int_map.find_opt h m.map_index with Some b -> b | None -> [] in
   match bucket_mem_key bucket key with
   | Some ((stored_key, old) as victim) ->
+      prof_map_scans :=
+        !prof_map_scans + List.length m.map_front + List.length m.map_back;
       (* ONE new pair object shared by both order lists and the index
          bucket: the entry's identity is the pair object, and every
          structure must keep carrying the same one (a later replace or
@@ -388,6 +577,8 @@ let set_insert_entry (s : set_store) (item : t) : bool * t option * set_store =
   let bucket = match Int_map.find_opt h s.set_index with Some b -> b | None -> [] in
   match List.find_opt (fun e -> lookup_eq e item) bucket with
   | Some victim ->
+      prof_set_scans :=
+        !prof_set_scans + List.length s.set_front + List.length s.set_back;
       let replace e = if e == victim then item else e in
       ( true,
         Some victim,
@@ -543,8 +734,8 @@ let rec serialize_value (buf : Buffer.t) (v : t) : unit =
       Array.iter (serialize_value buf) elems
   | Array elems ->
       Buffer.add_char buf (Char.chr 0x0A);
-      put_u64 buf (Int64.of_int (Array.length elems));
-      Array.iter (serialize_value buf) elems
+      put_u64 buf (Int64.of_int (arr_length elems));
+      arr_iter (serialize_value buf) elems
   | Set store ->
       Buffer.add_char buf (Char.chr 0x0E);
       put_u64 buf (Int64.of_int (set_len store));
@@ -640,7 +831,7 @@ let rec deserialize_value (c : cursor) : t =
       String (Bytes.to_string (cursor_take c len))
   | 0x08 -> Tuple (cursor_elems c)
   | 0x09 -> Struct (cursor_elems c)
-  | 0x0A -> Array (cursor_elems c)
+  | 0x0A -> Array (arr_of_array (cursor_elems c))
   | 0x0B ->
       let tag = cursor_count c in
       Enum (tag, cursor_elems c)
@@ -688,7 +879,8 @@ let deserialize (bytes : Bytes.t) : t =
    and are left untouched. *)
 let rec drop_glue (m : Vm_memory.t) (v : t) : unit =
   match v with
-  | Tuple elems | Struct elems | Array elems -> Array.iter (drop_glue m) elems
+  | Tuple elems | Struct elems -> Array.iter (drop_glue m) elems
+  | Array elems -> arr_iter (drop_glue m) elems
   | Set store -> List.iter (drop_glue m) (set_elems store)
   | Map store ->
       List.iter (fun (k, v) -> drop_glue m k; drop_glue m v) (map_pairs store)

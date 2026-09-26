@@ -30,9 +30,12 @@ type region = {
 }
 
 type t = {
-  mutable regions : region array;
-  mutable next_region : int;
+  mutable regions : region array;  (* capacity >= next_region (geometric) *)
+  mutable next_region : int;       (* logical region count / next id *)
 }
+
+(* region-allocation counter (diagnostic; see Vm_value's copy counters) *)
+let prof_regions = ref 0
 
 let create () = { regions = [||]; next_region = 0 }
 
@@ -58,6 +61,8 @@ let mem_error_string = function
 
 let is_power_of_two (n : int) : bool = n > 0 && n land (n - 1) = 0
 
+let dead_region = { live = false; bytes = Bytes.empty; alignment = 1; kind = Serialized }
+
 let alloc ?(kind = Serialized) (m : t) (size : int) (alignment : int) :
     (pointer, mem_error) result =
   if size < 0 then Error (NegativeSize size)
@@ -66,7 +71,17 @@ let alloc ?(kind = Serialized) (m : t) (size : int) (alignment : int) :
     let region_id = m.next_region in
     m.next_region <- m.next_region + 1;
     let region = { live = true; bytes = Bytes.make size '\000'; alignment; kind } in
-    m.regions <- Array.append m.regions [| region |];
+    prof_regions := !prof_regions + 1;
+    (* geometric growth: the table copy is amortized O(1) per region
+       (the previous one-element append was quadratic in the region
+       count — the kernel's allocator allocates regions in bulk) *)
+    if region_id >= Array.length m.regions then begin
+      let cap = max 16 (2 * Array.length m.regions) in
+      let grown = Array.make cap dead_region in
+      Array.blit m.regions 0 grown 0 region_id;
+      m.regions <- grown
+    end;
+    m.regions.(region_id) <- region;
     Ok { region = region_id; offset = 0 }
   end
 
@@ -77,7 +92,7 @@ let alloc_bytes (m : t) (size : int) : (pointer, mem_error) result = alloc m siz
    second free, a free of a dead region, a free of a non-base pointer and
    a free of an unknown region are all deterministic errors. *)
 let free (m : t) (p : pointer) : (unit, mem_error) result =
-  if p.region < 0 || p.region >= Array.length m.regions then Error (BadRegion p.region)
+  if p.region < 0 || p.region >= m.next_region then Error (BadRegion p.region)
   else
     let r = m.regions.(p.region) in
     if not r.live then Error (DeadRegion p)
@@ -88,7 +103,7 @@ let free (m : t) (p : pointer) : (unit, mem_error) result =
     end
 
 let region_of (m : t) (p : pointer) : (region, mem_error) result =
-  if p.region < 0 || p.region >= Array.length m.regions then Error (BadRegion p.region)
+  if p.region < 0 || p.region >= m.next_region then Error (BadRegion p.region)
   else
     let r = m.regions.(p.region) in
     if not r.live then Error (DeadRegion p) else Ok r

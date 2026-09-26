@@ -27,6 +27,7 @@ use tg_compiler::types::{
   TypedEffectOp, TypedEffectDecl,
   DeinitPlan, PlaceMoveState, fn_owner_key_of_def,
   module_qualified_fn_key, subst_type_args, deinit_plan_is_trivial,
+  TypeQueryKind, TypeQueryRecord, type_query_kind_name,
   TypeEnv, TypeDef, TypeDefKind, TypeKind, FieldInfo, type_properties_of,
   FunctionCleanupTable, ScopeId, function_cleanup_table_new,
   TypedBudget,
@@ -753,6 +754,15 @@ enum MirConstantKind
   # closed residual error at mono). The constant's `ty` is the parameter's
   # DECLARED scalar type (the `UInt` of `const N: UInt`).
   MirConstParamValue(Int)
+  # (the type-query placeholder): `size_of[T]()` / `align_of[T]()` — the
+  # compile-time query of kind (SizeOf/AlignOf) over its SOLVED type
+  # argument, lowered IN PLACE OF the extern call (the checker's
+  # TypeQueryRecord channel). Monomorphization substitutes the payload
+  # type under the instance map; the post-mono fold
+  # (mir_fold_type_queries) resolves it to a MirInt through the layout
+  # engine. A placeholder that survives into a concrete function is a
+  # fail-closed compile error — never an emission.
+  MirTypeQuery(TypeQueryKind, Type)
   MirFloat(Float)
   MirChar(Char)
   MirString(String)
@@ -969,6 +979,12 @@ def duplicate_constant(constant: MirConstant) -> MirConstant
     MirConstant { kind: MirConstantKind::MirInt(value), ty: constant.ty.clone(), instance: Option::None }
   when MirConstantKind::MirConstParamValue(gpid) then
     MirConstant { kind: MirConstantKind::MirConstParamValue(gpid), ty: constant.ty.clone(), instance: Option::None }
+  when MirConstantKind::MirTypeQuery(qkind, qarg) then
+    MirConstant {
+      kind: MirConstantKind::MirTypeQuery(qkind.clone(), qarg.clone()),
+      ty: constant.ty.clone(),
+      instance: Option::None
+    }
   when MirConstantKind::MirFloat(value) then
     MirConstant { kind: MirConstantKind::MirFloat(value), ty: constant.ty.clone(), instance: Option::None }
   when MirConstantKind::MirChar(value) then
@@ -2107,6 +2123,12 @@ struct MirBuilder
   # codegen's dispatch reads the stamped id first and falls back to the
   # semantic router only for the synthesized calls.
   typed_intrinsics: Map[Int, IntrinsicId]
+  # (the type-query typed channel): call expr node id -> the checker's
+  # TypeQueryRecord (kind + SOLVED type argument) for the special form
+  # `size_of[T]()` / `align_of[T]()`. lr_call reads it FIRST: the query
+  # lowers to the MirTypeQuery placeholder constant, never an ordinary
+  # extern call. Empty for hand-built/synthesized MIR.
+  type_queries: Map[Int, TypeQueryRecord]
   # Typed identifier resolutions (expr node id -> local id); the semantic
   # source for lr_ident (name-based scope lookup is the
   # fallback).
@@ -2411,6 +2433,7 @@ def builder_new() -> MirBuilder
     trait_contract_conflicts: Set::new(),
     current_contract_identity: Option::None,
     typed_intrinsics: Map::new(),
+    type_queries: Map::new(),
     ident_resolutions: Map::new(),
     const_param_reads: Map::new(),
     closure_captures: Map::new(),
@@ -6013,6 +6036,10 @@ def lower_program(program: Program, analyzed: AnalyzedProgram, hir_view: HirNode
   b.typed_type_variants = analyzed.typed.type_variants.clone()
   b.call_def_ids = analyzed.typed.call_targets.clone()
   b.call_instances = analyzed.typed.call_instances.clone()
+  # (the type-query typed channel): the checker's per-call query records —
+  # read by lr_call so `size_of[T]()`/`align_of[T]()` lower to the
+  # MirTypeQuery placeholder, never an ordinary extern call.
+  b.type_queries = analyzed.typed.type_queries.clone()
   b.contract_calls = analyzed.typed.contract_calls.clone()
   b.trait_contract_methods = analyzed.typed.trait_contract_methods.clone()
   b.trait_contract_conflicts = analyzed.typed.trait_contract_conflicts.clone()
@@ -13230,6 +13257,24 @@ def attach_call_instance(b: MirBuilder, op: MirOperand, instance: Option[Instanc
 end
 
 def lr_call(inout b: MirBuilder, callee_expr: Expr, arg_exprs: Vec[Expr], span: Span, call_node_id: Int) -> MirRvalue
+  # (the type-query special form): `size_of[T]()` / `align_of[T]()` —
+  # the checker recorded the query kind + SOLVED type argument; emit the
+  # MirTypeQuery placeholder the post-mono fold resolves through the
+  # layout engine. No callee is lowered and NO MirCall is emitted: the
+  # query is compile-time-only (the seed's TypeQuery callee class).
+  match b.type_queries.get(call_node_id)
+  when Option::Some(query) then
+    let qty = match typed_expr_ty(b, call_node_id)
+    when Option::Some(t) then t
+    when Option::None then Type::UInt
+    end
+    return MirRvalue { kind: MirRvalueKind::MirMove(operand_constant(MirConstant {
+      kind: MirConstantKind::MirTypeQuery(query.kind.clone(), query.arg.clone()),
+      ty: qty,
+      instance: Option::None
+    })) }
+  when Option::None then ()
+  end
   let callee_kind = expr_kind_name(&callee_expr.kind)
   # (turbofish free-function call): the indexed callee `f[T]` is not an
   # index expression when its base is a direct callable — the payload is
@@ -21456,6 +21501,7 @@ def format_mir_constant(names: Map[Int, String], param_names: Map[Int, String], 
   when MirConstantKind::MirBool(b) then if b then "true" else "false" end
   when MirConstantKind::MirInt(n) then n.to_string() + "_" + format_mir_type(names, param_names, &c.ty)
   when MirConstantKind::MirConstParamValue(gpid) then "const_param(" + gpid.to_string() + ")"
+  when MirConstantKind::MirTypeQuery(qkind, qarg) then type_query_kind_name(qkind.clone()) + "[" + format_mir_type(names, param_names, &qarg) + "]"
   when MirConstantKind::MirFloat(f) then "f" + f.to_bits().to_string() + "_" + format_mir_type(names, param_names, &c.ty)
   when MirConstantKind::MirChar(ch) then "'" + ch.to_string() + "'"
   when MirConstantKind::MirString(s) then "\"" + s.clone() + "\""
@@ -39438,6 +39484,10 @@ def verifier_constant_type(cst: MirConstant) -> Option[Type]
   # "int into uint/u64/..." mismatch.
   when MirConstantKind::MirInt(_) then Option::Some(cst.ty.clone())
   when MirConstantKind::MirConstParamValue(_) then Option::Some(Type::Int)
+  # (the type-query placeholder): its value type is the carried result type
+  # (the query's declared return — UInt); the payload type argument's
+  # concreteness is checked by the embedded-types walk.
+  when MirConstantKind::MirTypeQuery(_, _) then Option::Some(cst.ty.clone())
   when MirConstantKind::MirFloat(_) then Option::Some(cst.ty.clone())
   when MirConstantKind::MirChar(_) then Option::Some(Type::Char)
   when MirConstantKind::MirString(_) then Option::Some(Type::String)
@@ -40235,6 +40285,7 @@ def verifier_constant_kind_key(kind: MirConstantKind) -> String
   when MirConstantKind::MirBool(_) then "bool"
   when MirConstantKind::MirInt(_) then "int"
   when MirConstantKind::MirConstParamValue(_) then "const_param"
+  when MirConstantKind::MirTypeQuery(_, _) then "type_query"
   when MirConstantKind::MirFloat(_) then "float"
   when MirConstantKind::MirChar(_) then "char"
   when MirConstantKind::MirString(_) then "string"
@@ -40310,6 +40361,18 @@ def verifier_check_operand_embedded_types(plans: Map[String, DeinitPlan], type_i
     # (Type::Closure/FnPtr), the value types of the primitive constants.
     let cst_what = ctx.clone() + " constant type"
     verifier_check_type_concreteness(plans, type_index, param_names, &cst_what, &cst.ty, allow_param, errors)
+    # (the type-query placeholder): the payload type argument must be
+    # concrete under the SAME template posture — a still-generic body
+    # legitimately carries the enclosing declaration's Param (substituted
+    # at specialization); a CONCRETE function carrying a Param/Var
+    # payload means monomorphization failed to substitute it (the fold
+    # then fails closed with the query/type named).
+    match cst.kind
+    when MirConstantKind::MirTypeQuery(qkind, qarg) then
+      let q_what = ctx.clone() + " type query `" + type_query_kind_name(qkind) + "` type argument"
+      verifier_check_type_concreteness(plans, type_index, param_names, &q_what, &qarg, allow_param, errors)
+    when _ then ()
+    end
     # The InstanceId generic arguments of a MirFnItem — the call signatures
     # and the deinit/drop instance payloads: every Type row (and every
     # const row's type view) must be concrete.

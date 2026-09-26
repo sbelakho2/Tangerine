@@ -1,0 +1,242 @@
+# linkprobe.tg — the kernel-native compile-to-executable micro-repro.
+#
+# ONE probe entry, TWO modes selected by the kernel argv (so a single
+# prepared-VM program/cache serves both):
+#
+#   linkprobe linkobj   (default fast mode)
+#       Builds a minimal aarch64 Mach-O object IN THE VM (mov x0,#42; ret +
+#       the `main` symbol) and runs the REAL kernel linker path:
+#       link_executable -> perform_link (Mach-O emission, in-memory
+#       validation) -> write output.tmp -> chmod -> codesign -s - ->
+#       codesign --verify -> rename.  This is the seconds-scale loop for
+#       link/codesign fixes: it exercises the exact failing layer without
+#       the kernel front end / MIR / codegen work.
+#
+#   linkprobe full
+#       Runs the REAL kernel compile entry (compile_startup_entry ->
+#       ... -> generate_executable) over a tiny embedded source: the
+#       end-to-end proof that the whole compile-to-executable path works.
+#
+# Both modes write build/linkprobe_report.txt; main returns 0 only when
+# the artifact exists with a nonzero size.  The harness executes the
+# artifact natively and requires exit code 42 (the embedded/constructed
+# `main`).
+
+use std::core::{Option, Result}
+use std::collections::{Vec}
+use std::args::{raw_arg_count, raw_arg_copy}
+use std::fs::{write_file, file_exists, file_size}
+use std::io::{println}
+use tg_compiler::asm::{
+  AsmSymbol, Relocation, RelocKind, Section, SymBinding, SymKind, Arch, OsAbi, asm_target
+}
+use tg_compiler::object::{object_new, ObjectFile}
+use tg_compiler::linker::{LinkerInput, link_executable}
+use tg_compiler::compiler_core::{compile_startup_entry, default_options}
+
+const LINKPROBE_SRC: String = "use std::alloc::{size_of, align_of}\n\nstruct ProbePair[T]\n  a: u8\n  b: T\nend\n\ndef q_size[T]() -> Int\n  size_of[T]() as Int\nend\n\ndef q_align[T]() -> Int\n  align_of[T]() as Int\nend\n\ndef main() -> Int\n  let a = match __intrinsic_str_parse_int(\"42\")\n    when Result::Ok(n) then n == 42\n    when Result::Err(_) then false\n    end\n  let b = match __intrinsic_str_parse_int(\"nope\")\n    when Result::Ok(_) then false\n    when Result::Err(_) then true\n    end\n  let c = (__intrinsic_float_to_bits(1.5) as Int) == 0x3FF8000000000000\n  let d = __intrinsic_int_to_float(3) == 3.0\n  let e = __intrinsic_float_to_int(2.75) == 2\n  # size_of/align_of: concrete primitives ...\n  let f = (size_of[u8]() == 1) && (align_of[u8]() == 1)\n  let g = (size_of[UInt]() == 8) && (align_of[UInt]() == 8)\n  # ... a concrete INSTANCE of a generic nominal (ProbePair[u8] =\n  # {a: u8 @0, b: u8 @1} -> size 2 / align 1) ...\n  let h = (size_of[ProbePair[u8]]() == 2) && (align_of[ProbePair[u8]]() == 1)\n  # ... and the same instance shapes reached through GENERIC helper\n  # functions (ProbePair[UInt] = {a: u8 @0, b: UInt @8} -> size 16 /\n  # align 8), the generic-instantiation route.\n  let i = (q_size[ProbePair[UInt]]() == 16) && (q_align[ProbePair[UInt]]() == 8)\n  let j = (q_size[UInt]() == 8) && (q_align[UInt]() == 8)\n  if a && b && c && d && e && f && g && h && i && j then 42 else 1 end\nend\n"
+
+def linkprobe_emit_u32_le(inout v: Vec[u8], w: Int) -> Unit
+  v.push((w & 0xFF) as u8)
+  v.push(((w >> 8) & 0xFF) as u8)
+  v.push(((w >> 16) & 0xFF) as u8)
+  v.push(((w >> 24) & 0xFF) as u8)
+end
+
+def linkprobe_write_report(report: String) -> Unit
+  let _ = write_file("build/linkprobe_report.txt", report.clone())
+  println(report.trim())
+end
+
+def linkprobe_finish(code: Int, out_path: String, tag: String) -> Int
+  let exists = file_exists(out_path.to_string())
+  var bytes = 0
+  match file_size(out_path.to_string())
+  when Option::Some(sz) then bytes = sz as Int
+  when Option::None then ()
+  end
+  var report = tag + " compile_exit=" + code.to_string() + " artifact_exists=" + exists.to_string() + " artifact_bytes=" + bytes.to_string() + "\n"
+  linkprobe_write_report(report)
+  if code == 0 && exists && bytes > 0 then
+    println(tag + " PASS")
+    0
+  else
+    println(tag + " FAIL")
+    1
+  end
+end
+
+# The direct link_executable mode: hand-built objects through the REAL
+# linker — three sub-checks, all required:
+#   1. the minimal no-import artifact (build/linkprobe_obj.out; the
+#      harness executes it, expecting exit 42);
+#   2. a legitimate libc import (`_exit`, resolved by dyld through the
+#      generated stub/GOT) still links AND runs (exit 42): the
+#      fail-closed guard must never reject real dylib imports;
+#   3. an unresolved `__intrinsic_str_parse_int` import is REJECTED by
+#      the linker with the symbol named (the fail-closed guard — never a
+#      silent artifact that dies at dyld).
+def linkprobe_run_linkobj() -> Int
+  let target = asm_target(Arch::AArch64, OsAbi::MacOS)
+
+  # ── 1. the minimal no-import object ─────────────────────────────
+  let out_path = "build/linkprobe_obj.out"
+  var obj = object_new(target)
+  # mov x0, #42 ; ret
+  linkprobe_emit_u32_le(&mut obj.text, 0xD2800540)
+  linkprobe_emit_u32_le(&mut obj.text, 0xD65F03C0)
+  obj.symbols.push(AsmSymbol {
+    name: "main",
+    section: Section::Text,
+    offset: 0,
+    size: 8,
+    binding: SymBinding::Global,
+    kind: SymKind::Func
+  })
+  var objects: Vec[ObjectFile] = Vec::new()
+  objects.push(obj)
+  let input = LinkerInput {
+    objects: objects,
+    entry: "main",
+    entry_offset: -1,
+    output: out_path,
+    target: target
+  }
+  var minimal_ok = false
+  match link_executable(&input)
+  when Result::Ok(_) then minimal_ok = true
+  when Result::Err(e) then
+    linkprobe_write_report("LINKPROBE linkobj minimal link failed: " + e + "\n")
+    return 1
+  end
+
+  # ── 2. a legitimate libc import still links ─────────────────────
+  # main: mov x0, #42 ; bl _exit  (dyld resolves _exit from libSystem
+  # through the stub/GOT the linker emits).
+  let libc_path = "build/linkprobe_libc.out"
+  var lobj = object_new(target)
+  linkprobe_emit_u32_le(&mut lobj.text, 0xD2800540)
+  linkprobe_emit_u32_le(&mut lobj.text, 0x94000000)   # bl <_exit>
+  lobj.relocations.push(Relocation {
+    offset: 4,
+    kind: RelocKind::R_AARCH64_CALL26,
+    symbol: "_exit",
+    addend: 0
+  })
+  lobj.symbols.push(AsmSymbol {
+    name: "main",
+    section: Section::Text,
+    offset: 0,
+    size: 8,
+    binding: SymBinding::Global,
+    kind: SymKind::Func
+  })
+  lobj.symbols.push(AsmSymbol {
+    name: "_exit",
+    section: Section::Extern,
+    offset: 0,
+    size: 0,
+    binding: SymBinding::Global,
+    kind: SymKind::Func
+  })
+  var lobjects: Vec[ObjectFile] = Vec::new()
+  lobjects.push(lobj)
+  let linput = LinkerInput {
+    objects: lobjects,
+    entry: "main",
+    entry_offset: -1,
+    output: libc_path,
+    target: target
+  }
+  match link_executable(&linput)
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    linkprobe_write_report("LINKPROBE linkobj libc-import link failed: " + e + "\n")
+    return 1
+  end
+
+  # ── 3. an unresolved __intrinsic_* import FAILS the link ────────
+  # main: bl __intrinsic_str_parse_int ; mov x0,#0 ; ret — the declared
+  # extern with no runtime definition must be rejected with the symbol
+  # named, never handed to dyld.
+  let reject_path = "build/linkprobe_reject.out"
+  var robj = object_new(target)
+  linkprobe_emit_u32_le(&mut robj.text, 0x94000000)   # bl <__intrinsic_str_parse_int>
+  linkprobe_emit_u32_le(&mut robj.text, 0xD2800000)   # mov x0, #0
+  linkprobe_emit_u32_le(&mut robj.text, 0xD65F03C0)   # ret
+  robj.relocations.push(Relocation {
+    offset: 0,
+    kind: RelocKind::R_AARCH64_CALL26,
+    symbol: "__intrinsic_str_parse_int",
+    addend: 0
+  })
+  robj.symbols.push(AsmSymbol {
+    name: "main",
+    section: Section::Text,
+    offset: 0,
+    size: 12,
+    binding: SymBinding::Global,
+    kind: SymKind::Func
+  })
+  robj.symbols.push(AsmSymbol {
+    name: "__intrinsic_str_parse_int",
+    section: Section::Extern,
+    offset: 0,
+    size: 0,
+    binding: SymBinding::Global,
+    kind: SymKind::Func
+  })
+  var robjects: Vec[ObjectFile] = Vec::new()
+  robjects.push(robj)
+  let rinput = LinkerInput {
+    objects: robjects,
+    entry: "main",
+    entry_offset: -1,
+    output: reject_path,
+    target: target
+  }
+  match link_executable(&rinput)
+  when Result::Ok(_) then
+    linkprobe_write_report("LINKPROBE linkobj failclosed FAIL: the linker accepted an unresolved __intrinsic_str_parse_int import\n")
+    return 1
+  when Result::Err(e) then
+    if !e.contains("__intrinsic_str_parse_int") then
+      linkprobe_write_report("LINKPROBE linkobj failclosed FAIL: rejected but the error does not name the symbol: " + e + "\n")
+      return 1
+    end
+  end
+
+  if minimal_ok then
+    linkprobe_finish(0, out_path, "LINKPROBE linkobj libc_import=ok failclosed=__intrinsic_str_parse_int")
+  else
+    1
+  end
+end
+
+# The end-to-end mode: the real kernel compile entry over a tiny source.
+def linkprobe_run_full() -> Int
+  let src_path = "build/linkprobe_src.tg"
+  let out_path = "build/linkprobe.out"
+  match write_file(src_path, LINKPROBE_SRC.clone())
+  when Result::Ok(_) then ()
+  when Result::Err(e) then
+    linkprobe_write_report("LINKPROBE full write_source_failed: " + e.message() + "\n")
+    return 2
+  end
+  var opts = default_options()
+  opts.strict_resolution = true
+  let code = compile_startup_entry(&opts, src_path, out_path)
+  linkprobe_finish(code, out_path, "LINKPROBE full")
+end
+
+def main() -> Int
+  let argc = raw_arg_count()
+  # argv[0] is the program name ("tg-bootstrap"), argv[1] the probe name,
+  # argv[2] the mode (the harness passes `linkprobe <mode>`).
+  let mode = if argc > 2 then raw_arg_copy(2) else "linkobj" end
+  if mode == "full" then
+    linkprobe_run_full()
+  else
+    linkprobe_run_linkobj()
+  end
+end

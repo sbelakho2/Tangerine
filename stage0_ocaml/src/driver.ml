@@ -1341,6 +1341,12 @@ type boot_opts = {
      serialized directly from the checker's structured channel) to this
      path instead of the evidence relying on stdout scraping. *)
   diagnostics_jsonl : string option;
+  (* the prepared-VM program cache (kernel-native fast lane): when set,
+     the successful closure pipeline writes the folded mono'd program
+     here (keyed by the manifest fingerprint).  bootstrap-check/compile
+     are the WRITE side; Driver.run_bootstrap_vm (the selfcheck fast-lane
+     entry) is the READ side that re-executes ONLY the VM stage. *)
+  vm_cache : string option;
 }
 
 let default_boot_opts =
@@ -1351,6 +1357,7 @@ let default_boot_opts =
     entry = None;
     strict = false;
     diagnostics_jsonl = None;
+    vm_cache = None;
   }
 
 let boot_specs =
@@ -1361,7 +1368,25 @@ let boot_specs =
     { name = "--entry"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with entry = Some v } | None -> o) };
     { name = "--strict"; takes_value = false; apply = (fun _ o -> { o with strict = true }) };
     { name = "--diagnostics-jsonl"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with diagnostics_jsonl = Some v } | None -> o) };
+    { name = "--vm-cache"; takes_value = true; apply = (fun v o -> match v with Some v -> { o with vm_cache = Some v } | None -> o) };
   ]
+
+(* ── phase wall-clock instrumentation (TANGERINE_PHASE_TIMES=1) ───
+   The bootstrap closure's wall time must be attributable — the seed
+   front end, lowering, mono and the VM run are the separate candidates
+   for the fast-loop cache decision.  The lines go to stderr so the
+   machine-readable stdout evidence is untouched; the env gate keeps the
+   default output byte-identical. *)
+let phase_timing_enabled = lazy (Sys.getenv_opt "TANGERINE_PHASE_TIMES" <> None)
+
+let phase_time ~(label : string) (f : unit -> 'a) : 'a =
+  if not (Lazy.force phase_timing_enabled) then f ()
+  else begin
+    let t0 = Unix.gettimeofday () in
+    let r = f () in
+    Printf.eprintf "[phase] %s: %.1fs\n%!" label (Unix.gettimeofday () -. t0);
+    r
+  end
 
 (* ── @cfg elimination (audit @cfg P0) ──────────────────────────── *)
 
@@ -1870,6 +1895,8 @@ type closure_ctx = {
 let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
     ~(target : Target.t) ~(strict : bool) ?(profile_jsonl : string option)
     () : (closure_ctx, string) result =
+  phase_time ~label:"closure front end (parse..resolve..typecheck)"
+    (fun () ->
   match Bootstrap_manifest.load ~repo_root ~manifest_path with
   | Error m -> Error m
   | Ok manifest ->
@@ -2144,7 +2171,7 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
             ctx_audit = fresh_closure_audit ();
             lowered_methods = 0;
             ctx_cfg_program = None }
-      end)
+      end))
 
 (* Public entry: the bootstrap-closure default — recovery-mode semantic
    pipeline plus the unconditional strict-mode audit (selfcheck call
@@ -5301,6 +5328,134 @@ let artifact_exists ~(repo_root : string) (path : string) : bool =
   if Filename.is_relative path then Sys.file_exists (Filename.concat repo_root path)
   else Sys.file_exists path
 
+(* ── the prepared-VM program cache (kernel-native fast lane) ─────────
+   The seed front end (parse -> resolve -> typecheck fixpoint -> lower ->
+   mono -> TypeQuery fold) is a pure function of the manifest closure's
+   SOURCE BYTES; only the guest argv varies between runs.  The kernel-
+   native codesign/linker development loop therefore caches the folded
+   Seed MIR program (plus entry instance and lang items) keyed by the
+   manifest's SHA-256 fingerprint (which covers every source file's bytes
+   and the manifest content):
+
+     - a warm run re-executes ONLY the VM stage;
+     - the cache is written only after the full pipeline (template verify,
+       mono residual check, reachable-host closure) reached the VM stage,
+       so a cache hit never skips a gate that had not already passed;
+     - a cache hit RE-RUNS the reachable-host closure check over the
+       cached program before executing it — a tampered or stale cache
+       cannot turn a missing binding into a trap at run time;
+     - any source byte change changes the fingerprint and forces the full
+       pipeline; a mismatched or unreadable cache is ignored, never an
+       error. *)
+type vm_program_cache = {
+  vpc_fingerprint : string;
+  vpc_target : string;
+  vpc_entry : string;
+  vpc_program : Seed_mir.program;
+  vpc_entry_instance : Instance_id.t;
+  vpc_lang_items : Lang_items.t;
+}
+
+let vm_cache_fingerprint ~(repo_root : string) ~(manifest_path : string) :
+    string option =
+  match Bootstrap_manifest.load ~repo_root ~manifest_path with
+  | Ok m -> Some (Bootstrap_manifest.fingerprint m)
+  | Error _ -> None
+
+let vm_cache_load ~(path : string) ~(fingerprint : string) ~(target : string)
+    ~(entry : string option) :
+    (Seed_mir.program * Instance_id.t * Lang_items.t) option =
+  if not (Sys.file_exists path) then None
+  else
+    match
+      (try
+         let ic = open_in_bin path in
+         let c : vm_program_cache = Marshal.from_channel ic in
+         close_in ic;
+         Some c
+       with _ -> None)
+    with
+    | Some c
+      when c.vpc_fingerprint = fingerprint
+           && c.vpc_target = target
+           && c.vpc_entry = (match entry with Some e -> e | None -> "") ->
+        Some (c.vpc_program, c.vpc_entry_instance, c.vpc_lang_items)
+    | _ -> None
+
+let vm_cache_store ~(path : string) ~(fingerprint : string) ~(target : string)
+    ~(entry : string option) ~(program : Seed_mir.program)
+    ~(entry_instance : Instance_id.t) ~(lang_items : Lang_items.t) : unit =
+  try
+    let tmp = path ^ ".tmp" in
+    let oc = open_out_bin tmp in
+    Marshal.to_channel oc
+      {
+        vpc_fingerprint = fingerprint;
+        vpc_target = target;
+        vpc_entry = (match entry with Some e -> e | None -> "");
+        vpc_program = program;
+        vpc_entry_instance = entry_instance;
+        vpc_lang_items = lang_items;
+      }
+      [];
+    close_out oc;
+    Sys.rename tmp path
+  with _ ->
+    (* a cache write failure must never fail the compile — the next run
+       simply pays the full pipeline again *)
+    ()
+
+(* ── the prepared-VM execution (the warm half of the fast lane) ──────
+   Runs a prepared/folded Seed MIR program with the real host table.
+   The reachable-host closure check is re-run over the prepared program
+   BEFORE execution (fail closed: a cached program can never dispatch to
+   a host id without an executable binding). *)
+type bootstrap_vm_run = {
+  bvr_vm_code : int option;
+  bvr_stdout : string;
+  bvr_stderr : string;
+  bvr_trap : string option;
+  bvr_reachable : int;
+  bvr_cache_hit : bool;
+}
+
+let run_prepared_vm ~(repo_root : string) ~(kernel_args : string list)
+    ~(program : Seed_mir.program) ~(entry : Instance_id.t)
+    ~(lang_items : Lang_items.t) ~(cache_hit : bool) : bootstrap_vm_run =
+  let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
+  let host = Host.create ~repo_root ~argv in
+  let reachable = collect_reachable_host_ids program in
+  match Host.closure_check_reachable host reachable with
+  | Error problems ->
+      {
+        bvr_vm_code = None;
+        bvr_stdout = "";
+        bvr_stderr = "";
+        bvr_trap =
+          Some
+            ("reachable host closure failed on the prepared program: "
+            ^ String.concat "; " problems);
+        bvr_reachable = List.length reachable;
+        bvr_cache_hit = cache_hit;
+      }
+  | Ok _ ->
+      let result =
+        Vm.run_li ~limits:bootstrap_vm_limits ~lang_items ~program ~entry ~argv
+          ~host
+      in
+      let stdout = Host.stdout_contents host in
+      let stderr = Host.stderr_contents host in
+      {
+        bvr_vm_code =
+          (match result with Ok code -> Some code | Error _ -> None);
+        bvr_stdout = stdout;
+        bvr_stderr = stderr;
+        bvr_trap =
+          (match result with Ok _ -> None | Error e -> Some e.Vm.message);
+        bvr_reachable = List.length reachable;
+        bvr_cache_hit = cache_hit;
+      }
+
 (* ── the ONE structured bootstrap closure (re-audit P0: the gate must
    not reconstruct the pipeline — every consumer inspects this result) ─ *)
 type bootstrap_stages = {
@@ -5339,7 +5494,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
             bs_oracle_incomplete = true;
           }
       else begin
-        match (try Ok (lower_closure ctx) with e -> Error (Printexc.to_string e)) with
+        match (try Ok (phase_time ~label:"lower_closure (Seed MIR)" (fun () -> lower_closure ctx)) with e -> Error (Printexc.to_string e)) with
         | Error _ ->
             (* lowering failed before any MIR existed: the gate reports the
                recorded-channel lane and fails at the lowering stage *)
@@ -5389,13 +5544,14 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
               }
         | Some (entry_name, entry_id) -> (
             match
+              phase_time ~label:"mono phase" (fun () ->
               run_mono_phase ~entry_name ~entry:entry_id
                 ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
                           ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
                 ~generic_types:(closure_generic_types ctx.ctx_env)
                 ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
                 ~env:(Some ctx.ctx_env)
-                prog
+                prog)
             with
             | Error _ ->
                 Ok
@@ -5450,7 +5606,8 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                           bs_oracle_incomplete = oracle_incomplete;
                         }
                   | Ok report -> (
-                      match Vm.run_li ~limits:bootstrap_vm_limits ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:(vm_program_with_folded_queries ctx mo) ~entry:mo.mo_entry ~argv ~host with
+                      match phase_time ~label:"VM run (kernel in the seed VM)" (fun () ->
+                        Vm.run_li ~limits:bootstrap_vm_limits ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:(vm_program_with_folded_queries ctx mo) ~entry:mo.mo_entry ~argv ~host) with
                       | Error e ->
                           (* the trap message is the ONLY diagnostic of an
                              in-VM failure (the exit code is unavailable) —
@@ -5496,6 +5653,67 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                             })
         end)
     end
+
+(* ── the kernel-native fast lane entry (selfcheck harnesses) ─────────
+   Warm path: the manifest fingerprint matches the cache, so ONLY the VM
+   stage runs.  Cold path: the full closure pipeline (all static gates)
+   runs; on a successful VM stage the prepared program is written to the
+   cache for the next iteration.  Kernel argv is runtime data and never
+   part of the key. *)
+let run_bootstrap_vm ~(repo_root : string) ~(manifest_path : string)
+    ~(target : Target.t) ~(entry : string option) ~(kernel_args : string list)
+    ?(vm_cache : string option) () : (bootstrap_vm_run, string) result =
+  let fingerprint =
+    match vm_cache with
+    | None -> None
+    | Some _ -> vm_cache_fingerprint ~repo_root ~manifest_path
+  in
+  match vm_cache, fingerprint with
+  | Some path, Some fp -> (
+      match vm_cache_load ~path ~fingerprint:fp ~target:(Target.to_string target) ~entry with
+      | Some (program, entry_instance, lang_items) ->
+          Ok
+            (run_prepared_vm ~repo_root ~kernel_args ~program
+               ~entry:entry_instance ~lang_items ~cache_hit:true)
+      | None -> (
+          match
+            run_bootstrap_closure ~repo_root ~manifest_path ~target ~entry
+              ~kernel_args
+          with
+          | Error m -> Error m
+          | Ok stages ->
+              (match (stages.bs_ctx, stages.bs_mono) with
+              | ctx, Some mo when stages.bs_vm_code <> None ->
+                  let program = vm_program_with_folded_queries ctx mo in
+                  vm_cache_store ~path ~fingerprint:fp
+                    ~target:(Target.to_string target) ~entry ~program
+                    ~entry_instance:mo.mo_entry
+                    ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
+              | _ -> ());
+              Ok
+                {
+                  bvr_vm_code = stages.bs_vm_code;
+                  bvr_stdout = "";
+                  bvr_stderr = "";
+                  bvr_trap = None;
+                  bvr_reachable = 0;
+                  bvr_cache_hit = false;
+                }))
+  | _ -> (
+      match
+        run_bootstrap_closure ~repo_root ~manifest_path ~target ~entry ~kernel_args
+      with
+      | Error m -> Error m
+      | Ok stages ->
+          Ok
+            {
+              bvr_vm_code = stages.bs_vm_code;
+              bvr_stdout = "";
+              bvr_stderr = "";
+              bvr_trap = None;
+              bvr_reachable = 0;
+              bvr_cache_hit = false;
+            })
 
 let cmd_bootstrap_check (args : string list) : int =
   let opts, positional = parse_options boot_specs default_boot_opts args in
@@ -5814,9 +6032,27 @@ let cmd_bootstrap_check (args : string list) : int =
                               Printf.printf "EVIDENCE_HOST reachable_closure=pass reachable=%d declared=%d implemented=%d\n"
                                 (List.length reachable) report.Host.declared report.Host.implemented;
                                Printf.printf "  BOOTSTRAP_EXECUTABLE_CLOSURE = PASS\n";
+                                let vm_program = vm_program_with_folded_queries ctx mo in
+                               (match opts.vm_cache with
+                                | Some path -> (
+                                    match
+                                      vm_cache_fingerprint
+                                        ~repo_root:opts.repo_root
+                                        ~manifest_path:opts.manifest
+                                    with
+                                    | Some fp ->
+                                        vm_cache_store ~path ~fingerprint:fp
+                                          ~target:(Target.to_string target)
+                                          ~entry:opts.entry ~program:vm_program
+                                          ~entry_instance:mo.mo_entry
+                                          ~lang_items:
+                                            (Typecheck.lang_items_of_env
+                                               ctx.ctx_env)
+                                    | None -> ())
+                                | None -> ());
                                 (match
                                    Vm.run_li ~limits:bootstrap_vm_limits ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
-                                    ~program:(vm_program_with_folded_queries ctx mo)
+                                    ~program:vm_program
                                     ~entry:mo.mo_entry ~argv ~host
                                 with
                                | Error e ->
@@ -5863,11 +6099,102 @@ let cmd_bootstrap_check (args : string list) : int =
                                            Printf.printf "  RESULT: FAIL\n";
                                            1
                                          end
-                                         else begin
-                                           Printf.printf "  artifact produced: %s\n" out_path;
-                                           Printf.printf "  RESULT = PASS\n";
-                                           0
-                                         end)))
+                                          else begin
+                                            Printf.printf "  artifact produced: %s\n" out_path;
+                                            (* ── post-link RUN gate ───────────────────
+                                               Artifact existence is NOT runnability.
+                                               Execute the produced executable and
+                                               require the corpus program's exit:
+                                               01_defs_arith's main returns
+                                               factorial(6)+total = 725; the process
+                                               status is 725 & 0xFF = 213. A dyld
+                                               "Symbol not found" abort (SIGABRT) or a
+                                               trap FAILS the gate, so RESULT: PASS
+                                               implies the artifact actually ran. *)
+                                            let artifact_abs =
+                                              if Filename.is_relative out_path then
+                                                Filename.concat opts.repo_root out_path
+                                              else out_path
+                                            in
+                                            let run_stderr, run_status =
+                                              let err_path =
+                                                Filename.temp_file "tg_bootstrap_run" ".err"
+                                              in
+                                              let err_fd =
+                                                Unix.openfile err_path
+                                                  [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ]
+                                                  0o600
+                                              in
+                                              let pid =
+                                                try
+                                                  Unix.create_process artifact_abs
+                                                    [| artifact_abs |] Unix.stdin Unix.stdout
+                                                    err_fd
+                                                with e ->
+                                                  Unix.close err_fd;
+                                                  raise e
+                                              in
+                                              Unix.close err_fd;
+                                              let status = snd (Unix.waitpid [] pid) in
+                                              let text =
+                                                try
+                                                  let ic = open_in_bin err_path in
+                                                  let nn = in_channel_length ic in
+                                                  let t = really_input_string ic nn in
+                                                  close_in ic;
+                                                  t
+                                                with _ -> ""
+                                              in
+                                              (try Sys.remove err_path with _ -> ());
+                                              (text, status)
+                                            in
+                                            let loader_diag =
+                                              List.exists
+                                                (fun needle ->
+                                                  let ln = String.length needle in
+                                                  let total = String.length run_stderr in
+                                                  let rec go i =
+                                                    i + ln <= total
+                                                    && (String.sub run_stderr i ln = needle
+                                                       || go (i + 1))
+                                                  in
+                                                  go 0)
+                                                [ "Symbol not found"; "dyld"; "Library not loaded" ]
+                                            in
+                                            if run_stderr <> "" then
+                                              Printf.printf "  artifact stderr:\n%s\n" run_stderr;
+                                            (match run_status with
+                                            | Unix.WEXITED 213 ->
+                                                if loader_diag then begin
+                                                  Printf.printf
+                                                    "  artifact run: FAILED (loader diagnostics on stderr — the artifact is not cleanly runnable)\n";
+                                                  Printf.printf "  RESULT: FAIL\n";
+                                                  1
+                                                end
+                                                else begin
+                                                  Printf.printf
+                                                    "  artifact run: exit 213 (01_defs_arith main = 725, status & 0xFF) — executed natively\n";
+                                                  Printf.printf "  RESULT = PASS\n";
+                                                  0
+                                                end
+                                            | Unix.WEXITED c ->
+                                                Printf.printf
+                                                  "  artifact run: FAILED (exit %d; expected 213 = 725 & 0xFF)\n"
+                                                  c;
+                                                Printf.printf "  RESULT: FAIL\n";
+                                                1
+                                            | Unix.WSIGNALED s ->
+                                                Printf.printf
+                                                  "  artifact run: FAILED (killed by signal %d — the artifact is not runnable)\n"
+                                                  s;
+                                                Printf.printf "  RESULT: FAIL\n";
+                                                1
+                                            | Unix.WSTOPPED s ->
+                                                Printf.printf
+                                                  "  artifact run: FAILED (stopped by signal %d)\n" s;
+                                                Printf.printf "  RESULT: FAIL\n";
+                                                1)
+                                          end)))
                        end)))
       end)
 
@@ -5909,7 +6236,7 @@ let cmd_compile (args : string list) : int =
          1
        end
        else begin
-         let prog = lower_closure ctx in
+         let prog = phase_time ~label:"lower_closure (Seed MIR)" (fun () -> lower_closure ctx) in
          (match
             Mir_verify.require_valid_template
                           ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
@@ -5927,16 +6254,17 @@ let cmd_compile (args : string list) : int =
                   Printf.printf "compile: FAILED — no entry function in the closure\n";
                   Printf.printf "  RESULT: FAIL\n";
                   1
-              | Some (entry_name, entry) -> (
-                  match
-                    run_mono_phase ~entry_name ~entry
-                      ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
-                          ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
-                      ~generic_types:(closure_generic_types ctx.ctx_env)
-                      ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
-                      ~env:(Some ctx.ctx_env)
-                      prog
-                  with
+               | Some (entry_name, entry) -> (
+                   match
+                     phase_time ~label:"mono phase" (fun () ->
+                     run_mono_phase ~entry_name ~entry
+                       ~box_tid:(ctx.ctx_env.Typecheck.state.box_tid)
+                           ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
+                       ~generic_types:(closure_generic_types ctx.ctx_env)
+                       ~query_sigs:(closure_query_sigs ~lowered:(Some prog) ctx.ctx_env)
+                       ~env:(Some ctx.ctx_env)
+                       prog)
+                   with
                   | Error _ ->
                       Printf.printf "compile: FAILED — mono phase\n";
                       Printf.printf "  RESULT: FAIL\n";
@@ -5964,8 +6292,26 @@ let cmd_compile (args : string list) : int =
                         in
                         let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
                         Printf.printf "  compile: kernel argv: %s\n" (String.concat " " (Array.to_list argv));
-                        let host = Host.create ~repo_root:opts.repo_root ~argv in
-                        (match Vm.run_li ~limits:bootstrap_vm_limits ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:(vm_program_with_folded_queries ctx mo) ~entry:mo.mo_entry ~argv ~host with
+                         let vm_program = vm_program_with_folded_queries ctx mo in
+                         (match opts.vm_cache with
+                          | Some path -> (
+                              match
+                                vm_cache_fingerprint
+                                  ~repo_root:opts.repo_root
+                                  ~manifest_path:opts.manifest
+                              with
+                              | Some fp ->
+                                  vm_cache_store ~path ~fingerprint:fp
+                                    ~target:(Target.to_string target)
+                                    ~entry:opts.entry ~program:vm_program
+                                    ~entry_instance:mo.mo_entry
+                                    ~lang_items:
+                                      (Typecheck.lang_items_of_env ctx.ctx_env)
+                              | None -> ())
+                          | None -> ());
+                         let host = Host.create ~repo_root:opts.repo_root ~argv in
+                         (match phase_time ~label:"VM run (kernel in the seed VM)" (fun () ->
+                           Vm.run_li ~limits:bootstrap_vm_limits ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:vm_program ~entry:mo.mo_entry ~argv ~host) with
                          | Error e ->
                              Printf.printf "compile: VM bootstrap run TRAPPED: %s\n" e.Vm.message;
                              let out = Host.stdout_contents host in

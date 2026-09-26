@@ -1013,6 +1013,14 @@ def emit_intrinsic_runtime(inout ctx: RuntimeEmitCtx) -> Unit
   emit_tg_get_argc(ctx)
   emit_tg_get_argv(ctx)
   emit_tg_get_envp(ctx)
+  # the std/core.tg parse/float-conversion intrinsic symbols the semantic
+  # router does not classify (fixed runtime ABI; see the emitters below)
+  emit_tg_str_parse_int(ctx)
+  emit_tg_string_parse_int(ctx)
+  emit_tg_string_parse_float(ctx)
+  emit_tg_float_to_bits(ctx)
+  emit_tg_int_to_float(ctx)
+  emit_tg_float_to_int(ctx)
 end
 
 # __intrinsic_abort: Abort execution with trap
@@ -12821,6 +12829,727 @@ def emit_tg_str_to_float(inout ctx: RuntimeEmitCtx) -> Unit
     x64_pop(&mut ctx.text, X64::R12)
     x64_pop(&mut ctx.text, X64::RBX)
     x64_pop(&mut ctx.text, X64::RBP)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
+# The std/core.tg conversion intrinsics the semantic router does NOT
+# classify (types.tg's intrinsic_id_of_call has no row for them):
+# `extern def __intrinsic_*` declarations whose calls resolve BY NAME to
+# the runtime symbol — the checker's declared-callable gate passes them
+# and both routes emit the ordinary extern call, exactly like the
+# __intrinsic_abort / map-visit family. The runtime MUST therefore define
+# these symbols; without them the linker hands dyld an unresolved import
+# (the bootstrap_check.out "Symbol not found: __intrinsic_str_parse_int"
+# loader abort).
+#
+# The seed stage0_ocaml/src/host.ml semantics are mirrored:
+#   parse_int: optional '+'/'-', one or more decimal digits, the WHOLE
+#     string consumed; Ok(value) / Err("invalid integer") (the seed's
+#     exact message).
+#   parse_float: decimal f64 — sign, digits with an optional '.', an
+#     optional e/E exponent — the whole string consumed; Some(bits) /
+#     None. (Residual vs OCaml float_of_string_opt: hex-float, inf/nan
+#     and underscore spellings parse as None — fail-closed, never a
+#     silently wrong value.)
+#   float_to_bits: identity (the f64 bits ARE the value word).
+#   int_to_float: scvtf; float_to_int: truncate toward zero.
+# Result/Option words: the canonical TaggedPtr encoding of the lang-item
+# enums — Some/Ok discriminant 0 (heap image {tag @ 0, payload @ 8}),
+# None/Err discriminant 1 (the fixed discriminants types.tg registers
+# for Option/Result; the same 0/1 the seed's host results carry).
+def emit_tg_str_parse_int(inout ctx: RuntimeEmitCtx) -> Unit
+  emit_tg_parse_int_fn(ctx, "__intrinsic_str_parse_int".to_string(), false)
+end
+
+def emit_tg_string_parse_int(inout ctx: RuntimeEmitCtx) -> Unit
+  emit_tg_parse_int_fn(ctx, "__intrinsic_string_parse_int".to_string(), true)
+end
+
+def emit_tg_parse_int_fn(inout ctx: RuntimeEmitCtx, name: String, object_arg: Bool) -> Unit
+  def_runtime_fn(ctx, name)
+
+  let lbl_plus = fresh_label(ctx, ".Lpi_plus")
+  let lbl_digits = fresh_label(ctx, ".Lpi_digits")
+  let lbl_loop = fresh_label(ctx, ".Lpi_loop")
+  let lbl_end = fresh_label(ctx, ".Lpi_end")
+  let lbl_ok = fresh_label(ctx, ".Lpi_ok")
+  let lbl_invalid = fresh_label(ctx, ".Lpi_invalid")
+  let lbl_ret = fresh_label(ctx, ".Lpi_ret")
+
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+
+    if object_arg then
+      # owned String object -> its data pointer
+      a64_ldur(&mut ctx.text, A64::X0, A64::X0, 0)
+    end
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)   # scan
+    a64_mov_ri(&mut ctx.text, A64::X20, 0)         # value
+    a64_mov_ri(&mut ctx.text, A64::X21, 0)         # negative flag
+
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 45)         # '-'
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_plus.clone())
+    a64_mov_ri(&mut ctx.text, A64::X21, 1)
+    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
+    a64_b(&mut ctx.text, lbl_digits.clone())
+
+    def_label(&mut ctx.text, lbl_plus.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X9, 43)         # '+'
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_digits.clone())
+    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
+
+    def_label(&mut ctx.text, lbl_digits.clone())
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 48)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), lbl_invalid.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X9, 57)
+    a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_invalid.clone())
+
+    def_label(&mut ctx.text, lbl_loop.clone())
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 48)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), lbl_end.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X9, 57)
+    a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_end.clone())
+    a64_mov_ri(&mut ctx.text, A64::X10, 10)
+    a64_mul_rrr(&mut ctx.text, A64::X20, A64::X20, A64::X10)
+    a64_sub_rri(&mut ctx.text, A64::X9, A64::X9, 48)
+    a64_add_rrr(&mut ctx.text, A64::X20, A64::X20, A64::X9)
+    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
+    a64_b(&mut ctx.text, lbl_loop.clone())
+
+    def_label(&mut ctx.text, lbl_end.clone())
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_invalid.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X21, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_ok.clone())
+    a64_neg(&mut ctx.text, A64::X20, A64::X20)
+
+    def_label(&mut ctx.text, lbl_ok.clone())
+    a64_mov_ri(&mut ctx.text, A64::X0, 16)
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")
+    a64_mov_ri(&mut ctx.text, A64::X9, 0)          # Ok = 0
+    a64_str(&mut ctx.text, A64::X9, A64::X0, 0)
+    a64_str(&mut ctx.text, A64::X20, A64::X0, 8)
+    a64_b(&mut ctx.text, lbl_ret.clone())
+
+    def_label(&mut ctx.text, lbl_invalid.clone())
+    # Err("invalid integer") — the seed's exact message as an owned
+    # String object built through the real String runtime.
+    a64_bl(&mut ctx.text, "_tg_string_new")
+    a64_mov_rr(&mut ctx.text, A64::X22, A64::X0)
+    a64_mov_rr(&mut ctx.text, A64::X0, A64::X22)
+    a64_mov_ri(&mut ctx.text, A64::X1, 16)
+    a64_bl(&mut ctx.text, "_tg_string_reserve")
+    a64_ldur(&mut ctx.text, A64::X9, A64::X22, 0)  # data buffer
+    a64_mov_ri(&mut ctx.text, A64::X10, 0x2064696C61766E69)   # "invalid "
+    a64_str(&mut ctx.text, A64::X10, A64::X9, 0)
+    a64_mov_ri(&mut ctx.text, A64::X10, 0x0072656765746E69)   # "integer\0"
+    a64_str(&mut ctx.text, A64::X10, A64::X9, 8)
+    a64_mov_ri(&mut ctx.text, A64::X10, 15)
+    a64_str(&mut ctx.text, A64::X10, A64::X22, 8)  # len = 15
+    a64_mov_ri(&mut ctx.text, A64::X0, 16)
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")
+    a64_mov_ri(&mut ctx.text, A64::X9, 1)          # Err = 1
+    a64_str(&mut ctx.text, A64::X9, A64::X0, 0)
+    a64_str(&mut ctx.text, A64::X22, A64::X0, 8)
+
+    def_label(&mut ctx.text, lbl_ret.clone())
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+
+  when Arch::X86_64 then
+    # three pushes keep rsp 16-byte aligned at the runtime calls below
+    x64_push(&mut ctx.text, X64::RBX)
+    x64_push(&mut ctx.text, X64::R12)
+    x64_push(&mut ctx.text, X64::R13)
+
+    if object_arg then
+      x64_mov_rm(&mut ctx.text, X64::RDI, X64::RDI, 0)
+    end
+    x64_mov_rr(&mut ctx.text, X64::R12, X64::RDI)
+    x64_mov_rr(&mut ctx.text, X64::RCX, X64::R12)  # scan (movzx [rcx] form)
+    x64_mov_ri(&mut ctx.text, X64::R13, 0)         # value
+    x64_mov_ri(&mut ctx.text, X64::RBX, 0)         # negative flag
+
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)                     # movzx eax, byte [rcx]
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 45)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_plus.clone())
+    x64_mov_ri(&mut ctx.text, X64::RBX, 1)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_digits.clone())
+
+    def_label(&mut ctx.text, lbl_plus.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 43)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_digits.clone())
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+
+    def_label(&mut ctx.text, lbl_digits.clone())
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 48)
+    x64_jcc(&mut ctx.text, CC::L, lbl_invalid.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 57)
+    x64_jcc(&mut ctx.text, CC::G, lbl_invalid.clone())
+
+    def_label(&mut ctx.text, lbl_loop.clone())
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 48)
+    x64_jcc(&mut ctx.text, CC::L, lbl_end.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 57)
+    x64_jcc(&mut ctx.text, CC::G, lbl_end.clone())
+    x64_mov_ri(&mut ctx.text, X64::RDX, 10)
+    x64_imul_rr(&mut ctx.text, X64::R13, X64::RDX)
+    x64_sub_ri(&mut ctx.text, X64::RAX, 48)
+    x64_add_rr(&mut ctx.text, X64::R13, X64::RAX)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_loop.clone())
+
+    def_label(&mut ctx.text, lbl_end.clone())
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)
+    x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_invalid.clone())
+    x64_test_rr(&mut ctx.text, X64::RBX, X64::RBX)
+    x64_jcc(&mut ctx.text, CC::E, lbl_ok.clone())
+    x64_neg_r(&mut ctx.text, X64::R13)
+
+    def_label(&mut ctx.text, lbl_ok.clone())
+    x64_mov_ri(&mut ctx.text, X64::RDI, 16)
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RCX)
+    x64_mov_mr(&mut ctx.text, X64::RAX, 8, X64::R13)
+    x64_jmp(&mut ctx.text, lbl_ret.clone())
+
+    def_label(&mut ctx.text, lbl_invalid.clone())
+    x64_call_label(&mut ctx.text, "_tg_string_new")
+    x64_mov_rr(&mut ctx.text, X64::RBX, X64::RAX)
+    x64_mov_rr(&mut ctx.text, X64::RDI, X64::RBX)
+    x64_mov_ri(&mut ctx.text, X64::RSI, 16)
+    x64_call_label(&mut ctx.text, "_tg_string_reserve")
+    x64_mov_rm(&mut ctx.text, X64::RCX, X64::RBX, 0)   # data buffer
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0x2064696C61766E69)
+    x64_mov_mr(&mut ctx.text, X64::RCX, 0, X64::RAX)
+    x64_mov_ri(&mut ctx.text, X64::RAX, 0x0072656765746E69)
+    x64_mov_mr(&mut ctx.text, X64::RCX, 8, X64::RAX)
+    x64_mov_ri(&mut ctx.text, X64::RAX, 15)
+    x64_mov_mr(&mut ctx.text, X64::RBX, 8, X64::RAX)
+    x64_mov_ri(&mut ctx.text, X64::RDI, 16)
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")
+    x64_mov_ri(&mut ctx.text, X64::RCX, 1)
+    x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RCX)
+    x64_mov_mr(&mut ctx.text, X64::RAX, 8, X64::RBX)
+
+    def_label(&mut ctx.text, lbl_ret.clone())
+    x64_pop(&mut ctx.text, X64::R13)
+    x64_pop(&mut ctx.text, X64::R12)
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# __intrinsic_string_parse_float: owned String -> Option[Float].
+# Args: x0/rdi = String object. Returns: x0/rax = Option[Float] word
+# (Some = heap image {0, f64 bits}, None = 1).
+def emit_tg_string_parse_float(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "__intrinsic_string_parse_float")
+
+  let lbl_plus = fresh_label(ctx, ".Lpf_plus")
+  let lbl_int = fresh_label(ctx, ".Lpf_int")
+  let lbl_intdone = fresh_label(ctx, ".Lpf_intdone")
+  let lbl_frac = fresh_label(ctx, ".Lpf_frac")
+  let lbl_fracdone = fresh_label(ctx, ".Lpf_fracdone")
+  let lbl_expcheck = fresh_label(ctx, ".Lpf_expcheck")
+  let lbl_expsign = fresh_label(ctx, ".Lpf_expsign")
+  let lbl_expplus = fresh_label(ctx, ".Lpf_expplus")
+  let lbl_expdigits = fresh_label(ctx, ".Lpf_expdigits")
+  let lbl_exploop = fresh_label(ctx, ".Lpf_exploop")
+  let lbl_endcheck = fresh_label(ctx, ".Lpf_endcheck")
+  let lbl_scale = fresh_label(ctx, ".Lpf_scale")
+  let lbl_clampneg = fresh_label(ctx, ".Lpf_clampneg")
+  let lbl_value = fresh_label(ctx, ".Lpf_value")
+  let lbl_nofrac = fresh_label(ctx, ".Lpf_nofrac")
+  let lbl_mul = fresh_label(ctx, ".Lpf_mul")
+  let lbl_div = fresh_label(ctx, ".Lpf_div")
+  let lbl_sign = fresh_label(ctx, ".Lpf_sign")
+  let lbl_make = fresh_label(ctx, ".Lpf_make")
+  let lbl_invalid = fresh_label(ctx, ".Lpf_invalid")
+  let lbl_ret = fresh_label(ctx, ".Lpf_ret")
+
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_stp_pre(&mut ctx.text, A64::FP, A64::LR, A64::SP, -16)
+    a64_mov_rr(&mut ctx.text, A64::FP, A64::SP)
+    a64_stp_pre(&mut ctx.text, A64::X19, A64::X20, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X21, A64::X22, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X23, A64::X24, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X25, A64::X26, A64::SP, -16)
+    a64_stp_pre(&mut ctx.text, A64::X27, A64::XZR, A64::SP, -16)
+
+    a64_ldur(&mut ctx.text, A64::X0, A64::X0, 0)   # String object -> data
+    a64_mov_rr(&mut ctx.text, A64::X19, A64::X0)   # scan
+    a64_mov_ri(&mut ctx.text, A64::X20, 0)         # int acc
+    a64_mov_ri(&mut ctx.text, A64::X21, 0)         # frac acc
+    a64_mov_ri(&mut ctx.text, A64::X22, 1)         # frac divisor
+    a64_mov_ri(&mut ctx.text, A64::X23, 0)         # exponent
+    a64_mov_ri(&mut ctx.text, A64::X24, 0)         # exponent sign
+    a64_mov_ri(&mut ctx.text, A64::X25, 0)         # negative
+    a64_mov_ri(&mut ctx.text, A64::X26, 0)         # int digit count
+    a64_mov_ri(&mut ctx.text, A64::X27, 0)         # frac digit count
+
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 45)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_plus.clone())
+    a64_mov_ri(&mut ctx.text, A64::X25, 1)
+    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
+    a64_b(&mut ctx.text, lbl_int.clone())
+
+    def_label(&mut ctx.text, lbl_plus.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X9, 43)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_int.clone())
+    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
+
+    def_label(&mut ctx.text, lbl_int.clone())
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 48)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), lbl_intdone.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X9, 57)
+    a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_intdone.clone())
+    a64_mov_ri(&mut ctx.text, A64::X10, 10)
+    a64_mul_rrr(&mut ctx.text, A64::X20, A64::X20, A64::X10)
+    a64_sub_rri(&mut ctx.text, A64::X9, A64::X9, 48)
+    a64_add_rrr(&mut ctx.text, A64::X20, A64::X20, A64::X9)
+    a64_add_rri(&mut ctx.text, A64::X26, A64::X26, 1)
+    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
+    a64_b(&mut ctx.text, lbl_int.clone())
+
+    def_label(&mut ctx.text, lbl_intdone.clone())
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 46)         # '.'
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_expcheck.clone())
+    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
+
+    def_label(&mut ctx.text, lbl_frac.clone())
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 48)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), lbl_fracdone.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X9, 57)
+    a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_fracdone.clone())
+    a64_mov_ri(&mut ctx.text, A64::X10, 10)
+    a64_mul_rrr(&mut ctx.text, A64::X21, A64::X21, A64::X10)
+    a64_sub_rri(&mut ctx.text, A64::X9, A64::X9, 48)
+    a64_add_rrr(&mut ctx.text, A64::X21, A64::X21, A64::X9)
+    a64_mul_rrr(&mut ctx.text, A64::X22, A64::X22, A64::X10)
+    a64_add_rri(&mut ctx.text, A64::X27, A64::X27, 1)
+    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
+    a64_b(&mut ctx.text, lbl_frac.clone())
+
+    def_label(&mut ctx.text, lbl_fracdone.clone())
+    def_label(&mut ctx.text, lbl_expcheck.clone())
+    a64_add_rrr(&mut ctx.text, A64::X9, A64::X26, A64::X27)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_invalid.clone())
+
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 101)        # 'e'
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_expsign.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X9, 69)         # 'E'
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_endcheck.clone())
+
+    def_label(&mut ctx.text, lbl_expsign.clone())
+    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 45)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_expplus.clone())
+    a64_mov_ri(&mut ctx.text, A64::X24, 1)
+    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
+    a64_b(&mut ctx.text, lbl_expdigits.clone())
+
+    def_label(&mut ctx.text, lbl_expplus.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X9, 43)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_expdigits.clone())
+    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
+
+    def_label(&mut ctx.text, lbl_expdigits.clone())
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 48)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), lbl_invalid.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X9, 57)
+    a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_invalid.clone())
+
+    def_label(&mut ctx.text, lbl_exploop.clone())
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 48)
+    a64_bcond(&mut ctx.text, a64_cc_lt(), lbl_endcheck.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X9, 57)
+    a64_bcond(&mut ctx.text, a64_cc_gt(), lbl_endcheck.clone())
+    a64_mov_ri(&mut ctx.text, A64::X10, 10)
+    a64_mul_rrr(&mut ctx.text, A64::X23, A64::X23, A64::X10)
+    a64_sub_rri(&mut ctx.text, A64::X9, A64::X9, 48)
+    a64_add_rrr(&mut ctx.text, A64::X23, A64::X23, A64::X9)
+    a64_add_rri(&mut ctx.text, A64::X19, A64::X19, 1)
+    a64_b(&mut ctx.text, lbl_exploop.clone())
+
+    def_label(&mut ctx.text, lbl_endcheck.clone())
+    a64_ldrb(&mut ctx.text, A64::X9, A64::X19, 0)
+    a64_cmp_ri(&mut ctx.text, A64::X9, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ne(), lbl_invalid.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X24, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_scale.clone())
+    a64_neg(&mut ctx.text, A64::X23, A64::X23)
+
+    def_label(&mut ctx.text, lbl_scale.clone())
+    a64_mov_ri(&mut ctx.text, A64::X9, 400)
+    a64_cmp_rr(&mut ctx.text, A64::X23, A64::X9)
+    a64_bcond(&mut ctx.text, a64_cc_le(), lbl_clampneg.clone())
+    a64_mov_ri(&mut ctx.text, A64::X23, 400)
+
+    def_label(&mut ctx.text, lbl_clampneg.clone())
+    a64_mov_ri(&mut ctx.text, A64::X9, -400)
+    a64_cmp_rr(&mut ctx.text, A64::X23, A64::X9)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_value.clone())
+    a64_mov_ri(&mut ctx.text, A64::X23, -400)
+
+    def_label(&mut ctx.text, lbl_value.clone())
+    a64_scvtf_dx(&mut ctx.text, A64V::V0, A64::X20)
+    a64_cmp_ri(&mut ctx.text, A64::X27, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_nofrac.clone())
+    a64_scvtf_dx(&mut ctx.text, A64V::V1, A64::X21)
+    a64_scvtf_dx(&mut ctx.text, A64V::V2, A64::X22)
+    a64_fdiv_ddd(&mut ctx.text, A64V::V1, A64V::V1, A64V::V2)
+    a64_fadd_ddd(&mut ctx.text, A64V::V0, A64V::V0, A64V::V1)
+
+    def_label(&mut ctx.text, lbl_nofrac.clone())
+    a64_mov_ri(&mut ctx.text, A64::X9, 0x4024000000000000)  # 10.0
+    a64_fmov_dx(&mut ctx.text, A64V::V3, A64::X9)
+
+    def_label(&mut ctx.text, lbl_mul.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X23, 0)
+    a64_bcond(&mut ctx.text, a64_cc_le(), lbl_div.clone())
+    a64_fmul_ddd(&mut ctx.text, A64V::V0, A64V::V0, A64V::V3)
+    a64_sub_rri(&mut ctx.text, A64::X23, A64::X23, 1)
+    a64_b(&mut ctx.text, lbl_mul.clone())
+
+    def_label(&mut ctx.text, lbl_div.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X23, 0)
+    a64_bcond(&mut ctx.text, a64_cc_ge(), lbl_sign.clone())
+    a64_fdiv_ddd(&mut ctx.text, A64V::V0, A64V::V0, A64V::V3)
+    a64_add_rri(&mut ctx.text, A64::X23, A64::X23, 1)
+    a64_b(&mut ctx.text, lbl_div.clone())
+
+    def_label(&mut ctx.text, lbl_sign.clone())
+    a64_cmp_ri(&mut ctx.text, A64::X25, 0)
+    a64_bcond(&mut ctx.text, a64_cc_eq(), lbl_make.clone())
+    a64_fneg_dd(&mut ctx.text, A64V::V0, A64V::V0)
+
+    def_label(&mut ctx.text, lbl_make.clone())
+    a64_fmov_xd(&mut ctx.text, A64::X19, A64V::V0)  # bits (scan dead)
+    a64_mov_ri(&mut ctx.text, A64::X0, 16)
+    a64_bl(&mut ctx.text, "_tg_bump_alloc")
+    a64_mov_ri(&mut ctx.text, A64::X9, 0)           # Some = 0
+    a64_str(&mut ctx.text, A64::X9, A64::X0, 0)
+    a64_str(&mut ctx.text, A64::X19, A64::X0, 8)
+    a64_b(&mut ctx.text, lbl_ret.clone())
+
+    def_label(&mut ctx.text, lbl_invalid.clone())
+    a64_mov_ri(&mut ctx.text, A64::X0, 1)           # None = 1
+
+    def_label(&mut ctx.text, lbl_ret.clone())
+    a64_ldp_post(&mut ctx.text, A64::X27, A64::XZR, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X25, A64::X26, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X23, A64::X24, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X21, A64::X22, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::X19, A64::X20, A64::SP, 16)
+    a64_ldp_post(&mut ctx.text, A64::FP, A64::LR, A64::SP, 16)
+    a64_ret(&mut ctx.text)
+
+  when Arch::X86_64 then
+    # one push keeps rsp 16-byte aligned at the runtime call below
+    x64_push(&mut ctx.text, X64::RBX)
+
+    x64_mov_rm(&mut ctx.text, X64::RDI, X64::RDI, 0)   # String object -> data
+    x64_mov_rr(&mut ctx.text, X64::RCX, X64::RDI)      # scan
+    x64_mov_ri(&mut ctx.text, X64::R8, 0)              # int acc
+    x64_mov_ri(&mut ctx.text, X64::R9, 0)              # frac acc
+    x64_mov_ri(&mut ctx.text, X64::R10, 1)             # frac divisor
+    x64_mov_ri(&mut ctx.text, X64::R11, 0)             # exponent
+    x64_mov_ri(&mut ctx.text, X64::RSI, 0)             # int digit count
+    x64_mov_ri(&mut ctx.text, X64::RDI, 0)             # frac digit count
+    x64_mov_ri(&mut ctx.text, X64::RBX, 0)             # negative flag
+
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)                         # movzx eax, byte [rcx]
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 45)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_plus.clone())
+    x64_mov_ri(&mut ctx.text, X64::RBX, 1)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_int.clone())
+
+    def_label(&mut ctx.text, lbl_plus.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 43)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_int.clone())
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+
+    def_label(&mut ctx.text, lbl_int.clone())
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 48)
+    x64_jcc(&mut ctx.text, CC::L, lbl_intdone.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 57)
+    x64_jcc(&mut ctx.text, CC::G, lbl_intdone.clone())
+    x64_mov_ri(&mut ctx.text, X64::RDX, 10)
+    x64_imul_rr(&mut ctx.text, X64::R8, X64::RDX)
+    x64_sub_ri(&mut ctx.text, X64::RAX, 48)
+    x64_add_rr(&mut ctx.text, X64::R8, X64::RAX)
+    x64_add_ri(&mut ctx.text, X64::RSI, 1)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_int.clone())
+
+    def_label(&mut ctx.text, lbl_intdone.clone())
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 46)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_expcheck.clone())
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+
+    def_label(&mut ctx.text, lbl_frac.clone())
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 48)
+    x64_jcc(&mut ctx.text, CC::L, lbl_fracdone.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 57)
+    x64_jcc(&mut ctx.text, CC::G, lbl_fracdone.clone())
+    x64_mov_ri(&mut ctx.text, X64::RDX, 10)
+    x64_imul_rr(&mut ctx.text, X64::R9, X64::RDX)
+    x64_sub_ri(&mut ctx.text, X64::RAX, 48)
+    x64_add_rr(&mut ctx.text, X64::R9, X64::RAX)
+    x64_imul_rr(&mut ctx.text, X64::R10, X64::RDX)
+    x64_add_ri(&mut ctx.text, X64::RDI, 1)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_frac.clone())
+
+    def_label(&mut ctx.text, lbl_fracdone.clone())
+    def_label(&mut ctx.text, lbl_expcheck.clone())
+    x64_mov_rr(&mut ctx.text, X64::RDX, X64::RSI)
+    x64_add_rr(&mut ctx.text, X64::RDX, X64::RDI)
+    x64_test_rr(&mut ctx.text, X64::RDX, X64::RDX)
+    x64_jcc(&mut ctx.text, CC::E, lbl_invalid.clone())
+
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 101)
+    x64_jcc(&mut ctx.text, CC::E, lbl_expsign.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 69)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_endcheck.clone())
+
+    def_label(&mut ctx.text, lbl_expsign.clone())
+    x64_mov_ri(&mut ctx.text, X64::RSI, 0)             # exp sign flag
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 45)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_expplus.clone())
+    x64_mov_ri(&mut ctx.text, X64::RSI, 1)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_expdigits.clone())
+
+    def_label(&mut ctx.text, lbl_expplus.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 43)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_expdigits.clone())
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+
+    def_label(&mut ctx.text, lbl_expdigits.clone())
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 48)
+    x64_jcc(&mut ctx.text, CC::L, lbl_invalid.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 57)
+    x64_jcc(&mut ctx.text, CC::G, lbl_invalid.clone())
+
+    def_label(&mut ctx.text, lbl_exploop.clone())
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 48)
+    x64_jcc(&mut ctx.text, CC::L, lbl_endcheck.clone())
+    x64_cmp_ri(&mut ctx.text, X64::RAX, 57)
+    x64_jcc(&mut ctx.text, CC::G, lbl_endcheck.clone())
+    x64_mov_ri(&mut ctx.text, X64::RDX, 10)
+    x64_imul_rr(&mut ctx.text, X64::R11, X64::RDX)
+    x64_sub_ri(&mut ctx.text, X64::RAX, 48)
+    x64_add_rr(&mut ctx.text, X64::R11, X64::RAX)
+    x64_add_ri(&mut ctx.text, X64::RCX, 1)
+    x64_jmp(&mut ctx.text, lbl_exploop.clone())
+
+    def_label(&mut ctx.text, lbl_endcheck.clone())
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0xB6)
+    emit8(&mut ctx.text, 0x01)
+    x64_test_rr(&mut ctx.text, X64::RAX, X64::RAX)
+    x64_jcc(&mut ctx.text, CC::NE, lbl_invalid.clone())
+    x64_test_rr(&mut ctx.text, X64::RSI, X64::RSI)
+    x64_jcc(&mut ctx.text, CC::E, lbl_scale.clone())
+    x64_neg_r(&mut ctx.text, X64::R11)
+
+    def_label(&mut ctx.text, lbl_scale.clone())
+    x64_mov_ri(&mut ctx.text, X64::RDX, 400)
+    x64_cmp_rr(&mut ctx.text, X64::R11, X64::RDX)
+    x64_jcc(&mut ctx.text, CC::LE, lbl_clampneg.clone())
+    x64_mov_ri(&mut ctx.text, X64::R11, 400)
+
+    def_label(&mut ctx.text, lbl_clampneg.clone())
+    x64_mov_ri(&mut ctx.text, X64::RDX, -400)
+    x64_cmp_rr(&mut ctx.text, X64::R11, X64::RDX)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_value.clone())
+    x64_mov_ri(&mut ctx.text, X64::R11, -400)
+
+    def_label(&mut ctx.text, lbl_value.clone())
+    # cvtsi2sd xmm0, r8  (F2 49 0F 2A C0 — hand-encoded: x64_cvtsi2sd
+    # omits REX.B for the high source registers r8-r15)
+    emit8(&mut ctx.text, 0xF2)
+    emit8(&mut ctx.text, 0x49)
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0x2A)
+    emit8(&mut ctx.text, 0xC0)
+    x64_test_rr(&mut ctx.text, X64::RDI, X64::RDI)
+    x64_jcc(&mut ctx.text, CC::E, lbl_nofrac.clone())
+    # cvtsi2sd xmm1, r9 ; cvtsi2sd xmm2, r10 (hand-encoded, REX.B)
+    emit8(&mut ctx.text, 0xF2)
+    emit8(&mut ctx.text, 0x49)
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0x2A)
+    emit8(&mut ctx.text, 0xC9)
+    emit8(&mut ctx.text, 0xF2)
+    emit8(&mut ctx.text, 0x49)
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0x2A)
+    emit8(&mut ctx.text, 0xD2)
+    x64_divsd(&mut ctx.text, 1, 2)
+    x64_addsd(&mut ctx.text, 0, 1)
+
+    def_label(&mut ctx.text, lbl_nofrac.clone())
+    x64_mov_ri(&mut ctx.text, X64::RDX, 0x4024000000000000)  # 10.0
+    emit8(&mut ctx.text, 0x66)                               # movq xmm3, rdx
+    emit8(&mut ctx.text, 0x48)
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0x6E)
+    emit8(&mut ctx.text, 0xDA)
+
+    def_label(&mut ctx.text, lbl_mul.clone())
+    x64_cmp_ri(&mut ctx.text, X64::R11, 0)
+    x64_jcc(&mut ctx.text, CC::LE, lbl_div.clone())
+    x64_mulsd(&mut ctx.text, 0, 3)
+    x64_sub_ri(&mut ctx.text, X64::R11, 1)
+    x64_jmp(&mut ctx.text, lbl_mul.clone())
+
+    def_label(&mut ctx.text, lbl_div.clone())
+    x64_cmp_ri(&mut ctx.text, X64::R11, 0)
+    x64_jcc(&mut ctx.text, CC::GE, lbl_sign.clone())
+    x64_divsd(&mut ctx.text, 0, 3)
+    x64_add_ri(&mut ctx.text, X64::R11, 1)
+    x64_jmp(&mut ctx.text, lbl_div.clone())
+
+    def_label(&mut ctx.text, lbl_sign.clone())
+    x64_test_rr(&mut ctx.text, X64::RBX, X64::RBX)
+    x64_jcc(&mut ctx.text, CC::E, lbl_make.clone())
+    x64_mov_ri(&mut ctx.text, X64::RAX, -9223372036854775808 as i64)
+    emit8(&mut ctx.text, 0x66)                               # movq xmm4, rax
+    emit8(&mut ctx.text, 0x48)
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0x6E)
+    emit8(&mut ctx.text, 0xE0)
+    emit8(&mut ctx.text, 0x66)                               # xorpd xmm0, xmm4
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0x57)
+    emit8(&mut ctx.text, 0xC4)
+
+    def_label(&mut ctx.text, lbl_make.clone())
+    x64_movq_r64_xmm0(&mut ctx.text, X64::RBX)               # bits
+    x64_mov_ri(&mut ctx.text, X64::RDI, 16)
+    x64_call_label(&mut ctx.text, "_tg_bump_alloc")
+    x64_mov_ri(&mut ctx.text, X64::RCX, 0)
+    x64_mov_mr(&mut ctx.text, X64::RAX, 0, X64::RCX)
+    x64_mov_mr(&mut ctx.text, X64::RAX, 8, X64::RBX)
+    x64_jmp(&mut ctx.text, lbl_ret.clone())
+
+    def_label(&mut ctx.text, lbl_invalid.clone())
+    x64_mov_ri(&mut ctx.text, X64::RAX, 1)
+
+    def_label(&mut ctx.text, lbl_ret.clone())
+    x64_pop(&mut ctx.text, X64::RBX)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# __intrinsic_float_to_bits(Float) -> u64: the f64 bits ARE the value
+# word in this ABI — the identity move.
+def emit_tg_float_to_bits(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "__intrinsic_float_to_bits")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    x64_mov_rr(&mut ctx.text, X64::RAX, X64::RDI)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# __intrinsic_int_to_float(Int) -> Float: scvtf (the seed's Int64 ->
+# float conversion).
+def emit_tg_int_to_float(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "__intrinsic_int_to_float")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_scvtf_dx(&mut ctx.text, A64V::V0, A64::X0)
+    a64_fmov_xd(&mut ctx.text, A64::X0, A64V::V0)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    x64_cvtsi2sd(&mut ctx.text, 0, X64::RDI)
+    x64_movq_r64_xmm0(&mut ctx.text, X64::RAX)
+    x64_ret(&mut ctx.text)
+  end
+end
+
+# __intrinsic_float_to_int(Float) -> Int: truncate toward zero (the
+# seed's Int64.of_float).
+def emit_tg_float_to_int(inout ctx: RuntimeEmitCtx) -> Unit
+  def_runtime_fn(ctx, "__intrinsic_float_to_int")
+  match ctx.target.arch
+  when Arch::AArch64 then
+    a64_fmov_dx(&mut ctx.text, A64V::V0, A64::X0)
+    a64_fcvtzs_xd(&mut ctx.text, A64::X0, A64V::V0)
+    a64_ret(&mut ctx.text)
+  when Arch::X86_64 then
+    emit8(&mut ctx.text, 0x66)                      # movq xmm0, rdi
+    emit8(&mut ctx.text, 0x48)
+    emit8(&mut ctx.text, 0x0F)
+    emit8(&mut ctx.text, 0x6E)
+    emit8(&mut ctx.text, 0xC7)
+    x64_cvttsd2si(&mut ctx.text, X64::RAX, 0)
     x64_ret(&mut ctx.text)
   end
 end

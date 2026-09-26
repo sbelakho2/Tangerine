@@ -147,13 +147,21 @@ let load ~(repo_root : string) ~(manifest_path : string) : (t, string) result =
                      if !version <> None then
                        errors := Printf.sprintf "line %d: duplicate version record" (lineno + 1) :: !errors;
                      version := Some value
-                 | "std" | "compiler" ->
+                 | "std" | "compiler" | "selfcheck" ->
                      if value = "" then
                        errors := Printf.sprintf "line %d: empty filename" (lineno + 1) :: !errors
                      else begin
                        (* The record kind names the source directory:
-                          `std:` -> std/, `compiler:` -> tg_compiler/. *)
-                       let dir = if kind = "std" then "std" else "tg_compiler" in
+                          `std:` -> std/, `compiler:` -> tg_compiler/,
+                          `selfcheck:` -> stage0_ocaml/selfcheck/ (the
+                          seed selfcheck probe closures: the same
+                          manifest closure semantics, no production
+                          source tree pollution). *)
+                       let dir =
+                         if kind = "std" then "std"
+                         else if kind = "compiler" then "tg_compiler"
+                         else "stage0_ocaml/selfcheck"
+                       in
                        let rel = dir ^ "/" ^ value in
                        if Util.StringSet.mem rel !seen then
                          errors := Printf.sprintf "line %d: duplicate path '%s'" (lineno + 1) rel :: !errors;

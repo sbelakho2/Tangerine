@@ -15,13 +15,13 @@ use tg_compiler::ast::{
   Pattern, TraitDecl, TraitMethod, ImplDecl
 }
 use tg_compiler::parser::{parse, diag_has_errors, diag_macro_expansion_depth_exceeded, diag_macro_ambiguity}
-use tg_compiler::types::{type_check_typed, type_env_new, TypeError, extract_import_paths, TypeEnv, Type}
+use tg_compiler::types::{type_check_typed, type_env_new, TypeError, extract_import_paths, TypeEnv, Type, TypeQueryKind, type_query_kind_name}
 use tg_compiler::resolver::{resolve_names, ResolutionError}
 use tg_compiler::access_check::{access_check, AccessError}
 use tg_compiler::resource_check::{resource_check, build_typed_cfg, ResourceError, AnalyzedProgram, analysis_context_new}
-use tg_compiler::mir::{lower_to_mir, lower_to_mir_with_hir_lineage, MirProgram, optimize_mir_verified, pretty_print_mir, instrument_for_pgo, verify_mir, check_effect_class_annotations_mir, check_purity_annotations_mir, check_budget_annotations_mir}
+use tg_compiler::mir::{lower_to_mir, lower_to_mir_with_hir_lineage, MirProgram, optimize_mir_verified, pretty_print_mir, instrument_for_pgo, verify_mir, check_effect_class_annotations_mir, check_purity_annotations_mir, check_budget_annotations_mir, MirConstantKind, MirOperandKind, MirRvalueKind, MirStatementKind, move_rvalue, mir_int_constant_of, mir_type_is_int_kind, mir_type_identity_key}
 use tg_compiler::layout_engine::{layout_engine_new, layout_engine_register_types, layout_of_concrete, LayoutError}
-use tg_compiler::codegen::{generate_executable, generate_object_file, detect_host_target, stamp_slp_vector_facility}
+use tg_compiler::codegen::{generate_executable, generate_object_file, detect_host_target, stamp_slp_vector_facility, codegen_layout_target}
 use tg_compiler::asm::{AsmTarget, Arch, OsAbi}
 use tg_compiler::mono::{monomorphize_program, mono_cache_new_ephemeral}
 use tg_compiler::stable_ids::{untracked_artifact_text, HirNodeLineageView}
@@ -956,6 +956,95 @@ end
 
 def layout_error_message(e: LayoutError) -> String
   e.message
+end
+
+# ———————————————————————————————————————————————————————————————
+# THE TYPE-QUERY FOLD (size_of[T]() / align_of[T]())
+# ———————————————————————————————————————————————————————————————
+# Runs immediately AFTER monomorphization and BEFORE the post-mono
+# verifier: every MirTypeQuery placeholder in a CONCRETE (non-template)
+# function resolves through the kernel layout engine (layout_of_concrete,
+# the fail-closed query) to the MirInt size/align constant, preserving
+# the constant's carried result type. This mirrors the seed's
+# Layout_fold.fold_program exactly:
+#   - the query kind decides which layout row is read (SizeOf -> size,
+#     AlignOf -> align);
+#   - the destination slot keeps the query's declared result type;
+#   - a still-generic (Param/Var/ConstParam), unsized or unregistered
+#     type argument FAILS CLOSED with a precise error naming the query
+#     and the type — never a guessed word;
+#   - generic TEMPLATES are skipped: their placeholders are substituted
+#     at specialization (the post-mono verifier's embedded-types walk
+#     re-proves the payload concreteness).
+# The layout engine is registered with the program's post-mono type
+# table, so Adt sizes/alignments resolve through the concrete (TypeId,
+# substs) key.
+pub def mir_fold_type_queries(inout mir: MirProgram, target: AsmTarget) -> Result[Unit, Vec[String]]
+  var engine = layout_engine_new(codegen_layout_target(target.arch))
+  layout_engine_register_types(&mut engine, mir.types)
+  var errors: Vec[String] = Vec::new()
+  var fi = 0
+  while fi < mir.functions.len() do
+    var f = mir.functions[fi]
+    if f.generic_params.is_empty() then
+      var bi = 0
+      while bi < f.blocks.len() do
+        var block = f.blocks[bi]
+        var si = 0
+        while si < block.statements.len() do
+          var stmt = block.statements[si]
+          match stmt.kind
+          when MirStatementKind::MirAssign(place, rvalue) then
+            match rvalue.kind
+            when MirRvalueKind::MirMove(op) then
+              match op.kind
+              when MirOperandKind::MirConstant(cst) then
+                match cst.kind
+                when MirConstantKind::MirTypeQuery(qkind, qarg) then
+                  let qname = type_query_kind_name(qkind.clone())
+                  # (the seed's int_value_of_dest guard): the query's
+                  # carried result type is the assignment slot's type — an
+                  # integer kind by construction (the declared query
+                  # return is UInt). Anything else (an inference variable
+                  # or a non-integer slot) fails closed here, never a
+                  # silent retype.
+                  if !mir_type_is_int_kind(cst.ty.clone()) then
+                    errors.push("type query `" + qname + "` in fn " + f.name.clone() + ": result type `" + mir_type_identity_key(cst.ty.clone()) + "` is not an integer kind (the query must occupy an integer slot; fail closed)")
+                  else
+                    match layout_of_concrete(&mut engine, &qarg)
+                    when Result::Err(e) then
+                      errors.push("type query `" + qname + "` on `" + e.type_name + "` in fn " + f.name.clone() + ": " + e.message + " — the query argument must have a concrete layout before codegen (fail closed, never a guessed word)")
+                    when Result::Ok(layout) then
+                      let n = match qkind
+                      when TypeQueryKind::SizeOf then layout.size
+                      when TypeQueryKind::AlignOf then layout.align
+                      end
+                      stmt.kind = MirStatementKind::MirAssign(place.clone(), move_rvalue(mir_int_constant_of(n, cst.ty.clone())))
+                    end
+                  end
+                when _ then ()
+                end
+              when _ then ()
+              end
+            when _ then ()
+            end
+          when _ then ()
+          end
+          block.statements[si] = stmt
+          si = si + 1
+        end
+        f.blocks[bi] = block
+        bi = bi + 1
+      end
+    end
+    mir.functions[fi] = f
+    fi = fi + 1
+  end
+  if errors.is_empty() then
+    Result::Ok(())
+  else
+    Result::Err(errors)
+  end
 end
 
 # Use Diagnostic definition from parser
@@ -2386,6 +2475,20 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   # target on its own.
   let target = resolve_codegen_target(opts)
 
+  # (the type-query fold): resolve every size_of[T]()/align_of[T]()
+  # placeholder in the mono'd CONCRETE bodies through the layout engine —
+  # immediately after monomorphization, before the post-mono verifier so
+  # the verifier + oracle inspect the exact post-fold IR codegen gets. A
+  # still-generic/unsized query argument fails closed here.
+  match mir_fold_type_queries(&mut mir, target)
+  when Result::Err(qerrs) then
+    for e in qerrs do
+      eprintln("type query fold error: " + e)
+    end
+    return Result::Err("type query folding failed with " + qerrs.len().to_string() + " error(s)")
+  when Result::Ok(_) then ()
+  end
+
   # Verify MIR invariants after monomorphization. The post-mono
   # verification is UNCONDITIONAL (the reviewer's item-11 firewall: the
   # generic substitution is a transformative boundary every build — debug
@@ -2901,6 +3004,23 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
   when Result::Ok(_) then ()
   end
 
+  # (the type-query fold): resolve every size_of[T]()/align_of[T]()
+  # placeholder in the mono'd CONCRETE bodies through the layout engine
+  # immediately after monomorphization — before the post-mono verifier so
+  # the verifier + oracle inspect the exact post-fold IR codegen gets. A
+  # still-generic/unsized query argument fails closed here, never at
+  # codegen/dyld.
+  let target = resolve_codegen_target(opts)
+  match mir_fold_type_queries(&mut mir, target)
+  when Result::Err(qerrs) then
+    for e in qerrs do
+      eprintln("type query fold error: " + e)
+    end
+    println("type query folding failed with " + qerrs.len().to_string() + " error(s)")
+    return 1
+  when Result::Ok(_) then ()
+  end
+
   let verify_everything = mir_verify_everything(opts)
   if verify_everything then
     let post_mono_errs = verify_mir(&mir)
@@ -2971,7 +3091,7 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
   # (audit item 34 residual) the SLP target-capability stamp: the direct
   # emitter's arch (the ONE resolve_codegen_target authority) — never a
   # second target probe.
-  stamp_slp_vector_facility(&mut mir, resolve_codegen_target(opts).arch)
+  stamp_slp_vector_facility(&mut mir, target.arch)
   optimize_mir_verified(&mut mir, opts.opt_level, verify_everything)
 
   let post_opt_errs = verify_mir(&mir)
@@ -2991,8 +3111,6 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
   if opts.verbose then
     println("  Generating native code...")
   end
-  let target = resolve_codegen_target(opts)
-
   match opts.emit
   when EmitMode::Object then
     let obj_bytes = match generate_object_file(&mir, &target)
@@ -5584,6 +5702,23 @@ pub def compile_multiple_files(opts: CompilerOptions, files: Vec[String], output
   when Result::Ok(_) then ()
   end
 
+  # (the type-query fold): resolve every size_of[T]()/align_of[T]()
+  # placeholder in the mono'd CONCRETE bodies through the layout engine
+  # immediately after monomorphization — before the post-mono verifier so
+  # the verifier + oracle inspect the exact post-fold IR codegen gets. A
+  # still-generic/unsized query argument fails closed here, never at
+  # codegen/dyld.
+  let target = resolve_codegen_target(opts)
+  match mir_fold_type_queries(&mut mir, target)
+  when Result::Err(qerrs) then
+    for e in qerrs do
+      eprintln("type query fold error: " + e)
+    end
+    println("type query folding failed with " + qerrs.len().to_string() + " error(s)")
+    return 1
+  when Result::Ok(_) then ()
+  end
+
   let verify_everything = mir_verify_everything(opts)
   if verify_everything then
     let post_mono_errs = verify_mir(&mir)
@@ -5641,7 +5776,7 @@ pub def compile_multiple_files(opts: CompilerOptions, files: Vec[String], output
   # (audit item 34 residual) the SLP target-capability stamp: the direct
   # emitter's arch (the ONE resolve_codegen_target authority) — never a
   # second target probe.
-  stamp_slp_vector_facility(&mut mir, resolve_codegen_target(opts).arch)
+  stamp_slp_vector_facility(&mut mir, target.arch)
   optimize_mir_verified(&mut mir, opts.opt_level, verify_everything)
 
   let post_opt_errs = verify_mir(&mir)
@@ -5661,8 +5796,6 @@ pub def compile_multiple_files(opts: CompilerOptions, files: Vec[String], output
   if opts.verbose then
     println("  Generating native code...")
   end
-  let target = resolve_codegen_target(opts)
-
   match opts.emit
   when EmitMode::Object then
     let obj_bytes = match generate_object_file(&mir, &target)
