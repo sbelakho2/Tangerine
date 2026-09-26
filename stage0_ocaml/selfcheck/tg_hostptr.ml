@@ -25,12 +25,27 @@ let fail fmt =
       exit 1)
     fmt
 
+let ensure_dir path =
+  let rec go p =
+    if p = "" || p = "." || p = "/" || Sys.file_exists p then ()
+    else begin
+      go (Filename.dirname p);
+      try Unix.mkdir p 0o755 with
+      | Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+      | Unix.Unix_error (e, _, _) ->
+          fail "cannot create the output directory %s: %s" p
+            (Unix.error_message e)
+    end
+  in
+  go path
+
 let () =
   let repo_root =
     match Array.to_list Sys.argv with
     | _ :: r :: _ -> r
     | _ -> ".."
   in
+  ensure_dir (Filename.concat repo_root "build");
   let target =
     match Target.unsupported_triple "aarch64-apple-darwin" with
     | Error m -> fail "target: %s" m

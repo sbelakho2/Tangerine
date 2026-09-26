@@ -34,6 +34,20 @@ let fail fmt =
       exit 1)
     fmt
 
+let ensure_dir path =
+  let rec go p =
+    if p = "" || p = "." || p = "/" || Sys.file_exists p then ()
+    else begin
+      go (Filename.dirname p);
+      try Unix.mkdir p 0o755 with
+      | Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+      | Unix.Unix_error (e, _, _) ->
+          fail "cannot create the output directory %s: %s" p
+            (Unix.error_message e)
+    end
+  in
+  go path
+
 let read_file path =
   let ic = open_in_bin path in
   let n = in_channel_length ic in
@@ -149,6 +163,7 @@ let () =
   let repo_root, rest =
     match args with _ :: r :: rest -> (r, rest) | _ -> ("..", [])
   in
+  ensure_dir (Filename.concat repo_root "build");
   let mode, use_cache, cache_path =
     let rec go mode cache = function
       | "--mode" :: m :: rest -> go m cache rest
@@ -199,7 +214,11 @@ let () =
       if Sys.file_exists report_path then
         Printf.printf "tg_linkprobe: probe report:\n%s" (read_file report_path);
       (match run.Driver.bvr_vm_code with
-      | Some 0 -> ()
+      | Some 0 ->
+          if not (Sys.file_exists report_path) then
+            fail
+              "VM exit 0 but the expected probe report %s is missing — the probe's write_file failed silently (its parent directory must exist before the guest writes; the guest write error is discarded) or the probe did not reach the write"
+              report_path
       | Some code ->
           fail
             "probe main returned %d — the kernel executable backend failed (see the report above)"
