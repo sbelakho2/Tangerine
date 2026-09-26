@@ -105,12 +105,44 @@ let macho_undefined_intrinsics path =
     cmds 32 0;
     List.rev !out
 
+let contains_substring haystack needle =
+  let n = String.length haystack and m = String.length needle in
+  if m = 0 then true
+  else begin
+    let found = ref false in
+    let i = ref 0 in
+    while (not !found) && !i + m <= n do
+      if String.sub haystack !i m = needle then found := true;
+      incr i
+    done;
+    !found
+  end
+
 let run_native path =
-  let pid = Unix.create_process path [| path |] Unix.stdin Unix.stdout Unix.stderr in
-  match Unix.waitpid [] pid with
-  | _, Unix.WEXITED c -> `Exited c
-  | _, Unix.WSIGNALED s -> `Signaled s
-  | _, Unix.WSTOPPED s -> `Stopped s
+  let out_r, out_w = Unix.pipe () in
+  let pid =
+    Unix.create_process path [| path |] Unix.stdin out_w Unix.stderr
+  in
+  Unix.close out_w;
+  let buf = Buffer.create 256 in
+  let chunk = Bytes.create 4096 in
+  let rec drain () =
+    match Unix.read out_r chunk 0 4096 with
+    | 0 -> ()
+    | n ->
+        Buffer.add_subbytes buf chunk 0 n;
+        drain ()
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> drain ()
+  in
+  drain ();
+  Unix.close out_r;
+  let status =
+    match Unix.waitpid [] pid with
+    | _, Unix.WEXITED c -> `Exited c
+    | _, Unix.WSIGNALED s -> `Signaled s
+    | _, Unix.WSTOPPED s -> `Stopped s
+  in
+  (status, Buffer.contents buf)
 
 let () =
   let args = Array.to_list Sys.argv in
@@ -198,20 +230,56 @@ let () =
         fail
           "the artifact still carries forbidden undefined extern symbol(s): %s — the linker left them for dyld instead of failing closed, or size_of/align_of were not folded to layout constants"
           (String.concat ", " leftover);
-      (* Execute the artifact natively: the probe's main returns 42. *)
-      let execute label path =
-        match
+      (* Execute the artifact natively: the probe's main returns 42 and,
+         in full mode, prints the parse-boundary check marker — the
+         in-artifact assertion for the literal / owned / as_str-derived
+         parse cases. A non-42 exit names the first failing check. *)
+      let exit_hint code =
+        if mode = "full" && code >= 11 && code <= 24 then
+          let what =
+            match code with
+            | 11 -> "parse literal Ok(42)"
+            | 12 -> "parse literal Err(garbage)"
+            | 13 -> "owned String parse Ok(43)"
+            | 14 -> "owned String parse Err(12x)"
+            | 15 -> "as_str-derived view parse Ok(43)"
+            | 16 -> "as_str-derived view parse Err(12x)"
+            | 17 -> "float_to_bits"
+            | 18 -> "int_to_float"
+            | 19 -> "float_to_int"
+            | 20 -> "size_of/align_of u8"
+            | 21 -> "size_of/align_of UInt"
+            | 22 -> "size_of/align_of ProbePair[u8]"
+            | 23 -> "generic size_of/align_of ProbePair[UInt]"
+            | _ -> "generic size_of/align_of UInt"
+          in
+          Printf.sprintf " — the failing check is %s" what
+        else ""
+      in
+      let execute ?(marker = "") label path =
+        let status, output =
           try run_native path
           with Unix.Unix_error (e, _, _) ->
             fail "could not execute the %s artifact: %s" label
               (Unix.error_message e)
-        with
+        in
+        if output <> "" then
+          Printf.printf "tg_linkprobe: %s artifact stdout:\n%s" label output;
+        (match status with
         | `Exited 42 -> ()
-        | `Exited c -> fail "the %s artifact ran but exited %d (expected 42)" label c
+        | `Exited c ->
+            fail "the %s artifact ran but exited %d (expected 42)%s" label c
+              (exit_hint c)
         | `Signaled s -> fail "the %s artifact was killed by signal %d" label s
-        | `Stopped s -> fail "the %s artifact stopped by signal %d" label s
+        | `Stopped s -> fail "the %s artifact stopped by signal %d" label s);
+        if marker <> "" && not (contains_substring output marker) then
+          fail
+            "the %s artifact did not print the expected marker %S — the embedded parse-boundary checks did not all hold"
+            label marker
       in
-      execute "probe" out_path;
+      if mode = "full" then
+        execute ~marker:"LINKPROBE_ARTIFACT_OK" "probe" out_path
+      else execute "probe" out_path;
       (* linkobj mode also executes the libc-import artifact: a dyld
          import (libSystem `_exit`) must still link and run after the
          fail-closed intrinsic guard. *)
