@@ -1234,10 +1234,22 @@ let binop_int (vm : t) (op : Seed_mir.bin_op) (a : Int_value.t) (b : Int_value.t
   | Seed_mir.And -> Vm_value.Bool (not (is_zero a) && not (is_zero b))
   | Seed_mir.Or -> Vm_value.Bool (not (is_zero a) || not (is_zero b))
 
+(* a Read/Copy operand STORED into a new place (assignment, aggregate
+   construction, cast) creates a second holder of the value while the
+   source place stays live — an in-place element write through it would
+   alias, so the top-level array cell loses its owned status *)
+let mark_read_operand_value (op : Seed_mir.operand) (v : Vm_value.t) : unit =
+  match op with
+  | Seed_mir.Read _ | Seed_mir.Copy _ -> Vm_value.arr_mark_shared_value v
+  | Seed_mir.Move _ | Seed_mir.Consume _ | Seed_mir.Constant _ -> ()
+
 let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t =
   step_limit vm;
   match rv with
-  | Seed_mir.Use op -> eval_operand vm frame op
+  | Seed_mir.Use op ->
+      let v = eval_operand vm frame op in
+      mark_read_operand_value op v;
+      v
   | Seed_mir.Ref p | Seed_mir.RefMut p ->
       if
         (not (Seed_mir.root_is_static p.Seed_mir.root))
@@ -1257,7 +1269,15 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
            real reference too *)
         Vm_value.Ref (Vm_value.Place (frame, (Seed_mir.root_key p.Seed_mir.root), p.Seed_mir.projections))
   | Seed_mir.Aggregate (kind, ops) ->
-      let vals = Array.of_list (List.map (eval_operand vm frame) ops) in
+      let vals =
+        Array.of_list
+          (List.map
+             (fun op ->
+               let v = eval_operand vm frame op in
+               mark_read_operand_value op v;
+               v)
+             ops)
+      in
       (match kind with
        | Seed_mir.TupleAgg -> Vm_value.Tuple vals
        | Seed_mir.ArrayAgg -> Vm_value.Array (Vm_value.arr_of_array vals)
@@ -1358,6 +1378,7 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
       | _ -> err_trap vm "len on unsupported value")
   | Seed_mir.Cast (op, ty) -> (
       let vv = eval_operand vm frame op in
+      mark_read_operand_value op vv;
       match ty with
       | Type_repr.Int kind -> (
           match vv with
@@ -1906,12 +1927,6 @@ and run_frame (vm : t) (frame : frame) : unit =
     in
     raise (Failure (Printf.sprintf "%s [fn %d %s %s]" msg frame.fn (fn_tag ()) where))
 
-and mark_read_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : unit =
-  match op with
-  | Seed_mir.Read p | Seed_mir.Copy p ->
-      Vm_value.arr_mark_shared_value (eval_operand vm frame (Seed_mir.Copy p))
-  | Seed_mir.Move _ | Seed_mir.Consume _ | Seed_mir.Constant _ -> ()
-
 and exec_statement (vm : t) (frame : frame) (st : Seed_mir.statement) : unit =
   step_limit vm;
   match st with
@@ -1931,14 +1946,6 @@ and exec_statement (vm : t) (frame : frame) (st : Seed_mir.statement) : unit =
          overwrite boundary the verifier's destroyed-lattice models as
          destroyed-by-assignment. *)
        drop_old_value_at vm frame dest;
-       (* a Read/Copy operand stored into another place creates a second
-          holder of the value while the source place stays live — an
-          in-place element write through it would alias *)
-       (match rv with
-        | Seed_mir.Use op -> mark_read_operand vm frame op
-        | Seed_mir.Aggregate (_, ops) -> List.iter (mark_read_operand vm frame) ops
-        | Seed_mir.Cast (op, _) -> mark_read_operand vm frame op
-        | _ -> ());
        let v = eval_rvalue vm frame rv in
        write_place vm frame dest v
   | Seed_mir.StorageLive l ->

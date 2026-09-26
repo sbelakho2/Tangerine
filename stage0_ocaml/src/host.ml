@@ -2970,7 +2970,9 @@ let binding_manifest : binding list =
            | [| Vm_value.Map store |] -> (
                match Vm_value.map_pairs store with
                | [] -> Ok vm_option_none
-               | (k, _) :: _ -> Ok (vm_option_some k))
+               | (k, _) :: _ ->
+                   Vm_value.arr_mark_shared_value k;
+                   Ok (vm_option_some k))
            | _ -> arg_mismatch "Map"));
     intrinsic_binding "__intrinsic_map_visit_next"
       (adapter_raw (lets [ map_of p0 p1; p0 ]) (option_of (ref_ p0))
@@ -2978,7 +2980,9 @@ let binding_manifest : binding list =
            match args with
            | [| Vm_value.Map store; handle |] -> (
                match map_visit_pair (Vm_value.map_pairs store) handle with
-               | Some (_, (k, _) :: _) -> Ok (vm_option_some k)
+               | Some (_, (k, _) :: _) ->
+                   Vm_value.arr_mark_shared_value k;
+                   Ok (vm_option_some k)
                | Some (_, []) | None -> Ok vm_option_none)
            | _ -> arg_mismatch "(Map, key)"));
     intrinsic_binding "__intrinsic_map_visit_value"
@@ -2987,7 +2991,9 @@ let binding_manifest : binding list =
            match args with
            | [| Vm_value.Map store; handle |] -> (
                match map_visit_pair (Vm_value.map_pairs store) handle with
-               | Some ((_, v), _) -> Ok v
+               | Some ((_, v), _) ->
+                   Vm_value.arr_mark_shared_value v;
+                   Ok v
                | None ->
                    Error
                      "stale record-visit handle: the entry is no longer in the \
@@ -3000,7 +3006,9 @@ let binding_manifest : binding list =
            | [| Vm_value.Set store |] -> (
                match Vm_value.set_elems store with
                | [] -> Ok vm_option_none
-               | x :: _ -> Ok (vm_option_some x))
+               | x :: _ ->
+                   Vm_value.arr_mark_shared_value x;
+                   Ok (vm_option_some x))
            | _ -> arg_mismatch "Set"));
     intrinsic_binding "__intrinsic_set_visit_next"
       (adapter_raw (lets [ set_of p0; p0 ]) (option_of (ref_ p0))
@@ -3008,7 +3016,9 @@ let binding_manifest : binding list =
            match args with
            | [| Vm_value.Set store; handle |] -> (
                match set_visit_after (Vm_value.set_elems store) handle with
-               | Some (x :: _) -> Ok (vm_option_some x)
+               | Some (x :: _) ->
+                   Vm_value.arr_mark_shared_value x;
+                   Ok (vm_option_some x)
                | Some [] | None -> Ok vm_option_none)
            | _ -> arg_mismatch "(Set, item)"));
      (* ── raw memory / syscalls / control flow.  The arena makes the raw

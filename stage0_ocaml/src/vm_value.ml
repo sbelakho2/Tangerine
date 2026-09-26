@@ -199,13 +199,6 @@ let arr_equal_seq (eq : t -> t -> bool) (a : arr) (b : arr) : bool =
   let rec go i = i >= a.len || (eq a.cell.data.(i) b.cell.data.(i) && go (i + 1)) in
   go 0
 
-let arr_fold_left (f : 'a -> t -> 'a) (init : 'a) (a : arr) : 'a =
-  let acc = ref init in
-  for i = 0 to a.len - 1 do
-    acc := f !acc a.cell.data.(i)
-  done;
-  !acc
-
 (* frontier append: in place when this view owns the written frontier
    (len = high), else a private fork of the prefix *)
 let arr_push (a : arr) (v : t) : arr =
@@ -270,8 +263,6 @@ let arr_sub (a : arr) (pos : int) (n : int) : arr =
   arr_of_array (Array.sub a.cell.data pos n)
 
 let arr_make (n : int) (v : t) : arr = arr_of_array (Array.make n v)
-
-let arr_truncate (a : arr) (n : int) : arr = arr_sub a 0 n
 
 let arr_remove (a : arr) (i : int) : arr =
   let n = a.len in
