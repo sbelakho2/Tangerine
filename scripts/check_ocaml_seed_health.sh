@@ -98,14 +98,23 @@ TG_DEVIRT_TIMEOUT_S=900
 # the linkprobe_mini closure is the FULL kernel closure plus the probe).
 # Measured on the Darwin/arm64 host:
 #   - cold (program cache absent, closure front end + mono + linkobj VM):
-#     ~11.6 min under concurrent host load (~350 s front end alone when
-#     the machine is otherwise idle);
-#   - warm (prepared-VM program cache hit, linkobj mode): ~1.0 s;
-#   - --mode full (the REAL kernel compile entry) is minutes-scale
-#     because the seed VM's copy-on-push Array model makes the kernel's
-#     byte-at-a-time Mach-O emission quadratic — kept opt-in.
-# Cap 1800 s (provisional, comfortably above the measured cold wall); a
-# cap is a bound, never a skip.
+#     390.3 s at light load (~11.6 min under concurrent host load was the
+#     earlier calibration);
+#   - warm (prepared-VM program cache hit, linkobj mode): ~0.5 s;
+#   - --mode full (the REAL kernel compile entry): the emitted ~914 KiB
+#     executable is ad-hoc codesigned by the kernel, run natively by the
+#     harness, and must exit 42.  Warm (prepared-VM cache hit): 484.0 s
+#     (8.1 min) at load ~8.4; the cache-miss run measured 1121.8 s
+#     (18.7 min) at load ~13.  The mem_free small-block clobber (x0, the
+#     user block pointer, was overwritten with the class index before
+#     _tg_alloc_lock, so the free-list link store went through x0 = NULL)
+#     is fixed — base now lives in the callee-saved x21 across the lock
+#     with an FP/LR prologue on the AArch64 path — and the native RUN
+#     gate is green.  The CI lane
+#     (.woodpecker/ocaml-seed-health.yaml's kernel-native-link-lane) runs
+#     --mode full by default; TG_LINKPROBE_FULL=0 only skips it.
+# Cap 1800 s (1121.8 x 1.5 = 1682.7 rounded up to the next 60 s; also the
+# bound the CI step uses); a cap is a bound, never a skip.
 TG_LINKPROBE_TIMEOUT_S=1800
 
 if [ -f scripts/check_ocaml_toolchain.sh ]; then
