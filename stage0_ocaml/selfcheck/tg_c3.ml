@@ -34,6 +34,20 @@ let fail fmt =
       exit 1)
     fmt
 
+let ensure_dir path =
+  let rec go p =
+    if p = "" || p = "." || p = "/" || Sys.file_exists p then ()
+    else begin
+      go (Filename.dirname p);
+      try Unix.mkdir p 0o755 with
+      | Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+      | Unix.Unix_error (e, _, _) ->
+          fail "cannot create the output directory %s: %s" p
+            (Unix.error_message e)
+    end
+  in
+  go path
+
 let read_file path =
   let ic = open_in_bin path in
   let n = in_channel_length ic in
@@ -57,6 +71,7 @@ let () =
     | _ :: r :: _ -> (r, false)
     | _ -> ("..", false)
   in
+  ensure_dir (Filename.concat repo_root "build");
   let target =
     match Target.unsupported_triple "aarch64-apple-darwin" with
     | Error m -> fail "target: %s" m
@@ -80,13 +95,18 @@ let () =
   | Error m -> fail "closure pipeline: %s" m
   | Ok stages -> (
       let report_path = Filename.concat repo_root "build/c3_probe.txt" in
+      let report_exists = Sys.file_exists report_path in
       let report =
-        if Sys.file_exists report_path then read_file report_path
+        if report_exists then read_file report_path
         else "(no build/c3_probe.txt — the probe did not reach the report write)\n"
       in
       print_string report;
       match stages.Driver.bs_vm_code with
       | Some 0 ->
+          if not report_exists then
+            fail
+              "VM exit 0 but the expected probe report %s is missing — the probe's write_file failed silently (its parent directory must exist before the guest writes; the guest write error is discarded) or the probe did not reach the write"
+              report_path;
           let clean_case name =
             contains report ("CASE " ^ name ^ ": errors=0 no_method=0")
           in
