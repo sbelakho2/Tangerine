@@ -68,7 +68,13 @@ and arr_cell = {
      a closure-capture binding, a projected move out of an aggregate).
      An owned cell's only holder is the place a direct element write
      reads and writes back, so the write may mutate `data` in place —
-     no other binding can observe it.  Forked cells start owned. *)
+     no other binding can observe it.  Forked cells start owned.
+
+     The mark is DEEP and TRANSITIVE: aliasing a container marks every
+     array cell reachable through it (mark_value_shared below), so
+     `owned = false` is also the walk's completion marker — a cell
+     holds no unmarked nested array, and arr_push marks the one value
+     that can enter a shared cell afterwards (the frontier append). *)
   mutable owned : bool;
 }
 
@@ -153,12 +159,65 @@ let arr_of_array (xs : t array) : arr =
   { cell = { data = xs; high = Array.length xs; owned = true };
     len = Array.length xs }
 
-(* mark a value as possibly held by a second binding: in-place writes
-   through the top-level array become illegal (they would alias) *)
-let arr_mark_shared_value (v : t) : unit =
-  match v with Array a -> a.cell.owned <- false | _ -> ()
+(* mark a value as possibly held by a second binding: EVERY array cell
+   reachable through the value loses its owned status.  The walk is
+   DEEP because a value-semantics copy copies the nested arrays too —
+   `Struct { data = [1,2] }` bound twice shares `data`'s cell with both
+   holders, so an in-place write through either nested array would be
+   observable through the other.  A cell marked shared here disables the
+   in-place element write (arr_set_direct forks instead) for every
+   holder of that nested array.
 
-let arr_mark_shared (a : arr) : unit = a.cell.owned <- false
+   ── Cycle safety and the memoization contract ─────────────────────
+   The only mutable links in the value model are the array cells, so
+   any cycle passes through a cell.  Setting `owned <- false` BEFORE
+   descending is the visited mark: a cycle re-entering the same cell
+   observes the flag and stops (arr_push can build such a cycle — an
+   element may be a view of the array's own cell).  The flag doubles as
+   the completion marker: `owned = false` means the cell's whole
+   logical element subtree was deep-marked at that point.  The one path
+   that can add an element to an already-marked cell afterwards —
+   arr_push's frontier append into a shared cell — marks the appended
+   value itself (see arr_push), so the invariant holds and a repeated
+   mark may stop at an unowned cell without re-walking its contents.
+   Every mark function routes through this one walk, so no caller can
+   leave a cell owned-but-shared.
+
+   Map KEYS are marked as well as values, by explicit decision: the
+   store surface hands stored keys back to the guest (map_get /
+   drain_one / the visit and entries bindings return them) and a key
+   may be an aggregate containing arrays; marking is the conservative
+   direction and the walk is memoized per cell.  References
+   (Ref (Place _) / Ref (Region _)), RawPtr and Function are not part
+   of the value tree (a reference names a place or an owned region
+   image — it does not own a nested value), so the walk stops there. *)
+let rec mark_value_shared (v : t) : unit =
+  match v with
+  | Array a ->
+      if a.cell.owned then begin
+        a.cell.owned <- false;
+        (* the logical content is data[0..len) — the frontier slots
+           beyond len belong to other views and are not this value's *)
+        for i = 0 to a.len - 1 do
+          mark_value_shared a.cell.data.(i)
+        done
+      end
+  | Tuple elems | Struct elems -> Array.iter mark_value_shared elems
+  | Enum (_, payload) -> Array.iter mark_value_shared payload
+  | Closure (_, caps) -> Array.iter mark_value_shared caps
+  | Set s ->
+      List.iter mark_value_shared s.set_front;
+      List.iter mark_value_shared s.set_back
+  | Map m ->
+      List.iter (fun (k, v) -> mark_value_shared k; mark_value_shared v) m.map_front;
+      List.iter (fun (k, v) -> mark_value_shared k; mark_value_shared v) m.map_back
+  | Unit | Bool _ | Int _ | Float32 _ | Float64 _ | Char _ | String _
+  | Function _ | RawPtr _ | Ref _ | Null | MovedOut ->
+      ()
+
+let arr_mark_shared_value (v : t) : unit = mark_value_shared v
+
+let arr_mark_shared (a : arr) : unit = mark_value_shared (Array a)
 
 let arr_empty : arr = arr_of_array [||]
 
@@ -213,6 +272,12 @@ let arr_push (a : arr) (v : t) : arr =
       c.data <- data'
     end
     else c.data.(c.high) <- v;
+    (* the appended value enters a cell that a second holder already
+       shares: mark it now, because the deep walk stops at an unowned
+       cell (its elements were marked when the cell was marked).  A
+       unique (owned) cell needs no mark — its holder is the only one
+       that can ever reach the new element. *)
+    if not c.owned then mark_value_shared v;
     c.high <- c.high + 1;
     { cell = c; len = a.len + 1 }
   end

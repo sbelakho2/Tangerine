@@ -472,7 +472,8 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
         (* the moved component can remain reachable through another
            holder of the containing aggregate (a Read-bound parent, a
            forked parent): a direct element write through the extracted
-           value must not alias *)
+           value — including through any array nested inside it — must
+           not alias, so the value is marked shared recursively *)
         Vm_value.arr_mark_shared_value v;
         write_place vm frame p Vm_value.MovedOut;
         v
@@ -1237,7 +1238,9 @@ let binop_int (vm : t) (op : Seed_mir.bin_op) (a : Int_value.t) (b : Int_value.t
 (* a Read/Copy operand STORED into a new place (assignment, aggregate
    construction, cast) creates a second holder of the value while the
    source place stays live — an in-place element write through it would
-   alias, so the top-level array cell loses its owned status *)
+   alias, so every array cell reachable through the value loses its
+   owned status (the mark is RECURSIVE: a container's nested arrays are
+   shared by the second holder exactly like its top-level arrays) *)
 let mark_read_operand_value (op : Seed_mir.operand) (v : Vm_value.t) : unit =
   match op with
   | Seed_mir.Read _ | Seed_mir.Copy _ -> Vm_value.arr_mark_shared_value v
@@ -1627,12 +1630,14 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                   a Box-typed parameter (nominal identity), so there is no
                   transparent wrapper load at the call boundary. *)
                 let all_args = Array.append arg_vals caps in
-               (* a Read (by-value borrow) parameter or a closure capture
-                  gives the callee a second holder of the value while the
-                  caller's binding stays live: in-place element writes
-                  through it would be observable, so the cell loses its
-                  owned status (a Modify parameter is the caller's
-                  authorized mutation channel — it does NOT clear it) *)
+                (* a Read (by-value borrow) parameter or a closure capture
+                   gives the callee a second holder of the value while the
+                   caller's binding stays live: in-place element writes
+                   through it would be observable, so every array cell
+                   reachable through the value loses its owned status
+                   (the mark recurses into containers; a Modify parameter
+                   is the caller's authorized mutation channel — it does
+                   NOT clear it) *)
                Array.iteri
                  (fun i v ->
                    if i < Array.length args then (

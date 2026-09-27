@@ -2121,6 +2121,492 @@ let check_inplace_set_alias () =
            fail "in-place set alias: the caller's argument changed: %s"
              (Vm_value.slot_state other)))
 
+(* ── (i) recursive sharing propagation for NESTED growable arrays ──
+
+   The audit's top-P0/P1 correctness risk: `arr_mark_shared_value`
+   marked only a TOP-LEVEL Array, so aliasing a value that CONTAINS an
+   array (Struct/Tuple/Enum/Closure fields, Array elements, Map/Set
+   members) left the nested cell `owned = true`; a projected in-place
+   element write through one holder could then mutate the backing data
+   every other holder reads.  The fix makes the mark DEEP and
+   cycle-safe (vm_value.ml's mark_value_shared; arr_push marks the one
+   value that can enter a shared cell afterwards).
+
+   Two legs prove the fix:
+     • OCaml level — the tracking contract itself.  Every case builds a
+       container embedding an array, records the second holder exactly
+       as the VM does (`arr_mark_shared_value` on the container), then
+       takes the in-place fast path (`arr_set_direct`) through the
+       nested array a holder can reach.  With shallow tracking the
+       nested cell is still owned and the write mutates the shared
+       backing data (the test fails); with the recursive mark the cell
+       is shared, the write forks, and the aliased value keeps [1,2].
+     • VM level — the end-to-end value semantics for every shape the
+       guest MIR can express (Struct field, tuple index, Array element,
+       plus the host-intrinsic Map[String, Array] / Set[Array]
+       extraction paths).  An Enum payload write is NOT expressible in
+       the current guest MIR (update_place has no Enum/Downcast write
+       arm — a write through a downcast place is dropped), and a
+       closure capture has no projection; both are covered at the OCaml
+       level above. *)
+
+let oi (n : int) : Vm_value.t =
+  Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int n))
+
+let int_list (a : Vm_value.arr) : int list =
+  List.map
+    (function Vm_value.Int i -> Int64.to_int (Int_value.to_int64 i) | _ -> min_int)
+    (Vm_value.arr_to_list a)
+
+let expect_ints (what : string) (a : Vm_value.arr) (want : int list) : bool =
+  let got = int_list a in
+  if got = want then true
+  else begin
+    fail "%s: contents are [%s] (expected [%s])" what
+      (String.concat ";" (List.map string_of_int got))
+      (String.concat ";" (List.map string_of_int want));
+    false
+  end
+
+(* one nested-alias case: build a container embedding a fresh [1,2]
+   array, mark the container shared (B = A), extract the nested array
+   through the container, and take the direct in-place write path on
+   it.  The first holder's value must stay byte-for-byte [1,2] and the
+   write must land in a FORKED cell. *)
+let nested_alias_case (name : string) (build : Vm_value.t -> Vm_value.t)
+    (extract : Vm_value.t -> Vm_value.t) : unit =
+  let inner = Vm_value.array [| oi 1; oi 2 |] in
+  let container = build inner in
+  (* Closures are not serializable (a closure carries an instance id, not
+     a byte image); their identity check falls back to structural
+     equality below. *)
+  let before = try Some (Vm_value.serialize container) with Failure _ -> None in
+  Vm_value.arr_mark_shared_value container;
+  let view =
+    match extract container with
+    | Vm_value.Array a -> a
+    | _ ->
+        fail "%s: the test's extraction did not yield an array" name;
+        Vm_value.arr_empty
+  in
+  let updated = Vm_value.arr_set_direct view 0 (oi 99) in
+  let old_ok = expect_ints (name ^ ": the aliased holder") view [ 1; 2 ] in
+  let new_ok = expect_ints (name ^ ": the direct write's own view") updated [ 99; 2 ] in
+  let identity_ok =
+    match before with
+    | Some b -> Vm_value.serialize container = b
+    | None -> Vm_value.equal container (build inner)
+  in
+  let forked = not (view.Vm_value.cell == updated.Vm_value.cell) in
+  if old_ok && new_ok && identity_ok && forked then
+    pass
+      "%s: the recursive mark disables the in-place write — the nested cell forks, the aliased value stays byte-identical"
+      name
+  else if old_ok && identity_ok && not forked then
+    fail "%s: arr_set_direct mutated the shared cell in place (no fork)" name
+  else ()
+
+let check_nested_sharing_tracking () =
+  nested_alias_case "nested sharing: Struct(Array)" (fun i -> Vm_value.Struct [| i |])
+    (function Vm_value.Struct f -> f.(0) | _ -> assert false);
+  nested_alias_case "nested sharing: Tuple(Array)" (fun i -> Vm_value.Tuple [| i |])
+    (function Vm_value.Tuple f -> f.(0) | _ -> assert false);
+  nested_alias_case "nested sharing: Enum(Array)" (fun i -> Vm_value.Enum (0, [| i |]))
+    (function Vm_value.Enum (_, f) -> f.(0) | _ -> assert false);
+  nested_alias_case "nested sharing: Array(Array) element" (fun i -> Vm_value.array [| i |])
+    (function Vm_value.Array a -> Vm_value.arr_get a 0 | _ -> assert false);
+  nested_alias_case "nested sharing: Closure capture Array"
+    (fun i -> Vm_value.Closure (instance 77, [| i |]))
+    (function Vm_value.Closure (_, caps) -> caps.(0) | _ -> assert false);
+  nested_alias_case "nested sharing: Map value Array"
+    (fun i -> Vm_value.map_of_pairs [ (Vm_value.String "k", i) ])
+    (function
+      | Vm_value.Map m -> (
+          match Vm_value.map_find m (Vm_value.String "k") with
+          | Some (_, v) -> v
+          | None -> assert false)
+      | _ -> assert false);
+  nested_alias_case "nested sharing: Map key Array"
+    (fun i -> Vm_value.map_of_pairs [ (i, Vm_value.String "v") ])
+    (function
+      | Vm_value.Map m -> (
+          match Vm_value.map_pairs m with (k, _) :: _ -> k | [] -> assert false)
+      | _ -> assert false);
+  nested_alias_case "nested sharing: Set(Array) element" (fun i -> Vm_value.set_of_list [ i ])
+    (function
+      | Vm_value.Set s -> (
+          match Vm_value.set_elems s with x :: _ -> x | [] -> assert false)
+      | _ -> assert false);
+  nested_alias_case "nested sharing: Set(Struct(Array)) element"
+    (fun i -> Vm_value.set_of_list [ Vm_value.Struct [| i |] ])
+    (function
+      | Vm_value.Set s -> (
+          match Vm_value.set_elems s with
+          | Vm_value.Struct f :: _ -> f.(0)
+          | _ -> assert false)
+      | _ -> assert false)
+
+(* a value appended into an ALREADY-SHARED cell is reachable from every
+   holder of that cell: the deep walk stops at an unowned cell, so
+   arr_push must mark the appended value itself.  A direct write through
+   the appended array must therefore fork; before the fix it mutated the
+   shared cell in place. *)
+let check_push_sharing_maintenance () =
+  let a = Vm_value.arr_of_array [| oi 0 |] in
+  Vm_value.arr_mark_shared a;
+  let inner = Vm_value.arr_of_array [| oi 5 |] in
+  let _grown = Vm_value.arr_push a (Vm_value.Array inner) in
+  let updated = Vm_value.arr_set_direct inner 0 (oi 99) in
+  let old_ok = expect_ints "push into a shared cell: the appended value" inner [ 5 ] in
+  let new_ok = expect_ints "push into a shared cell: the write's own view" updated [ 99 ] in
+  let forked = not (inner.Vm_value.cell == updated.Vm_value.cell) in
+  if old_ok && new_ok && forked then
+    pass
+      "push into a shared cell: the appended value is marked shared — a direct write through it forks and the shared value keeps [5]"
+  else if old_ok && not forked then
+    fail
+      "push into a shared cell: the appended value was NOT marked — an in-place write aliased the shared value";
+  (* a push at an UNIQUE frontier must stay the amortized in-place
+     append: same cell, grown, still owned *)
+  let b = Vm_value.arr_of_array [| oi 1 |] in
+  let b' = Vm_value.arr_push b (oi 2) in
+  if (not b'.Vm_value.cell.owned) || not (b'.Vm_value.cell == b.Vm_value.cell) then
+    fail "push at an unshared frontier: the append forked instead of growing in place"
+  else ignore (expect_ints "push at an unshared frontier" b' [ 1; 2 ])
+
+(* the walk terminates on a cyclic value (an element that is a view of
+   its own cell) — the only mutable links in the value model pass
+   through an array cell, and the cell's flag is set before descending. *)
+let check_cyclic_mark () =
+  let a = Vm_value.arr_of_array [| oi 1 |] in
+  let self = Vm_value.Array a in
+  let grown = Vm_value.arr_push a self in
+  Vm_value.arr_mark_shared_value (Vm_value.Array grown);
+  pass
+    "cycle-safe deep mark: marking an array whose element contains the array's own cell terminates"
+
+(* ── the VM-level nested-alias battery (guest-expressible shapes) ── *)
+
+let nested_arr_ty = Type_repr.Fixed_array (i64, 2)
+let nested_arr_arr_ty = Type_repr.Fixed_array (nested_arr_ty, 2)
+let nested_tup_ty = Type_repr.Tuple [| nested_arr_ty |]
+let nested_s_tid = Ids.Type_id.make 401
+let nested_s_ty = Type_repr.Named (nested_s_tid, [||])
+
+let nested_s_def : Seed_mir.type_def =
+  Seed_mir.StructDef
+    { sd_id = nested_s_tid; sd_fields = [ mk_fd 4011 0 nested_arr_ty ] }
+
+let nested_arr_value () : Vm_value.t = Vm_value.array [| oi 1; oi 2 |]
+
+let nested_holder_ok (v : Vm_value.t) : bool =
+  Vm_value.serialize v = Vm_value.serialize (nested_arr_value ())
+
+(* run the program; its return value must be the untouched holder's
+   nested [0] = 1, and the holder slot named by `holder` must still
+   serialize byte-identically to [1,2]. *)
+let check_nested_vm (what : string) (prog : Seed_mir.program) (holder : int) : unit =
+  match Vm.entry_frame_of ~program:prog ~entry:(entry_of prog) ~argv:[||] with
+  | Error m -> fail "%s: entry setup: %s" what m
+  | Ok (vm, frame) -> (
+      match Vm.run_inspect vm frame with
+      | Error m -> fail "%s: %s" what m
+      | Ok ret ->
+          let holder_ok =
+            match frame.locals.(holder) with
+            | Vm_value.Live v -> (
+                match v with
+                | Vm_value.Struct f -> nested_holder_ok f.(0)
+                | Vm_value.Tuple f -> nested_holder_ok f.(0)
+                | Vm_value.Array a -> nested_holder_ok (Vm_value.arr_get a 0)
+                | _ -> false)
+            | _ -> false
+          in
+          if ret <> "1" then
+            fail "%s: the untouched holder read %s (expected 1 — the alias was mutated)" what
+              ret
+          else if not holder_ok then
+            fail "%s: the untouched holder's nested array is no longer byte-identical to [1,2]"
+              what
+          else
+            pass
+              "%s: the nested element write forked — the untouched holder stays byte-identical [1,2]"
+              what)
+
+(* Build the container in local 2, alias it into local 3 (Copy — the
+   Read/Copy mark), mutate the nested element through one holder
+   (`mutate_through`), and return the nested element read through the
+   other.  Prelude statements build the inner array(s) in scratch
+   locals; local 5 is the return scratch. *)
+let nested_vm_prog (locals : Type_repr.t array) (types : Seed_mir.type_def array)
+    (prelude : Seed_mir.statement list) (build : Seed_mir.rvalue)
+    (mutate_through : int) (hit : Seed_mir.projection list) : Seed_mir.program =
+  let other = if mutate_through = 2 then 3 else 2 in
+  single_block locals types
+    (prelude
+    @ [
+        Seed_mir.Assign (pl 2, build);
+        Seed_mir.Assign (pl 3, Seed_mir.Use (Seed_mir.Copy (pl 2)));
+        Seed_mir.Assign (plp mutate_through hit, Seed_mir.Use (int_op 99));
+        Seed_mir.Assign (pl 5, Seed_mir.Use (Seed_mir.Copy (plp other hit)));
+        Seed_mir.Assign (pl 0, Seed_mir.Use (Seed_mir.Copy (pl 5)));
+      ])
+    Seed_mir.Ret
+
+let check_nested_array_vm_alias () =
+  let inner_prelude =
+    [ Seed_mir.Assign
+        ( pl 1,
+          Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ int_op 1; int_op 2 ]) ) ]
+  in
+  let struct_build =
+    Seed_mir.Aggregate
+      ( Seed_mir.StructCtor (nested_s_tid, [| Ids.Field_index.make 0 |]),
+        [ Seed_mir.Copy (pl 1) ] )
+  in
+  check_nested_vm "VM alias: Struct(Array), mutate B read A"
+    (nested_vm_prog
+       [| i64; nested_arr_ty; nested_s_ty; nested_s_ty; i64; i64 |]
+       [| nested_s_def |] inner_prelude struct_build 3 [ fid 4011; cidx 0 ])
+    2;
+  check_nested_vm "VM alias: Struct(Array), mutate A read B"
+    (nested_vm_prog
+       [| i64; nested_arr_ty; nested_s_ty; nested_s_ty; i64; i64 |]
+       [| nested_s_def |] inner_prelude struct_build 2 [ fid 4011; cidx 0 ])
+    3;
+  let tuple_build =
+    Seed_mir.Aggregate (Seed_mir.TupleAgg, [ Seed_mir.Copy (pl 1) ])
+  in
+  check_nested_vm "VM alias: Tuple(Array), mutate B read A"
+    (nested_vm_prog
+       [| i64; nested_arr_ty; nested_tup_ty; nested_tup_ty; i64; i64 |]
+       [||] inner_prelude tuple_build 3 [ cidx 0; cidx 0 ])
+    2;
+  check_nested_vm "VM alias: Tuple(Array), mutate A read B"
+    (nested_vm_prog
+       [| i64; nested_arr_ty; nested_tup_ty; nested_tup_ty; i64; i64 |]
+       [||] inner_prelude tuple_build 2 [ cidx 0; cidx 0 ])
+    3;
+  let arr_arr_build =
+    Seed_mir.Aggregate
+      (Seed_mir.ArrayAgg, [ Seed_mir.Copy (pl 1); Seed_mir.Copy (pl 4) ])
+  in
+  let arr_arr_prelude =
+    inner_prelude
+    @ [ Seed_mir.Assign
+          ( pl 4,
+            Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ int_op 3; int_op 4 ]) ) ]
+  in
+  check_nested_vm "VM alias: Array(Array), mutate B read A"
+    (nested_vm_prog
+       [| i64; nested_arr_ty; nested_arr_arr_ty; nested_arr_arr_ty; nested_arr_ty; i64 |]
+       [||] arr_arr_prelude arr_arr_build 3 [ cidx 0; cidx 0 ])
+    2;
+  check_nested_vm "VM alias: Array(Array), mutate A read B"
+    (nested_vm_prog
+       [| i64; nested_arr_ty; nested_arr_arr_ty; nested_arr_arr_ty; nested_arr_ty; i64 |]
+       [||] arr_arr_prelude arr_arr_build 2 [ cidx 0; cidx 0 ])
+    3;
+  (* the host extraction path: vec_get returns the STORED inner array
+     (the binding marks it shared), then a direct projected write lands
+     on the extracted root cell — it must fork, never mutate the vec's
+     stored element *)
+  let get_prog =
+    prog_with_types
+      [| Type_repr.Unit; nested_arr_ty; nested_arr_ty; nested_arr_arr_ty;
+         nested_arr_arr_ty; nested_arr_ty; i64 |]
+      [||]
+      [|
+        { Seed_mir.id = 0;
+          statements =
+            [
+              Seed_mir.Assign
+                ( pl 1,
+                  Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ int_op 1; int_op 2 ]) );
+              Seed_mir.Assign
+                ( pl 2,
+                  Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ int_op 3; int_op 4 ]) );
+              Seed_mir.Assign
+                ( pl 3,
+                  Seed_mir.Aggregate
+                    (Seed_mir.ArrayAgg, [ Seed_mir.Copy (pl 1); Seed_mir.Copy (pl 2) ]) );
+              Seed_mir.Assign (pl 4, Seed_mir.Use (Seed_mir.Copy (pl 3)));
+              Seed_mir.Assign (pl 6, Seed_mir.Use (int_op 0));
+            ];
+          terminator =
+            Seed_mir.Call
+              ( local 5,
+                collection_intrinsic "__intrinsic_array_get",
+                [| read_arg 3; read_arg 6 |],
+                1,
+                None ) };
+        { Seed_mir.id = 1;
+          statements =
+            [
+              Seed_mir.Assign (plp 5 [ cidx 0 ], Seed_mir.Use (int_op 99));
+              Seed_mir.Assign
+                ( pl 0,
+                  Seed_mir.Use
+                    (Seed_mir.Copy
+                       { root = Seed_mir.Local 3; projections = [ cidx 0; cidx 0 ] }) );
+            ];
+          terminator = Seed_mir.Ret };
+      |]
+  in
+  (match Vm.entry_frame_of ~program:get_prog ~entry:(entry_of get_prog) ~argv:[||] with
+   | Error m -> fail "VM alias: host vec_get extraction: entry setup: %s" m
+   | Ok (vm, frame) -> (
+       match Vm.run_inspect vm frame with
+       | Error m -> fail "VM alias: host vec_get extraction: %s" m
+       | Ok ret ->
+           let extracted_ok =
+             match frame.locals.(5) with
+             | Vm_value.Live (Vm_value.Array a) -> int_list a = [ 99; 2 ]
+             | _ -> false
+           in
+           if ret <> "1" then
+             fail
+               "VM alias: host vec_get extraction: the vec's stored inner array became %s (expected 1)"
+               ret
+           else if not extracted_ok then
+             fail "VM alias: host vec_get extraction: the extracted array is not [99,2]"
+           else
+             pass
+               "VM alias: host vec_get extraction — the direct write forked; the vec's stored inner array stays [1,2]"))
+
+(* Map[String, Array] through the REAL host bindings: copy the map,
+   read the stored array through the copy (map_get marks it shared),
+   take the direct write path on the extracted array, and check the
+   map's retained value stays byte-identical.  option_expect transfers
+   the payload out of the Option. *)
+let check_nested_map_vm_alias () =
+  let map_ty = Type_repr.Named (Ids.Type_id.make 1, [| string_ty; nested_arr_ty |]) in
+  let opt_ty = Type_repr.Named (Ids.Type_id.make 3, [||]) in
+  let prog =
+    main_prog [| Type_repr.Unit; map_ty; opt_ty; vec_ty; string_ty; string_ty |]
+      [|
+        { id = 0;
+          statements = [];
+          terminator =
+            Seed_mir.Call
+              ( local 2,
+                collection_intrinsic "__intrinsic_map_get",
+                [| read_arg 1; read_arg 4 |],
+                1,
+                None ) };
+        { id = 1;
+          statements = [];
+          terminator =
+            Seed_mir.Call
+              ( local 3,
+                collection_intrinsic "__intrinsic_option_expect",
+                [| consume_move 2; read_arg 5 |],
+                2,
+                None ) };
+        { id = 2;
+          statements =
+            [
+              Seed_mir.Assign (plp 3 [ cidx 0 ], Seed_mir.Use (int_op 99));
+              Seed_mir.Assign (pl 0, Seed_mir.Use (int_op 0));
+            ];
+          terminator = Seed_mir.Ret };
+      |]
+  in
+  let seed (_vm : Vm.t) (frame : Vm_value.frame) (_res : Vm_memory.pointer array) : unit =
+    frame.locals.(1) <-
+      Vm_value.Live
+        (Vm_value.map_of_pairs [ (Vm_value.String "k", nested_arr_value ()) ]);
+    frame.locals.(4) <- Vm_value.Live (Vm_value.String "k");
+    frame.locals.(5) <- Vm_value.Live (Vm_value.String "missing")
+  in
+  match seeded_run prog seed 0 with
+  | Setup_error m -> fail "VM alias: Map[String, Array]: entry setup: %s" m
+  | Ran_error (m, _) -> fail "VM alias: Map[String, Array]: %s" m
+  | Ran_ok run ->
+      let stored_ok =
+        match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Map store) -> (
+            match Vm_value.map_find store (Vm_value.String "k") with
+            | Some (_, v) -> nested_holder_ok v
+            | None -> false)
+        | _ -> false
+      in
+      let extracted_ok =
+        match run.sframe.locals.(3) with
+        | Vm_value.Live (Vm_value.Array a) -> int_list a = [ 99; 2 ]
+        | _ -> false
+      in
+      if stored_ok && extracted_ok then
+        pass
+          "VM alias: Map[String, Array] — map_get marks the stored array shared; the direct write forked and the map's retained value stays [1,2]"
+      else if not stored_ok then
+        fail "VM alias: Map[String, Array]: the map's stored array was mutated in place"
+      else fail "VM alias: Map[String, Array]: the extracted array is not [99,2]"
+
+(* Set[Array] through the REAL host bindings: set_entries returns the
+   stored elements (each marked shared), vec_get extracts one, and the
+   direct write on it must fork rather than mutate the set's member. *)
+let check_nested_set_vm_alias () =
+  let set_ty_arr = Type_repr.Named (Ids.Type_id.make 2, [| nested_arr_ty |]) in
+  let prog =
+    main_prog [| Type_repr.Unit; set_ty_arr; vec_ty; vec_ty; i64 |]
+      [|
+        { id = 0;
+          statements = [];
+          terminator =
+            Seed_mir.Call
+              ( local 2,
+                collection_intrinsic "__intrinsic_set_entries",
+                [| read_arg 1 |],
+                1,
+                None ) };
+        { id = 1;
+          statements = [];
+          terminator =
+            Seed_mir.Call
+              ( local 3,
+                collection_intrinsic "__intrinsic_array_get",
+                [| read_arg 2; read_arg 4 |],
+                2,
+                None ) };
+        { id = 2;
+          statements =
+            [
+              Seed_mir.Assign (plp 3 [ cidx 0 ], Seed_mir.Use (int_op 99));
+              Seed_mir.Assign (pl 0, Seed_mir.Use (int_op 0));
+            ];
+          terminator = Seed_mir.Ret };
+      |]
+  in
+  let seed (_vm : Vm.t) (frame : Vm_value.frame) (_res : Vm_memory.pointer array) : unit =
+    frame.locals.(1) <-
+      Vm_value.Live (Vm_value.set_of_list [ nested_arr_value () ]);
+    frame.locals.(4) <- Vm_value.Live (int64_value 0L)
+  in
+  match seeded_run prog seed 0 with
+  | Setup_error m -> fail "VM alias: Set[Array]: entry setup: %s" m
+  | Ran_error (m, _) -> fail "VM alias: Set[Array]: %s" m
+  | Ran_ok run ->
+      let stored_ok =
+        match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Set store) -> (
+            match Vm_value.set_elems store with
+            | [ v ] -> nested_holder_ok v
+            | _ -> false)
+        | _ -> false
+      in
+      let extracted_ok =
+        match run.sframe.locals.(3) with
+        | Vm_value.Live (Vm_value.Array a) -> int_list a = [ 99; 2 ]
+        | _ -> false
+      in
+      if stored_ok && extracted_ok then
+        pass
+          "VM alias: Set[Array] — set_entries marks each member shared; the direct write forked and the set's member stays [1,2]"
+      else if not stored_ok then
+        fail "VM alias: Set[Array]: the set's stored member was mutated in place"
+      else fail "VM alias: Set[Array]: the extracted array is not [99,2]"
+
 let () =
   Printf.printf "Seed VM kernel-closure primitive self-check\n";
   check_dyn_index ();
@@ -2138,6 +2624,13 @@ let () =
   check_map_insert_ownership ();
   check_nested_set_ownership ();
   check_inplace_set_alias ();
+  (* audit top-P0/P1: recursive sharing propagation for nested arrays *)
+  check_nested_sharing_tracking ();
+  check_push_sharing_maintenance ();
+  check_cyclic_mark ();
+  check_nested_array_vm_alias ();
+  check_nested_map_vm_alias ();
+  check_nested_set_vm_alias ();
   check_unwind_pair ();
   if !failures = 0 then begin
     Printf.printf "ALL PASS\n";

@@ -1850,6 +1850,17 @@ let extern_binding (name : string) (a : adapter) : binding =
      • a FAILED bounds check consumes NOTHING: the check runs before
        any mutation, the adapter returns an error, and no writeback is
        produced (the VM traps on the error);
+     • every value-returning READ (get/remove/pop/drain, the visit and
+       entries bindings, from_list's identity) hands a stored member to
+       the caller while the container stays live: the member is marked
+       shared with the DEEP, recursive `arr_mark_shared_value` — every
+       array cell reachable INSIDE the member (a Struct field, a tuple/
+       enum slot, a closure capture, a Map/Set member, a nested Array
+       element) is marked too, because the returned member keeps sharing
+       those nested arrays with the collection's retained value.  An
+       in-place element write through the returned value (or through a
+       nested array extracted from it) forks instead of mutating the
+       collection's backing data;
      • the WRITEBACK channel never duplicates an aggregate: each
        element/key object of the old collection either stays (shared
        into the new collection — single live owner, the old collection
