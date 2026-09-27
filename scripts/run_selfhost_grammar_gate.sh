@@ -57,7 +57,19 @@
 #      currently EMPTY (the tree is fully clean; a future exception MUST be
 #      justified in that file).
 #
-#   4. COMPILER CHECK (when usable) — if a native compiler binary exists in
+#   4. KERNEL PARSE-PARITY (the grammar authority) — run the REAL kernel
+#      lexer+parser (stage0_ocaml build of the tg_parse_parity lane, which
+#      compiles the kernel front end with the OCaml seed and parses every
+#      manifest closure source in the seed VM) over the 45-source closure.
+#      Any grammar diagnostic ("expected item", "expected 'end'", ...)
+#      fails the gate. This catches seed/kernel grammar divergence — the
+#      match-tail `end  end  end` class that otherwise blocks stage1
+#      tens of minutes into the ladder — in a few minutes. The lane is
+#      built on demand with dune; when neither the lane binary nor dune is
+#      available the step warns and the structural scans above remain the
+#      authoritative rejection.
+#
+#   5. COMPILER CHECK (when usable) — if a native compiler binary exists in
 #      build/ (tg_stage3, else tg_stage2, else tg_stage1) AND that binary
 #      rejects a legacy-spelling probe (i.e. it implements the current E100
 #      grammar — a stale binary built before the E100 removal silently accepts
@@ -68,9 +80,11 @@
 #
 # Exit codes:
 #   0  closure AND full tool tree are clean (structural scans passed;
-#      compiler check passed or skipped)
+#      parse-parity passed or was unavailable; compiler check passed or
+#      skipped)
 #   1  hard failure: missing closure file, forbidden legacy form, stale
-#      tokenize call, or a closure source failed the current compiler's check
+#      tokenize call, a closure source the kernel parser cannot parse, or a
+#      closure source failed the current compiler's check
 
 set -uo pipefail
 
@@ -275,7 +289,38 @@ fi
 echo "[grammar-gate] full-tree structural scan OK: no legacy parameter forms / stale tokenize calls in ANY tg_compiler/*.tg"
 
 # ———————————————————————————————————————————————————————————————
-# Step 4 — compiler check over the closure (usable binary only)
+# Step 4 — kernel parse-parity over the manifest closure
+# ———————————————————————————————————————————————————————————————
+# The structural scans cannot see whether the KERNEL parser (the one every
+# stage from stage1 up is built from) accepts the closure the SEED accepts.
+# The tg_parse_parity lane compiles the real kernel front end with the OCaml
+# seed and, in the seed VM, parses every manifest closure source; any
+# grammar diagnostic fails the gate. Cheap relative to the stage ladder
+# (~3 minutes), so a seed/kernel grammar divergence is caught here instead
+# of 45 minutes into run_bootstrap.sh.
+
+PARITY_LANE="$ROOT_DIR/stage0_ocaml/_build/default/selfcheck/tg_parse_parity.exe"
+if [ ! -x "$PARITY_LANE" ]; then
+  if command -v dune >/dev/null 2>&1; then
+    echo "[grammar-gate] building the kernel parse-parity lane (dune build selfcheck/tg_parse_parity.exe)"
+    if ! (cd "$ROOT_DIR/stage0_ocaml" && dune build selfcheck/tg_parse_parity.exe); then
+      fail "cannot build the kernel parse-parity lane (dune build selfcheck/tg_parse_parity.exe)"
+    fi
+  fi
+fi
+
+if [ -x "$PARITY_LANE" ]; then
+  echo "[grammar-gate] kernel parse-parity: parsing the $n closure sources with the kernel parser (seed VM)"
+  if ! "$PARITY_LANE" "$ROOT_DIR"; then
+    fail "kernel parse-parity FAILED: the kernel parser records error diagnostics on a closure source the seed accepts (see build/parse_parity_report.txt)"
+  fi
+  echo "[grammar-gate] kernel parse-parity OK: every manifest closure source parses clean under the kernel parser"
+else
+  echo "[grammar-gate] warning: parse-parity lane $PARITY_LANE is unavailable and dune is not on PATH — kernel parse-parity NOT checked (structural scans remain authoritative)"
+fi
+
+# ———————————————————————————————————————————————————————————————
+# Step 5 — compiler check over the closure (usable binary only)
 # ———————————————————————————————————————————————————————————————
 
 GOOD_PROBE_FILE="$BUILD_DIR/bootstrap/grammar_gate_good_probe.tg"
