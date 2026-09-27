@@ -21,21 +21,20 @@
 
    Typecheck-debt policy (audit P1 + re-audit findings 3/5): the debt
    policy has ONE authority — this gate — running NO-REGRESSION against
-   a CHECKED baseline captured from a real `tg_stage0.exe
-   bootstrap-check` run on the checked tree and pinned in
-   baseline_typecheck_debt below (last re-pinned on the 2026-08-27
-   tree):
+   the accepted baseline captured from a real `tg_stage0.exe
+   bootstrap-check` run on the checked tree and pinned in the accepted
+   pointer bootstrap/evidence/ocaml/accepted.json + its evidence record
+   (SHA-256 verified); the hardcoded scalars in baseline_typecheck_debt
+   below are only the explicitly overridden development fallback
+   (TG_BOOTSTRAP_ACCEPTED_OVERRIDE=1):
 
-     checked baseline: debt_total 84, debt_primary 28, debt_secondary
-     56 (the per-category buckets are diagnostic context only — the
-     gate enforces the three monotonic scalars, never the buckets)
-     current measured state (2026-08-27): 80 errors across 56 modules /
-     4499 items (4 measured declaration-fixpoint passes — re-audit
-     finding 2: closure_ctx carries !decl_rounds, not a hard-coded 2);
-     debt_total 80, debt_primary 24, debt_secondary 56 — at/below the
-     checked baseline; per-category: unresolved_type 3,
-     unresolved_callable 8, unresolved_module 0, cannot_infer_generic
-     5, type_mismatch 53, obligation 3, duplicate_decl 0, other 8
+     accepted baseline: read from the verified accepted record (the
+     pointer's debt facts; per-category buckets are diagnostic context
+     only — the gate enforces the three monotonic scalars, never the
+     buckets); the accepted record currently names debt_total 172,
+     debt_primary 89, debt_secondary 83
+     hardcoded development fallback: debt_total 160, debt_primary 77,
+     debt_secondary 83 — used only under the explicit override
 
    The MONOTONIC gate fails (exit 1) exactly when a scalar rises:
    total > baseline total, primary > baseline primary, or secondary >
@@ -56,96 +55,22 @@
    The per-category buckets are diagnostic context only (a category may
    rise while the total falls — re-audit finding 5).
 
-   Re-audit item 30: the hardcoded baseline below is the FALLBACK; the
-   SINGLE machine-readable pointer is bootstrap/evidence/ocaml/
-   accepted.json (the tested SHA + the expected debt facts), which the
-   gate and the health script both read — the two can no longer drift.
-   When the accepted record is present, its debt facts replace the
-   fallback scalars. *)
-let baseline_from_file (repo_root : string) : Debt_report.t option =
-  (* re-audit P0-G: accepted.json is a tiny IMMUTABLE POINTER —
-     evidence_record + evidence_sha256 + approval — with NO copied
-     measurement fields.  The gate loads the pointer, verifies the
-     record's SHA-256, loads the generated evidence record, and reads
-     the debt facts FROM THAT RECORD.  A pointer whose record is
-     missing or hash-mismatched is rejected (fall back to the
-     hardcoded baseline with a loud warning); the class of error where
-     the pointer and the record describe different builds is
-     impossible. *)
-  let path = Filename.concat repo_root "bootstrap/evidence/ocaml/accepted.json" in
-  match In_channel.open_bin path with
-  | exception _ -> None
-  | ic ->
-      let content = In_channel.input_all ic in
-      close_in ic;
-      let key_of key =
-        (* the pointer's STRING values (the record filename, the SHA):
-           the digits-only generic reader cannot parse them, so extract
-           the quoted JSON string after `"key": ` *)
-        let pat = "\"" ^ key ^ "\": \"" in
-        match Util.find_key_value_pos content pat with
-        | None -> ""
-        | Some i -> (
-            let rest = String.sub content (i + String.length pat)
-                (String.length content - i - String.length pat) in
-            match String.index_opt rest '"' with
-            | None -> ""
-            | Some j -> String.sub rest 0 j)
-      in
-      let record_name = key_of "evidence_record" in
-      let expected_sha = key_of "evidence_sha256" in
-      if record_name = "" || expected_sha = "" then begin
-        Printf.printf
-          "  WARNING: accepted.json is not a pointer record (missing evidence_record/evidence_sha256) — falling back to the hardcoded baseline\n";
-        None
-      end
-      else begin
-        let rec_path = Filename.concat repo_root ("bootstrap/evidence/ocaml/" ^ record_name) in
-        match In_channel.open_bin rec_path with
-        | exception _ ->
-            Printf.printf
-              "  WARNING: accepted pointer's evidence record %s is missing — falling back to the hardcoded baseline\n"
-              record_name;
-            None
-        | ic2 ->
-            let rec_content = In_channel.input_all ic2 in
-            close_in ic2;
-            let actual_sha =
-              Digest.to_hex (Digest.string rec_content)
-            in
-            if actual_sha <> expected_sha then begin
-              Printf.printf
-                "  WARNING: accepted pointer's evidence record %s hash mismatch (record %s, pointer %s) — falling back to the hardcoded baseline\n"
-                record_name actual_sha expected_sha;
-              None
-            end
-            else begin
-              let int_of_key key =
-                let pat = "\"" ^ key ^ "\"" in
-                match Util.find_key_value rec_content pat with
-                | Some v -> int_of_string v
-                | None -> 0
-              in
-              let total = int_of_key "debt_total" in
-              let primaries = int_of_key "debt_primary" in
-              let secondaries = int_of_key "debt_secondary" in
-              if total <= 0 || primaries <= 0 || secondaries <= 0 then begin
-                Printf.printf
-                  "  WARNING: evidence record %s has malformed debt facts — falling back to the hardcoded baseline\n"
-                  record_name;
-                None
-              end
-              else
-                Some
-                  {
-                    Debt_report.buckets =
-                      List.map (fun c -> (c, 0)) Debt_report.categories;
-                    total;
-                    primaries;
-                    secondaries;
-                  }
-            end
-      end
+   Re-audit item 30 + audit items 18-20: the hardcoded baseline below is
+   ONLY the explicitly overridden development fallback; the SINGLE
+   machine-readable pointer is bootstrap/evidence/ocaml/accepted.json
+   (the tested record + its REAL SHA-256), which the gate and the
+   health script both read — the two can no longer drift.  When the
+   accepted record is present and verified, its debt facts replace the
+   fallback scalars, including a 0/0/0 record (the intended final
+   accepted baseline).
+
+   The pointer/record verification is fail-closed (audit item 20): a
+   missing or malformed pointer, a pointer whose record is missing, a
+   SHA-256 mismatch, or malformed/inconsistent debt facts are hard
+   bootstrap-infrastructure errors.  The one documented escape is
+   TG_BOOTSTRAP_ACCEPTED_OVERRIDE=1 (see Bootstrap_accepted.load),
+   which restores the old warning + hardcoded-baseline behaviour for
+   development only. *)
 let baseline_typecheck_debt : Debt_report.t =
   {
     Debt_report.buckets =
@@ -355,18 +280,21 @@ let () =
   Printf.printf "TANGERINE OCAML SEED — BOOTSTRAP COMPLETENESS GATE (tg_bootstrap_gate)\n";
   Printf.printf "  repo-root: %s; target: %s\n" repo_root target_str;
   let baseline =
-    match baseline_from_file repo_root with
-    | Some b when b.Debt_report.total > 0 ->
+    match Bootstrap_accepted.load ~repo_root ~hardcoded:baseline_typecheck_debt with
+    | Ok { Bootstrap_accepted.baseline = b; source = Bootstrap_accepted.Accepted_record record_name }
+      ->
         Printf.printf
-          "  checked typecheck-debt baseline (bootstrap/evidence/ocaml/accepted.json — the single accepted pointer): total %d, primary %d, secondary %d\n"
-          b.Debt_report.total b.Debt_report.primaries b.Debt_report.secondaries;
+          "  checked typecheck-debt baseline (bootstrap/evidence/ocaml/accepted.json -> %s, REAL SHA-256 verified): total %d, primary %d, secondary %d\n"
+          record_name b.Debt_report.total b.Debt_report.primaries b.Debt_report.secondaries;
         b
-    | _ ->
+    | Ok { Bootstrap_accepted.baseline = b; source = Bootstrap_accepted.Hardcoded_fallback reason }
+      ->
         Printf.printf
-          "  checked typecheck-debt baseline (hardcoded fallback — no accepted.json): total %d, primary %d, secondary %d\n"
-          baseline_typecheck_debt.Debt_report.total baseline_typecheck_debt.Debt_report.primaries
-          baseline_typecheck_debt.Debt_report.secondaries;
-        baseline_typecheck_debt
+          "  WARNING: accepted bootstrap evidence unusable (%s); %s=1 is set — using the hardcoded development fallback: total %d, primary %d, secondary %d\n"
+          reason Bootstrap_accepted.override_env b.Debt_report.total b.Debt_report.primaries
+          b.Debt_report.secondaries;
+        b
+    | Error m -> fail "accepted bootstrap evidence: %s" m
   in
   List.iter
     (fun (c, n) -> Printf.printf "    baseline %s: %d\n" c n)
