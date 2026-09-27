@@ -21,6 +21,13 @@ let prof_set_copies = ref 0
 let prof_pushes = ref 0
 let prof_map_scans = ref 0
 let prof_set_scans = ref 0
+(* the deep-share mark accounting: top-level marks, every visited value
+   node (aggregate spines included) and every array cell cleared.  A
+   mark's cost is exactly its visited-node count, so the beacon deltas
+   name the walk volume the execution pays. *)
+let prof_mark_calls = ref 0
+let prof_mark_nodes = ref 0
+let prof_mark_cleared = ref 0
 
 type t =
   | Unit
@@ -30,14 +37,14 @@ type t =
   | Float64 of int64
   | Char of Uchar.t
   | String of string
-  | Tuple of t array
-  | Struct of t array
-  | Enum of int * t array          (* variant index, payload *)
+  | Tuple of agg
+  | Struct of agg
+  | Enum of int * agg          (* variant index, payload *)
   | Array of arr
-  | Set of set_store               (* the runtime Set: order + hash index *)
-  | Map of map_store               (* the runtime Map: order + hash index *)
+  | Set of set_store           (* the runtime Set: order + hash index *)
+  | Map of map_store           (* the runtime Map: order + hash index *)
   | Function of Instance_id.t
-  | Closure of Instance_id.t * t array
+  | Closure of Instance_id.t * agg
   | RawPtr of Vm_memory.pointer
   | Ref of ref_target
   | Null
@@ -59,6 +66,23 @@ type t =
      in-place append: value semantics is preserved with NO uniqueness
      analysis.  Element writes / insert / remove / slice / clone fork a
      private cell, exactly the old whole-array copy. *)
+(* ── The aggregate payload (the deep-share completion marker) ────────
+   Tuple/Struct/Enum/Closure payloads carry a mutable `agg_marked`
+   flag: the aggregate analogue of the array cell's `owned` flag, and
+   the walk's completion marker for the immutable spines between array
+   cells.  `agg_marked = true` means every array cell reachable through
+   the payload was deep-marked (or was already unowned) when the flag
+   was set; the payload array itself is never mutated, and the only way
+   new content can become reachable under an already-marked aggregate
+   is an arr_push into a shared cell, which marks the appended value
+   itself.  A repeated mark of a marked aggregate is therefore O(1)
+   instead of a full re-walk of its subtree — the completion marker
+   that keeps the deep mark linear on structural-sharing workloads. *)
+and agg = {
+  mutable agg_marked : bool;
+  agg_elems : t array;
+}
+
 and arr = { cell : arr_cell; len : int }
 and arr_cell = {
   mutable data : t array;
@@ -159,6 +183,33 @@ let arr_of_array (xs : t array) : arr =
   { cell = { data = xs; high = Array.length xs; owned = true };
     len = Array.length xs }
 
+(* ── The aggregate-payload surface ──────────────────────────────────
+   Construction wraps the immutable element array in the marker record;
+   every access goes through these helpers so no caller reads past the
+   payload's length.  The payload is never mutated: aggregates rebuild
+   on write, exactly the value semantics the walk relies on. *)
+let agg (xs : t array) : agg = { agg_marked = false; agg_elems = xs }
+
+let agg_len (a : agg) : int = Array.length a.agg_elems
+
+let agg_get (a : agg) (i : int) : t = a.agg_elems.(i)
+
+let agg_to_array (a : agg) : t array = a.agg_elems
+
+let agg_to_list (a : agg) : t list = Array.to_list a.agg_elems
+
+let agg_iter (f : t -> unit) (a : agg) : unit = Array.iter f a.agg_elems
+
+let agg_exists (f : t -> bool) (a : agg) : bool = Array.exists f a.agg_elems
+
+let agg_for_all2 (f : t -> t -> bool) (a : agg) (b : agg) : bool =
+  Array.length a.agg_elems = Array.length b.agg_elems
+  && Array.for_all2 f a.agg_elems b.agg_elems
+
+(* the single-element payload view (the host's one-field handle shapes) *)
+let agg_singleton (a : agg) : t option =
+  if Array.length a.agg_elems = 1 then Some a.agg_elems.(0) else None
+
 (* mark a value as possibly held by a second binding: EVERY array cell
    reachable through the value loses its owned status.  The walk is
    DEEP because a value-semantics copy copies the nested arrays too —
@@ -192,19 +243,19 @@ let arr_of_array (xs : t array) : arr =
    of the value tree (a reference names a place or an owned region
    image — it does not own a nested value), so the walk stops there. *)
 let rec mark_value_shared (v : t) : unit =
+  incr prof_mark_nodes;
   match v with
   | Array a ->
       if a.cell.owned then begin
         a.cell.owned <- false;
+        incr prof_mark_cleared;
         (* the logical content is data[0..len) — the frontier slots
            beyond len belong to other views and are not this value's *)
         for i = 0 to a.len - 1 do
           mark_value_shared a.cell.data.(i)
         done
       end
-  | Tuple elems | Struct elems -> Array.iter mark_value_shared elems
-  | Enum (_, payload) -> Array.iter mark_value_shared payload
-  | Closure (_, caps) -> Array.iter mark_value_shared caps
+  | Tuple a | Struct a | Enum (_, a) | Closure (_, a) -> mark_agg a
   | Set s ->
       List.iter mark_value_shared s.set_front;
       List.iter mark_value_shared s.set_back
@@ -215,9 +266,19 @@ let rec mark_value_shared (v : t) : unit =
   | Function _ | RawPtr _ | Ref _ | Null | MovedOut ->
       ()
 
-let arr_mark_shared_value (v : t) : unit = mark_value_shared v
+(* the aggregate completion marker: the first mark walks the payload, a
+   repeated mark stops in O(1) *)
+and mark_agg (a : agg) : unit =
+  if not a.agg_marked then begin
+    a.agg_marked <- true;
+    Array.iter mark_value_shared a.agg_elems
+  end
 
-let arr_mark_shared (a : arr) : unit = mark_value_shared (Array a)
+let arr_mark_shared_value (v : t) : unit =
+  incr prof_mark_calls;
+  mark_value_shared v
+
+let arr_mark_shared (a : arr) : unit = arr_mark_shared_value (Array a)
 
 let arr_empty : arr = arr_of_array [||]
 
@@ -277,7 +338,7 @@ let arr_push (a : arr) (v : t) : arr =
        cell (its elements were marked when the cell was marked).  A
        unique (owned) cell needs no mark — its holder is the only one
        that can ever reach the new element. *)
-    if not c.owned then mark_value_shared v;
+    if not c.owned then arr_mark_shared_value v;
     c.high <- c.high + 1;
     { cell = c; len = a.len + 1 }
   end
@@ -410,12 +471,12 @@ let rec equal (a : t) (b : t) : bool =
   | Char x, Char y -> Uchar.equal x y
   | String x, String y -> x = y
   | Tuple x, Tuple y | Struct x, Struct y ->
-      Array.length x = Array.length y && Array.for_all2 equal x y
+      agg_for_all2 equal x y
   | Array x, Array y -> arr_equal_seq equal x y
-  | Enum (i, x), Enum (j, y) -> i = j && Array.length x = Array.length y && Array.for_all2 equal x y
+  | Enum (i, x), Enum (j, y) -> i = j && agg_for_all2 equal x y
   | Function a, Function b -> Instance_id.compare a b = 0
   | Closure (a, ca), Closure (b, cb) ->
-      Instance_id.compare a b = 0 && Array.length ca = Array.length cb && Array.for_all2 equal ca cb
+      Instance_id.compare a b = 0 && agg_for_all2 equal ca cb
   | RawPtr a, RawPtr b ->
       a.Vm_memory.region = b.Vm_memory.region && a.Vm_memory.offset = b.Vm_memory.offset
   | Ref a, Ref b -> (
@@ -451,9 +512,9 @@ let rec value_hash (v : t) : int =
   | Float64 f -> mix 7 (Int64.to_int f)
   | Char c -> mix 11 (Uchar.to_int c)
   | String s -> mix 13 (Hashtbl.hash s)
-  | Tuple elems | Struct elems -> mix 17 (array_hash elems)
+  | Tuple elems | Struct elems -> mix 17 (array_hash (agg_to_array elems))
   | Array elems -> mix 17 (arr_hash elems)
-  | Enum (tag, payload) -> mix 19 (mix tag (array_hash payload))
+  | Enum (tag, payload) -> mix 19 (mix tag (array_hash (agg_to_array payload)))
   | RawPtr p -> mix 29 (mix p.Vm_memory.region p.Vm_memory.offset)
   | Ref (Region p) -> mix 31 (mix p.Vm_memory.region p.Vm_memory.offset)
   | Null -> 41
@@ -483,14 +544,14 @@ and arr_hash (elems : arr) : int =
 let rec has_owned_ref (v : t) : bool =
   match v with
   | Tuple elems | Struct elems | Enum (_, elems) ->
-      Array.exists has_owned_ref elems
+      agg_exists has_owned_ref elems
   | Array elems -> arr_exists has_owned_ref elems
   | Set s ->
       List.exists has_owned_ref s.set_front || List.exists has_owned_ref s.set_back
   | Map m ->
       List.exists (fun (k, v) -> has_owned_ref k || has_owned_ref v) m.map_front
       || List.exists (fun (k, v) -> has_owned_ref k || has_owned_ref v) m.map_back
-  | Closure (_, caps) -> Array.exists has_owned_ref caps
+  | Closure (_, caps) -> agg_exists has_owned_ref caps
   | Ref (Region _) -> true
   | Unit | Bool _ | Int _ | Float32 _ | Float64 _ | Char _ | String _
   | Function _ | RawPtr _ | Ref (Place _) | Null | MovedOut ->
@@ -782,12 +843,12 @@ let rec serialize_value (buf : Buffer.t) (v : t) : unit =
       Buffer.add_string buf s
   | Tuple elems ->
       Buffer.add_char buf (Char.chr 0x08);
-      put_u64 buf (Int64.of_int (Array.length elems));
-      Array.iter (serialize_value buf) elems
+      put_u64 buf (Int64.of_int (agg_len elems));
+      agg_iter (serialize_value buf) elems
   | Struct elems ->
       Buffer.add_char buf (Char.chr 0x09);
-      put_u64 buf (Int64.of_int (Array.length elems));
-      Array.iter (serialize_value buf) elems
+      put_u64 buf (Int64.of_int (agg_len elems));
+      agg_iter (serialize_value buf) elems
   | Array elems ->
       Buffer.add_char buf (Char.chr 0x0A);
       put_u64 buf (Int64.of_int (arr_length elems));
@@ -807,8 +868,8 @@ let rec serialize_value (buf : Buffer.t) (v : t) : unit =
   | Enum (tag, payload) ->
       Buffer.add_char buf (Char.chr 0x0B);
       put_u64 buf (Int64.of_int tag);
-      put_u64 buf (Int64.of_int (Array.length payload));
-      Array.iter (serialize_value buf) payload
+      put_u64 buf (Int64.of_int (agg_len payload));
+      agg_iter (serialize_value buf) payload
   | RawPtr p ->
       Buffer.add_char buf (Char.chr 0x0C);
       put_u64 buf (Int64.of_int p.Vm_memory.region);
@@ -885,12 +946,12 @@ let rec deserialize_value (c : cursor) : t =
   | 0x07 ->
       let len = cursor_count c in
       String (Bytes.to_string (cursor_take c len))
-  | 0x08 -> Tuple (cursor_elems c)
-  | 0x09 -> Struct (cursor_elems c)
+  | 0x08 -> Tuple (agg (cursor_elems c))
+  | 0x09 -> Struct (agg (cursor_elems c))
   | 0x0A -> Array (arr_of_array (cursor_elems c))
   | 0x0B ->
       let tag = cursor_count c in
-      Enum (tag, cursor_elems c)
+      Enum (tag, agg (cursor_elems c))
   | 0x0C ->
       let region = cursor_count c in
       let offset = cursor_count c in
@@ -935,12 +996,12 @@ let deserialize (bytes : Bytes.t) : t =
    and are left untouched. *)
 let rec drop_glue (m : Vm_memory.t) (v : t) : unit =
   match v with
-  | Tuple elems | Struct elems -> Array.iter (drop_glue m) elems
+  | Tuple elems | Struct elems -> agg_iter (drop_glue m) elems
   | Array elems -> arr_iter (drop_glue m) elems
   | Set store -> List.iter (drop_glue m) (set_elems store)
   | Map store ->
       List.iter (fun (k, v) -> drop_glue m k; drop_glue m v) (map_pairs store)
-  | Enum (_, payload) -> Array.iter (drop_glue m) payload
+  | Enum (_, payload) -> agg_iter (drop_glue m) payload
   | Ref (Region p) -> (
       match Vm_memory.free m p with
       | Ok () -> ()

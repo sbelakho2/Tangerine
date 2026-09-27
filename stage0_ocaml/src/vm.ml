@@ -171,6 +171,10 @@ let mk_error vm kind message =
    populated only when TANGERINE_DEBUG_STEPS is set) *)
 let host_prof : (string, int * float) Hashtbl.t = Hashtbl.create 256
 
+(* diagnostic: wall time since the previous beacon (first beacon from
+   module load) *)
+let beacon_prev = ref (Unix.gettimeofday ())
+
 let step_limit (vm : t) : unit =
   vm.steps <- vm.steps + 1;
   (if Array.length vm.step_hist > 0 then begin
@@ -180,10 +184,15 @@ let step_limit (vm : t) : unit =
       | _ -> ());
      if vm.steps mod 100_000_000 = 0 then
        let st = Gc.quick_stat () in
+       let now = Unix.gettimeofday () in
+       let dt = now -. !beacon_prev in
+       beacon_prev := now;
        Printf.eprintf
-         "VM BEACON steps=%d host=%d pushes=%d push_copies=%d set_copies=%d map_scans=%d set_scans=%d regions=%d live_mb=%.0f\n%!"
+         "VM BEACON steps=%d host=%d pushes=%d push_copies=%d set_copies=%d map_scans=%d set_scans=%d mark_calls=%d mark_nodes=%d mark_cleared=%d dt=%.1fs regions=%d live_mb=%.0f\n%!"
          vm.steps vm.host_calls !Vm_value.prof_pushes !Vm_value.prof_push_copies
          !Vm_value.prof_set_copies !Vm_value.prof_map_scans !Vm_value.prof_set_scans
+         !Vm_value.prof_mark_calls !Vm_value.prof_mark_nodes
+         !Vm_value.prof_mark_cleared dt
          !Vm_memory.prof_regions
          (float_of_int st.Gc.live_words *. 8. /. 1048576.)
    end);
@@ -447,8 +456,8 @@ let rec eval_operand (vm : t) (frame : frame) (op : Seed_mir.operand) : Vm_value
          struct literal and the empty Vec::new() container — a static
          read lowering to these constants executes as the aggregate *)
       | Seed_mir.Enum (vi, _) ->
-          Vm_value.Enum (Ids.Variant_index.to_int vi, [||])
-      | Seed_mir.Struct _ -> Vm_value.Struct [||]
+          Vm_value.Enum (Ids.Variant_index.to_int vi, Vm_value.agg [||])
+      | Seed_mir.Struct _ -> Vm_value.Struct (Vm_value.agg [||])
       | Seed_mir.Array _ -> Vm_value.Array Vm_value.arr_empty
       | Seed_mir.Map _ -> Vm_value.map_empty
       | Seed_mir.Set _ -> Vm_value.set_empty)
@@ -567,14 +576,15 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                recurse
                  (Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:false 0L))
            | Vm_value.Struct fields | Vm_value.Tuple fields ->
-               if i < 0 || i >= Array.length fields then
+               if i < 0 || i >= Vm_value.agg_len fields then
                  err_trap vm
                    (Printf.sprintf "field index out of bounds (type %s, %d field(s), index %d)"
-                      (Seed_mir.print_type base_ty) (Array.length fields) i)
-               else recurse fields.(i)
+                      (Seed_mir.print_type base_ty) (Vm_value.agg_len fields) i)
+               else recurse (Vm_value.agg_get fields i)
            | Vm_value.Enum (_, fields) ->
-               if i < 0 || i >= Array.length fields then err_trap vm "enum field index out of bounds"
-               else recurse fields.(i)
+               if i < 0 || i >= Vm_value.agg_len fields then
+                 err_trap vm "enum field index out of bounds"
+               else recurse (Vm_value.agg_get fields i)
            | _ -> err_trap vm "field projection on non-aggregate")
        | Seed_mir.ConstantIndex i -> (
            match base with
@@ -582,11 +592,11 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                if i < 0 || i >= Vm_value.arr_length elems then err_trap vm "index out of bounds"
                else recurse (Vm_value.arr_get elems i)
            | Vm_value.Tuple elems ->
-               if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds"
-               else recurse elems.(i)
+               if i < 0 || i >= Vm_value.agg_len elems then err_trap vm "tuple index out of bounds"
+               else recurse (Vm_value.agg_get elems i)
            | Vm_value.Struct elems ->
-               if i < 0 || i >= Array.length elems then err_trap vm "struct index out of bounds"
-               else recurse elems.(i)
+               if i < 0 || i >= Vm_value.agg_len elems then err_trap vm "struct index out of bounds"
+               else recurse (Vm_value.agg_get elems i)
            | Vm_value.String str ->
                if i < 0 || i >= String.length str then err_trap vm "string index out of bounds"
                else recurse (Vm_value.Char (Uchar.of_char str.[i]))
@@ -598,8 +608,8 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                if i < 0 || i >= Vm_value.arr_length elems then err_trap vm "index out of bounds"
                else recurse (Vm_value.arr_get elems i)
            | Vm_value.Tuple elems ->
-               if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds"
-               else recurse elems.(i)
+               if i < 0 || i >= Vm_value.agg_len elems then err_trap vm "tuple index out of bounds"
+               else recurse (Vm_value.agg_get elems i)
            | Vm_value.String str ->
                if i < 0 || i >= String.length str then err_trap vm "string index out of bounds"
                else recurse (Vm_value.Char (Uchar.of_char str.[i]))
@@ -634,14 +644,17 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                recurse tv
            | Vm_value.Ref (Vm_value.Region ptr) -> recurse (memory_load vm ptr)
            | Vm_value.RawPtr ptr -> recurse (memory_load_typed vm ptr deref_ty)
-            | Vm_value.Struct [| Vm_value.Int a |] when is_ptr_handle_ty vm base_ty ->
-                (* the Ptr[T]/PtrMut[T] handle's value model: a
-                   single-address struct; deref decodes the address through
-                   the one codec *)
-                recurse
-                  (memory_load_typed vm
-                     (Vm_memory.pointer_of_int64 (Int_value.to_int64 a))
-                     deref_ty)
+             | Vm_value.Struct fields when is_ptr_handle_ty vm base_ty -> (
+                 (* the Ptr[T]/PtrMut[T] handle's value model: a
+                    single-address struct; deref decodes the address through
+                    the one codec *)
+                 match Vm_value.agg_singleton fields with
+                 | Some (Vm_value.Int a) ->
+                     recurse
+                       (memory_load_typed vm
+                          (Vm_memory.pointer_of_int64 (Int_value.to_int64 a))
+                          deref_ty)
+                 | _ -> err_trap vm "deref on non-pointer")
             | _
               when (match base_ty with
                    | Type_repr.Ref_internal _ -> true
@@ -841,21 +854,21 @@ and update_place ?(direct = false) (vm : t) (frame : frame) (base : Vm_value.t)
                | Vm_value.Null -> Vm_value.Null
                | _ -> err_trap vm "pointer address write with a non-integer value")
            | Vm_value.Struct fields ->
-              if i < 0 || i >= Array.length fields then
+              if i < 0 || i >= Vm_value.agg_len fields then
                  err_trap vm
                    (Printf.sprintf "field index out of bounds (type %s, %d field(s), index %d)"
-                      (Seed_mir.print_type base_ty) (Array.length fields) i);
-              let copy = Array.copy fields in
-              copy.(i) <- update_place vm frame fields.(i) next_ty rest v;
-              Vm_value.Struct copy
+                      (Seed_mir.print_type base_ty) (Vm_value.agg_len fields) i);
+              let copy = Array.copy (Vm_value.agg_to_array fields) in
+              copy.(i) <- update_place vm frame (Vm_value.agg_get fields i) next_ty rest v;
+              Vm_value.Struct (Vm_value.agg copy)
           | Vm_value.Tuple fields ->
-              if i < 0 || i >= Array.length fields then
+              if i < 0 || i >= Vm_value.agg_len fields then
                  err_trap vm
                    (Printf.sprintf "field index out of bounds (type %s, %d field(s), index %d)"
-                      (Seed_mir.print_type base_ty) (Array.length fields) i);
-              let copy = Array.copy fields in
-              copy.(i) <- update_place vm frame fields.(i) next_ty rest v;
-              Vm_value.Tuple copy
+                      (Seed_mir.print_type base_ty) (Vm_value.agg_len fields) i);
+              let copy = Array.copy (Vm_value.agg_to_array fields) in
+              copy.(i) <- update_place vm frame (Vm_value.agg_get fields i) next_ty rest v;
+              Vm_value.Tuple (Vm_value.agg copy)
           | _ -> err_trap vm "field write on non-aggregate")
       | Seed_mir.ConstantIndex i -> (
           match base with
@@ -868,15 +881,15 @@ and update_place ?(direct = false) (vm : t) (frame : frame) (base : Vm_value.t)
               in
               Vm_value.Array elems'
           | Vm_value.Tuple elems ->
-              if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds";
-              let copy = Array.copy elems in
-              copy.(i) <- update_place vm frame elems.(i) next_ty rest v;
-              Vm_value.Tuple copy
+              if i < 0 || i >= Vm_value.agg_len elems then err_trap vm "tuple index out of bounds";
+              let copy = Array.copy (Vm_value.agg_to_array elems) in
+              copy.(i) <- update_place vm frame (Vm_value.agg_get elems i) next_ty rest v;
+              Vm_value.Tuple (Vm_value.agg copy)
           | Vm_value.Struct elems ->
-              if i < 0 || i >= Array.length elems then err_trap vm "struct index out of bounds";
-              let copy = Array.copy elems in
-              copy.(i) <- update_place vm frame elems.(i) next_ty rest v;
-              Vm_value.Struct copy
+              if i < 0 || i >= Vm_value.agg_len elems then err_trap vm "struct index out of bounds";
+              let copy = Array.copy (Vm_value.agg_to_array elems) in
+              copy.(i) <- update_place vm frame (Vm_value.agg_get elems i) next_ty rest v;
+              Vm_value.Struct (Vm_value.agg copy)
           | Vm_value.String str ->
               if i < 0 || i >= String.length str then err_trap vm "string index out of bounds";
               let c =
@@ -898,10 +911,10 @@ and update_place ?(direct = false) (vm : t) (frame : frame) (base : Vm_value.t)
               in
               Vm_value.Array elems'
           | Vm_value.Tuple elems ->
-              if i < 0 || i >= Array.length elems then err_trap vm "tuple index out of bounds";
-              let copy = Array.copy elems in
-              copy.(i) <- update_place vm frame elems.(i) next_ty rest v;
-              Vm_value.Tuple copy
+              if i < 0 || i >= Vm_value.agg_len elems then err_trap vm "tuple index out of bounds";
+              let copy = Array.copy (Vm_value.agg_to_array elems) in
+              copy.(i) <- update_place vm frame (Vm_value.agg_get elems i) next_ty rest v;
+              Vm_value.Tuple (Vm_value.agg copy)
           | Vm_value.String str ->
               if i < 0 || i >= String.length str then err_trap vm "string index out of bounds";
               let c =
@@ -934,15 +947,18 @@ and update_place ?(direct = false) (vm : t) (frame : frame) (base : Vm_value.t)
                    memory_store_typed vm ptr deref_ty
                      (update_place vm frame cur next_ty rest v));
                base
-           | Vm_value.Struct [| Vm_value.Int a |] when is_ptr_handle_ty vm base_ty -> (
-               let ptr = Vm_memory.pointer_of_int64 (Int_value.to_int64 a) in
-               (match rest with
-                | [] -> memory_store_typed vm ptr deref_ty v
-                | _ ->
-                    let cur = memory_load_typed vm ptr deref_ty in
-                    memory_store_typed vm ptr deref_ty
-                       (update_place vm frame cur next_ty rest v));
-                base)
+           | Vm_value.Struct fields when is_ptr_handle_ty vm base_ty -> (
+               match Vm_value.agg_singleton fields with
+               | Some (Vm_value.Int a) -> (
+                   let ptr = Vm_memory.pointer_of_int64 (Int_value.to_int64 a) in
+                   (match rest with
+                    | [] -> memory_store_typed vm ptr deref_ty v
+                    | _ ->
+                        let cur = memory_load_typed vm ptr deref_ty in
+                        memory_store_typed vm ptr deref_ty
+                          (update_place vm frame cur next_ty rest v));
+                   base)
+               | _ -> err_trap vm "deref write on non-pointer")
             | _
               when (match base_ty with
                    | Type_repr.Ref_internal _ -> true
@@ -1024,8 +1040,9 @@ and drop_node (vm : t) (ty : Type_repr.t) (node : Drop_plan.plan_node)
   | Drop_plan.Fields fps, (Vm_value.Struct elems | Vm_value.Tuple elems) ->
       Array.iter
         (fun (fp : Drop_plan.field_plan) ->
-          if fp.Drop_plan.fp_index >= 0 && fp.Drop_plan.fp_index < Array.length elems then
-            drop_node vm fp.Drop_plan.fp_ty fp.Drop_plan.fp_node elems.(fp.Drop_plan.fp_index))
+          if fp.Drop_plan.fp_index >= 0 && fp.Drop_plan.fp_index < Vm_value.agg_len elems then
+            drop_node vm fp.Drop_plan.fp_ty fp.Drop_plan.fp_node
+              (Vm_value.agg_get elems fp.Drop_plan.fp_index))
         fps
   | Drop_plan.EnumVariants vps, Vm_value.Enum (tag, payload) ->
       Array.iter
@@ -1033,10 +1050,11 @@ and drop_node (vm : t) (ty : Type_repr.t) (node : Drop_plan.plan_node)
           if vp.Drop_plan.vp_tag = tag then
             Array.iter
               (fun (fp : Drop_plan.field_plan) ->
-                if fp.Drop_plan.fp_index >= 0 && fp.Drop_plan.fp_index < Array.length payload
+                if fp.Drop_plan.fp_index >= 0
+                   && fp.Drop_plan.fp_index < Vm_value.agg_len payload
                 then
                   drop_node vm fp.Drop_plan.fp_ty fp.Drop_plan.fp_node
-                    payload.(fp.Drop_plan.fp_index))
+                    (Vm_value.agg_get payload fp.Drop_plan.fp_index))
               vp.Drop_plan.vp_fields)
         vps
   | Drop_plan.Repeat { count; element = _ }, Vm_value.Array elems -> (
@@ -1088,14 +1106,14 @@ let drop_old_value_at (vm : t) (frame : frame) (p : Seed_mir.place) : unit =
                 match proj, v with
                 | Seed_mir.Field fid, Vm_value.Struct fields -> (
                     let i = field_index_of vm (type_of_local vm frame.fn local) fid in
-                    if i >= 0 && i < Array.length fields then
-                      match fields.(i) with
+                    if i >= 0 && i < Vm_value.agg_len fields then
+                      match Vm_value.agg_get fields i with
                       | Vm_value.MovedOut -> None
                       | fv -> leaf_value fv rest
                     else None)
                 | Seed_mir.ConstantIndex k, Vm_value.Tuple elems
-                  when k >= 0 && k < Array.length elems -> (
-                    match elems.(k) with
+                  when k >= 0 && k < Vm_value.agg_len elems -> (
+                    match Vm_value.agg_get elems k with
                     | Vm_value.MovedOut -> None
                     | ev -> leaf_value ev rest)
                 | Seed_mir.ConstantIndex k, Vm_value.Array elems
@@ -1104,7 +1122,9 @@ let drop_old_value_at (vm : t) (frame : frame) (p : Seed_mir.place) : unit =
                     | Vm_value.MovedOut -> None
                     | ev -> leaf_value ev rest)
                 | Seed_mir.Downcast _, Vm_value.Enum (_, payload) ->
-                    if Array.length payload > 0 then leaf_value payload.(0) rest else None
+                    if Vm_value.agg_len payload > 0 then
+                      leaf_value (Vm_value.agg_get payload 0) rest
+                    else None
                 | _ -> None)
           in
           match frame.locals.(local) with
@@ -1282,11 +1302,12 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
              ops)
       in
       (match kind with
-       | Seed_mir.TupleAgg -> Vm_value.Tuple vals
+       | Seed_mir.TupleAgg -> Vm_value.Tuple (Vm_value.agg vals)
        | Seed_mir.ArrayAgg -> Vm_value.Array (Vm_value.arr_of_array vals)
-       | Seed_mir.StructCtor _ -> Vm_value.Struct vals
-       | Seed_mir.EnumCtor (_, vid) -> Vm_value.Enum (Ids.Variant_index.to_int vid, vals)
-       | Seed_mir.ClosureAgg inst -> Vm_value.Closure (inst, vals))
+       | Seed_mir.StructCtor _ -> Vm_value.Struct (Vm_value.agg vals)
+       | Seed_mir.EnumCtor (_, vid) ->
+           Vm_value.Enum (Ids.Variant_index.to_int vid, Vm_value.agg vals)
+       | Seed_mir.ClosureAgg inst -> Vm_value.Closure (inst, Vm_value.agg vals))
   | Seed_mir.BinaryOp ((Seed_mir.And | Seed_mir.Or) as op, l, r) -> (
       (* `&&`/`||` SHORT-CIRCUIT: the direct kernel's codegen branches
          past the RHS when the LHS settles the result, so the RHS (which
@@ -1377,7 +1398,7 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
       match read_place vm frame p with
       | Ok (Vm_value.Array a) -> Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int (Vm_value.arr_length a)))
       | Ok (Vm_value.String s) -> Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int (String.length s)))
-      | Ok (Vm_value.Tuple t) -> Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int (Array.length t)))
+      | Ok (Vm_value.Tuple t) -> Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int (Vm_value.agg_len t)))
       | _ -> err_trap vm "len on unsupported value")
   | Seed_mir.Cast (op, ty) -> (
       let vv = eval_operand vm frame op in
@@ -1400,10 +1421,12 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
               Vm_value.Int
                 (Int_value.of_int64 ~width:(int_width kind) ~signed:(int_signed kind)
                    (Vm_memory.pointer_to_int64 p))
-          | Vm_value.Struct [| Vm_value.Int a |] ->
+          | Vm_value.Struct a -> (
               (* `p as Int` on the source Ptr { address } handle: the
                  handle's address field is the address *)
-              Vm_value.Int (int_cast a kind)
+              match Vm_value.agg_singleton a with
+              | Some (Vm_value.Int i) -> Vm_value.Int (int_cast i kind)
+              | _ -> err_trap vm "invalid cast to int")
           | Vm_value.Null ->
               Vm_value.Int
                 (Int_value.of_int64 ~width:(int_width kind) ~signed:(int_signed kind) 0L)
@@ -1463,7 +1486,8 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
           | Vm_value.Ref _ | Vm_value.RawPtr _ | Vm_value.Null -> vv
           | Vm_value.Struct _ -> vv
           | Vm_value.Int i ->
-              Vm_value.Struct [| Vm_value.Int (int_cast i Type_repr.UInt) |]
+              Vm_value.Struct
+                (Vm_value.agg [| Vm_value.Int (int_cast i Type_repr.UInt) |])
           | _ -> err_trap vm "invalid cast to a raw-pointer handle")
       | Type_repr.Named _ | Type_repr.Tuple _ | Type_repr.Fixed_array _ ->
           (* re-audit P12: the enum-rebrand cast — the `?` failure path
@@ -1576,7 +1600,8 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
         | Seed_mir.FnValue op -> (
             match eval_operand vm frame op with
             | Vm_value.Function inst -> (inst, [||])
-            | Vm_value.Closure (inst, caps) -> (inst, caps)
+            | Vm_value.Closure (inst, caps) ->
+                (inst, Vm_value.agg_to_array caps)
             | _ ->
                 err_trap vm
                   "fn-value call: callee operand is not a function value")
@@ -2039,7 +2064,7 @@ and invoke_guest_value (vm : t) (statics : Vm_value.slot array) (fv : Vm_value.t
       let inst, caps =
         match fv with
         | Vm_value.Function inst -> (inst, [||])
-        | Vm_value.Closure (inst, caps) -> (inst, caps)
+        | Vm_value.Closure (inst, caps) -> (inst, Vm_value.agg_to_array caps)
         | _ -> assert false
       in
       match find_fn vm inst with
@@ -2153,7 +2178,11 @@ and set_unwind_payload (vm : t) (statics : Vm_value.slot array) (msg : string) :
       if mutable_ && bare name = "_current_panic" then
         statics.(i) <-
           Vm_value.Live
-            (Vm_value.Enum (0, [| Vm_value.Enum (0, [| Vm_value.String msg |]) |]))
+            (Vm_value.Enum
+               ( 0,
+                 Vm_value.agg
+                   [| Vm_value.Enum
+                        (0, Vm_value.agg [| Vm_value.String msg |]) |] ))
       else go (i + 1)
     end
   in
@@ -2176,8 +2205,9 @@ let statics_initial_values (program : Seed_mir.program) : Vm_value.slot array =
           | Seed_mir.String str -> Vm_value.Live (Vm_value.String str)
           | Seed_mir.Function inst -> Vm_value.Live (Vm_value.Function inst)
           | Seed_mir.Enum (vi, _) ->
-              Vm_value.Live (Vm_value.Enum (Ids.Variant_index.to_int vi, [||]))
-          | Seed_mir.Struct _ -> Vm_value.Live (Vm_value.Struct [||])
+              Vm_value.Live
+                (Vm_value.Enum (Ids.Variant_index.to_int vi, Vm_value.agg [||]))
+          | Seed_mir.Struct _ -> Vm_value.Live (Vm_value.Struct (Vm_value.agg [||]))
           | Seed_mir.Array _ -> Vm_value.Live (Vm_value.Array Vm_value.arr_empty)
           | Seed_mir.Map _ -> Vm_value.Live Vm_value.map_empty
           | Seed_mir.Set _ -> Vm_value.Live Vm_value.set_empty))

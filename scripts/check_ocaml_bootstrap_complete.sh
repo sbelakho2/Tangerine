@@ -34,14 +34,20 @@ cd stage0_ocaml
 dune build
 
 # Harness timeout calibration (shared with check_ocaml_seed_health.sh;
-# re-measured 2026-09-14 on the development host, tree at 1e5ea8a + the
-# active workstream changes): tg_bootstrap_gate measured 1207.6 s wall
-# (20:07.55); the cap is the measurement x 1.5 rounded up to the next 60 s
-# (1811.3 -> 1860 s), matching the health script's calibrated gate cap (the
-# host carries unrelated background load: load average 12-17 on 18 cores
-# during the calibration). A cap is a bound, never a skip. Re-measure when
-# the closure grows materially.
-GATE_TIMEOUT_S=1860
+# re-measured 2026-09-27 on the development host, tree at the
+# post-mono-mark-memoization seed + the active workstream changes, under
+# background load): tg_bootstrap_gate measured 2759.9 s wall (sum of the
+# driver phase prints: closure front end 1419.5 s, lower 22.2 s, mono
+# 53.7 s, reachable-host 0.2 s, closure check 0.0 s, layout fold 0.0 s,
+# VM run 1264.3 s); the cap is the measurement x 1.5 rounded up to the
+# next 60 s (4139.9 -> 4140 s), matching the health script's calibrated
+# gate cap (the host carries unrelated background load).  The pre-fix
+# 1860 s cap is superseded: the frozen tree stalled in the post-mono
+# segment (the deep-share mark's redundant aggregate re-walks) and the
+# fix lands the full closure — the cap must cover the RUN, not the
+# stall.  A cap is a bound, never a skip.  Re-measure when the closure
+# grows materially.
+GATE_TIMEOUT_S=4140
 set +e
 timeout "$GATE_TIMEOUT_S" _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. >/tmp/ocaml_bootstrap_gate.out 2>&1
 GATE_STATUS=$?

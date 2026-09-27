@@ -55,7 +55,14 @@ PINNED_TEST_INVENTORY=230
 # bound, never a skip: the full check still runs under it, and the debt
 # predicate is unchanged. Re-measure when the closure grows materially.
 BOOTSTRAP_CHECK_TIMEOUT_S=1620
-GATE_TIMEOUT_S=1860
+# The gate cap was re-measured 2026-09-27 after the post-mono deep-share
+# mark fix landed the full closure: 2759.9 s wall (closure front end
+# 1419.5 + lower 22.2 + mono 53.7 + reachable-host 0.2 + fold 0.0 + VM
+# run 1264.3) -> 4139.9 -> the same 4140 s cap as
+# check_ocaml_bootstrap_complete.sh.  The pre-fix 1860 s cap is
+# superseded (the frozen tree stalled in the post-mono segment and never
+# reached the VM; the cap must cover the run, not the stall).
+GATE_TIMEOUT_S=4140
 EVIDENCE_TIMEOUT_S=1920
 
 # Merged-probe calibration (the tg_infer probe: the Seed VM typecheck of

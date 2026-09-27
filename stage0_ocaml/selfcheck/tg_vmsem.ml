@@ -721,14 +721,16 @@ let check_recursive_drop () =
        match Vm_memory.alloc m 32 8 with
        | Error e -> fail "drop glue: alloc 2 failed: %s" (Vm_memory.mem_error_string e)
        | Ok raw -> (
-           let v =
-             Vm_value.Tuple
-               [|
-                 Vm_value.String "s";
-                 Vm_value.Tuple
-                   [| Vm_value.Ref (Vm_value.Region owned); Vm_value.RawPtr raw |];
-               |]
-           in
+            let v =
+              Vm_value.Tuple
+                (Vm_value.agg
+                   [|
+                     Vm_value.String "s";
+                     Vm_value.Tuple
+                       (Vm_value.agg
+                          [| Vm_value.Ref (Vm_value.Region owned); Vm_value.RawPtr raw |]);
+                   |])
+            in
            Vm_value.drop_glue m v;
            (match Vm_memory.region_of m owned with
             | Error _ ->
@@ -745,15 +747,17 @@ let check_recursive_drop () =
 let check_serialization () =
   let v =
     Vm_value.Tuple
-      [|
-        Vm_value.Int (Int_value.of_int64 ~width:32 ~signed:false 0xDEADBEEFL);
-        Vm_value.Int (Int_value.of_int64 ~width:128 ~signed:true (-1L));
-        Vm_value.Bool true;
-        Vm_value.Char (Uchar.of_int 0x1F600);
-        Vm_value.String "h\195\169llo";
-        Vm_value.array [| Vm_value.Float64 0x3FF0000000000000L; Vm_value.Unit |];
-        Vm_value.Enum (1, [| Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true 42L) |]);
-      |]
+      (Vm_value.agg
+         [|
+           Vm_value.Int (Int_value.of_int64 ~width:32 ~signed:false 0xDEADBEEFL);
+           Vm_value.Int (Int_value.of_int64 ~width:128 ~signed:true (-1L));
+           Vm_value.Bool true;
+           Vm_value.Char (Uchar.of_int 0x1F600);
+           Vm_value.String "h\195\169llo";
+           Vm_value.array [| Vm_value.Float64 0x3FF0000000000000L; Vm_value.Unit |];
+           Vm_value.Enum
+             (1, Vm_value.agg [| Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true 42L) |]);
+         |])
   in
   let back = Vm_value.deserialize (Vm_value.serialize v) in
   if Vm_value.equal v back then
@@ -1453,11 +1457,13 @@ let check_array_pop_ownership () =
    | Ran_ok run ->
        expect_owned run.svm "pop: transferred element (drops=0 at the call)"
          [ run.sres.(0); run.sres.(1) ];
-       (match (run.sframe.locals.(1), run.sframe.locals.(2)) with
-        | Vm_value.Live (Vm_value.Array elems), Vm_value.Live (Vm_value.Enum (0, [| v |]))
-          when Vm_value.arr_length elems = 1
-               && Vm_value.equal (Vm_value.arr_get elems 0) (ref_of run.sres.(0))
-               && Vm_value.equal v (ref_of run.sres.(1)) ->
+        (match (run.sframe.locals.(1), run.sframe.locals.(2)) with
+         | Vm_value.Live (Vm_value.Array elems), Vm_value.Live (Vm_value.Enum (0, a))
+           when Vm_value.arr_length elems = 1
+                && Vm_value.equal (Vm_value.arr_get elems 0) (ref_of run.sres.(0))
+                && (match Vm_value.agg_singleton a with
+                    | Some v -> Vm_value.equal v (ref_of run.sres.(1))
+                    | None -> false) ->
             pass
               "pop: the popped R2 is NOT dropped by the host — it transfers into the returned Option (vec holds [R1])"
         | _ ->
@@ -1657,10 +1663,9 @@ let check_map_insert_ownership () =
        expect_owned run.svm "map_insert replace: new V member (stored exactly once)"
          [ run.sres.(2) ];
         (match (run.sframe.locals.(1), run.sframe.locals.(4)) with
-         | Vm_value.Live (Vm_value.Map store),
-           Vm_value.Live (Vm_value.Enum (0, [| Vm_value.Array v1 |])) -> (
-             match Vm_value.map_pairs store with
-             | [ (k, Vm_value.Array v2) ]
+         | Vm_value.Live (Vm_value.Map store), Vm_value.Live (Vm_value.Enum (0, a)) -> (
+             match (Vm_value.agg_singleton a, Vm_value.map_pairs store) with
+             | Some (Vm_value.Array v1), [ (k, Vm_value.Array v2) ]
                when Vm_value.equal k (Vm_value.String "a")
                     && Vm_value.arr_length v2 = 1 && Vm_value.arr_length v1 = 2
                     && Vm_value.equal (Vm_value.arr_get v2 0) (ref_of run.sres.(2))
@@ -1894,16 +1899,20 @@ let try_invoke_main (f : Instance_id.t) : Seed_mir.block array =
   |]
 
 let is_option_none (v : Vm_value.t) : bool =
-  match v with Vm_value.Enum (1, a) -> Array.length a = 0 | _ -> false
+  match v with Vm_value.Enum (1, a) -> Vm_value.agg_len a = 0 | _ -> false
 
 let option_some (v : Vm_value.t) : Vm_value.t option =
-  match v with Vm_value.Enum (0, [| x |]) -> Some x | _ -> None
+  match v with Vm_value.Enum (0, a) -> Vm_value.agg_singleton a | _ -> None
 
 let payload_text (v : Vm_value.slot) : string option =
   match v with
-  | Vm_value.Live (Vm_value.Enum (0, [| Vm_value.Enum (0, [| Vm_value.String s |]) |]))
-    ->
-      Some s
+  | Vm_value.Live (Vm_value.Enum (0, a)) -> (
+      match Vm_value.agg_singleton a with
+      | Some (Vm_value.Enum (0, b)) -> (
+          match Vm_value.agg_singleton b with
+          | Some (Vm_value.String s) -> Some s
+          | _ -> None)
+      | _ -> None)
   | _ -> None
 
 let check_unwind_pair () =
@@ -1972,7 +1981,7 @@ let check_unwind_pair () =
            fail "try_invoke unwind: expected Option::None, got %s"
              (Vm_value.slot_state other));
        (match run.sframe.statics.(0) with
-       | Vm_value.Live (Vm_value.Enum (0, a)) when Array.length a = 0 ->
+       | Vm_value.Live (Vm_value.Enum (0, a)) when Vm_value.agg_len a = 0 ->
            pass
              "try_invoke unwind: the payload already stored in _current_panic is not clobbered by the delivery"
        | other ->
@@ -2207,17 +2216,20 @@ let nested_alias_case (name : string) (build : Vm_value.t -> Vm_value.t)
   else ()
 
 let check_nested_sharing_tracking () =
-  nested_alias_case "nested sharing: Struct(Array)" (fun i -> Vm_value.Struct [| i |])
-    (function Vm_value.Struct f -> f.(0) | _ -> assert false);
-  nested_alias_case "nested sharing: Tuple(Array)" (fun i -> Vm_value.Tuple [| i |])
-    (function Vm_value.Tuple f -> f.(0) | _ -> assert false);
-  nested_alias_case "nested sharing: Enum(Array)" (fun i -> Vm_value.Enum (0, [| i |]))
-    (function Vm_value.Enum (_, f) -> f.(0) | _ -> assert false);
+  nested_alias_case "nested sharing: Struct(Array)"
+    (fun i -> Vm_value.Struct (Vm_value.agg [| i |]))
+    (function Vm_value.Struct f -> Vm_value.agg_get f 0 | _ -> assert false);
+  nested_alias_case "nested sharing: Tuple(Array)"
+    (fun i -> Vm_value.Tuple (Vm_value.agg [| i |]))
+    (function Vm_value.Tuple f -> Vm_value.agg_get f 0 | _ -> assert false);
+  nested_alias_case "nested sharing: Enum(Array)"
+    (fun i -> Vm_value.Enum (0, Vm_value.agg [| i |]))
+    (function Vm_value.Enum (_, f) -> Vm_value.agg_get f 0 | _ -> assert false);
   nested_alias_case "nested sharing: Array(Array) element" (fun i -> Vm_value.array [| i |])
     (function Vm_value.Array a -> Vm_value.arr_get a 0 | _ -> assert false);
   nested_alias_case "nested sharing: Closure capture Array"
-    (fun i -> Vm_value.Closure (instance 77, [| i |]))
-    (function Vm_value.Closure (_, caps) -> caps.(0) | _ -> assert false);
+    (fun i -> Vm_value.Closure (instance 77, Vm_value.agg [| i |]))
+    (function Vm_value.Closure (_, caps) -> Vm_value.agg_get caps 0 | _ -> assert false);
   nested_alias_case "nested sharing: Map value Array"
     (fun i -> Vm_value.map_of_pairs [ (Vm_value.String "k", i) ])
     (function
@@ -2238,11 +2250,11 @@ let check_nested_sharing_tracking () =
           match Vm_value.set_elems s with x :: _ -> x | [] -> assert false)
       | _ -> assert false);
   nested_alias_case "nested sharing: Set(Struct(Array)) element"
-    (fun i -> Vm_value.set_of_list [ Vm_value.Struct [| i |] ])
+    (fun i -> Vm_value.set_of_list [ Vm_value.Struct (Vm_value.agg [| i |]) ])
     (function
       | Vm_value.Set s -> (
           match Vm_value.set_elems s with
-          | Vm_value.Struct f :: _ -> f.(0)
+          | Vm_value.Struct f :: _ -> Vm_value.agg_get f 0
           | _ -> assert false)
       | _ -> assert false)
 
@@ -2316,8 +2328,8 @@ let check_nested_vm (what : string) (prog : Seed_mir.program) (holder : int) : u
             match frame.locals.(holder) with
             | Vm_value.Live v -> (
                 match v with
-                | Vm_value.Struct f -> nested_holder_ok f.(0)
-                | Vm_value.Tuple f -> nested_holder_ok f.(0)
+                | Vm_value.Struct f -> nested_holder_ok (Vm_value.agg_get f 0)
+                | Vm_value.Tuple f -> nested_holder_ok (Vm_value.agg_get f 0)
                 | Vm_value.Array a -> nested_holder_ok (Vm_value.arr_get a 0)
                 | _ -> false)
             | _ -> false

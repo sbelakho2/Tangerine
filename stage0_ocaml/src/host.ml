@@ -481,14 +481,24 @@ let value_kind_name (v : Vm_value.t) : string =
    over a handle (the Box/Ptr wrapper shape).  None when the value is not
    a pointer at all. *)
 let pointer_value_to_pointer (v : Vm_value.t) : Vm_memory.pointer option =
+  let int_ptr (v : Vm_value.t) : Vm_memory.pointer option =
+    match v with
+    | Vm_value.Int i -> Some (Vm_memory.pointer_of_int64 (Int_value.to_int64 i))
+    | _ -> None
+  in
   match v with
   | Vm_value.RawPtr p -> Some p
   | Vm_value.Null -> Some (Vm_memory.pointer_of_int64 0L)
   | Vm_value.Int i -> Some (Vm_memory.pointer_of_int64 (Int_value.to_int64 i))
-  | Vm_value.Struct [| Vm_value.Int i |] ->
-      Some (Vm_memory.pointer_of_int64 (Int_value.to_int64 i))
-  | Vm_value.Struct [| Vm_value.Struct [| Vm_value.Int i |] |] ->
-      Some (Vm_memory.pointer_of_int64 (Int_value.to_int64 i))
+  | Vm_value.Struct a -> (
+      match Vm_value.agg_singleton a with
+      | Some (Vm_value.Int i) ->
+          Some (Vm_memory.pointer_of_int64 (Int_value.to_int64 i))
+      | Some (Vm_value.Struct b) -> (
+          match Vm_value.agg_singleton b with
+          | Some inner -> int_ptr inner
+          | None -> None)
+      | _ -> None)
   | _ -> None
 
 let ptr_arg (v : Vm_value.t) : (Vm_memory.pointer, string) result =
@@ -625,19 +635,24 @@ let ptr_of_int_arg (v : Vm_value.t) : Vm_memory.pointer =
 let raw_image_scalar (v : Vm_value.t) : Raw_memory.scalar option =
   match v with
   | Vm_value.RawPtr _ | Vm_value.Null -> Some Raw_memory.SPtr
-  | Vm_value.Struct [| Vm_value.Int i |] when i.Int_value.width <= 64 ->
+  | Vm_value.Struct a -> (
       (* the `Ptr { address }` handle: exactly one 8-byte address word *)
-      Some Raw_memory.SPtr
+      match Vm_value.agg_singleton a with
+      | Some (Vm_value.Int i) when i.Int_value.width <= 64 -> Some Raw_memory.SPtr
+      | _ -> scalar_of_value v)
   | _ -> scalar_of_value v
 
 (* The element-image encoder under the same view: a handle struct packs
    its address word, every other scalar uses the shared encoder. *)
 let encode_raw_image (s : Raw_memory.scalar) (v : Vm_value.t) : Bytes.t option =
   match s, v with
-  | Raw_memory.SPtr, Vm_value.Struct [| Vm_value.Int i |] ->
-      let b = Bytes.make 8 '\000' in
-      Raw_memory.put_u64_le b 0 8 (Int_value.to_int64 i);
-      Some b
+  | Raw_memory.SPtr, Vm_value.Struct a -> (
+      match Vm_value.agg_singleton a with
+      | Some (Vm_value.Int i) ->
+          let b = Bytes.make 8 '\000' in
+          Raw_memory.put_u64_le b 0 8 (Int_value.to_int64 i);
+          Some b
+      | _ -> Raw_memory.encode_with s v)
   | _ -> Raw_memory.encode_with s v
 
 (* Materialize a Vec/Array as raw storage: every element's scalar raw
@@ -1718,12 +1733,12 @@ let rec vm_sort_compare (a : Vm_value.t) (b : Vm_value.t) : int option =
   | Vm_value.String x, Vm_value.String y -> Some (String.compare x y)
   | Vm_value.Tuple xs, Vm_value.Tuple ys
   | Vm_value.Struct xs, Vm_value.Struct ys ->
-      vm_sort_compare_seq (Array.to_list xs) (Array.to_list ys)
+      vm_sort_compare_seq (Vm_value.agg_to_list xs) (Vm_value.agg_to_list ys)
   | Vm_value.Array xs, Vm_value.Array ys ->
       vm_sort_compare_seq (Vm_value.arr_to_list xs) (Vm_value.arr_to_list ys)
   | Vm_value.Enum (i, xs), Vm_value.Enum (j, ys) ->
       if i <> j then Some (compare i j)
-      else vm_sort_compare_seq (Array.to_list xs) (Array.to_list ys)
+      else vm_sort_compare_seq (Vm_value.agg_to_list xs) (Vm_value.agg_to_list ys)
   | _ -> None
 
 and vm_sort_compare_seq (xs : Vm_value.t list) (ys : Vm_value.t list) : int option =
@@ -1936,8 +1951,8 @@ let int_to_string_bindings : binding list =
    mutation is implementation-defined, exactly like the raw entries
    snapshot). *)
 
-let vm_option_none : Vm_value.t = Vm_value.Enum (1, [||])
-let vm_option_some (v : Vm_value.t) : Vm_value.t = Vm_value.Enum (0, [| v |])
+let vm_option_none : Vm_value.t = Vm_value.Enum (1, Vm_value.agg [||])
+let vm_option_some (v : Vm_value.t) : Vm_value.t = Vm_value.Enum (0, Vm_value.agg [| v |])
 
 (* the map entry a visit handle names: physical identity of the stored
    key first (the adapter's own returned object), then the structural
@@ -2098,14 +2113,14 @@ let binding_manifest : binding list =
                match Vm_value.set_drain_one store with
                | None, store' ->
                    Ok
-                     { value = Vm_value.Enum (1, [||]);
+                     { value = Vm_value.Enum (1, Vm_value.agg [||]);
                        writebacks =
                          [ { arg_index = 0; replacement = Vm_value.Set store';
                              removed = [] } ] }
                | Some x, store' ->
                    Vm_value.arr_mark_shared_value x;
                    Ok
-                     { value = Vm_value.Enum (0, [| x |]);
+                     { value = Vm_value.Enum (0, Vm_value.agg [| x |]);
                        writebacks =
                          [ { arg_index = 0; replacement = Vm_value.Set store';
                              removed = [] } ] })
@@ -2143,8 +2158,8 @@ let binding_manifest : binding list =
                match Vm_value.map_find store key with
                | Some (_, v) ->
                    Vm_value.arr_mark_shared_value v;
-                   Ok (Vm_value.Enum (0, [| v |]))
-               | None -> Ok (Vm_value.Enum (1, [||])))
+                   Ok (Vm_value.Enum (0, Vm_value.agg [| v |]))
+               | None -> Ok (Vm_value.Enum (1, Vm_value.agg [||])))
            | _ -> arg_mismatch "(Map, key)"));
     intrinsic_binding "__intrinsic_map_insert"
       (adapter_raw_wb
@@ -2186,8 +2201,8 @@ let binding_manifest : binding list =
                      (match old with
                       | Some v ->
                           Vm_value.arr_mark_shared_value v;
-                          Vm_value.Enum (0, [| v |])
-                      | None -> Vm_value.Enum (1, [||]));
+                          Vm_value.Enum (0, Vm_value.agg [| v |])
+                      | None -> Vm_value.Enum (1, Vm_value.agg [||]));
                    writebacks =
                      [ { arg_index = 0; replacement = Vm_value.Map store';
                          removed = [] } ] }
@@ -2213,7 +2228,7 @@ let binding_manifest : binding list =
                           (fun (k, v) ->
                             Vm_value.arr_mark_shared_value k;
                             Vm_value.arr_mark_shared_value v;
-                            Vm_value.Tuple [| k; v |])
+                            Vm_value.Tuple (Vm_value.agg [| k; v |]))
                           (Vm_value.map_pairs store))))
            | _ -> arg_mismatch "(Map)"));
     (* ── The Vec/Array host surface (the growable-array family) ──────
@@ -2309,13 +2324,13 @@ let binding_manifest : binding list =
                 match Vm_value.arr_pop elems with
                 | None, replacement ->
                     Ok
-                      { value = Vm_value.Enum (1, [||]);
+                      { value = Vm_value.Enum (1, Vm_value.agg [||]);
                         writebacks =
                           [ { arg_index = 0; replacement = Vm_value.Array replacement;
                               removed = [] } ] }
                 | Some last, replacement ->
                     Ok
-                      { value = Vm_value.Enum (0, [| last |]);
+                      { value = Vm_value.Enum (0, Vm_value.agg [| last |]);
                         writebacks =
                           [ { arg_index = 0; replacement = Vm_value.Array replacement;
                               removed = [] } ] })
@@ -2542,8 +2557,8 @@ let binding_manifest : binding list =
            match args with
            | [| Vm_value.String s; Vm_value.String sub |] -> (
                match string_find s sub with
-               | Some i -> Ok (Vm_value.Enum (0, [| vm_int i |]))
-               | None -> Ok (Vm_value.Enum (1, [||])))
+               | Some i -> Ok (Vm_value.Enum (0, Vm_value.agg [| vm_int i |]))
+               | None -> Ok (Vm_value.Enum (1, Vm_value.agg [||])))
            | _ -> arg_mismatch "(String, String)"));
     intrinsic_binding "__intrinsic_str_slice"
       (adapter_raw
@@ -2566,9 +2581,10 @@ let binding_manifest : binding list =
                    Ok
                      (Vm_value.Enum
                         ( 0,
-                          [| Vm_value.Int
-                               (Int_value.of_int64 ~width:64 ~signed:true i) |] ))
-               | Error m -> Ok (Vm_value.Enum (1, [| vm_string m |])))
+                          Vm_value.agg
+                            [| Vm_value.Int
+                                 (Int_value.of_int64 ~width:64 ~signed:true i) |] ))
+               | Error m -> Ok (Vm_value.Enum (1, Vm_value.agg [| vm_string m |])))
            | _ -> arg_mismatch "String"));
     intrinsic_binding "__intrinsic_string_as_str"
       (adapter_raw (lets [ Type_repr.String ]) Type_repr.String (fun _ args ->
@@ -2586,8 +2602,8 @@ let binding_manifest : binding list =
            match args with
            | [| Vm_value.String s; Vm_value.String sub |] -> (
                match string_find s sub with
-               | Some i -> Ok (Vm_value.Enum (0, [| vm_int i |]))
-               | None -> Ok (Vm_value.Enum (1, [||])))
+               | Some i -> Ok (Vm_value.Enum (0, Vm_value.agg [| vm_int i |]))
+               | None -> Ok (Vm_value.Enum (1, Vm_value.agg [||])))
            | _ -> arg_mismatch "(String, String)"));
     intrinsic_binding "__intrinsic_string_slice"
       (adapter_raw
@@ -2610,9 +2626,10 @@ let binding_manifest : binding list =
                    Ok
                      (Vm_value.Enum
                         ( 0,
-                          [| Vm_value.Int
-                               (Int_value.of_int64 ~width:64 ~signed:true i) |] ))
-               | Error m -> Ok (Vm_value.Enum (1, [| vm_string m |])))
+                          Vm_value.agg
+                            [| Vm_value.Int
+                                 (Int_value.of_int64 ~width:64 ~signed:true i) |] ))
+               | Error m -> Ok (Vm_value.Enum (1, Vm_value.agg [| vm_string m |])))
            | _ -> arg_mismatch "String"));
     intrinsic_binding "__intrinsic_string_parse_float"
       (adapter_raw (lets [ Type_repr.String ]) (option_of Intrinsic_registry.ty_float)
@@ -2623,8 +2640,8 @@ let binding_manifest : binding list =
                | Some f ->
                    Ok
                      (Vm_value.Enum
-                        (0, [| Vm_value.Float64 (Int64.bits_of_float f) |]))
-               | None -> Ok (Vm_value.Enum (1, [||])))
+                        (0, Vm_value.agg [| Vm_value.Float64 (Int64.bits_of_float f) |]))
+               | None -> Ok (Vm_value.Enum (1, Vm_value.agg [||])))
            | _ -> arg_mismatch "String"));
     intrinsic_binding "__intrinsic_string_reserve"
       (adapter_raw
@@ -2897,13 +2914,13 @@ let binding_manifest : binding list =
                       enumerated in `removed` for the single drop *)
                    Vm_value.arr_mark_shared_value v;
                    Ok
-                     { value = Vm_value.Enum (0, [| v |]);
+                     { value = Vm_value.Enum (0, Vm_value.agg [| v |]);
                        writebacks =
                          [ { arg_index = 0; replacement = Vm_value.Map store';
                              removed = [ k ] } ] }
                | None, store' ->
                    Ok
-                     { value = Vm_value.Enum (1, [||]);
+                     { value = Vm_value.Enum (1, Vm_value.agg [||]);
                        writebacks =
                          [ { arg_index = 0; replacement = Vm_value.Map store';
                              removed = [] } ] })
@@ -2932,7 +2949,7 @@ let binding_manifest : binding list =
                match Vm_value.map_drain_one store with
                | (None, store') ->
                    Ok
-                     { value = Vm_value.Enum (1, [||]);
+                     { value = Vm_value.Enum (1, Vm_value.agg [||]);
                        writebacks =
                          [ { arg_index = 0; replacement = Vm_value.Map store';
                              removed = [] } ] }
@@ -2940,7 +2957,7 @@ let binding_manifest : binding list =
                    Vm_value.arr_mark_shared_value k;
                    Vm_value.arr_mark_shared_value v;
                    Ok
-                     { value = Vm_value.Enum (0, [| Vm_value.Tuple [| k; v |] |]);
+                     { value = Vm_value.Enum (0, Vm_value.agg [| Vm_value.Tuple (Vm_value.agg [| k; v |]) |]);
                        writebacks =
                          [ { arg_index = 0; replacement = Vm_value.Map store';
                              removed = [] } ] })
@@ -3168,8 +3185,8 @@ let binding_manifest : binding list =
                        (the guest-function invocation channel is installed by Vm.run)"
                 | Some invoke -> (
                     match invoke fv with
-                    | Ok v -> Ok (Vm_value.Enum (0, [| v |]))
-                    | Error _ -> Ok (Vm_value.Enum (1, [||]))))
+                    | Ok v -> Ok (Vm_value.Enum (0, Vm_value.agg [| v |]))
+                    | Error _ -> Ok (Vm_value.Enum (1, Vm_value.agg [||]))))
             | [| _ |] ->
                 Error
                   "__intrinsic_try_invoke: argument is not a function value (expected a \
@@ -3225,11 +3242,11 @@ let binding_manifest : binding list =
       (adapter_raw (lets [ vec_of p0 ]) (option_of p0) (fun _ args ->
            match args with
            | [| Vm_value.Array elems |] ->
-               if Vm_value.arr_length elems = 0 then Ok (Vm_value.Enum (1, [||]))
+               if Vm_value.arr_length elems = 0 then Ok (Vm_value.Enum (1, Vm_value.agg [||]))
                else begin
                  let v = Vm_value.arr_get elems 0 in
                  Vm_value.arr_mark_shared_value v;
-                 Ok (Vm_value.Enum (0, [| v |]))
+                 Ok (Vm_value.Enum (0, Vm_value.agg [| v |]))
                end
            | _ -> arg_mismatch "(Array)"));
     intrinsic_binding "__intrinsic_array_last"
@@ -3237,11 +3254,11 @@ let binding_manifest : binding list =
            match args with
            | [| Vm_value.Array elems |] ->
                let n = Vm_value.arr_length elems in
-               if n = 0 then Ok (Vm_value.Enum (1, [||]))
+               if n = 0 then Ok (Vm_value.Enum (1, Vm_value.agg [||]))
                else begin
                  let v = Vm_value.arr_get elems (n - 1) in
                  Vm_value.arr_mark_shared_value v;
-                 Ok (Vm_value.Enum (0, [| v |]))
+                 Ok (Vm_value.Enum (0, Vm_value.agg [| v |]))
                end
            | _ -> arg_mismatch "(Array)"));
     intrinsic_binding "__intrinsic_array_resize"
@@ -3447,10 +3464,13 @@ let binding_manifest : binding list =
               unchanged (RawPtr/Null, the `Ptr { address }` handle
               struct, and the handle over a handle). *)
            match args with
-           | [| ( Vm_value.RawPtr _ | Vm_value.Null | Vm_value.Int _
-                | Vm_value.Struct [| Vm_value.Int _ |]
-                | Vm_value.Struct [| Vm_value.Struct [| Vm_value.Int _ |] |] ) as p |] ->
-               Ok p
+           | [| p |] -> (
+               (* every address-bearing pointer shape passes through
+                  unchanged (RawPtr/Null, the `Ptr { address }` handle
+                  struct, and the handle over a handle) *)
+               match pointer_value_to_pointer p with
+               | Some _ -> Ok p
+               | None -> arg_mismatch "Ptr")
            | _ -> arg_mismatch "Ptr"));
 
     (* Option::expect (the None case is the std's defined panic — a
@@ -3460,9 +3480,14 @@ let binding_manifest : binding list =
          [ (Access_effect.Sink, option_of p0); (Access_effect.Let, ty_string) ]
          p0 (fun _ args ->
            match args with
-           | [| Vm_value.Enum (0, [| v |]); Vm_value.String _ |] -> Ok v
-           | [| Vm_value.Enum (1, [||]); Vm_value.String msg |] ->
-               Error (Printf.sprintf "Option::expect: %s" msg)
+           | [| Vm_value.Enum (0, a); Vm_value.String _ |] -> (
+               match Vm_value.agg_singleton a with
+               | Some v -> Ok v
+               | None -> arg_mismatch "(Option[T], String)")
+           | [| Vm_value.Enum (1, a); Vm_value.String msg |] ->
+               if Vm_value.agg_len a = 0 then
+                 Error (Printf.sprintf "Option::expect: %s" msg)
+               else arg_mismatch "(Option[T], String)"
            | _ -> arg_mismatch "(Option[T], String)"));
 
     (* compiler-registered free builtins. *)

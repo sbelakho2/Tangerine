@@ -5424,8 +5424,14 @@ let run_prepared_vm ~(repo_root : string) ~(kernel_args : string list)
     ~(lang_items : Lang_items.t) ~(cache_hit : bool) : bootstrap_vm_run =
   let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
   let host = Host.create ~repo_root ~argv in
-  let reachable = collect_reachable_host_ids program in
-  match Host.closure_check_reachable host reachable with
+  let reachable =
+    phase_time ~label:"reachable-host collection" (fun () ->
+        collect_reachable_host_ids program)
+  in
+  match
+    phase_time ~label:"reachable-host closure check" (fun () ->
+        Host.closure_check_reachable host reachable)
+  with
   | Error problems ->
       {
         bvr_vm_code = None;
@@ -5440,8 +5446,9 @@ let run_prepared_vm ~(repo_root : string) ~(kernel_args : string list)
       }
   | Ok _ ->
       let result =
-        Vm.run_li ~limits:bootstrap_vm_limits ~lang_items ~program ~entry ~argv
-          ~host
+        phase_time ~label:"VM run (kernel in the seed VM)" (fun () ->
+            Vm.run_li ~limits:bootstrap_vm_limits ~lang_items ~program ~entry
+              ~argv ~host)
       in
       let stdout = Host.stdout_contents host in
       let stderr = Host.stderr_contents host in
@@ -5590,8 +5597,14 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                 else begin
                   let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
                   let host = Host.create ~repo_root ~argv in
-                  let reachable = collect_reachable_host_ids mo.mo_program in
-                  match Host.closure_check_reachable host reachable with
+                  let reachable =
+                    phase_time ~label:"reachable-host collection" (fun () ->
+                        collect_reachable_host_ids mo.mo_program)
+                  in
+                  match
+                    phase_time ~label:"reachable-host closure check" (fun () ->
+                        Host.closure_check_reachable host reachable)
+                  with
                   | Error _ ->
                       Ok
                         {
@@ -5606,8 +5619,17 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                           bs_oracle_incomplete = oracle_incomplete;
                         }
                   | Ok report -> (
-                      match phase_time ~label:"VM run (kernel in the seed VM)" (fun () ->
-                        Vm.run_li ~limits:bootstrap_vm_limits ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:(vm_program_with_folded_queries ctx mo) ~entry:mo.mo_entry ~argv ~host) with
+                      let vm_program =
+                        phase_time ~label:"fold-queries (TypeQuery layout fold)"
+                          (fun () -> vm_program_with_folded_queries ctx mo)
+                      in
+                      match
+                        phase_time ~label:"VM run (kernel in the seed VM)"
+                          (fun () ->
+                            Vm.run_li ~limits:bootstrap_vm_limits
+                              ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
+                              ~program:vm_program ~entry:mo.mo_entry ~argv ~host)
+                      with
                       | Error e ->
                           (* the trap message is the ONLY diagnostic of an
                              in-VM failure (the exit code is unavailable) —
