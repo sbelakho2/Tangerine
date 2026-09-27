@@ -38,6 +38,24 @@
 # The ladder can only complete once the seed's typecheck debt is zero
 # (check_ocaml_bootstrap_complete.sh prints exactly what remains).
 #
+# Per-stage validation policy (the implemented split):
+#   - stage1 gets the early critical suite (run_critical_canaries + the
+#     semantic canary negatives) — the pre-self-host runtime/ABI check;
+#   - stage2 gets validate_stage + the diagnostic ladder (Step 3);
+#   - stage3 gets the full native acceptance suites (run_native_tests: the
+#     native canaries + ARM64 lanes, Step 4);
+#   - byte identity transfers stage3 runtime evidence to stage2: the hard
+#     stage2 == stage3 byte-identity gate (plus the per-phase fingerprint
+#     gate) makes the stage3 runtime/acceptance evidence valid for stage2.
+#   (validate_stage itself runs on every ladder stage, stage1/stage2/stage3
+#   and the materialized full compiler; the per-stage suites above are the
+#   additional gates.)
+# The two completion milestones reported by this script are:
+#   - `Kernel Stage3 Complete`: stage3 built, validated, native-tested and
+#     byte-identical to stage2 (the kernel self-host fixed point);
+#   - `Full Toolchain Materialization Complete`: build/tg compiled from
+#     tg_compiler/driver.tg by stage3 and validated.
+#
 # Flag mapping (the pre-rewire flags keep their meaning at the delegation
 # points that exist once the ladder is live):
 #   --skip-ladder       skip scripts/run_stage2_diag_ladder.sh (the live
@@ -388,10 +406,13 @@ if ! validate_stage tg "$TG_FULL" "$DRIVER_FULL_SRC"; then
   bh_err "materialized full compiler failed validation"
   exit 1
 fi
-bh_log "full compiler ready: $TG_FULL (published with the stage artifacts)"
+bh_log "Full Toolchain Materialization Complete: $TG_FULL (full compiler ready; published with the stage artifacts)"
 
-# Critical canaries under stage1: prove stage1's runtime can compile the
-# compiler before spending a full self-host cycle.
+# Critical canaries under stage1 ONLY (the implemented policy): prove stage1's
+# runtime can compile the compiler before spending a full self-host cycle.
+# stage2 does not re-run this suite; its gates are validate_stage + the Step 3
+# diagnostic ladder, and byte identity transfers stage3's runtime evidence to
+# stage2 (stage2 == stage3 at every phase).
 if [ "$RUN_NATIVE_TESTS" = "1" ]; then
   bh_log "== Critical canaries (via stage1) =="
   if ! run_critical_canaries "$STAGE1" "$BUILD_DIR/.native_stage1"; then
@@ -463,6 +484,12 @@ if ! bh_phase_equality tg_stage2 tg_stage3 "$BUILD_DIR" $phase_gate_args; then
   exit 2
 fi
 
+# Completion milestone: the kernel ladder's fixed point is established —
+# stage3 is built, validated, native-tested (Step 4) and byte-identical to
+# stage2 at every fingerprinted phase, so stage3's runtime evidence transfers
+# to stage2.
+bh_log "Kernel Stage3 Complete: $STAGE3 (validated; byte-identical to $STAGE2 at every fingerprinted phase)"
+
 # ———————————————————————————————————————————————————————————————
 # Step 6 — two-root reproducibility check
 # ———————————————————————————————————————————————————————————————
@@ -492,6 +519,7 @@ bh_log "stage2:  $STAGE2"
 bh_log "stage3:  $STAGE3"
 bh_log "tg:      $TG_FULL (full compiler materialized from $DRIVER_FULL_SRC via stage3)"
 bh_log "logs:    $BOOT_LOG_DIR"
+bh_log "milestones: Kernel Stage3 Complete; Full Toolchain Materialization Complete"
 bh_log "bootstrap OK"
 
 exit 0

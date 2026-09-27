@@ -168,11 +168,17 @@ bh_arch_of() {
 
 # Emit a stable, machine-readable phase fingerprint line for one stage.
 # Usage: bh_phase_line <stage> <phase> <hash>
-# A phase with value UNAVAILABLE is a documented gap: the phase exists in the
-# pipeline but the stage binary cannot currently dump it (see the report in
-# bh_fingerprints). UNAVAILABLE never silently drops a phase — it is recorded
-# so the stage2==stage3 equality gate can distinguish "not comparable" from
-# "comparable and equal".
+# UNAVAILABLE is never a "phase has no route" gap: EVERY fingerprinted
+# semantic phase has a real dump route in the stage binaries today (the kernel
+# entry tg_compiler/bootstrap_main.tg maps --dump-tokens / --dump-ast /
+# --dump-resolved-ast / --dump-mir-lowered / --dump-mir-mono to
+# opts.dump_phase and the kernel compile entry tg_compiler/compiler_core.tg
+# writes the normalized dump and stops). UNAVAILABLE records that a probe
+# could not produce output — the probe exited nonzero / printed nothing
+# (semantic phases), or the host lacks the Mach-O inspection tools
+# (otool/nm — object phases). It never silently drops a
+# phase — it is recorded so the stage2==stage3 equality gate can distinguish
+# "not comparable" from "comparable and equal".
 bh_phase_line() {
   printf 'FINGERPRINT %s %s %s\n' "$1" "$2" "$3"
 }
@@ -200,13 +206,18 @@ bh_dump_hash() {
 #   symbols    : sorted symbol table (nm)
 #   relocs     : normalized relocation table (otool -r)
 #
-# Front-end phases (tokens, ast/hir, mir, mir-mono) use the driver's --dump-*
-# phase hooks (tg_compiler/driver.tg parse_args AND the kernel entry
-# tg_compiler/bootstrap_main.tg both accept them; the kernel compile entry
-# routes them through compile_startup_entry, which writes the normalized phase
-# dumps). The harness probes each stage binary; a probe that fails or produces
-# no output is recorded as UNAVAILABLE, and the RELEASE gate (bh_phase_equality
-# with a 4th argument "release") treats UNAVAILABLE as a hard failure.
+# Front-end phases (tokens, ast/hir, mir, mir-mono) use the kernel entry's REAL
+# --dump-* routes: tg_compiler/bootstrap_main.tg parse_args maps each flag to
+# opts.dump_phase (tokens / ast / resolved-ast / mir-lowered / mir-mono) and
+# the kernel compile entry routes through compile_startup_entry
+# (tg_compiler/compiler_core.tg), which writes the normalized phase dump and
+# stops before further pipeline work. The harness probes each stage binary; a
+# probe that fails or produces no output is recorded as UNAVAILABLE, and the
+# RELEASE gate (bh_phase_equality with a 4th argument "release") treats
+# UNAVAILABLE as a hard failure. The release phase gate must obtain ALL FIVE
+# semantic phase hashes (tokens, ast, hir, mir, mir-mono) from these routes as
+# nonempty, deterministic output — to be proven by the first successful
+# stage2/stage3 run.
 BOOTSTRAP_PHASES="link-image text sections symbols relocs tokens ast hir mir mir-mono"
 
 # Compute the phase fingerprints for a stage binary.
@@ -273,10 +284,15 @@ bh_fingerprints() {
     bh_fp text UNAVAILABLE
   fi
 
-  # Phases 6-10: front-end phases via the driver's --dump-* phase hooks.
-  # Probed only under trace mode (each probe runs a compile); the probes are
-  # what the kernel entry will support once bootstrap_main.tg threads the
-  # driver flags — today they record UNAVAILABLE.
+  # Phases 6-10: front-end phases via the kernel entry's real --dump-* routes.
+  # Probed only under trace mode (each probe runs a compile). The routes are
+  # live today: bootstrap_main.tg parse_args maps each flag to opts.dump_phase
+  # and the kernel compile entry (compiler_core.tg) writes the normalized dump
+  # for tokens/ast/resolved-ast/mir-lowered/mir-mono and stops. A probe that
+  # exits nonzero or prints nothing records UNAVAILABLE — a probe failure, NOT
+  # a missing route. The RELEASE phase gate must obtain all five semantic phase
+  # hashes from these routes (nonempty deterministic output, to be proven by
+  # the first successful stage2/stage3 run).
   if [ "${BOOTSTRAP_TRACE_ACTIVE}" = "1" ]; then
     local dump_src="${source_file:-tg_compiler/bootstrap_main.tg}"
     bh_dump_phase() {
@@ -310,15 +326,16 @@ bh_fingerprints() {
 }
 
 # Hard-gate: stage2 and stage3 must agree on EVERY fingerprinted phase, not
-# just the final link image. A phase UNAVAILABLE in both stages is a recorded
-# gap and does not fail; a phase available in one stage only, or differing
-# between the stages, fails the gate.
+# just the final link image. A phase UNAVAILABLE in both stages records a
+# probe failure and does not fail outside release mode; a phase available in
+# one stage only, or differing between the stages, fails the gate.
 #
 # RELEASE GATE (4th argument "release"): the CI/bootstrap gate (run_bootstrap
-# Step 6) treats ANY UNAVAILABLE fingerprint as a HARD FAILURE — the semantic
-# phases must all produce real fingerprints, and a "not comparable" phase is
-# never acceptable in a release build. The UNAVAILABLE tolerance remains only
-# for non-release/debug probes (no 4th argument).
+# Step 6) treats ANY UNAVAILABLE fingerprint as a HARD FAILURE — all five
+# semantic phases (tokens, ast, hir, mir, mir-mono) have real --dump-* routes
+# in the stage binaries and must produce fingerprints from them, so a "not
+# comparable" phase is never acceptable in a release build. The UNAVAILABLE
+# tolerance remains only for non-release/debug probes (no 4th argument).
 # Usage: bh_phase_equality <stage-a> <stage-b> <outdir> [release]
 bh_phase_equality() {
   local stage_a="$1" stage_b="$2" outdir="$3" release_gate="${4:-}"
@@ -347,7 +364,7 @@ bh_phase_equality() {
         failures=$((failures + 1))
         continue
       fi
-      bh_log "phase equality: $phase UNAVAILABLE in both stages (documented gap; kernel entry must thread --dump-*)"
+      bh_log "phase equality: $phase UNAVAILABLE in both stages (probe produced no output; release mode makes this fatal)"
       unavailable=$((unavailable + 1))
       continue
     fi
@@ -870,7 +887,11 @@ run_canary_files() {
 
 # Pre-self-host critical suite: exercises the runtime/ABI surfaces that the
 # compiler itself depends on, so a stage's runtime is proven capable before
-# compiling the compiler again. Run under stage1 and stage2.
+# compiling the compiler again. Run under stage1 ONLY (the implemented
+# policy: stage1 gets the early critical suite; stage2's gates are
+# validate_stage + the Step 3 diagnostic ladder; stage3 gets the full native
+# acceptance suites; byte identity transfers stage3 runtime evidence to
+# stage2).
 # Every critical canary must exist AND be a member of the authoritative
 # tests/canary/MANIFEST (absence or an unlisted file is fatal).
 # Usage: run_critical_canaries <compiler> <outdir>
