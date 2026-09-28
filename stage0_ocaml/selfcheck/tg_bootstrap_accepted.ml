@@ -15,7 +15,13 @@
      (j) negative debt facts are rejected;
      (k) TG_BOOTSTRAP_ACCEPTED_OVERRIDE=1 restores the hardcoded
          fallback for development (and only "1" enables it);
-     (l) the override never bypasses a valid accepted record. *)
+     (l) the override never bypasses a valid accepted record;
+     (m) the REAL checked-out accepted pointer verifies;
+     (n) containment (P1-4): "../x.json", absolute, nested, non-.json,
+         "." / ".." and symlink-escape record names are rejected, even
+         when a matching record exists at the escaped location;
+     (o) canonical pointer JSON (P1-4): duplicate keys, unknown keys,
+         trailing garbage and escape sequences are rejected. *)
 
 let failures = ref 0
 
@@ -59,6 +65,9 @@ let write_pointer (repo : string) (record_name : string) (sha : string) : unit =
 
 let write_record (repo : string) (record_name : string) (content : string) : unit =
   write_file (Filename.concat repo ("bootstrap/evidence/ocaml/" ^ record_name)) content
+
+let write_pointer_raw (repo : string) (content : string) : unit =
+  write_file (Filename.concat repo "bootstrap/evidence/ocaml/accepted.json") content
 
 (* A distinctive fallback marker: the loader must return exactly the
    hardcoded report it was given. *)
@@ -203,6 +212,79 @@ let () =
   | Ok _ -> fail "override=1: used the fallback despite a valid record"
   | Error m -> fail "override=1: valid record rejected: %s" m);
   Unix.putenv Bootstrap_accepted.override_env "";
+  (* (n) containment: evidence_record must name one .json file directly
+     in bootstrap/evidence/ocaml; traversal, absolute, nested, "." / "..",
+     non-.json and symlink-escape names are rejected even when a matching
+     record exists at the escaped location. *)
+  let pointer_text (name : string) (sha : string) : string =
+    Printf.sprintf
+      "{ \"evidence_record\": \"%s\", \"evidence_sha256\": \"%s\", \"approved_by\": \"test\", \
+       \"approval_reason\": \"test\" }\n"
+      name sha
+  in
+  let repo_n = tmp_repo () in
+  write_file (Filename.concat (Filename.dirname repo_n) "escaped_record.json") content_a;
+  write_pointer_raw repo_n (pointer_text "../escaped_record.json" sha_a);
+  expects_error "containment: ../ record name" (load repo_n) "bare file name";
+  let repo_n2 = tmp_repo () in
+  let absolute_record = Filename.concat (Filename.dirname repo_n2) "absolute_record.json" in
+  write_file absolute_record content_a;
+  write_pointer_raw repo_n2 (pointer_text absolute_record sha_a);
+  expects_error "containment: absolute record name" (load repo_n2) "bare file name";
+  let repo_n3 = tmp_repo () in
+  mkdir_p (Filename.concat repo_n3 "bootstrap/evidence/ocaml/nested");
+  write_record repo_n3 "nested/record.json" content_a;
+  write_pointer_raw repo_n3 (pointer_text "nested/record.json" sha_a);
+  expects_error "containment: nested record name" (load repo_n3) "bare file name";
+  let repo_n4 = tmp_repo () in
+  write_record repo_n4 "record.txt" content_a;
+  write_pointer_raw repo_n4 (pointer_text "record.txt" sha_a);
+  expects_error "containment: non-.json record name" (load repo_n4) "ending in .json";
+  let repo_n5 = tmp_repo () in
+  write_pointer_raw repo_n5 (pointer_text ".." sha_a);
+  expects_error "containment: .. record name" (load repo_n5) "path traversal component";
+  let repo_n6 = tmp_repo () in
+  let symlink_target = Filename.concat (Filename.dirname repo_n6) "symlink_target.json" in
+  write_file symlink_target content_a;
+  Unix.symlink symlink_target
+    (Filename.concat repo_n6 "bootstrap/evidence/ocaml/symlink_record.json");
+  write_pointer_raw repo_n6 (pointer_text "symlink_record.json" sha_a);
+  expects_error "containment: symlink escape" (load repo_n6) "outside the canonical evidence";
+  (* (o) canonical pointer JSON: duplicate keys, unknown keys, trailing
+     garbage and escape sequences are rejected. *)
+  let repo_o = tmp_repo () in
+  write_record repo_o rec_a content_a;
+  write_pointer_raw repo_o
+    (Printf.sprintf
+       "{ \"evidence_record\": \"%s\", \"evidence_record\": \"%s\", \"evidence_sha256\": \"%s\", \
+        \"approved_by\": \"test\", \"approval_reason\": \"test\" }\n"
+       rec_a "other_record.json" sha_a);
+  expects_error "canonical pointer: duplicate key" (load repo_o) "duplicate key";
+  let repo_o2 = tmp_repo () in
+  write_record repo_o2 rec_a content_a;
+  write_pointer_raw repo_o2
+    (Printf.sprintf
+       "{ \"evidence_record\": \"%s\", \"evidence_sha256\": \"%s\", \"approved_by\": \"test\", \
+        \"approval_reason\": \"test\", \"extra\": \"x\" }\n"
+       rec_a sha_a);
+  expects_error "canonical pointer: unknown key" (load repo_o2) "unknown key";
+  let repo_o3 = tmp_repo () in
+  write_record repo_o3 rec_a content_a;
+  write_pointer_raw repo_o3
+    (Printf.sprintf
+       "{ \"evidence_record\": \"%s\", \"evidence_sha256\": \"%s\", \"approved_by\": \"test\", \
+        \"approval_reason\": \"test\" } trailing garbage\n"
+       rec_a sha_a);
+  expects_error "canonical pointer: trailing garbage" (load repo_o3) "trailing garbage";
+  let repo_o4 = tmp_repo () in
+  write_record repo_o4 rec_a content_a;
+  write_pointer_raw repo_o4
+    (Printf.sprintf
+       "{ \"evidence_record\": \"aaaaaa\\u0061_1.json\", \"evidence_sha256\": \"%s\", \
+        \"approved_by\": \"test\", \"approval_reason\": \"test\" }\n"
+       sha_a);
+  expects_error "canonical pointer: escaped string value" (load repo_o4)
+    "escape sequences are not permitted";
   (* (m) the REAL accepted pointer in the checked-out repo must verify
      (the same invariant the gate and the health lane rely on). *)
   (match load ".." with
