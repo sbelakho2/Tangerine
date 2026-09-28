@@ -1,7 +1,8 @@
 (* tg_bootstrap_accepted.ml — accepted bootstrap-evidence loader self-check
-   (audit items 18-20).
+   (audit items 18-20) AND the machine-readable accepted-debt authority.
 
-   Exercises Bootstrap_accepted.load on synthetic repos:
+   Default mode (no --print-debt-json) exercises Bootstrap_accepted.load
+   on synthetic repos:
      (a) a valid record (nonzero debt) is accepted with its own facts;
      (b) a valid 0/0/0 record (the intended final accepted baseline) is
          accepted — the old `total <= 0` malformed rule is gone;
@@ -21,7 +22,23 @@
          "." / ".." and symlink-escape record names are rejected, even
          when a matching record exists at the escaped location;
      (o) canonical pointer JSON (P1-4): duplicate keys, unknown keys,
-         trailing garbage and escape sequences are rejected. *)
+         trailing garbage and escape sequences are rejected.
+
+   `--print-debt-json [--repo-root DIR]` is the SINGLE accepted-debt
+   authority for the development-health lane (audit P0/P1-1): it resolves
+   bootstrap/evidence/ocaml/accepted.json, verifies the record's REAL
+   SHA-256, validates the debt schema (total >= 0, primary >= 0,
+   secondary >= 0, total = primary + secondary) and prints ONE canonical
+   JSON line:
+
+     {"record":"<name>","total":172,"primary":89,"secondary":83}
+
+   Fail-closed: a missing/malformed pointer, a missing record, a hash
+   mismatch or malformed facts exit non-zero with the reason on stderr
+   and NOTHING on stdout.  This mode deliberately calls load_pointer
+   (never load): the TG_BOOTSTRAP_ACCEPTED_OVERRIDE development fallback
+   must not be able to swap the baseline the health lane compares
+   against. *)
 
 let failures = ref 0
 
@@ -111,7 +128,64 @@ let unchanged_baseline (_name : string) (t : Bootstrap_accepted.t) : bool =
   && t.Bootstrap_accepted.baseline.Debt_report.primaries = hardcoded.Debt_report.primaries
   && t.Bootstrap_accepted.baseline.Debt_report.secondaries = hardcoded.Debt_report.secondaries
 
-let () =
+(* ── --print-debt-json: the accepted-debt authority ──────────────── *)
+
+let json_escape (s : string) : string =
+  let buf = Buffer.create (String.length s) in
+  String.iter
+    (fun c ->
+      match c with
+      | '"' -> Buffer.add_string buf "\\\""
+      | '\\' -> Buffer.add_string buf "\\\\"
+      | '\n' -> Buffer.add_string buf "\\n"
+      | '\r' -> Buffer.add_string buf "\\r"
+      | '\t' -> Buffer.add_string buf "\\t"
+      | c when Char.code c < 0x20 -> Buffer.add_string buf (Printf.sprintf "\\u%04x" (Char.code c))
+      | c -> Buffer.add_char buf c)
+    s;
+  Buffer.contents buf
+
+let print_debt_json (repo_root : string) : unit =
+  match Bootstrap_accepted.load_pointer repo_root with
+  | Error reason ->
+      Printf.eprintf "tg_bootstrap_accepted: --print-debt-json: %s\n" reason;
+      exit 2
+  | Ok (baseline, record_name) ->
+      let total = baseline.Debt_report.total
+      and primaries = baseline.Debt_report.primaries
+      and secondaries = baseline.Debt_report.secondaries in
+      (* Defense in depth: load_pointer already enforces the schema; the
+         authority re-asserts it so the printed object is valid by
+         construction. *)
+      if total < 0 || primaries < 0 || secondaries < 0 || total <> primaries + secondaries then begin
+        Printf.eprintf
+          "tg_bootstrap_accepted: --print-debt-json: malformed debt facts from %s (total %d, \
+           primary %d, secondary %d)\n"
+          record_name total primaries secondaries;
+        exit 2
+      end;
+      Printf.printf "{\"record\":\"%s\",\"total\":%d,\"primary\":%d,\"secondary\":%d}\n"
+        (json_escape record_name) total primaries secondaries;
+      exit 0
+
+let print_debt_json_cli (args : string list) : unit =
+  let repo_root = ref ".." and syntax_ok = ref true in
+  let rec go = function
+    | [] -> ()
+    | "--print-debt-json" :: rest -> go rest
+    | "--repo-root" :: v :: rest ->
+        repo_root := v;
+        go rest
+    | _ -> syntax_ok := false
+  in
+  go args;
+  if not !syntax_ok then begin
+    Printf.eprintf "usage: %s --print-debt-json [--repo-root DIR]\n" Sys.argv.(0);
+    exit 2
+  end;
+  print_debt_json !repo_root
+
+let run_self_check () =
   Printf.printf "TG BOOTSTRAP ACCEPTED-EVIDENCE SELF-CHECK\n";
   (* The override must be off for the fail-closed cases, regardless of
      the ambient environment. *)
@@ -309,3 +383,7 @@ let () =
     exit 1
   end;
   Printf.printf "TG BOOTSTRAP ACCEPTED-EVIDENCE SELF-CHECK: PASS\n"
+
+let () =
+  let args = match Array.to_list Sys.argv with _ :: rest -> rest | [] -> [] in
+  if List.mem "--print-debt-json" args then print_debt_json_cli args else run_self_check ()
