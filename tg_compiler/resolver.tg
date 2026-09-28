@@ -553,6 +553,30 @@ struct ResolutionContext
   # binding with a fresh LocalId (the ids.tg LocalId domain; the type
   # checker allocates its OWN LocalIds in its own domain).
   next_local_id: Int
+
+  # (bare-name index — resolver performance): the ONE derived lookup
+  # structure over symbol_table.module_symbols. Built ONCE at the end of
+  # phase 1 from module_symbols.entries() (insertion order), it maps a bare
+  # name — the LAST "::" segment of a module-qualified key (a
+  # separator-free key is its own bare name) — to every (key, DefId) entry
+  # whose key carries that bare name, in module_symbols insertion order.
+  # bare_name_resolve iterates only that entry group instead of rescanning
+  # and re-materializing every module symbol per query, preserving the
+  # 0/1/>1 rule, own-module shadowing, kind filtering, first-seen foreign
+  # dedup and insertion-order determinism EXACTLY (the full scan visited
+  # the matching entries in the same order).
+  # INVARIANT: module_symbols is mutated only by add_item_to_symbols during
+  # phase 1; build_resolver_indexes runs after that pass and no later phase
+  # inserts, so the index can never go stale mid-resolution.
+  bare_name_index: Map[String, Vec[(String, DefId)]]
+
+  # (module-path index — resolver performance): def_metadata_key(did) ->
+  # the module path parsed from the FIRST module_symbols key (insertion
+  # order) carrying that DefId — byte-for-byte the outcome of the old
+  # module_path_of scan (a separator-free key yields an empty path; a
+  # DefId that was never registered yields an empty path via an index
+  # miss).
+  module_path_index: Map[String, Vec[String]]
 end
 
 struct ResolverLocalBinding
@@ -587,6 +611,13 @@ def resolve_names(program: Program) -> Result[ResolvedNames, Vec[ResolutionError
 
   # Phase 1: Build symbol table from all items
   build_resolver_symbol_table(&mut ctx, program)
+
+  # Phase 1.5 (resolver performance): the derived bare-name / module-path
+  # lookup indexes over the now-frozen module_symbols (see
+  # ResolutionContext.bare_name_index). Built exactly once per resolution;
+  # every phase-3 bare-name lookup and module_path_of read is then O(1) plus
+  # the matching candidate group.
+  build_resolver_indexes(&mut ctx)
 
   # Phase 2: Resolve imports
   rs_resolve_imports(&mut ctx)
@@ -629,7 +660,9 @@ def context_new() -> ResolutionContext
     current_owner_path: Vec::new(),
     current_owner_module: ModuleId { id: 0 },
     next_builtin_index: 0,
-    next_local_id: 0
+    next_local_id: 0,
+    bare_name_index: Map::new(),
+    module_path_index: Map::new()
   }
 end
 
@@ -750,6 +783,50 @@ def build_resolver_symbol_table(inout ctx: ResolutionContext, program: Program) 
     add_item_to_symbols(ctx, &item, &owner_path, owner_module)
     record_item_def(ctx, &item, item_idx, &owner_path, owner_module)
     item_idx = item_idx + 1
+  end
+end
+
+# The bare name a module-qualified key resolves as: the LAST "::" segment
+# (a separator-free key is its own bare name). Every bare-name query in
+# this resolver is a single identifier segment, so the index below matches
+# exactly the entries the old key == name / key.ends_with("::" + name)
+# scan matched.
+def bare_name_of_key(key: String) -> String
+  match key.rfind("::")
+  when Option::Some(pos) then key.slice(pos + 2, key.len())
+  when Option::None then key.clone()
+  end
+end
+
+# The module path recorded in a module-qualified key (the same parse the
+# old module_path_of scan performed per DefId lookup).
+def module_path_of_key(key: String) -> Vec[String]
+  match key.rfind("::")
+  when Option::Some(pos) then key.slice(0, pos).split("::")
+  when Option::None then Vec::new()
+  end
+end
+
+# Build the derived lookup indexes over the FROZEN module_symbols: one pass
+# in entries() order fills bare_name_index (bare name -> (key, DefId)
+# candidates, insertion order preserved) and module_path_index (the FIRST
+# key carrying each DefId -> its parsed module path). Called exactly once
+# after symbol-table construction; the invariant that module_symbols is not
+# mutated afterwards (see ResolutionContext.bare_name_index) is what makes
+# the indexes valid for every phase-3 query.
+def build_resolver_indexes(inout ctx: ResolutionContext) -> Unit
+  for (key, did) in ctx.symbols.module_symbols.entries() do
+    let bare = bare_name_of_key(&key)
+    var group = match ctx.bare_name_index.get(&bare)
+    when Option::Some(existing) then existing
+    when Option::None then Vec::new()
+    end
+    group.push((key.clone(), did.clone()))
+    ctx.bare_name_index.insert(bare, group)
+    let metadata_key = def_metadata_key(did)
+    if !ctx.module_path_index.contains_key(&metadata_key) then
+      ctx.module_path_index.insert(metadata_key, module_path_of_key(&key))
+    end
   end
 end
 
@@ -957,26 +1034,20 @@ def lookup_module_callable(symbols: SymbolTable, path: Vec[String], name: String
   end
 end
 
-# (next layer): recover the module path segments recorded for a DefId
-# by parsing the module_symbols keys ("path::name"): find the key whose
-# value is the given DefId and strip the trailing "::name" (rfind = last
-# separator, so paths containing "::" are handled). The root module's
-# bare key (no separator) yields an empty path. Returns an empty path if
-# the DefId was never registered in module_symbols. DefId equality
-# is (module, index) — module is a ModuleId (compared by id); the kind is
-# metadata and does not participate.
-def module_path_of(symbols: SymbolTable, def_id: DefId) -> Vec[String]
-  for (key, did) in symbols.module_symbols.entries() do
-    if did.module.id == def_id.module.id && did.index == def_id.index then
-      match key.rfind("::")
-      when Option::Some(pos) then
-        return key.slice(0, pos).split("::")
-      when Option::None then
-        return Vec::new()
-      end
-    end
+# (next layer): recover the module path segments recorded for a DefId. The
+# index (ResolutionContext.module_path_index) holds, for every registered
+# DefId, exactly what the old scan returned: the path parsed from the FIRST
+# module_symbols key (insertion order) whose value is that DefId, with the
+# root module's bare key (no separator) yielding an empty path. DefId
+# equality is (module, index) — module is a ModuleId (compared by id); the
+# kind is metadata and does not participate; def_metadata_key renders
+# exactly that pair. An unregistered DefId (index miss) yields an empty
+# path, identical to the old scan falling through.
+def module_path_of(inout ctx: ResolutionContext, def_id: DefId) -> Vec[String]
+  match ctx.module_path_index.get(def_metadata_key(def_id))
+  when Option::Some(path) then path
+  when Option::None then Vec::new()
   end
-  Vec::new()
 end
 
 # The module-qualified key of the CURRENT module's own qualified
@@ -985,7 +1056,19 @@ end
 # (symbols.current_module) — the exact composition add_item_to_symbols
 # registers the item's "path::name" key with, so the own-entry test
 # compares the same spelling.
-def current_module_qualified_key(ctx: ResolutionContext, name: String) -> String
+#
+# (READ-ONLY inout — resolver performance): this helper, lookup_local,
+# module_path_of and the import-fallback helpers below take `inout ctx`
+# although they never write it.  A by-value Read argument makes the seed
+# VM deep-mark the whole aggregate at the call boundary, and the context
+# carries Maps (module_symbols, def_kinds, the lookup indexes,
+# expr_resolutions), whose marking is NOT memoized: each call re-walks
+# every entry of every context map, and resolution mutates the context
+# per recorded name, so by-value passes reintroduce an O(names x symbols)
+# profile after the index fix.  `inout` is the exclusive-borrow spelling
+# in this kernel (reference parameters are not a feature — parser E106),
+# so the read-only helpers borrow instead of copy-marking.
+def current_module_qualified_key(inout ctx: ResolutionContext, name: String) -> String
   var full = ctx.current_owner_path.clone()
   for seg in ctx.symbols.current_module do
     full.push(seg.clone())
@@ -1031,15 +1114,16 @@ def bare_name_resolve(inout ctx: ResolutionContext, name: String, kinds: Vec[Def
   var own_did = Option::None
   var foreign = Vec::new()
   var foreign_seen = Map::new()
-  let suffix = "::" + name.clone()
-  for (key, did) in ctx.symbols.module_symbols.entries() do
-    var matches = false
-    if key == name.clone() then
-      matches = true
-    elsif key.ends_with(suffix) then
-      matches = true
-    end
-    if matches then
+  # Index-backed candidate scan (RESOLVER PERF): ctx.bare_name_index holds
+  # exactly the (key, did) entries the old full-map scan matched — the key
+  # is the bare name itself or ends with "::" + name — grouped under the
+  # bare name in module_symbols insertion order. Iterating only that group
+  # therefore yields the identical candidate order, own-module shadowing
+  # (last own candidate wins exactly as before), kind filtering, first-seen
+  # foreign dedup and 0/1/>1 outcome as the full scan.
+  match ctx.bare_name_index.get(&name)
+  when Option::Some(candidates) then
+    for (key, did) in candidates do
       let did_kind = match ctx.symbols.def_kinds.get(def_metadata_key(did))
       when Option::Some(k) then k
       when Option::None then DefKind::Other
@@ -1068,6 +1152,7 @@ def bare_name_resolve(inout ctx: ResolutionContext, name: String, kinds: Vec[Def
         end
       end
     end
+  when Option::None then ()
   end
   match own_did
   when Option::Some(did) then
@@ -1662,7 +1747,7 @@ def resolve_module_imports(inout symbols: SymbolTable, inout module: ModuleSymbo
   end
 end
 
-def cycle_in_import_graph(symbols: SymbolTable, from: String, to: String) -> Bool
+def cycle_in_import_graph(inout symbols: SymbolTable, from: String, to: String) -> Bool
   # Check if adding edge from->to would create a cycle
   # by checking if 'to' can reach 'from'
   var visited = Set::new()
@@ -1751,7 +1836,7 @@ def detect_all_import_cycles(symbols: SymbolTable) -> Vec[Vec[String]]
   cycles
 end
 
-def resolve_import_path(symbols: SymbolTable, path: Vec[String]) -> Bool
+def resolve_import_path(inout symbols: SymbolTable, path: Vec[String]) -> Bool
   if path.is_empty() then return false end
 
   # Every bootstrap-kernel module declared in
@@ -2185,7 +2270,7 @@ def resolve_path(inout ctx: ResolutionContext, path: Vec[String], node_id: Int, 
   if path.len() >= 2 then
     match bare_name_resolve(ctx, &first, &vec![DefKind::TypeName], &span)
     when BareNameResolution::Resolved(owner_did) then
-      let owner_path = module_path_of(&ctx.symbols, owner_did.clone())
+      let owner_path = module_path_of(ctx, owner_did.clone())
       let second = path[1]
       match ctx.symbols.module_symbols.get(module_qualified_key(&owner_path, &second))
       when Option::Some(var_did) then
@@ -2361,8 +2446,8 @@ def is_frontend_intrinsic_name(name: String) -> Bool
   name == "string_reserve" || name == "string_is_empty" || name == "string_bytes"
 end
 
-def resolve_via_imports(inout ctx: ResolutionContext, name: String, expr: Expr) -> Bool
-  let module = get_current_module_ref(&ctx.symbols)
+def resolve_via_imports(inout ctx: ResolutionContext, name: String, node_id: Int) -> Bool
+  let module = get_current_module_ref(&mut ctx.symbols)
 
   for import in module.imports do
     if import.is_glob then
@@ -2401,7 +2486,7 @@ def resolve_via_imports(inout ctx: ResolutionContext, name: String, expr: Expr) 
           index: target_idx
         }
         record_def_kind(ctx, &target_did, target_kind)
-        ctx.resolved.call_targets.insert(expr.node_id, target_did)
+        ctx.resolved.call_targets.insert(node_id, target_did)
         target_idx
       when Option::None then 0 as UInt
       end
@@ -2436,7 +2521,7 @@ def resolve_via_imports(inout ctx: ResolutionContext, name: String, expr: Expr) 
       when _ then
         ResolvedExprKind::Function(target_did)
       end
-      ctx.resolved.expr_resolutions.insert(expr.node_id, ResolvedExpr {
+      ctx.resolved.expr_resolutions.insert(node_id, ResolvedExpr {
         kind: resolved_kind,
         module_path: import.path.clone()
       })
@@ -2451,7 +2536,7 @@ end
 # authority — the def_kinds METADATA of the module_symbols entry for
 # exactly this (module_path, name) pair ("path::name"). The bare-name
 # root-tree lookups (per-module tree AND the root fallback) are not part of the model.
-def import_target_kind(ctx: ResolutionContext, module_path: Vec[String], name: String) -> DefKind
+def import_target_kind(inout ctx: ResolutionContext, module_path: Vec[String], name: String) -> DefKind
   let key = module_qualified_key(module_path, name)
   match ctx.symbols.module_symbols.get(key)
   when Option::Some(did) then
@@ -2472,7 +2557,7 @@ def resolve_via_imports_path(inout ctx: ResolutionContext, path: Vec[String], sp
     return false
   end
 
-  let module = get_current_module_ref(&ctx.symbols)
+  let module = get_current_module_ref(&mut ctx.symbols)
 
   # Check exact imports (use foo::bar::Baz)
   for import in module.imports do
@@ -2552,7 +2637,7 @@ def record_path_call_target(inout ctx: ResolutionContext, path: Vec[String], nod
   if path.len() < 2 then return end
   var key_attempts: Vec[Vec[String]] = Vec::new()
   key_attempts.push(path.clone())
-  let module = get_current_module_ref(&ctx.symbols)
+  let module = get_current_module_ref(&mut ctx.symbols)
   for import in module.imports do
     if import.path.is_empty() then next end
     let import_alias = match import.alias_name
@@ -2601,7 +2686,7 @@ end
 # "path::name" keys (module_symbols), the module path plus the remaining
 # segments joined. The bare-name root-tree walk and its flat root
 # fallback is not part of the model.
-def verify_symbol_in_module(ctx: ResolutionContext, module_path: Vec[String], remaining: Vec[String]) -> Bool
+def verify_symbol_in_module(inout ctx: ResolutionContext, module_path: Vec[String], remaining: Vec[String]) -> Bool
   if remaining.is_empty() then
     return false
   end
@@ -2616,9 +2701,9 @@ def verify_symbol_in_module(ctx: ResolutionContext, module_path: Vec[String], re
   ctx.symbols.module_symbols.contains_key(&key)
 end
 
-def resolve_type_via_imports(ctx: ResolutionContext, path: Vec[String]) -> Bool
+def resolve_type_via_imports(inout ctx: ResolutionContext, path: Vec[String]) -> Bool
   # Check if type is imported
-  let module = get_current_module_ref(&ctx.symbols)
+  let module = get_current_module_ref(&mut ctx.symbols)
 
   for import in module.imports do
     if import.path == path.clone() then
@@ -2654,7 +2739,7 @@ def define_local(inout ctx: ResolutionContext, name: String, inout binding: Reso
   end
 end
 
-def lookup_local(ctx: ResolutionContext, name: String) -> Option[ResolverLocalBinding]
+def lookup_local(inout ctx: ResolutionContext, name: String) -> Option[ResolverLocalBinding]
   var i = ctx.local_scopes.len()
   while i > 0 do
     i = i - 1
@@ -2666,7 +2751,7 @@ def lookup_local(ctx: ResolutionContext, name: String) -> Option[ResolverLocalBi
   Option::None
 end
 
-def get_current_module_ref(symbols: SymbolTable) -> ModuleSymbols
+def get_current_module_ref(inout symbols: SymbolTable) -> ModuleSymbols
   var module = symbols.root
   for seg in symbols.current_module do
     module = module.submodules.get(&seg).expect("module not found")
@@ -2694,7 +2779,7 @@ end
 # add_item_to_symbols registered the symbol's index into, so the returned
 # index matches the module_symbols DefId byte-for-byte). The bare-name
 # root-tree walk and its root fallback is not part of the model.
-def symbol_index_for(ctx: ResolutionContext, module_path: Vec[String], name: String) -> Option[UInt]
+def symbol_index_for(inout ctx: ResolutionContext, module_path: Vec[String], name: String) -> Option[UInt]
   match ctx.symbols.module_tables.get(module_path.join("::"))
   when Option::Some(m) then
     match m.symbol_indices.get(name)
@@ -2896,7 +2981,7 @@ def resolve_ident_expr(inout ctx: ResolutionContext, name: String, expr: Expr) -
   end
 
   # Check imports
-  if !resolve_via_imports(ctx, name, expr) then
+  if !resolve_via_imports(ctx, name, expr.node_id) then
     rs_add_error(&mut ctx.symbols, ResolutionErrorKind::UnresolvedName,
       "unresolved name: " + name + " @" + expr.span.start.to_string(), expr.span.clone())
   end
