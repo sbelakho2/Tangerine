@@ -3073,21 +3073,29 @@ def parse_enum_decl(inout p: TgcParser, vis: Visibility, start: Span, derives: V
   end  end
 end
 
-def parse_variant_field(inout p: TgcParser) -> (Option[String], Option[TypeExpr])
+def parse_variant_field(inout p: TgcParser, allow_soft_names: Bool) -> (Option[String], Option[TypeExpr])
   # variant_field = [ IDENT ':' ] type_expr
-  # Check if this is a named field (lookahead for IDENT Colon). Soft
-  # keywords count as field names (`Try { ..., finally: ... }`).
-  match soft_ident_name(peek(p))
-  when Option::Some(_) then
-    match lookahead_kind(p, 1)
-    when TokenKind::Colon then
-      # Named field — capture name, skip colon, then parse the type
-      let field_name = expect_ident(p)
-      advance(p)
-      return (field_name, parse_type(p))
-    when _ then ()
+  # Named-field detection: a name is a plain IDENT, plus (BRACE form only)
+  # the soft keywords — the seed's parenthesized variant list tests
+  # `at_ident p && kind_at p 1 = Token.Colon` (parser.ml:1054-1057) while the
+  # brace form uses expect_ident (parser.ml:1070-1078), which is why
+  # `V(finally: Int)` is rejected but `Try { finally: ... }` parses.
+  mut named = false
+  match peek(p)
+  when TokenKind::Ident(_) then named = true
+  when _ then
+    if allow_soft_names then
+      match soft_ident_name(peek(p))
+      when Option::Some(_) then named = true
+      when Option::None then ()
+      end
     end
-  when Option::None then ()
+  end
+  if named && lookahead_kind(p, 1) == TokenKind::Colon then
+    # Named field — capture name, skip colon, then parse the type
+    let field_name = expect_ident(p)
+    advance(p)
+    return (field_name, parse_type(p))
   end
   # Positional field — just a type
   (Option::None, parse_type(p))
@@ -3102,7 +3110,7 @@ def parse_variant_decl(inout p: TgcParser) -> Option[VariantDecl]
     if at(p, TokenKind::LParen) then
       advance(p)
       if !at(p, TokenKind::RParen) then
-        let (fn0, ty0) = parse_variant_field(p)
+        let (fn0, ty0) = parse_variant_field(p, false)
         match ty0
         when Option::Some(ty) then
           fields.push(ty)
@@ -3111,7 +3119,7 @@ def parse_variant_decl(inout p: TgcParser) -> Option[VariantDecl]
         end
         while at(p, TokenKind::Comma) do
           advance(p)
-          let (fn_n, ty_n) = parse_variant_field(p)
+          let (fn_n, ty_n) = parse_variant_field(p, false)
           match ty_n
           when Option::Some(ty) then
             fields.push(ty)
@@ -3127,7 +3135,7 @@ def parse_variant_decl(inout p: TgcParser) -> Option[VariantDecl]
       skip_newlines(p)
       skip_doc_comments(p)
       if !at(p, TokenKind::RBrace) then
-        let (fn0, ty0) = parse_variant_field(p)
+        let (fn0, ty0) = parse_variant_field(p, true)
         match ty0
         when Option::Some(ty) then
           fields.push(ty)
@@ -3139,7 +3147,7 @@ def parse_variant_decl(inout p: TgcParser) -> Option[VariantDecl]
           skip_newlines(p)
           skip_doc_comments(p)
           if at(p, TokenKind::RBrace) then break end
-          let (fn_n, ty_n) = parse_variant_field(p)
+          let (fn_n, ty_n) = parse_variant_field(p, true)
           match ty_n
           when Option::Some(ty) then
             fields.push(ty)
@@ -6070,6 +6078,14 @@ def parse_single_pattern(inout p: TgcParser) -> Option[Pattern]
         advance(p)
         mut fields: Vec[(String, Pattern)] = Vec::new()
         while !at(p, TokenKind::RBrace) && !at(p, TokenKind::Eof) do
+          # The seed's struct-pattern loop stops at a terminator `end`
+          # (parser.ml:3245-3262): a bare `end` (`S { a end }`) is not a
+          # field name — only `end` followed by a name-continuation token
+          # (`end: x`) is. The kernel then reports the missing `}` instead
+          # of reading the terminator as a field (accidental widening).
+          if at_kw_end_as_terminator(p) then
+            break
+          end
           if at(p, TokenKind::DotDot) then
             # Rest pattern: `..` (the seed skips it; the kernel PatternKind
             # has no rest slot, so no field is recorded).
@@ -6132,6 +6148,11 @@ def parse_single_pattern(inout p: TgcParser) -> Option[Pattern]
           advance(p)
           mut fields = Vec::new()
           while !at(p, TokenKind::RBrace) && !at(p, TokenKind::Eof) do
+            # Same terminator guard as the simple struct pattern above
+            # (seed parser.ml:3214-3226): a bare `end` ends the pattern.
+            if at_kw_end_as_terminator(p) then
+              break
+            end
             if at(p, TokenKind::DotDot) then
               # Rest pattern: `..` (skipped, like the seed).
               advance(p)
@@ -7003,6 +7024,16 @@ def parse_struct_literal_fields(inout p: TgcParser) -> Vec[(String, Expr)]
   end
 
   while true do
+    # The seed's field loop stops at a terminator `end`
+    # (parser.ml:2586 `not (at_kw_end_as_terminator p)`): `end` followed on
+    # the same line by a name-continuation token (`end: 1`) IS a field
+    # name, but a bare `end` (`S { end }`, `S { a: 1 end }`) ends the field
+    # list — the kernel then reports the missing `}`, matching the seed's
+    # stray-brace rejection. Without this guard the soft-identifier fallback
+    # would read the terminator as a shorthand field (accidental widening).
+    if at_kw_end_as_terminator(p) then
+      break
+    end
     let field_span = peek_span(p)
     match expect_ident(p)
     when Option::Some(fname) then
@@ -7700,12 +7731,21 @@ def parse_primary(inout p: TgcParser) -> Option[Expr]
             end
           end
         else
-          # The seed's lenient array-element separation (parser.ml:2174-2190):
+          # The seed's lenient array-element separation (parser.ml:2189-2227):
           # an element on a NEW line continues the literal without a comma.
+          # Comments are trivia and may sit before the newline, so skip doc
+          # comments and newlines in either order; the continuation requires
+          # an actual Newline in the gap (the seed's token stream drops both
+          # and tests the raw source span for the newline).
           let saved = p.pos
-          skip_newlines(p)
-          skip_doc_comments(p)
-          if p.pos != saved && at_expr_start(p) then
+          mut saw_newline = false
+          while at(p, TokenKind::Newline) || is_doc_comment(peek(p)) do
+            if at(p, TokenKind::Newline) then
+              saw_newline = true
+            end
+            advance(p)
+          end
+          if saw_newline && at_expr_start(p) then
             match parse_expr(p)
             when Option::Some(e) then elems.push(e)
             when Option::None then more = false

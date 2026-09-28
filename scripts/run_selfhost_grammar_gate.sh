@@ -57,17 +57,27 @@
 #      currently EMPTY (the tree is fully clean; a future exception MUST be
 #      justified in that file).
 #
-#   4. KERNEL PARSE-PARITY (the grammar authority) — run the REAL kernel
-#      lexer+parser (stage0_ocaml build of the tg_parse_parity lane, which
-#      compiles the kernel front end with the OCaml seed and parses every
-#      manifest closure source in the seed VM) over the 45-source closure.
-#      Any grammar diagnostic ("expected item", "expected 'end'", ...)
-#      fails the gate. This catches seed/kernel grammar divergence — the
-#      match-tail `end  end  end` class that otherwise blocks stage1
-#      tens of minutes into the ladder — in a few minutes. The lane is
-#      built on demand with dune; when neither the lane binary nor dune is
-#      available the step warns and the structural scans above remain the
-#      authoritative rejection.
+#   4. KERNEL PARSE-PARITY + GRAMMAR-CONFORMANCE CORPUS (hard when it runs;
+#      fail-closed when it cannot run) — run the REAL kernel lexer+parser
+#      (the stage0_ocaml build of the tg_parse_parity lane, which compiles
+#      the kernel front end with the OCaml seed and parses every manifest
+#      closure source in the seed VM) over the 45-source closure, and the
+#      DELIBERATE grammar-conformance corpus
+#      (tests/grammar_conformance/manifest.txt) on BOTH parsers: the lane
+#      checks the corpus with the OCaml seed parser in process and the
+#      kernel probe checks the same registry in the seed VM. Any grammar
+#      diagnostic ("expected item", "expected 'end'", ...) or any corpus
+#      decision violation fails the gate. This catches seed/kernel grammar
+#      divergence — the match-tail `end  end  end` class that otherwise
+#      blocks stage1 tens of minutes into the ladder — in a few minutes, and
+#      it keeps parity from legitimizing accidentally-accepted syntax.
+#      POLICY: the lane is built with dune when dune is available; when the
+#      lane cannot be built or run this step FAILS CLOSED, because the
+#      structural scans alone are NOT a grammar authority. The explicit
+#      TG_GRAMMAR_GATE_ALLOW_PARITY_SKIP=1 opt-out allows the structural
+#      scans to run alone, but that run is reported as DEGRADED — grammar
+#      (closure parity AND corpus) NOT CHECKED — and is not a
+#      grammar-authority run.
 #
 #   5. COMPILER CHECK (when usable) — if a native compiler binary exists in
 #      build/ (tg_stage3, else tg_stage2, else tg_stage1) AND that binary
@@ -80,11 +90,14 @@
 #
 # Exit codes:
 #   0  closure AND full tool tree are clean (structural scans passed;
-#      parse-parity passed or was unavailable; compiler check passed or
-#      skipped)
+#      parse-parity + the grammar-conformance corpus passed; compiler check
+#      passed or skipped). With the explicit TG_GRAMMAR_GATE_ALLOW_PARITY_SKIP=1
+#      opt-out the run may exit 0 without the grammar lane: that run is
+#      reported as DEGRADED and is NOT a grammar-authority run.
 #   1  hard failure: missing closure file, forbidden legacy form, stale
-#      tokenize call, a closure source the kernel parser cannot parse, or a
-#      closure source failed the current compiler's check
+#      tokenize call, a closure source or corpus specimen the kernel parser
+#      disagrees with, a closure source failed the current compiler's check,
+#      or the grammar lane is unavailable without the explicit skip opt-out
 
 set -uo pipefail
 
@@ -289,34 +302,47 @@ fi
 echo "[grammar-gate] full-tree structural scan OK: no legacy parameter forms / stale tokenize calls in ANY tg_compiler/*.tg"
 
 # ———————————————————————————————————————————————————————————————
-# Step 4 — kernel parse-parity over the manifest closure
+# Step 4 — kernel parse-parity + grammar-conformance corpus
 # ———————————————————————————————————————————————————————————————
 # The structural scans cannot see whether the KERNEL parser (the one every
-# stage from stage1 up is built from) accepts the closure the SEED accepts.
-# The tg_parse_parity lane compiles the real kernel front end with the OCaml
-# seed and, in the seed VM, parses every manifest closure source; any
-# grammar diagnostic fails the gate. Cheap relative to the stage ladder
-# (~3 minutes), so a seed/kernel grammar divergence is caught here instead
-# of 45 minutes into run_bootstrap.sh.
+# stage from stage1 up is built from) accepts the closure the SEED accepts,
+# nor whether either parser still obeys the DELIBERATE grammar decisions in
+# tests/grammar_conformance/. The tg_parse_parity lane compiles the real
+# kernel front end with the OCaml seed, parses every manifest closure source
+# and the corpus in the seed VM, and checks the corpus with the seed parser
+# in process; any grammar diagnostic or corpus-decision violation fails the
+# gate. Cheap relative to the stage ladder (~3 minutes).
+#
+# POLICY (fail closed): when dune is available the lane is (re)built from
+# the current sources; when the lane cannot be built or run this step FAILS,
+# because the structural scans alone are NOT a grammar authority and must
+# not be described as one. TG_GRAMMAR_GATE_ALLOW_PARITY_SKIP=1 is an explicit
+# opt-out for environments that cannot run the lane: it exits 0 but reports
+# the run as DEGRADED with the grammar NOT CHECKED.
 
 PARITY_LANE="$ROOT_DIR/stage0_ocaml/_build/default/selfcheck/tg_parse_parity.exe"
-if [ ! -x "$PARITY_LANE" ]; then
-  if command -v dune >/dev/null 2>&1; then
-    echo "[grammar-gate] building the kernel parse-parity lane (dune build selfcheck/tg_parse_parity.exe)"
-    if ! (cd "$ROOT_DIR/stage0_ocaml" && dune build selfcheck/tg_parse_parity.exe); then
-      fail "cannot build the kernel parse-parity lane (dune build selfcheck/tg_parse_parity.exe)"
-    fi
+PARITY_STATUS="NOT RUN"
+
+if command -v dune >/dev/null 2>&1; then
+  echo "[grammar-gate] building the kernel parse-parity lane (dune build selfcheck/tg_parse_parity.exe)"
+  if ! (cd "$ROOT_DIR/stage0_ocaml" && dune build selfcheck/tg_parse_parity.exe); then
+    fail "cannot build the kernel parse-parity lane (dune build selfcheck/tg_parse_parity.exe)"
   fi
 fi
 
 if [ -x "$PARITY_LANE" ]; then
-  echo "[grammar-gate] kernel parse-parity: parsing the $n closure sources with the kernel parser (seed VM)"
+  echo "[grammar-gate] kernel parse-parity + grammar-conformance corpus: $n closure sources and the tests/grammar_conformance registry, kernel parser in the seed VM + seed parser in process"
   if ! "$PARITY_LANE" "$ROOT_DIR"; then
-    fail "kernel parse-parity FAILED: the kernel parser records error diagnostics on a closure source the seed accepts (see build/parse_parity_report.txt)"
+    fail "kernel parse-parity FAILED: a closure source or a grammar-conformance specimen disagrees with a parser (see build/parse_parity_report.txt)"
   fi
-  echo "[grammar-gate] kernel parse-parity OK: every manifest closure source parses clean under the kernel parser"
+  echo "[grammar-gate] kernel parse-parity + grammar-conformance corpus OK"
+  PARITY_STATUS="PASS"
+elif [ "${TG_GRAMMAR_GATE_ALLOW_PARITY_SKIP:-0}" = "1" ]; then
+  echo "[grammar-gate:warning] kernel parse-parity NOT CHECKED: lane $PARITY_LANE is unavailable and dune is not on PATH"
+  echo "[grammar-gate:warning] TG_GRAMMAR_GATE_ALLOW_PARITY_SKIP=1 — this run is DEGRADED: only the structural scans ran; it is NOT a grammar-authority run and says nothing about closure parse-parity or the grammar-conformance corpus"
+  PARITY_STATUS="SKIPPED (DEGRADED — NOT a grammar-authority run)"
 else
-  echo "[grammar-gate] warning: parse-parity lane $PARITY_LANE is unavailable and dune is not on PATH — kernel parse-parity NOT checked (structural scans remain authoritative)"
+  fail "kernel parse-parity lane $PARITY_LANE is unavailable and dune is not on PATH — cannot verify the grammar. This step is fail-closed by design; set TG_GRAMMAR_GATE_ALLOW_PARITY_SKIP=1 to run the structural scans alone (that run is DEGRADED and NOT a grammar-authority run)"
 fi
 
 # ———————————————————————————————————————————————————————————————
@@ -362,7 +388,7 @@ PROBE
 done
 
 if [ -z "$BIN" ]; then
-  echo "[grammar-gate] no usable native compiler binary in $BUILD_DIR — structural scans only (bootstrap will produce one)"
+  echo "[grammar-gate] no usable native compiler binary in $BUILD_DIR — compiler check skipped (bootstrap will produce one); grammar lane: $PARITY_STATUS"
   exit 0
 fi
 
@@ -378,5 +404,5 @@ done <<< "$closure"
 if [ "$bad" -ne 0 ]; then
   fail "compiler check FAILED for closure sources under $BIN"
 fi
-echo "[grammar-gate] compiler check OK: every manifest source passed \`$BIN check\`"
+echo "[grammar-gate] compiler check OK: every manifest source passed \`$BIN check\`; grammar lane: $PARITY_STATUS"
 exit 0
