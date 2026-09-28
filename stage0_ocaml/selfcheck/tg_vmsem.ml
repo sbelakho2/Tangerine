@@ -2992,6 +2992,480 @@ let check_edw_alias_cow () =
             (String.concat ";" (List.map string_of_int b))
       | _ -> fail "%s: an enum payload is not a live array" what)
 
+(* ── (k) the drop mirror through enum-downcast destinations ─────────
+
+   `drop_old_value_at`'s projected resolve recursed a Downcast into
+   payload POSITION 0 (instead of the payload STRUCT the read and write
+   arms use) and resolved every Field against the root local type
+   (instead of the projected owner type).  Both defects stayed dormant
+   while the displaced leaf was copyable and position 0 happened to fall
+   through to the no-value fallback, but now that downcast writes land
+   they leak (or over-drop) the displaced OWNED component.
+
+   The battery proves the corrected mirror end to end.  The owned-drop
+   cases (0-5, 7) seed region owners at frame setup exactly like the (g)
+   ownership battery — the verifier's static state cannot see a seeded
+   value (it treats the seeded local as possibly uninitialized), so those
+   legs are VM-only; the (j) battery already owns the verifier-accepted
+   shapes, and case 6b keeps one MIR-built, verifier-checked trap.
+     0. the root dispatch is ACTIVATED (the pre-fix `else` attached to
+        the inner bounds `if`, leaving the whole local-root branch dead):
+        a whole-local overwrite drops the displaced value exactly once;
+     1. [Downcast; ConstantIndex 0] overwriting an owned payload
+        component frees the displaced region EXACTLY once and stores the
+        new ref;
+     2. [Downcast; Field] resolves the FieldId against the projected
+        payload struct (the defect's root-type resolve traps on the
+        enum) and frees the displaced payload field exactly once;
+     3. a unique nested array of refs inside the payload: the displaced
+        element drops exactly once and its sibling stays owned;
+     4. the A/B payload COW: the payload's nested array is marked shared
+        by the Copy, the deeper projected write forks and A stays intact;
+     5. a wrong runtime variant traps BEFORE any drop (the displaced
+        payload ref is not freed by the failed assignment);
+     6. an unknown FieldId traps deterministically (VM-only seeded);
+        a Field on a tuple payload (whose FieldId resolves against the
+        payload type) is verifier-rejected and traps in the VM;
+     7. a moved-out payload component is a no-op for the drop mirror (no
+        double drop) — the moved value is destroyed exactly once by its
+        new owner. *)
+
+let dmd_tid = Ids.Type_id.make 701
+let dmd_s_tid = Ids.Type_id.make 702
+let dmd_enum_ty = Type_repr.Named (dmd_tid, [||])
+let dmd_s_ty = Type_repr.Named (dmd_s_tid, [||])
+let dmd_i64_arr_ty = Type_repr.Fixed_array (i64, 2)
+let dmd_ref_arr_ty = Type_repr.Fixed_array (ref_ty, 2)
+
+let dmd_s_def : Seed_mir.type_def =
+  Seed_mir.StructDef
+    {
+      sd_id = dmd_s_tid;
+      sd_fields =
+        [ mk_fd 7011 0 ref_ty; mk_fd 7012 1 i64; mk_fd 7013 2 dmd_i64_arr_ty ];
+    }
+
+let dmd_v_ref = 70
+let dmd_v_sref = 71
+let dmd_v_refarr = 72
+
+let dmd_enum_def : Seed_mir.type_def =
+  Seed_mir.EnumDef
+    {
+      ed_id = dmd_tid;
+      ed_variants =
+        [
+          { vd_id = Ids.Variant_id.make dmd_v_ref;
+            vd_index = Ids.Variant_index.make 0;
+            vd_payload = Type_repr.Tuple [| ref_ty |] };
+          { vd_id = Ids.Variant_id.make dmd_v_sref;
+            vd_index = Ids.Variant_index.make 1;
+            vd_payload = dmd_s_ty };
+          { vd_id = Ids.Variant_id.make dmd_v_refarr;
+            vd_index = Ids.Variant_index.make 2;
+            vd_payload = Type_repr.Tuple [| dmd_ref_arr_ty |] };
+        ];
+    }
+
+let dmd_types = [| dmd_enum_def; dmd_s_def |]
+
+let dmd_dcast (v : int) : Seed_mir.projection =
+  Seed_mir.Downcast (Ids.Variant_id.make v)
+
+let dmd_ref (p : Vm_memory.pointer) : Vm_value.t = Vm_value.Ref (Vm_value.Region p)
+
+let dmd_run (what : string) (n : int) (prog : Seed_mir.program)
+    (seed : Vm.t -> Vm_value.frame -> Vm_memory.pointer array -> unit) :
+    seeded_run option =
+  match seeded_run prog seed n with
+  | Ran_ok run -> Some run
+  | Ran_error (m, _) -> fail "%s: %s" what m; None
+  | Setup_error m -> fail "%s: entry setup: %s" what m; None
+
+let dmd_expect_trap (what : string) (n : int) (prog : Seed_mir.program)
+    (seed : Vm.t -> Vm_value.frame -> Vm_memory.pointer array -> unit)
+    (needle : string) : unit =
+  match seeded_run prog seed n with
+  | Ran_error (m, _) ->
+      if contains m needle then pass "%s: deterministic trap" what
+      else fail "%s: trap message %S does not contain %S" what m needle
+  | Ran_ok _ -> fail "%s: the write silently succeeded (no trap)" what
+  | Setup_error m -> fail "%s: entry setup: %s" what m
+
+(* The region-ownership leg: the expect_* diagnostics already fail with
+   the precise region, so the callers only need the combined verdict to
+   decide whether their semantic pass line may print. *)
+let dmd_region_checks (vm : Vm.t) (what : string)
+    (dead : Vm_memory.pointer list) (live : Vm_memory.pointer list) : bool =
+  let before = !failures in
+  expect_dropped vm what dead;
+  expect_owned vm what live;
+  !failures = before
+
+let dmd_struct_payload (frame : Vm_value.frame) (l : int) : Vm_value.t array option =
+  match frame.locals.(l) with
+  | Vm_value.Live (Vm_value.Enum (1, p)) ->
+      Some (Array.init (Vm_value.agg_len p) (Vm_value.agg_get p))
+  | _ -> None
+
+(* 0. the whole-root overwrite drops the displaced value exactly once
+   (the root dispatch's previously dead local branch). *)
+let check_dmd_whole_root_drop () =
+  let what = "enum-downcast drop: whole-local overwrite drops the displaced value" in
+  let prog =
+    single_block
+      [| Type_repr.Unit; ref_ty; ref_ty |]
+      [||]
+      [
+        Seed_mir.Assign (pl 1, Seed_mir.Use (Seed_mir.Move (pl 2)));
+        Seed_mir.Assign (pl 0, Seed_mir.Use (Seed_mir.Constant Seed_mir.Unit));
+      ]
+      Seed_mir.Ret
+  in
+  let seed _vm (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
+    frame.locals.(1) <- Vm_value.Live (dmd_ref res.(0));
+    frame.locals.(2) <- Vm_value.Live (dmd_ref res.(1))
+  in
+  match dmd_run what 2 prog seed with
+  | None -> ()
+  | Some run ->
+      let regions_ok =
+        dmd_region_checks run.svm what [ run.sres.(0) ] [ run.sres.(1) ]
+      in
+      let stored_ok =
+        match run.sframe.locals.(1) with
+        | Vm_value.Live v -> Vm_value.equal v (dmd_ref run.sres.(1))
+        | _ -> false
+      in
+      if regions_ok && stored_ok then
+        pass
+          "%s: the whole-root overwrite freed the displaced region exactly once and stored the new ref"
+          what
+      else if not regions_ok then ()
+      else fail "%s: the local does not hold the freshly stored ref" what
+
+(* 1. [Downcast; ConstantIndex 0] over an owned payload component. *)
+let check_dmd_payload_component_drop () =
+  let what = "enum-downcast drop: displaced owned payload component" in
+  let prog =
+    single_block
+      [| Type_repr.Unit; dmd_enum_ty; ref_ty |]
+      dmd_types
+      [
+        Seed_mir.Assign
+          ( plp 1 [ dmd_dcast dmd_v_ref; cidx 0 ],
+            Seed_mir.Use (Seed_mir.Move (pl 2)) );
+        Seed_mir.Assign (pl 0, Seed_mir.Use (Seed_mir.Constant Seed_mir.Unit));
+      ]
+      Seed_mir.Ret
+  in
+  let seed _vm (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
+    frame.locals.(1) <-
+      Vm_value.Live (Vm_value.Enum (0, Vm_value.agg [| dmd_ref res.(0) |]));
+    frame.locals.(2) <- Vm_value.Live (dmd_ref res.(1))
+  in
+  match dmd_run what 2 prog seed with
+  | None -> ()
+  | Some run ->
+      let regions_ok =
+        dmd_region_checks run.svm what [ run.sres.(0) ] [ run.sres.(1) ]
+      in
+      let stored_ok =
+        match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Enum (0, p)) ->
+            Vm_value.agg_len p = 1
+            && Vm_value.equal (Vm_value.agg_get p 0) (dmd_ref run.sres.(1))
+        | _ -> false
+      in
+      if regions_ok && stored_ok then
+        pass
+          "%s: [Downcast; ConstantIndex 0] freed the displaced region exactly once, stored the new ref, and the new ref stays owned"
+          what
+      else if not regions_ok then ()
+      else fail "%s: the payload does not hold the freshly stored ref" what
+
+(* 2. [Downcast; Field] resolves the FieldId against the projected payload
+   struct; the displaced field ref drops exactly once. *)
+let check_dmd_payload_field_drop () =
+  let what = "enum-downcast drop: [Downcast; Field] on the projected payload struct" in
+  let prog =
+    single_block
+      [| Type_repr.Unit; dmd_enum_ty; ref_ty |]
+      dmd_types
+      [
+        Seed_mir.Assign
+          ( plp 1 [ dmd_dcast dmd_v_sref; fid 7011 ],
+            Seed_mir.Use (Seed_mir.Move (pl 2)) );
+        Seed_mir.Assign (pl 0, Seed_mir.Use (Seed_mir.Constant Seed_mir.Unit));
+      ]
+      Seed_mir.Ret
+  in
+  let seed _vm (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
+    frame.locals.(1) <-
+      Vm_value.Live
+        (Vm_value.Enum
+           ( 1,
+             Vm_value.agg
+               [| dmd_ref res.(0); int64_value 5L; Vm_value.array [| oi 7; oi 8 |] |] ));
+    frame.locals.(2) <- Vm_value.Live (dmd_ref res.(1))
+  in
+  match dmd_run what 2 prog seed with
+  | None -> ()
+  | Some run ->
+      let regions_ok =
+        dmd_region_checks run.svm what [ run.sres.(0) ] [ run.sres.(1) ]
+      in
+      let stored_ok =
+        match dmd_struct_payload run.sframe 1 with
+        | Some p ->
+            Array.length p = 3
+            && Vm_value.equal p.(0) (dmd_ref run.sres.(1))
+            && edw_is_int p.(1) 5
+            && (match p.(2) with Vm_value.Array a -> int_list a = [ 7; 8 ] | _ -> false)
+        | None -> false
+      in
+      if regions_ok && stored_ok then
+        pass
+          "%s: the field write landed on the payload struct (the siblings stay [5; [7;8]]); the displaced ref region was freed exactly once"
+          what
+      else if not regions_ok then ()
+      else fail "%s: the payload struct was not rebuilt with the new field ref" what
+
+(* 3. a unique nested array of refs inside the payload: the displaced
+   element drops exactly once and its sibling stays owned. *)
+let check_dmd_payload_array_element_drop () =
+  let what = "enum-downcast drop: displaced ref element of a payload array" in
+  let prog =
+    single_block
+      [| Type_repr.Unit; dmd_enum_ty; ref_ty |]
+      dmd_types
+      [
+        Seed_mir.Assign
+          ( plp 1 [ dmd_dcast dmd_v_refarr; cidx 0; cidx 1 ],
+            Seed_mir.Use (Seed_mir.Move (pl 2)) );
+        Seed_mir.Assign (pl 0, Seed_mir.Use (Seed_mir.Constant Seed_mir.Unit));
+      ]
+      Seed_mir.Ret
+  in
+  let seed _vm (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
+    frame.locals.(1) <-
+      Vm_value.Live
+        (Vm_value.Enum
+           ( 2,
+             Vm_value.agg [| Vm_value.array [| dmd_ref res.(0); dmd_ref res.(1) |] |] ));
+    frame.locals.(2) <- Vm_value.Live (dmd_ref res.(2))
+  in
+  match dmd_run what 3 prog seed with
+  | None -> ()
+  | Some run ->
+      let regions_ok =
+        dmd_region_checks run.svm what [ run.sres.(1) ] [ run.sres.(0); run.sres.(2) ]
+      in
+      let stored_ok =
+        match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Enum (2, p)) -> (
+            match Vm_value.agg_get p 0 with
+            | Vm_value.Array a ->
+                Vm_value.arr_length a = 2
+                && Vm_value.equal (Vm_value.arr_get a 0) (dmd_ref run.sres.(0))
+                && Vm_value.equal (Vm_value.arr_get a 1) (dmd_ref run.sres.(2))
+            | _ -> false)
+        | _ -> false
+      in
+      if regions_ok && stored_ok then
+        pass
+          "%s: [Downcast; ConstantIndex 0; ConstantIndex 1] dropped only the displaced element (the sibling and the stored ref stay owned)"
+          what
+      else if not regions_ok then ()
+      else fail "%s: the payload array is not [sibling; new ref]" what
+
+(* 4. the A/B payload COW: the payload's nested array is marked shared by
+   the Copy; the deeper projected write forks and A stays intact. *)
+let check_dmd_payload_array_cow () =
+  let what = "enum-downcast drop: payload nested-array COW across A/B" in
+  let prog =
+    single_block
+      [| Type_repr.Unit; dmd_enum_ty; dmd_enum_ty |]
+      dmd_types
+      [
+        Seed_mir.Assign (pl 2, Seed_mir.Use (Seed_mir.Copy (pl 1)));
+        Seed_mir.Assign
+          ( plp 2 [ dmd_dcast dmd_v_sref; fid 7013; cidx 1 ],
+            Seed_mir.Use (int_op 99) );
+        Seed_mir.Assign
+          ( pl 0,
+            Seed_mir.Use
+              (Seed_mir.Copy (plp 1 [ dmd_dcast dmd_v_sref; fid 7013; cidx 1 ])) );
+      ]
+      Seed_mir.Ret
+  in
+  let seed _vm (frame : Vm_value.frame) (_res : Vm_memory.pointer array) : unit =
+    frame.locals.(1) <-
+      Vm_value.Live
+        (Vm_value.Enum
+           ( 1,
+             Vm_value.agg
+               [| Vm_value.Null; int64_value 5L; Vm_value.array [| oi 7; oi 8 |] |] ));
+  in
+  let payload_array (frame : Vm_value.frame) (l : int) : int list option =
+    match dmd_struct_payload frame l with
+    | Some p -> (
+        match p.(2) with Vm_value.Array a -> Some (int_list a) | _ -> None)
+    | None -> None
+  in
+  match dmd_run what 0 prog seed with
+  | None -> ()
+  | Some run -> (
+      match (payload_array run.sframe 1, payload_array run.sframe 2) with
+      | Some a, Some b when a = [ 7; 8 ] && b = [ 7; 99 ] && edw_live_int run.sframe 0 8 ->
+          pass
+            "%s: the Copy marked the payload array shared, B's deeper projected write forked ([7; 99]), A stays [7; 8]"
+            what
+      | Some a, Some b ->
+          fail "%s: A=%s B=%s (expected A=[7;8], B=[7;99])" what
+            (String.concat ";" (List.map string_of_int a))
+            (String.concat ";" (List.map string_of_int b))
+      | _ -> fail "%s: the payload arrays are not live int arrays" what)
+
+(* 5. a wrong runtime variant must trap BEFORE the drop resolves anything:
+   the parked payload ref must stay owned (a pre-trap drop would free it).
+   The destination is the WHOLE downcast payload so the defect's
+   payload-position-0 recursion would resolve the parked field-0 ref and
+   free it before the tag check ever runs. *)
+let check_dmd_wrong_variant_trap () =
+  let what = "enum-downcast drop: wrong runtime variant traps before any drop" in
+  let prog =
+    single_block
+      [| Type_repr.Unit; dmd_enum_ty; ref_ty |]
+      dmd_types
+      [
+        Seed_mir.Assign
+          ( plp 1 [ dmd_dcast dmd_v_ref ],
+            Seed_mir.Use (Seed_mir.Move (pl 2)) );
+        Seed_mir.Assign (pl 0, Seed_mir.Use (Seed_mir.Constant Seed_mir.Unit));
+      ]
+      Seed_mir.Ret
+  in
+  let seed _vm (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
+    (* the LIVE value is the struct variant (tag 1); the destination
+       downcasts to the ref variant (semantic 70, tag 0) — the mismatch
+       must trap without touching the struct payload's field 0 ref *)
+    frame.locals.(1) <-
+      Vm_value.Live
+        (Vm_value.Enum
+           ( 1,
+             Vm_value.agg
+               [| dmd_ref res.(0); int64_value 5L; Vm_value.array [| oi 7; oi 8 |] |] ));
+    frame.locals.(2) <- Vm_value.Live (dmd_ref res.(1))
+  in
+  match seeded_run prog seed 2 with
+  | Ran_error (m, run) ->
+      if contains m "runtime tag 1" then begin
+        if
+          dmd_region_checks run.svm (what ^ ": the parked payload ref") []
+            [ run.sres.(0) ]
+        then pass "%s: the tag mismatch trapped and the payload was left untouched" what
+      end
+      else fail "%s: unexpected trap %S" what m
+  | Ran_ok _ -> fail "%s: the wrong-variant write silently succeeded" what
+  | Setup_error m -> fail "%s: entry setup: %s" what m
+
+(* 6. an unknown FieldId traps deterministically. *)
+let check_dmd_wrong_field_trap () =
+  let what = "enum-downcast drop: unknown FieldId traps" in
+  let prog =
+    single_block
+      [| Type_repr.Unit; dmd_enum_ty |]
+      dmd_types
+      [
+        Seed_mir.Assign
+          ( plp 1 [ dmd_dcast dmd_v_sref; fid 9999 ],
+            Seed_mir.Use (int_op 5) );
+        Seed_mir.Assign (pl 0, Seed_mir.Use (Seed_mir.Constant Seed_mir.Unit));
+      ]
+      Seed_mir.Ret
+  in
+  dmd_expect_trap what 0 prog
+    (fun _vm (frame : Vm_value.frame) (_res : Vm_memory.pointer array) ->
+      frame.locals.(1) <-
+        Vm_value.Live
+          (Vm_value.Enum
+             ( 1,
+               Vm_value.agg
+                 [| Vm_value.Null; int64_value 5L; Vm_value.array [| oi 7; oi 8 |] |] )))
+    "field identity #9999 not found"
+
+(* 6b. a Field over a TUPLE payload: the projected owner is not a struct,
+   so the FieldId resolves against the payload type (a tuple) and both the
+   verifier and the VM's drop mirror reject it deterministically. *)
+let check_dmd_field_on_tuple_payload_trap () =
+  let what = "enum-downcast drop: Field on a tuple payload traps" in
+  let prog =
+    single_block
+      [| i64; edw_enum_ty |]
+      edw_types
+      [
+        Seed_mir.Assign
+          ( pl 1,
+            Seed_mir.Aggregate
+              ( Seed_mir.EnumCtor (edw_tid, Ids.Variant_index.make 0),
+                [ int_op 7; int_op 8 ] ) );
+        Seed_mir.Assign
+          (plp 1 [ dcast edw_v_pair; fid 6011 ], Seed_mir.Use (int_op 42));
+        Seed_mir.Assign (pl 0, Seed_mir.Use (int_op 0));
+      ]
+      Seed_mir.Ret
+  in
+  edw_expect_invalid what prog;
+  edw_expect_seeded_trap what prog (fun _ _ _ -> ()) "non-struct static type"
+
+(* 7. a moved-out payload component is not dropped again: the moved value
+   is destroyed exactly once by its new owner. *)
+let check_dmd_moved_out_no_double_drop () =
+  let what = "enum-downcast drop: moved-out payload component is not double-dropped" in
+  let prog =
+    prog_with_types
+      [| Type_repr.Unit; dmd_enum_ty; ref_ty; ref_ty; ref_ty |]
+      dmd_types
+      [|
+        {
+          Seed_mir.id = 0;
+          statements =
+            [
+              Seed_mir.Assign
+                ( pl 3,
+                  Seed_mir.Use (Seed_mir.Move (plp 1 [ dmd_dcast dmd_v_ref; cidx 0 ])) );
+              Seed_mir.Assign
+                ( plp 1 [ dmd_dcast dmd_v_ref; cidx 0 ],
+                  Seed_mir.Use (Seed_mir.Move (pl 2)) );
+              Seed_mir.Assign
+                ( pl 4,
+                  Seed_mir.Use (Seed_mir.Move (plp 1 [ dmd_dcast dmd_v_ref; cidx 0 ])) );
+              Seed_mir.Assign (pl 0, Seed_mir.Use (Seed_mir.Constant Seed_mir.Unit));
+            ];
+          terminator = Seed_mir.Goto 1;
+        };
+        { Seed_mir.id = 1; statements = []; terminator = Seed_mir.Drop (local 3, 2, None) };
+        { Seed_mir.id = 2; statements = []; terminator = Seed_mir.Drop (local 4, 3, None) };
+        { Seed_mir.id = 3; statements = []; terminator = Seed_mir.Ret };
+      |]
+  in
+  let seed _vm (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
+    frame.locals.(1) <-
+      Vm_value.Live (Vm_value.Enum (0, Vm_value.agg [| dmd_ref res.(0) |]));
+    frame.locals.(2) <- Vm_value.Live (dmd_ref res.(1))
+  in
+  match dmd_run what 2 prog seed with
+  | None -> ()
+  | Some run ->
+      let regions_ok =
+        dmd_region_checks run.svm what [ run.sres.(0); run.sres.(1) ] []
+      in
+      if regions_ok then
+        pass
+          "%s: the re-assignment left the MovedOut hole alone; each region was freed exactly once by its own drop (a second free would have trapped)"
+          what
+
 let () =
   Printf.printf "Seed VM kernel-closure primitive self-check\n";
   check_dyn_index ();
@@ -3025,6 +3499,16 @@ let () =
   check_edw_non_enum_trap ();
   check_edw_rebuild_trap ();
   check_edw_alias_cow ();
+  (* enum-downcast drop mirror: displaced owned components, COW, traps *)
+  check_dmd_whole_root_drop ();
+  check_dmd_payload_component_drop ();
+  check_dmd_payload_field_drop ();
+  check_dmd_payload_array_element_drop ();
+  check_dmd_payload_array_cow ();
+  check_dmd_wrong_variant_trap ();
+  check_dmd_wrong_field_trap ();
+  check_dmd_field_on_tuple_payload_trap ();
+  check_dmd_moved_out_no_double_drop ();
   check_unwind_pair ();
   if !failures = 0 then begin
     Printf.printf "ALL PASS\n";

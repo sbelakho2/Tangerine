@@ -1096,15 +1096,38 @@ and drop_node (vm : t) (ty : Type_repr.t) (node : Drop_plan.plan_node)
       | _ -> Vm_value.drop_glue vm.memory v)
   | _ -> Vm_value.drop_glue vm.memory v
 
-(* re-audit P0-9 / P1-26: drop the old value at a place about to be
-   OVERWRITTEN by an assignment — resolve the current component value
-   WITHOUT trapping on a MovedOut hole and run the typed drop over it
-   (the plan-driven recursion frees region-backed refs and is a no-op
-   for everything else; plan-less values fall back to the structural
-   glue). *)
+(* re-audit P0-9 / P1-26 / enum-downcast drop mirror: drop the old value
+   at a place about to be OVERWRITTEN by an assignment — resolve the
+   current leaf component WITHOUT trapping on a MovedOut hole and run the
+   typed drop over it (the plan-driven recursion frees region-backed refs
+   and is a no-op for everything else; plan-less values fall back to the
+   structural glue).
+
+   The projected resolve walks the aggregate tree THREADING THE PROJECTED
+   STATIC TYPE exactly like project_read and update_place (the read/write/
+   drop triads share one type walk): a Downcast validates the runtime tag
+   against the owner enum def and descends into the variant payload
+   STRUCT (the same wrapper the read and write arms recurse through), and
+   a Field resolves its semantic FieldId against the PROJECTED owner type
+   (after a Downcast, the payload struct type), never the root.  A MovedOut
+   component along the path carries no live value (the transfer already
+   happened): the walk is a no-op — dropping it here would be the
+   double-drop.  A deref / dynamic-index destination is the verifier's
+   untracked boundary: the write-through machinery owns those places and
+   no drop-before-store is promised, so the walk yields no old value.  A
+   tracked destination whose runtime value contradicts the projected type
+   (verified programs cannot produce one) traps deterministically, exactly
+   like the read and write arms.
+
+   The root dispatch reads the destination slot through a straight
+   if/else over Local|Static and then runs the SAME walk for both roots
+   (the pre-fix `else` attached to the inner bounds `if`, so the whole
+   local-root body — including both the whole-root and the projected
+   overwrite drop — was dead code; projected Static roots dropped the
+   whole static value under the leaf type instead of the leaf). *)
 let drop_old_value_at (vm : t) (frame : frame) (p : Seed_mir.place) : unit =
+  let root_ty = type_of_local vm frame.fn (Seed_mir.root_key p.Seed_mir.root) in
   let ty_of_place () : Type_repr.t =
-    let root_ty = type_of_local vm frame.fn (Seed_mir.root_key p.Seed_mir.root) in
     List.fold_left (fun ty proj -> proj_type_of vm ty proj) root_ty p.Seed_mir.projections
   in
   let drop_slot s =
@@ -1112,54 +1135,84 @@ let drop_old_value_at (vm : t) (frame : frame) (p : Seed_mir.place) : unit =
     | Vm_value.Live v -> drop_value_typed vm (ty_of_place ()) v
     | Vm_value.Uninitialized | Vm_value.Moved | Vm_value.Dropped -> ()
   in
-  if Seed_mir.root_is_static p.Seed_mir.root then
-    let sidx = Seed_mir.root_static_index p.Seed_mir.root in
-    if sidx < Array.length frame.statics then drop_slot frame.statics.(sidx)
-  else begin
-    let local = Seed_mir.root_key p.Seed_mir.root in
-    if local >= 0 && local < Array.length frame.locals then
+  let rec leaf_value (v : Vm_value.t) (ty : Type_repr.t)
+      (projs : Seed_mir.projection list) : Vm_value.t option =
+    match projs, v with
+    | _, Vm_value.MovedOut -> None
+    | [], _ -> Some v
+    | proj :: rest, _ -> (
+        let next_ty = proj_type_of vm ty proj in
+        let recurse v = leaf_value v next_ty rest in
+        match proj with
+        | Seed_mir.Field fid -> (
+            let i = field_index_of vm ty fid in
+            match v with
+            | Vm_value.RawPtr ptr when i = 0 && is_ptr_handle_ty vm ty ->
+                recurse
+                  (Vm_value.Int
+                     (Int_value.of_int64 ~width:64 ~signed:false
+                        (Vm_memory.pointer_to_int64 ptr)))
+            | Vm_value.Null when i = 0 && is_ptr_handle_ty vm ty ->
+                recurse (Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:false 0L))
+            | Vm_value.Struct fields ->
+                if i < 0 || i >= Vm_value.agg_len fields then
+                  err_trap vm
+                    (Printf.sprintf "field index out of bounds (type %s, %d field(s), index %d)"
+                       (Seed_mir.print_type ty) (Vm_value.agg_len fields) i)
+                else recurse (Vm_value.agg_get fields i)
+            | _ -> err_trap vm "field write on non-aggregate")
+        | Seed_mir.ConstantIndex i -> (
+            match v with
+            | Vm_value.Array elems ->
+                if i < 0 || i >= Vm_value.arr_length elems then err_trap vm "index out of bounds"
+                else recurse (Vm_value.arr_get elems i)
+            | Vm_value.Tuple elems ->
+                if i < 0 || i >= Vm_value.agg_len elems then
+                  err_trap vm "tuple index out of bounds"
+                else recurse (Vm_value.agg_get elems i)
+            | Vm_value.Struct elems ->
+                if i < 0 || i >= Vm_value.agg_len elems then
+                  err_trap vm "struct index out of bounds"
+                else recurse (Vm_value.agg_get elems i)
+            | Vm_value.String str ->
+                if i < 0 || i >= String.length str then err_trap vm "string index out of bounds"
+                else recurse (Vm_value.Char (Uchar.of_char str.[i]))
+            | _ -> err_trap vm "index write on non-array")
+        | Seed_mir.Downcast vid -> (
+            let expect = variant_index_of vm ty vid in
+            match v with
+            | Vm_value.Enum (tag, payload) ->
+                if tag <> expect then
+                  err_trap vm
+                    (Printf.sprintf
+                       "variant downcast: runtime tag %d does not match VariantId %d's declaration-order tag %d"
+                       tag (Ids.Variant_id.to_int vid) expect)
+                else recurse (Vm_value.Struct payload)
+            | _ -> err_trap vm "downcast write on non-enum value")
+        | Seed_mir.Deref | Seed_mir.Index _ -> None)
+  in
+  let root_slot =
+    if Seed_mir.root_is_static p.Seed_mir.root then
+      let sidx = Seed_mir.root_static_index p.Seed_mir.root in
+      if sidx >= 0 && sidx < Array.length frame.statics then Some frame.statics.(sidx)
+      else None
+    else
+      let local = Seed_mir.root_key p.Seed_mir.root in
+      if local >= 0 && local < Array.length frame.locals then Some frame.locals.(local)
+      else None
+  in
+  match root_slot with
+  | None -> ()
+  | Some slot -> (
       match p.Seed_mir.projections with
-      | [] -> drop_slot frame.locals.(local)
-      | _projs -> (
-          (* the projected overwrite: only the exact leaf component's
-             old value is replaced — walk the aggregate tree without
-             trapping on MovedOut holes *)
-          let rec leaf_value (v : Vm_value.t) (projs : Seed_mir.projection list) :
-              Vm_value.t option =
-            match projs with
-            | [] -> Some v
-            | proj :: rest -> (
-                match proj, v with
-                | Seed_mir.Field fid, Vm_value.Struct fields -> (
-                    let i = field_index_of vm (type_of_local vm frame.fn local) fid in
-                    if i >= 0 && i < Vm_value.agg_len fields then
-                      match Vm_value.agg_get fields i with
-                      | Vm_value.MovedOut -> None
-                      | fv -> leaf_value fv rest
-                    else None)
-                | Seed_mir.ConstantIndex k, Vm_value.Tuple elems
-                  when k >= 0 && k < Vm_value.agg_len elems -> (
-                    match Vm_value.agg_get elems k with
-                    | Vm_value.MovedOut -> None
-                    | ev -> leaf_value ev rest)
-                | Seed_mir.ConstantIndex k, Vm_value.Array elems
-                  when k >= 0 && k < Vm_value.arr_length elems -> (
-                    match Vm_value.arr_get elems k with
-                    | Vm_value.MovedOut -> None
-                    | ev -> leaf_value ev rest)
-                | Seed_mir.Downcast _, Vm_value.Enum (_, payload) ->
-                    if Vm_value.agg_len payload > 0 then
-                      leaf_value (Vm_value.agg_get payload 0) rest
-                    else None
-                | _ -> None)
-          in
-          match frame.locals.(local) with
+      | [] -> drop_slot slot
+      | projs -> (
+          match slot with
           | Vm_value.Live v -> (
-              match leaf_value v p.Seed_mir.projections with
+              match leaf_value v root_ty projs with
               | Some old -> drop_value_typed vm (ty_of_place ()) old
               | None -> ())
-          | _ -> ())
-  end
+          | Vm_value.Uninitialized | Vm_value.Moved | Vm_value.Dropped -> ()))
 
 (* A needs_drop value requires a Drop terminator; the verifier has already
    checked the plan.  The drop is RECURSIVE: the value's contained
