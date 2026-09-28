@@ -2150,14 +2150,12 @@ let check_inplace_set_alias () =
        nested cell is still owned and the write mutates the shared
        backing data (the test fails); with the recursive mark the cell
        is shared, the write forks, and the aliased value keeps [1,2].
-     • VM level — the end-to-end value semantics for every shape the
-       guest MIR can express (Struct field, tuple index, Array element,
-       plus the host-intrinsic Map[String, Array] / Set[Array]
-       extraction paths).  An Enum payload write is NOT expressible in
-       the current guest MIR (update_place has no Enum/Downcast write
-       arm — a write through a downcast place is dropped), and a
-       closure capture has no projection; both are covered at the OCaml
-       level above. *)
+      • VM level — the end-to-end value semantics for every shape the
+        guest MIR can express (Struct field, tuple index, Array element,
+        Enum payload writes through the Downcast write arm — the (j)
+        battery below — plus the host-intrinsic Map[String, Array] /
+        Set[Array] extraction paths).  A closure capture has no
+        projection and stays covered at the OCaml level above. *)
 
 let oi (n : int) : Vm_value.t =
   Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true (Int64.of_int n))
@@ -2619,6 +2617,381 @@ let check_nested_set_vm_alias () =
         fail "VM alias: Set[Array]: the set's stored member was mutated in place"
       else fail "VM alias: Set[Array]: the extracted array is not [99,2]"
 
+(* ── (j) enum-downcast projected writes (audit P0/P1-2) ─────────────
+
+   `update_place`'s write path used to return the base enum for a
+   Downcast projection (`| Seed_mir.Downcast _ -> base`) — a write whose
+   destination crossed an enum downcast silently vanished.  The write
+   arm now mirrors the read side: the semantic VariantId resolves to the
+   declaration-order runtime tag through the owner enum def, the runtime
+   tag must equal it, the payload struct is updated recursively with the
+   remaining projections, and the enum is rebuilt; a non-enum base, a
+   wrong runtime tag and a non-struct payload rebuild all trap
+   deterministically.
+
+   The battery (hand-built MIR, verifier-checked where the program is
+   conforming — the two defense-in-depth traps pin the verifier's
+   fail-closed rejection AND the VM's deterministic trap):
+     1. payload scalar write through [Downcast; ConstantIndex] (the
+        sibling payload position must stay untouched);
+     2. payload nested-array element write (the array lives INSIDE the
+        payload — the COW/fork path must still apply);
+     3. [Downcast; Field] through a struct payload;
+     4. a deeper [Downcast; ConstantIndex; ConstantIndex] chain;
+     5. the wrong-variant write traps (runtime tag != VariantId tag);
+     6. the non-enum base traps (and the verifier rejects the chain);
+     7. the non-struct whole-payload rebuild traps (verifier-rejected
+        shape, never a silent no-op);
+     8. the A/B alias case: B = A (Copy marks the enum payload's array
+        shared), mutate B's payload array element, A stays [1,2]. *)
+
+let edw_tid = Ids.Type_id.make 601
+let edw_s_tid = Ids.Type_id.make 602
+let edw_enum_ty = Type_repr.Named (edw_tid, [||])
+let edw_s_ty = Type_repr.Named (edw_s_tid, [||])
+let edw_inner_tup_ty = Type_repr.Tuple [| i64; i64 |]
+
+let edw_s_def : Seed_mir.type_def =
+  Seed_mir.StructDef
+    { sd_id = edw_s_tid; sd_fields = [ mk_fd 6011 0 i64; mk_fd 6012 1 i64 ] }
+
+let edw_v_pair = 60
+let edw_v_nested = 61
+let edw_v_structy = 62
+let edw_v_deep = 63
+
+let edw_enum_def : Seed_mir.type_def =
+  Seed_mir.EnumDef
+    {
+      ed_id = edw_tid;
+      ed_variants =
+        [
+          { vd_id = Ids.Variant_id.make edw_v_pair;
+            vd_index = Ids.Variant_index.make 0;
+            vd_payload = Type_repr.Tuple [| i64; i64 |] };
+          { vd_id = Ids.Variant_id.make edw_v_nested;
+            vd_index = Ids.Variant_index.make 1;
+            vd_payload = Type_repr.Tuple [| nested_arr_ty |] };
+          { vd_id = Ids.Variant_id.make edw_v_structy;
+            vd_index = Ids.Variant_index.make 2;
+            vd_payload = edw_s_ty };
+          { vd_id = Ids.Variant_id.make edw_v_deep;
+            vd_index = Ids.Variant_index.make 3;
+            vd_payload = Type_repr.Tuple [| edw_inner_tup_ty; i64 |] };
+        ];
+    }
+
+let edw_types = [| edw_enum_def; edw_s_def |]
+
+let dcast (v : int) : Seed_mir.projection =
+  Seed_mir.Downcast (Ids.Variant_id.make v)
+
+let edw_is_int (v : Vm_value.t) (want : int) : bool =
+  Vm_value.equal v (int64_value (Int64.of_int want))
+
+let edw_expect_valid (what : string) (prog : Seed_mir.program) : unit =
+  match Mir_verify.require_valid_concrete prog with
+  | Ok () -> ()
+  | Error errs ->
+      fail "%s: Mir_verify rejected the conforming program: %s" what
+        (String.concat "; " errs)
+
+let edw_expect_invalid (what : string) (prog : Seed_mir.program) : unit =
+  match Mir_verify.require_valid_concrete prog with
+  | Ok () ->
+      fail "%s: Mir_verify accepted a program it must reject" what
+  | Error _ -> ()
+
+let edw_run_seeded (what : string) (prog : Seed_mir.program)
+    (seed : Vm.t -> Vm_value.frame -> Vm_memory.pointer array -> unit) :
+    seeded_run option =
+  match seeded_run prog seed 0 with
+  | Ran_ok run -> Some run
+  | Ran_error (m, _) -> fail "%s: %s" what m; None
+  | Setup_error m -> fail "%s: entry setup: %s" what m; None
+
+let edw_expect_seeded_trap (what : string) (prog : Seed_mir.program)
+    (seed : Vm.t -> Vm_value.frame -> Vm_memory.pointer array -> unit)
+    (needle : string) : unit =
+  match seeded_run prog seed 0 with
+  | Ran_error (m, _) ->
+      if contains m needle then pass "%s: deterministic trap" what
+      else fail "%s: trap message %S does not contain %S" what m needle
+  | Ran_ok _ -> fail "%s: the write silently succeeded (no trap)" what
+  | Setup_error m -> fail "%s: entry setup: %s" what m
+
+let edw_live_int (frame : Vm_value.frame) (l : int) (want : int) : bool =
+  match frame.locals.(l) with Vm_value.Live v -> edw_is_int v want | _ -> false
+
+let check_edw_scalar_write () =
+  let what = "enum downcast write: payload scalar [Downcast; ConstantIndex]" in
+  let prog =
+    single_block
+      [| i64; edw_enum_ty |]
+      edw_types
+      [
+        Seed_mir.Assign
+          ( pl 1,
+            Seed_mir.Aggregate
+              ( Seed_mir.EnumCtor (edw_tid, Ids.Variant_index.make 0),
+                [ int_op 7; int_op 8 ] ) );
+        Seed_mir.Assign
+          (plp 1 [ dcast edw_v_pair; cidx 0 ], Seed_mir.Use (int_op 42));
+        Seed_mir.Assign
+          ( pl 0,
+            Seed_mir.Use (Seed_mir.Copy (plp 1 [ dcast edw_v_pair; cidx 1 ])) );
+      ]
+      Seed_mir.Ret
+  in
+  edw_expect_valid what prog;
+  match edw_run_seeded what prog (fun _ _ _ -> ()) with
+  | None -> ()
+  | Some run ->
+      let payload_ok =
+        match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Enum (0, p)) ->
+            Vm_value.agg_len p = 2
+            && edw_is_int (Vm_value.agg_get p 0) 42
+            && edw_is_int (Vm_value.agg_get p 1) 8
+        | _ -> false
+      in
+      if payload_ok && edw_live_int run.sframe 0 8 then
+        pass
+          "%s: the write landed (payload [42; 8]); the sibling position stays 8 and the read-back is 8"
+          what
+      else fail "%s: the payload is not [42; 8]" what
+
+let check_edw_nested_array_write () =
+  let what = "enum downcast write: payload nested-array element" in
+  let prog =
+    single_block
+      [| i64; edw_enum_ty; nested_arr_ty |]
+      edw_types
+      [
+        Seed_mir.Assign
+          (pl 2, Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ int_op 1; int_op 2 ]));
+        Seed_mir.Assign
+          ( pl 1,
+            Seed_mir.Aggregate
+              ( Seed_mir.EnumCtor (edw_tid, Ids.Variant_index.make 1),
+                [ Seed_mir.Copy (pl 2) ] ) );
+        Seed_mir.Assign
+          (plp 1 [ dcast edw_v_nested; cidx 0; cidx 1 ], Seed_mir.Use (int_op 99));
+        Seed_mir.Assign
+          ( pl 0,
+            Seed_mir.Use
+              (Seed_mir.Copy (plp 1 [ dcast edw_v_nested; cidx 0; cidx 0 ])) );
+      ]
+      Seed_mir.Ret
+  in
+  edw_expect_valid what prog;
+  match edw_run_seeded what prog (fun _ _ _ -> ()) with
+  | None -> ()
+  | Some run ->
+      let payload_ok =
+        match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Enum (1, p)) -> (
+            match Vm_value.agg_get p 0 with
+            | Vm_value.Array a -> int_list a = [ 1; 99 ]
+            | _ -> false)
+        | _ -> false
+      in
+      let source_ok =
+        match run.sframe.locals.(2) with
+        | Vm_value.Live (Vm_value.Array a) -> int_list a = [ 1; 2 ]
+        | _ -> false
+      in
+      if payload_ok && source_ok && edw_live_int run.sframe 0 1 then
+        pass
+          "%s: [Downcast; ConstantIndex 0; ConstantIndex 1] = 99 landed in the payload array ([1; 99]); the copied source array stays [1; 2]"
+          what
+      else fail "%s: payload=%b source=%b" what payload_ok source_ok
+
+let check_edw_field_write () =
+  let what = "enum downcast write: struct payload [Downcast; Field]" in
+  let prog =
+    single_block
+      [| i64; edw_enum_ty |]
+      edw_types
+      [
+        Seed_mir.Assign
+          ( pl 1,
+            Seed_mir.Aggregate
+              ( Seed_mir.EnumCtor (edw_tid, Ids.Variant_index.make 2),
+                [ int_op 7; int_op 8 ] ) );
+        Seed_mir.Assign
+          (plp 1 [ dcast edw_v_structy; fid 6011 ], Seed_mir.Use (int_op 42));
+        Seed_mir.Assign
+          ( pl 0,
+            Seed_mir.Use (Seed_mir.Copy (plp 1 [ dcast edw_v_structy; fid 6012 ])) );
+      ]
+      Seed_mir.Ret
+  in
+  edw_expect_valid what prog;
+  match edw_run_seeded what prog (fun _ _ _ -> ()) with
+  | None -> ()
+  | Some run ->
+      let payload_ok =
+        match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Enum (2, p)) ->
+            edw_is_int (Vm_value.agg_get p 0) 42
+            && edw_is_int (Vm_value.agg_get p 1) 8
+        | _ -> false
+      in
+      if payload_ok && edw_live_int run.sframe 0 8 then
+        pass
+          "%s: the payload field write landed ([42; 8]); the sibling field stays 8"
+          what
+      else fail "%s: the payload is not [42; 8]" what
+
+let check_edw_deep_chain_write () =
+  let what = "enum downcast write: deeper [Downcast; ConstantIndex; ConstantIndex]" in
+  let prog =
+    single_block
+      [| i64; edw_enum_ty; edw_inner_tup_ty |]
+      edw_types
+      [
+        Seed_mir.Assign
+          (pl 2, Seed_mir.Aggregate (Seed_mir.TupleAgg, [ int_op 7; int_op 8 ]));
+        Seed_mir.Assign
+          ( pl 1,
+            Seed_mir.Aggregate
+              ( Seed_mir.EnumCtor (edw_tid, Ids.Variant_index.make 3),
+                [ Seed_mir.Copy (pl 2); int_op 9 ] ) );
+        Seed_mir.Assign
+          (plp 1 [ dcast edw_v_deep; cidx 0; cidx 1 ], Seed_mir.Use (int_op 42));
+        Seed_mir.Assign
+          ( pl 0,
+            Seed_mir.Use
+              (Seed_mir.Copy (plp 1 [ dcast edw_v_deep; cidx 0; cidx 0 ])) );
+      ]
+      Seed_mir.Ret
+  in
+  edw_expect_valid what prog;
+  match edw_run_seeded what prog (fun _ _ _ -> ()) with
+  | None -> ()
+  | Some run ->
+      let payload_ok =
+        match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Enum (3, p)) -> (
+            match Vm_value.agg_get p 0 with
+            | Vm_value.Tuple inner ->
+                edw_is_int (Vm_value.agg_get inner 0) 7
+                && edw_is_int (Vm_value.agg_get inner 1) 42
+            | _ -> false)
+        | _ -> false
+      in
+      if payload_ok && edw_live_int run.sframe 0 7 then
+        pass
+          "%s: the inner payload tuple became (7, 42) and the read-back is 7"
+          what
+      else fail "%s: the inner payload tuple is not (7, 42)" what
+
+let check_edw_wrong_variant_trap () =
+  let what = "enum downcast write: wrong runtime variant" in
+  let prog =
+    single_block
+      [| i64; edw_enum_ty |]
+      edw_types
+      [
+        Seed_mir.Assign
+          ( pl 1,
+            Seed_mir.Aggregate
+              ( Seed_mir.EnumCtor (edw_tid, Ids.Variant_index.make 2),
+                [ int_op 7; int_op 8 ] ) );
+        Seed_mir.Assign
+          (plp 1 [ dcast edw_v_pair; cidx 0 ], Seed_mir.Use (int_op 42));
+        Seed_mir.Assign (pl 0, Seed_mir.Use (int_op 0));
+      ]
+      Seed_mir.Ret
+  in
+  edw_expect_valid what prog;
+  edw_expect_seeded_trap what prog (fun _ _ _ -> ()) "runtime tag 2"
+
+let check_edw_non_enum_trap () =
+  let what = "enum downcast write: non-enum base" in
+  let prog =
+    single_block
+      [| i64; i64 |]
+      [||]
+      [
+        Seed_mir.Assign (pl 1, Seed_mir.Use (int_op 5));
+        Seed_mir.Assign (plp 1 [ dcast edw_v_pair; cidx 0 ], Seed_mir.Use (int_op 42));
+        Seed_mir.Assign (pl 0, Seed_mir.Use (int_op 0));
+      ]
+      Seed_mir.Ret
+  in
+  edw_expect_invalid what prog;
+  edw_expect_seeded_trap what prog (fun _ _ _ -> ()) "non-enum"
+
+let check_edw_rebuild_trap () =
+  let what = "enum downcast write: non-struct payload rebuild" in
+  let prog =
+    single_block
+      [| i64; edw_enum_ty; nested_arr_ty |]
+      edw_types
+      [
+        Seed_mir.Assign
+          (pl 2, Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ int_op 1; int_op 2 ]));
+        Seed_mir.Assign
+          ( pl 1,
+            Seed_mir.Aggregate
+              ( Seed_mir.EnumCtor (edw_tid, Ids.Variant_index.make 1),
+                [ Seed_mir.Copy (pl 2) ] ) );
+        Seed_mir.Assign (plp 1 [ dcast edw_v_nested ], Seed_mir.Use (int_op 5));
+        Seed_mir.Assign (pl 0, Seed_mir.Use (int_op 0));
+      ]
+      Seed_mir.Ret
+  in
+  edw_expect_invalid what prog;
+  edw_expect_seeded_trap what prog (fun _ _ _ -> ()) "expected payload struct"
+
+let check_edw_alias_cow () =
+  let what = "enum downcast write: A/B alias COW across the enum payload" in
+  let prog =
+    single_block
+      [| i64; edw_enum_ty; nested_arr_ty; edw_enum_ty |]
+      edw_types
+      [
+        Seed_mir.Assign
+          (pl 2, Seed_mir.Aggregate (Seed_mir.ArrayAgg, [ int_op 1; int_op 2 ]));
+        Seed_mir.Assign
+          ( pl 1,
+            Seed_mir.Aggregate
+              ( Seed_mir.EnumCtor (edw_tid, Ids.Variant_index.make 1),
+                [ Seed_mir.Copy (pl 2) ] ) );
+        Seed_mir.Assign (pl 3, Seed_mir.Use (Seed_mir.Copy (pl 1)));
+        Seed_mir.Assign
+          (plp 3 [ dcast edw_v_nested; cidx 0; cidx 1 ], Seed_mir.Use (int_op 99));
+        Seed_mir.Assign
+          ( pl 0,
+            Seed_mir.Use
+              (Seed_mir.Copy (plp 1 [ dcast edw_v_nested; cidx 0; cidx 1 ])) );
+      ]
+      Seed_mir.Ret
+  in
+  let payload_of (frame : Vm_value.frame) (l : int) : int list option =
+    match frame.locals.(l) with
+    | Vm_value.Live (Vm_value.Enum (1, p)) -> (
+        match Vm_value.agg_get p 0 with
+        | Vm_value.Array a -> Some (int_list a)
+        | _ -> None)
+    | _ -> None
+  in
+  match edw_run_seeded what prog (fun _ _ _ -> ()) with
+  | None -> ()
+  | Some run -> (
+      match (payload_of run.sframe 1, payload_of run.sframe 3) with
+      | Some a, Some b when a = [ 1; 2 ] && b = [ 1; 99 ] && edw_live_int run.sframe 0 2 ->
+          pass
+            "%s: mutating B's payload array forked ([1; 99]); A stays [1; 2] and the read-back through A is 2"
+            what
+      | Some a, Some b ->
+          fail "%s: A=%s B=%s (expected A=[1;2], B=[1;99])" what
+            (String.concat ";" (List.map string_of_int a))
+            (String.concat ";" (List.map string_of_int b))
+      | _ -> fail "%s: an enum payload is not a live array" what)
+
 let () =
   Printf.printf "Seed VM kernel-closure primitive self-check\n";
   check_dyn_index ();
@@ -2643,6 +3016,15 @@ let () =
   check_nested_array_vm_alias ();
   check_nested_map_vm_alias ();
   check_nested_set_vm_alias ();
+  (* audit P0/P1-2: enum-downcast projected writes *)
+  check_edw_scalar_write ();
+  check_edw_nested_array_write ();
+  check_edw_field_write ();
+  check_edw_deep_chain_write ();
+  check_edw_wrong_variant_trap ();
+  check_edw_non_enum_trap ();
+  check_edw_rebuild_trap ();
+  check_edw_alias_cow ();
   check_unwind_pair ();
   if !failures = 0 then begin
     Printf.printf "ALL PASS\n";

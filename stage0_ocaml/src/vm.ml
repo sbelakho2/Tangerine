@@ -924,7 +924,33 @@ and update_place ?(direct = false) (vm : t) (frame : frame) (base : Vm_value.t)
               in
               Vm_value.String (string_with_char_at str i c)
           | _ -> err_trap vm "index write on non-array")
-      | Seed_mir.Downcast _ -> base
+      | Seed_mir.Downcast vid -> (
+          (* the write mirror of the read-side downcast: the semantic
+             VariantId resolves to the declaration-order runtime tag
+             through the owner enum def.  The runtime tag must equal it,
+             then the payload struct is updated recursively (the
+             remaining projections apply to the payload) and the enum is
+             rebuilt around the updated payload.  A non-enum base, a
+             wrong runtime tag, or an update that does not rebuild the
+             payload struct traps deterministically — a write through a
+             downcast place is never silently dropped. *)
+          let expect = variant_index_of vm base_ty vid in
+          match base with
+          | Vm_value.Enum (tag, payload) ->
+              if tag <> expect then
+                err_trap vm
+                  (Printf.sprintf
+                     "variant downcast: runtime tag %d does not match VariantId %d's declaration-order tag %d"
+                     tag (Ids.Variant_id.to_int vid) expect)
+              else (
+                match
+                  update_place vm frame (Vm_value.Struct payload) next_ty rest v
+                with
+                | Vm_value.Struct fields -> Vm_value.Enum (tag, fields)
+                | _ ->
+                    err_trap vm
+                      "variant downcast write: the updated payload is not the expected payload struct")
+          | _ -> err_trap vm "downcast write on non-enum value")
       | Seed_mir.Deref -> (
            let deref_ty =
              match pointee_type_of vm base_ty with Some t -> t | None -> next_ty
