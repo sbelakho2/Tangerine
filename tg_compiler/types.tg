@@ -3404,6 +3404,15 @@ struct TypeEnv
   # multiple modules. Purely additive for the bootstrap (no cross-module
   # same-name collisions — qualified keys map to the same indices).
   module_type_names: Map[String, Int]
+  # (suffix index over module_type_names): every "::"-joined suffix of a
+  # registered qualified type-name key -> the keys in registration order.
+  # Maintained at record_module_type_name (the single insertion site;
+  # pass-1/pass-2 re-registrations are idempotent), so a bare-name query
+  # (`key == name || key.ends_with("::" + name)`) is an O(1) bucket lookup
+  # instead of a full scan — resolve_bare_type_name / trait_id_for.  The
+  # bucket stores keys only; the value is read from module_type_names, so
+  # a re-registration can never leave a stale index value.
+  type_name_suffix_index: Map[String, Vec[String]]
  # (final layer — module-qualified CALLABLE identity): "path::name" ->
   # the Type the checker bound for that qualified function/const/static
   # definition, mirrored at pass-3 registration guarded by the resolver's
@@ -4022,6 +4031,7 @@ impl Clone for TypeEnv
       type_list: self.type_list.clone(),
       type_name_index: self.type_name_index.clone(),
       module_type_names: self.module_type_names.clone(),
+      type_name_suffix_index: self.type_name_suffix_index.clone(),
       module_callable_types: self.module_callable_types.clone(),
       callable_first_wins: self.callable_first_wins.clone(),
       callable_suffix_index: self.callable_suffix_index.clone(),
@@ -6910,6 +6920,7 @@ def type_env_new() -> TypeEnv
     type_list: Vec::new(),
     type_name_index: Map::new(),
     module_type_names: Map::new(),
+    type_name_suffix_index: Map::new(),
     module_callable_types: Map::new(),
     callable_first_wins: Map::new(),
     callable_suffix_index: Map::new(),
@@ -7913,7 +7924,26 @@ def record_module_type_name(inout env: TypeEnv, name: String, idx: Int, module_p
       match def_kind_of(&res, &did)
       when Option::Some(k) then
         if k == DefKind::TypeName || k == DefKind::Trait then
-          env.module_type_names.insert(key, idx)
+          # the suffix/reverse indexes only grow for NEW keys (a
+          # re-registration replaces the value in place, keeping the
+          # original position); the bucket stores the key, the value is
+          # read from module_type_names — never stale.
+          let is_new = !env.module_type_names.contains_key(&key)
+          env.module_type_names.insert(key.clone(), idx)
+          if is_new then
+            let segs = key.split("::")
+            var si = 0
+            while si < segs.len() do
+              let suffix = segs.slice(si, segs.len()).join("::")
+              var group = match env.type_name_suffix_index.get(&suffix)
+              when Option::Some(existing) then existing
+              when Option::None then Vec::new()
+              end
+              group.push(key.clone())
+              env.type_name_suffix_index.insert(suffix, group)
+              si = si + 1
+            end
+          end
         end
       when Option::None then ()
       end
@@ -7984,16 +8014,12 @@ end
 # entry; any FURTHER module's definition of such a name is a module-local
 # type (every declaration is its own type).
 def has_qualified_type_entry(env: TypeEnv, name: String) -> Bool
-  for (key, _) in env.module_type_names.entries() do
-    if key == name.clone() then
-      return true
-    end
-    let suffix = "::" + name.clone()
-    if key.ends_with(suffix) then
-      return true
-    end
+  # suffix-index bucket is exactly the keys where
+  # `key == name || key.ends_with("::" + name)` — nonempty iff any exists.
+  match env.type_name_suffix_index.get(&name)
+  when Option::Some(v) then !v.is_empty()
+  when Option::None then false
   end
-  false
 end
 
 # (seed-parity imports): the current module's explicit import of a TYPE
@@ -8101,24 +8127,23 @@ def resolve_bare_type_name(inout env: TypeEnv, name: String, span: Span) -> Opti
   var foreign_distinct = 0
   var foreign_seen = Map::new()
   let own_key = module_qualified_key(&env.current_module_path, &name)
-  let entry_vec = env.module_type_names.entries()
-  for (key, idx) in entry_vec do
-    var matches = false
-    if key == name.clone() then
-      matches = true
-    else
-      let suffix = "::" + name.clone()
-      if key.ends_with(suffix) then
-        matches = true
-      end
-    end
-    if matches then
+  # suffix-index bucket = the keys where
+  # `key == name || key.ends_with("::" + name)`, registration order; the
+  # value is read from module_type_names (never stale).
+  let entry_vec = match env.type_name_suffix_index.get(&name)
+  when Option::Some(v) then v
+  when Option::None then Vec::new()
+  end
+  for key in entry_vec do
+    match env.module_type_names.get(key.clone())
+    when Option::Some(idx) then
       if key == own_key then
         own_idx = Option::Some(idx)
       elsif !foreign_seen.contains_key(&idx) then
         foreign_seen.insert(idx, true)
         foreign_distinct = foreign_distinct + 1
       end
+    when Option::None then ()
     end
   end
   match own_idx
@@ -13046,25 +13071,24 @@ def trait_id_for(env: TypeEnv, name: String) -> TraitId
   when Option::None then
     var foreign_distinct = 0
     var foreign_seen = Map::new()
-    let suffix = "::" + name.clone()
-    let entry_vec = env.module_type_names.entries()
-    for (key, idx) in entry_vec do
-      let ftd = env.type_list[idx]
-      if type_def_is_trait(&ftd) then
-        var matches = false
-        if key == name.clone() then
-          matches = true
-        else
-          if key.ends_with(suffix) then
-            matches = true
-          end
-        end
-        if matches && key != own_key then
+    # suffix-index bucket = the keys where
+    # `key == name || key.ends_with("::" + name)`, registration order;
+    # values are read from module_type_names (never stale).
+    let entry_vec = match env.type_name_suffix_index.get(&name)
+    when Option::Some(v) then v
+    when Option::None then Vec::new()
+    end
+    for key in entry_vec do
+      match env.module_type_names.get(key.clone())
+      when Option::Some(idx) then
+        let ftd = env.type_list[idx]
+        if type_def_is_trait(&ftd) && key != own_key then
           if !foreign_seen.contains_key(&ftd.id.id) then
             foreign_seen.insert(ftd.id.id, true)
             foreign_distinct = foreign_distinct + 1
           end
         end
+      when Option::None then ()
       end
     end
     if foreign_distinct >= 2 then
@@ -17558,6 +17582,8 @@ end
 def type_registration_module_path(env: TypeEnv, tid: TypeId) -> Vec[String]
   match env.type_id_index.get(tid.id)
   when Option::Some(idx) then
+    # the LIVE module_type_names scan (exact under any re-registration:
+    # the candidate set is defined by the map's CURRENT values).
     var candidates = Vec::new()
     for (key, kidx) in env.module_type_names.entries() do
       if kidx == idx then
