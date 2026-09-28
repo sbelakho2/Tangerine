@@ -1,0 +1,181 @@
+# tg_compiler/resolution_parity_probe.tg — kernel resolution-parity probe.
+#
+# The bootstrap authority is the KERNEL resolver (tg_compiler/resolver.tg)
+# produced by the OCaml seed; the closure it must resolve is
+# bootstrap/compiler_kernel.manifest. A resolver/kernel divergence (the
+# per-module import authority, the nested-definition surfaces, or the
+# same-spelled-symbol determinism) otherwise surfaces only after the whole
+# stage1 build. This probe runs the REAL kernel front end over every
+# closure source inside the seed VM: it parses each file, merges them into
+# ONE Program with the per-file Module table (each file's items stamped
+# with their owner ModuleId — the same shape compiler_core's
+# merge_imported_deps produces), assigns node ids, and runs resolve_names.
+# The probe fails when any file fails to parse or the resolver records ANY
+# error (an error here is a strict-resolution diagnostic: the seed's own
+# audit of the same closure is 0).
+#
+# The probe reads bootstrap/compiler_kernel.manifest itself (std:/compiler:
+# entries, resolved against the harness repo root), so the gate cannot
+# drift from the manifest the bootstrap compiles.
+#
+# main returns 0 iff every closure file parsed clean and resolve_names
+# reported zero errors; 1 otherwise. Per-error rows (message + the owning
+# file/offset) are written to build/resolution_parity_report.txt and echoed
+# to stdout.
+
+use std::core::{Option, Result, String}
+use std::collections::{Vec, Map}
+use std::fs::{read_file, write_file}
+use std::io::{println}
+use tg_compiler::lexer::{tokenize}
+use tg_compiler::parser::{parse, diag_has_errors}
+use tg_compiler::ast::{Program, Crate, Module, Item, assign_node_ids}
+use tg_compiler::token::{Span}
+use tg_compiler::ids::{ModuleId, ItemId}
+use tg_compiler::resolver::{resolve_names}
+
+def resolution_parity_collect_paths(source: String) -> Vec[String]
+  var paths = Vec::new()
+  for line in source.split("\n") do
+    let trimmed = line.trim()
+    if !trimmed.is_empty() && !trimmed.starts_with("#") then
+      match trimmed.split_once(" ")
+      when Option::Some(parts) then
+        let kind = parts.0.trim()
+        let rel = parts.1.trim()
+        if kind == "std:" then
+          paths.push("std/" + rel)
+        elsif kind == "compiler:" then
+          paths.push("tg_compiler/" + rel)
+        end
+      when Option::None then ()
+      end
+    end
+  end
+  paths
+end
+
+# "std/alloc.tg" -> ["std", "alloc"] (the Module.path the resolver's
+# module-qualified keys are built from — the ".tg" extension is dropped).
+def resolution_parity_module_path(path: String) -> Vec[String]
+  var segs = path.split("/")
+  var out = Vec::new()
+  var i = 0
+  while i < segs.len() do
+    var seg = segs[i].clone()
+    if i == segs.len() - 1 && seg.ends_with(".tg") then
+      seg = seg.slice(0, seg.len() - 3)
+    end
+    out.push(seg)
+    i = i + 1
+  end
+  out
+end
+
+def main() -> Int
+  let manifest_src = match read_file("bootstrap/compiler_kernel.manifest")
+  when Result::Ok(s) then s
+  when Result::Err(_) then
+    println("resolution-parity: READ FAIL bootstrap/compiler_kernel.manifest")
+    return 1
+  end
+  let paths = resolution_parity_collect_paths(manifest_src)
+  if paths.is_empty() then
+    println("resolution-parity: FAIL no std:/compiler: closure entries in bootstrap/compiler_kernel.manifest")
+    return 1
+  end
+
+  let report_path = "build/resolution_parity_report.txt"
+  var report = ""
+  var merged: Vec[Item] = Vec::new()
+  var modules: Map[ModuleId, Module] = Map::new()
+  var bad_parse = 0
+  var i = 0
+  while i < paths.len() do
+    let path = paths[i].clone()
+    match read_file(path.clone())
+    when Result::Ok(source) then
+      let parsed = parse(tokenize(source, path.clone()))
+      if diag_has_errors(&parsed.diagnostics) then
+        bad_parse = bad_parse + 1
+        report = report + "PARSE FAIL " + path + " (" + parsed.diagnostics.len().to_string() + " diagnostics)\n"
+        println("resolution-parity: PARSE FAIL " + path)
+        for d in parsed.diagnostics do
+          report = report + "  " + d.message + "\n"
+        end
+      else
+        let mid = ModuleId { id: 1 + i }
+        var item_ids: Vec[ItemId] = Vec::new()
+        for item in parsed.program.items do
+          var owned = item.clone()
+          owned.owner_module = ModuleId { id: mid.id }
+          item_ids.push(ItemId { id: merged.len() })
+          merged.push(owned)
+        end
+        var module = Module {
+          id: mid,
+          path: resolution_parity_module_path(path.clone()),
+          items: item_ids,
+          imports: Vec::new()
+        }
+        modules.insert(mid, module)
+      end
+    when Result::Err(_) then
+      bad_parse = bad_parse + 1
+      report = report + "READ FAIL " + path + "\n"
+      println("resolution-parity: READ FAIL " + path)
+    end
+    i = i + 1
+  end
+
+  var program = Program {
+    items: merged.clone(),
+    crate: Crate {
+      root: ModuleId { id: 0 },
+      modules: modules
+    },
+    span: Span { file: "resolution-parity".to_string(), start: 0, end_pos: 0 }
+  }
+  assign_node_ids(&mut program)
+
+  var resolve_errors = 0
+  var pre_resolution_macros = 0
+  match resolve_names(program)
+  when Result::Ok(_res) then ()
+  when Result::Err(errs) then
+    for err in errs do
+      # `debug_assert!` is a compiler builtin macro the real pipeline
+      # expands (compiler_core's expand_macros) BEFORE resolve_names — this
+      # probe deliberately skips the heavy expansion pass, so its residual
+      # macro-call row is a pre-resolution artifact, not a resolution
+      # diagnostic. Every OTHER residual macro spelling still fails the
+      # lane (the resolver's unsupported-construct guard stays enforced).
+      if err.message.contains("residual macro call `debug_assert`") then
+        pre_resolution_macros = pre_resolution_macros + 1
+        report = report + "PRE-RESOLUTION " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message + "\n"
+      else
+        resolve_errors = resolve_errors + 1
+        report = report + "RESOLVE " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message + "\n"
+        println("resolution-parity: RESOLVE " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message)
+      end
+    end
+  end
+
+  if bad_parse > 0 || resolve_errors > 0 then
+    let row = "resolution-parity: FAILED (" + bad_parse.to_string() + " parse failure(s), " + resolve_errors.to_string() + " resolver error(s) over " + paths.len().to_string() + " closure files)\n"
+    report = report + row
+    match write_file(report_path.clone(), report)
+    when Result::Ok(_) then ()
+    when Result::Err(_) then ()
+    end
+    println(row.trim())
+    return 1
+  end
+  let ok_row = "OK " + paths.len().to_string() + " closure files parsed clean; resolver diagnostics 0 (" + pre_resolution_macros.to_string() + " pre-resolution debug_assert macro artifact(s), expanded before resolve_names in the real pipeline)\n"
+  match write_file(report_path.clone(), ok_row)
+  when Result::Ok(_) then ()
+  when Result::Err(_) then ()
+  end
+  println("resolution-parity: OK (" + paths.len().to_string() + " closure files, resolver diagnostics 0, " + pre_resolution_macros.to_string() + " pre-resolution debug_assert artifact(s))")
+  0
+end

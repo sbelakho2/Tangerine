@@ -12,7 +12,7 @@ use std::fs::{read_file}
 use tg_compiler::token::{Span, span_dummy, ParsedIntegerLiteral, ParsedFloatLiteral, parsed_int_to_host, parsed_int_fits_host, parsed_int_decimal, parsed_int_is_zero, parsed_float_f32_overflow, parsed_float_f64_overflow}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::parser::{parse, DiagnosticSemanticData, EffectViolationData, TypeMismatchData, TraitFailureData, CapabilityDiagnosticData}
-use tg_compiler::resolver::{ResolvedNames, def_id_of_item, def_kind_of, module_qualified_key}
+use tg_compiler::resolver::{ResolvedNames, def_id_of_item, def_kind_of, module_qualified_key, imported_target_key}
 use tg_compiler::ids::{
   DefId, DefKind, FieldId, ModuleId, TypeId, TraitId, GenericParamId, GenericParamTable,
   CallableId, InstanceId, GenericArg, ConstValue, VariantId, LocalId, NodeId, AccessRoot, ClosureId, EffectId, EffectRegistry,
@@ -3416,6 +3416,14 @@ struct TypeEnv
   # fires (see resolve_bare_callable).
   module_callable_types: Map[String, Type]
   callable_first_wins: Map[String, Type]
+  # (suffix index over module_callable_types): every "::"-joined suffix of
+  # a registered qualified callable key -> the keys in registration order.
+  # Maintained at record_module_callable (the single insertion site) so a
+  # name query returns exactly `key == name || key.ends_with("::" + name)`
+  # in first-registration order, with O(1) bucket lookup instead of a
+  # full-module scan per query (mangled_free_fn_target / static-path
+  # method-alias resolution).
+  callable_suffix_index: Map[String, Vec[String]]
   type_id_index: Map[Int, Int]         # TypeId.id -> index into type_list
   type_id_counter: Int
   # TypeId.id -> the declaration's LAYOUT attributes (@repr(C) / @align(N)
@@ -4016,6 +4024,7 @@ impl Clone for TypeEnv
       module_type_names: self.module_type_names.clone(),
       module_callable_types: self.module_callable_types.clone(),
       callable_first_wins: self.callable_first_wins.clone(),
+      callable_suffix_index: self.callable_suffix_index.clone(),
       type_id_index: self.type_id_index.clone(),
       type_id_counter: self.type_id_counter.clone(),
       layout_attrs: self.layout_attrs.clone(),
@@ -6903,6 +6912,7 @@ def type_env_new() -> TypeEnv
     module_type_names: Map::new(),
     module_callable_types: Map::new(),
     callable_first_wins: Map::new(),
+    callable_suffix_index: Map::new(),
     type_id_index: Map::new(),
     type_id_counter: 100,
     layout_attrs: Map::new(),
@@ -7923,7 +7933,26 @@ end
 # the resolver's bare-name first-wins tables). Idempotent: one callable
 # registration happens per item in pass 3.
 def record_module_callable(inout env: TypeEnv, name: String, ty: Type, module_path: Vec[String], kind: DefKind) -> Unit
-  env.module_callable_types.insert(module_qualified_key(module_path, &name), ty.clone())
+  let key = module_qualified_key(module_path, &name)
+  # a re-registration replaces the value IN PLACE (module_callable_types
+  # keeps the original position), so the suffix index only grows for keys
+  # that are new — preserving first-registration order exactly.
+  let is_new = !env.module_callable_types.contains_key(&key)
+  env.module_callable_types.insert(key.clone(), ty.clone())
+  if is_new then
+    let segs = key.split("::")
+    var si = 0
+    while si < segs.len() do
+      let suffix = segs.slice(si, segs.len()).join("::")
+      var group = match env.callable_suffix_index.get(&suffix)
+      when Option::Some(existing) then existing
+      when Option::None then Vec::new()
+      end
+      group.push(key.clone())
+      env.callable_suffix_index.insert(suffix, group)
+      si = si + 1
+    end
+  end
   if !env.callable_first_wins.contains_key(&name) then
     env.callable_first_wins.insert(name, ty.clone())
   end
@@ -7967,21 +7996,89 @@ def has_qualified_type_entry(env: TypeEnv, name: String) -> Bool
   false
 end
 
+# (seed-parity imports): the current module's explicit import of a TYPE
+# name, from the resolver's imports snapshot — the module-qualified key of
+# the imported declaration when the binding targets a TypeName/Trait.
+# Mirrors the seed resolver's authority order (explicit sc_imports first —
+# explicit_candidates filters by namespace, so a value import never answers
+# a type lookup), which is what makes a same-spelled name (Arch, ErrorCode)
+# resolve to the module's declared import instead of the cross-module
+# ambiguity the seed itself never raises for a module-scoped name.
+def imported_type_key_of(inout env: TypeEnv, name: String) -> Option[String]
+  match env.resolutions
+  when Option::Some(res) then
+    match imported_target_key(&res, env.current_module_path.clone(), name.clone())
+    when Option::Some(key) then
+      match res.module_symbols.get(key.clone())
+      when Option::Some(did) then
+        match def_kind_of(&res, &did)
+        when Option::Some(k) then
+          if k == DefKind::TypeName || k == DefKind::Trait then Option::Some(key)
+          else Option::None end
+        when Option::None then Option::None
+        end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end  end
+end
+
+# (seed-parity imports): the current module's explicit import of a
+# CALLABLE name (Function/Constant/Static) — the value-namespace sibling of
+# imported_type_key_of, returning the module-qualified registration key the
+# type checker's module_callable_types map holds.
+def imported_callable_key_of(inout env: TypeEnv, name: String) -> Option[String]
+  match env.resolutions
+  when Option::Some(res) then
+    match imported_target_key(&res, env.current_module_path.clone(), name.clone())
+    when Option::Some(key) then
+      match res.module_symbols.get(key.clone())
+      when Option::Some(did) then
+        match def_kind_of(&res, &did)
+        when Option::Some(k) then
+          if k == DefKind::Function || k == DefKind::Constant || k == DefKind::Static then Option::Some(key)
+          else Option::None end
+        when Option::None then Option::None
+        end
+      when Option::None then Option::None
+      end
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end  end
+end
+
 # (next layer): resolve a type name to its TypeId, preferring the
-# current module's own module-qualified identity over the bare first-wins
-# entry. Falls back to the bare entry when no qualified entry exists
-# (builtins, traits, aliases, capabilities — compatibility behavior).
-def get_type_id_by_qualified_name(env: TypeEnv, name: String, module_path: Vec[String]) -> Option[TypeId]
+# current module's own module-qualified identity, then the current
+# module's EXPLICIT import of the name (the seed's sc_imports authority),
+# over the bare first-wins entry. Falls back to the bare entry when no
+# qualified/introduced entry exists (builtins, traits, aliases,
+# capabilities — compatibility behavior).
+def get_type_id_by_qualified_name(inout env: TypeEnv, name: String, module_path: Vec[String]) -> Option[TypeId]
   let key = module_qualified_key(module_path, &name)
   match env.module_type_names.get(key)
   when Option::Some(idx) then
     Option::Some(env.type_list[idx].id)
   when Option::None then
-    match env.type_name_index.get(name)
-    when Option::Some(idx) then
-      Option::Some(env.type_list[idx].id)
+    match imported_type_key_of(env, name.clone())
+    when Option::Some(import_key) then
+      match env.module_type_names.get(import_key)
+      when Option::Some(idx) then Option::Some(env.type_list[idx].id)
+      when Option::None then
+        match env.type_name_index.get(name)
+        when Option::Some(idx) then Option::Some(env.type_list[idx].id)
+        when Option::None then Option::None
+        end
+      end
     when Option::None then
-      Option::None
+      match env.type_name_index.get(name)
+      when Option::Some(idx) then
+        Option::Some(env.type_list[idx].id)
+      when Option::None then
+        Option::None
+      end
     end
   end
 end
@@ -8028,12 +8125,25 @@ def resolve_bare_type_name(inout env: TypeEnv, name: String, span: Span) -> Opti
   when Option::Some(idx) then
     Option::Some(idx)
   when Option::None then
-    if foreign_distinct >= 2 then
-      type_add_error(env, "ambiguous type name `" + name + "`: defined in multiple modules; qualify the path", span)
-    end
-    match env.type_name_index.get(name)
-    when Option::Some(idx) then Option::Some(idx)
+    # the current module's EXPLICIT import of the name — the seed's
+    # sc_imports authority: an imported type wins before the
+    # cross-module ambiguity is even considered (the seed resolver never
+    # raises that ambiguity for a module-scoped name).
+    let import_idx = match imported_type_key_of(env, name.clone())
+    when Option::Some(key) then env.module_type_names.get(key)
     when Option::None then Option::None
+    end
+    match import_idx
+    when Option::Some(idx) then
+      Option::Some(idx)
+    when Option::None then
+      if foreign_distinct >= 2 then
+        type_add_error(env, "ambiguous type name `" + name + "`: defined in multiple modules; qualify the path", span)
+      end
+      match env.type_name_index.get(name)
+      when Option::Some(idx) then Option::Some(idx)
+      when Option::None then Option::None
+      end
     end
   end
 end
@@ -8080,7 +8190,13 @@ def resolve_bare_callable(inout env: TypeEnv, name: String, span: Span, fallback
     var foreign_distinct = 0
     var foreign_seen = Map::new()
     let suffix = "::" + name.clone()
-    let entry_vec = res.module_symbols.entries()
+    # the suffix index returns exactly the keys where
+    # `key == name || key.ends_with("::" + name)`, in module_symbols
+    # insertion order — the same candidates the full scan enumerated.
+    let entry_vec = match res.symbol_suffix_index.get(&name)
+    when Option::Some(v) then v
+    when Option::None then Vec::new()
+    end
     for (key, did) in entry_vec do
  # the DefKind is metadata — the resolver's def_kinds snapshot.
       let did_kind = match def_kind_of(&res, &did)
@@ -8115,14 +8231,26 @@ def resolve_bare_callable(inout env: TypeEnv, name: String, span: Span, fallback
     when Option::Some(ty) then
       ty
     when Option::None then
-      if foreign_distinct >= 2 then
-        type_add_error(env, "ambiguous name `" + name + "`: defined in multiple modules; qualify the path", span)
-        match env.callable_first_wins.get(name.clone())
-        when Option::Some(ty) then ty.clone()
-        when Option::None then fallback
-        end
+      # the current module's EXPLICIT import of the name (the seed's
+      # sc_imports authority) wins before the cross-module ambiguity is
+      # considered.
+      let import_ty = match imported_callable_key_of(env, name.clone())
+      when Option::Some(key) then env.module_callable_types.get(key)
+      when Option::None then Option::None
+      end
+      match import_ty
+      when Option::Some(ty) then
+        ty
+      when Option::None then
+        if foreign_distinct >= 2 then
+          type_add_error(env, "ambiguous name `" + name + "`: defined in multiple modules; qualify the path", span)
+          match env.callable_first_wins.get(name.clone())
+          when Option::Some(ty) then ty.clone()
+          when Option::None then fallback
+          end
       else
         fallback
+      end
       end
     end
   when Option::None then
@@ -17483,7 +17611,13 @@ def scan_qualified_method_def(env: TypeEnv, key: String) -> Option[DefId]
     var found: Option[DefId] = Option::None
     var count = 0
     let suffix = "::" + key.clone()
-    for (ms_key, ms_did) in res.module_symbols.entries() do
+    # the suffix index bucket is exactly the keys where
+    # `ms_key == key || ms_key.ends_with("::" + key)`, insertion order.
+    let candidates = match res.symbol_suffix_index.get(&key)
+    when Option::Some(v) then v
+    when Option::None then Vec::new()
+    end
+    for (ms_key, ms_did) in candidates do
       var matches = false
       if ms_key == key.clone() then
         matches = true
@@ -22219,7 +22353,13 @@ def bare_callable_def_recovery(env: TypeEnv, name: String) -> Option[DefId]
     var foreign: Vec[DefId] = Vec::new()
     var unclassified: Vec[DefId] = Vec::new()
     let suffix = "::" + name.clone()
-    for (key, did) in res.module_symbols.entries() do
+    # suffix-index bucket = `key == name || key.ends_with("::" + name)`,
+    # in module_symbols insertion order.
+    let candidates = match res.symbol_suffix_index.get(&name)
+    when Option::Some(v) then v
+    when Option::None then Vec::new()
+    end
+    for (key, did) in candidates do
       if key == name.clone() || key.ends_with(suffix.clone()) then
         if key == own_key then
           own_did = Option::Some(did.clone())
@@ -22273,12 +22413,20 @@ def mangled_free_fn_target(env: TypeEnv, owner: String, method: String) -> Optio
   when Option::None then ()
   end
   if matched_key == "" then
-    let suffix = "::" + free_name.clone()
-    for (key, ty) in env.module_callable_types.entries() do
+    # callable suffix-index bucket = the keys where
+    # `key == free_name || key.ends_with("::" + free_name)`, in
+    # module_callable_types insertion order.
+    let candidates = match env.callable_suffix_index.get(&free_name)
+    when Option::Some(v) then v
+    when Option::None then Vec::new()
+    end
+    for ckey in candidates do
       if matched_key == "" then
-        if key == free_name.clone() || key.ends_with(suffix.clone()) then
+        match env.module_callable_types.get(ckey.clone())
+        when Option::Some(ty) then
           ty_opt = Option::Some(ty.clone())
-          matched_key = key.clone()
+          matched_key = ckey.clone()
+        when Option::None then ()
         end
       end
     end
@@ -22291,14 +22439,16 @@ def mangled_free_fn_target(env: TypeEnv, owner: String, method: String) -> Optio
     var did_opt: Option[DefId] = Option::None
     match env.resolutions
     when Option::Some(res) then
-      for (key, did) in res.module_symbols.entries() do
-        if did_opt.is_none() && key == matched_key then
-          match def_kind_of(&res, &did)
-          when Option::Some(k) then
-            if k == DefKind::Function then did_opt = Option::Some(did.clone()) end
-          when Option::None then ()
-          end
+      # the matched key is a UNIQUE module_symbols key — the direct get
+      # is the first-and-only entry the scan found.
+      match res.module_symbols.get(matched_key.clone())
+      when Option::Some(did) then
+        match def_kind_of(&res, &did)
+        when Option::Some(k) then
+          if k == DefKind::Function then did_opt = Option::Some(did.clone()) end
+        when Option::None then ()
         end
+      when Option::None then ()
       end
     when Option::None then ()
     end
@@ -24119,21 +24269,47 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
       if path.segments.len() >= 2 then
         let variant_name = path.segments[path.segments.len() - 1]
         let enum_name = path.segments[path.segments.len() - 2]
-        match find_enum_variant(env, variant_name.clone())
-        when Option::Some((enum_td, _)) then
-          if enum_td.name == enum_name then
-            let enum_type_args = fresh_type_args_for(env, &enum_td)
- # the builtin Option/Result identity is the LangItems TypeId
-            # — never the declared name.
-            if enum_td.id.id == env.lang_items.result then
-              builtin_adt(env, "Result".to_string(), [fresh_type_var(env), fresh_type_var(env)])
-            elsif enum_td.id.id == env.lang_items.option then
-              builtin_adt(env, "Option".to_string(), [fresh_type_var(env)])
-            else
-              Type::Adt(enum_td.id, enum_type_args)
+        # OWNER-first (the same order as check_enum_variant_construct and
+        # the pattern junction): the qualified owner segment resolves
+        # through the module-qualified identity tables — the current
+        # module's own declaration, then its EXPLICIT import (the seed's
+        # sc_imports determinism), both import-aware via
+        # get_type_id_by_qualified_name. Only when no owner resolves does
+        # the first-owner name-matching scan apply as the bare fallback
+        # (the pre-existing behavior for context-free variant paths).
+        var variant_owner: Option[TypeDef] = Option::None
+        match get_type_id_by_qualified_name(env, enum_name.clone(), &env.current_module_path)
+        when Option::Some(owner_tid) then
+          match get_type_by_id_ref(env, &owner_tid)
+          when Option::Some(owner_td) then
+            match find_enum_variant_in_owner(owner_td.clone(), variant_name.clone())
+            when Option::Some(_) then variant_owner = Option::Some(owner_td)
+            when Option::None then ()
             end
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+        match variant_owner
+        when Option::None then
+          match find_enum_variant(env, variant_name.clone())
+          when Option::Some((enum_td, _)) then
+            if enum_td.name == enum_name then variant_owner = Option::Some(enum_td) end
+          when Option::None then ()
+          end
+        when Option::Some(_) then ()
+        end
+        match variant_owner
+        when Option::Some(enum_td) then
+          let enum_type_args = fresh_type_args_for(env, &enum_td)
+  # the builtin Option/Result identity is the LangItems TypeId
+          # — never the declared name.
+          if enum_td.id.id == env.lang_items.result then
+            builtin_adt(env, "Result".to_string(), [fresh_type_var(env), fresh_type_var(env)])
+          elsif enum_td.id.id == env.lang_items.option then
+            builtin_adt(env, "Option".to_string(), [fresh_type_var(env)])
           else
-            fresh_type_var(env)
+            Type::Adt(enum_td.id, enum_type_args)
           end
         when Option::None then fresh_type_var(env)
         end

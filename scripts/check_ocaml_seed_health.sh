@@ -131,6 +131,15 @@ TG_DEVIRT_TIMEOUT_S=900
 # bound the CI step uses); a cap is a bound, never a skip.
 TG_LINKPROBE_TIMEOUT_S=1800
 
+# Resolution-parity lane calibration (the tg_resolution_parity probe: the
+# resolution_parity_mini closure is the kernel front end + id/type modules
+# and the probe parses+merges+resolves the FULL bootstrap closure). Measured
+# 2026-09-28 on the development host at light load: 612.2 s wall (10:12.22)
+# for the green path. Cap 960 s (612.2 x 1.5 = 918.3 rounded up to the next
+# 60 s); a cap is a bound, never a skip. Re-measure when the front end
+# grows materially.
+RESOLUTION_PARITY_TIMEOUT_S=960
+
 if [ -f scripts/check_ocaml_toolchain.sh ]; then
   scripts/check_ocaml_toolchain.sh
 fi
@@ -208,6 +217,9 @@ for name in $NAMES; do
   fi
   if [ "$name" = "tg_linkprobe" ]; then
     SC_TIMEOUT_S="$TG_LINKPROBE_TIMEOUT_S"
+  fi
+  if [ "$name" = "tg_resolution_parity" ]; then
+    SC_TIMEOUT_S="$RESOLUTION_PARITY_TIMEOUT_S"
   fi
   if ! timeout "$SC_TIMEOUT_S" "_build/default/selfcheck/${name}.exe" >"/tmp/ocaml_sc_${name}.out" 2>&1; then
     echo "check_ocaml_seed_health: FAIL — selfcheck ${name} exited non-zero"

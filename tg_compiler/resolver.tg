@@ -242,11 +242,34 @@ struct ResolvedNames
   # every bare-name resolution (the 0/1/>1 rule) feeds on this snapshot.
   module_symbols: Map[String, DefId]
 
- # (DefKind metadata snapshot): the symbol table's def_kinds map —
+  # (DefKind metadata snapshot): the symbol table's def_kinds map —
   # "module_id::index" -> DefKind for every resolver-produced DefId (the
   # resolver metadata map; DefId itself carries no
   # kind). Consumers render kinds via def_kind_of, never from the DefId.
   def_kinds: Map[String, DefKind]
+
+  # (imports snapshot — seed-parity resolution): per-module import
+  # bindings, "<module path>" -> the flattened use-imports in source
+  # order (resolver SymbolTable.module_tables' imports). The type checker's
+  # bare-name resolution consults the importing module's explicit
+  # bindings FIRST (the seed resolver's authority order: sc_imports, then
+  # globs, then own items), so a same-spelled name a module explicitly
+  # imports (Arch, ErrorCode) resolves to the imported declaration instead
+  # of the cross-module ambiguity — the determinism the seed gets from its
+  # scoped import bindings. ImportedTypeKey / ImportedCallableKey read
+  # this snapshot.
+  import_bindings: Map[String, Vec[ImportSymbol]]
+
+  # (suffix index over the frozen module_symbols): every "::"-joined
+  # suffix of a module-qualified key -> its (key, DefId) candidates in
+  # module_symbols insertion order. Built once by build_resolver_indexes
+  # (right after symbol-table construction; module_symbols is never
+  # mutated afterwards). A query for `name` returns exactly the keys where
+  # `key == name || key.ends_with("::" + name)`, in the same order a full
+  # scan would — an O(1) bucket lookup instead of O(symbols) per query
+  # (the type checker's bare/qualified callable scans share it; the
+  # resolver's own bare_name_index stays the phase-3 lookup).
+  symbol_suffix_index: Map[String, Vec[(String, DefId)]]
 
   # Stable IDs for incremental compilation
   stable_ids: StableIdMap
@@ -632,6 +655,13 @@ def resolve_names(program: Program) -> Result[ResolvedNames, Vec[ResolutionError
   # metadata map (DefId carries no kind — def_kind_of consults this).
   ctx.resolved.module_symbols = ctx.symbols.module_symbols.clone()
   ctx.resolved.def_kinds = ctx.symbols.def_kinds.clone()
+  # (imports snapshot): per-module import bindings for the type checker's
+  # module-aware bare-name resolution (see ResolvedNames.import_bindings).
+  var import_bindings: Map[String, Vec[ImportSymbol]] = Map::new()
+  for (key, m) in ctx.symbols.module_tables.entries() do
+    import_bindings.insert(key.clone(), m.imports.clone())
+  end
+  ctx.resolved.import_bindings = import_bindings
 
   if ctx.symbols.errors.is_empty() then
     Result::Ok(ctx.resolved)
@@ -654,6 +684,8 @@ def context_new() -> ResolutionContext
       item_defs: Map::new(),
       module_symbols: Map::new(),
       def_kinds: Map::new(),
+      import_bindings: Map::new(),
+      symbol_suffix_index: Map::new(),
       stable_ids: stable_id_map_new()
     },
     prelude_imports: vec!["std", "core"],
@@ -823,6 +855,23 @@ def build_resolver_indexes(inout ctx: ResolutionContext) -> Unit
     end
     group.push((key.clone(), did.clone()))
     ctx.bare_name_index.insert(bare, group)
+    # every "::"-joined suffix of this key (the full key included) maps to
+    # the candidate, preserving module_symbols insertion order per bucket —
+    # ResolvedNames.symbol_suffix_index is the snapshot consumers' O(1)
+    # replacement for the full-scan `key == name || key.ends_with("::" + name)`
+    # queries.
+    let segs = key.split("::")
+    var si = 0
+    while si < segs.len() do
+      let suffix = segs.slice(si, segs.len()).join("::")
+      var group2 = match ctx.resolved.symbol_suffix_index.get(&suffix)
+      when Option::Some(existing) then existing
+      when Option::None then Vec::new()
+      end
+      group2.push((key.clone(), did.clone()))
+      ctx.resolved.symbol_suffix_index.insert(suffix, group2)
+      si = si + 1
+    end
     let metadata_key = def_metadata_key(did)
     if !ctx.module_path_index.contains_key(&metadata_key) then
       ctx.module_path_index.insert(metadata_key, module_path_of_key(&key))
@@ -1407,10 +1456,16 @@ def add_item_to_symbols(inout ctx: ResolutionContext, item: Item, module_path: V
 
   when ItemKind::ItemUse(use_decl) then
     let imports = flatten_use_decl(&use_decl, Vec::new())
-    # Shared iteration is projected: clone each import into the module's
-    # table (consuming iteration is not supported yet).
+    # Per-module import bindings: stored on the OWNER module's table
+    # (module_tables — written back below). The inline-tree copy handed
+    # back by get_current_module does not persist its Vec pushes across
+    # calls, which left every later phase with an EMPTY import list (the
+    # reason std::time::instant_now and the std::gfx_errors ErrorCode
+    # import were invisible to expression/type resolution). The seed
+    # binds use-declarations into the MODULE's scope (Resolver.scope.
+    # sc_imports, phase 2); this per-owner table is the kernel mirror.
     for import in imports do
-      module.imports.push(import.clone())
+      mtab.imports.push(import.clone())
     end
 
   when ItemKind::ItemConst(c) then
@@ -1702,7 +1757,34 @@ end
 # ———————————————————————————————————————————————————————————————
 
 def rs_resolve_imports(inout ctx: ResolutionContext) -> Unit
-  resolve_module_imports(&mut ctx.symbols, &mut ctx.symbols.root, Vec::new())
+  # Per-module import verification (the seed's E2001): every flattened
+  # use-declaration is checked against the known-module authority
+  # (resolve_import_path). Imports are stored per owner module in
+  # module_tables (add_item_to_symbols' ItemUse arm) — the inline-tree
+  # walk saw an empty list because ModuleSymbols copies do not persist Vec
+  # pushes, so this pass was dormant. The seed resolver emits no
+  # import-cycle diagnostic (CyclicImport exists in its error enum but is
+  # never produced), so cycle errors stay out of the kernel mirror; the
+  # retained import-graph helpers (resolve_module_imports,
+  # cycle_in_import_graph) are not part of this pass.
+  var keys = Vec::new()
+  for (key, _m) in ctx.symbols.module_tables.entries() do
+    keys.push(key.clone())
+  end
+  var ki = 0
+  while ki < keys.len() do
+    let imports = match ctx.symbols.module_tables.get(keys[ki].clone())
+    when Option::Some(m) then m.imports
+    when Option::None then Vec::new()
+    end
+    for import in imports do
+      if !resolve_import_path(&mut ctx.symbols, &import.path) then
+        rs_add_error(&mut ctx.symbols, ResolutionErrorKind::UnresolvedImport,
+          "unresolved import: " + import.path.join("::"), import.span.clone())
+      end
+    end
+    ki = ki + 1
+  end
 end
 
 def resolve_module_imports(inout symbols: SymbolTable, inout module: ModuleSymbols,
@@ -2259,23 +2341,25 @@ def resolve_path(inout ctx: ResolutionContext, path: Vec[String], node_id: Int, 
 
   let first = path[0]
 
- # (type-path branch): Type::method / Enum::Variant paths resolve the
-  # OWNER through the module-qualified TypeName machinery — the 0/1/>1
-  # rule (the bare-name root-tree lookup is are not part of the model; an ambiguous owner is
-  # FINAL — the ambiguity diagnostic, no first-wins pick). The variant
-  # identity comes from the owner module's qualified EnumVariant entry
-  # ("path::VariantName" -> DefId — the same registration machinery that
-  # recorded the owner), so the resolution record and the call target
-  # carry the OWNER-module identities end to end.
+  # (type-path branch): Type::method / Enum::Variant paths resolve the
+  # OWNER through the current module's explicit imports first (the seed
+  # resolver's sc_imports authority — a module that imports
+  # tg_compiler::target_desc::Arch means THAT Arch), then the
+  # module-qualified 0/1/>1 rule (an ambiguous owner is FINAL — the
+  # ambiguity diagnostic, no first-wins pick). The variant identity comes
+  # from the owner module's qualified EnumVariant entry ("path::VariantName"
+  # -> DefId — the same registration machinery that recorded the owner), so
+  # the resolution record and the call target carry the OWNER-module
+  # identities end to end.
   if path.len() >= 2 then
-    match bare_name_resolve(ctx, &first, &vec![DefKind::TypeName], &span)
-    when BareNameResolution::Resolved(owner_did) then
+    match resolve_path_owner_type(ctx, first.clone(), span.clone())
+    when PathOwnerResolution::Owner(owner_did) then
       let owner_path = module_path_of(ctx, owner_did.clone())
       let second = path[1]
       match ctx.symbols.module_symbols.get(module_qualified_key(&owner_path, &second))
       when Option::Some(var_did) then
         # The variant's own module-qualified EnumVariant DefId. The
- # resolution record carries the VariantId form (): the owner
+  # resolution record carries the VariantId form (): the owner
         # TypeId is completed by the type checker at consumption (the
         # resolver cannot fabricate type-checker ids; TypeId { id: -1 }
         # marks an unset owner — the codebase's convention); the index is
@@ -2302,18 +2386,16 @@ def resolve_path(inout ctx: ResolutionContext, path: Vec[String], node_id: Int, 
         })
       end
       return
-    when BareNameResolution::Ambiguous then
+    when PathOwnerResolution::Ambiguous then
+      # the ambiguity diagnostic is already recorded; resolution is FINAL
       return
-    when BareNameResolution::NoCandidate then
-      # (builtin owners — the enum-path-value family): a builtin compound
-      # name (Option/Result/...) is registered by the compiler prelude, not
-      # by a source module, so bare_name_resolve has no TypeName symbol for
-      # it. The path still names a genuine builtin enum's variant
-      # (`Option::None` in value position), so record the provisional
-      # VariantId form (the same record the unregistered-variant case above
-      # writes; the type checker completes the owner from the registered
-      # builtin enum) instead of failing the path. A non-builtin owner keeps
-      # the unresolved-path error below.
+    when PathOwnerResolution::NoOwner then
+      # No owner of any kind. The one fallthrough: a builtin compound
+      # name (Option/Result/...) has no source module symbol, so the path
+      # still names a genuine builtin enum's variant (`Option::None` in
+      # value position) — record the provisional VariantId form the type
+      # checker completes from the registered builtin enum. A non-builtin
+      # owner keeps the unresolved-path error below.
       if is_builtin_type_name(&first) then
         ctx.resolved.expr_resolutions.insert(node_id, ResolvedExpr {
           kind: ResolvedExprKind::Variant(VariantId {
@@ -2350,13 +2432,19 @@ def rs_resolve_type_expr(inout ctx: ResolutionContext, ty: TypeExpr, span: Span)
     # are not part of the model; >= 2 DISTINCT qualified definitions is the ambiguity
     # diagnostic — its ONLY outcome; a first-wins pick is never made).
     if !is_builtin_type_name(&name) then
-      match bare_name_resolve(ctx, &name, &vec![DefKind::TypeName], &span)
-      when BareNameResolution::Resolved(_) then ()
-      when BareNameResolution::Ambiguous then ()
-      when BareNameResolution::NoCandidate then
-        if !resolve_type_via_imports(ctx, &vec![name.clone()]) then
-          rs_add_error(&mut ctx.symbols, ResolutionErrorKind::UnresolvedType,
-            "unresolved type: " + name, span)
+      # explicit import of a TYPE name first (the seed's sc_imports
+      # authority): fs.tg's `use std::gfx_errors::{ErrorCode}` resolves the
+      # annotation to gfx_errors::ErrorCode instead of the parser.tg
+      # cross-module ambiguity.
+      if !type_name_imported(ctx, name.clone()) then
+        match bare_name_resolve(ctx, &name, &vec![DefKind::TypeName], &span)
+        when BareNameResolution::Resolved(_) then ()
+        when BareNameResolution::Ambiguous then ()
+        when BareNameResolution::NoCandidate then
+          if !resolve_type_via_imports(ctx, &vec![name.clone()]) then
+            rs_add_error(&mut ctx.symbols, ResolutionErrorKind::UnresolvedType,
+              "unresolved type: " + name, span)
+          end
         end
       end
     end
@@ -2373,12 +2461,14 @@ def rs_resolve_type_expr(inout ctx: ResolutionContext, ty: TypeExpr, span: Span)
  # the terminal segment's module-qualified TypeName identity
         # (the bare-name root-tree lookup is are not part of the model).
         let last = path.segments[path.segments.len() - 1]
-        match bare_name_resolve(ctx, &last, &vec![DefKind::TypeName], &span)
-        when BareNameResolution::Resolved(_) then ()
-        when BareNameResolution::Ambiguous then ()
-        when BareNameResolution::NoCandidate then
-          rs_add_error(&mut ctx.symbols, ResolutionErrorKind::UnresolvedType,
-            "unresolved type: " + path.segments.join("::"), span)
+        if !type_name_imported(ctx, last.clone()) then
+          match bare_name_resolve(ctx, &last, &vec![DefKind::TypeName], &span)
+          when BareNameResolution::Resolved(_) then ()
+          when BareNameResolution::Ambiguous then ()
+          when BareNameResolution::NoCandidate then
+            rs_add_error(&mut ctx.symbols, ResolutionErrorKind::UnresolvedType,
+              "unresolved type: " + path.segments.join("::"), span)
+          end
         end
       end
     end
@@ -2432,6 +2522,112 @@ def is_builtin_type_name(name: String) -> Bool
   name == "Ptr" || name == "Box" || name == "Rc" || name == "Arc"
 end
 
+# Host/runtime-provided module symbols the seed's resolver accepts by
+# (module path, name) — resolver.ml's builtin_module_symbol: the std::time
+# duration queries and instant_now are compiler builtins (their typed
+# signatures live in the seed type checker's builtin table, so
+# std/time.tg declares no source definition), std::env::args/vars and
+# std::process::exit are host surfaces, and tg_compiler::ast::Function /
+# tg_compiler::parser::{Parser, ParseError} are the kernel-legacy imports
+# observed in the closure. An import of one of these resolves as ITBuiltin
+# in the seed (item_or_child) — never E2001 — so the kernel mirrors the
+# same acceptance here.
+def is_builtin_module_symbol(path: Vec[String], name: String) -> Bool
+  path.len() == 2 &&
+  ((path[0] == "std" && path[1] == "env" && (name == "args" || name == "vars")) ||
+   (path[0] == "std" && path[1] == "process" && name == "exit") ||
+   (path[0] == "std" && path[1] == "time" &&
+      (name == "instant_now" || name == "duration_nanos" ||
+       name == "duration_millis" || name == "duration_secs_f64")) ||
+   (path[0] == "tg_compiler" && path[1] == "ast" && name == "Function") ||
+   (path[0] == "tg_compiler" && path[1] == "parser" && (name == "Parser" || name == "ParseError")))
+end
+
+# The bound NAME of one flattened use-import (flatten_use_decl's binding
+# rule): the alias when present, else the path's last segment.
+def import_bound_name(import: ImportSymbol) -> String
+  match import.alias_name
+  when Option::Some(a) then a.clone()
+  when Option::None then
+    if import.path.is_empty() then "".to_string()
+    else import.path[import.path.len() - 1].clone()
+    end
+  end  end
+end
+
+# The module-qualified symbol key an explicit import of `name` in
+# `module_path` names, read from the RESOLVED snapshot (the type checker's
+# view of the per-module imports). Option::None when the module has no
+# explicit binding of the name, or the binding names no registered symbol;
+# the caller filters by DefKind (def_kind_of) for its namespace.
+def imported_target_key(res: ResolvedNames, module_path: Vec[String], name: String) -> Option[String]
+  match res.import_bindings.get(module_path.join("::"))
+  when Option::Some(imports) then
+    var i = 0
+    while i < imports.len() do
+      let imp = imports[i]
+      if !imp.is_glob && import_bound_name(imp) == name && !imp.path.is_empty() then
+        let key = imp.path.join("::")
+        if res.module_symbols.contains_key(&key) then
+          return Option::Some(key)
+        end
+      end
+      i = i + 1
+    end
+    Option::None
+  when Option::None then Option::None
+  end  end
+end
+
+# The import bindings recorded for `module_path` (the per-owner table in
+# module_tables; imports are stored at symbol-table construction — see
+# add_item_to_symbols' ItemUse arm). Empty when the module has no table.
+def module_imports(inout ctx: ResolutionContext, module_path: Vec[String]) -> Vec[ImportSymbol]
+  match ctx.symbols.module_tables.get(module_path.join("::"))
+  when Option::Some(m) then m.imports
+  when Option::None then Vec::new()
+  end  end
+end
+
+# The explicit (non-glob) import binding of `name` in the current owner
+# module, in source order — the seed resolver's sc_imports lookup
+# (explicit/aliased/group bindings). Glob imports are consulted separately
+# (glob_import_symbol_for).
+def explicit_import_for(inout ctx: ResolutionContext, name: String) -> Option[ImportSymbol]
+  let imports = module_imports(ctx, ctx.current_owner_path.clone())
+  var i = 0
+  while i < imports.len() do
+    let imp = imports[i]
+    if !imp.is_glob && import_bound_name(imp) == name then
+      return Option::Some(imp)
+    end
+    i = i + 1
+  end
+  Option::None
+end
+
+# Glob import candidates: the imported module's own item named `name`
+# (module_symbols "path::name" — the key the item registered under);
+# mirrors the seed resolver's glob_candidates. Source order; the first
+# matching glob wins (the kernel's glob form carries no ambiguity surface
+# beyond the seed's).
+def glob_import_symbol_for(inout ctx: ResolutionContext, name: String) -> Option[DefId]
+  let imports = module_imports(ctx, ctx.current_owner_path.clone())
+  var i = 0
+  while i < imports.len() do
+    let imp = imports[i]
+    if imp.is_glob then
+      let key = module_qualified_key(&imp.path, &name)
+      match ctx.symbols.module_symbols.get(key)
+      when Option::Some(did) then return Option::Some(did)
+      when Option::None then ()
+      end
+    end
+    i = i + 1
+  end
+  Option::None
+end
+
 # The frontend intrinsic FUNCTION names the checker's intrinsic router
 # (types.tg intrinsic_id_of_call) classifies by name and the backend
 # emits an intrinsic body for.  They have no source definition, so the
@@ -2446,90 +2642,206 @@ def is_frontend_intrinsic_name(name: String) -> Bool
   name == "string_reserve" || name == "string_is_empty" || name == "string_bytes"
 end
 
-def resolve_via_imports(inout ctx: ResolutionContext, name: String, node_id: Int) -> Bool
-  let module = get_current_module_ref(&mut ctx.symbols)
+# What a per-module import binding names for a bare VALUE ident.
+enum ImportResolution
+  NoImport          # no matching binding (or its target is not a value)
+  Builtin           # host/runtime-provided module symbol (the seed's ITBuiltin)
+  Item(DefId)       # the registered target symbol
+end
 
-  for import in module.imports do
-    if import.is_glob then
-      # Would need to search the imported module
-      next
-    end
-
-    let import_name = match import.alias_name
-    when Option::Some(alias_val) then alias_val.clone()
-    when Option::None then
-      if import.path.is_empty() then next end
-      import.path[import.path.len() - 1].clone()
-    end
-
-    if import_name == name.clone() then
-      # DefId.module is the TARGET module's ModuleId (the per-module table
-      # of the import path carries it — module_tables are keyed by path join
-      # and stamped with the owner ModuleId); the symbol index comes from
-      # the TARGET module's symbol table under the imported item's name.
+# Resolve a bare value name through the current module's import bindings:
+# explicit bindings first (the seed resolver's authority order — sc_imports
+# before globs before the module's own items), then glob imports. The
+# target is verified against the module-qualified authority: a binding
+# whose target is unknown or of a non-value kind is NOT a resolution
+# (fail-closed, mirroring the seed's E2001), and a builtin module symbol
+# (std::time::instant_now, ...) is accepted as ITBuiltin exactly like the
+# seed's item_or_child.
+def resolve_import_binding(inout ctx: ResolutionContext, name: String) -> ImportResolution
+  match explicit_import_for(ctx, name.clone())
+  when Option::Some(imp) then
+    if !imp.path.is_empty() then
+      let target_name = imp.path[imp.path.len() - 1]
       var module_path = Vec::new()
-      var mpi = 0
-      while mpi < import.path.len() - 1 do
-        module_path.push(import.path[mpi].clone())
-        mpi = mpi + 1
+      var pi = 0
+      while pi < imp.path.len() - 1 do
+        module_path.push(imp.path[pi].clone())
+        pi = pi + 1
       end
-      let target_name = import.path[import.path.len() - 1].clone()
-      let target_kind = import_target_kind(ctx, &module_path, &target_name)
-      let target_mod = match ctx.symbols.module_tables.get(module_path.join("::"))
-      when Option::Some(tab) then ModuleId { id: tab.module_id }
-      when Option::None then ModuleId { id: 0 }
+      if is_builtin_module_symbol(module_path, target_name.clone()) then
+        return ImportResolution::Builtin
       end
-      let target_idx = match symbol_index_for(ctx, &module_path, &target_name)
-      when Option::Some(target_idx) then
-        let target_did = DefId {
-          module: target_mod,
-          index: target_idx
-        }
-        record_def_kind(ctx, &target_did, target_kind)
-        ctx.resolved.call_targets.insert(node_id, target_did)
-        target_idx
-      when Option::None then 0 as UInt
+      match ctx.symbols.module_symbols.get(imp.path.join("::"))
+      when Option::Some(did) then
+        match ctx.symbols.def_kinds.get(def_metadata_key(&did))
+        when Option::Some(k) then
+          if k != DefKind::TypeName && k != DefKind::Trait then
+            return ImportResolution::Item(did)
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
       end
-      # The resolved-expression kind carries the semantic DefId (never the
-      # source name); the id matches the call_targets entry exactly. The
-      # identity key is the expression's NODE id.
-      let target_did = DefId {
-        module: target_mod,
-        index: target_idx
-      }
-      record_def_kind(ctx, &target_did, target_kind)
-      let resolved_kind = match target_kind
-      when DefKind::Static then ResolvedExprKind::Static(target_did.clone())
-      when DefKind::Constant then ResolvedExprKind::Constant(target_did.clone())
-      when DefKind::EnumVariant then
- # the imported item is an enum variant — the record carries the
-        # VariantId form (the owner TypeId is completed by the type checker
-        # at consumption; TypeId { id: -1 } marks an unset owner — the
-        # resolver cannot fabricate type-checker ids); the variant's own
-        # DefId (call_targets, recorded above) is the module-qualified
-        # EnumVariant identity.
-        ResolvedExprKind::Variant(VariantId {
-          owner: TypeId { id: -1 },
-          index: target_idx
-        })
-      when DefKind::Trait then
- # an imported trait resolves with its declaration DefId (the
-        # module-qualified trait identity); expression-position trait refs
-        # carry it like a callable (traits are not invocable — the DefId is
-        # identity metadata for the checker's trait resolution).
-        ResolvedExprKind::Function(target_did)
-      when _ then
-        ResolvedExprKind::Function(target_did)
-      end
-      ctx.resolved.expr_resolutions.insert(node_id, ResolvedExpr {
-        kind: resolved_kind,
-        module_path: import.path.clone()
-      })
-      return true
     end
-  end
+    # an explicit import that does not bind a value in this namespace does
+    # not mask the next authority (the seed filters explicit candidates by
+    # namespace)
+    match glob_import_symbol_for(ctx, name.clone())
+    when Option::Some(did) then ImportResolution::Item(did)
+    when Option::None then ImportResolution::NoImport
+    end
+  when Option::None then
+    match glob_import_symbol_for(ctx, name.clone())
+    when Option::Some(did) then ImportResolution::Item(did)
+    when Option::None then ImportResolution::NoImport
+    end
+  end  end
+end
 
-  false
+# The module-qualified symbol key the current module's explicit import of
+# `name` names, when the target is a registered TYPE declaration (TypeName/
+# Trait) — the TYPE-namespace sibling of resolve_import_binding. The seed
+# resolver's explicit_candidates filters bindings by namespace, so a
+# value-namespace import never answers a type-name lookup and vice versa.
+def imported_type_key(inout ctx: ResolutionContext, name: String) -> Option[String]
+  match explicit_import_for(ctx, name.clone())
+  when Option::Some(imp) then
+    if !imp.path.is_empty() then
+      let key = imp.path.join("::")
+      match ctx.symbols.module_symbols.get(key.clone())
+      when Option::Some(did) then
+        match ctx.symbols.def_kinds.get(def_metadata_key(&did))
+        when Option::Some(k) then
+          if k == DefKind::TypeName || k == DefKind::Trait then return Option::Some(key) end
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
+    # namespace miss: fall through to the glob candidates below
+    match glob_import_symbol_for(ctx, name.clone())
+    when Option::Some(did) then
+      match ctx.symbols.def_kinds.get(def_metadata_key(&did))
+      when Option::Some(k) then
+        if k == DefKind::TypeName || k == DefKind::Trait then return Option::Some(module_qualified_key(&module_path_of(ctx, did.clone()), &name)) end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
+    Option::None
+  when Option::None then
+    Option::None
+  end  end
+end
+
+# The owner TYPE declaration of a qualified path's first segment
+# (`Arch::X86_64`, `ErrorCode::IOError`), in the seed resolver's authority
+# order: the current module's EXPLICIT import of the name first (the
+# seed's sc_imports), then the module-qualified 0/1/>1 bare-name rule
+# (own definition shadowing; >= 2 foreign definitions stay AMBIGUOUS —
+# fail-closed, the diagnostic is recorded by bare_name_resolve). The
+# Ambiguous outcome is kept DISTINCT so the caller never stacks an
+# unresolved-path diagnostic on top of the ambiguity error.
+enum PathOwnerResolution
+  NoOwner
+  Ambiguous
+  Owner(DefId)
+end
+
+def resolve_path_owner_type(inout ctx: ResolutionContext, name: String, span: Span) -> PathOwnerResolution
+  match explicit_import_for(ctx, name.clone())
+  when Option::Some(imp) then
+    if !imp.path.is_empty() then
+      match ctx.symbols.module_symbols.get(imp.path.join("::"))
+      when Option::Some(did) then
+        match ctx.symbols.def_kinds.get(def_metadata_key(&did))
+        when Option::Some(k) then
+          if k == DefKind::TypeName then return PathOwnerResolution::Owner(did) end
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
+    # a non-type explicit import does not mask the module-qualified rule
+    match bare_name_resolve(ctx, &name, &vec![DefKind::TypeName], &span)
+    when BareNameResolution::Resolved(did) then PathOwnerResolution::Owner(did)
+    when BareNameResolution::Ambiguous then PathOwnerResolution::Ambiguous
+    when BareNameResolution::NoCandidate then PathOwnerResolution::NoOwner
+    end
+  when Option::None then
+    match bare_name_resolve(ctx, &name, &vec![DefKind::TypeName], &span)
+    when BareNameResolution::Resolved(did) then PathOwnerResolution::Owner(did)
+    when BareNameResolution::Ambiguous then PathOwnerResolution::Ambiguous
+    when BareNameResolution::NoCandidate then PathOwnerResolution::NoOwner
+    end
+  end  end
+end
+
+# The explicit import binding of a TYPE name in the current module
+# (rs_resolve_type_expr / the type-position checks): Option::Some(key)
+# when the binding's target is a registered TypeName/Trait.
+def type_name_imported(inout ctx: ResolutionContext, name: String) -> Bool
+  match imported_type_key(ctx, name.clone())
+  when Option::Some(_) then true
+  when Option::None then false
+  end  end
+end
+
+# The imported TYPE declaration's DefId (the type-position sibling of
+# resolve_import_binding). Option::None when the module has no explicit
+# import of the name (or the imported target is not a type declaration).
+def imported_type_owner(inout ctx: ResolutionContext, name: String) -> Option[DefId]
+  match imported_type_key(ctx, name.clone())
+  when Option::Some(key) then ctx.symbols.module_symbols.get(key)
+  when Option::None then Option::None
+  end  end
+end
+
+def resolve_via_imports(inout ctx: ResolutionContext, name: String, node_id: Int) -> Bool
+  match resolve_import_binding(ctx, name.clone())
+  when ImportResolution::Builtin then
+    # Host/runtime-provided module symbol: the seed's ITBuiltin (no
+    # resolver-domain declaration; the checker's builtin signature table
+    # is the typed authority). Record the synthetic runtime-intrinsic
+    # DefId (the same identity domain the __intrinsic_* registrations
+    # use) so the call keeps an ID-based target.
+    let bidx = ctx.next_builtin_index
+    ctx.next_builtin_index = ctx.next_builtin_index + 1
+    let bdid = DefId {
+      module: synthetic_module_id(SYNTHETIC_MODULE_INTRINSIC),
+      index: bidx as UInt
+    }
+    record_def_kind(ctx, &bdid, DefKind::Intrinsic)
+    ctx.resolved.call_targets.insert(node_id, bdid.clone())
+    ctx.resolved.expr_resolutions.insert(node_id, ResolvedExpr {
+      kind: ResolvedExprKind::Function(bdid),
+      module_path: ctx.symbols.current_module.clone()
+    })
+    true
+  when ImportResolution::Item(did) then
+    let did_kind = match ctx.symbols.def_kinds.get(def_metadata_key(&did))
+    when Option::Some(k) then k
+    when Option::None then DefKind::Other
+    end
+    ctx.resolved.call_targets.insert(node_id, did.clone())
+    let resolved_kind = match did_kind
+    when DefKind::Constant then ResolvedExprKind::Constant(did.clone())
+    when DefKind::Static then ResolvedExprKind::Static(did.clone())
+    when DefKind::EnumVariant then
+      ResolvedExprKind::Variant(VariantId {
+        owner: TypeId { id: -1 },
+        index: did.index
+      })
+    when _ then ResolvedExprKind::Function(did.clone())
+    end
+    ctx.resolved.expr_resolutions.insert(node_id, ResolvedExpr {
+      kind: resolved_kind,
+      module_path: ctx.symbols.current_module.clone()
+    })
+    true
+  when ImportResolution::NoImport then
+    false
+  end  end
 end
 
 # the DefKind of an import target, from the module-qualified
@@ -2934,8 +3246,22 @@ def resolve_ident_expr(inout ctx: ResolutionContext, name: String, expr: Expr) -
 
   # Type names used in expression position (e.g. generic call type args such as
   # `alloc[RcInner[T]]()`) resolve as type references, not errors — through
-  # the module-qualified TypeName machinery (0/1/>1; the bare-name
-  # root-tree lookup is are not part of the model).
+  # the current module's explicit TYPE imports first, then the
+  # module-qualified TypeName machinery (0/1/>1; the bare-name root-tree
+  # lookup is are not part of the model). The import-first step is what
+  # resolves a same-spelled name (Arch, ErrorCode) to the module's
+  # declared import instead of the cross-module ambiguity.
+  match imported_type_owner(ctx, name.clone())
+  when Option::Some(did) then
+    ctx.resolved.call_targets.insert(expr.node_id, did.clone())
+    let resolved_expr = ResolvedExpr {
+      kind: ResolvedExprKind::Function(did.clone()),
+      module_path: ctx.symbols.current_module.clone()
+    }
+    let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
+    return
+  when Option::None then ()
+  end
   match bare_name_resolve(ctx, name, &vec![DefKind::TypeName], &expr.span)
   when BareNameResolution::Resolved(did) then
     # The resolved expression carries the TYPE NAME's DefId (kind TypeName,
@@ -2999,6 +3325,31 @@ def effect_perform_callee_path_resolver(expr: Expr) -> Bool
   end  end
 end
 
+# The callee SHAPE of a type-query call (`size_of[T]()` / `align_of[T]()`;
+# the kernel AST's turbofish form — the resolver-side mirror of the type
+# checker's type_query_kind_of_callee). The seed resolves the type queries
+# as a SPECIAL FORM at call sites, BEFORE any name lookup (typecheck.ml
+# check_call: "they must NOT sit in the functions table, or the exact-name
+# lookup would shadow a module's own size_of(engine, ty)"). The resolver
+# must therefore accept the query callee without resolving its base as a
+# value: std/alloc declares the extern query form and layout_engine
+# declares its own size_of(engine, ty), so a bare-name lookup of `size_of`
+# is cross-module ambiguous while the query call itself is well-defined.
+def type_query_callee_shape(callee: Expr) -> Bool
+  match callee.kind
+  when ExprKind::ExprIndex(base, _) then
+    match (*base.get()).kind
+    when ExprKind::ExprIdent(name) then
+      name == "size_of" || name == "align_of"
+    when ExprKind::ExprPath(p) then
+      p.segments.len() > 0 &&
+      (p.segments[p.segments.len() - 1] == "size_of" || p.segments[p.segments.len() - 1] == "align_of")
+    when _ then false
+    end
+  when _ then false
+  end  end
+end
+
 def resolve_expr(inout ctx: ResolutionContext, expr: Expr) -> Unit
  # (exhaustive visitor): EVERY ExprKind variant has an explicit arm —
   # no `when _` fallback — so an expression form the resolver does not
@@ -3056,7 +3407,15 @@ def resolve_expr(inout ctx: ResolutionContext, expr: Expr) -> Unit
     # The callee is an OWNED Box[Expr]: unbox it once (Box is the wrapper,
     # never transparent to the Expr it holds).
     let callee_expr = *callee.get()
-    resolve_expr(ctx, &callee_expr)
+    # Type-query special form (`size_of[T]()`, `align_of[T]()`): the seed
+    # resolves the query BEFORE any name lookup (see
+    # type_query_callee_shape) — the callee (a turbofish index whose base
+    # is the query name, and whose payload is a type-argument list) is
+    # never resolved as a value expression; the checker's typ-query channel
+    # resolves the type argument.
+    if !type_query_callee_shape(&callee_expr) then
+      resolve_expr(ctx, &callee_expr)
+    end
     # The operation-call surface: std::effects::perform(EFFECT.op, ...) —
     # the FIRST argument is the operation REFERENCE (an EFFECT.op path the
     # type checker resolves against the declared effect's typed op table),
