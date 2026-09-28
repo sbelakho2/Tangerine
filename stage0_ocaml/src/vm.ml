@@ -1818,6 +1818,13 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
              args;
            vm.frames <- List.tl vm.frames;
            vm.depth <- vm.depth - 1;
+           (* the call result REPLACES the destination's value exactly like
+              an assignment (the verifier's destroyed lattice models the old
+              value as destroyed-by-store): drop the old value of the exact
+              destination place first, so an overwrite can never leak the
+              replaced value's resources.  A fresh/uninitialized destination
+              is a no-op. *)
+           drop_old_value_at vm frame dest;
            write_place vm frame dest ret;
            frame.block <- next;
            frame.stmt <- 0
@@ -1912,6 +1919,10 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
               List.iter drop_removed wb.Host.removed
             end)
           hr.Host.writebacks;
+        (* the host-result store is a destination replacement like every
+           other call store: drop the old value of the exact destination
+           place before the write. *)
+        drop_old_value_at vm frame dest;
         write_place vm frame dest hr.Host.value;
         frame.block <- next;
         frame.stmt <- 0)
