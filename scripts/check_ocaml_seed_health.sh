@@ -165,15 +165,24 @@ fi
 cd stage0_ocaml
 dune build
 
-TEST_OUT="$(timeout 120 _build/default/test/test_main.exe 2>&1 || true)"
-if ! grep -qE '[0-9]+ passed, 0 failed' <<<"$TEST_OUT"; then
-  echo "check_ocaml_seed_health: FAIL — unit test suite did not report a clean pass:"
+# The unit-test gate is exit status AND evidence: a pathological binary
+# that prints the summary and hangs (killed by timeout) or exits nonzero
+# must never be accepted on its text alone (the timeout's `|| true` made
+# the text the only signal).  Require rc == 0 and EXACTLY ONE exact-count
+# summary line.
+set +e
+TEST_OUT="$(timeout 120 _build/default/test/test_main.exe 2>&1)"
+TEST_RC=$?
+set -e
+if [ "$TEST_RC" -ne 0 ]; then
+  echo "check_ocaml_seed_health: FAIL — unit test suite exited non-zero (rc=$TEST_RC):"
   echo "$TEST_OUT" | tail -5
   exit 1
 fi
 TESTS="$(grep -oE '[0-9]+ passed, 0 failed' <<<"$TEST_OUT" | head -1)"
-if [ "$TESTS" != "${PINNED_TEST_INVENTORY} passed, 0 failed" ]; then
-  echo "check_ocaml_seed_health: FAIL — test inventory changed: got '$TESTS', pinned exact inventory '${PINNED_TEST_INVENTORY} passed, 0 failed'"
+if [ "$(grep -Fxc "${PINNED_TEST_INVENTORY} passed, 0 failed" <<<"$TEST_OUT")" != "1" ]; then
+  echo "check_ocaml_seed_health: FAIL — unit test suite must print exactly one exact summary line '${PINNED_TEST_INVENTORY} passed, 0 failed'; got '$TESTS'"
+  echo "$TEST_OUT" | tail -5
   exit 1
 fi
 
@@ -182,6 +191,10 @@ fi
 # sentinel is accepted, so the marker gate can never be ceremonial.
 if ! "$ROOT/scripts/test_selfcheck_sentinel.sh"; then
   echo "check_ocaml_seed_health: FAIL — selfcheck sentinel verifier meta-test"
+  exit 1
+fi
+if ! "$ROOT/scripts/check_selfcheck_source_sentinels.sh"; then
+  echo "check_ocaml_seed_health: FAIL — selfcheck sentinel source invariants"
   exit 1
 fi
 

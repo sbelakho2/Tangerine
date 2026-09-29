@@ -31,4 +31,13 @@ if [ "$count" != "1" ]; then
   exit 1
 fi
 
+# Exactly one sentinel GLOBALLY: one selfcheck's output must never carry a
+# second check's marker (a cross-contaminated or duplicated emission is a
+# harness-integrity failure, not a pass).
+total="$(grep -cE '^TANGERINE_SELFCHECK_PASS ' "$out" || true)"
+if [ "$total" != "1" ]; then
+  echo "selfcheck-sentinel: FAIL — ${name} output contains ${total:-0} sentinel line(s) (exactly one global sentinel per selfcheck required)" >&2
+  exit 1
+fi
+
 exit 0

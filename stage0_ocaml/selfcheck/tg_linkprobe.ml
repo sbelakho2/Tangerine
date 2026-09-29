@@ -195,7 +195,9 @@ let () =
   match
     Driver.run_bootstrap_vm ~repo_root
       ~manifest_path:"bootstrap/linkprobe_mini.manifest" ~target
-      ~entry:(Some "main") ~kernel_args:[ "linkprobe"; mode ] ?vm_cache ()
+      ~entry:(Some "main")
+      ~kernel_args:[ "linkprobe"; mode; target_str ]
+      ?vm_cache ()
   with
   | Error m -> fail "closure pipeline: %s" m
   | Ok run ->

@@ -39,7 +39,7 @@ use tg_compiler::asm::{
 }
 use tg_compiler::object::{object_new, ObjectFile}
 use tg_compiler::linker::{LinkerInput, link_executable}
-use tg_compiler::compiler_core::{compile_startup_entry, default_options}
+use tg_compiler::compiler_core::{compile_startup_entry, default_options, parse_check_cli, CheckCli, StopAfter}
 
 const LINKPROBE_SRC: String = "use std::alloc::{size_of, align_of}\nuse std::io::{println}\n\nstruct ProbePair[T]\n  a: u8\n  b: T\nend\n\ndef q_size[T]() -> Int\n  size_of[T]() as Int\nend\n\ndef q_align[T]() -> Int\n  align_of[T]() as Int\nend\n\ndef main() -> Int effect Io\n  # 1. the parse boundary, LITERAL argument: the MIR literal rule\n  #    materializes it into an owned String object at the by-name\n  #    __intrinsic_str_parse_int parameter (the seed host binding's\n  #    Vm_value.String) — Ok for a valid integer, Err for garbage.\n  let a = match __intrinsic_str_parse_int(\"42\")\n    when Result::Ok(n) then n == 42\n    when Result::Err(_) then false\n    end\n  let b = match __intrinsic_str_parse_int(\"nope\")\n    when Result::Ok(_) then false\n    when Result::Err(_) then true\n    end\n  # 2. the parse boundary, OWNED String OBJECT (non-literal): the\n  #    object handle flows straight to the by-name symbol, which\n  #    unwraps its data pointer itself — Ok for a valid integer, Err\n  #    for garbage (the seed host binding's Result contract).\n  let s_ok = __intrinsic_string_slice(\"43\", 0, 2)\n  let c = match __intrinsic_str_parse_int(s_ok)\n    when Result::Ok(n) then n == 43\n    when Result::Err(_) then false\n    end\n  let s_bad = __intrinsic_string_slice(\"12x\", 0, 3)\n  let d = match __intrinsic_str_parse_int(s_bad)\n    when Result::Ok(_) then false\n    when Result::Err(_) then true\n    end\n  # 3. the parse boundary, `as_str()`-derived RAW VIEW: the borrowed\n  #    bytes are materialized into an owned String object (the explicit\n  #    owned conversion the raw->object boundary requires) and then\n  #    parsed through the object-convention symbol.\n  let s_view_ok = __intrinsic_string_slice(\"43\", 0, 2)\n  let e = match __intrinsic_str_parse_int(__intrinsic_string_from_static(s_view_ok.as_str()))\n    when Result::Ok(n) then n == 43\n    when Result::Err(_) then false\n    end\n  let s_view_bad = __intrinsic_string_slice(\"12x\", 0, 3)\n  let f = match __intrinsic_str_parse_int(__intrinsic_string_from_static(s_view_bad.as_str()))\n    when Result::Ok(_) then false\n    when Result::Err(_) then true\n    end\n  let g = (__intrinsic_float_to_bits(1.5) as Int) == 0x3FF8000000000000\n  let h = __intrinsic_int_to_float(3) == 3.0\n  let i = __intrinsic_float_to_int(2.75) == 2\n  # size_of/align_of: concrete primitives ...\n  let j = (size_of[u8]() == 1) && (align_of[u8]() == 1)\n  let k = (size_of[UInt]() == 8) && (align_of[UInt]() == 8)\n  # ... a concrete INSTANCE of a generic nominal (ProbePair[u8] =\n  # {a: u8 @0, b: u8 @1} -> size 2 / align 1) ...\n  let l = (size_of[ProbePair[u8]]() == 2) && (align_of[ProbePair[u8]]() == 1)\n  # ... and the same instance shapes reached through GENERIC helper\n  # functions (ProbePair[UInt] = {a: u8 @0, b: UInt @8} -> size 16 /\n  # align 8), the generic-instantiation route.\n  let m = (q_size[ProbePair[UInt]]() == 16) && (q_align[ProbePair[UInt]]() == 8)\n  let n = (q_size[UInt]() == 8) && (q_align[UInt]() == 8)\n  # Distinct failure codes name the first failing check (the harness\n  # reports the code; 42 is the all-checks-pass success).\n  if !a then return 11 end\n  if !b then return 12 end\n  if !c then return 13 end\n  if !d then return 14 end\n  if !e then return 15 end\n  if !f then return 16 end\n  if !g then return 17 end\n  if !h then return 18 end\n  if !i then return 19 end\n  if !j then return 20 end\n  if !k then return 21 end\n  if !l then return 22 end\n  if !m then return 23 end\n  if !n then return 24 end\n  println(\"LINKPROBE_ARTIFACT_OK parse_int literal+owned+view\")\n  42\nend\n"
 
@@ -221,7 +221,7 @@ def linkprobe_run_linkobj() -> Int
 end
 
 # The end-to-end mode: the real kernel compile entry over a tiny source.
-def linkprobe_run_full() -> Int
+def linkprobe_run_full(target_triple: String) -> Int
   let src_path = "build/linkprobe_src.tg"
   let out_path = "build/linkprobe.out"
   match write_file(src_path, LINKPROBE_SRC.clone())
@@ -232,17 +232,222 @@ def linkprobe_run_full() -> Int
   end
   var opts = default_options()
   opts.strict_resolution = true
+  # The artifact must be compiled for the SAME target the harness executes
+  # (host-detection defaults to aarch64/macOS and produced an unrunnable
+  # artifact on Linux hosts).
+  if target_triple.len() > 0 then
+    opts.target_triple = Option::Some(target_triple.clone())
+  end
   let code = compile_startup_entry(&opts, src_path, out_path)
   linkprobe_finish(code, out_path, "LINKPROBE full")
 end
 
+# ── the check-command CLI contract (P0-1 regression, seconds-scale) ──
+# `check` is the self-host preflight command: its --target option must be
+# recognized in any position, and malformed/unknown options must fail
+# closed.  A missing --target here silently checked the WRONG target
+# (host-default macOS on Linux) or exited 1 before the check ran.
+def linkprobe_cli_checks() -> Int
+  # 1. target after the file
+  let c1 = match parse_check_cli(vec!["foo.tg", "--target", "aarch64-apple-darwin"])
+  when Result::Err(_) then
+    println("LINKPROBE_CLI target-after-file=FAIL (rejected)")
+    return 31
+  when Result::Ok(c) then c
+  end
+  var ok1 = c1.file == "foo.tg"
+  match c1.opts.target_triple
+  when Option::Some(t) then if t != "aarch64-apple-darwin" then ok1 = false end
+  when Option::None then ok1 = false
+  end
+  if !ok1 then
+    println("LINKPROBE_CLI target-after-file=FAIL (wrong parse)")
+    return 31
+  end
+  println("LINKPROBE_CLI target-after-file=PASS")
+  # 2. target before the file
+  let c2 = match parse_check_cli(vec!["--target", "aarch64-apple-darwin", "foo.tg"])
+  when Result::Err(_) then
+    println("LINKPROBE_CLI target-before-file=FAIL (rejected)")
+    return 32
+  when Result::Ok(c) then c
+  end
+  var ok2 = c2.file == "foo.tg"
+  match c2.opts.target_triple
+  when Option::Some(t) then if t != "aarch64-apple-darwin" then ok2 = false end
+  when Option::None then ok2 = false
+  end
+  if !ok2 then
+    println("LINKPROBE_CLI target-before-file=FAIL (wrong parse)")
+    return 32
+  end
+  println("LINKPROBE_CLI target-before-file=PASS")
+  # 3. --target with no argument must fail closed
+  match parse_check_cli(vec!["foo.tg", "--target"])
+  when Result::Err(_) then println("LINKPROBE_CLI missing-target-arg=PASS")
+  when Result::Ok(_) then
+    println("LINKPROBE_CLI missing-target-arg=FAIL (accepted)")
+    return 33
+  end
+  # 4. unknown options must fail closed
+  match parse_check_cli(vec!["foo.tg", "--garbage"])
+  when Result::Err(_) then println("LINKPROBE_CLI unknown-option=PASS")
+  when Result::Ok(_) then
+    println("LINKPROBE_CLI unknown-option=FAIL (accepted)")
+    return 34
+  end
+  # 5. --stop-after=mono is the final preflight's depth certificate
+  let c5 = match parse_check_cli(vec!["--stop-after=mono", "foo.tg"])
+  when Result::Err(_) then
+    println("LINKPROBE_CLI stop-after-mono=FAIL (rejected)")
+    return 35
+  when Result::Ok(c) then c
+  end
+  if c5.opts.stop_after != StopAfter::Mono then
+    println("LINKPROBE_CLI stop-after-mono=FAIL (wrong depth)")
+    return 35
+  end
+  println("LINKPROBE_CLI stop-after-mono=PASS")
+  # 6. a bogus --stop-after value must fail closed
+  match parse_check_cli(vec!["--stop-after=nope", "foo.tg"])
+  when Result::Err(_) then println("LINKPROBE_CLI stop-after-bogus=PASS")
+  when Result::Ok(_) then
+    println("LINKPROBE_CLI stop-after-bogus=FAIL (accepted)")
+    return 36
+  end
+  0
+end
+
+# ── the ELF import policy (P0-3 regression): a referenced undefined
+# non-intrinsic external must be a LINK ERROR (never a trap stub, never
+# another architecture's bytes); a symbol with a kernel-provided x86_64
+# shim links.  aarch64 ELF has no shim table, so any unresolved import
+# there is rejected too.
+def linkprobe_elf_import_policy_checks() -> Int
+  # 1. x86_64 Linux, undefined non-intrinsic import -> link error
+  let x64_linux = asm_target(Arch::X86_64, OsAbi::Linux)
+  var bad_obj = object_new(x64_linux)
+  bad_obj.text.push(0xC3)                       # ret (entry)
+  bad_obj.text.push(0xE8)                       # call rel32
+  bad_obj.text.push(0x00); bad_obj.text.push(0x00)
+  bad_obj.text.push(0x00); bad_obj.text.push(0x00)
+  bad_obj.relocations.push(Relocation {
+    offset: 1,
+    kind: RelocKind::R_X86_64_PLT32,
+    symbol: "ruby_init",
+    addend: -4
+  })
+  bad_obj.symbols.push(AsmSymbol {
+    name: "_start", section: Section::Text, offset: 0, size: 6,
+    binding: SymBinding::Global, kind: SymKind::Func
+  })
+  var bad_objects: Vec[ObjectFile] = Vec::new()
+  bad_objects.push(bad_obj)
+  let bad_input = LinkerInput {
+    objects: bad_objects,
+    entry: "_start",
+    entry_offset: -1,
+    output: "build/linkprobe_elf_unresolved.out",
+    target: x64_linux
+  }
+  match link_executable(&bad_input)
+  when Result::Ok(_) then
+    println("LINKPROBE_ELF unresolved-nonintrinsic=FAIL (linked)")
+    return 41
+  when Result::Err(e) then
+    if !e.contains("unresolved external symbol") then
+      println("LINKPROBE_ELF unresolved-nonintrinsic=FAIL (wrong error: " + e + ")")
+      return 41
+    end
+  end
+  println("LINKPROBE_ELF unresolved-nonintrinsic=PASS (link-time rejection)")
+  # 2. x86_64 Linux, a supported shim import -> links
+  var shim_obj = object_new(x64_linux)
+  shim_obj.text.push(0xC3)
+  shim_obj.text.push(0xE8)
+  shim_obj.text.push(0x00); shim_obj.text.push(0x00)
+  shim_obj.text.push(0x00); shim_obj.text.push(0x00)
+  shim_obj.relocations.push(Relocation {
+    offset: 1,
+    kind: RelocKind::R_X86_64_PLT32,
+    symbol: "memcpy",
+    addend: -4
+  })
+  shim_obj.symbols.push(AsmSymbol {
+    name: "_start", section: Section::Text, offset: 0, size: 6,
+    binding: SymBinding::Global, kind: SymKind::Func
+  })
+  var shim_objects: Vec[ObjectFile] = Vec::new()
+  shim_objects.push(shim_obj)
+  let shim_input = LinkerInput {
+    objects: shim_objects,
+    entry: "_start",
+    entry_offset: -1,
+    output: "build/linkprobe_elf_shim.out",
+    target: x64_linux
+  }
+  match link_executable(&shim_input)
+  when Result::Ok(_) then println("LINKPROBE_ELF libc-shim=PASS (memcpy links)")
+  when Result::Err(e) then
+    println("LINKPROBE_ELF libc-shim=FAIL (" + e + ")")
+    return 42
+  end
+  # 3. aarch64 Linux: no shim table -> every unresolved import rejected
+  let a64_linux = asm_target(Arch::AArch64, OsAbi::Linux)
+  var a64_obj = object_new(a64_linux)
+  linkprobe_emit_u32_le(&mut a64_obj.text, 0xD65F03C0)  # ret (entry)
+  linkprobe_emit_u32_le(&mut a64_obj.text, 0x94000000)  # bl <ruby_init>
+  a64_obj.relocations.push(Relocation {
+    offset: 4,
+    kind: RelocKind::R_AARCH64_CALL26,
+    symbol: "ruby_init",
+    addend: 0
+  })
+  a64_obj.symbols.push(AsmSymbol {
+    name: "_start", section: Section::Text, offset: 0, size: 8,
+    binding: SymBinding::Global, kind: SymKind::Func
+  })
+  var a64_objects: Vec[ObjectFile] = Vec::new()
+  a64_objects.push(a64_obj)
+  let a64_input = LinkerInput {
+    objects: a64_objects,
+    entry: "_start",
+    entry_offset: -1,
+    output: "build/linkprobe_elf_a64_unresolved.out",
+    target: a64_linux
+  }
+  match link_executable(&a64_input)
+  when Result::Ok(_) then
+    println("LINKPROBE_ELF aarch64-unresolved=FAIL (linked)")
+    return 43
+  when Result::Err(e) then
+    if !e.contains("unresolved external symbol") then
+      println("LINKPROBE_ELF aarch64-unresolved=FAIL (wrong error: " + e + ")")
+      return 43
+    end
+  end
+  println("LINKPROBE_ELF aarch64-unresolved=PASS (link-time rejection, no foreign-arch bytes)")
+  0
+end
+
 def main() -> Int
+  let cli_rc = linkprobe_cli_checks()
+  if cli_rc != 0 then
+    return cli_rc
+  end
+  let policy_rc = linkprobe_elf_import_policy_checks()
+  if policy_rc != 0 then
+    return policy_rc
+  end
   let argc = raw_arg_count()
   # argv[0] is the program name ("tg-bootstrap"), argv[1] the probe name,
-  # argv[2] the mode (the harness passes `linkprobe <mode>`).
+  # argv[2] the mode, argv[3] the optional artifact triple (the harness
+  # passes `linkprobe <mode> <triple>` so full mode compiles for the SAME
+  # target the harness executes).
   let mode = if argc > 2 then raw_arg_copy(2) else "linkobj" end
+  let artifact_triple = if argc > 3 then raw_arg_copy(3) else "" end
   if mode == "full" then
-    linkprobe_run_full()
+    linkprobe_run_full(artifact_triple)
   else
     linkprobe_run_linkobj()
   end

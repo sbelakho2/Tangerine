@@ -711,6 +711,7 @@ pub enum StopAfter
   Parse
   Semantic
   Mir
+  Mono
   Object
   Link
 end
@@ -774,6 +775,63 @@ pub def default_options() -> CompilerOptions
     verify_everything: false
   }
 end
+
+# The check-command CLI surface, factored so the option contract is
+# testable without a host (the linkprobe probe calls it with synthetic
+# argument vectors — the exact --target regression class this guards).
+# `args` is the argument list AFTER the command name.  The target is the
+# same option as compile's: @cfg elimination, layout, ABI and the
+# type-query folds are all target-dependent, so the self-host preflight
+# must be able to select the exact bootstrap target.
+struct CheckCli
+  opts: CompilerOptions
+  file: String
+end
+
+pub def parse_check_cli(args: Vec[String]) -> Result[CheckCli, String]
+  var opts = default_options()
+  opts.strict_resolution = true
+  opts.check_only = true
+  opts.stop_after = StopAfter::Mir
+  # (self-host preflight evidence): the machine-readable TG_CHECK_OK
+  # summary (file/manifest_entries/sources/modules/items) is emitted at
+  # the check stop so the seed harness can assert the exact manifest
+  # closure it consumed.
+  opts.emit_check_summary = true
+  var file = ""
+  var i = 0
+  while i < args.len() do
+    let arg = args[i].clone()
+    if arg == "--strict-resolution" then
+      opts.strict_resolution = true
+    elsif arg == "--target" then
+      i = i + 1
+      if i >= args.len() then
+        return Result::Err("error: missing argument for --target")
+      end
+      opts.target_triple = Option::Some(args[i].clone())
+    elsif arg == "--stop-after=mir" then
+      opts.stop_after = StopAfter::Mir
+    elsif arg == "--stop-after=mono" then
+      opts.stop_after = StopAfter::Mono
+    elsif arg.starts_with("--stop-after=") then
+      return Result::Err("error: unknown --stop-after value: " + arg)
+    elsif arg.starts_with("-") then
+      return Result::Err("error: unknown option: " + arg)
+    else
+      if file.len() > 0 then
+        return Result::Err("error: multiple input files are not supported by the bootstrap entry")
+      end
+      file = arg
+    end
+    i = i + 1
+  end
+  if file.len() == 0 then
+    return Result::Err("error: no input file")
+  end
+  Result::Ok(CheckCli { opts: opts, file: file })
+end
+
 
 # The MIR verifier policy gate (MIR-verifier policy): the DEBUG/CI builds
 # (Mode::Dev / Mode::Strict — the driver's default mode, and the mode every
@@ -2170,6 +2228,25 @@ pub def analyze_source(source: String, file: String, opts: CompilerOptions) -> R
   analyze_parsed(&mut env, &mut ast, opts)
 end
 
+# The ONE machine-readable preflight summary (mir + mono stops share it):
+# manifest_entries is the manifest authority's size (0 for non-kernel-entry
+# builds); unique_sources equals the module count post-dedup — the root
+# plus one module per DISTINCT dependency file — so a duplicated root can
+# never satisfy the preflight again.  `stop` names the exact depth the
+# summary certifies (a Mir-only image can never masquerade as a mono run).
+pub def emit_check_ok_summary(path: String, ast: Program, stop: String) -> Unit
+  let manifest_entries = match bootstrap_manifest_sources()
+  when Option::Some(files) then files.len()
+  when Option::None then 0
+  end
+  println("TG_CHECK_OK file=" + path
+    + " stop=" + stop
+    + " manifest_entries=" + manifest_entries.to_string()
+    + " unique_sources=" + ast.crate.modules.len().to_string()
+    + " modules=" + ast.crate.modules.len().to_string()
+    + " items=" + ast.items.len().to_string())
+end
+
 pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: DiagnosticEmitter) -> Result[Unit, String]
   if opts.verbose then
     println("[diag] compile_file_core entered, path=" + path.clone())
@@ -2277,7 +2354,12 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   # its imports from the repo like any other program.
   let manifest_closed = is_kernel_entry_path(path.clone())
   # `var` so the canonical semantic pass below can take &mut ast.
-  var ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: manifest_closed)
+  # The root dedup applies to the MANIFEST-CLOSED kernel-entry build (the
+  # root is a member of the manifest closure).  A repo-closure build keeps
+  # the plain prelude walk: its root may itself be a prelude module, and
+  # removing that module would break path-qualified imports.
+  let root_dedup = if manifest_closed then path.clone() else "".to_string() end
+  var ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: manifest_closed, root_path: root_dedup)
   when Result::Ok(a) then a
   when Result::Err(e) then
     return Result::Err(e)
@@ -2453,10 +2535,7 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
     # (the root module is not a file); for tg_compiler/bootstrap_main.tg
     # this is exactly the bootstrap/compiler_kernel.manifest closure size.
     if opts.emit_check_summary then
-      println("TG_CHECK_OK file=" + path.clone()
-        + " sources=" + (ast.crate.modules.len() - 1).to_string()
-        + " modules=" + ast.crate.modules.len().to_string()
-        + " items=" + ast.items.len().to_string())
+      emit_check_ok_summary(path.clone(), &ast, "mir")
     end
     return Result::Ok(())
   end
@@ -2538,6 +2617,17 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
     print_mir(&mir)
     return Result::Ok(())
   when _ then ()
+  end
+
+  # (the strongest no-codegen preflight stop): mono + type-query fold +
+  # post-mono verify + completeness oracle have all run; optimization,
+  # codegen and link have NOT.  The final pre-bootstrap authorization uses
+  # this stop to cover the specialization/query/post-mono failure surface.
+  if opts.stop_after == StopAfter::Mono then
+    if opts.emit_check_summary then
+      emit_check_ok_summary(path.clone(), &ast, "mono")
+    end
+    return Result::Ok(())
   end
 
   # Phase 5.6: MIR Optimization (gated by opt_level)
@@ -2858,7 +2948,8 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
   # its imports from the repo like any other program.
   let manifest_closed = is_kernel_entry_path(path.clone())
   # `var` so the canonical semantic pass below can take &mut ast.
-  var ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: manifest_closed)
+  let root_dedup = if manifest_closed then path.clone() else "".to_string() end
+  var ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: manifest_closed, root_path: root_dedup)
   when Result::Ok(a) then a
   when Result::Err(e) then
     println(e)
@@ -3211,8 +3302,18 @@ end
 # item is (owner ModuleId, namespace, name) against that per-module table,
 # so a same-named declaration in a DIFFERENT file module registers its own
 # qualified entry instead of failing the root bare-name occupancy.
-pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false) -> Result[Program, String]
+pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false, root_path: String = "") -> Result[Program, String]
   var loaded = Set::new()
+  # (P0: the root is a MEMBER of the closure, never an extra) — seed the
+  # loaded set with the root source path so a manifest/prelude entry naming
+  # the same file is a NO-OP.  Without this the kernel-entry build loaded
+  # bootstrap_main.tg twice: root module 0 PLUS a manifest dependency
+  # module, duplicating every item/DefId/instance and hiding a 46-module
+  # graph behind a "45 sources" claim.  45 unique source files must mean
+  # EXACTLY 45 modules (root + 44 dependencies).
+  if root_path.len() > 0 then
+    loaded.insert(root_path.clone())
+  end
   var merged_items = Vec::new()
   var merged_modules = Map::new()
   # Program items first  ensures the main program's definitions
@@ -5594,7 +5695,9 @@ pub def compile_multiple_files(opts: CompilerOptions, files: Vec[String], output
     println("  Merging imported dependencies...")
   end
   # `var` so the canonical semantic pass below can take &mut ast.
-  var ast = match merge_imported_deps(merged_ast, include_compiler_lib: manifest_closed)
+  # compile_multiple_files synthesizes ONE program from several roots:
+  # there is no single root path to seed, so no dedup applies here.
+  var ast = match merge_imported_deps(merged_ast, include_compiler_lib: manifest_closed, root_path: "")
   when Result::Ok(a) then a
   when Result::Err(e) then
     println(e)

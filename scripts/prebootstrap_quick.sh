@@ -120,6 +120,7 @@ run_check "kernel struct integrity" scripts/check_struct_integrity.sh
 run_check "accepted-debt policy regression lane" scripts/test_ocaml_seed_debt_policy.sh
 run_check "degraded escape-valve rejection" scripts/prebootstrap_env_gate.sh
 run_check "selfcheck-sentinel verifier meta-test" scripts/test_selfcheck_sentinel.sh
+run_check "selfcheck sentinel source invariants" scripts/check_selfcheck_source_sentinels.sh
 
 # static invariants (each is a one-line grep/stat; sub-second)
 CHECKS=$((CHECKS + 1))
@@ -173,8 +174,13 @@ manifest_check() {
     echo "  compiler records: ${compiler_n} (expected exactly 31)"
     return 1
   }
+  # Deduplicate by CANONICAL repo-relative path: std/foo.tg and
+  # tg_compiler/foo.tg are DIFFERENT files, so comparing the bare
+  # filenames would encode a false duplicate invariant.
   local dupes
-  dupes="$(printf '%s\n' "$entries" | awk '{print $2}' | sort | uniq -d)"
+  dupes="$(printf '%s\n' "$entries" |
+    awk '{ rel=$2; kind=$1; if (kind == "std:") print "std/" rel; else if (kind == "compiler:") print "tg_compiler/" rel; else print rel }' |
+    sort | uniq -d)"
   [ -z "$dupes" ] || {
     echo "  duplicate manifest paths: ${dupes}"
     return 1

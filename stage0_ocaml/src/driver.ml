@@ -5379,10 +5379,27 @@ type vm_program_cache = {
   vpc_fingerprint : string;
   vpc_target : string;
   vpc_entry : string;
+  (* The SEED BUILD IDENTITY and cache schema: a cache prepared by a
+     different seed binary (same closure, different lowering/mono) must
+     never be reused.  Otherwise a seed bug fix could be masked by a warm
+     cache.  Identity = executable size + mtime + schema version. *)
+  vpc_seed_identity : string;
   vpc_program : Seed_mir.program;
   vpc_entry_instance : Instance_id.t;
   vpc_lang_items : Lang_items.t;
 }
+
+let vm_cache_schema_version = "1"
+
+let seed_build_identity () : string =
+  let exe = Sys.executable_name in
+  let size =
+    try string_of_int (Unix.stat exe).Unix.st_size with _ -> "?"
+  in
+  let mtime =
+    try string_of_float (Unix.stat exe).Unix.st_mtime with _ -> "?"
+  in
+  Printf.sprintf "schema=%s exe=%s size=%s mtime=%s" vm_cache_schema_version exe size mtime
 
 let vm_cache_fingerprint ~(repo_root : string) ~(manifest_path : string) :
     string option =
@@ -5406,7 +5423,8 @@ let vm_cache_load ~(path : string) ~(fingerprint : string) ~(target : string)
     | Some c
       when c.vpc_fingerprint = fingerprint
            && c.vpc_target = target
-           && c.vpc_entry = (match entry with Some e -> e | None -> "") ->
+           && c.vpc_entry = (match entry with Some e -> e | None -> "")
+           && c.vpc_seed_identity = seed_build_identity () ->
         Some (c.vpc_program, c.vpc_entry_instance, c.vpc_lang_items)
     | _ -> None
 
@@ -5421,6 +5439,7 @@ let vm_cache_store ~(path : string) ~(fingerprint : string) ~(target : string)
         vpc_fingerprint = fingerprint;
         vpc_target = target;
         vpc_entry = (match entry with Some e -> e | None -> "");
+        vpc_seed_identity = seed_build_identity ();
         vpc_program = program;
         vpc_entry_instance = entry_instance;
         vpc_lang_items = lang_items;

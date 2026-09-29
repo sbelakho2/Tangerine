@@ -1097,18 +1097,17 @@ def PF_R() -> u32 = 4
 # ── the ELF freestanding import policy (x86_64) ────────────────────
 # The ELF backend links a FREESTANDING static image (no PT_INTERP, direct
 # syscalls), so undefined imports cannot be resolved by a dynamic linker.
-# Two mechanisms, in order:
+# Policy:
 #   1. kernel-provided libc shims for the symbols this compiler's own
 #      runtime actually calls (the allocator's memcpy/memmove/memset and
-#      the scheduler's sched_yield) — real implementations, emitted into
-#      .text;
-#   2. a deterministic TRAP STUB for every other undefined import.  This
-#      mirrors the macOS dyld LAZY-import behavior for never-called FFI
-#      surface (libruby, dlopen): binding exists, first execution traps —
-#      never a silent artifact and never a hard link failure for code the
-#      program does not run.  `__intrinsic_*` symbols stay FAIL-CLOSED:
-#      they are compiler-emitted calls that must always have a host
-#      implementation (same guard as the Mach-O path).
+#      the scheduler's sched_yield) — real x86_64 implementations emitted
+#      into .text;
+#   2. every other referenced undefined external is a LINK ERROR.  No
+#      trap stubs and no foreign-architecture bytes: a platform surface
+#      that cannot bind (libruby/dlopen on a freestanding ELF) must fail
+#      at link time, not at first execution.
+# `__intrinsic_*` symbols stay FAIL-CLOSED on every path (compiler-owned;
+# same guard as the Mach-O dyld-import check).
 def libc_shim_x64(name: String) -> Option[Vec[u8]]
   var b: Vec[u8] = Vec::new()
   if name == "memcpy" then
@@ -1157,13 +1156,6 @@ def libc_shim_x64(name: String) -> Option[Vec[u8]]
     return Option::Some(b)
   end
   Option::None
-end
-
-def trap_stub_x64() -> Vec[u8]
-  var b: Vec[u8] = Vec::new()
-  b.push(0x0F); b.push(0x0B)   # ud2: deterministic illegal instruction
-  b.push(0xC3)                 # ret (unreachable; keeps a return-shaped frame)
-  b
 end
 
 def append_text_bytes(inout sections: Vec[LinkedSection], bytes: Vec[u8]) -> Int
@@ -1251,10 +1243,12 @@ def link_elf64(input: LinkerInput) -> Result[Vec[u8], String]
     end
     return Result::Err(imsg)
   end
-  # Non-intrinsic referenced imports: kernel shims where they exist, a
-  # deterministic fail-closed trap stub otherwise (the macOS lazy-import
-  # behavior for never-called FFI surface).
-  var stub_names: Vec[String] = Vec::new()
+  # Non-intrinsic referenced imports: a kernel-provided shim where one
+  # exists (the freestanding libc surface this compiler's runtime calls),
+  # otherwise a LINK ERROR.  A referenced undefined external must never
+  # become an executable artifact that only fails when execution reaches
+  # it — and it must never be patched with another architecture's bytes.
+  var unresolved: Vec[String] = Vec::new()
   uj = 0
   while uj < undef_names.len() do
     let uname = undef_names[uj].clone()
@@ -1262,29 +1256,28 @@ def link_elf64(input: LinkerInput) -> Result[Vec[u8], String]
     when Arch::X86_64 then libc_shim_x64(uname.clone())
     when _ then Option::None
     end
-    let code = match shim
-    when Option::Some(bytes) then bytes
+    match shim
+    when Option::Some(bytes) then
+      let off = append_text_bytes(&mut sections, bytes)
+      all_symbols.push(AsmSymbol {
+        name: uname.clone(),
+        section: Section::Text,
+        offset: off,
+        size: 0,
+        binding: SymBinding::Global,
+        kind: SymKind::Func
+      })
     when Option::None then
-      stub_names.push(uname.clone())
-      trap_stub_x64()
+      unresolved.push(uname.clone())
     end
-    let off = append_text_bytes(&mut sections, code)
-    all_symbols.push(AsmSymbol {
-      name: uname.clone(),
-      section: Section::Text,
-      offset: off,
-      size: 0,
-      binding: SymBinding::Global,
-      kind: SymKind::Func
-    })
     uj = uj + 1
   end
-  if !stub_names.is_empty() then
-    var warn = "link: warning: " + stub_names.len().to_string() + " undefined import(s) have no kernel shim and were bound to fail-closed trap stubs (first execution traps):"
-    for sn in stub_names do
-      warn = warn + " " + sn.clone()
+  if !unresolved.is_empty() then
+    var umsg = "unresolved external symbol(s) with no target runtime/linker binding (fail closed — no trap stubs, no cross-architecture bytes):"
+    for un in unresolved do
+      umsg = umsg + " " + un.clone()
     end
-    println(warn)
+    return Result::Err(umsg)
   end
 
   # Resolve symbols

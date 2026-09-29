@@ -94,22 +94,23 @@ let () =
      validate the target the ladder builds: @cfg elimination is
      target-parameterized, and the kernel's check runs the whole closure
      for exactly this target. *)
-  let rec parse args repo_root target =
+  let rec parse args repo_root target no_cache =
     match args with
-    | "--repo-root" :: r :: rest -> parse rest r target
-    | "--target" :: t :: rest -> parse rest repo_root t
-    | _ :: rest -> parse rest repo_root target
-    | [] -> (repo_root, target)
+    | "--repo-root" :: r :: rest -> parse rest r target no_cache
+    | "--target" :: t :: rest -> parse rest repo_root t no_cache
+    | "--no-cache" :: rest -> parse rest repo_root target true
+    | _ :: rest -> parse rest repo_root target no_cache
+    | [] -> (repo_root, target, no_cache)
   in
   let default_target =
     match Sys.getenv_opt "TG_BOOTSTRAP_TARGET" with
     | Some t -> t
     | None -> "aarch64-apple-darwin"
   in
-  let repo_root, target_str =
+  let repo_root, target_str, no_cache =
     match Array.to_list Sys.argv with
-    | _ :: args -> parse args ".." default_target
-    | [] -> ("..", default_target)
+    | _ :: args -> parse args ".." default_target false
+    | [] -> ("..", default_target, false)
   in
   ensure_dir (Filename.concat repo_root "build");
   let target =
@@ -128,14 +129,15 @@ let () =
       manifest_count expected_manifest_sources;
   Printf.printf "  manifest closure: %d source(s) [pinned]\n%!" manifest_count;
   let cache_path = Filename.concat repo_root "build/bootstrap_selfcheck.vmcache" in
+  let vm_cache = if no_cache then None else Some cache_path in
   let kernel_args =
-    [ "check"; "--strict-resolution"; "tg_compiler/bootstrap_main.tg";
-      "--target"; target_str ]
+    [ "check"; "--strict-resolution"; "--stop-after=mono";
+      "tg_compiler/bootstrap_main.tg"; "--target"; target_str ]
   in
   match
     Driver.run_bootstrap_vm ~repo_root
       ~manifest_path:"bootstrap/compiler_kernel.manifest" ~target ~entry:None
-      ~kernel_args ~vm_cache:cache_path ()
+      ~kernel_args ?vm_cache ()
   with
   | Error m -> fail "closure pipeline: %s" m
   | Ok run -> (
@@ -167,22 +169,44 @@ let () =
           in
           (match rows with
           | [ row ] -> (
+              (match summary_field row "stop" with
+              | Some v when v = "mono" -> ()
+              | Some v ->
+                  fail
+                    "kernel preflight stopped at `%s`, the final authorization requires the                      mono stop (--stop-after=mono)"
+                    v
+              | None -> fail "kernel summary has no stop= field: %s" row);
               (match summary_field row "file" with
               | Some f when f = "tg_compiler/bootstrap_main.tg" -> ()
               | Some f ->
                   fail "kernel summary checked `%s`, not `tg_compiler/bootstrap_main.tg`" f
               | None -> fail "kernel summary has no file= field: %s" row);
-              (match summary_field row "sources" with
+              (* P0 dedup invariant: manifest_entries, unique_sources and
+                 modules must all equal the manifest authority's size (a
+                 duplicated root historically made modules=46 while the
+                 summary claimed 45 sources). *)
+              (match summary_field row "manifest_entries" with
+              | Some v when int_of_string_opt v = Some expected_manifest_sources -> ()
+              | Some v ->
+                  fail "kernel reports manifest_entries=%s, the manifest closure is %d" v
+                    expected_manifest_sources
+              | None -> fail "kernel summary has no manifest_entries= field: %s" row);
+              (match summary_field row "unique_sources" with
               | Some v when int_of_string_opt v = Some expected_manifest_sources -> ()
               | Some v ->
                   fail
-                    "kernel consumed %s source(s), the manifest closure is %d — the kernel did \
-                     not load the exact stage1 source graph"
+                    "kernel consumed %s unique source(s), the manifest closure is %d — the                      kernel did not load the exact stage1 source graph (duplicate root?)"
                     v expected_manifest_sources
-              | None -> fail "kernel summary has no sources= field: %s" row);
+              | None -> fail "kernel summary has no unique_sources= field: %s" row);
+              (match summary_field row "modules" with
+              | Some v when int_of_string_opt v = Some expected_manifest_sources -> ()
+              | Some v ->
+                  fail "kernel merged %s module(s), the deduplicated closure is %d" v
+                    expected_manifest_sources
+              | None -> fail "kernel summary has no modules= field: %s" row);
               Printf.printf
                 "tg_bootstrap_selfcheck: OK — kernel check exit 0 over the exact %d-source \
-                 manifest closure (strict resolution; resolver 0, type 0; stop after MIR; \
+                 manifest closure (strict resolution; resolver 0, type 0; stop after MONO; \
                  cache_hit=%b)\n"
                 manifest_count run.Driver.bvr_cache_hit;
               Selfcheck_sentinel.emit_and_exit "tg_bootstrap_selfcheck")

@@ -867,14 +867,17 @@ end
 
 # x86-64: avoid RAX (return/scratch), RSP (stack), RBP (frame).
 def x64_allocatable_regs() -> Vec[PhysReg]
+  # CALLEE-SAVED ONLY — the same call-crossing model as a64_allocatable_regs
+  # (X19-X28).  The allocator has no call-crossing liveness/save pass: a
+  # local allocated to a register must survive every call in its live
+  # range, which is only true for registers the prologue saves (the
+  # codegen's saved_regs: RBX, R12-R15, tracked through used_callee).
+  # Allocating a caller-saved register (RCX/RDX/RSI/RDI/R8-R10) broke the
+  # first executed artifact: `y` lived in R9 across the inner div(8,2)
+  # call, the callee clobbered R9, and mul(y, div(...)) received 8 — a
+  # stale argument.  RAX is the return register and R11 the designated
+  # non-allocatable scratch; RBP/RSP are the frame.
   var regs = Vec::new()
-  regs.push(PhysReg::X64Reg(X64::RCX))
-  regs.push(PhysReg::X64Reg(X64::RDX))
-  regs.push(PhysReg::X64Reg(X64::RSI))
-  regs.push(PhysReg::X64Reg(X64::RDI))
-  regs.push(PhysReg::X64Reg(X64::R8))
-  regs.push(PhysReg::X64Reg(X64::R9))
-  regs.push(PhysReg::X64Reg(X64::R10))
   regs.push(PhysReg::X64Reg(X64::RBX))
   regs.push(PhysReg::X64Reg(X64::R12))
   regs.push(PhysReg::X64Reg(X64::R13))
@@ -8445,11 +8448,18 @@ def codegen_terminator(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, term: Mi
     emit_jmp(ctx, label)
 
   when MirTerminatorKind::MirSwitchInt(discr, targets, default_target) then
-    load_operand_control_input(ctx, fctx, discr, rr)
+    # Control inputs load into the NON-ALLOCATABLE scratch register, never
+    # the return register: a terminator may execute while local 0 (the
+    # return place) lives in rr, and clobbering it corrupted returns
+    # (the first executed x86-64 artifact's `add` returned the assert
+    # flag instead of the sum — every checked-arithmetic function was
+    # wrong).
+    let discr_reg = scratch_reg(ctx.target.arch)
+    load_operand_control_input(ctx, fctx, discr, discr_reg)
     var target_idx = 0
     while target_idx < targets.len() do
       let sw = targets[target_idx]
-      emit_cmp_ri(ctx, rr, sw.value as i32)
+      emit_cmp_ri(ctx, discr_reg, sw.value as i32)
       let tgt_label = block_label_for(fctx, sw.target.id)
       emit_jcc(ctx, CondKind::Eq, tgt_label)
       target_idx = target_idx + 1
@@ -8472,8 +8482,12 @@ def codegen_terminator(inout ctx: CodegenCtx, inout fctx: FnCodegenCtx, term: Mi
     emit_jmp(ctx, label)
 
   when MirTerminatorKind::MirAssert(cond, expected, msg, target, unwind) then
-    load_operand_control_input(ctx, fctx, cond, rr)
-    emit_test_rr(ctx, rr, rr)
+    # Same rule as SwitchInt: the condition rides the non-allocatable
+    # scratch register so a live return value in rr is never destroyed
+    # (MirAssert is also the overflow/bounds/contract trap terminator).
+    let cond_reg = scratch_reg(ctx.target.arch)
+    load_operand_control_input(ctx, fctx, cond, cond_reg)
+    emit_test_rr(ctx, cond_reg, cond_reg)
     let ck = if expected then CondKind::Ne else CondKind::Eq end
     let tgt_label = block_label_for(fctx, target.id)
     emit_jcc(ctx, ck, tgt_label)
@@ -12100,10 +12114,15 @@ def codegen_prologue(inout ctx: CodegenCtx, fctx: FnCodegenCtx) -> Unit
       emit8(&mut ctx.text, 0xAE)
       emit8(&mut ctx.text, 0x14)
       emit8(&mut ctx.text, 0x24)
-      emit8(&mut ctx.text, 0x48)  # add rsp, 4
+      # In 64-bit mode `push imm32` pushes EIGHT bytes (sign-extended);
+      # the pop-side adjustment must be `add rsp, 8`.  The former
+      # `add rsp, 4` left every float-using frame 4 bytes skewed — the
+      # frame epilogue then popped a garbage return address (the first
+      # truly-executed x86-64 artifact segfaulted on main's epilogue).
+      emit8(&mut ctx.text, 0x48)  # add rsp, 8
       emit8(&mut ctx.text, 0x83)
       emit8(&mut ctx.text, 0xC4)
-      emit8(&mut ctx.text, 0x04)
+      emit8(&mut ctx.text, 0x08)
     end
   end
 

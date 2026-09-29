@@ -416,13 +416,53 @@ bh_is_macho64() {
   [ "$magic" = "cffaedfe" ]
 }
 
-# ELF64 little-endian magic (the Linux targets' native image format).
+# The bootstrap target's canonical architecture token (the same authority
+# the ladder compiles for).
+bh_target_arch_name() {
+  case "$(bh_boot_target)" in
+    x86_64-*) printf 'x86_64' ;;
+    aarch64-* | arm64-*) printf 'arm64' ;;
+    *) printf '' ;;
+  esac
+}
+
+# ELF64 header check (the Linux targets' native image format): magic,
+# EI_CLASS = ELFCLASS64, EI_DATA = ELFDATA2LSB, e_type in {ET_EXEC,
+# ET_DYN}, and e_machine matching the TARGET arch (62 x86-64 / 183
+# AArch64).  A magic-only check accepted ELF32 and foreign-arch images.
 bh_is_elf64() {
   local f="$1"
   if [ ! -f "$f" ]; then return 1; fi
-  local magic
-  magic="$(od -An -tx1 -N4 "$f" | tr -d ' \n')"
-  [ "$magic" = "7f454c46" ]
+  local hdr
+  hdr="$(od -An -tx1 -N20 "$f" | tr -d ' \n')"
+  [ "${hdr:0:8}" = "7f454c46" ] || return 1
+  [ "${hdr:8:2}" = "02" ] || return 1   # EI_CLASS = ELFCLASS64
+  [ "${hdr:10:2}" = "01" ] || return 1  # EI_DATA  = ELFDATA2LSB
+  case "${hdr:32:4}" in
+    0200 | 0300) ;;                     # ET_EXEC | ET_DYN (little endian)
+    *) return 1 ;;
+  esac
+  case "$(bh_target_arch_name)" in
+    x86_64) [ "${hdr:36:4}" = "3e00" ] ;;
+    arm64) [ "${hdr:36:4}" = "b700" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# Mach-O 64-bit header check: magic AND cputype matching the TARGET arch
+# (arm64 0x0100000C / x86_64 0x01000007, little endian).  A magic-only
+# check accepted a foreign-arch Mach-O.
+bh_is_macho64() {
+  local f="$1"
+  if [ ! -f "$f" ]; then return 1; fi
+  local hdr
+  hdr="$(od -An -tx1 -N8 "$f" | tr -d ' \n')"
+  [ "${hdr:0:8}" = "cffaedfe" ] || return 1
+  case "$(bh_target_arch_name)" in
+    arm64) [ "${hdr:8:8}" = "0c000001" ] ;;
+    x86_64) [ "${hdr:8:8}" = "07000001" ] ;;
+    *) return 1 ;;
+  esac
 }
 
 # The stage image format follows the BOOTSTRAP TARGET (the same authority
@@ -435,6 +475,90 @@ bh_stage_image_ok() {
     *apple-darwin*) bh_is_macho64 "$f" ;;
     *linux* | *linux-gnu* | *linux-musl*) bh_is_elf64 "$f" ;;
     *) bh_is_macho64 "$f" ;;
+  esac
+}
+
+# ── execution capability (host OS + arch vs target OS + arch) ──────
+# Same ARCHITECTURE is not enough: a Linux ELF cannot execute on macOS
+# even on the same CPU.  A target is executable only when the host OS and
+# arch match, or a real runner exists (Rosetta for x86-64-on-arm64-darwin,
+# qemu-user for cross-arch Linux).  Never scattered inference.
+bh_host_os_name() {
+  case "$(uname -s)" in
+    Darwin) printf 'darwin' ;;
+    Linux) printf 'linux' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+bh_target_os_name() {
+  local triple="${1:-$(bh_boot_target)}"
+  case "$triple" in
+    *apple-darwin*) printf 'darwin' ;;
+    *linux*) printf 'linux' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+bh_host_arch_name() {
+  case "$(uname -m)" in
+    x86_64 | amd64) printf 'x86_64' ;;
+    arm64 | aarch64) printf 'arm64' ;;
+    *) printf '' ;;
+  esac
+}
+
+bh_target_arch_name_of() {
+  case "${1:-$(bh_boot_target)}" in
+    x86_64-*) printf 'x86_64' ;;
+    aarch64-* | arm64-*) printf 'arm64' ;;
+    *) printf '' ;;
+  esac
+}
+
+# Prints the execution mode for a triple: "native", a runner prefix
+# ("arch -x86_64", "qemu-x86_64", ...), or "UNAVAILABLE".
+bh_target_runner_for() {
+  local triple="$1"
+  local hos tos ha ta
+  hos="$(bh_host_os_name)"
+  tos="$(bh_target_os_name "$triple")"
+  ha="$(bh_host_arch_name)"
+  ta="$(bh_target_arch_name_of "$triple")"
+  if [ -n "$ta" ] && [ "$hos" = "$tos" ] && [ "$ha" = "$ta" ]; then
+    printf 'native'
+    return 0
+  fi
+  if [ "$hos" = darwin ] && [ "$tos" = darwin ] && [ "$ta" = x86_64 ] && [ "$ha" = arm64 ] &&
+    command -v arch >/dev/null 2>&1 && arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+    printf 'arch -x86_64'
+    return 0
+  fi
+  if command -v "qemu-$ta" >/dev/null 2>&1; then
+    printf 'qemu-%s' "$ta"
+    return 0
+  fi
+  printf 'UNAVAILABLE'
+}
+
+bh_target_runner() {
+  bh_target_runner_for "$(bh_boot_target)"
+}
+
+# Execute a target binary with its runner (fail closed when none exists).
+bh_run_target() {
+  local runner
+  runner="$(bh_target_runner)"
+  case "$runner" in
+    native) "$@" ;;
+    UNAVAILABLE)
+      bh_err "no execution capability for target $(bh_boot_target) on host $(bh_host_os_name)/$(bh_host_arch_name)"
+      return 127
+      ;;
+    *)
+      # shellcheck disable=SC2086
+      $runner "$@"
+      ;;
   esac
 }
 
@@ -492,14 +616,15 @@ validate_stage() {
   link_hash="$(bh_sha256_file "$binary")"
   bh_log "$stage size=${size} bytes sha256=${link_hash} image=$(bh_stage_image_kind)=ok"
 
-  if ! "$binary" --version >/dev/null 2>&1 && ! "$binary" version >/dev/null 2>&1; then
-    bh_err "$stage did not answer --version/version"
+  if ! bh_run_target "$binary" --version >/dev/null 2>&1 &&
+    ! bh_run_target "$binary" version >/dev/null 2>&1; then
+    bh_err "$stage did not answer --version/version (runner: $(bh_target_runner))"
     return 1
   fi
 
   if [ -f "$source_file" ]; then
-    if ! "$binary" check "$source_file" >/dev/null 2>&1; then
-      bh_err "$stage failed to self-check $source_file"
+    if ! bh_run_target "$binary" check "$source_file" >/dev/null 2>&1; then
+      bh_err "$stage failed to self-check $source_file (runner: $(bh_target_runner))"
       return 1
     fi
     bh_log "$stage self-check OK"
@@ -515,8 +640,8 @@ def main() -> Int
   0
 end
 EOF
-  if ! "$binary" compile "$canary_src" -o "$canary_bin" --target "$(bh_boot_target)" >/dev/null 2>&1; then
-    bh_err "$stage failed to compile the execution canary"
+  if ! bh_run_target "$binary" compile "$canary_src" -o "$canary_bin" --target "$(bh_boot_target)" >/dev/null 2>&1; then
+    bh_err "$stage failed to compile the execution canary (runner: $(bh_target_runner))"
     return 1
   fi
   if [ ! -f "$canary_bin" ]; then
@@ -529,7 +654,7 @@ EOF
   fi
   chmod +x "$canary_bin"
   local canary_out
-  canary_out="$("$canary_bin" 2>/dev/null)"
+  canary_out="$(bh_run_target "$canary_bin" 2>/dev/null)"
   local canary_rc=$?
   if [ "$canary_rc" -ne 0 ]; then
     bh_err "$stage canary exited nonzero ($canary_rc)"
@@ -1233,9 +1358,16 @@ bh_scan_traps() {
   local allowed=0 banned=0
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
+      *\>*:)
+        # objdump / llvm-objdump symbol header: "ADDR <name>:" — the
+        # function-symbol attribution for ELF disassembly.
+        lbl="${line##*<}"
+        lbl="${lbl%>*}"
+        cur_sym="${lbl#_}"
+        ;;
       *:)
-        # Label line: a function/global symbol or a local label. Local
-        # labels (_.Lxxx / .Lxxx) keep the current function attribution.
+        # otool label line: a function/global symbol or a local label.
+        # Local labels (_.Lxxx / .Lxxx) keep the current attribution.
         lbl="${line%:}"
         case "$lbl" in
           _.L*|.L*) ;;
@@ -1281,16 +1413,32 @@ bh_assert_no_trap_stubs() {
     bh_err "trap-stub gate: missing binary $binary"
     return 1
   fi
-  if ! command -v otool >/dev/null 2>&1; then
-    bh_err "trap-stub gate: otool is not available (cannot disassemble $binary)"
-    return 1
-  fi
   local arch
   arch="$(bh_arch_of "$triple")"
-  local dis
-  dis="$(otool -tv -arch "$arch" "$binary" 2>/dev/null || true)"
+  case "$arch" in aarch64) arch="arm64" ;; esac
+  local dis=""
+  case "$(bh_target_os_name "$triple")" in
+    darwin)
+      # Mach-O: otool first (the native authority), llvm-objdump as the
+      # cross-format fallback.
+      if command -v otool >/dev/null 2>&1; then
+        dis="$(otool -tv -arch "$arch" "$binary" 2>/dev/null || true)"
+      elif command -v llvm-objdump >/dev/null 2>&1; then
+        dis="$(llvm-objdump -d "$binary" 2>/dev/null || true)"
+      fi
+      ;;
+    linux)
+      # ELF: every toolchain ships objdump; llvm-objdump preferred when
+      # present (one disassembly grammar for both formats).
+      if command -v llvm-objdump >/dev/null 2>&1; then
+        dis="$(llvm-objdump -d "$binary" 2>/dev/null || true)"
+      elif command -v objdump >/dev/null 2>&1; then
+        dis="$(objdump -d "$binary" 2>/dev/null || true)"
+      fi
+      ;;
+  esac
   if [ -z "$dis" ]; then
-    bh_err "trap-stub gate: cannot disassemble $binary for $arch"
+    bh_err "trap-stub gate: no disassembler produced output for $binary ($(bh_target_os_name "$triple") $arch) — install llvm-objdump/otool/objdump (release gates fail closed)"
     return 1
   fi
   local scan allowed banned
@@ -1330,22 +1478,19 @@ run_target_lane_canaries() {
     return 1
   fi
 
-  local host_arch target_arch
-  host_arch="$(uname -m)"
+  local target_arch
   target_arch="$(bh_arch_of "$triple")"
 
   local can_exec=0
   local runner=()
-  if [ "$host_arch" = "$target_arch" ]; then
+  local runner_mode
+  runner_mode="$(bh_target_runner_for "$triple")"
+  if [ "$runner_mode" = "native" ]; then
     can_exec=1
-  elif [ "$target_arch" = "x86_64" ] && command -v arch >/dev/null 2>&1 \
-       && arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
-    # Rosetta 2 present: x86-64 binaries execute on the arm64 host.
+  elif [ "$runner_mode" != "UNAVAILABLE" ]; then
     can_exec=1
-    runner=(arch -x86_64)
-  elif command -v "qemu-$target_arch" >/dev/null 2>&1; then
-    can_exec=1
-    runner=("qemu-$target_arch")
+    # shellcheck disable=SC2206
+    runner=($runner_mode)
   fi
 
   local failures=0 total=0

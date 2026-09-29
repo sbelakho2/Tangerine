@@ -542,8 +542,8 @@ let () =
              (and every pinned count) when the kernel closure grows"
             manifest_count expected_manifest_sources;
         let preflight_args =
-          [ "check"; "--strict-resolution"; "tg_compiler/bootstrap_main.tg";
-            "--target"; target_str ]
+          [ "check"; "--strict-resolution"; "--stop-after=mono";
+            "tg_compiler/bootstrap_main.tg"; "--target"; target_str ]
         in
         let pre =
           match stages.Driver.bs_mono with
@@ -592,24 +592,54 @@ let () =
                   if extra <> [] then
                     fail "self-host preflight emitted %d TG_CHECK_OK rows (exactly one expected)"
                       (List.length rows);
+                  (* The depth certificate: the final authorization must
+                     have reached the Mono stop (mono + type-query fold +
+                     post-mono verify + completeness oracle) — a Mir-only
+                     image can never satisfy the preflight. *)
+                  (match summary_field row "stop" with
+                  | Some v when v = "mono" -> ()
+                  | Some v ->
+                      fail
+                        "self-host preflight stopped at `%s`, the final authorization requires \
+                         the mono stop (--stop-after=mono)" v
+                  | None -> fail "self-host preflight summary has no stop= field: %s" row);
                   (match summary_field row "file" with
                   | Some f when f = "tg_compiler/bootstrap_main.tg" -> ()
                   | Some f ->
                       fail "self-host preflight checked `%s`, not `tg_compiler/bootstrap_main.tg`" f
                   | None -> fail "self-host preflight summary has no file= field: %s" row);
-                  (match parse_int_field row "sources" with
+                  (* The dedup invariant (P0): manifest_entries = the
+                     manifest authority's size, unique_sources = modules =
+                     the post-dedup graph (root + one module per distinct
+                     dependency file).  A duplicated root made modules 46
+                     while claiming 45; every count must now agree. *)
+                  (match parse_int_field row "manifest_entries" with
                   | Some n when n = expected_manifest_sources -> ()
                   | Some n ->
                       fail
-                        "self-host preflight consumed %d source(s), the manifest closure is %d \
-                         — the kernel did not load the exact stage1 source graph"
+                        "self-host preflight reports manifest_entries=%d, the manifest closure is %d"
                         n expected_manifest_sources
-                  | None -> fail "self-host preflight summary has no sources= field: %s" row);
+                  | None -> fail "self-host preflight summary has no manifest_entries= field: %s" row);
+                  (match parse_int_field row "unique_sources" with
+                  | Some n when n = expected_manifest_sources -> ()
+                  | Some n ->
+                      fail
+                        "self-host preflight consumed %d unique source(s), the manifest closure is %d \
+                         — the kernel did not load the exact stage1 source graph (duplicate root?)"
+                        n expected_manifest_sources
+                  | None -> fail "self-host preflight summary has no unique_sources= field: %s" row);
+                  (match parse_int_field row "modules" with
+                  | Some n when n = expected_manifest_sources -> ()
+                  | Some n ->
+                      fail
+                        "self-host preflight merged %d module(s), the deduplicated closure is %d"
+                        n expected_manifest_sources
+                  | None -> fail "self-host preflight summary has no modules= field: %s" row);
                   Printf.printf
                     "  SELF-HOST PREFLIGHT: PASS — kernel check of tg_compiler/bootstrap_main.tg \
-                     exit 0 over the exact %d-source manifest closure (resolver 0, type 0; \
-                     strict, stop after MIR)\n"
-                    manifest_count)));
+                     exit 0 over the exact %d-source manifest closure (manifest_entries=%d, \
+                     unique_sources=%d, modules=%d; resolver 0, type 0; strict, stop after MONO)\n"
+                    manifest_count manifest_count manifest_count manifest_count)));
         (* hygiene: never leave the generated probe in the working tree *)
         if Sys.getenv_opt "TG_BOOTSTRAP_KEEP_GATE_ARTIFACT" = Some "1" then
           Printf.printf
