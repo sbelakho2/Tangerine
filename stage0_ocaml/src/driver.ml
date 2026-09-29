@@ -1063,7 +1063,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
        with
       | None -> 0
       | Some main ->
-          let host = Host.create ~repo_root:"." ~argv:[||] in
+          let host = Host.create ~repo_root:"." ~argv:[||] () in
           (match Vm.run_li ~limits:Vm.default_limits ~lang_items:(Typecheck.lang_items_of_env env) ~program:prog ~entry:main.Seed_mir.instance ~argv:[||] ~host with
            | Ok code -> Printf.printf "// VM: exit %d\n" code; 0
            | Error e -> Printf.printf "// VM: %s\n" e.Vm.message; 1))
@@ -3304,7 +3304,7 @@ type mono_outcome = {
 
 (* ── The bootstrap VM budget ──────────────────────────────────────────
    Workload: the bootstrap-check / compile kernel invocation
-     compile tests/differential/corpus/01_defs_arith.tg -o bootstrap_check.out
+     compile tests/differential/corpus/01_defs_arith.tg -o build/bootstrap_check.out
    The kernel does NOT compile only that one-file smoke: compile_startup_entry
    runs merge_imported_deps with include_compiler_lib=false, which loads the
    std prelude set (prelude_files(): std/alloc, collections, core, ffi, fmt,
@@ -5324,9 +5324,37 @@ let kernel_output_path (kernel_args : string list) : string option =
           else Some file
       | _ -> None)
 
+(* The guest OS ABI of a compile target (see Host.guest_is_darwin): the
+   kernel's std was compiled for this target, so its raw syscall argument
+   encodings are THIS OS's — never the host process's. *)
+let guest_is_darwin_of_target (target : Target.t) : bool =
+  match target.Target.os with Target.MacOS -> true | Target.Linux -> false
+
 let artifact_exists ~(repo_root : string) (path : string) : bool =
   if Filename.is_relative path then Sys.file_exists (Filename.concat repo_root path)
   else Sys.file_exists path
+
+(* Repository-artifact hygiene (audit P0-1): the VM's output artifacts
+   must land under build/, never at the repository root.  The directory
+   is created (best effort) and any stale copy is removed BEFORE the VM
+   run, so existence afterwards proves a FRESH artifact instead of a
+   leftover from an earlier run. *)
+let prepare_artifact_path ~(repo_root : string) (rel : string) : string =
+  let abs = Filename.concat repo_root rel in
+  let rec ensure_dir p =
+    if p = "" || p = "." || p = "/" || Sys.file_exists p then ()
+    else begin
+      ensure_dir (Filename.dirname p);
+      try Unix.mkdir p 0o755 with
+      | Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+      | Unix.Unix_error (e, _, _) ->
+          Printf.eprintf "warning: cannot create artifact directory %s: %s\n" p
+            (Unix.error_message e)
+    end
+  in
+  ensure_dir (Filename.dirname abs);
+  (try Sys.remove abs with Sys_error _ -> ());
+  rel
 
 (* ── the prepared-VM program cache (kernel-native fast lane) ─────────
    The seed front end (parse -> resolve -> typecheck fixpoint -> lower ->
@@ -5421,9 +5449,13 @@ type bootstrap_vm_run = {
 
 let run_prepared_vm ~(repo_root : string) ~(kernel_args : string list)
     ~(program : Seed_mir.program) ~(entry : Instance_id.t)
-    ~(lang_items : Lang_items.t) ~(cache_hit : bool) : bootstrap_vm_run =
+    ~(lang_items : Lang_items.t) ~(cache_hit : bool) ~(target : Target.t) :
+    bootstrap_vm_run =
   let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
-  let host = Host.create ~repo_root ~argv in
+  let host =
+    Host.create ~repo_root ~argv
+      ~guest_is_darwin:(guest_is_darwin_of_target target) ()
+  in
   let reachable =
     phase_time ~label:"reachable-host collection" (fun () ->
         collect_reachable_host_ids program)
@@ -5475,6 +5507,10 @@ type bootstrap_stages = {
   bs_vm_code : int option;
   bs_artifact : string option;
   bs_oracle_incomplete : bool;
+  (* the kernel's captured stdout/stderr (self-host preflight evidence:
+     the TG_CHECK_OK summary line rides stdout) *)
+  bs_stdout : string;
+  bs_stderr : string;
 }
 
 let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
@@ -5499,6 +5535,8 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
             bs_vm_code = None;
             bs_artifact = None;
             bs_oracle_incomplete = true;
+            bs_stdout = "";
+            bs_stderr = "";
           }
       else begin
         match (try Ok (phase_time ~label:"lower_closure (Seed MIR)" (fun () -> lower_closure ctx)) with e -> Error (Printexc.to_string e)) with
@@ -5516,6 +5554,8 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                 bs_vm_code = None;
                 bs_artifact = None;
                 bs_oracle_incomplete = true;
+                bs_stdout = "";
+                bs_stderr = "";
               }
         | Ok prog ->
         let tpl_ok =
@@ -5548,6 +5588,8 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                 bs_vm_code = None;
                 bs_artifact = None;
                 bs_oracle_incomplete = oracle_incomplete;
+                bs_stdout = "";
+                bs_stderr = "";
               }
         | Some (entry_name, entry_id) -> (
             match
@@ -5572,6 +5614,8 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                     bs_vm_code = None;
                     bs_artifact = None;
                     bs_oracle_incomplete = oracle_incomplete;
+                    bs_stdout = "";
+                    bs_stderr = "";
                   }
                      | Ok mo ->
                          debug_missing_user_callees ctx mo.mo_program;
@@ -5593,10 +5637,15 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                       bs_vm_code = None;
                       bs_artifact = None;
                       bs_oracle_incomplete = oracle_incomplete;
+                      bs_stdout = "";
+                      bs_stderr = "";
                     }
                 else begin
                   let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
-                  let host = Host.create ~repo_root ~argv in
+                  let host =
+                    Host.create ~repo_root ~argv
+                      ~guest_is_darwin:(guest_is_darwin_of_target target) ()
+                  in
                   let reachable =
                     phase_time ~label:"reachable-host collection" (fun () ->
                         collect_reachable_host_ids mo.mo_program)
@@ -5617,6 +5666,8 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                           bs_vm_code = None;
                           bs_artifact = None;
                           bs_oracle_incomplete = oracle_incomplete;
+                          bs_stdout = "";
+                          bs_stderr = "";
                         }
                   | Ok report -> (
                       let vm_program =
@@ -5651,6 +5702,8 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                               bs_vm_code = None;
                               bs_artifact = None;
                               bs_oracle_incomplete = oracle_incomplete;
+                              bs_stdout = out;
+                              bs_stderr = err;
                             }
                       | Ok code ->
                           let artifact =
@@ -5672,6 +5725,8 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
                               bs_vm_code = Some code;
                               bs_artifact = artifact;
                               bs_oracle_incomplete = oracle_incomplete;
+                              bs_stdout = Host.stdout_contents host;
+                              bs_stderr = Host.stderr_contents host;
                             })
         end)
     end
@@ -5696,7 +5751,7 @@ let run_bootstrap_vm ~(repo_root : string) ~(manifest_path : string)
       | Some (program, entry_instance, lang_items) ->
           Ok
             (run_prepared_vm ~repo_root ~kernel_args ~program
-               ~entry:entry_instance ~lang_items ~cache_hit:true)
+               ~entry:entry_instance ~lang_items ~cache_hit:true ~target)
       | None -> (
           match
             run_bootstrap_closure ~repo_root ~manifest_path ~target ~entry
@@ -5715,8 +5770,8 @@ let run_bootstrap_vm ~(repo_root : string) ~(manifest_path : string)
               Ok
                 {
                   bvr_vm_code = stages.bs_vm_code;
-                  bvr_stdout = "";
-                  bvr_stderr = "";
+                  bvr_stdout = stages.bs_stdout;
+                  bvr_stderr = stages.bs_stderr;
                   bvr_trap = None;
                   bvr_reachable = 0;
                   bvr_cache_hit = false;
@@ -5730,8 +5785,8 @@ let run_bootstrap_vm ~(repo_root : string) ~(manifest_path : string)
           Ok
             {
               bvr_vm_code = stages.bs_vm_code;
-              bvr_stdout = "";
-              bvr_stderr = "";
+              bvr_stdout = stages.bs_stdout;
+              bvr_stderr = stages.bs_stderr;
               bvr_trap = None;
               bvr_reachable = 0;
               bvr_cache_hit = false;
@@ -6020,12 +6075,19 @@ let cmd_bootstrap_check (args : string list) : int =
                             re-audit's strongest-solution order).  The VM
                             compiler invocation is dynamic evidence ON TOP
                             of the static proof. *)
+                         let out_rel =
+                           prepare_artifact_path ~repo_root:opts.repo_root
+                             "build/bootstrap_check.out"
+                         in
                          let kernel_args =
                            [ "compile"; "tests/differential/corpus/01_defs_arith.tg"; "-o";
-                             "bootstrap_check.out" ]
+                             out_rel; "--target"; opts.target ]
                          in
                          let argv = Array.of_list ("tg-bootstrap" :: kernel_args) in
-                          let host = Host.create ~repo_root:opts.repo_root ~argv in
+                          let host =
+                            Host.create ~repo_root:opts.repo_root ~argv
+                              ~guest_is_darwin:(guest_is_darwin_of_target target) ()
+                          in
                           let reachable = collect_reachable_host_ids mo.mo_program in
                          let reachable_names =
                            List.map
@@ -6331,7 +6393,10 @@ let cmd_compile (args : string list) : int =
                                       (Typecheck.lang_items_of_env ctx.ctx_env)
                               | None -> ())
                           | None -> ());
-                         let host = Host.create ~repo_root:opts.repo_root ~argv in
+                         let host =
+                           Host.create ~repo_root:opts.repo_root ~argv
+                             ~guest_is_darwin:(guest_is_darwin_of_target target) ()
+                         in
                          (match phase_time ~label:"VM run (kernel in the seed VM)" (fun () ->
                            Vm.run_li ~limits:bootstrap_vm_limits ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env) ~program:vm_program ~entry:mo.mo_entry ~argv ~host) with
                          | Error e ->

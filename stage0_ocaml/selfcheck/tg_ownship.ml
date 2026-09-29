@@ -70,7 +70,7 @@ let () =
 
   if !failures = 0 then begin
     Printf.printf "tg_ownship: ALL PASS\n";
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_ownship"
   end
   else begin
     Printf.printf "tg_ownship: %d FAILURE(S)\n" !failures;

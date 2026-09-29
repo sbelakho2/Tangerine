@@ -118,7 +118,7 @@ let entry_of (prog : Seed_mir.program) : Instance_id.t =
   prog.Seed_mir.functions.(0).Seed_mir.instance
 
 let run_program (prog : Seed_mir.program) : (int, Vm.vm_error) result =
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] () in
   Vm.run ~program:prog ~entry:(entry_of prog) ~argv:[||] ~host
 
 let run_inspect (prog : Seed_mir.program) : (string, string) result =
@@ -3466,6 +3466,605 @@ let check_dmd_moved_out_no_double_drop () =
           "%s: the re-assignment left the MovedOut hole alone; each region was freed exactly once by its own drop (a second free would have trapped)"
           what
 
+
+(* ── (h) call-result destination replacement (audit P1-7 / P1-8) ─────
+
+   A call-result store is an assignment: the OLD value of the exact
+   destination place is dropped exactly once before the result lands.
+   This section crosses both producers (a user function and a host
+   intrinsic) with every place shape (whole local, struct field, enum
+   payload, enum->struct nested field, projected static), plus the
+   lifecycle edges (uninitialized and MovedOut destinations, a trapping
+   call, a wrong-variant destination trap, repeated A->B->C overwrite)
+   and the audit-P1-8 deref / dynamic-index rules.  Region-backed refs
+   are the ownership counters: a freed region = dropped exactly once,
+   a live one = still owned (a second free would trap in the glue). *)
+
+let crr_s_tid = Ids.Type_id.make 701
+let crr_s_ty = Type_repr.Named (crr_s_tid, [||])
+
+let crr_s_def : Seed_mir.type_def =
+  Seed_mir.StructDef { sd_id = crr_s_tid; sd_fields = [ mk_fd 7011 0 ref_ty ] }
+
+let crr_e_tid = Ids.Type_id.make 702
+let crr_e_ty = Type_repr.Named (crr_e_tid, [||])
+let crr_v_ref = Ids.Variant_id.make 7001
+let crr_v_struct = Ids.Variant_id.make 7002
+
+let crr_e_def : Seed_mir.type_def =
+  Seed_mir.EnumDef
+    {
+      ed_id = crr_e_tid;
+      ed_variants =
+        [
+          { vd_id = crr_v_ref;
+            vd_index = Ids.Variant_index.make 0;
+            vd_payload = Type_repr.Tuple [| ref_ty |] };
+          { vd_id = crr_v_struct;
+            vd_index = Ids.Variant_index.make 1;
+            vd_payload = crr_s_ty };
+        ];
+    }
+
+let crr_types = [| crr_s_def; crr_e_def |]
+
+(* the user producer: returns its ref argument unchanged (the caller
+   seeds distinct regions for the destination and the argument). *)
+let crr_produce_fn : Seed_mir.function_ =
+  {
+    Seed_mir.name = "produce";
+    instance = instance 1;
+    params = [| { Type_repr.pt_convention = Access_effect.Let; pt_type = ref_ty } |];
+    locals = [| ref_ty; ref_ty |];
+    blocks =
+      [|
+        {
+          Seed_mir.id = 0;
+          statements =
+            [ Seed_mir.Assign (pl 0, Seed_mir.Use (Seed_mir.Copy (pl 1))) ];
+          terminator = Seed_mir.Ret;
+        };
+      |];
+    entry = 0;
+  }
+
+let crr_prog (locals : Type_repr.t array)
+    (statics : (string * Type_repr.t * bool * Seed_mir.constant option) array)
+    (blocks : Seed_mir.block array) : Seed_mir.program =
+  {
+    Seed_mir.functions =
+      [|
+        { Seed_mir.name = "main"; instance = instance 0; params = [||]; locals; blocks; entry = 0 };
+        crr_produce_fn;
+      |];
+    statics;
+    types = crr_types;
+  }
+
+let crr_arg (l : int) : Seed_mir.call_arg =
+  { Seed_mir.effect_ = Access_effect.Read; value = Seed_mir.Copy (pl l) }
+
+let crr_struct (p : Vm_memory.pointer) : Vm_value.t =
+  Vm_value.Struct (Vm_value.agg [| ref_of p |])
+let crr_enum (tag : int) (payload : Vm_value.t array) : Vm_value.t =
+  Vm_value.Enum (tag, Vm_value.agg payload)
+
+let crr_ref_slot (what : string) (slot : Vm_value.slot)
+    (p : Vm_memory.pointer) : unit =
+  match slot with
+  | Vm_value.Live v when Vm_value.equal v (ref_of p) -> ()
+  | _ -> fail "%s: destination slot is not the expected region-backed ref" what
+
+let check_call_result_destinations () =
+  let seed_dest_arg (_vm : Vm.t) (frame : Vm_value.frame)
+      (res : Vm_memory.pointer array) : unit =
+    frame.locals.(1) <- Vm_value.Live (ref_of res.(0));
+    frame.locals.(2) <- Vm_value.Live (ref_of res.(1))
+  in
+  (* (1) user function -> whole local *)
+  let whole_local =
+    crr_prog [| i64; ref_ty; ref_ty |] [||]
+      [|
+        { Seed_mir.id = 0; statements = [];
+          terminator =
+            Seed_mir.Call (pl 1, Seed_mir.User (instance 1), [| crr_arg 2 |], 1, None) };
+        { Seed_mir.id = 1; statements = []; terminator = Seed_mir.Ret };
+      |]
+  in
+  (match seeded_run whole_local seed_dest_arg 2 with
+   | Setup_error m -> fail "call dest whole local: setup: %s" m
+   | Ran_error (m, _) -> fail "call dest whole local: %s" m
+   | Ran_ok run ->
+       expect_dropped run.svm "user call -> whole local (displaced)" [ run.sres.(0) ];
+       expect_owned run.svm "user call -> whole local (installed)" [ run.sres.(1) ];
+       crr_ref_slot "user call -> whole local" run.sframe.locals.(1) run.sres.(1);
+       pass "user call -> whole local: the displaced R1 dropped exactly once, the result R2 installed");
+  (* (2) user function -> struct field *)
+  let struct_field =
+    let open Seed_mir in
+    crr_prog [| i64; crr_s_ty; ref_ty |] [||]
+      [|
+        { id = 0; statements = [];
+          terminator =
+            Call
+              ( { root = Local 1; projections = [ Field (Ids.Field_id.make 7011) ] },
+                User (instance 1), [| crr_arg 2 |], 1, None ) };
+        { id = 1; statements = []; terminator = Ret };
+      |]
+  in
+  (match seeded_run struct_field
+           (fun _ frame res ->
+             frame.locals.(1) <- Vm_value.Live (crr_struct res.(0));
+             frame.locals.(2) <- Vm_value.Live (ref_of res.(1)))
+           2
+   with
+   | Setup_error m -> fail "call dest struct field: setup: %s" m
+   | Ran_error (m, _) -> fail "call dest struct field: %s" m
+   | Ran_ok run ->
+       expect_dropped run.svm "user call -> struct field (displaced)" [ run.sres.(0) ];
+       expect_owned run.svm "user call -> struct field (installed)" [ run.sres.(1) ];
+       (match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Struct fields)
+          when Vm_value.agg_len fields = 1
+               && Vm_value.equal (Vm_value.agg_get fields 0) (ref_of run.sres.(1)) -> ()
+        | _ -> fail "user call -> struct field: the field does not hold the result");
+       pass "user call -> struct field: the displaced R1 dropped exactly once, the field holds R2");
+  (* (3) user function -> enum payload (downcast destination) *)
+  let enum_payload =
+    let open Seed_mir in
+    crr_prog [| i64; crr_e_ty; ref_ty |] [||]
+      [|
+        { id = 0; statements = [];
+          terminator =
+            Call
+              ( { root = Local 1;
+                  projections = [ Downcast crr_v_ref; ConstantIndex 0 ] },
+                User (instance 1), [| crr_arg 2 |], 1, None ) };
+        { id = 1; statements = []; terminator = Ret };
+      |]
+  in
+  (match seeded_run enum_payload
+           (fun _ frame res ->
+             frame.locals.(1) <- Vm_value.Live (crr_enum 0 [| ref_of res.(0) |]);
+             frame.locals.(2) <- Vm_value.Live (ref_of res.(1)))
+           2
+   with
+   | Setup_error m -> fail "call dest enum payload: setup: %s" m
+   | Ran_error (m, _) -> fail "call dest enum payload: %s" m
+   | Ran_ok run ->
+       expect_dropped run.svm "user call -> enum payload (displaced)" [ run.sres.(0) ];
+       expect_owned run.svm "user call -> enum payload (installed)" [ run.sres.(1) ];
+       (match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Enum (0, payload))
+          when Vm_value.agg_len payload = 1
+               && Vm_value.equal (Vm_value.agg_get payload 0) (ref_of run.sres.(1)) -> ()
+        | _ -> fail "user call -> enum payload: the payload does not hold the result");
+       pass "user call -> enum payload: the displaced R1 dropped exactly once, the payload holds R2");
+  (* (4) user function -> nested [Downcast; Field] destination *)
+  let nested_field =
+    let open Seed_mir in
+    crr_prog [| i64; crr_e_ty; ref_ty |] [||]
+      [|
+        { id = 0; statements = [];
+          terminator =
+            Call
+              ( { root = Local 1;
+                  projections = [ Downcast crr_v_struct; Field (Ids.Field_id.make 7011) ] },
+                User (instance 1), [| crr_arg 2 |], 1, None ) };
+        { id = 1; statements = []; terminator = Ret };
+      |]
+  in
+  (match seeded_run nested_field
+           (fun _ frame res ->
+             frame.locals.(1) <-
+               Vm_value.Live (crr_enum 1 [| ref_of res.(0) |]);
+             frame.locals.(2) <- Vm_value.Live (ref_of res.(1)))
+           2
+   with
+   | Setup_error m -> fail "call dest nested enum->struct: setup: %s" m
+   | Ran_error (m, _) -> fail "call dest nested enum->struct: %s" m
+   | Ran_ok run ->
+       expect_dropped run.svm "user call -> nested enum->struct field (displaced)" [ run.sres.(0) ];
+       expect_owned run.svm "user call -> nested enum->struct field (installed)" [ run.sres.(1) ];
+       (match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Enum (1, payload))
+          when Vm_value.agg_len payload = 1
+               && Vm_value.equal (Vm_value.agg_get payload 0) (ref_of run.sres.(1)) -> ()
+        | _ -> fail "user call -> nested enum->struct: the nested field does not hold the result");
+       pass
+         "user call -> nested enum->struct field: the displaced R1 dropped exactly once, the deep field holds R2");
+  (* (5) user function -> projected static destination *)
+  let static_field =
+    let open Seed_mir in
+    crr_prog [| i64; ref_ty |]
+      [| ("CRR_S", crr_s_ty, true, None) |]
+      [|
+        { id = 0; statements = [];
+          terminator =
+            Call
+              ( { root = Static 0; projections = [ Field (Ids.Field_id.make 7011) ] },
+                User (instance 1), [| crr_arg 1 |], 1, None ) };
+        { id = 1; statements = []; terminator = Ret };
+      |]
+  in
+  (match seeded_run static_field
+           (fun _ frame res ->
+             frame.statics.(0) <- Vm_value.Live (crr_struct res.(0));
+             frame.locals.(1) <- Vm_value.Live (ref_of res.(1)))
+           2
+   with
+   | Setup_error m -> fail "call dest projected static: setup: %s" m
+   | Ran_error (m, _) -> fail "call dest projected static: %s" m
+   | Ran_ok run ->
+       expect_dropped run.svm "user call -> projected static (displaced)" [ run.sres.(0) ];
+       expect_owned run.svm "user call -> projected static (installed)" [ run.sres.(1) ];
+       (match run.sframe.statics.(0) with
+        | Vm_value.Live (Vm_value.Struct fields)
+          when Vm_value.agg_len fields = 1
+               && Vm_value.equal (Vm_value.agg_get fields 0) (ref_of run.sres.(1)) -> ()
+        | _ -> fail "user call -> projected static: the static field does not hold the result");
+       pass
+         "user call -> projected static field: the displaced R1 dropped exactly once, the static holds R2");
+  (* (6) host intrinsic -> whole local *)
+  let host_whole =
+    let open Seed_mir in
+    crr_prog [| i64; ref_ty; vec_ty; i64 |] [||]
+      [|
+        { id = 0; statements = [];
+          terminator =
+            Call (pl 1, collection_intrinsic "__intrinsic_array_get",
+                  [| mod_arg 2; read_arg 3 |], 1, None) };
+        { id = 1; statements = []; terminator = Ret };
+      |]
+  in
+  (match seeded_run host_whole
+           (fun _ frame res ->
+             frame.locals.(1) <- Vm_value.Live (ref_of res.(0));
+             frame.locals.(2) <- Vm_value.Live (Vm_value.array [| ref_of res.(1) |]);
+             frame.locals.(3) <- Vm_value.Live (int64_value 0L))
+           2
+   with
+   | Setup_error m -> fail "host result -> whole local: setup: %s" m
+   | Ran_error (m, _) -> fail "host result -> whole local: %s" m
+   | Ran_ok run ->
+       expect_dropped run.svm "host result -> whole local (displaced)" [ run.sres.(0) ];
+       expect_owned run.svm "host result -> whole local (copied element stays owned)"
+         [ run.sres.(1) ];
+       crr_ref_slot "host result -> whole local" run.sframe.locals.(1) run.sres.(1);
+       pass
+         "host intrinsic -> whole local: the displaced R1 dropped exactly once, the read element installed");
+  (* (7) host intrinsic -> struct field *)
+  let host_field =
+    let open Seed_mir in
+    crr_prog [| i64; crr_s_ty; vec_ty; i64 |] [||]
+      [|
+        { id = 0; statements = [];
+          terminator =
+            Call
+              ( { root = Local 1; projections = [ Field (Ids.Field_id.make 7011) ] },
+                collection_intrinsic "__intrinsic_array_get",
+                [| mod_arg 2; read_arg 3 |], 1, None ) };
+        { id = 1; statements = []; terminator = Ret };
+      |]
+  in
+  (match seeded_run host_field
+           (fun _ frame res ->
+             frame.locals.(1) <- Vm_value.Live (crr_struct res.(0));
+             frame.locals.(2) <- Vm_value.Live (Vm_value.array [| ref_of res.(1) |]);
+             frame.locals.(3) <- Vm_value.Live (int64_value 0L))
+           2
+   with
+   | Setup_error m -> fail "host result -> struct field: setup: %s" m
+   | Ran_error (m, _) -> fail "host result -> struct field: %s" m
+   | Ran_ok run ->
+       expect_dropped run.svm "host result -> struct field (displaced)" [ run.sres.(0) ];
+       (match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Struct fields)
+          when Vm_value.agg_len fields = 1
+               && Vm_value.equal (Vm_value.agg_get fields 0) (ref_of run.sres.(1)) -> ()
+        | _ -> fail "host result -> struct field: the field does not hold the result");
+       pass
+         "host intrinsic -> struct field: the displaced R1 dropped exactly once, the field holds the read element");
+  (* (8) host intrinsic -> projected static *)
+  let host_static =
+    let open Seed_mir in
+    crr_prog [| i64; vec_ty; i64 |]
+      [| ("CRR_T", crr_s_ty, true, None) |]
+      [|
+        { id = 0; statements = [];
+          terminator =
+            Call
+              ( { root = Static 0; projections = [ Field (Ids.Field_id.make 7011) ] },
+                collection_intrinsic "__intrinsic_array_get",
+                [| mod_arg 1; read_arg 2 |], 1, None ) };
+        { id = 1; statements = []; terminator = Ret };
+      |]
+  in
+  (match seeded_run host_static
+           (fun _ frame res ->
+             frame.statics.(0) <- Vm_value.Live (crr_struct res.(0));
+             frame.locals.(1) <- Vm_value.Live (Vm_value.array [| ref_of res.(1) |]);
+             frame.locals.(2) <- Vm_value.Live (int64_value 0L))
+           2
+   with
+   | Setup_error m -> fail "host result -> projected static: setup: %s" m
+   | Ran_error (m, _) -> fail "host result -> projected static: %s" m
+   | Ran_ok run ->
+       expect_dropped run.svm "host result -> projected static (displaced)" [ run.sres.(0) ];
+       (match run.sframe.statics.(0) with
+        | Vm_value.Live (Vm_value.Struct fields)
+          when Vm_value.agg_len fields = 1
+               && Vm_value.equal (Vm_value.agg_get fields 0) (ref_of run.sres.(1)) -> ()
+        | _ -> fail "host result -> projected static: the static field does not hold the result");
+       pass
+         "host intrinsic -> projected static field: the displaced R1 dropped exactly once, the static holds the read element");
+  (* (9) uninitialized destination -> no drop, the result lands *)
+  let uninit_dest =
+    crr_prog [| i64; ref_ty; ref_ty |] [||]
+      [|
+        { Seed_mir.id = 0; statements = [];
+          terminator =
+            Seed_mir.Call (pl 1, Seed_mir.User (instance 1), [| crr_arg 2 |], 1, None) };
+        { Seed_mir.id = 1; statements = []; terminator = Seed_mir.Ret };
+      |]
+  in
+  (match seeded_run uninit_dest
+           (fun _ frame res -> frame.locals.(2) <- Vm_value.Live (ref_of res.(0)))
+           1
+   with
+   | Setup_error m -> fail "call dest uninitialized: setup: %s" m
+   | Ran_error (m, _) -> fail "call dest uninitialized: %s" m
+   | Ran_ok run ->
+       expect_owned run.svm "call dest uninitialized (nothing was displaced)" [ run.sres.(0) ];
+       crr_ref_slot "call dest uninitialized" run.sframe.locals.(1) run.sres.(0);
+       pass
+         "call dest uninitialized: no drop ran (the slot was never initialized) and the result installed");
+  (* (10) MovedOut destination -> no drop, the result lands *)
+  let moved_dest = uninit_dest in
+  (match seeded_run moved_dest
+           (fun _ frame res ->
+             frame.locals.(1) <- Vm_value.Moved;
+             frame.locals.(2) <- Vm_value.Live (ref_of res.(0)))
+           1
+   with
+   | Setup_error m -> fail "call dest moved-out: setup: %s" m
+   | Ran_error (m, _) -> fail "call dest moved-out: %s" m
+   | Ran_ok run ->
+       expect_owned run.svm "call dest moved-out (nothing was displaced)" [ run.sres.(0) ];
+       crr_ref_slot "call dest moved-out" run.sframe.locals.(1) run.sres.(0);
+       pass "call dest moved-out: no drop ran (the slot was moved out) and the result installed");
+  (* (11) a trapping call leaves the destination semantically intact *)
+  let trap_dest =
+    crr_prog [| i64; ref_ty |] [||]
+      [|
+        { Seed_mir.id = 0; statements = [];
+          terminator =
+            Seed_mir.Call (pl 1, Seed_mir.User (instance 99), [||], 1, None) };
+        { Seed_mir.id = 1; statements = []; terminator = Seed_mir.Ret };
+      |]
+  in
+  (match seeded_run trap_dest
+           (fun _ frame res -> frame.locals.(1) <- Vm_value.Live (ref_of res.(0)))
+           1
+   with
+   | Setup_error m -> fail "call trap leaves dest: setup: %s" m
+   | Ran_ok _ -> fail "call trap leaves dest: the unknown-instance call did not trap"
+   | Ran_error (m, run) ->
+       if not (contains m "unknown instance") then
+         fail "call trap leaves dest: unexpected trap text: %s" m;
+       expect_owned run.svm "call trap leaves dest (old value intact)" [ run.sres.(0) ];
+       crr_ref_slot "call trap leaves dest" run.sframe.locals.(1) run.sres.(0);
+       pass
+         "trapping call: the old destination stays semantically intact (no drop before a result exists)");
+  (* (12) a wrong-variant destination traps BEFORE dropping unrelated storage *)
+  let wrong_variant =
+    let open Seed_mir in
+    crr_prog [| i64; crr_e_ty; ref_ty |] [||]
+      [|
+        { id = 0; statements = [];
+          terminator =
+            Call
+              ( { root = Local 1; projections = [ Downcast crr_v_struct ] },
+                User (instance 1), [| crr_arg 2 |], 1, None ) };
+        { id = 1; statements = []; terminator = Ret };
+      |]
+  in
+  (match seeded_run wrong_variant
+           (fun _ frame res ->
+             frame.locals.(1) <- Vm_value.Live (crr_enum 0 [| ref_of res.(0) |]);
+             frame.locals.(2) <- Vm_value.Live (ref_of res.(1)))
+           2
+   with
+   | Setup_error m -> fail "call dest wrong variant: setup: %s" m
+   | Ran_ok _ -> fail "call dest wrong variant: the mismatched downcast did not trap"
+   | Ran_error (m, run) ->
+       if not (contains m "variant downcast") then
+         fail "call dest wrong variant: unexpected trap text: %s" m;
+       expect_owned run.svm "call dest wrong variant (unrelated storage untouched)"
+         [ run.sres.(0); run.sres.(1) ];
+       pass
+         "wrong-variant destination: traps before dropping the unrelated live payload (both regions stay owned)");
+  (* (13) repeated overwrite A -> B -> C drops exactly the two displaced values *)
+  let repeated =
+    crr_prog [| i64; ref_ty; ref_ty; ref_ty |] [||]
+      [|
+        { Seed_mir.id = 0; statements = [];
+          terminator =
+            Seed_mir.Call (pl 1, Seed_mir.User (instance 1), [| crr_arg 2 |], 1, None) };
+        { Seed_mir.id = 1; statements = [];
+          terminator =
+            Seed_mir.Call (pl 1, Seed_mir.User (instance 1), [| crr_arg 3 |], 2, None) };
+        { Seed_mir.id = 2; statements = []; terminator = Seed_mir.Ret };
+      |]
+  in
+  (match seeded_run repeated
+           (fun _ frame res ->
+             frame.locals.(1) <- Vm_value.Live (ref_of res.(0));
+             frame.locals.(2) <- Vm_value.Live (ref_of res.(1));
+             frame.locals.(3) <- Vm_value.Live (ref_of res.(2)))
+           3
+   with
+   | Setup_error m -> fail "repeated overwrite: setup: %s" m
+   | Ran_error (m, _) -> fail "repeated overwrite: %s" m
+   | Ran_ok run ->
+       expect_dropped run.svm "repeated overwrite (both displaced values)" [ run.sres.(0); run.sres.(1) ];
+       expect_owned run.svm "repeated overwrite (the final value)" [ run.sres.(2) ];
+       crr_ref_slot "repeated overwrite" run.sframe.locals.(1) run.sres.(2);
+       pass
+         "repeated overwrite A->B->C: exactly the two displaced values dropped, the final result installed")
+
+(* audit P1-8: dynamic-index destinations are tracked (the VM drops the
+   displaced element) — both the assignment form and the call-result
+   form. *)
+let check_dynamic_index_overwrite_drop () =
+  let arr_ty = Type_repr.Fixed_array (ref_ty, 3) in
+  let idx = Seed_mir.Index 2 in
+  let prog_assign =
+    crr_prog [| i64; arr_ty; i64; ref_ty |] [||]
+      [|
+        { Seed_mir.id = 0;
+          statements =
+            [ Seed_mir.Assign
+                ( { Seed_mir.root = Seed_mir.Local 1; projections = [ idx ] },
+                  Seed_mir.Use (Seed_mir.Copy (pl 3)) ) ];
+          terminator = Seed_mir.Ret };
+      |]
+  in
+  let seed (_vm : Vm.t) (frame : Vm_value.frame) (res : Vm_memory.pointer array) : unit =
+    frame.locals.(1) <-
+      Vm_value.Live (Vm_value.array [| ref_of res.(0); ref_of res.(1); ref_of res.(2) |]);
+    frame.locals.(2) <- Vm_value.Live (int64_value 1L);
+    frame.locals.(3) <- Vm_value.Live (ref_of res.(3))
+  in
+  (match seeded_run prog_assign seed 4 with
+   | Setup_error m -> fail "dynamic-index overwrite (assign): setup: %s" m
+   | Ran_error (m, _) -> fail "dynamic-index overwrite (assign): %s" m
+   | Ran_ok run ->
+       expect_dropped run.svm "dynamic-index overwrite (displaced element)" [ run.sres.(1) ];
+       expect_owned run.svm "dynamic-index overwrite (untouched siblings + new value)"
+         [ run.sres.(0); run.sres.(2); run.sres.(3) ];
+       (match run.sframe.locals.(1) with
+        | Vm_value.Live (Vm_value.Array elems)
+          when Vm_value.arr_length elems = 3
+               && Vm_value.equal (Vm_value.arr_get elems 1) (ref_of run.sres.(3)) -> ()
+        | _ -> fail "dynamic-index overwrite: the element was not replaced");
+       pass
+         "dynamic index overwrite: the displaced element drops exactly once and the new value lands");
+  let prog_call =
+    crr_prog [| i64; arr_ty; i64; ref_ty |] [||]
+      [|
+        { Seed_mir.id = 0; statements = [];
+          terminator =
+            Seed_mir.Call
+              ( { Seed_mir.root = Seed_mir.Local 1; projections = [ idx ] },
+                Seed_mir.User (instance 1), [| crr_arg 3 |], 1, None ) };
+        { Seed_mir.id = 1; statements = []; terminator = Seed_mir.Ret };
+      |]
+  in
+  (match seeded_run prog_call seed 4 with
+   | Setup_error m -> fail "dynamic-index overwrite (call result): setup: %s" m
+   | Ran_error (m, _) -> fail "dynamic-index overwrite (call result): %s" m
+   | Ran_ok run ->
+       expect_dropped run.svm "dynamic-index call-result overwrite (displaced element)"
+         [ run.sres.(1) ];
+       expect_owned run.svm "dynamic-index call-result overwrite (siblings + result)"
+         [ run.sres.(0); run.sres.(2); run.sres.(3) ];
+       pass
+         "dynamic index call-result overwrite: the displaced element drops exactly once through the call-result store")
+
+(* audit P1-8: a deref destination over a REAL reference delegates the
+   displaced drop to the target place (no leakage, no double drop). *)
+let check_deref_place_overwrite_drop () =
+  let prog =
+    crr_prog [| i64; ref_ty; ref_ty; ref_ty |] [||]
+      [|
+        { Seed_mir.id = 0;
+          statements = [ Seed_mir.Assign (pl 1, Seed_mir.Ref (pl 3)) ];
+          terminator =
+            Seed_mir.Call
+              ( { Seed_mir.root = Seed_mir.Local 1; projections = [ Seed_mir.Deref ] },
+                Seed_mir.User (instance 1), [| crr_arg 2 |], 1, None ) };
+        { Seed_mir.id = 1; statements = []; terminator = Seed_mir.Ret };
+      |]
+  in
+  (match
+     seeded_run prog
+       (fun _ frame res ->
+         frame.locals.(2) <- Vm_value.Live (ref_of res.(1));
+         frame.locals.(3) <- Vm_value.Live (ref_of res.(0)))
+       2
+   with
+   | Setup_error m -> fail "deref-place overwrite: setup: %s" m
+   | Ran_error (m, _) -> fail "deref-place overwrite: %s" m
+   | Ran_ok run ->
+       expect_dropped run.svm "deref-place overwrite (displaced target value)" [ run.sres.(0) ];
+       expect_owned run.svm "deref-place overwrite (installed target value)" [ run.sres.(1) ];
+       crr_ref_slot "deref-place overwrite (the ref target place)" run.sframe.locals.(3) run.sres.(1);
+       pass
+         "deref destination over a real reference: the displaced target drops exactly once and the write lands in the target place")
+
+(* audit P1-8 (the explicit `unsafe` boundary): a raw-pointer deref
+   destination is a serialized memory image with no place identity.  The
+   VM performs the store without attempting a displaced drop (never a
+   guessed free into unidentifiable memory), and the scalar raw-store
+   vocabulary works end to end.  The kernel's one owning raw-write
+   primitive (std::ffi::write_ptr / SliceMut::write) is `unsafe` by
+   contract: the caller owns the slot's lifecycle. *)
+let check_raw_deref_store_boundary () =
+  let raw_mut_i64 = Type_repr.Raw_ptr (Type_repr.Mutable, i64) in
+  let prog =
+    {
+      Seed_mir.functions =
+        [|
+          {
+            Seed_mir.name = "main";
+            instance = instance 0;
+            params = [||];
+            locals = [| i64; raw_mut_i64 |];
+            blocks =
+              [|
+                {
+                  Seed_mir.id = 0;
+                  statements =
+                    [
+                      Seed_mir.Assign
+                        ( { Seed_mir.root = Seed_mir.Local 1;
+                            projections = [ Seed_mir.Deref ] },
+                          Seed_mir.Use (int_op 42) );
+                      Seed_mir.Assign
+                        ( pl 0,
+                          Seed_mir.Use
+                            (Seed_mir.Copy
+                               { Seed_mir.root = Seed_mir.Local 1;
+                                 projections = [ Seed_mir.Deref ] }) );
+                    ];
+                  terminator = Seed_mir.Ret;
+                };
+              |];
+            entry = 0;
+          };
+        |];
+      statics = [||];
+      types = [||];
+    }
+  in
+  (match
+     seeded_run prog
+       (fun vm frame _res ->
+         match Vm_memory.alloc vm.Vm.memory 64 8 with
+         | Ok p -> frame.locals.(1) <- Vm_value.Live (Vm_value.RawPtr p)
+         | Error e -> fail "raw deref store: region alloc failed: %s" (Vm_memory.mem_error_string e))
+       0
+   with
+   | Setup_error m -> fail "raw deref store: setup: %s" m
+   | Ran_error (m, _) -> fail "raw deref store: %s" m
+   | Ran_ok run -> (
+       match run.sframe.locals.(0) with
+       | Vm_value.Live (Vm_value.Int i) when Int_value.to_int64 i = 42L ->
+           pass
+             "raw deref boundary: a scalar raw store writes through the pointer and reads back (no displaced drop attempted — the explicit unsafe boundary)"
+       | _ -> fail "raw deref store: the raw memory read back did not hold 42"))
+
 let () =
   Printf.printf "Seed VM kernel-closure primitive self-check\n";
   check_dyn_index ();
@@ -3499,6 +4098,11 @@ let () =
   check_edw_non_enum_trap ();
   check_edw_rebuild_trap ();
   check_edw_alias_cow ();
+  (* call-result destination replacement + P1-8 overwrite rules *)
+  check_call_result_destinations ();
+  check_dynamic_index_overwrite_drop ();
+  check_deref_place_overwrite_drop ();
+  check_raw_deref_store_boundary ();
   (* enum-downcast drop mirror: displaced owned components, COW, traps *)
   check_dmd_whole_root_drop ();
   check_dmd_payload_component_drop ();
@@ -3512,7 +4116,7 @@ let () =
   check_unwind_pair ();
   if !failures = 0 then begin
     Printf.printf "ALL PASS\n";
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_vmsem"
   end
   else begin
     Printf.printf "%d FAILURE(S)\n" !failures;

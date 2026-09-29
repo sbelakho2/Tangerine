@@ -134,7 +134,7 @@ let () =
         | Some f -> f.Seed_mir.instance
         | None -> failwith "no main function"
       in
-      let host = Host.create ~repo_root:"." ~argv:[||] in
+      let host = Host.create ~repo_root:"." ~argv:[||] () in
       (match Vm.run ~program:prog ~entry ~argv:[||] ~host with
        | Error e ->
            Printf.printf "  VM: FAIL %s\n" e.Vm.message;
@@ -147,3 +147,5 @@ let () =
                 match Vm.run_inspect vm2 entry_frame with
                 | Ok ret_val -> Printf.printf "  main returned: %s\n" ret_val
                 | Error m -> Printf.printf "  main returned: <inspect failed: %s>\n" m)))
+
+let () = Selfcheck_sentinel.emit "tg_pipeline"

@@ -1125,7 +1125,7 @@ and drop_node (vm : t) (ty : Type_repr.t) (node : Drop_plan.plan_node)
    local-root body — including both the whole-root and the projected
    overwrite drop — was dead code; projected Static roots dropped the
    whole static value under the leaf type instead of the leaf). *)
-let drop_old_value_at (vm : t) (frame : frame) (p : Seed_mir.place) : unit =
+let rec drop_old_value_at (vm : t) (frame : frame) (p : Seed_mir.place) : unit =
   let root_ty = type_of_local vm frame.fn (Seed_mir.root_key p.Seed_mir.root) in
   let ty_of_place () : Type_repr.t =
     List.fold_left (fun ty proj -> proj_type_of vm ty proj) root_ty p.Seed_mir.projections
@@ -1135,61 +1135,119 @@ let drop_old_value_at (vm : t) (frame : frame) (p : Seed_mir.place) : unit =
     | Vm_value.Live v -> drop_value_typed vm (ty_of_place ()) v
     | Vm_value.Uninitialized | Vm_value.Moved | Vm_value.Dropped -> ()
   in
+  (* one projection step over a live value; None names a place the
+     drop cannot reach through a VALUE (a raw/region deref boundary, or
+     the dynamic index of a non-container) — the write path then owns
+     the trap. *)
+  let step_value (v : Vm_value.t) (ty : Type_repr.t) (proj : Seed_mir.projection) :
+      Vm_value.t option =
+    match proj with
+    | Seed_mir.Field fid -> (
+        let i = field_index_of vm ty fid in
+        match v with
+        | Vm_value.RawPtr ptr when i = 0 && is_ptr_handle_ty vm ty ->
+            Some
+              (Vm_value.Int
+                 (Int_value.of_int64 ~width:64 ~signed:false
+                    (Vm_memory.pointer_to_int64 ptr)))
+        | Vm_value.Null when i = 0 && is_ptr_handle_ty vm ty ->
+            Some (Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:false 0L))
+        | Vm_value.Struct fields ->
+            if i < 0 || i >= Vm_value.agg_len fields then
+              err_trap vm
+                (Printf.sprintf "field index out of bounds (type %s, %d field(s), index %d)"
+                   (Seed_mir.print_type ty) (Vm_value.agg_len fields) i)
+            else Some (Vm_value.agg_get fields i)
+        | _ -> err_trap vm "field write on non-aggregate")
+    | Seed_mir.ConstantIndex i -> (
+        match v with
+        | Vm_value.Array elems ->
+            if i < 0 || i >= Vm_value.arr_length elems then err_trap vm "index out of bounds"
+            else Some (Vm_value.arr_get elems i)
+        | Vm_value.Tuple elems ->
+            if i < 0 || i >= Vm_value.agg_len elems then err_trap vm "tuple index out of bounds"
+            else Some (Vm_value.agg_get elems i)
+        | Vm_value.Struct elems ->
+            if i < 0 || i >= Vm_value.agg_len elems then err_trap vm "struct index out of bounds"
+            else Some (Vm_value.agg_get elems i)
+        | Vm_value.String str ->
+            if i < 0 || i >= String.length str then err_trap vm "string index out of bounds"
+            else Some (Vm_value.Char (Uchar.of_char str.[i]))
+        | _ -> err_trap vm "index write on non-array")
+    | Seed_mir.Index li -> (
+        (* dynamic-index overwrite (audit P1-8): the displaced ELEMENT is
+           tracked and dropped exactly once — the local slot holds the
+           container and the index local holds the element position, so
+           the element is reachable before the write, exactly like the
+           ConstantIndex form.  An out-of-range index returns None and
+           the write path raises its canonical bounds trap; a string
+           element is a Char (no drop). *)
+        let i = index_of_local vm frame li in
+        match v with
+        | Vm_value.Array elems ->
+            if i < 0 || i >= Vm_value.arr_length elems then None
+            else Some (Vm_value.arr_get elems i)
+        | Vm_value.Tuple elems ->
+            if i < 0 || i >= Vm_value.agg_len elems then None
+            else Some (Vm_value.agg_get elems i)
+        | Vm_value.Struct elems ->
+            if i < 0 || i >= Vm_value.agg_len elems then None
+            else Some (Vm_value.agg_get elems i)
+        | Vm_value.String _ -> None
+        | _ -> None)
+    | Seed_mir.Downcast vid -> (
+        let expect = variant_index_of vm ty vid in
+        match v with
+        | Vm_value.Enum (tag, payload) ->
+            if tag <> expect then
+              err_trap vm
+                (Printf.sprintf
+                   "variant downcast: runtime tag %d does not match VariantId %d's declaration-order tag %d"
+                   tag (Ids.Variant_id.to_int vid) expect)
+            else Some (Vm_value.Struct payload)
+        | _ -> err_trap vm "downcast write on non-enum value")
+    | Seed_mir.Deref -> None
+  in
   let rec leaf_value (v : Vm_value.t) (ty : Type_repr.t)
       (projs : Seed_mir.projection list) : Vm_value.t option =
     match projs, v with
     | _, Vm_value.MovedOut -> None
     | [], _ -> Some v
-    | proj :: rest, _ -> (
+    | proj :: rest, _ ->
+        (* the type-level projection resolves FIRST (the historical trap
+           order: an ill-typed projection is diagnosed by proj_type_of
+           before the value-level step) *)
         let next_ty = proj_type_of vm ty proj in
-        let recurse v = leaf_value v next_ty rest in
-        match proj with
-        | Seed_mir.Field fid -> (
-            let i = field_index_of vm ty fid in
-            match v with
-            | Vm_value.RawPtr ptr when i = 0 && is_ptr_handle_ty vm ty ->
-                recurse
-                  (Vm_value.Int
-                     (Int_value.of_int64 ~width:64 ~signed:false
-                        (Vm_memory.pointer_to_int64 ptr)))
-            | Vm_value.Null when i = 0 && is_ptr_handle_ty vm ty ->
-                recurse (Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:false 0L))
-            | Vm_value.Struct fields ->
-                if i < 0 || i >= Vm_value.agg_len fields then
-                  err_trap vm
-                    (Printf.sprintf "field index out of bounds (type %s, %d field(s), index %d)"
-                       (Seed_mir.print_type ty) (Vm_value.agg_len fields) i)
-                else recurse (Vm_value.agg_get fields i)
-            | _ -> err_trap vm "field write on non-aggregate")
-        | Seed_mir.ConstantIndex i -> (
-            match v with
-            | Vm_value.Array elems ->
-                if i < 0 || i >= Vm_value.arr_length elems then err_trap vm "index out of bounds"
-                else recurse (Vm_value.arr_get elems i)
-            | Vm_value.Tuple elems ->
-                if i < 0 || i >= Vm_value.agg_len elems then
-                  err_trap vm "tuple index out of bounds"
-                else recurse (Vm_value.agg_get elems i)
-            | Vm_value.Struct elems ->
-                if i < 0 || i >= Vm_value.agg_len elems then
-                  err_trap vm "struct index out of bounds"
-                else recurse (Vm_value.agg_get elems i)
-            | Vm_value.String str ->
-                if i < 0 || i >= String.length str then err_trap vm "string index out of bounds"
-                else recurse (Vm_value.Char (Uchar.of_char str.[i]))
-            | _ -> err_trap vm "index write on non-array")
-        | Seed_mir.Downcast vid -> (
-            let expect = variant_index_of vm ty vid in
-            match v with
-            | Vm_value.Enum (tag, payload) ->
-                if tag <> expect then
-                  err_trap vm
-                    (Printf.sprintf
-                       "variant downcast: runtime tag %d does not match VariantId %d's declaration-order tag %d"
-                       tag (Ids.Variant_id.to_int vid) expect)
-                else recurse (Vm_value.Struct payload)
-            | _ -> err_trap vm "downcast write on non-enum value")
-        | Seed_mir.Deref | Seed_mir.Index _ -> None)
+        (match step_value v ty proj with
+         | Some v' -> leaf_value v' next_ty rest
+         | None -> None)
+  in
+  (* Deref destinations whose base is a REAL reference (Ref (Place _)):
+     the displaced value lives in the target frame's place, so the drop
+     is DELEGATED to that place — the deref form is not a tracking hole
+     (audit P1-8).  A RAW-POINTER/region deref's pointee is a serialized
+     memory image with no place identity: no displaced drop is executed
+     and none can be tracked.  That is the language's explicit `unsafe`
+     boundary — std::ffi's `read_ptr`/`write_ptr` and SliceMut::write are
+     the owning primitives on it, and their contract (the caller owns the
+     slot's lifecycle; the write does not run the old image's drop) is
+     pinned by tg_vmsem's raw-deref boundary check.  The VM never guesses
+     a drop into memory it cannot identify; the traceable forms above
+     (dynamic Index, real-reference Deref) do drop exactly once. *)
+  let rec deref_target (v : Vm_value.t) (ty : Type_repr.t)
+      (projs : Seed_mir.projection list) : (frame * Seed_mir.place) option =
+    match projs with
+    | [] -> None
+    | Seed_mir.Deref :: rest -> (
+        match v with
+        | Vm_value.Ref (Vm_value.Place (tf, l, projs0)) ->
+            Some (tf, place_of_ref_key l (projs0 @ rest))
+        | _ -> None)
+    | proj :: rest -> (
+        let next_ty = proj_type_of vm ty proj in
+        match step_value v ty proj with
+        | Some v' -> deref_target v' next_ty rest
+        | None -> None)
   in
   let root_slot =
     if Seed_mir.root_is_static p.Seed_mir.root then
@@ -1209,9 +1267,12 @@ let drop_old_value_at (vm : t) (frame : frame) (p : Seed_mir.place) : unit =
       | projs -> (
           match slot with
           | Vm_value.Live v -> (
-              match leaf_value v root_ty projs with
-              | Some old -> drop_value_typed vm (ty_of_place ()) old
-              | None -> ())
+              match deref_target v root_ty projs with
+              | Some (tf, target) -> drop_old_value_at vm tf target
+              | None -> (
+                  match leaf_value v root_ty projs with
+                  | Some old -> drop_value_typed vm (ty_of_place ()) old
+                  | None -> ()))
           | Vm_value.Uninitialized | Vm_value.Moved | Vm_value.Dropped -> ()))
 
 (* A needs_drop value requires a Drop terminator; the verifier has already
@@ -2347,7 +2408,7 @@ let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
              memory = Vm_memory.create ();
              lang_items;
              drop_plans = Drop_plan.of_program ~lang_items program;
-             host = Host.create ~repo_root:"." ~argv:[||];
+             host = Host.create ~repo_root:"." ~argv:[||] ();
              limits;
              steps = 0;
              host_calls = 0;

@@ -135,4 +135,4 @@ let () =
       (* the report, machine-readable, then the gate verdict *)
       List.iter print_endline (Debt_report.to_lines rep1);
       Printf.printf "DEBT REPORT PASS\n";
-      exit 0
+      Selfcheck_sentinel.emit_and_exit "tg_debt"

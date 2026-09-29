@@ -629,7 +629,19 @@ end
 # Public API
 # ———————————————————————————————————————————————————————————————
 
-def resolve_names(program: Program) -> Result[ResolvedNames, Vec[ResolutionError]]
+# (partial-resolution evidence): the SAME canonical phase order as
+# resolve_names (symbol table -> derived indexes -> imports -> reference
+# resolution), with the snapshot and the diagnostics returned TOGETHER.
+# A caller that deliberately skips a pre-resolution pass (e.g. the
+# resolution-parity probe, which does not expand macros) still gets the
+# authoritative symbol table / suffix index for its scan oracle instead
+# of losing the snapshot to the Result gate.
+pub struct ResolutionOutcome
+  resolved: ResolvedNames
+  errors: Vec[ResolutionError]
+end
+
+pub def resolve_names_partial(program: Program) -> ResolutionOutcome
   var ctx = context_new()
 
   # Phase 1: Build symbol table from all items
@@ -663,31 +675,49 @@ def resolve_names(program: Program) -> Result[ResolvedNames, Vec[ResolutionError
   end
   ctx.resolved.import_bindings = import_bindings
 
-  if ctx.symbols.errors.is_empty() then
-    Result::Ok(ctx.resolved)
+  ResolutionOutcome {
+    resolved: ctx.resolved,
+    errors: ctx.symbols.errors
+  }
+end
+
+pub def resolve_names(program: Program) -> Result[ResolvedNames, Vec[ResolutionError]]
+  let partial = resolve_names_partial(program)
+  if partial.errors.is_empty() then
+    Result::Ok(partial.resolved)
   else
-    Result::Err(ctx.symbols.errors)
+    Result::Err(partial.errors)
   end
+end
+
+# The ONE authoritative empty ResolvedNames constructor (audit P1-10):
+# every fresh resolution snapshot is built here, so a new field can never
+# be omitted from a scattered literal again (the import_bindings /
+# symbol_suffix_index omission class).  `git grep -n 'ResolvedNames {'
+# -- tg_compiler` must show only the struct definition, this constructor,
+# and deliberately isolated tests.
+pub def resolved_names_empty() -> ResolvedNames
+  ResolvedNames {
+    expr_resolutions: Map::new(),
+    type_resolutions: Map::new(),
+    pattern_resolutions: Map::new(),
+    call_targets: Map::new(),
+    type_def_ids: Map::new(),
+    intrinsic_ids: Map::new(),
+    item_defs: Map::new(),
+    module_symbols: Map::new(),
+    def_kinds: Map::new(),
+    import_bindings: Map::new(),
+    symbol_suffix_index: Map::new(),
+    stable_ids: stable_id_map_new()
+  }
 end
 
 def context_new() -> ResolutionContext
   ResolutionContext {
     symbols: symbol_table_new(),
     local_scopes: Vec::new(),
-    resolved: ResolvedNames {
-      expr_resolutions: Map::new(),
-      type_resolutions: Map::new(),
-      pattern_resolutions: Map::new(),
-      call_targets: Map::new(),
-      type_def_ids: Map::new(),
-      intrinsic_ids: Map::new(),
-      item_defs: Map::new(),
-      module_symbols: Map::new(),
-      def_kinds: Map::new(),
-      import_bindings: Map::new(),
-      symbol_suffix_index: Map::new(),
-      stable_ids: stable_id_map_new()
-    },
+    resolved: resolved_names_empty(),
     prelude_imports: vec!["std", "core"],
     current_owner_path: Vec::new(),
     current_owner_module: ModuleId { id: 0 },
@@ -3165,6 +3195,33 @@ def resolve_ident_expr(inout ctx: ResolutionContext, name: String, expr: Expr) -
   # name derived from the InstanceId's DefId must equal the callee's own
   # DefId-derived emission name). The kinds are metadata (def_kinds) —
   # DefId carries no kind.
+  # Explicit/glob import bindings come FIRST (the seed resolver's
+  # authority order: explicit imports, then globs, then the module's own
+  # items): an explicit import that binds a value disambiguates a bare
+  # callable name before the global ambiguity scan can fire.  This is the
+  # kernel/seed parity the resolution lane pins (audit P0-3).
+  match resolve_import_binding(ctx, name.clone())
+  when ImportResolution::Item(did) then
+    let did_kind = match ctx.symbols.def_kinds.get(def_metadata_key(&did))
+    when Option::Some(k) then k
+    when Option::None then DefKind::Other
+    end
+    ctx.resolved.call_targets.insert(expr.node_id, did.clone())
+    let resolved_kind = match did_kind
+    when DefKind::Constant then ResolvedExprKind::Constant(did.clone())
+    when DefKind::Static then ResolvedExprKind::Static(did.clone())
+    when _ then ResolvedExprKind::Function(did.clone())
+    end
+    let resolved_expr = ResolvedExpr {
+      kind: resolved_kind,
+      module_path: ctx.symbols.current_module.clone()
+    }
+    let _ = ctx.resolved.expr_resolutions.insert(expr.node_id, resolved_expr)
+    return
+  when ImportResolution::Builtin then ()
+  when ImportResolution::NoImport then ()
+  end
+
   let callable_kinds = vec![DefKind::Function, DefKind::Constant, DefKind::Static]
   match bare_name_resolve(ctx, name, &callable_kinds, &expr.span)
   when BareNameResolution::Resolved(did) then

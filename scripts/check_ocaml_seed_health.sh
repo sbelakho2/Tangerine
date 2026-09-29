@@ -20,8 +20,13 @@
 #      regression fails; corrupted/malformed pointers and malformed
 #      authority output fail closed; the real tree passes)
 #   5. EVERY self-check executable enumerated in selfcheck/dune (a new
-#      self-check is automatically required; each must exit 0 and print
-#      its PASS marker)
+#      self-check is automatically required; each must exit 0 AND print
+#      EXACTLY ONE machine-readable sentinel
+#      `TANGERINE_SELFCHECK_PASS name=<name> version=1` — an exit-0
+#      executable with no sentinel is rejected by the exact-line
+#      verifier, never a loose `grep PASS`.  tg_bootstrap_gate and
+#      tg_bootstrap_selfcheck are completeness gates reported separately,
+#      not components of this lane.)
 #   6. bootstrap-check: must not crash; the measured typecheck count is
 #      reported, and the debt policy is enforced against the accepted
 #      baseline by the three-scalar helper above; tg_bootstrap_gate (the
@@ -54,7 +59,10 @@ PINNED_TEST_INVENTORY=230
 # is superseded: the closure now runs the full 0-error path instead of
 # stopping at the frontend): the FULL bootstrap-check closure measured
 # 1049.9 s wall (17:29.88), tg_bootstrap_gate 1207.6 s (20:07.55) and the
-# tg_evidence component 1276.6 s (21:16.63). Each cap is the measurement
+# tg_evidence component 1276.6 s (21:16.63).  The zero-debt path also
+# runs the self-host preflight in a second VM (audit P0-2), so re-measure
+# the gate cap at zero debt before treating a timeout as a stall.  Each
+# cap is the measurement
 # x 1.5 rounded up to the next 60 s (bootstrap-check: 1049.9 x 1.5 =
 # 1574.8 -> 1620 s; gate: 1207.6 x 1.5 = 1811.3 -> 1860 s; tg_evidence:
 # 1276.6 x 1.5 = 1914.9 -> 1920 s): the host carries unrelated background
@@ -144,6 +152,16 @@ if [ -f scripts/check_ocaml_toolchain.sh ]; then
   scripts/check_ocaml_toolchain.sh
 fi
 
+# Repository-artifact hygiene (audit P0-1): cheap, index-only, fail-closed
+# BEFORE any build — a tracked native artifact is never accepted, and a
+# bootstrap gate that dropped one at the repository root must go red here.
+if [ -x scripts/check_repo_artifact_hygiene.sh ]; then
+  if ! scripts/check_repo_artifact_hygiene.sh; then
+    echo "check_ocaml_seed_health: FAIL — repository artifact hygiene"
+    exit 1
+  fi
+fi
+
 cd stage0_ocaml
 dune build
 
@@ -156,6 +174,14 @@ fi
 TESTS="$(grep -oE '[0-9]+ passed, 0 failed' <<<"$TEST_OUT" | head -1)"
 if [ "$TESTS" != "${PINNED_TEST_INVENTORY} passed, 0 failed" ]; then
   echo "check_ocaml_seed_health: FAIL — test inventory changed: got '$TESTS', pinned exact inventory '${PINNED_TEST_INVENTORY} passed, 0 failed'"
+  exit 1
+fi
+
+# Success-evidence verifier meta-test (audit P0-4): proves in
+# milliseconds that a silent exit-0 executable is rejected and the exact
+# sentinel is accepted, so the marker gate can never be ceremonial.
+if ! "$ROOT/scripts/test_selfcheck_sentinel.sh"; then
+  echo "check_ocaml_seed_health: FAIL — selfcheck sentinel verifier meta-test"
   exit 1
 fi
 
@@ -188,11 +214,13 @@ if [ -z "$NAMES" ]; then
   exit 1
 fi
 for name in $NAMES; do
-  if [ "$name" = "tg_bootstrap_gate" ]; then
+  if [ "$name" = "tg_bootstrap_gate" ] || [ "$name" = "tg_bootstrap_selfcheck" ]; then
     # tg_bootstrap_gate is the FULL-COMPLETENESS gate (red by design
-    # while the subset is nonzero) — reported separately, never part of
-    # the component-selfcheck lane (re-audit P0: health vs completeness
-    # split).
+    # while the subset is nonzero) and tg_bootstrap_selfcheck is the
+    # self-host preflight that can only run once the closure typechecks
+    # clean — both are reported separately, never part of the
+    # component-selfcheck lane (re-audit P0: health vs completeness
+    # split; the complete gate runs them).
     continue
   fi
   # The denominator is DERIVED from the enumerated dune names (minus
@@ -226,6 +254,18 @@ for name in $NAMES; do
     tail -10 "/tmp/ocaml_sc_${name}.out" || true
     SELFCHECK_FAIL=1
   fi
+  # Success evidence (audit P0-4): exit 0 alone is not a pass — the
+  # executable must print EXACTLY ONE machine-readable sentinel
+  # (TANGERINE_SELFCHECK_PASS name=<name> version=1).  A broken
+  # selfcheck that exits early with 0 and prints nothing is rejected by
+  # the exact-line verifier (never a loose `grep PASS`: error text can
+  # contain the word).  scripts/test_selfcheck_sentinel.sh proves the
+  # verifier's reject/pass behaviour.
+  if ! "$ROOT/scripts/check_selfcheck_sentinel.sh" "$name" "/tmp/ocaml_sc_${name}.out"; then
+    echo "check_ocaml_seed_health: FAIL — selfcheck ${name} exited 0 without its success sentinel"
+    tail -10 "/tmp/ocaml_sc_${name}.out" || true
+    SELFCHECK_FAIL=1
+  fi
   # tg_infer's merged-corpus diagnostic (opt-in, TG_INFER_MERGED=1): the
   # probe's merged mode runs the canonical preparation + the kernel
   # checker over the merged corpus+std closure (build/infer_merged.flag)
@@ -249,7 +289,7 @@ done
 # here — it is delegated to tg_bootstrap_gate, the single debt authority
 # (monotonic no-regression vs its checked baseline).
 set +e
-timeout "$BOOTSTRAP_CHECK_TIMEOUT_S" _build/default/bin/tg_stage0.exe bootstrap-check --repo-root .. >/tmp/ocaml_bootstrap_check.out 2>&1
+timeout "$BOOTSTRAP_CHECK_TIMEOUT_S" _build/default/bin/tg_stage0.exe bootstrap-check --repo-root .. --target "${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}" >/tmp/ocaml_bootstrap_check.out 2>&1
 BC_STATUS=$?
 set -e
 if [ "$BC_STATUS" -ne 0 ] && [ "$BC_STATUS" -ne 1 ]; then
@@ -334,7 +374,7 @@ fi
 # FULL-COMPLETENESS gate: tg_bootstrap_gate — reported separately,
 # informational only; red by design while the subset is nonzero.
 set +e
-timeout "$GATE_TIMEOUT_S" _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. >/tmp/ocaml_bootstrap_gate.out 2>&1
+timeout "$GATE_TIMEOUT_S" _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. --target "${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}" >/tmp/ocaml_bootstrap_gate.out 2>&1
 GATE_STATUS=$?
 set -e
 SUBSET_N="$(grep -oE 'SUBSET_FIREWALL = (PASS|FAIL \([0-9]+ findings)' /tmp/ocaml_bootstrap_check.out 2>/dev/null | head -1 | grep -oE 'PASS|[0-9]+' | head -1 || true)"
@@ -342,8 +382,19 @@ if [ "$GATE_STATUS" -eq 0 ]; then
   echo "check_ocaml_seed_health: DEVELOPMENT DEBT GATE: PASS (no regression vs the checked baseline)"
   echo "DEBT-GATE-PASS (FULL COMPLETENESS: NOT RUN / DEFERRED)" > /tmp/ocaml_full_completeness_verdict.txt
 else
-  echo "check_ocaml_seed_health: DEVELOPMENT DEBT GATE: RED (gate exit $GATE_STATUS — informational; this lane is development health, the gate is reported separately)"
+  echo "check_ocaml_seed_health: DEVELOPMENT DEBT GATE: RED (gate exit $GATE_STATUS)"
   echo "DEBT-GATE-RED" > /tmp/ocaml_full_completeness_verdict.txt
+  # The subtle health/completeness agreement rule: while the typecheck
+  # debt is nonzero the gate may be informational, but AT ZERO DEBT the
+  # gate's full closure (including the self-host preflight) is mandatory
+  # — a red completeness gate is a red health result, never a green
+  # dashboard next to an unclosed closure.
+  if [ "$DEBT_TOTAL" -eq 0 ]; then
+    echo "check_ocaml_seed_health: FAIL — typecheck debt is 0 but tg_bootstrap_gate is red (full closure / self-host preflight failed); health cannot pass while completeness is red at zero debt"
+    tail -30 /tmp/ocaml_bootstrap_gate.out
+    exit 1
+  fi
+  echo "check_ocaml_seed_health: note: the gate is informational ONLY because the typecheck debt is nonzero (${DEBT_TOTAL})"
 fi
 
 if [ "$SELFCHECK_FAIL" -ne 0 ]; then

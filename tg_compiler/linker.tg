@@ -621,6 +621,25 @@ end
 # Symbol resolution
 # ———————————————————————————————————————————————————————————————
 
+def section_name_of(sec: Section) -> String
+  match sec
+  when Section::Text then "text"
+  when Section::Data then "data"
+  when Section::Rodata then "rodata"
+  when Section::Bss then "bss"
+  when Section::ColdText then "coldtext"
+  when _ then "other"
+  end
+end
+
+def binding_name_of(b: SymBinding) -> String
+  match b
+  when SymBinding::Local then "local"
+  when SymBinding::Global then "global"
+  when _ then "other"
+  end
+end
+
 def is_stdlib_static(name: String) -> Bool
   # Static variables from std/ library that may appear in multiple compilation units.
   # These start with underscore and are safe to deduplicate since they have identical
@@ -652,7 +671,12 @@ def resolve_symbols(all_symbols: Vec[AsmSymbol]) -> Result[Map[String, LinkerSym
       when Option::Some(existing) then
         if existing.is_defined then
           if !is_stdlib_static(&sym.name) then
-            return Result::Err("duplicate symbol: " + sym.name)
+            return Result::Err("duplicate symbol: " + sym.name
+              + " (first: section-index " + existing.section.to_string()
+              + " value " + existing.value.to_string()
+              + "; again: section " + section_name_of(sym.section)
+              + " offset " + sym.offset.to_string()
+              + " binding " + binding_name_of(sym.binding) + ")")
           end
         end
       when Option::None then ()
@@ -1070,6 +1094,89 @@ def PF_X() -> u32 = 1
 def PF_W() -> u32 = 2
 def PF_R() -> u32 = 4
 
+# ── the ELF freestanding import policy (x86_64) ────────────────────
+# The ELF backend links a FREESTANDING static image (no PT_INTERP, direct
+# syscalls), so undefined imports cannot be resolved by a dynamic linker.
+# Two mechanisms, in order:
+#   1. kernel-provided libc shims for the symbols this compiler's own
+#      runtime actually calls (the allocator's memcpy/memmove/memset and
+#      the scheduler's sched_yield) — real implementations, emitted into
+#      .text;
+#   2. a deterministic TRAP STUB for every other undefined import.  This
+#      mirrors the macOS dyld LAZY-import behavior for never-called FFI
+#      surface (libruby, dlopen): binding exists, first execution traps —
+#      never a silent artifact and never a hard link failure for code the
+#      program does not run.  `__intrinsic_*` symbols stay FAIL-CLOSED:
+#      they are compiler-emitted calls that must always have a host
+#      implementation (same guard as the Mach-O path).
+def libc_shim_x64(name: String) -> Option[Vec[u8]]
+  var b: Vec[u8] = Vec::new()
+  if name == "memcpy" then
+    # rax = rdi; rcx = rdx; rep movsb; ret
+    b.push(0x48); b.push(0x89); b.push(0xF8)
+    b.push(0x48); b.push(0x89); b.push(0xD1)
+    b.push(0xF3); b.push(0xA4)
+    b.push(0xC3)
+    return Option::Some(b)
+  end
+  if name == "memset" then
+    # rax = rdi; rcx = rdx; eax = esi; rep stosb; ret
+    b.push(0x48); b.push(0x89); b.push(0xF8)
+    b.push(0x48); b.push(0x89); b.push(0xD1)
+    b.push(0x89); b.push(0xF0)
+    b.push(0xF3); b.push(0xAA)
+    b.push(0xC3)
+    return Option::Some(b)
+  end
+  if name == "memmove" then
+    # Overlap-safe: forward when dst <= src, backward otherwise (std/cld
+    # around the backward rep).  Layout: rax=dst; n==0 -> ret; then
+    # direction select, backward block, forward block, ret.
+    b.push(0x48); b.push(0x89); b.push(0xF8)             # mov rax, rdi
+    b.push(0x48); b.push(0x85); b.push(0xD2)             # test rdx, rdx
+    b.push(0x74); b.push(0x1D)                           # jz ret (+29)
+    b.push(0x48); b.push(0x39); b.push(0xF7)             # cmp rdi, rsi
+    b.push(0x76); b.push(0x13)                           # jbe fwd (+19)
+    b.push(0x48); b.push(0x8D); b.push(0x74); b.push(0x16); b.push(0xFF) # lea rsi,[rsi+rdx-1]
+    b.push(0x48); b.push(0x8D); b.push(0x7C); b.push(0x17); b.push(0xFF) # lea rdi,[rdi+rdx-1]
+    b.push(0x48); b.push(0x89); b.push(0xD1)             # mov rcx, rdx
+    b.push(0xFD)                                         # std
+    b.push(0xF3); b.push(0xA4)                           # rep movsb
+    b.push(0xFC)                                         # cld
+    b.push(0xEB); b.push(0x05)                           # jmp ret (+5)
+    b.push(0x48); b.push(0x89); b.push(0xD1)             # fwd: mov rcx, rdx
+    b.push(0xF3); b.push(0xA4)                           # rep movsb
+    b.push(0xC3)                                         # ret
+    return Option::Some(b)
+  end
+  if name == "sched_yield" then
+    # Linux x86_64 sched_yield = 24
+    b.push(0xB8); b.push(0x18); b.push(0x00); b.push(0x00); b.push(0x00)
+    b.push(0x0F); b.push(0x05)
+    b.push(0xC3)
+    return Option::Some(b)
+  end
+  Option::None
+end
+
+def trap_stub_x64() -> Vec[u8]
+  var b: Vec[u8] = Vec::new()
+  b.push(0x0F); b.push(0x0B)   # ud2: deterministic illegal instruction
+  b.push(0xC3)                 # ret (unreachable; keeps a return-shaped frame)
+  b
+end
+
+def append_text_bytes(inout sections: Vec[LinkedSection], bytes: Vec[u8]) -> Int
+  let off = sections[0].data.len() as Int
+  var i = 0
+  while i < bytes.len() do
+    sections[0].data.push(bytes[i])
+    i = i + 1
+  end
+  sections[0].mem_size = sections[0].data.len() as u64
+  off
+end
+
 def link_elf64(input: LinkerInput) -> Result[Vec[u8], String]
   var out = Vec::new()
 
@@ -1079,6 +1186,106 @@ def link_elf64(input: LinkerInput) -> Result[Vec[u8], String]
   var all_data_relocations: Vec[Relocation] = Vec::new()
   var all_relocations: Vec[Relocation] = Vec::new()
   var sections = merge_sections(&input.objects, &mut text_offsets, &mut all_symbols, &mut all_relocations, &mut all_data_relocations)
+
+  # ── freestanding imports: shims + fail-closed trap stubs (see the
+  # policy above).  The undefined set is RELOCATION-REFERENCED symbols
+  # only (the Mach-O collect_macho_imports contract): an extern
+  # DECLARATION is not an import — the object declares the whole std
+  # intrinsic/FFI surface, while only the code that is emitted
+  # references a subset.
+  var defined_set: Set[String] = Set::new()
+  var declared_set: Set[String] = Set::new()
+  var ui = 0
+  while ui < all_symbols.len() do
+    let usym = all_symbols[ui]
+    declared_set.insert(usym.name.clone())
+    if usym.section != Section::Extern then
+      defined_set.insert(usym.name.clone())
+    end
+    ui = ui + 1
+  end
+  var undef_set: Set[String] = Set::new()
+  var ur = 0
+  while ur < all_relocations.len() do
+    let rsym = all_relocations[ur].symbol.clone()
+    if !defined_set.contains(&rsym) then
+      undef_set.insert(rsym)
+    end
+    ur = ur + 1
+  end
+  var undef_names = undef_set.entries_cloned()
+  undef_names.sort()
+  # A referenced name that is not even DECLARED is a codegen defect, not
+  # a platform import: fail closed naming every offender.
+  var undeclared: Vec[String] = Vec::new()
+  var uj = 0
+  while uj < undef_names.len() do
+    if !declared_set.contains(&undef_names[uj]) then
+      undeclared.push(undef_names[uj].clone())
+    end
+    uj = uj + 1
+  end
+  if !undeclared.is_empty() then
+    var umsg = "undefined symbol(s) with no declaration in the linked object (fail closed):"
+    for un in undeclared do
+      umsg = umsg + " " + un.clone()
+    end
+    return Result::Err(umsg)
+  end
+  # Referenced `__intrinsic_*` imports are compiler-owned: they must have
+  # been lowered inline or defined by the runtime — collect ALL and fail
+  # closed naming every offender (never one symbol per link run).
+  var missing_intrinsics: Vec[String] = Vec::new()
+  uj = 0
+  while uj < undef_names.len() do
+    let uname = undef_names[uj].clone()
+    if uname.starts_with("__intrinsic_") then
+      missing_intrinsics.push(uname.clone())
+    end
+    uj = uj + 1
+  end
+  if !missing_intrinsics.is_empty() then
+    var imsg = "undefined compiler intrinsic symbol(s) in ELF link (fail closed — every referenced __intrinsic_* call must be lowered inline or emitted by the runtime):"
+    for mn in missing_intrinsics do
+      imsg = imsg + " " + mn.clone()
+    end
+    return Result::Err(imsg)
+  end
+  # Non-intrinsic referenced imports: kernel shims where they exist, a
+  # deterministic fail-closed trap stub otherwise (the macOS lazy-import
+  # behavior for never-called FFI surface).
+  var stub_names: Vec[String] = Vec::new()
+  uj = 0
+  while uj < undef_names.len() do
+    let uname = undef_names[uj].clone()
+    let shim = match linker_input_arch(input)
+    when Arch::X86_64 then libc_shim_x64(uname.clone())
+    when _ then Option::None
+    end
+    let code = match shim
+    when Option::Some(bytes) then bytes
+    when Option::None then
+      stub_names.push(uname.clone())
+      trap_stub_x64()
+    end
+    let off = append_text_bytes(&mut sections, code)
+    all_symbols.push(AsmSymbol {
+      name: uname.clone(),
+      section: Section::Text,
+      offset: off,
+      size: 0,
+      binding: SymBinding::Global,
+      kind: SymKind::Func
+    })
+    uj = uj + 1
+  end
+  if !stub_names.is_empty() then
+    var warn = "link: warning: " + stub_names.len().to_string() + " undefined import(s) have no kernel shim and were bound to fail-closed trap stubs (first execution traps):"
+    for sn in stub_names do
+      warn = warn + " " + sn.clone()
+    end
+    println(warn)
+  end
 
   # Resolve symbols
   let syms = match resolve_symbols(&all_symbols)
@@ -2028,7 +2235,17 @@ def link_executable(input: LinkerInput) -> Result[Unit, String]
     let _ = delete_file(tmp_path.clone())
   end
 
-  let fd = libc_open_path(tmp_path.as_ptr(), 1 | 512 | 1024, 420)
+  # The open(2) flag ENCODING follows the TARGET OS (the image being
+  # linked), never the host: O_WRONLY|O_CREAT|O_TRUNC is 1|512|1024 in the
+  # Darwin layout and 1|64|512 in the Linux layout.  Hardcoding the Darwin
+  # bits made every Linux-target link fail with ENOENT on a fresh
+  # output.tmp (the create bit was not set).
+  let open_flags = if linker_input_os(input) == OsAbi::MacOS then
+    1 | 512 | 1024
+  else
+    1 | 64 | 512
+  end
+  let fd = libc_open_path(tmp_path.as_ptr(), open_flags, 420)
   if fd < 0 then
     return Result::Err("failed to open output.tmp for writing (fd=" + fd.to_string() + ")")
   end
@@ -2113,7 +2330,7 @@ end
 # ———————————————————————————————————————————————————————————————
 
 # Generates minimal _start that calls main() and exits
-def inject_start_x64_linux(inout text: CodeBuffer) -> Unit
+def inject_start_x64_linux(inout text: CodeBuffer, main_label: String) -> Unit
   use tg_compiler::asm::{
     x64_xor_rr, x64_mov_rr, x64_call_label, x64_mov_ri,
     x64_syscall, x64_and_ri8, x64_mov_rm, x64_lea_mem,
@@ -2133,8 +2350,9 @@ def inject_start_x64_linux(inout text: CodeBuffer) -> Unit
   # Align stack to 16 bytes (SysV ABI requirement)
   x64_and_ri8(text, X64::RSP, -16 as i8)
 
-  # Call main
-  x64_call_label(text, "main")
+  # Call the program entry (the codegen-side function LABEL: ".Lfn_entry.N",
+  # never the public symbol name — direct calls resolve labels).
+  x64_call_label(text, main_label)
 
   # exit(rax)
   x64_mov_rr(text, X64::RDI, X64::RAX)
@@ -2142,7 +2360,7 @@ def inject_start_x64_linux(inout text: CodeBuffer) -> Unit
   x64_syscall(text)
 end
 
-def inject_start_a64_linux(inout text: CodeBuffer) -> Unit
+def inject_start_a64_linux(inout text: CodeBuffer, main_label: String) -> Unit
   use tg_compiler::asm::{
     a64_mov_rr, a64_bl, a64_mov_ri, a64_svc, a64_ldr, a64_add_rri, def_label, A64
   }
@@ -2153,8 +2371,8 @@ def inject_start_a64_linux(inout text: CodeBuffer) -> Unit
   a64_ldr(text, A64::X0, A64::SP, 0)
   a64_add_rri(text, A64::X1, A64::SP, 8)
 
-  # Call main
-  a64_bl(text, "main")
+  # Call the program entry (the codegen-side function LABEL).
+  a64_bl(text, main_label)
 
   # exit(x0)
   a64_mov_rr(text, A64::X0, A64::X0)  # return code already in X0

@@ -546,7 +546,7 @@ let check_verifier () =
 (* ── (f) VM: drop-after-move / plan-driven typed drop ─────────────── *)
 
 let vm_run (prog : Seed_mir.program) : (int, Vm.vm_error) result =
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] () in
   Vm.run_li ~limits:Vm.default_limits ~lang_items:Lang_items.seed_defaults ~program:prog ~entry:(entry_of prog) ~argv:[||]
     ~host
 
@@ -885,7 +885,7 @@ let () =
   check_cfg_langitems_overlay ();
   if !failures = 0 then begin
     Printf.printf "tg_type_props: ALL PASS\n";
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_type_props"
   end
   else begin
     Printf.printf "tg_type_props: %d FAILURE(S)\n" !failures;

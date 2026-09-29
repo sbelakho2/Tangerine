@@ -124,7 +124,7 @@ let () =
 
   if !failures = 0 then begin
     Printf.printf "tg_verify: ALL PASS\n";
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_verify"
   end
   else begin
     Printf.printf "tg_verify: %d FAILURE(S)\n" !failures;

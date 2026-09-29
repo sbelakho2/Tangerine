@@ -93,7 +93,7 @@ let () =
           else begin
             Printf.printf
               "tg_devirt: PASS — monomorphize_program completed and the mono'd program verifies with zero rows (VM exit 0)\n";
-            exit 0
+            Selfcheck_sentinel.emit_and_exit "tg_devirt"
           end
       | Some code -> fail "kernel VM exit %d (expected 0)" code
       | None ->

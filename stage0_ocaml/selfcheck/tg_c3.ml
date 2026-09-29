@@ -137,7 +137,7 @@ let () =
             restore ();
             Printf.printf
               "tg_c3: PASS — the kernel checker completed the trivial struct/method battery with the loop regression and the C3 method-resolution cases clean (VM exit 0)\n";
-            exit 0
+            Selfcheck_sentinel.emit_and_exit "tg_c3"
           end
       | Some code -> fail "kernel VM exit %d (expected 0)" code
       | None ->

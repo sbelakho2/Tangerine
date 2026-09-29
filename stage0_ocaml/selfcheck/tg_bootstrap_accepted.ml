@@ -165,8 +165,7 @@ let print_debt_json (repo_root : string) : unit =
         exit 2
       end;
       Printf.printf "{\"record\":\"%s\",\"total\":%d,\"primary\":%d,\"secondary\":%d}\n"
-        (json_escape record_name) total primaries secondaries;
-      exit 0
+        (json_escape record_name) total primaries secondaries
 
 let print_debt_json_cli (args : string list) : unit =
   let repo_root = ref ".." and syntax_ok = ref true in
@@ -382,7 +381,8 @@ let run_self_check () =
     Printf.printf "TG BOOTSTRAP ACCEPTED-EVIDENCE SELF-CHECK: FAIL (%d)\n" !failures;
     exit 1
   end;
-  Printf.printf "TG BOOTSTRAP ACCEPTED-EVIDENCE SELF-CHECK: PASS\n"
+  Printf.printf "TG BOOTSTRAP ACCEPTED-EVIDENCE SELF-CHECK: PASS\n";
+  Selfcheck_sentinel.emit "tg_bootstrap_accepted"
 
 let () =
   let args = match Array.to_list Sys.argv with _ :: rest -> rest | [] -> [] in

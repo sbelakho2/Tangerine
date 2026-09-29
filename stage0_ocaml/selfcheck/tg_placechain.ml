@@ -830,7 +830,7 @@ let () =
   test_loop_after_partial_move ();
   if !failures = 0 then begin
     Printf.printf "tg_placechain: ALL PASS\n";
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_placechain"
   end
   else begin
     Printf.printf "tg_placechain: %d FAILURE(S)\n" !failures;

@@ -304,7 +304,7 @@ let run_main (env : Typecheck.env) (prog_ast : Ast.program) (expected : int) : u
     | Some f -> f.Seed_mir.instance
     | None -> failwith "no main function"
   in
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] () in
   (match Vm.run ~program:prog ~entry ~argv:[||] ~host with
    | Error e ->
        Printf.printf "  VM: FAIL %s\n" e.Vm.message;
@@ -872,4 +872,5 @@ end
   run_main env prog_ast 10;;
 
 let () =
-  Printf.printf "tg_derived_clone: ALL LEGS PASS\n"
+  Printf.printf "tg_derived_clone: ALL LEGS PASS\n";
+  Selfcheck_sentinel.emit "tg_derived_clone"

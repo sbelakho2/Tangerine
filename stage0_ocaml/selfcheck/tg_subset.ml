@@ -790,7 +790,7 @@ let () =
   run_manifest_firewall ();
   if !failures = 0 then begin
     Printf.printf "tg_subset: ALL PASS\n";
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_subset"
   end
   else begin
     Printf.printf "tg_subset: %d FAILURE(S)\n" !failures;

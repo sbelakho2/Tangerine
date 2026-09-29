@@ -7,7 +7,19 @@
 
 open Test_util
 
-let corpus_dir = "/Users/sabelakhoua/IdeaProjects/Tangerine/tests/differential/corpus"
+(* The corpus lives in the repository; resolve it relative to the current
+   directory (the suite runs from stage0_ocaml/, as the health gate does),
+   walking upward so the test also works from a build sandbox. No absolute
+   author path: the corpus must be found on every checkout. *)
+let corpus_dir : string =
+  let rec find dir depth =
+    if depth > 6 then "tests/differential/corpus"
+    else
+      let candidate = Filename.concat dir "tests/differential/corpus" in
+      if Sys.file_exists candidate && Sys.is_directory candidate then candidate
+      else find (Filename.concat dir "..") (depth + 1)
+  in
+  find (Sys.getcwd ()) 0
 
 let parse_source (label : string) (src : string) :
     Diagnostic.bag * Ast.program =

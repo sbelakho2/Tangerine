@@ -619,7 +619,7 @@ end
                ~name_of:(fun tid -> List.assoc_opt tid !Typecheck.type_names_global)
                mo.Driver.mo_program
            in
-           let host = Host.create ~repo_root:"." ~argv:[||] in
+           let host = Host.create ~repo_root:"." ~argv:[||] () in
            (match
               Vm.run_li ~limits:Vm.default_limits ~lang_items ~program:vprog
                 ~entry:mo.Driver.mo_entry ~argv:[||] ~host
@@ -694,7 +694,7 @@ let vm_result_of_src (name : string) (src : string) : (string, string) result =
                ~name_of:(fun tid -> List.assoc_opt tid !Typecheck.type_names_global)
                mo.Driver.mo_program
            in
-           let host = Host.create ~repo_root:"." ~argv:[||] in
+           let host = Host.create ~repo_root:"." ~argv:[||] () in
            (match
               Vm.run_li ~limits:Vm.default_limits ~lang_items ~program:vprog
                 ~entry:mo.Driver.mo_entry ~argv:[||] ~host
@@ -978,7 +978,7 @@ let () =
   borrow_walk_part ();
   if !failures = 0 then begin
     Printf.printf "tg_boxnominal: ALL BOX-NOMINAL IDENTITY LEGS PASS\n";
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_boxnominal"
   end
   else begin
     Printf.printf "tg_boxnominal: %d FAILURE(S)\n" !failures;

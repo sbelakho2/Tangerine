@@ -128,7 +128,7 @@ let () =
     Printf.printf
       "CORPUS GATE PASS: all %d corpus files parse; typecheck_clean=%d typecheck_failing=%d aggregate_errors=%d\n"
       !files !clean !failing !aggregate;
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_corpus"
   end
   else begin
     Printf.printf

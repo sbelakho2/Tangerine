@@ -129,6 +129,17 @@ if [ -x "$ROOT_DIR/scripts/check_struct_integrity.sh" ]; then
   fi
 fi
 
+# Repository-artifact hygiene pre-gate (audit P0-1): index-only and
+# seconds-scale — a tracked native artifact (bootstrap_gate.out at the
+# root, a stray .o, an accidentally committed stage binary) fails before
+# any build or VM work.
+if [ -x "$ROOT_DIR/scripts/check_repo_artifact_hygiene.sh" ]; then
+  if ! "$ROOT_DIR/scripts/check_repo_artifact_hygiene.sh"; then
+    echo "[bootstrap:error] repository artifact hygiene pre-gate failed (a generated binary is tracked; see build/ for the correct output location)" >&2
+    exit 1
+  fi
+fi
+
 # Self-host grammar pre-gate: the current parser HARD-REJECTS the legacy
 # parameter spellings (mut/&/&mut/move/own prefixes, `x: &T` / `x: &mut T`
 # markers, `fn(&T)` fn-type params, `&self` / `&mut self` receivers — the
@@ -195,6 +206,13 @@ Options:
   --skip-native-tests        skip compiling+running native canaries / arch tests
   -h | --help                show this help
 
+Every --skip-* flag makes the run a DEGRADED DEVELOPMENT RUN: the persisted
+result (build/bootstrap/bootstrap_result.txt and the final log lines) says
+"BOOTSTRAP RESULT: DEGRADED DEVELOPMENT RUN / NOT RELEASE / FIXED-POINT
+EVIDENCE" instead of "BOOTSTRAP RESULT: FULL RUN".  Degraded escape
+environment variables (TG_BOOTSTRAP_ACCEPTED_OVERRIDE,
+TG_GRAMMAR_GATE_ALLOW_PARITY_SKIP) are rejected outright.
+
 Stage 0 (the OCaml seed):
   Stage 0 is built from stage0_ocaml/ with `cd stage0_ocaml && dune build`;
   the stage-0 binary is stage0_ocaml/_build/default/bin/tg_stage0.exe.
@@ -232,6 +250,29 @@ HELP
       ;;
   esac
 done
+
+# ———————————————————————————————————————————————————————————————
+# Degraded-run accounting + escape-valve rejection (audit P0-5)
+# ———————————————————————————————————————————————————————————————
+
+# A run with any --skip-* flag is a DEGRADED DEVELOPMENT RUN: useful for
+# iteration, but NOT release / fixed-point evidence.  The status is
+# printed at every exit and persisted in the log directory so the
+# classification can never be inferred only from scrollback.
+RUN_DEGRADED=0
+if [ "$RUN_LADDER" != "1" ] || [ "$RUN_DETERMINISM" != "1" ] || [ "$RUN_NATIVE_TESTS" != "1" ]; then
+  RUN_DEGRADED=1
+fi
+
+# Forbidden environment escape valves: a full bootstrap never runs under
+# a variable that turns a mandatory semantic test into a skip.  Fails
+# BEFORE any build.
+if [ -x "$ROOT_DIR/scripts/prebootstrap_env_gate.sh" ]; then
+  if ! "$ROOT_DIR/scripts/prebootstrap_env_gate.sh"; then
+    bh_err "full bootstrap refuses degraded escape overrides (see scripts/prebootstrap_env_gate.sh)"
+    exit 1
+  fi
+fi
 
 # ———————————————————————————————————————————————————————————————
 # Step 0 — environment & directories
@@ -512,6 +553,19 @@ fi
 # Summary
 # ———————————————————————————————————————————————————————————————
 
+# The persistent final state: written to the log directory (survives the
+# terminal) and printed.  A degraded run can never be mistaken for
+# release evidence.
+if [ "$RUN_DEGRADED" = "1" ]; then
+  RESULT_LINE="BOOTSTRAP RESULT: DEGRADED DEVELOPMENT RUN"
+  RESULT_NOTE="NOT RELEASE / FIXED-POINT EVIDENCE — re-run without --skip-* for the authoritative result"
+  printf '%s\n%s\n' "$RESULT_LINE" "$RESULT_NOTE" >"$BOOT_LOG_DIR/bootstrap_result.txt"
+else
+  RESULT_LINE="BOOTSTRAP RESULT: FULL RUN"
+  RESULT_NOTE="release evidence: kernel fixed point (stage2 == stage3 at every fingerprinted phase), two-root determinism, native acceptance lanes"
+  printf '%s\n%s\n' "$RESULT_LINE" "$RESULT_NOTE" >"$BOOT_LOG_DIR/bootstrap_result.txt"
+fi
+
 bh_log "== Bootstrap complete =="
 bh_log "stage0:  $STAGE0_BIN (OCaml seed)"
 bh_log "stage1:  $STAGE1"
@@ -520,6 +574,8 @@ bh_log "stage3:  $STAGE3"
 bh_log "tg:      $TG_FULL (full compiler materialized from $DRIVER_FULL_SRC via stage3)"
 bh_log "logs:    $BOOT_LOG_DIR"
 bh_log "milestones: Kernel Stage3 Complete; Full Toolchain Materialization Complete"
+bh_log "$RESULT_LINE"
+bh_log "$RESULT_NOTE"
 bh_log "bootstrap OK"
 
 exit 0

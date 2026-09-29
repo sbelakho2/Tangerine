@@ -91,6 +91,51 @@ let baseline_typecheck_debt : Debt_report.t =
 
 let fail fmt = Printf.ksprintf (fun s -> Printf.printf "BOOTSTRAP GATE: FAIL: %s\n" s; exit 1) fmt
 
+(* ── Self-host preflight helpers (audit P0-2) ─────────────────────
+   The preflight asks the prepared kernel to `check` its own stage1
+   source graph.  Two machine-checkable facts are required beyond the
+   kernel exit code: the exact manifest closure size (the recorded
+   stage1 closure is 45 sources: 14 std + 31 compiler) and the kernel's
+   own TG_CHECK_OK summary naming `tg_compiler/bootstrap_main.tg`. *)
+
+(* The recorded stage-1 closure size.  The manifest remains the single
+   source of truth: this constant pins the exact size the manifold gate
+   authorizes, and the extracted manifest count must agree with it. *)
+let expected_manifest_sources = 45
+
+let manifest_closure_count ~(repo_root : string) : int =
+  let path = Filename.concat repo_root "bootstrap/compiler_kernel.manifest" in
+  let ic = open_in path in
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () ->
+      let count = ref 0 in
+      (try
+         while true do
+           let line = String.trim (input_line ic) in
+           let is_entry =
+             String.length line > 0
+             && line.[0] <> '#'
+             && (String.starts_with ~prefix:"std:" line
+                || String.starts_with ~prefix:"compiler:" line)
+           in
+           if is_entry then incr count
+         done
+       with End_of_file -> ());
+      !count)
+
+(* Extract `name=value` from the TG_CHECK_OK summary line (space-separated
+   fields).  Returns None when the field is absent or empty. *)
+let summary_field (row : string) (name : string) : string option =
+  let prefix = name ^ "=" in
+  let fields = List.filter (fun s -> s <> "") (String.split_on_char ' ' row) in
+  match List.find_opt (fun f -> String.starts_with ~prefix f) fields with
+  | None -> None
+  | Some f -> Some (String.sub f (String.length prefix) (String.length f - String.length prefix))
+
+let parse_int_field (row : string) (name : string) : int option =
+  match summary_field row name with Some v -> int_of_string_opt v | None -> None
+
 (* ── Stage 0: the executable-subset firewall proof ─────────────── *)
 
 (* Each entry: (name, expected code, source).  The source must parse
@@ -320,9 +365,38 @@ let () =
   (* THE canonical closure: the gate consumes Driver.run_bootstrap_closure
      (strict resolution + subset scan + template verify + mono with the
      generic registry + concrete verify + static reachable-host proof +
-     VM + artifact) — the gate no longer reconstructs the pipeline. *)
+     VM + artifact) — the gate no longer reconstructs the pipeline.
+
+     REPOSITORY-ARTIFACT HYGIENE (audit P0-1): the VM artifact lands in
+     build/bootstrap/, never at the repository root.  The path is
+     PID-unique so concurrent gates cannot clobber each other, any stale
+     copy is removed BEFORE the VM run (existence after the run is
+     therefore proof of a fresh artifact, never a leftover), and the
+     artifact is removed again afterwards unless evidence retention is
+     explicitly requested with TG_BOOTSTRAP_KEEP_GATE_ARTIFACT=1. *)
+  let gate_artifact =
+    Printf.sprintf "build/bootstrap/gate_probe.%d" (Unix.getpid ())
+  in
+  let ensure_dir path =
+    let rec go p =
+      if p = "" || p = "." || p = "/" || Sys.file_exists p then ()
+      else begin
+        go (Filename.dirname p);
+        try Unix.mkdir p 0o755 with
+        | Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+        | Unix.Unix_error (e, _, _) ->
+            fail "cannot create the gate artifact directory %s: %s" p
+              (Unix.error_message e)
+      end
+    in
+    go path
+  in
+  let artifact_abs = Filename.concat repo_root gate_artifact in
+  ensure_dir (Filename.dirname artifact_abs);
+  (try Sys.remove artifact_abs with Sys_error _ -> ());
   let kernel_args =
-    [ "compile"; "tests/differential/corpus/01_defs_arith.tg"; "-o"; "bootstrap_gate.out" ]
+    [ "compile"; "tests/differential/corpus/01_defs_arith.tg"; "-o"; gate_artifact;
+      "--target"; target_str ]
   in
   (match
      Driver.run_bootstrap_closure ~repo_root ~manifest_path:"bootstrap/compiler_kernel.manifest"
@@ -419,18 +493,132 @@ let () =
                    "  [9/10] mono (reachable closure): PASS — pre %d -> post %d instances\n"
                    mo.Driver.mo_pre_functions mo.Driver.mo_post_functions;
                  Printf.printf "  [10/10] reachable-host closure + VM run + artifact production\n";
-                 (match stages.Driver.bs_host_report with
-                  | None -> fail "static reachable-host closure proof missing"
-                  | Some _ ->
-                      Printf.printf "  REACHABLE_HOST_CLOSURE = PASS\n";
-                      (match stages.Driver.bs_vm_code with
-                       | None -> fail "VM bootstrap run missing"
-                       | Some code ->
-                           Printf.printf "  VM bootstrap run: exit %d\n" code;
-                           if code <> 0 then fail "nonzero exit from the kernel";
-                           (match stages.Driver.bs_artifact with
-                            | None -> fail "VM exited 0 but produced no artifact"
-                            | Some out_path ->
-                                Printf.printf "  artifact produced: %s\n" out_path)))));
-       Printf.printf "BOOTSTRAP GATE: PASS — full closure through every stage\n";
-       exit 0)
+                  (match stages.Driver.bs_host_report with
+                   | None -> fail "static reachable-host closure proof missing"
+                   | Some _ ->
+                       Printf.printf "  REACHABLE_HOST_CLOSURE = PASS\n";
+                       (match stages.Driver.bs_vm_code with
+                        | None -> fail "VM bootstrap run missing"
+                        | Some code ->
+                            Printf.printf "  VM bootstrap run: exit %d\n" code;
+                            if code <> 0 then fail "nonzero exit from the kernel";
+                            (match stages.Driver.bs_artifact with
+                             | None ->
+                                 fail
+                                   "VM exited 0 but produced no artifact at %s (stale copies are \
+                                    removed before the run — a missing file is a real failure, \
+                                    never masked by a leftover)"
+                                   gate_artifact
+                             | Some out_path ->
+                                 if out_path <> gate_artifact then
+                                   fail "artifact path mismatch: kernel wrote %s, expected %s"
+                                     out_path gate_artifact;
+                                 if not (Sys.file_exists artifact_abs) then
+                                   fail
+                                     "artifact path %s reported but the file does not exist \
+                                      under the repo root"
+                                     gate_artifact;
+                                 Printf.printf "  artifact produced: %s\n" out_path)))));
+        (* ── [11/11] the self-host preflight (audit P0-2) ───────────
+           The artifact run proves the kernel can compile a small
+           program.  This stage proves the kernel can consume its OWN
+           stage1 source graph: the same prepared kernel program is
+           executed in a FRESH VM with `check --strict-resolution
+           tg_compiler/bootstrap_main.tg`.  The check stops after MIR
+           verification (no native codegen/link), and the kernel emits
+           the machine-readable TG_CHECK_OK summary carrying the exact
+           manifest closure size.  Exit 0 in strict mode subsumes zero
+           resolver and zero type diagnostics (the kernel check fails
+           closed on any of them); the gate additionally requires the
+           summary to name bootstrap_main.tg and the exact 45-source
+           closure, so a stale/other input can never false-green. *)
+        Printf.printf
+          "  [11/11] self-host preflight: kernel checks tg_compiler/bootstrap_main.tg (strict resolution, stop after MIR)\n";
+        let manifest_count = manifest_closure_count ~repo_root in
+        if manifest_count <> expected_manifest_sources then
+          fail
+            "manifest closure size changed: bootstrap/compiler_kernel.manifest lists %d sources, \
+             the recorded stage1 closure is %d — update expected_manifest_sources deliberately \
+             (and every pinned count) when the kernel closure grows"
+            manifest_count expected_manifest_sources;
+        let preflight_args =
+          [ "check"; "--strict-resolution"; "tg_compiler/bootstrap_main.tg";
+            "--target"; target_str ]
+        in
+        let pre =
+          match stages.Driver.bs_mono with
+          | None -> fail "mono phase missing for the self-host preflight"
+          | Some mo ->
+              (* instrumented: the preflight is a SECOND kernel VM run and
+                 the gate's timeout cap must be re-pinned from its real
+                 duration (never a blind increase). *)
+              let t0 = Unix.gettimeofday () in
+              let r =
+                Driver.run_prepared_vm ~repo_root ~kernel_args:preflight_args
+                  ~program:(Driver.vm_program_with_folded_queries ctx mo)
+                  ~entry:mo.Driver.mo_entry
+                  ~lang_items:(Typecheck.lang_items_of_env ctx.ctx_env)
+                  ~cache_hit:false ~target
+              in
+              Printf.printf "  phase] self-host preflight VM run: %.1fs\n%!"
+                (Unix.gettimeofday () -. t0);
+              r
+        in
+        (match pre.Driver.bvr_vm_code with
+         | None ->
+             fail
+               "self-host preflight did not complete: %s\nkernel stderr:\n%s"
+               (Option.value ~default:"no VM exit (step/alloc budget or an upstream stage)"
+                  pre.Driver.bvr_trap)
+               pre.Driver.bvr_stderr
+         | Some code when code <> 0 ->
+             fail
+               "self-host preflight FAILED (kernel check exit %d) — the kernel cannot consume \
+                tg_compiler/bootstrap_main.tg\nkernel stdout:\n%s\nkernel stderr:\n%s"
+               code pre.Driver.bvr_stdout pre.Driver.bvr_stderr
+         | Some _ ->
+             let rows =
+               List.filter
+                 (fun l -> String.starts_with ~prefix:"TG_CHECK_OK " l)
+                 (String.split_on_char '\n' pre.Driver.bvr_stdout)
+             in
+             (match rows with
+              | [] ->
+                  fail
+                    "self-host preflight exited 0 without the TG_CHECK_OK summary — refusing \
+                     the false green (stale or wrong kernel binary); stdout:\n%s"
+                    pre.Driver.bvr_stdout
+              | row :: extra -> (
+                  if extra <> [] then
+                    fail "self-host preflight emitted %d TG_CHECK_OK rows (exactly one expected)"
+                      (List.length rows);
+                  (match summary_field row "file" with
+                  | Some f when f = "tg_compiler/bootstrap_main.tg" -> ()
+                  | Some f ->
+                      fail "self-host preflight checked `%s`, not `tg_compiler/bootstrap_main.tg`" f
+                  | None -> fail "self-host preflight summary has no file= field: %s" row);
+                  (match parse_int_field row "sources" with
+                  | Some n when n = expected_manifest_sources -> ()
+                  | Some n ->
+                      fail
+                        "self-host preflight consumed %d source(s), the manifest closure is %d \
+                         — the kernel did not load the exact stage1 source graph"
+                        n expected_manifest_sources
+                  | None -> fail "self-host preflight summary has no sources= field: %s" row);
+                  Printf.printf
+                    "  SELF-HOST PREFLIGHT: PASS — kernel check of tg_compiler/bootstrap_main.tg \
+                     exit 0 over the exact %d-source manifest closure (resolver 0, type 0; \
+                     strict, stop after MIR)\n"
+                    manifest_count)));
+        (* hygiene: never leave the generated probe in the working tree *)
+        if Sys.getenv_opt "TG_BOOTSTRAP_KEEP_GATE_ARTIFACT" = Some "1" then
+          Printf.printf
+            "  artifact retained (TG_BOOTSTRAP_KEEP_GATE_ARTIFACT=1): %s\n"
+            gate_artifact
+        else begin
+          (try Sys.remove artifact_abs with Sys_error _ -> ());
+          Printf.printf "  artifact removed: %s (set TG_BOOTSTRAP_KEEP_GATE_ARTIFACT=1 to retain)\n"
+            gate_artifact
+        end;
+        Printf.printf "BOOTSTRAP GATE: PASS — full closure through every stage\n";
+        Selfcheck_sentinel.emit_and_exit "tg_bootstrap_gate")

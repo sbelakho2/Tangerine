@@ -95,4 +95,4 @@ let () =
   let results = List.map (fun (n, e, s) -> check_snippet n e s) all in
   let passed = List.fold_left (fun acc r -> if r then acc + 1 else acc) 0 results in
   Printf.printf "flowcheck: %d/%d passed\n" passed (List.length all);
-  if passed = List.length all then exit 0 else exit 1
+  if passed = List.length all then Selfcheck_sentinel.emit_and_exit "tg_flowcheck" else exit 1

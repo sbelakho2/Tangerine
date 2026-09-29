@@ -77,12 +77,14 @@ use tg_compiler::asm::{
   x64_setcc, x64_movzx_r64_r8,
   x64_jmp, x64_jcc, x64_call_label, x64_call_extern, x64_call_r,
   x64_ret, x64_push, x64_pop,
-  x64_lea_rip, x64_lea_mem,
+  x64_lea_rip, x64_lea_rip_reloc, x64_lea_mem,
   x64_syscall, x64_nop,
   host_target
 }
 use tg_compiler::object::{ObjectFile, build_object}
-use tg_compiler::linker::{LinkerInput, link_executable}
+use tg_compiler::linker::{
+  LinkerInput, link_executable, inject_start_x64_linux, inject_start_a64_linux
+}
 use tg_compiler::runtime::{emit_all_runtime, runtime_ctx_new}
 use tg_compiler::mono::{type_to_mangled, type_has_params, is_generic_function}
 use tg_compiler::asm::{merge_code_buffer}
@@ -3954,7 +3956,19 @@ end
 # LEA reg, [rip + label] (x86) / ADRP+ADD (arm64)
 def emit_lea_label(inout ctx: CodegenCtx, dst: PhysReg, label: String) -> Unit
   match dst
-  when PhysReg::X64Reg(xd) then x64_lea_rip(&mut ctx.text, xd, label)
+  when PhysReg::X64Reg(xd) then
+    # A label defined in THIS text buffer is a same-section reference and
+    # rides a local fixup.  Any other label (rodata string constants
+    # `.Lstr.N`, data statics) lives in another section: a local fixup
+    # cannot see it — the pre-resolution stub pass would fabricate a RET
+    # stub at the end of .text, pointing the LEA at the stub AND
+    # colliding with the real symbol (the ELF duplicate-symbol error).
+    # Cross-section references are RELOCATIONS, like the A64 branch below.
+    if ctx.text.labels.contains_key(label.clone()) then
+      x64_lea_rip(&mut ctx.text, xd, label)
+    else
+      x64_lea_rip_reloc(&mut ctx.text, xd, label, RelocKind::R_X86_64_PC32, -4)
+    end
   when PhysReg::A64Reg(ad) then
     # ADRP + ADD (needs page-relative relocations)
     add_reloc(&mut ctx.text, RelocKind::R_AARCH64_ADR_PREL_PG_HI21, label.clone(), 0)
@@ -17347,6 +17361,41 @@ def codegen_program(inout ctx: CodegenCtx, program: MirProgram) -> Result[Unit, 
     when Option::Some(_) then ()
     end
     fi = fi + 1
+  end
+
+  # (the platform entry): the language entry is the program's `main`, but
+  # the LINUX linker's default entry symbol is `_start` (see
+  # linker_resolve_entry_name) — the object must DEFINE it.  Inject the
+  # platform startup that calls main(argc, argv) and exits, exactly once,
+  # unless the program already defines `_start` (the bare/no_std entry).
+  # The macOS route enters at `main` directly and the bare-metal targets
+  # define their own reset handler, so this is Linux-only.  The injected
+  # call rides a LOCAL fixup resolved against main's label here; the
+  # symbol registered below carries the global identity the ELF linker
+  # validates.
+  if ctx.target.os == OsAbi::Linux && !ctx.text.labels.contains_key("_start") then
+    let start_off = buf_pos(&ctx.text)
+    # Direct calls resolve LABELS, not public symbol names: the program
+    # entry's compiled label is the fn_alias identity (".Lfn_entry.N").
+    let main_label = match ctx.fn_alias.get("main")
+    when Option::Some(l) then l.clone()
+    when Option::None then "main".to_string()
+    end
+    match ctx.target.arch
+    when Arch::X86_64 then inject_start_x64_linux(&mut ctx.text, main_label.clone())
+    when Arch::AArch64 then inject_start_a64_linux(&mut ctx.text, main_label.clone())
+    when _ then ()
+    end
+    if ctx.text.labels.contains_key("_start") then
+      add_symbol(&mut ctx.text, AsmSymbol {
+        name: "_start".to_string(),
+        section: Section::Text,
+        offset: start_off,
+        size: buf_pos(&ctx.text) - start_off,
+        binding: SymBinding::Global,
+        kind: SymKind::Func
+      })
+    end
   end
 
   # Resolve local branch fixups

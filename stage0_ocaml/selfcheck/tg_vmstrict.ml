@@ -39,7 +39,7 @@ let instance (callable : int) : Instance_id.t =
 
 let run_program (prog : Seed_mir.program) : (int, Vm.vm_error) result =
   let entry = prog.Seed_mir.functions.(0).Seed_mir.instance in
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] () in
   Vm.run ~program:prog ~entry ~argv:[||] ~host
 
 (* ── (a) division / remainder by zero, and signed min / -1 ────────── *)
@@ -280,4 +280,4 @@ let () =
   check_block_id_invariant ();
   check_memory ();
   Printf.printf "OK: vm strictness self-check passed\n";
-  exit 0
+  Selfcheck_sentinel.emit_and_exit "tg_vmstrict"

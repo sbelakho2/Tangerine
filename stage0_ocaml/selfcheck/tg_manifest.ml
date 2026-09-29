@@ -9,7 +9,10 @@
        fails to load (no fabricated empty source/hash snapshot);
    (e) a manifest registering the same logical module path twice is
        rejected (logical-path uniqueness, separate from file
-       uniqueness). *)
+       uniqueness);
+   (f) the REAL manifest is the exact recorded stage-1 closure:
+       45 records = 14 std + 31 compiler, bootstrap_main.tg exactly
+       once (the same closure the self-host preflight asserts). *)
 
 let fail fmt = Printf.ksprintf (fun s -> Printf.printf "FAIL: %s\n" s; exit 1) fmt
 
@@ -59,8 +62,38 @@ let () =
          | Some v -> v
          | None -> fail "real manifest has no version"
        in
-       let n = List.length (Bootstrap_manifest.entries manifest) in
-       Printf.printf "  real manifest version %s, %d entries: PASS\n" v n);
+       let entries = Bootstrap_manifest.entries manifest in
+       let n = List.length entries in
+       (* the EXACT kernel closure composition (audit P1-11 manifest
+          structure): 45 records = 14 std + 31 compiler, and the kernel
+          entry point exactly once.  This pins the recorded stage1
+          closure the self-host preflight also asserts. *)
+       if n <> 45 then
+         fail "real manifest has %d entries, expected exactly 45 (14 std + 31 compiler)" n;
+       let count_prefix p =
+         List.length
+           (List.filter
+              (fun (e : Bootstrap_manifest.module_entry) ->
+                String.starts_with ~prefix:p e.Bootstrap_manifest.file)
+              entries)
+       in
+       let std_n = count_prefix "std/" in
+       let compiler_n = count_prefix "tg_compiler/" in
+       if std_n <> 14 then fail "real manifest has %d std entries, expected 14" std_n;
+       if compiler_n <> 31 then
+         fail "real manifest has %d compiler entries, expected 31" compiler_n;
+       let main_n =
+         List.length
+           (List.filter
+              (fun (e : Bootstrap_manifest.module_entry) ->
+                e.Bootstrap_manifest.file = "tg_compiler/bootstrap_main.tg")
+              entries)
+       in
+       if main_n <> 1 then
+         fail "bootstrap_main.tg must appear exactly once in the kernel manifest (found %d)" main_n;
+       Printf.printf
+         "  real manifest version %s, %d entries (14 std + 31 compiler), bootstrap_main exactly once: PASS\n"
+         v n);
   (* (d) single: source-load failure is an Error, never an empty snapshot *)
   (match
      Bootstrap_manifest.single
@@ -94,4 +127,4 @@ let () =
   Unix.rmdir repo;
   Unix.rmdir dir;
   Printf.printf "ALL MANIFEST PASS\n";
-  exit 0
+  Selfcheck_sentinel.emit_and_exit "tg_manifest"

@@ -149,4 +149,4 @@ let () =
   (try rm_rf tmp
    with Sys_error e -> Printf.printf "  (cleanup warning: %s)\n" e);
   Printf.printf "ALL HOST FS PASS\n";
-  exit 0
+  Selfcheck_sentinel.emit_and_exit "tg_hostfs"

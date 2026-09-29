@@ -123,7 +123,7 @@ let () =
             restore ();
             Printf.printf
               "tg_a4: PASS — the kernel typed channels recorded the corpus with zero internal errors (VM exit 0)\n";
-            exit 0
+            Selfcheck_sentinel.emit_and_exit "tg_a4"
           end
           else
             fail

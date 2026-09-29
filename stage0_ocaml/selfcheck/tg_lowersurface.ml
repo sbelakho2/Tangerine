@@ -611,7 +611,7 @@ end
                        Printf.printf "%s\n" (Seed_mir.print_program cprog_mir);
                        exit 1);
                   let c_entry = main_fn.Seed_mir.instance in
-                  let chost = Host.create ~repo_root:"." ~argv:[||] in
+                  let chost = Host.create ~repo_root:"." ~argv:[||] () in
                   (match Vm.run ~program:cprog_mir ~entry:c_entry ~argv:[||] ~host:chost with
                    | Error e ->
                        Printf.printf "  static-ctor VM: FAIL %s\n" e.Vm.message;
@@ -721,7 +721,7 @@ end
                        Printf.printf "%s\n" (Seed_mir.print_program dprog_mir);
                        exit 1);
                   let d_entry = dmain_fn.Seed_mir.instance in
-                  let dhost = Host.create ~repo_root:"." ~argv:[||] in
+                  let dhost = Host.create ~repo_root:"." ~argv:[||] () in
                   (match Vm.run ~program:dprog_mir ~entry:d_entry ~argv:[||] ~host:dhost with
                    | Error e ->
                        Printf.printf "  const-call VM: FAIL %s\n" e.Vm.message;
@@ -833,7 +833,7 @@ end
                   if not verify_ok then exit 1
                   else
                     let s_entry = s_fns.(0).Seed_mir.instance in
-                    let shost = Host.create ~repo_root:"." ~argv:[||] in
+                    let shost = Host.create ~repo_root:"." ~argv:[||] () in
                     (match Vm.run ~program:sprog_mir ~entry:s_entry ~argv:[||] ~host:shost with
                      | Error e ->
                          Printf.printf "  mutable static VM: FAIL %s\n" e.Vm.message;
@@ -1004,7 +1004,7 @@ end
                        List.iter (fun e -> Printf.printf "    %s\n" e) errs;
                        exit 1);
                   let d_entry = dmain_fn.Seed_mir.instance in
-                  let dhost = Host.create ~repo_root:"." ~argv:[||] in
+                  let dhost = Host.create ~repo_root:"." ~argv:[||] () in
                   (match Vm.run ~program:dprog_mir ~entry:d_entry ~argv:[||] ~host:dhost with
                    | Error e ->
                        Printf.printf "  destructuring-let VM: FAIL %s\n" e.Vm.message;
@@ -1126,7 +1126,7 @@ end
                        List.iter (fun e -> Printf.printf "    %s\n" e) errs;
                        exit 1);
                   let sentry = smain_fn.Seed_mir.instance in
-                  let shost = Host.create ~repo_root:"." ~argv:[||] in
+                  let shost = Host.create ~repo_root:"." ~argv:[||] () in
                   (match Vm.run ~program:sprog_mir ~entry:sentry ~argv:[||] ~host:shost with
                    | Error e ->
                        Printf.printf "  runtime Set iteration VM: FAIL %s\n" e.Vm.message;
@@ -1235,7 +1235,7 @@ end
                        List.iter (fun e -> Printf.printf "    %s\n" e) errs;
                        exit 1);
                   let mrentry = mrmain_fn.Seed_mir.instance in
-                  let mrhost = Host.create ~repo_root:"." ~argv:[||] in
+                  let mrhost = Host.create ~repo_root:"." ~argv:[||] () in
                   (match Vm.run ~program:mrprog_mir ~entry:mrentry ~argv:[||] ~host:mrhost with
                    | Error e ->
                        Printf.printf "  runtime Map iteration VM: FAIL %s\n" e.Vm.message;
@@ -1340,7 +1340,7 @@ end
                        List.iter (fun e -> Printf.printf "    %s\n" e) errs;
                        exit 1);
                   let stentry = stmain_fn.Seed_mir.instance in
-                  let sthost = Host.create ~repo_root:"." ~argv:[||] in
+                  let sthost = Host.create ~repo_root:"." ~argv:[||] () in
                   (match Vm.run ~program:stprog_mir ~entry:stentry ~argv:[||] ~host:sthost with
                    | Error e ->
                        Printf.printf "  runtime String iteration VM: FAIL %s\n" e.Vm.message;
@@ -1455,7 +1455,7 @@ end
                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
                       exit 1);
                  let flentry = flmain_fn.Seed_mir.instance in
-                 let flhost = Host.create ~repo_root:"." ~argv:[||] in
+                 let flhost = Host.create ~repo_root:"." ~argv:[||] () in
                  (match Vm.run ~program:flprog_mir ~entry:flentry ~argv:[||] ~host:flhost with
                   | Error e ->
                       Printf.printf "  flow nested-break-in-loop VM: FAIL %s\n" e.Vm.message;
@@ -1541,7 +1541,7 @@ end
                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
                       exit 1);
                  let fle2 = flfn2.Seed_mir.instance in
-                 let flh2 = Host.create ~repo_root:"." ~argv:[||] in
+                 let flh2 = Host.create ~repo_root:"." ~argv:[||] () in
                  (match Vm.run ~program:flp2m ~entry:fle2 ~argv:[||] ~host:flh2 with
                   | Error e ->
                       Printf.printf "  flow loop-return VM: FAIL %s\n" e.Vm.message;
@@ -1652,7 +1652,7 @@ end
                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
                       exit 1);
                  let ioentry = iofn.Seed_mir.instance in
-                 let iohost = Host.create ~repo_root:"." ~argv:[||] in
+                 let iohost = Host.create ~repo_root:"." ~argv:[||] () in
                  (match Vm.run ~program:ioprog_mir ~entry:ioentry ~argv:[||] ~host:iohost with
                   | Error e ->
                       Printf.printf "  inout writeback VM: FAIL %s\n" e.Vm.message;
@@ -1786,7 +1786,7 @@ end
                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
                       exit 1);
                  let ixentry = ixfn.Seed_mir.instance in
-                 let ixhost = Host.create ~repo_root:"." ~argv:[||] in
+                 let ixhost = Host.create ~repo_root:"." ~argv:[||] () in
                  (match Vm.run ~program:ixprog_mir ~entry:ixentry ~argv:[||] ~host:ixhost with
                   | Error e -> Printf.printf "  insert-contract VM: FAIL %s\n" e.Vm.message; exit 1
                   | Ok code -> (
@@ -1890,7 +1890,7 @@ end
                       List.iter (fun e -> Printf.printf "    %s\n" e) errs;
                       exit 1);
                  let ssentry = (ss_lower "main").Seed_mir.instance in
-                 let sshost = Host.create ~repo_root:"." ~argv:[||] in
+                 let sshost = Host.create ~repo_root:"." ~argv:[||] () in
                  (match Vm.run ~program:ssprog_mir ~entry:ssentry ~argv:[||] ~host:sshost with
                   | Error e -> Printf.printf "  Set-ABI VM: FAIL %s\n" e.Vm.message; exit 1
                   | Ok code -> (
@@ -1990,7 +1990,7 @@ end
                        List.iter (fun e -> Printf.printf "    %s\n" e) errs;
                        exit 1);
                   let v_entry = vmain_fn.Seed_mir.instance in
-                  let vhost = Host.create ~repo_root:"." ~argv:[||] in
+                  let vhost = Host.create ~repo_root:"." ~argv:[||] () in
                   (match Vm.run ~program:vprog_mir ~entry:v_entry ~argv:[||] ~host:vhost with
                    | Error e ->
                        Printf.printf "  runtime Vec iteration VM: FAIL %s\n" e.Vm.message;
@@ -3085,7 +3085,7 @@ end
         | Some f -> f.Seed_mir.instance
         | None -> failwith "no main function"
       in
-      let host = Host.create ~repo_root:"." ~argv:[||] in
+      let host = Host.create ~repo_root:"." ~argv:[||] () in
       (match Vm.run ~program:prog ~entry ~argv:[||] ~host with
        | Error e ->
            Printf.printf "  VM: FAIL %s\n" e.Vm.message;
@@ -3424,7 +3424,7 @@ end
         | Some f -> f.Seed_mir.instance
         | None -> failwith "struct-field proof: no main function"
       in
-      let fhost = Host.create ~repo_root:"." ~argv:[||] in
+      let fhost = Host.create ~repo_root:"." ~argv:[||] () in
       (match Vm.run ~program:fprog ~entry:fentry ~argv:[||] ~host:fhost with
        | Error e ->
            Printf.printf "  struct-field VM: FAIL %s\n" e.Vm.message;
@@ -3678,7 +3678,7 @@ end
         | Some f -> f.Seed_mir.instance
         | None -> failwith "writeback proof: no main function"
       in
-      let wbhost = Host.create ~repo_root:"." ~argv:[||] in
+      let wbhost = Host.create ~repo_root:"." ~argv:[||] () in
       (match Vm.run ~program:wbprog ~entry:wb_entry ~argv:[||] ~host:wbhost with
        | Error e ->
            Printf.printf "  writeback VM: FAIL %s\n" e.Vm.message;
@@ -4256,7 +4256,7 @@ end
         | Some f -> f.Seed_mir.instance
         | None -> failwith "nested-function proof: no main function"
       in
-      let nhost = Host.create ~repo_root:"." ~argv:[||] in
+      let nhost = Host.create ~repo_root:"." ~argv:[||] () in
       (match Vm.run ~program:nprog ~entry:nentry ~argv:[||] ~host:nhost with
        | Error e ->
            Printf.printf "  nested-function VM: FAIL %s\n" e.Vm.message;
@@ -4533,7 +4533,7 @@ end
          | Some f -> f.Seed_mir.instance
          | None -> failwith "struct-lit proof: no main function"
        in
-       let lhost = Host.create ~repo_root:"." ~argv:[||] in
+       let lhost = Host.create ~repo_root:"." ~argv:[||] () in
        (match Vm.run ~program:lprog ~entry:lentry ~argv:[||] ~host:lhost with
         | Error e ->
             Printf.printf "  struct-lit VM: FAIL %s\n" e.Vm.message;
@@ -4652,7 +4652,7 @@ end
          | Some f -> f.Seed_mir.instance
          | None -> failwith "partial-move proof: no main function"
        in
-       let phost = Host.create ~repo_root:"." ~argv:[||] in
+       let phost = Host.create ~repo_root:"." ~argv:[||] () in
        (match Vm.run ~program:pprog ~entry:pentry ~argv:[||] ~host:phost with
         | Error e ->
             Printf.printf "  partial-move VM: FAIL %s\n" e.Vm.message;
@@ -5012,7 +5012,7 @@ end
          | Some f -> f.Seed_mir.instance
          | None -> failwith "method-call proof: no main function"
        in
-       let mhost = Host.create ~repo_root:"." ~argv:[||] in
+       let mhost = Host.create ~repo_root:"." ~argv:[||] () in
        (match Vm.run ~program:mprog ~entry:mentry ~argv:[||] ~host:mhost with
         | Error e ->
             Printf.printf "  method-call VM: FAIL %s\n" e.Vm.message;
@@ -5410,7 +5410,7 @@ end
          | Some f -> f.Seed_mir.instance
          | None -> failwith "no-closure proof: no main function"
        in
-       let noc_host = Host.create ~repo_root:"." ~argv:[||] in
+       let noc_host = Host.create ~repo_root:"." ~argv:[||] () in
        (match Vm.run ~program:noc_prog ~entry:noc_entry ~argv:[||] ~host:noc_host with
         | Error e ->
             Printf.printf "  no-closure VM: FAIL %s\n" e.Vm.message;
@@ -5756,7 +5756,7 @@ end
          | Some f -> f.Seed_mir.instance
          | None -> failwith "qualified-call proof: no main function"
        in
-       let qhost = Host.create ~repo_root:"." ~argv:[||] in
+       let qhost = Host.create ~repo_root:"." ~argv:[||] () in
        (match Vm.run ~program:qprog ~entry:qentry ~argv:[||] ~host:qhost with
         | Error e ->
             Printf.printf "  qualified-call VM: FAIL %s\n" e.Vm.message;
@@ -6193,7 +6193,7 @@ end
             Printf.printf "%s\n" (Seed_mir.print_program sqprog);
             exit 1);
        let sqentry = sqmain_fn.Seed_mir.instance in
-       let sqhost = Host.create ~repo_root:"." ~argv:[||] in
+       let sqhost = Host.create ~repo_root:"." ~argv:[||] () in
        (match Vm.run ~program:sqprog ~entry:sqentry ~argv:[||] ~host:sqhost with
         | Error e ->
             Printf.printf "  String qualified-call VM: FAIL %s\n" e.Vm.message;
@@ -6412,7 +6412,7 @@ end
          | Some f -> f.Seed_mir.instance
          | None -> failwith "qualified-ctor proof: no main function"
        in
-       let qc_host = Host.create ~repo_root:"." ~argv:[||] in
+       let qc_host = Host.create ~repo_root:"." ~argv:[||] () in
        (match Vm.run ~program:qc_prog ~entry:qc_entry ~argv:[||] ~host:qc_host with
         | Error e ->
             Printf.printf "  qualified-ctor VM: FAIL %s\n" e.Vm.message;
@@ -6599,3 +6599,5 @@ end
               Printf.printf "  self-having qualified call: FAIL (wrong Seed_bug: %s)\n" m;
               exit 1
             end)
+
+let () = Selfcheck_sentinel.emit "tg_lowersurface"

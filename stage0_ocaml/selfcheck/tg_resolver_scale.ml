@@ -107,7 +107,7 @@ let run_probe repo_root budget =
           Printf.printf
             "tg_resolver_scale: PASS — %s symbols x %s refs resolved by the kernel resolver under the calibrated %s-step VM budget (wall %.1fs)\n"
             symbols refs budget dt;
-          exit 0
+          Selfcheck_sentinel.emit_and_exit "tg_resolver_scale"
       | Some code ->
           fail
             "kernel resolver scale probe FAILED: VM exit %d (see build/resolver_scale_report.txt)"

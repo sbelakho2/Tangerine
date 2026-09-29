@@ -70,7 +70,7 @@ let () =
               report_path;
           Printf.printf
             "tg_spawnprobe: PASS — echo/stdout, sh/stderr-exit7 and codesign/stderr all crossed the seed VM's process boundary\n";
-          exit 0
+          Selfcheck_sentinel.emit_and_exit "tg_spawnprobe"
       | Some code ->
           if Sys.file_exists report_path then
             Printf.printf "spawnprobe report:\n%s"

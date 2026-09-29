@@ -6,36 +6,59 @@
 # per-module import authority, the nested-definition surfaces, or the
 # same-spelled-symbol determinism) otherwise surfaces only after the whole
 # stage1 build. This probe runs the REAL kernel front end over every
-# closure source inside the seed VM: it parses each file, merges them into
-# ONE Program with the per-file Module table (each file's items stamped
-# with their owner ModuleId — the same shape compiler_core's
-# merge_imported_deps produces), assigns node ids, and runs resolve_names.
-# The probe fails when any file fails to parse or the resolver records ANY
-# error (an error here is a strict-resolution diagnostic: the seed's own
-# audit of the same closure is 0).
+# closure source inside the seed VM:
+#
+#   1. CANONICAL MERGE SHAPE: the probe reproduces the production merge
+#      order of merge_imported_deps — the root module (id 0) is the parsed
+#      tg_compiler/bootstrap_main.tg, every manifest source (sorted std
+#      files, then sorted compiler files, the SAME
+#      bootstrap_manifest_sources order production uses) is loaded as its
+#      own file module with the next id, each item is stamped with its
+#      owner ModuleId, and each Module.imports carries its use-declaration
+#      path joins exactly like collect_dep_file builds them.  (The old
+#      probe manufactured a root-less module table with `imports:
+#      Vec::new()` — that divergence is what this lane exists to catch.)
+#   2. THE ADVERSARIAL MICROCORPUS: tiny multi-module sources exercising
+#      the resolution authority order — explicit import over cross-module
+#      ambiguity, own-module shadowing, two/three-foreign ambiguity,
+#      kind-filter discrimination (type vs trait, callable vs static),
+#      multi-segment qualified suffix identity, and re-checked import
+#      bindings.
+#   3. THE SUFFIX-INDEX SCAN ORACLE: for the REAL resolution result (and
+#      for synthetic type-checked programs), every candidate bucket of
+#      symbol_suffix_index / type_name_suffix_index / callable_suffix_index
+#      is compared against the OLD reference algorithm — a full scan of
+#      the live authoritative map.  The production index is O(1); the
+#      oracle stays the straightforward scan and the two must agree,
+#      including registration order and re-registration semantics.
 #
 # The probe reads bootstrap/compiler_kernel.manifest itself (std:/compiler:
 # entries, resolved against the harness repo root), so the gate cannot
 # drift from the manifest the bootstrap compiles.
 #
-# main returns 0 iff every closure file parsed clean and resolve_names
-# reported zero errors; 1 otherwise. Per-error rows (message + the owning
-# file/offset) are written to build/resolution_parity_report.txt and echoed
-# to stdout.
+# main returns 0 iff every closure file parsed clean, resolve_names reported
+# zero errors, the microcorpus met every expectation, and every suffix
+# bucket equalled its scan oracle; 1 otherwise. Per-row evidence is written
+# to build/resolution_parity_report.txt and echoed to stdout.
 
 use std::core::{Option, Result, String}
-use std::collections::{Vec, Map}
+use std::collections::{Vec, Map, Set}
 use std::fs::{read_file, write_file}
 use std::io::{println}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::parser::{parse, diag_has_errors}
-use tg_compiler::ast::{Program, Crate, Module, Item, assign_node_ids}
+use tg_compiler::ast::{Program, Crate, Module, Item, ItemId, ModuleId, ItemKind, assign_node_ids}
 use tg_compiler::token::{Span}
-use tg_compiler::ids::{ModuleId, ItemId}
-use tg_compiler::resolver::{resolve_names}
+use tg_compiler::ids::{DefId}
+use tg_compiler::resolver::{resolve_names, resolve_names_partial, ResolvedNames}
+use tg_compiler::types::{type_env_new, type_check_typed}
+
+# ── canonical manifest order (mirrors compiler_core.bootstrap_manifest_sources:
+# sorted std files, then sorted compiler files) ─────────────────────────
 
 def resolution_parity_collect_paths(source: String) -> Vec[String]
-  var paths = Vec::new()
+  var std_files = Vec::new()
+  var compiler_files = Vec::new()
   for line in source.split("\n") do
     let trimmed = line.trim()
     if !trimmed.is_empty() && !trimmed.starts_with("#") then
@@ -44,15 +67,24 @@ def resolution_parity_collect_paths(source: String) -> Vec[String]
         let kind = parts.0.trim()
         let rel = parts.1.trim()
         if kind == "std:" then
-          paths.push("std/" + rel)
+          std_files.push(rel)
         elsif kind == "compiler:" then
-          paths.push("tg_compiler/" + rel)
+          compiler_files.push(rel)
         end
       when Option::None then ()
       end
     end
   end
-  paths
+  std_files.sort()
+  compiler_files.sort()
+  var out = Vec::new()
+  for f in std_files do
+    out.push("std/" + f.clone())
+  end
+  for f in compiler_files do
+    out.push("tg_compiler/" + f.clone())
+  end
+  out
 end
 
 # "std/alloc.tg" -> ["std", "alloc"] (the Module.path the resolver's
@@ -72,6 +104,424 @@ def resolution_parity_module_path(path: String) -> Vec[String]
   out
 end
 
+# The Module.imports production's collect_dep_file builds: the path join of
+# every top-level use declaration, in source order.
+def resolution_parity_module_imports(items: Vec[Item]) -> Vec[String]
+  var imports = Vec::new()
+  for item in items do
+    match item.kind
+    when ItemKind::ItemUse(u) then imports.push(u.path.segments.join("::"))
+    when _ then ()
+    end
+  end
+  imports
+end
+
+# Append one parsed file as a module: stamp every item's owner_module,
+# record the module's flat item ids and import joins, and return the new
+# ModuleId (the canonical processing-order id).
+def resolution_parity_merge_parsed(path: String, parsed: Program, inout items: Vec[Item], inout modules: Map[ModuleId, Module]) -> ModuleId
+  let mid = ModuleId { id: modules.len() }
+  var start = items.len()
+  for item in parsed.items do
+    var owned = item.clone()
+    owned.owner_module = ModuleId { id: mid.id }
+    items.push(owned)
+  end
+  var mod_items = Vec::new()
+  var k = start
+  while k < items.len() do
+    mod_items.push(ItemId { id: k })
+    k = k + 1
+  end
+  modules.insert(mid, Module {
+    id: mid,
+    path: resolution_parity_module_path(path.clone()),
+    items: mod_items,
+    imports: resolution_parity_module_imports(&parsed.items)
+  })
+  mid
+end
+
+# ── the suffix-index scan oracle ───────────────────────────────────────
+# Production: an O(1) bucket lookup in the maintained suffix index.
+# Oracle: the OLD reference algorithm — scan every key of the live
+# authoritative map in insertion order and match
+# `key == suffix || key.ends_with("::" + suffix)`.
+# The two candidate-key sequences must be identical (order included).
+
+def resolution_parity_scan_keys(live_keys: Vec[String], suffix: String) -> Vec[String]
+  var out = Vec::new()
+  let needle = "::" + suffix.clone()
+  for key in live_keys do
+    if key == suffix.clone() || key.ends_with(needle.clone()) then
+      out.push(key.clone())
+    end
+  end
+  out
+end
+
+def resolution_parity_same_keys(a: Vec[String], b: Vec[String]) -> Bool
+  if a.len() != b.len() then
+    return false
+  end
+  var i = 0
+  while i < a.len() do
+    if a[i] != b[i] then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+# Compare one suffix index against the scan oracle over `live_keys`.
+# `max_queries` bounds the (query x key) scan cost for the real closure;
+# every suffix of every live key is a query when the budget allows.
+def resolution_parity_check_index(label: String, index: Map[String, Vec[String]], live_keys: Vec[String], max_queries: Int, inout report: String, inout failures: Int) -> Unit
+  # every query derived from a live key must equal its full scan
+  var queries = Vec::new()
+  var seen = Set::new()
+  for key in live_keys do
+    let segs = key.clone().split("::")
+    var si = 0
+    while si < segs.len() do
+      let q = segs.slice(si, segs.len()).join("::")
+      if !seen.contains(&q) then
+        seen.insert(q.clone())
+        queries.push(q)
+      end
+      si = si + 1
+    end
+  end
+  var checked = 0
+  var mismatches = 0
+  var stride = 1
+  if max_queries > 0 && queries.len() > max_queries then
+    stride = 1 + queries.len() / max_queries
+  end
+  var qi = 0
+  while qi < queries.len() do
+    let q = queries[qi].clone()
+    let bucket = match index.get(&q)
+    when Option::Some(v) then v
+    when Option::None then Vec::new()
+    end
+    let scanned = resolution_parity_scan_keys(&live_keys, q.clone())
+    if !resolution_parity_same_keys(&bucket, &scanned) then
+      mismatches = mismatches + 1
+      if mismatches <= 5 then
+        report = report + "SUFFIX " + label.clone() + " query `" + q.clone() + "`: bucket " + bucket.len().to_string() + " key(s), scan " + scanned.len().to_string() + " key(s)\n"
+      end
+    end
+    checked = checked + 1
+    qi = qi + stride
+  end
+  # reverse direction: every bucket key must be live and match its suffix
+  var stale = 0
+  var live_set = Set::new()
+  for key in live_keys do
+    live_set.insert(key.clone())
+  end
+  for (suffix, bucket) in index.entries() do
+    for key in bucket do
+      var matches = key == suffix.clone() || key.ends_with("::" + suffix.clone())
+      if !matches || !live_set.contains(&key) then
+        stale = stale + 1
+        if stale <= 5 then
+          report = report + "SUFFIX " + label.clone() + " STALE bucket key `" + key.clone() + "` under `" + suffix.clone() + "`\n"
+        end
+      end
+    end
+  end
+  if mismatches > 0 || stale > 0 then
+    failures = failures + 1
+    report = report + "SUFFIX " + label.clone() + ": FAIL (" + checked.to_string() + " quer(ies) checked, " + mismatches.to_string() + " mismatch(es), " + stale.to_string() + " stale key(s))\n"
+  else
+    report = report + "SUFFIX " + label.clone() + ": PASS (" + checked.to_string() + " quer(ies) vs full scan; no stale bucket keys)\n"
+  end
+end
+
+# An explicitly-typed empty expectation list (an untyped `resolution_parity_no_msgs()` leaves
+# the element type unbound in the seed checker).
+def resolution_parity_no_msgs() -> Vec[String]
+  Vec::new()
+end
+
+# ── the adversarial microcorpus ────────────────────────────────────────
+
+def resolution_parity_build_program(label: String, names: Vec[String], sources: Vec[String], inout report: String) -> Option[Program]
+  var items = Vec::new()
+  var modules: Map[ModuleId, Module] = Map::new()
+  var bad = false
+  var i = 0
+  while i < names.len() do
+    let parsed = parse(tokenize(sources[i].clone(), label.clone() + "::" + names[i].clone()))
+    if diag_has_errors(&parsed.diagnostics) then
+      bad = true
+      report = report + "CORPUS " + label.clone() + ": PARSE FAIL (module " + names[i].clone() + ")\n"
+      for d in parsed.diagnostics do
+        report = report + "  " + d.message + "\n"
+      end
+    else
+      var mid = ModuleId { id: i }
+      var start = items.len()
+      for item in parsed.program.items do
+        var owned = item.clone()
+        owned.owner_module = ModuleId { id: mid.id }
+        items.push(owned)
+      end
+      var mod_items = Vec::new()
+      var k = start
+      while k < items.len() do
+        mod_items.push(ItemId { id: k })
+        k = k + 1
+      end
+      modules.insert(mid, Module {
+        id: mid,
+        path: names[i].clone().split("::"),
+        items: mod_items,
+        imports: resolution_parity_module_imports(&parsed.program.items)
+      })
+    end
+    i = i + 1
+  end
+  if bad then
+    Option::None
+  else
+    Option::Some(Program {
+      items: items,
+      crate: Crate { root: ModuleId { id: 0 }, modules: modules },
+      span: Span { file: label.clone(), start: 0, end_pos: 0 }
+    })
+  end
+end
+
+# Run one microcorpus case: resolve the assembled program and require every
+# `must_contain` substring in at least one diagnostic message and no
+# `must_not_contain` substring in any message.  A clean resolution passes
+# only when `must_contain` is empty.
+def resolution_parity_case(label: String, names: Vec[String], sources: Vec[String], must_contain: Vec[String], must_not_contain: Vec[String], inout report: String, inout failures: Int) -> Unit
+  match resolution_parity_build_program(label.clone(), names, sources, &mut report)
+  when Option::None then
+    failures = failures + 1
+  when Option::Some(program) then
+    var program = program
+    assign_node_ids(&mut program)
+    match resolve_names(program)
+    when Result::Ok(_res) then
+      if must_contain.len() > 0 then
+        failures = failures + 1
+        report = report + "CORPUS " + label.clone() + ": FAIL expected diagnostic(s) [" + must_contain.join(", ") + "] but resolution succeeded cleanly\n"
+      else
+        report = report + "CORPUS " + label.clone() + ": PASS (clean resolution)\n"
+      end
+    when Result::Err(errs) then
+      var ok = true
+      var mi = 0
+      while mi < must_contain.len() do
+        let want = must_contain[mi].clone()
+        var found = false
+        for e in errs do
+          if e.message.contains(want.clone()) then
+            found = true
+          end
+        end
+        if !found then
+          ok = false
+          report = report + "CORPUS " + label.clone() + ": MISSING diagnostic containing `" + want.clone() + "`\n"
+        end
+        mi = mi + 1
+      end
+      var fi = 0
+      while fi < must_not_contain.len() do
+        let forbidden = must_not_contain[fi].clone()
+        for e in errs do
+          if e.message.contains(forbidden.clone()) then
+            ok = false
+            report = report + "CORPUS " + label.clone() + ": FORBIDDEN diagnostic `" + e.message.clone() + "`\n"
+          end
+        end
+        fi = fi + 1
+      end
+      if ok then
+        report = report + "CORPUS " + label.clone() + ": PASS (" + errs.len().to_string() + " diagnostic(s), all expectations met)\n"
+      else
+        failures = failures + 1
+      end
+    end
+  end
+end
+
+# Type-check a synthetic program with the REAL kernel checker and compare
+# the type/callable suffix indexes it maintains against the scan oracle.
+def resolution_parity_type_index_case(label: String, names: Vec[String], sources: Vec[String], expect_clean: Bool, inout report: String, inout failures: Int) -> Unit
+  match resolution_parity_build_program(label.clone(), names, sources, &mut report)
+  when Option::None then
+    failures = failures + 1
+  when Option::Some(program) then
+    var program = program
+    assign_node_ids(&mut program)
+    match resolve_names(program)
+    when Result::Err(errs) then
+      failures = failures + 1
+      report = report + "CORPUS " + label.clone() + ": FAIL resolution failed before the index oracle (" + errs.len().to_string() + " diagnostic(s))\n"
+    when Result::Ok(res) then
+      var env = type_env_new()
+      env.strict_resolution = true
+      let result = type_check_typed(&mut env, &program, &res)
+      var type_keys = Vec::new()
+      for (key, _v) in env.module_type_names.entries() do
+        type_keys.push(key.clone())
+      end
+      var callable_keys = Vec::new()
+      for (key, _v) in env.module_callable_types.entries() do
+        callable_keys.push(key.clone())
+      end
+      resolution_parity_check_index(label.clone() + "/type_name", env.type_name_suffix_index, type_keys, 0, &mut report, &mut failures)
+      resolution_parity_check_index(label.clone() + "/callable", env.callable_suffix_index, callable_keys, 0, &mut report, &mut failures)
+      if expect_clean && result.errors.len() > 0 then
+        failures = failures + 1
+        report = report + "CORPUS " + label.clone() + ": FAIL expected a clean typecheck (kind-filter discrimination), got " + result.errors.len().to_string() + " error(s)\n"
+        for e in result.errors do
+          report = report + "  CHECK " + e.message + "\n"
+        end
+      else
+        report = report + "CORPUS " + label.clone() + ": indexed oracle checked over " + result.errors.len().to_string() + " checker error(s) (index invariants are independent of the verdict)\n"
+      end
+    end
+  end
+end
+
+def resolution_parity_msgs_one(m: String) -> Vec[String]
+  var v = Vec::new()
+  v.push(m)
+  v
+end
+
+def resolution_parity_must(m: String) -> Vec[String]
+  resolution_parity_msgs_one(m)
+end
+
+def resolution_parity_must_not(m: String) -> Vec[String]
+  resolution_parity_msgs_one(m)
+end
+
+def resolution_parity_run_microcorpus(inout report: String, inout failures: Int) -> Unit
+  # 1. an explicit import wins over cross-module callable ambiguity
+  resolution_parity_case("import-wins",
+    vec!["a", "b", "c"],
+    vec![
+      "pub def probe() -> Int\n  1\nend\n",
+      "pub def probe() -> Int\n  2\nend\n",
+      "use a::{probe}\npub def f() -> Int\n  probe()\nend\n"
+    ],
+    resolution_parity_no_msgs(),
+    resolution_parity_must_not("ambiguous name `probe`"),
+    &mut report, &mut failures)
+  # 2. two distinct foreign callables of the same bare name are ambiguous
+  resolution_parity_case("two-foreign-ambiguous",
+    vec!["a", "b", "c"],
+    vec![
+      "pub def probe() -> Int\n  1\nend\n",
+      "pub def probe() -> Int\n  2\nend\n",
+      "pub def f() -> Int\n  probe()\nend\n"
+    ],
+    resolution_parity_must("ambiguous name `probe`"),
+    resolution_parity_no_msgs(),
+    &mut report, &mut failures)
+  # 3. three distinct foreign callables stay ambiguous (no first-wins pick)
+  resolution_parity_case("three-foreign-ambiguous",
+    vec!["a", "b", "d", "c"],
+    vec![
+      "pub def probe() -> Int\n  1\nend\n",
+      "pub def probe() -> Int\n  2\nend\n",
+      "pub def probe() -> Int\n  3\nend\n",
+      "pub def f() -> Int\n  probe()\nend\n"
+    ],
+    resolution_parity_must("ambiguous name `probe`"),
+    resolution_parity_no_msgs(),
+    &mut report, &mut failures)
+  # 4. the current module's own definition shadows every foreign one
+  resolution_parity_case("own-module-wins",
+    vec!["a", "b", "c"],
+    vec![
+      "pub def probe() -> Int\n  1\nend\n",
+      "pub def probe() -> Int\n  2\nend\n",
+      "pub def probe() -> Int\n  3\nend\npub def f() -> Int\n  probe()\nend\n"
+    ],
+    resolution_parity_no_msgs(),
+    resolution_parity_must_not("ambiguous name `probe`"),
+    &mut report, &mut failures)
+  # 5. multi-segment qualified identity: x::y::probe must not collide with z::y::probe
+  resolution_parity_case("qualified-suffix-identity",
+    vec!["x::y", "z::y", "c"],
+    vec![
+      "pub def probe() -> Int\n  1\nend\n",
+      "pub def probe() -> Int\n  2\nend\n",
+      "use x::y::{probe}\npub def f() -> Int\n  probe()\nend\n"
+    ],
+    resolution_parity_no_msgs(),
+    resolution_parity_must_not("ambiguous name `probe`"),
+    &mut report, &mut failures)
+  # 6. a call target kind-filtered away from a same-spelled static
+  resolution_parity_case("callable-vs-static",
+    vec!["a", "c"],
+    vec![
+      "pub static probe: Int = 7\npub def probe_fn() -> Int\n  1\nend\n",
+      "pub def f() -> Int\n  probe_fn()\nend\n"
+    ],
+    resolution_parity_no_msgs(),
+    resolution_parity_must_not("ambiguous name `probe_fn`"),
+    &mut report, &mut failures)
+  # type/callable index scan oracles (registration, re-registration order,
+  # multi-segment suffixes).  expect_clean=true pins that the kind filter
+  # keeps a same-spelled type and trait apart: the imported struct wins.
+  resolution_parity_type_index_case("type-index-basic",
+    vec!["a", "b"],
+    vec![
+      "pub struct T\n  x: Int\nend\npub struct Deep\n  v: T\nend\n",
+      "pub struct T\n  y: Int\nend\n"
+    ],
+    true,
+    &mut report, &mut failures)
+  resolution_parity_type_index_case("type-index-deep-suffix",
+    vec!["a::b::c", "x::b", "main"],
+    vec![
+      "pub struct T\n  x: Int\nend\n",
+      "pub struct T\n  y: Int\nend\n",
+      "use a::b::c::{T}\npub def f() -> T\n  T { x: 1 }\nend\n"
+    ],
+    true,
+    &mut report, &mut failures)
+  resolution_parity_type_index_case("type-vs-trait-kind-filter",
+    vec!["a", "b", "main"],
+    vec![
+      "pub struct T\n  x: Int\nend\n",
+      "pub trait T\n  def size(self) -> Int\nend\n",
+      "use a::{T}\npub def f() -> T\n  T { x: 1 }\nend\n"
+    ],
+    true,
+    &mut report, &mut failures)
+  # (audit follow-up — the type-query special form): `size_of[T]()` /
+  # `align_of[T]()` inside a generic body is the seed's NAME-BASED special
+  # form (`Ast.Name(_, n, _) when n = "size_of" || n = "align_of"`), never
+  # an ordinary indexed call.  The kernel must record the TypeQueryRecord
+  # (kind + solved T) for exactly this shape even though the resolver
+  # deliberately skips the query callee (externs carry no resolver call
+  # target) — before the fix the payload T was evaluated as an index and
+  # unified against Int, failing the whole closure compile inside the VM.
+  resolution_parity_type_index_case("type-query-generic",
+    vec!["m"],
+    vec![
+      "extern \"Tangerine\"\n  def size_of[T]() -> UInt\n  def align_of[T]() -> UInt\nend\npub def layout_like[T]() -> Int\n  (size_of[T]() as Int) + (align_of[T]() as Int)\nend\n"
+    ],
+    true,
+    &mut report, &mut failures)
+end
+
+# ── main ───────────────────────────────────────────────────────────────
+
 def main() -> Int
   let manifest_src = match read_file("bootstrap/compiler_kernel.manifest")
   when Result::Ok(s) then s
@@ -87,9 +537,47 @@ def main() -> Int
 
   let report_path = "build/resolution_parity_report.txt"
   var report = ""
+  var failures = 0
   var merged: Vec[Item] = Vec::new()
   var modules: Map[ModuleId, Module] = Map::new()
   var bad_parse = 0
+
+  # root module id 0: the parsed kernel entry exactly like production's
+  # merge_imported_deps receives the root program.
+  match read_file("tg_compiler/bootstrap_main.tg")
+  when Result::Ok(source) then
+    let parsed = parse(tokenize(source, "tg_compiler/bootstrap_main.tg"))
+    if diag_has_errors(&parsed.diagnostics) then
+      bad_parse = bad_parse + 1
+      report = report + "PARSE FAIL tg_compiler/bootstrap_main.tg (root)\n"
+      println("resolution-parity: PARSE FAIL tg_compiler/bootstrap_main.tg (root)")
+    else
+      let root_id = ModuleId { id: 0 }
+      var root_items = Vec::new()
+      for item in parsed.program.items do
+        var owned = item.clone()
+        owned.owner_module = ModuleId { id: root_id.id }
+        merged.push(owned)
+      end
+      var root_ids = Vec::new()
+      var ri = 0
+      while ri < merged.len() do
+        root_ids.push(ItemId { id: ri })
+        ri = ri + 1
+      end
+      modules.insert(root_id, Module {
+        id: root_id,
+        path: Vec::new(),
+        items: root_ids,
+        imports: resolution_parity_module_imports(&parsed.program.items)
+      })
+    end
+  when Result::Err(_) then
+    bad_parse = bad_parse + 1
+    report = report + "READ FAIL tg_compiler/bootstrap_main.tg (root)\n"
+    println("resolution-parity: READ FAIL tg_compiler/bootstrap_main.tg (root)")
+  end
+
   var i = 0
   while i < paths.len() do
     let path = paths[i].clone()
@@ -98,32 +586,18 @@ def main() -> Int
       let parsed = parse(tokenize(source, path.clone()))
       if diag_has_errors(&parsed.diagnostics) then
         bad_parse = bad_parse + 1
-        report = report + "PARSE FAIL " + path + " (" + parsed.diagnostics.len().to_string() + " diagnostics)\n"
-        println("resolution-parity: PARSE FAIL " + path)
+        report = report + "PARSE FAIL " + path.clone() + " (" + parsed.diagnostics.len().to_string() + " diagnostics)\n"
+        println("resolution-parity: PARSE FAIL " + path.clone())
         for d in parsed.diagnostics do
           report = report + "  " + d.message + "\n"
         end
       else
-        let mid = ModuleId { id: 1 + i }
-        var item_ids: Vec[ItemId] = Vec::new()
-        for item in parsed.program.items do
-          var owned = item.clone()
-          owned.owner_module = ModuleId { id: mid.id }
-          item_ids.push(ItemId { id: merged.len() })
-          merged.push(owned)
-        end
-        var module = Module {
-          id: mid,
-          path: resolution_parity_module_path(path.clone()),
-          items: item_ids,
-          imports: Vec::new()
-        }
-        modules.insert(mid, module)
+        let _mid = resolution_parity_merge_parsed(path.clone(), parsed.program, &mut merged, &mut modules)
       end
     when Result::Err(_) then
       bad_parse = bad_parse + 1
-      report = report + "READ FAIL " + path + "\n"
-      println("resolution-parity: READ FAIL " + path)
+      report = report + "READ FAIL " + path.clone() + "\n"
+      println("resolution-parity: READ FAIL " + path.clone())
     end
     i = i + 1
   end
@@ -140,42 +614,75 @@ def main() -> Int
 
   var resolve_errors = 0
   var pre_resolution_macros = 0
-  match resolve_names(program)
-  when Result::Ok(_res) then ()
-  when Result::Err(errs) then
-    for err in errs do
-      # `debug_assert!` is a compiler builtin macro the real pipeline
-      # expands (compiler_core's expand_macros) BEFORE resolve_names — this
-      # probe deliberately skips the heavy expansion pass, so its residual
-      # macro-call row is a pre-resolution artifact, not a resolution
-      # diagnostic. Every OTHER residual macro spelling still fails the
-      # lane (the resolver's unsupported-construct guard stays enforced).
-      if err.message.contains("residual macro call `debug_assert`") then
-        pre_resolution_macros = pre_resolution_macros + 1
-        report = report + "PRE-RESOLUTION " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message + "\n"
-      else
-        resolve_errors = resolve_errors + 1
-        report = report + "RESOLVE " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message + "\n"
-        println("resolution-parity: RESOLVE " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message)
-      end
+  # partial resolution: the snapshot + diagnostics together, so the
+  # closure symbol-index oracle runs even when a deliberately-skipped
+  # pre-resolution pass (macro expansion) leaves residual artifacts.
+  let partial = resolve_names_partial(program)
+  let resolved = partial.resolved
+  for err in partial.errors do
+    # `debug_assert!` is a compiler builtin macro the real pipeline
+    # expands (compiler_core's expand_macros) BEFORE resolve_names — this
+    # probe deliberately skips the heavy expansion pass, so its residual
+    # macro-call row is a pre-resolution artifact, not a resolution
+    # diagnostic. Every OTHER residual macro spelling still fails the
+    # lane (the resolver's unsupported-construct guard stays enforced).
+    if err.message.contains("residual macro call `debug_assert`") then
+      pre_resolution_macros = pre_resolution_macros + 1
+      report = report + "PRE-RESOLUTION " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message + "\n"
+    else
+      resolve_errors = resolve_errors + 1
+      report = report + "RESOLVE " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message + "\n"
+      println("resolution-parity: RESOLVE " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message)
     end
   end
 
-  if bad_parse > 0 || resolve_errors > 0 then
-    let row = "resolution-parity: FAILED (" + bad_parse.to_string() + " parse failure(s), " + resolve_errors.to_string() + " resolver error(s) over " + paths.len().to_string() + " closure files)\n"
+
+  # the real-resolution symbol_suffix_index scan oracle (bounded query
+  # budget: every bucket must equal the full-map scan)
+  var symbol_keys = Vec::new()
+  for (key, _did) in resolved.module_symbols.entries() do
+    symbol_keys.push(key.clone())
+  end
+  # symbol_suffix_index buckets hold (key, DefId) pairs; the scan oracle
+  # compares the KEY sequence (candidate identity and order) after
+  # projecting the pairs to keys.
+  var symbol_key_index: Map[String, Vec[String]] = Map::new()
+  for (suffix, pairs) in resolved.symbol_suffix_index.entries() do
+    var keys = Vec::new()
+    for (key, _did) in pairs do
+      keys.push(key.clone())
+    end
+    symbol_key_index.insert(suffix.clone(), keys)
+  end
+  resolution_parity_check_index("closure/symbol_suffix_index", symbol_key_index, symbol_keys, 400, &mut report, &mut failures)
+
+  # the adversarial microcorpus + synthetic type/callable index oracles
+  resolution_parity_run_microcorpus(&mut report, &mut failures)
+
+  if bad_parse > 0 || resolve_errors > 0 || failures > 0 then
+    let row = "resolution-parity: FAILED (" + bad_parse.to_string() + " parse failure(s), " + resolve_errors.to_string() + " resolver error(s), " + failures.to_string() + " oracle/corpus failure(s) over " + paths.len().to_string() + " closure files)\n"
     report = report + row
     match write_file(report_path.clone(), report)
     when Result::Ok(_) then ()
     when Result::Err(_) then ()
     end
+    # the full row-level evidence goes to stdout as well: a host whose
+    # guest-write path is unavailable (target/host flag mismatch) must
+    # still surface WHICH expectations failed, never just a count.
     println(row.trim())
+    println("resolution-parity: full report follows")
+    for rline in report.split("\n") do
+      if !rline.trim().is_empty() then
+        println(rline.trim())
+      end
+    end
     return 1
   end
-  let ok_row = "OK " + paths.len().to_string() + " closure files parsed clean; resolver diagnostics 0 (" + pre_resolution_macros.to_string() + " pre-resolution debug_assert macro artifact(s), expanded before resolve_names in the real pipeline)\n"
-  match write_file(report_path.clone(), ok_row)
+  let ok_row = "OK " + paths.len().to_string() + " closure files parsed clean; resolver diagnostics 0 (" + pre_resolution_macros.to_string() + " pre-resolution debug_assert macro artifact(s), expanded before resolve_names in the real pipeline); adversarial microcorpus + suffix-index scan oracles: PASS\n"
+  match write_file(report_path.clone(), ok_row + report)
   when Result::Ok(_) then ()
   when Result::Err(_) then ()
   end
-  println("resolution-parity: OK (" + paths.len().to_string() + " closure files, resolver diagnostics 0, " + pre_resolution_macros.to_string() + " pre-resolution debug_assert artifact(s))")
+  println("resolution-parity: OK (" + paths.len().to_string() + " closure files, resolver diagnostics 0, " + pre_resolution_macros.to_string() + " pre-resolution debug_assert artifact(s); adversarial microcorpus + suffix-index scan oracles: PASS)")
   0
 end

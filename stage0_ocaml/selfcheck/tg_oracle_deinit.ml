@@ -43,7 +43,7 @@ let () =
       | Some 0 ->
           Printf.printf
             "tg_oracle_deinit: PASS — the kernel oracle deinit-plan walk completed (VM exit 0)\n";
-          exit 0
+          Selfcheck_sentinel.emit_and_exit "tg_oracle_deinit"
       | Some code -> fail "kernel VM exit %d (expected 0)" code
       | None ->
           fail

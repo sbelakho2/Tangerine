@@ -62,7 +62,7 @@ let () =
       | Some 0 ->
           Printf.printf
             "tg_hostptr: PASS — address_of_mut(&mut st) crossed the host boundary as a real reference (c_waitpid returned ECHILD -10, VM exit 0)\n";
-          exit 0
+          Selfcheck_sentinel.emit_and_exit "tg_hostptr"
       | Some code ->
           fail
             "probe main returned %d — the host call did not report the expected ECHILD (-10)"

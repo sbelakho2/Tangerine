@@ -416,6 +416,37 @@ bh_is_macho64() {
   [ "$magic" = "cffaedfe" ]
 }
 
+# ELF64 little-endian magic (the Linux targets' native image format).
+bh_is_elf64() {
+  local f="$1"
+  if [ ! -f "$f" ]; then return 1; fi
+  local magic
+  magic="$(od -An -tx1 -N4 "$f" | tr -d ' \n')"
+  [ "$magic" = "7f454c46" ]
+}
+
+# The stage image format follows the BOOTSTRAP TARGET (the same authority
+# the ladder compiles for): an apple-darwin target produces Mach-O 64-bit
+# images, a linux target produces ELF64 images.  Host-arch-specific
+# assumptions are exactly what blocked the ladder on non-macOS hosts.
+bh_stage_image_ok() {
+  local f="$1"
+  case "$(bh_boot_target)" in
+    *apple-darwin*) bh_is_macho64 "$f" ;;
+    *linux* | *linux-gnu* | *linux-musl*) bh_is_elf64 "$f" ;;
+    *) bh_is_macho64 "$f" ;;
+  esac
+}
+
+# The human name of the target's expected image format (diagnostics).
+bh_stage_image_kind() {
+  case "$(bh_boot_target)" in
+    *apple-darwin*) printf 'Mach-O 64-bit' ;;
+    *linux*) printf 'ELF64' ;;
+    *) printf 'Mach-O 64-bit' ;;
+  esac
+}
+
 # ———————————————————————————————————————————————————————————————
 # validate_stage
 # ———————————————————————————————————————————————————————————————
@@ -446,8 +477,8 @@ validate_stage() {
     bh_err "$stage not executable: $binary"
     return 1
   fi
-  if ! bh_is_macho64 "$binary"; then
-    bh_err "$stage is not a valid Mach-O 64-bit image"
+  if ! bh_stage_image_ok "$binary"; then
+    bh_err "$stage is not a valid $(bh_stage_image_kind) image (target $(bh_boot_target))"
     return 1
   fi
 
@@ -459,7 +490,7 @@ validate_stage() {
   fi
   local link_hash
   link_hash="$(bh_sha256_file "$binary")"
-  bh_log "$stage size=${size} bytes sha256=${link_hash} macho=ok"
+  bh_log "$stage size=${size} bytes sha256=${link_hash} image=$(bh_stage_image_kind)=ok"
 
   if ! "$binary" --version >/dev/null 2>&1 && ! "$binary" version >/dev/null 2>&1; then
     bh_err "$stage did not answer --version/version"
@@ -492,8 +523,8 @@ EOF
     bh_err "$stage did not produce a canary binary"
     return 1
   fi
-  if ! bh_is_macho64 "$canary_bin"; then
-    bh_err "$stage canary output is not a valid Mach-O 64-bit image"
+  if ! bh_stage_image_ok "$canary_bin"; then
+    bh_err "$stage canary output is not a valid $(bh_stage_image_kind) image"
     return 1
   fi
   chmod +x "$canary_bin"
@@ -709,7 +740,7 @@ EOF
 # warning — a suite advertised as a bootstrap acceptance gate must be present
 # on the supported host.
 
-CANARY_SUITE_POSITIVE_COUNT=148
+CANARY_SUITE_POSITIVE_COUNT=149
 CANARY_SUITE_NEGATIVE_COUNT=135
 CANARY_SUITE_ARM64_COUNT=2
 CANARY_SUITE_TOTAL=$((CANARY_SUITE_POSITIVE_COUNT + CANARY_SUITE_NEGATIVE_COUNT + CANARY_SUITE_ARM64_COUNT))
@@ -857,8 +888,8 @@ run_canary_files() {
       failures=$((failures + 1))
       continue
     fi
-    if ! bh_is_macho64 "$bin"; then
-      bh_err "native canary $name produced non-Mach-O output"
+    if ! bh_stage_image_ok "$bin"; then
+      bh_err "native canary $name produced non-$(bh_stage_image_kind) output"
       failures=$((failures + 1))
       continue
     fi

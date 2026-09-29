@@ -1094,7 +1094,7 @@ let () =
          "i5a: runtime-OOB program passes the verifier (Index li is never compile-time bounds-checked)"
          false);
   (let prog = runtime_oob_prog () in
-   let host = Host.create ~repo_root:"." ~argv:[||] in
+   let host = Host.create ~repo_root:"." ~argv:[||] () in
    match
      Vm.run ~program:prog ~entry:prog.Seed_mir.functions.(0).Seed_mir.instance ~argv:[||] ~host
    with
@@ -1115,7 +1115,7 @@ let () =
 
   if !failures = 0 then begin
     Printf.printf "ALL MUTATION TESTS PASS (%d)\n" !total_mutations;
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_verify_mutation"
   end
   else begin
     Printf.printf "%d MUTATION TEST FAILURE(S)\n" !failures;

@@ -74,4 +74,4 @@ let () =
   Unix.rmdir evil;
   Unix.rmdir dir;
   Printf.printf "PASS: fingerprint self-check\n";
-  exit 0
+  Selfcheck_sentinel.emit_and_exit "tg_fingerprint"

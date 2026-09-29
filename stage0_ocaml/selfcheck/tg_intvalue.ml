@@ -348,4 +348,5 @@ let () =
   Printf.printf "oracle: PASS (%d lines, from %s)\n" (List.length lines) name;
   run_fixed_vectors ();
   run_literal_checks ();
-  Printf.printf "all Int_value self-checks: PASS\n"
+  Printf.printf "all Int_value self-checks: PASS\n";
+  Selfcheck_sentinel.emit "tg_intvalue"

@@ -460,4 +460,4 @@ let () =
   check_p04_strict ();
   check_convention_property ();
   Printf.printf "OK: signature identity self-check passed\n";
-  exit 0
+  Selfcheck_sentinel.emit_and_exit "tg_sigid"

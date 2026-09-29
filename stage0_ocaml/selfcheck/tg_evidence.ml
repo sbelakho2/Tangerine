@@ -211,4 +211,4 @@ let () =
 
       (* ── run stamp (the only non-deterministic line) ───────────── *)
       Printf.printf "evidence run=%d\n" (int_of_float (Unix.time ()));
-      exit 0
+      Selfcheck_sentinel.emit_and_exit "tg_evidence"

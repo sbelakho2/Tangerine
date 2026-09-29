@@ -386,7 +386,7 @@ end
 
   if !failures = 0 then begin
     Printf.printf "tg_access_resource: ALL PASS\n";
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_access_resource"
   end
   else begin
     Printf.printf "tg_access_resource: %d FAILURE(S)\n" !failures;

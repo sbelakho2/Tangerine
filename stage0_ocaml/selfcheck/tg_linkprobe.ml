@@ -164,25 +164,29 @@ let () =
     match args with _ :: r :: rest -> (r, rest) | _ -> ("..", [])
   in
   ensure_dir (Filename.concat repo_root "build");
-  let mode, use_cache, cache_path =
-    let rec go mode cache = function
-      | "--mode" :: m :: rest -> go m cache rest
-      | "--no-cache" :: rest -> go mode None rest
-      | "--cache" :: p :: rest -> go mode (Some p) rest
-      | _ :: rest -> go mode cache rest
-      | [] -> (mode, cache)
+  let mode, use_cache, cache_path, target_str =
+    let rec go mode cache target = function
+      | "--mode" :: m :: rest -> go m cache target rest
+      | "--no-cache" :: rest -> go mode None target rest
+      | "--cache" :: p :: rest -> go mode (Some p) target rest
+      | "--target" :: t :: rest -> go mode cache t rest
+      | _ :: rest -> go mode cache target rest
+      | [] -> (mode, cache, target)
     in
-    let mode, cache =
+    let mode, cache, target =
       go "linkobj"
         (Some (Filename.concat repo_root "build/linkprobe.vmcache"))
+        (match Sys.getenv_opt "TG_BOOTSTRAP_TARGET" with
+         | Some t -> t
+         | None -> "aarch64-apple-darwin")
         rest
     in
-    (mode, cache <> None, match cache with Some p -> p | None -> "")
+    (mode, cache <> None, (match cache with Some p -> p | None -> ""), target)
   in
   if mode <> "linkobj" && mode <> "full" then
     fail "unknown --mode %s (expected linkobj or full)" mode;
   let target =
-    match Target.unsupported_triple "aarch64-apple-darwin" with
+    match Target.unsupported_triple target_str with
     | Error m -> fail "target: %s" m
     | Ok t -> t
   in
@@ -197,8 +201,8 @@ let () =
   | Ok run ->
       let dt = Unix.gettimeofday () -. t0 in
       Printf.printf
-        "tg_linkprobe: mode=%s vm_code=%s cache_hit=%b reachable=%d wall=%.1fs\n"
-        mode
+        "tg_linkprobe: mode=%s target=%s vm_code=%s cache_hit=%b reachable=%d wall=%.1fs\n"
+        mode target_str
         (match run.Driver.bvr_vm_code with
         | Some c -> string_of_int c
         | None -> "trap")
@@ -317,4 +321,4 @@ let () =
         (if mode = "linkobj" then "link_executable" else "compile-to-executable")
         (if mode = "linkobj" then " (libc-import artifact included)" else "")
         run.Driver.bvr_cache_hit dt;
-      exit 0
+      Selfcheck_sentinel.emit_and_exit "tg_linkprobe"

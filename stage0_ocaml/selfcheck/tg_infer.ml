@@ -259,7 +259,7 @@ let () =
                  " and zero impl-conformance/resource rows on the merged closure"
                else "")
             ;
-            exit 0
+            Selfcheck_sentinel.emit_and_exit "tg_infer"
           end
       | Some code -> fail "kernel VM exit %d (expected 0)" code
       | None ->

@@ -124,6 +124,15 @@ and t = {
   externs : Extern_registry.t;
   bindings : binding list;
   fs : Host_fs.t;
+  (* The GUEST's OS ABI (the compile TARGET of the kernel running in the
+     seed VM), not the host process's OS: the raw syscall argument
+     encodings — open flags, stat layout, errno values — are the guest
+     std's compile-time `is_macos()` choice.  A macOS-target kernel on a
+     Linux host must still receive the BSD flag/errno contract this host
+     layer emulates (the errno table and the stat layout are already the
+     Darwin ones); keying the flag decode off the HOST was the mismatch
+     that made guest file creation fail on Linux hosts. *)
+  guest_is_darwin : bool;
   process : process_api;
   argv : string array;
   mutable env : (string * string) list;
@@ -825,6 +834,9 @@ let host_write_from (t : t) (fd : int) (p : Vm_memory.pointer) (count : int) : i
    provides.  O_DIRECTORY/O_NOFOLLOW have no OCaml Unix spelling; a
    directory still opens read-only, and a symlink is followed (the host
    boundary's documented descriptor semantics). *)
+(* The DEFAULT guest ABI when the caller does not know the compile
+   target: the host's own OS.  Every bootstrap/compile path passes the
+   real target explicitly (Host.create ~guest_is_darwin). *)
 let host_is_darwin : bool =
   Sys.file_exists "/System/Library/CoreServices"
   || Sys.file_exists "/usr/lib/libSystem.B.dylib"
@@ -851,14 +863,15 @@ let host_real_path (t : t) (path : string) ~(for_create : bool) : string =
     | Ok real -> real
     | Error _ -> Filename.concat t.fs.Host_fs.repo_root path
 
-let open_flags_of_raw (flags : int) : Unix.open_flag list =
+let open_flags_of_raw ~(guest_is_darwin : bool) (flags : int) :
+    Unix.open_flag list =
   let acc = ref [] in
   (match flags land 0x3 with
    | 1 -> acc := Unix.O_WRONLY :: !acc
    | 2 -> acc := Unix.O_RDWR :: !acc
    | _ -> acc := Unix.O_RDONLY :: !acc);
   let has bit = flags land bit <> 0 in
-  if host_is_darwin then begin
+  if guest_is_darwin then begin
     if has 0x8 then acc := Unix.O_APPEND :: !acc;
     if has 0x200 then acc := Unix.O_CREAT :: !acc;
     if has 0x400 then acc := Unix.O_TRUNC :: !acc;
@@ -875,11 +888,16 @@ let open_flags_of_raw (flags : int) : Unix.open_flag list =
   !acc
 
 let host_open (t : t) (path : string) (flags : int) (mode : int) : int =
-  let create_bit = if host_is_darwin then 0x200 else 0x40 in
+  let create_bit = if t.guest_is_darwin then 0x200 else 0x40 in
   let for_create = flags land create_bit <> 0 in
   let real = host_real_path t path ~for_create in
   try
-    let fd = register_guest_fd (Unix.openfile real (open_flags_of_raw flags) mode) in
+    let fd =
+      register_guest_fd
+        (Unix.openfile real
+           (open_flags_of_raw ~guest_is_darwin:t.guest_is_darwin flags)
+           mode)
+    in
     (try
        if (Unix.stat real).Unix.st_kind = Unix.S_DIR then
          Hashtbl.replace dir_paths fd real
@@ -1055,6 +1073,35 @@ let mode_kind_bits (k : Unix.file_kind) : int =
   | Unix.S_FIFO -> 0x1000
   | Unix.S_SOCK -> 0xC000
 
+(* The Linux x86_64 `struct stat` layout (144 bytes) — the SAME offsets
+   std/fs.tg's stat_layout() Linux branch parses (st_nlink@16,
+   st_mode@24, st_size@48, st_blksize@56, st_blocks@64, atime@72,
+   mtime@88, ctime@104).  The host fills the layout of the GUEST's
+   target OS (see t.guest_is_darwin), never the host's. *)
+let host_stat_bytes_linux (st : Unix.LargeFile.stats) : Bytes.t =
+  let open Unix.LargeFile in
+  let b = Bytes.make 144 '\000' in
+  let put64 off v = Raw_memory.put_u64_le b off 8 v in
+  let put32 off v = Raw_memory.put_u64_le b off 4 (Int64.of_int v) in
+  let secs (f : float) : int64 = Int64.of_float (Float.trunc f) in
+  put64 0 (Int64.of_int st.st_dev);
+  put64 8 (Int64.of_int st.st_ino);
+  put64 16 (Int64.of_int st.st_nlink);
+  put32 24 (mode_kind_bits st.st_kind lor file_perm_bits st.st_perm);
+  put32 28 st.st_uid;
+  put32 32 st.st_gid;
+  put64 40 (Int64.of_int st.st_rdev);
+  put64 48 st.st_size;
+  put64 56 4096L (* st_blksize: not exposed; the conventional page size *);
+  put64 64 0L (* st_blocks: not exposed *);
+  put64 72 (secs st.st_atime);
+  put64 80 0L (* atime nsec *);
+  put64 88 (secs st.st_mtime);
+  put64 96 0L (* mtime nsec *);
+  put64 104 (secs st.st_ctime);
+  put64 112 0L (* ctime nsec *);
+  b
+
 let host_stat_bytes (st : Unix.LargeFile.stats) : Bytes.t =
   let open Unix.LargeFile in
   let b = Bytes.make 160 '\000' in
@@ -1077,6 +1124,9 @@ let host_stat_bytes (st : Unix.LargeFile.stats) : Bytes.t =
   put64 104 0L (* st_blocks: not exposed *);
   put64 112 4096L (* st_blksize: not exposed; the conventional page size *);
   b
+
+let host_stat_bytes_for (t : t) (st : Unix.LargeFile.stats) : Bytes.t =
+  if t.guest_is_darwin then host_stat_bytes st else host_stat_bytes_linux st
 
 let host_stat (t : t) (path : string) (kind : [ `Stat | `Lstat ]) :
     (Unix.LargeFile.stats, int) result =
@@ -1339,8 +1389,42 @@ let host_getdents64 (t : t) (fd : int) (p : Vm_memory.pointer) (count : int) : i
    and buffer contract is the runtime's, and the buffer arguments are
    arena pointers.  A number the host has no implementation for is a
    deterministic boundary error (never a fabricated byte count). *)
+(* The guest's canonical syscall number -> this dispatcher's case number.
+   The macOS guest passes the compiler's pre-adjusted Darwin numbers
+   (Darwin - 3, so + 3 recovers the BSD case), while a LINUX guest passes
+   the TG canonical numbers, which ARE the Linux x86_64 numbers
+   (std/fs.tg's SYS_* Linux branch; the direct kernel's x86_64 route
+   issues them unchanged).  The mapping below routes each Linux canonical
+   number to the operation's case slot; unknown numbers fall out of the
+   dispatcher's exhaustive match into the deterministic boundary error. *)
+let linux_syscall_case (n : int) : int =
+  match n with
+  | 0 -> 3 (* read *)
+  | 1 -> 4 (* write *)
+  | 2 -> 5 (* open *)
+  | 3 -> 6 (* close *)
+  | 4 -> 191 (* stat *)
+  | 5 -> 189 (* fstat *)
+  | 6 -> 190 (* lstat *)
+  | 8 -> 199 (* lseek *)
+  | 9 -> 197 (* mmap *)
+  | 16 -> 19 (* ioctl *)
+  | 32 -> 35 (* dup *)
+  | 33 -> 36 (* dup2 *)
+  | 79 -> 313 (* getcwd *)
+  | 80 -> 12 (* chdir *)
+  | 82 -> 128 (* rename *)
+  | 83 -> 136 (* mkdir *)
+  | 84 -> 137 (* rmdir *)
+  | 87 -> 10 (* unlink *)
+  | 88 -> 57 (* symlink *)
+  | 89 -> 58 (* readlink *)
+  | 90 -> 15 (* chmod *)
+  | 217 -> 220 (* getdents64 *)
+  | other -> -100000 - other (* unmapped: the boundary error names it *)
+
 let host_syscall (t : t) (n : int) (args : int array) : (int, string) result =
-  let so = n + 3 in
+  let so = if t.guest_is_darwin then n + 3 else linux_syscall_case n in
   let arg i = if i < Array.length args then args.(i) else 0 in
   let ptr i = Vm_memory.pointer_of_int64 (Int64.of_int (arg i)) in
   let path_at i =
@@ -1394,6 +1478,10 @@ let host_syscall (t : t) (n : int) (args : int array) : (int, string) result =
       (* dup(fd) — the audited raw number on both std branches (canonical
          32 and the macOS constant 32) *)
       Ok (host_dup (arg 0))
+  | 36 ->
+      (* dup2(oldfd, newfd) — the Linux canonical 33 (the macOS branch
+         passes 90, pre-adjusted to 93, and keeps its own path) *)
+      Ok (host_dup2 (arg 0) (arg 1))
   | 57 -> (
       match (path_at 0, path_at 1) with
       | Error e, _ | _, Error e -> Error e
@@ -1446,7 +1534,7 @@ let host_syscall (t : t) (n : int) (args : int array) : (int, string) result =
         match host_fstat (arg 0) with
         | Error code -> Ok code
         | Ok st -> (
-            match arena_store t (ptr 1) (host_stat_bytes st) with
+            match arena_store t (ptr 1) (host_stat_bytes_for t st) with
             | Ok () -> Ok 0
             | Error _ -> Ok (-errno_fault)))
       else (
@@ -1456,7 +1544,7 @@ let host_syscall (t : t) (n : int) (args : int array) : (int, string) result =
             match host_stat t path (if so = 190 then `Lstat else `Stat) with
             | Error code -> Ok code
             | Ok st -> (
-                match arena_store t (ptr 1) (host_stat_bytes st) with
+                match arena_store t (ptr 1) (host_stat_bytes_for t st) with
                 | Ok () -> Ok 0
                 | Error _ -> Ok (-errno_fault))))
   | 196 ->
@@ -1481,9 +1569,9 @@ let host_syscall (t : t) (n : int) (args : int array) : (int, string) result =
   | _ ->
       Error
         (Printf.sprintf
-           "__intrinsic_syscall: number %d (BSD %d) has no seed host implementation \
+           "__intrinsic_syscall: number %d (guest %s, case %d) has no seed host implementation \
             (deterministic boundary trap)"
-           n so)
+           n (if t.guest_is_darwin then "macos/bsd" else "linux") so)
 
 let vm_string (s : string) : Vm_value.t = Vm_value.String s
 
@@ -3889,7 +3977,8 @@ let binding_manifest : binding list =
                    | Ok path ->
                        let flags = int_arg flagsv in
                        let mode =
-                         if host_is_darwin then (if flags land 0x200 <> 0 then 0o644 else 0)
+                         if t.guest_is_darwin then
+                           (if flags land 0x200 <> 0 then 0o644 else 0)
                          else if flags land 0x40 <> 0 then 0o644
                          else 0
                        in
@@ -3985,13 +4074,15 @@ let default_process_api (fs : Host_fs.t) : process_api =
 (* Build a host from explicit registries (declared surface) and an
    explicit binding table (executable closure). *)
 let create_with ~repo_root ~(argv : string array) ~(intrinsics : Intrinsic_registry.t)
-    ~(externs : Extern_registry.t) ~(bindings : binding list) : t =
+    ~(externs : Extern_registry.t) ~(bindings : binding list)
+    ?(guest_is_darwin = host_is_darwin) () : t =
   let fs = Host_fs.create ~repo_root in
   {
     intrinsics;
     externs;
     bindings;
     fs;
+    guest_is_darwin;
     process = default_process_api fs;
     argv;
     env = [];
@@ -4005,9 +4096,10 @@ let create_with ~repo_root ~(argv : string array) ~(intrinsics : Intrinsic_regis
   }
 
 (* The default host: manifest registries and the manifest binding table. *)
-let create ~repo_root ~(argv : string array) : t =
+let create ~repo_root ~(argv : string array) ?(guest_is_darwin = host_is_darwin) () : t =
   create_with ~repo_root ~argv ~intrinsics:Intrinsic_registry.manifest
     ~externs:Extern_registry.manifest ~bindings:binding_manifest
+    ~guest_is_darwin ()
 
 (* Normalize the process environment for spawned children: LC_ALL=C and
    TZ=UTC are forced through Unix.putenv, then the recorded environment is

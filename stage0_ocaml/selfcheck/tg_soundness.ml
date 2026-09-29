@@ -126,7 +126,7 @@ end
   in
   if ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 then begin
     Printf.printf "SOUNDNESS = ALL PASS (8 negative proofs)\n";
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_soundness"
   end
   else begin
     Printf.printf "SOUNDNESS = FAIL\n";

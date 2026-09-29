@@ -814,7 +814,7 @@ let () =
   check_type_instances ();
   if !failures = 0 then begin
     Printf.printf "ALL MONO PASS\n";
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_mono"
   end
   else begin
     Printf.printf "%d FAILURE(S)\n" !failures;

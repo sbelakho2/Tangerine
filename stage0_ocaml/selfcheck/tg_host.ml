@@ -40,9 +40,14 @@ let manifest_binding (name : string) : Host.binding =
   | Some b -> b
   | None -> fail "manifest binding for '%s' not found" name
 
+(* These host tests exercise the KERNEL's macOS-target syscall ABI: the
+   raw numbers they pass are the compiler's pre-adjusted Darwin constants
+   (getcwd 310, dup 32, ioctl 16, ...) and the errno expectations are the
+   Darwin table — so every host here declares the guest ABI explicitly
+   (the production paths always pass the real target). *)
 let mk_host ~intrinsics ~bindings : Host.t =
   Host.create_with ~repo_root:"." ~argv:[||] ~intrinsics
-    ~externs:Extern_registry.empty ~bindings
+    ~externs:Extern_registry.empty ~bindings ~guest_is_darwin:true ()
 
 let register (name : string) (id : int) (sig_ : Intrinsic_registry.signature)
     (reg : Intrinsic_registry.t) : Intrinsic_registry.t =
@@ -195,7 +200,7 @@ let check_vm_dispatch () =
       (Some (Type_repr.Int Type_repr.Int, int_constant 42L)) Type_repr.String
   in
   let entry = p1.Seed_mir.functions.(0).Seed_mir.instance in
-  let host1 = Host.create ~repo_root:"." ~argv:[||] in
+  let host1 = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   (match Vm.run ~program:p1 ~entry ~argv:[||] ~host:host1 with
    | Error e -> fail "int-to-string host call failed: %s" e.Vm.message
    | Ok 0 -> (
@@ -215,7 +220,7 @@ let check_vm_dispatch () =
       Type_repr.Unit
   in
   let e2 = p2.Seed_mir.functions.(0).Seed_mir.instance in
-  let host2 = Host.create ~repo_root:"." ~argv:[||] in
+  let host2 = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   (match Vm.run ~program:p2 ~entry:e2 ~argv:[||] ~host:host2 with
    | Error e -> fail "println host call failed: %s" e.Vm.message
    | Ok 0 ->
@@ -230,7 +235,7 @@ let check_vm_dispatch () =
       (Some (Type_repr.String, Seed_mir.String "boom")) Type_repr.Never
   in
   let e3 = p3.Seed_mir.functions.(0).Seed_mir.instance in
-  let host3 = Host.create ~repo_root:"." ~argv:[||] in
+  let host3 = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   (match Vm.run ~program:p3 ~entry:e3 ~argv:[||] ~host:host3 with
    | Error e when contains e.Vm.message "panic: boom" ->
        pass "VM host dispatch invokes the real panic binding (deterministic host error)"
@@ -239,7 +244,7 @@ let check_vm_dispatch () =
   (* __intrinsic_abort() -> deterministic host error (zero-arity binding) *)
   let p4 = call_program (Seed_mir.Intrinsic (intrinsic_id "__intrinsic_abort", [||])) None Type_repr.Unit in
   let e4 = p4.Seed_mir.functions.(0).Seed_mir.instance in
-  let host4 = Host.create ~repo_root:"." ~argv:[||] in
+  let host4 = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   (match Vm.run ~program:p4 ~entry:e4 ~argv:[||] ~host:host4 with
    | Error e when contains e.Vm.message "abort: __intrinsic_abort" ->
        pass "VM host dispatch invokes the real __intrinsic_abort binding (zero-arity)"
@@ -250,7 +255,7 @@ let check_vm_dispatch () =
     call_program (Seed_mir.Extern (extern_id "__sync_synchronize", [||])) None Type_repr.Unit
   in
   let e5 = p5.Seed_mir.functions.(0).Seed_mir.instance in
-  let host5 = Host.create ~repo_root:"." ~argv:[||] in
+  let host5 = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   (match Vm.run ~program:p5 ~entry:e5 ~argv:[||] ~host:host5 with
    | Ok 0 -> pass "VM host dispatch invokes the real __sync_synchronize binding (Extern path)"
    | Error e -> fail "__sync_synchronize host call failed: %s" e.Vm.message
@@ -263,7 +268,7 @@ let check_vm_dispatch () =
       (Some (Type_repr.Char, Seed_mir.Char (Uchar.of_int 0xE9))) Type_repr.String
   in
   let e7 = p7.Seed_mir.functions.(0).Seed_mir.instance in
-  let host7 = Host.create ~repo_root:"." ~argv:[||] in
+  let host7 = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   (match Vm.run ~program:p7 ~entry:e7 ~argv:[||] ~host:host7 with
    | Error e -> fail "char-to-string host call failed: %s" e.Vm.message
    | Ok 0 -> (
@@ -288,7 +293,7 @@ let check_vm_dispatch () =
     call_program (Seed_mir.Extern (extern_id "rb_funcall", [||])) None Type_repr.Unit
   in
   let e6 = p6.Seed_mir.functions.(0).Seed_mir.instance in
-  let host6 = Host.create ~repo_root:"." ~argv:[||] in
+  let host6 = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   (match Vm.run ~program:p6 ~entry:e6 ~argv:[||] ~host:host6 with
    | Error e when contains e.Vm.message "has no binding (fail-closed)" ->
        pass "VM traps fail-closed for a declared-but-unbound host symbol"
@@ -314,7 +319,7 @@ let reachable_names (host : Host.t) (ids : Host.host_id list) : string =
        ids)
 
 let check_reachable_closure_boundary () =
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   (* (a) reachable calls: one bound intrinsic (__intrinsic_int_to_string)
      and one declared-but-unbound extern (rb_funcall) — the reachable
      closure check must FAIL and name the unbound extern *)
@@ -480,7 +485,7 @@ let poll_probe2 (binding : Host.binding) (host : Host.t) (fd1 : int) (fd2 : int)
 
 let check_poll_adapter () =
   let binding = manifest_binding "poll" in
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   let r, w = Unix.pipe ~cloexec:false () in
   let r2, w2 = Unix.pipe ~cloexec:false () in
   let guest_r = Host.register_guest_fd r in
@@ -523,7 +528,7 @@ let check_exit_adapter () =
   let code () =
     Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true 42L)
   in
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   (match binding.invoke host [| code () |] with
   | Ok _ -> fail "_exit self-check: the parent-host _exit returned instead of trapping"
   | Error m ->
@@ -531,7 +536,7 @@ let check_exit_adapter () =
         fail "_exit self-check: parent trap has the wrong message: %s" m);
   match Unix.fork () with
   | 0 ->
-      let child_host = Host.create ~repo_root:"." ~argv:[||] in
+      let child_host = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
       child_host.Host.in_fork_child <- true;
       (match binding.invoke child_host [| code () |] with
       | Ok _ -> Unix._exit 7
@@ -571,7 +576,7 @@ let syscall (name : string) (host : Host.t) (args : Vm_value.t array) : int =
       | _ -> fail "syscall %s: returned a non-integer" name)
 
 let check_getcwd () =
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   let call_cwd (p : Vm_memory.pointer) (size : int) : int =
     syscall "__intrinsic_syscall2" host
       [| s64 310L; addr_value p; s64 (Int64.of_int size) |]
@@ -607,7 +612,7 @@ let check_getcwd () =
   pass "getcwd writes the VIRTUAL cwd as a NUL-terminated string and reports ERANGE"
 
 let check_dup () =
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   let r, w = Unix.pipe ~cloexec:false () in
   let gr = Host.register_guest_fd r in
   ignore (Unix.write w (Bytes.of_string "x") 0 1);
@@ -629,7 +634,7 @@ let check_dup () =
   pass "dup duplicates a guest descriptor (shared stream) and reports EBADF for an unknown fd"
 
 let check_mmap () =
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   (* anonymous: fd = -1 -> a zeroed Raw region of the requested length *)
   let a =
     syscall "__intrinsic_syscall6" host
@@ -679,7 +684,7 @@ let check_mmap () =
   pass "mmap allocates a zeroed arena region anonymously and fills file-backed mappings from the offset without moving the descriptor"
 
 let check_ioctl () =
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   let r, w = Unix.pipe ~cloexec:false () in
   let gr = Host.register_guest_fd r in
   (match Host.arena_alloc host 8 1 with
@@ -730,7 +735,7 @@ let parse_linux_dirents (b : Bytes.t) (n : int) : string list =
   List.rev !names
 
 let check_getdents () =
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   let dir = Filename.temp_dir "tg_host_dents" "" in
   let touch name =
     let oc = open_out (Filename.concat dir name) in
@@ -817,7 +822,7 @@ let () =
   check_getdents ();
   (* Informational: the default manifest host is fail-closed (the Ruby C
      API / map-set / dl* symbols are declared without bindings). *)
-  let host = Host.create ~repo_root:"." ~argv:[||] in
+  let host = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
   (match Host.closure_check host with
    | Ok report ->
        Printf.printf
@@ -831,4 +836,4 @@ let () =
          + List.length (Extern_registry.names host.Host.externs))
          (List.length host.Host.bindings));
   Printf.printf "OK: host closure self-check passed\n";
-  exit 0
+  Selfcheck_sentinel.emit_and_exit "tg_host"

@@ -263,7 +263,7 @@ let () =
   expect_fail "bad-group" "@cfg(any(target_os))\ndef x() -> Int = 0\n" [ "malformed" ];
   if !failures = 0 then begin
     Printf.printf "ALL CFG MATRIX PASS (%d cases)\n" !total;
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_cfgmatrix"
   end
   else begin
     Printf.printf "CFG MATRIX FAILED: %d of %d cases failed\n" !failures !total;

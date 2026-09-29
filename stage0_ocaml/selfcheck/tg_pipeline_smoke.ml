@@ -113,7 +113,7 @@ let lower_and_check ~repo_root (env : Typecheck.env) (program : Ast.program) : u
    | Ok mo ->
        if mo.Driver.mo_residual_type_params > 0 then
          fail "residual Type_param after mono: %d" mo.Driver.mo_residual_type_params;
-       let host = Host.create ~repo_root ~argv:[||] in
+       let host = Host.create ~repo_root ~argv:[||] () in
        (match Vm.run ~program:mo.Driver.mo_program ~entry:mo.Driver.mo_entry ~argv:[||] ~host with
         | Error e -> fail "VM: %s" e.Vm.message
         | Ok code ->
@@ -127,7 +127,7 @@ let lower_and_check ~repo_root (env : Typecheck.env) (program : Ast.program) : u
                 | Ok ret -> Printf.printf "  main returned: %s\n" ret
                 | Error m -> fail "VM inspect run: %s" m));
             Printf.printf "SMOKE: PASS\n";
-            exit 0))
+            Selfcheck_sentinel.emit_and_exit "tg_pipeline_smoke"))
 
 let () =
   let argv = Array.to_list Sys.argv in
@@ -281,7 +281,7 @@ let () =
             if mo.Driver.mo_residual_type_params > 0 then
               fail "residual Type_param after mono: %d" mo.Driver.mo_residual_type_params;
             (* 6. VM run of the mono'd entry *)
-            let host = Host.create ~repo_root ~argv:[||] in
+            let host = Host.create ~repo_root ~argv:[||] () in
             (match Vm.run ~program:mo.Driver.mo_program ~entry:mo.Driver.mo_entry ~argv:[||] ~host with
              | Error e -> fail "VM: %s" e.Vm.message
              | Ok code ->
@@ -296,4 +296,4 @@ let () =
                      | Ok ret -> Printf.printf "  main returned: %s\n" ret
                      | Error m -> fail "VM inspect run: %s" m));
                  Printf.printf "SMOKE: PASS\n";
-                 exit 0)))
+                 Selfcheck_sentinel.emit_and_exit "tg_pipeline_smoke")))

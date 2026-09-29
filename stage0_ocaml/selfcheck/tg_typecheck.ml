@@ -33,11 +33,11 @@ let () =
           List.iter (fun e -> Printf.printf "    %s\n" e) (List.rev errors);
           if errors = [] then begin
             Printf.printf "OK: type check succeeded with 0 errors\n";
-            exit 0
+            Selfcheck_sentinel.emit_and_exit "tg_typecheck"
           end
           else begin
             (* STATUS reporter, not a gate: the corpus file legitimately
                exercises the full language; the count is the canary *)
             Printf.printf "TYPECHECK_STATUS = %d errors (known corpus surface)\n" (List.length errors);
-            exit 0
+            Selfcheck_sentinel.emit_and_exit "tg_typecheck"
           end

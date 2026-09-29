@@ -51,7 +51,7 @@ let () =
   else begin
     Printf.printf "  diagnostics: 0\n";
     Printf.printf "OK: parse + resolve succeeded with no diagnostics\n";
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_selfcheck"
   end
 
 (* Abstraction proof: a Type_id is accepted at the Type_repr.Named boundary. *)
