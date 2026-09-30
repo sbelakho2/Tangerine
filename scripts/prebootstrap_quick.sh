@@ -292,8 +292,11 @@ if [ "$MODE" = "final" ]; then
   # The closure gate is the authority: it reports NOT YET (exit 1) while
   # any typecheck debt remains, and at zero debt it must produce the
   # full-closure PASS *and* the kernel-in-VM self-host preflight PASS.
+  # NOTE: canonical resolution parity already ran in the MEDIUM section
+  # above; this final call is the full closure + the kernel-in-VM
+  # self-host preflight (the label must map exactly to what it runs).
   [ "$FAILURES" -eq 0 ] &&
-    run_check "full closure + canonical parity + self-host preflight" scripts/check_ocaml_bootstrap_complete.sh
+    run_check "full closure + self-host preflight" scripts/check_ocaml_bootstrap_complete.sh
 fi
 
 
@@ -307,6 +310,10 @@ fi
 case "$MODE" in
   quick) echo "PREBOOTSTRAP QUICK: PASS — ${CHECKS} check(s); seconds-scale ladder green" ;;
   medium) echo "PREBOOTSTRAP MEDIUM: PASS — ${CHECKS} check(s); parity lanes green" ;;
-  final) echo "PREBOOTSTRAP FINAL: PASS — ${CHECKS} check(s); pre-bootstrap authorization evidence complete" ;;
+  final)
+    echo "PREBOOTSTRAP FINAL: PASS — ${CHECKS} check(s); pre-bootstrap authorization evidence complete"
+    echo "  canonical resolution parity: PASS (medium tier)"
+    echo "  full closure + kernel-in-VM self-host preflight (stop after MONO): PASS"
+    ;;
 esac
 exit 0

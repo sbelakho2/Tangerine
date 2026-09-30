@@ -832,6 +832,9 @@ pub def parse_check_cli(args: Vec[String]) -> Result[CheckCli, String]
   if file.len() == 0 then
     return Result::Err("error: no input file")
   end
+  if opts.emit_check_summary && !bootstrap_proof_root_ok(file.clone()) then
+    return Result::Err("error: --bootstrap-proof requires the repository kernel entry root tg_compiler/bootstrap_main.tg (repository-relative, no \"..\")")
+  end
   Result::Ok(CheckCli { opts: opts, file: file })
 end
 
@@ -885,6 +888,30 @@ pub def canonical_kernel_source_path(path: String) -> String
   else
     path
   end
+end
+
+# The bootstrap PROOF root must be the REPOSITORY's own kernel entry, not a
+# lookalike path (audit P0-1): proof mode and the closure-root dedup accept
+# only repository-RELATIVE spellings that canonicalize to
+# tg_compiler/bootstrap_main.tg — no absolute paths and no ".." segments.
+# A suffix-recognized /tmp/evil/tg_compiler/bootstrap_main.tg can therefore
+# never carry the repository root's identity into the closure, and the
+# manifest-closed validation then rejects it (its bytes are not the
+# manifest's).
+pub def bootstrap_proof_root_ok(path: String) -> Bool
+  if path.starts_with("/") then
+    return false
+  end
+  if path.contains("..") then
+    return false
+  end
+  canonical_kernel_source_path(path) == "tg_compiler/bootstrap_main.tg"
+end
+
+# The prefix rule for the SNAPSHOT-bound fingerprint: the root entry is
+# keyed by the exact canonical manifest spelling.
+def tg_is_root_entry(root_path: String, rel: String) -> Bool
+  root_path.len() > 0 && canonical_kernel_source_path(root_path.clone()) == rel
 end
 
 # The FULL TOOLING DRIVER root (tg_compiler/driver.tg — fmt/lint/test/bench/
@@ -2470,11 +2497,43 @@ def tg_push_string(inout buf: Vec[u8], s: String) -> Unit
   end
 end
 
+# The fingerprint COMPOSITION primitive (one place, directly testable):
+# manifest + "\n\0" + version + "\n\0" + per entry ("\0" between):
+# join("::", path) + "\x01" + rel + "\x01" + len(bytes) + "\x01" +
+# sha256hex(bytes).  Isolating it lets the probe prove the encoding and
+# the byte-sensitivity on tiny inputs without paying for a second
+# full-closure pass in the VM (the step budget is a real bound).
+def tg_fingerprint_compose(manifest: String, version: String, path_joins: Vec[String],
+    rels: Vec[String], sources: Vec[String]) -> String
+  var buf: Vec[u8] = Vec::new()
+  tg_push_string(&mut buf, manifest)
+  buf.push(10)
+  buf.push(0)
+  tg_push_string(&mut buf, version)
+  buf.push(10)
+  buf.push(0)
+  var i = 0
+  while i < path_joins.len() do
+    if i > 0 then
+      buf.push(0)
+    end
+    tg_push_string(&mut buf, path_joins[i].clone())
+    buf.push(1)
+    tg_push_string(&mut buf, rels[i].clone())
+    buf.push(1)
+    tg_push_string(&mut buf, sources[i].as_bytes().len().to_string())
+    buf.push(1)
+    tg_push_string(&mut buf, tg_sha256_hex(sources[i].as_bytes()))
+    i = i + 1
+  end
+  tg_sha256_hex(buf)
+end
+
 # The seed-compatible fingerprint of the KERNEL closure: read the exact
 # manifest bytes, hash every listed source's exact bytes, compose in
 # manifest order.  Option::None when the manifest is absent/unreadable (a
 # non-kernel build), so the caller can emit a neutral field.
-pub def bootstrap_closure_fingerprint() -> Option[String]
+pub def bootstrap_closure_fingerprint(root_path: String, root_source: String) -> Option[String]
   let manifest_rel = "bootstrap/compiler_kernel.manifest"
   if !file_exists(manifest_rel) then
     return Option::None
@@ -2485,25 +2544,20 @@ pub def bootstrap_closure_fingerprint() -> Option[String]
   end
   let lines = content.split("\n")
   var version = ""
-  var buf: Vec[u8] = Vec::new()
-  tg_push_string(&mut buf, content.clone())
   # The version record must be found before the first entry; the seed
   # rejects a missing version, so mirror that here.
   var vi = 0
   while vi < lines.len() do
     let line = lines[vi].trim()
-    if line.starts_with("version:") || line.starts_with("version :") then
+    if line.starts_with("version:") then
       version = line.slice(line.index_of(":") + 1, line.len()).trim()
       break
     end
     vi = vi + 1
   end
-  buf.push(10)
-  buf.push(0)
-  tg_push_string(&mut buf, version.clone())
-  buf.push(10)
-  buf.push(0)
-  var first = true
+  var path_joins: Vec[String] = Vec::new()
+  var rels: Vec[String] = Vec::new()
+  var sources: Vec[String] = Vec::new()
   var li = 0
   while li < lines.len() do
     let line = lines[li].trim()
@@ -2530,29 +2584,27 @@ pub def bootstrap_closure_fingerprint() -> Option[String]
             end
             si = si + 1
           end
-          let source = match read_source_file(rel.clone())
-          when Result::Ok(s) then s
-          when Result::Err(_) then return Option::None
+          # (P0-1) the ROOT entry hashes the CONSUMED snapshot bytes, not a
+          # re-read: the digest is bound to what the compilation actually
+          # parsed, so a filesystem change between parse and proof cannot
+          # detach the evidence from the root source.
+          let source = if tg_is_root_entry(root_path.clone(), rel.clone()) then
+            root_source.clone()
+          else
+            match read_source_file(rel.clone())
+            when Result::Ok(s) then s
+            when Result::Err(_) then return Option::None
+            end
           end
-          if !first then
-            buf.push(0)
-          end
-          first = false
-          tg_push_string(&mut buf, joined)
-          buf.push(1)
-          tg_push_string(&mut buf, rel.clone())
-          buf.push(1)
-          # BYTE length (the seed hashes the raw bytes; String.len() is
-          # not the authority for UTF-8 content).
-          tg_push_string(&mut buf, source.as_bytes().len().to_string())
-          buf.push(1)
-          tg_push_string(&mut buf, tg_sha256_hex(source.as_bytes()))
+          path_joins.push(joined)
+          rels.push(rel)
+          sources.push(source)
         end
       end
     end
     li = li + 1
   end
-  Option::Some(tg_sha256_hex(buf))
+  Option::Some(tg_fingerprint_compose(content, version, path_joins, rels, sources))
 end
 
 # The ONE machine-readable preflight summary (mir + mono stops share it):
@@ -2561,13 +2613,13 @@ end
 # plus one module per DISTINCT dependency file — so a duplicated root can
 # never satisfy the preflight again.  `stop` names the exact depth the
 # summary certifies (a Mir-only image can never masquerade as a mono run).
-pub def emit_check_ok_summary(path: String, ast: Program, stop: String) -> Unit
+pub def emit_check_ok_summary(path: String, ast: Program, stop: String, root_source: String) -> Unit
   let manifest_entries = match bootstrap_manifest_sources()
   when Option::Some(files) then files.len()
   when Option::None then 0
   end
   let closure_sha256 = if manifest_entries > 0 then
-    match bootstrap_closure_fingerprint()
+    match bootstrap_closure_fingerprint(path.clone(), root_source)
     when Option::Some(fp) then fp
     when Option::None then "unavailable".to_string()
     end
@@ -2694,7 +2746,11 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   # root is a member of the manifest closure).  A repo-closure build keeps
   # the plain prelude walk: its root may itself be a prelude module, and
   # removing that module would break path-qualified imports.
-  let root_dedup = if manifest_closed then canonical_kernel_source_path(path.clone()) else "".to_string() end
+  let root_dedup = if manifest_closed && bootstrap_proof_root_ok(path.clone()) then
+    canonical_kernel_source_path(path.clone())
+  else
+    "".to_string()
+  end
   var ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: manifest_closed, root_path: root_dedup)
   when Result::Ok(a) then a
   when Result::Err(e) then
@@ -2875,7 +2931,7 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
     # bootstrap/compiler_kernel.manifest closure size.  The proof line is
     # emitted only under --bootstrap-proof.
     if opts.emit_check_summary then
-      emit_check_ok_summary(path.clone(), &ast, "mir")
+      emit_check_ok_summary(path.clone(), &ast, "mir", source.clone())
     end
     return Result::Ok(())
   end
@@ -2965,7 +3021,7 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   # this stop to cover the specialization/query/post-mono failure surface.
   if opts.stop_after == StopAfter::Mono then
     if opts.emit_check_summary then
-      emit_check_ok_summary(path.clone(), &ast, "mono")
+      emit_check_ok_summary(path.clone(), &ast, "mono", source.clone())
     end
     return Result::Ok(())
   end
@@ -3288,7 +3344,11 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
   # its imports from the repo like any other program.
   let manifest_closed = is_kernel_entry_path(path.clone())
   # `var` so the canonical semantic pass below can take &mut ast.
-  let root_dedup = if manifest_closed then canonical_kernel_source_path(path.clone()) else "".to_string() end
+  let root_dedup = if manifest_closed && bootstrap_proof_root_ok(path.clone()) then
+    canonical_kernel_source_path(path.clone())
+  else
+    "".to_string()
+  end
   var ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: manifest_closed, root_path: root_dedup)
   when Result::Ok(a) then a
   when Result::Err(e) then

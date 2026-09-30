@@ -32,14 +32,14 @@
 use std::core::{Option, Result}
 use std::collections::{Vec}
 use std::args::{raw_arg_count, raw_arg_copy}
-use std::fs::{write_file, file_exists, file_size}
+use std::fs::{write_file, read_file, file_exists, file_size}
 use std::io::{println}
 use tg_compiler::asm::{
   AsmSymbol, Relocation, RelocKind, Section, SymBinding, SymKind, Arch, OsAbi, asm_target
 }
 use tg_compiler::object::{object_new, ObjectFile}
 use tg_compiler::linker::{LinkerInput, link_executable}
-use tg_compiler::compiler_core::{compile_startup_entry, default_options, parse_check_cli, CheckCli, StopAfter, canonical_kernel_source_path, tg_sha256_hex, bootstrap_closure_fingerprint}
+use tg_compiler::compiler_core::{compile_startup_entry, default_options, parse_check_cli, CheckCli, StopAfter, canonical_kernel_source_path, bootstrap_proof_root_ok, tg_sha256_hex, tg_fingerprint_compose, bootstrap_closure_fingerprint}
 
 const LINKPROBE_SRC: String = "use std::alloc::{size_of, align_of}\nuse std::io::{println}\n\nstruct ProbePair[T]\n  a: u8\n  b: T\nend\n\ndef q_size[T]() -> Int\n  size_of[T]() as Int\nend\n\ndef q_align[T]() -> Int\n  align_of[T]() as Int\nend\n\ndef main() -> Int effect Io\n  # 1. the parse boundary, LITERAL argument: the MIR literal rule\n  #    materializes it into an owned String object at the by-name\n  #    __intrinsic_str_parse_int parameter (the seed host binding's\n  #    Vm_value.String) — Ok for a valid integer, Err for garbage.\n  let a = match __intrinsic_str_parse_int(\"42\")\n    when Result::Ok(n) then n == 42\n    when Result::Err(_) then false\n    end\n  let b = match __intrinsic_str_parse_int(\"nope\")\n    when Result::Ok(_) then false\n    when Result::Err(_) then true\n    end\n  # 2. the parse boundary, OWNED String OBJECT (non-literal): the\n  #    object handle flows straight to the by-name symbol, which\n  #    unwraps its data pointer itself — Ok for a valid integer, Err\n  #    for garbage (the seed host binding's Result contract).\n  let s_ok = __intrinsic_string_slice(\"43\", 0, 2)\n  let c = match __intrinsic_str_parse_int(s_ok)\n    when Result::Ok(n) then n == 43\n    when Result::Err(_) then false\n    end\n  let s_bad = __intrinsic_string_slice(\"12x\", 0, 3)\n  let d = match __intrinsic_str_parse_int(s_bad)\n    when Result::Ok(_) then false\n    when Result::Err(_) then true\n    end\n  # 3. the parse boundary, `as_str()`-derived RAW VIEW: the borrowed\n  #    bytes are materialized into an owned String object (the explicit\n  #    owned conversion the raw->object boundary requires) and then\n  #    parsed through the object-convention symbol.\n  let s_view_ok = __intrinsic_string_slice(\"43\", 0, 2)\n  let e = match __intrinsic_str_parse_int(__intrinsic_string_from_static(s_view_ok.as_str()))\n    when Result::Ok(n) then n == 43\n    when Result::Err(_) then false\n    end\n  let s_view_bad = __intrinsic_string_slice(\"12x\", 0, 3)\n  let f = match __intrinsic_str_parse_int(__intrinsic_string_from_static(s_view_bad.as_str()))\n    when Result::Ok(_) then false\n    when Result::Err(_) then true\n    end\n  let g = (__intrinsic_float_to_bits(1.5) as Int) == 0x3FF8000000000000\n  let h = __intrinsic_int_to_float(3) == 3.0\n  let i = __intrinsic_float_to_int(2.75) == 2\n  # size_of/align_of: concrete primitives ...\n  let j = (size_of[u8]() == 1) && (align_of[u8]() == 1)\n  let k = (size_of[UInt]() == 8) && (align_of[UInt]() == 8)\n  # ... a concrete INSTANCE of a generic nominal (ProbePair[u8] =\n  # {a: u8 @0, b: u8 @1} -> size 2 / align 1) ...\n  let l = (size_of[ProbePair[u8]]() == 2) && (align_of[ProbePair[u8]]() == 1)\n  # ... and the same instance shapes reached through GENERIC helper\n  # functions (ProbePair[UInt] = {a: u8 @0, b: UInt @8} -> size 16 /\n  # align 8), the generic-instantiation route.\n  let m = (q_size[ProbePair[UInt]]() == 16) && (q_align[ProbePair[UInt]]() == 8)\n  let n = (q_size[UInt]() == 8) && (q_align[UInt]() == 8)\n  # Distinct failure codes name the first failing check (the harness\n  # reports the code; 42 is the all-checks-pass success).\n  if !a then return 11 end\n  if !b then return 12 end\n  if !c then return 13 end\n  if !d then return 14 end\n  if !e then return 15 end\n  if !f then return 16 end\n  if !g then return 17 end\n  if !h then return 18 end\n  if !i then return 19 end\n  if !j then return 20 end\n  if !k then return 21 end\n  if !l then return 22 end\n  if !m then return 23 end\n  if !n then return 24 end\n  println(\"LINKPROBE_ARTIFACT_OK parse_int literal+owned+view\")\n  42\nend\n"
 
@@ -377,7 +377,8 @@ def linkprobe_cli_checks() -> Int
     println("LINKPROBE_CLI proof-opt-in=FAIL (summary on by default)")
     return 37
   end
-  let c7b = match parse_check_cli(vec!["--bootstrap-proof", "foo.tg"])
+  # --bootstrap-proof now requires the repository kernel entry root.
+  let c7b = match parse_check_cli(vec!["--bootstrap-proof", "tg_compiler/bootstrap_main.tg"])
   when Result::Err(_) then
     println("LINKPROBE_CLI proof-opt-in=FAIL (--bootstrap-proof rejected)")
     return 37
@@ -435,10 +436,19 @@ end
 # linkprobe lane before the expensive mono preflight.
 def linkprobe_closure_digest_checks(expected: String) -> Int
   if expected.len() == 0 then
-    println("LINKPROBE_CLOSURE_DIGEST=SKIP (no seed fingerprint supplied)")
-    return 0
+    # The integrity lane must never silently degrade into "not applicable":
+    # a manifest that cannot be loaded is a RED trust failure, not a skip.
+    println("LINKPROBE_CLOSURE_DIGEST=FAIL (no seed fingerprint supplied — manifest load must fail closed)")
+    return 40
   end
-  let got = match bootstrap_closure_fingerprint()
+  let root_path = "tg_compiler/bootstrap_main.tg".to_string()
+  let root_src = match read_file(root_path.clone())
+  when Result::Ok(src) => src
+  when Result::Err(_) =>
+    println("LINKPROBE_CLOSURE_DIGEST=FAIL (cannot read the root source)")
+    return 40
+  end
+  let got = match bootstrap_closure_fingerprint(root_path.clone(), root_src.clone())
   when Option::Some(fp) => fp
   when Option::None =>
     println("LINKPROBE_CLOSURE_DIGEST=FAIL (kernel could not compute it)")
@@ -448,7 +458,93 @@ def linkprobe_closure_digest_checks(expected: String) -> Int
     println("LINKPROBE_CLOSURE_DIGEST=FAIL (got " + got + ", seed " + expected + ")")
     return 40
   end
-  println("LINKPROBE_CLOSURE_DIGEST=PASS (kernel recomputation == seed fingerprint)")
+  # (P0-1) binding, cheap form: the composition primitive must be
+  # byte-sensitive and encoding-exact.  (A second full-closure pass in the
+  # VM exceeds the step budget, so the binding is pinned here on the SAME
+  # primitive the real fingerprint composes with, plus the static
+  # tg_is_root_entry contract that feeds it the consumed root bytes.)
+  let base = tg_fingerprint_compose(
+    "m".to_string(), "1".to_string(),
+    vec!["a"], vec!["a/x.tg"], vec!["AAA".to_string()])
+  let changed = tg_fingerprint_compose(
+    "m".to_string(), "1".to_string(),
+    vec!["a"], vec!["a/x.tg"], vec!["AAB".to_string()])
+  if base == changed then
+    println("LINKPROBE_CLOSURE_DIGEST=FAIL (composition is not byte-sensitive)")
+    return 41
+  end
+  # Encoding pin: independently assemble the exact expected byte buffer
+  # and hash it; the primitive must agree byte-for-byte.
+  var manual: Vec[u8] = Vec::new()
+  manual.push(109)
+  manual.push(10)
+  manual.push(0)
+  manual.push(49)
+  manual.push(10)
+  manual.push(0)
+  manual.push(97)
+  manual.push(1)
+  let rel = "a/x.tg"
+  var ri = 0
+  while ri < rel.len() do manual.push(rel.as_bytes()[ri]); ri = ri + 1 end
+  manual.push(1)
+  manual.push(51)
+  manual.push(1)
+  let ah = tg_sha256_hex("AAA".as_bytes())
+  var ai = 0
+  while ai < ah.len() do manual.push(ah.as_bytes()[ai]); ai = ai + 1 end
+  if tg_sha256_hex(manual) != base then
+    println("LINKPROBE_CLOSURE_DIGEST=FAIL (composition encoding mismatch vs manual buffer)")
+    return 41
+  end
+  println("LINKPROBE_CLOSURE_DIGEST=PASS (kernel recomputation == seed fingerprint; composition byte-sensitive and encoding-exact)")
+  0
+end
+
+# ── proof-root identity (audit P0-1): only repository-relative spellings
+# of the kernel entry may carry the bootstrap proof; lookalike absolute or
+# ".."-containing paths are rejected, and the CLI enforces the same rule
+# for --bootstrap-proof.
+def linkprobe_proof_root_checks() -> Int
+  if !bootstrap_proof_root_ok("tg_compiler/bootstrap_main.tg".to_string()) then
+    println("LINKPROBE_PROOF_ROOT=FAIL (canonical root rejected)")
+    return 42
+  end
+  if !bootstrap_proof_root_ok("./tg_compiler/bootstrap_main.tg".to_string()) then
+    println("LINKPROBE_PROOF_ROOT=FAIL (./-prefixed root rejected)")
+    return 42
+  end
+  if bootstrap_proof_root_ok("/tmp/fake/tg_compiler/bootstrap_main.tg".to_string()) then
+    println("LINKPROBE_PROOF_ROOT=FAIL (absolute lookalike accepted)")
+    return 42
+  end
+  if bootstrap_proof_root_ok("foo/../tg_compiler/bootstrap_main.tg".to_string()) then
+    println("LINKPROBE_PROOF_ROOT=FAIL (..-containing lookalike accepted)")
+    return 42
+  end
+  if bootstrap_proof_root_ok("std/core.tg".to_string()) then
+    println("LINKPROBE_PROOF_ROOT=FAIL (non-entry path accepted)")
+    return 42
+  end
+  match parse_check_cli(vec!["--bootstrap-proof", "/tmp/fake/tg_compiler/bootstrap_main.tg"])
+  when Result::Err(_) => ()
+  when Result::Ok(_) =>
+    println("LINKPROBE_PROOF_ROOT=FAIL (CLI accepted an external lookalike root)")
+    return 42
+  end
+  match parse_check_cli(vec!["--bootstrap-proof", "foo/../tg_compiler/bootstrap_main.tg"])
+  when Result::Err(_) => ()
+  when Result::Ok(_) =>
+    println("LINKPROBE_PROOF_ROOT=FAIL (CLI accepted a ..-containing root)")
+    return 42
+  end
+  match parse_check_cli(vec!["--bootstrap-proof", "tg_compiler/bootstrap_main.tg"])
+  when Result::Err(_) =>
+    println("LINKPROBE_PROOF_ROOT=FAIL (CLI rejected the repository root)")
+    return 42
+  when Result::Ok(_) => ()
+  end
+  println("LINKPROBE_PROOF_ROOT=PASS (lookalike roots rejected; repository root accepted)")
   0
 end
 
@@ -621,6 +717,10 @@ def main() -> Int
     if argc > 4 then raw_arg_copy(4) else "".to_string() end)
   if digest_rc != 0 then
     return digest_rc
+  end
+  let proof_root_rc = linkprobe_proof_root_checks()
+  if proof_root_rc != 0 then
+    return proof_root_rc
   end
   let policy_rc = linkprobe_elf_import_policy_checks()
   if policy_rc != 0 then

@@ -1516,6 +1516,36 @@ run_target_lane_canaries() {
     fi
   done < tests/canary/MANIFEST
 
+  # ── the DIRECT-emitter allocator canary (audit): the LIR route is the
+  # production default; the direct route's callee-saved allocator must be
+  # exercised EXPLICITLY, with route evidence, on x86-64 targets.
+  if [ "$target_arch" = "x86_64" ]; then
+    local alloc_src="tests/canary/canary_pos_x64_regs_spill_calls.tg"
+    if [ -f "$alloc_src" ]; then
+      local alloc_bin="$outdir/.lane_${target_arch}_allocator_direct"
+      if "$compiler" compile "$alloc_src" -o "$alloc_bin" --target "$triple" \
+        --codegen=direct >/dev/null 2>&1; then
+        if ! bh_assert_no_trap_stubs "$alloc_bin" "$triple"; then
+          bh_err "X64_ALLOCATOR_CANARY route=direct target=$triple FAIL (trap-stub gate)"
+          failures=$((failures + 1))
+        elif [ "$can_exec" -eq 1 ]; then
+          chmod +x "$alloc_bin"
+          if "${runner[@]}" "$alloc_bin" >/dev/null 2>&1; then
+            bh_log "X64_ALLOCATOR_CANARY route=direct target=$triple PASS (executed)"
+          else
+            bh_err "X64_ALLOCATOR_CANARY route=direct target=$triple FAIL (nonzero exit)"
+            failures=$((failures + 1))
+          fi
+        else
+          bh_log "X64_ALLOCATOR_CANARY route=direct target=$triple PASS (structural; execution unavailable)"
+        fi
+      else
+        bh_err "X64_ALLOCATOR_CANARY route=direct target=$triple FAIL (--codegen=direct compile failed)"
+        failures=$((failures + 1))
+      fi
+    fi
+  fi
+
   bh_log "target lane ($triple): $((total - failures))/$total passed (execution: $(if [ "$can_exec" -eq 1 ]; then printf 'yes'; else printf 'no — disassembly gate only'; fi))"
   if [ "$failures" -ne 0 ]; then
     bh_err "target lane ($triple) FAILED: $failures problem(s)"

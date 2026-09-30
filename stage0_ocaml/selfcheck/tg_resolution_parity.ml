@@ -86,6 +86,24 @@ let contains_sub s sub =
   let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in
   m = 0 || go 0
 
+(* The bootstrap target authority: an explicit --target wins, then
+   TG_BOOTSTRAP_TARGET (the same authority every other gate uses), then
+   the recorded default.  The parity lane MUST validate the target the
+   ladder will actually build — a Darwin-pinned parity run during a Linux
+   bootstrap validates a different @cfg elimination than production. *)
+let resolved_target_str () : string =
+  let rec arg_target = function
+    | "--target" :: t :: _ -> Some t
+    | _ :: rest -> arg_target rest
+    | [] -> None
+  in
+  match arg_target (Array.to_list Sys.argv) with
+  | Some t -> t
+  | None -> (
+      match Sys.getenv_opt "TG_BOOTSTRAP_TARGET" with
+      | Some t -> t
+      | None -> "aarch64-apple-darwin")
+
 let () =
   let repo_root =
     match Array.to_list Sys.argv with
@@ -93,8 +111,10 @@ let () =
     | _ -> ".."
   in
   ensure_dir (Filename.concat repo_root "build");
+  let target_str = resolved_target_str () in
+  Printf.printf "tg_resolution_parity: target %s\n%!" target_str;
   let target =
-    match Target.unsupported_triple "aarch64-apple-darwin" with
+    match Target.unsupported_triple target_str with
     | Error m -> fail "target: %s" m
     | Ok t -> t
   in
@@ -112,7 +132,7 @@ let () =
     Driver.run_bootstrap_closure ~repo_root
       ~manifest_path:"bootstrap/resolution_parity_mini.manifest" ~target
       ~entry:(Some "resolution_parity_main")
-      ~kernel_args:[ "resolution-parity"; "aarch64-apple-darwin" ]
+      ~kernel_args:[ "resolution-parity"; target_str ]
   with
   | Error m -> fail "closure pipeline: %s" m
   | Ok stages -> (
@@ -141,6 +161,12 @@ let () =
               report_path;
           if stages.Driver.bs_stdout <> "" then
             Printf.printf "kernel stdout:\n%s\n" stages.Driver.bs_stdout;
+          (* The evidence must be from the REQUESTED target: a stale or
+             wrong-target run can never masquerade as the requested one. *)
+          if not (contains_sub evidence ("target=" ^ target_str)) then
+            fail
+              "VM exit 0 but the probe evidence does not name the requested target %s — stale or wrong-target run"
+              target_str;
           if not (contains_sub evidence "resolver diagnostics 0") then
             fail
               "VM exit 0 but the probe evidence does not record zero resolver diagnostics — stale probe binary? rebuild the lane";
@@ -154,7 +180,8 @@ let () =
               "VM exit 0 but the probe report lacks the microcorpus/suffix-index oracle row — stale probe binary? rebuild the lane";
           ignore report;
           Printf.printf
-            "tg_resolution_parity: PASS — canonical merge shape (root module + every bootstrap/compiler_kernel.manifest source as its own file module, real Module.imports), resolver diagnostics ZERO, adversarial microcorpus + suffix-index scan oracles PASS (VM exit 0)\n";
+            "tg_resolution_parity: PASS — target %s; canonical production preparation (merge -> cfg -> macros -> node ids), resolver diagnostics ZERO, adversarial microcorpus + cfg-matrix + suffix-index scan oracles PASS (VM exit 0)\n"
+            target_str;
           Selfcheck_sentinel.emit_and_exit "tg_resolution_parity"
       | Some code ->
           if stages.Driver.bs_stdout <> "" then

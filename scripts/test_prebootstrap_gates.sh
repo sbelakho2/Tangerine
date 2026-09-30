@@ -244,6 +244,43 @@ else
   pass "parity manifest: probe entry present"
 fi
 
+# ── 7. contract provenance pins (audit follow-up) ────────────────────
+# Each pin names the source line that implements a proof-integrity
+# contract, so a future refactor that drops the contract goes red even if
+# no lane happens to run.
+check_pin() { # <label> <file> <regex>
+  local label="$1" file="$2" pattern="$3"
+  if grep -qE -- "$pattern" "$ROOT/$file"; then
+    pass "contract pin: ${label}"
+  else
+    bad "contract pin missing: ${label} (${file}: /${pattern}/)"
+  fi
+}
+check_pin "proof root requires the repository entry" tg_compiler/compiler_core.tg   'error: --bootstrap-proof requires the repository kernel entry root'
+check_pin "proof root rejects absolute lookalikes" tg_compiler/compiler_core.tg   'pub def bootstrap_proof_root_ok'
+check_pin "digest is bound to the consumed root bytes" tg_compiler/compiler_core.tg   'tg_is_root_entry\(root_path.clone\(\), rel.clone\(\)\)'
+check_pin "linkprobe never SKIPs the closure digest" stage0_ocaml/selfcheck/linkprobe.tg   'no seed fingerprint supplied'
+if grep -q 'LINKPROBE_CLOSURE_DIGEST=SKIP' "$ROOT/stage0_ocaml/selfcheck/linkprobe.tg"; then
+  bad "contract pin: linkprobe still has a digest SKIP path"
+else
+  pass "contract pin: no digest SKIP path"
+fi
+check_pin "linkprobe manifest load fails closed" stage0_ocaml/selfcheck/tg_linkprobe.ml   'cannot load compiler kernel manifest'
+check_pin "linkprobe is target/format aware" stage0_ocaml/selfcheck/tg_linkprobe.ml   'target_is_linux'
+check_pin "parity harness inherits the bootstrap target" stage0_ocaml/selfcheck/tg_resolution_parity.ml   'resolved_target_str'
+check_pin "parity evidence names the requested target" stage0_ocaml/selfcheck/tg_resolution_parity.ml   'does not name the requested target'
+check_pin "seed identity cannot be faked as unreadable" stage0_ocaml/src/driver.ml   'vpc_seed_identity : string option'
+check_pin "kernel parses --codegen=direct" tg_compiler/bootstrap_main.tg   '--codegen=lir requires the full driver'
+check_pin "direct allocator canary has route evidence" scripts/bootstrap_helpers.sh   'X64_ALLOCATOR_CANARY route=direct'
+
+# The mixed-architecture "tolerant" allowlist is now EMPTY: every
+# architecture-impossible register combination must fail closed.
+if [ "$(grep -c '# tolerant' "$ROOT/tg_compiler/codegen.tg" || true)" = "0" ]; then
+  pass "mixed-architecture tolerant allowlist is empty"
+else
+  bad "mixed-architecture # tolerant branches remain in tg_compiler/codegen.tg"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "test_prebootstrap_gates: FAIL"
   exit 1

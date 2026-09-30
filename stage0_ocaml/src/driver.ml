@@ -5382,8 +5382,10 @@ type vm_program_cache = {
   (* The SEED BUILD IDENTITY and cache schema: a cache prepared by a
      different seed binary (same closure, different lowering/mono) must
      never be reused.  Otherwise a seed bug fix could be masked by a warm
-     cache.  Identity = executable size + mtime + schema version. *)
-  vpc_seed_identity : string;
+     cache.  Identity = SHA-256(executable bytes) + path + schema.  An
+     ABSENT identity (executable unreadable) can never match or store a
+     cache — "could not establish identity" is not an identity. *)
+  vpc_seed_identity : string option;
   vpc_program : Seed_mir.program;
   vpc_entry_instance : Instance_id.t;
   vpc_lang_items : Lang_items.t;
@@ -5404,14 +5406,14 @@ let read_file_bytes (path : string) : string option =
    BYTES (plus path/schema).  Size+mtime is trivially collidable through
    copies/timestamp restoration, which would let a different seed's
    prepared program be reused. *)
-let seed_build_identity () : string =
+let seed_build_identity () : string option =
   let exe = Sys.executable_name in
-  let digest =
-    match read_file_bytes exe with
-    | Some bytes -> Sha256.digest bytes
-    | None -> "unreadable"
-  in
-  Printf.sprintf "schema=%s exe=%s sha256=%s" vm_cache_schema_version exe digest
+  match read_file_bytes exe with
+  | Some bytes ->
+      Some
+        (Printf.sprintf "schema=%s exe=%s sha256=%s" vm_cache_schema_version exe
+           (Sha256.digest bytes))
+  | None -> None
 
 let vm_cache_fingerprint ~(repo_root : string) ~(manifest_path : string) :
     string option =
@@ -5432,17 +5434,23 @@ let vm_cache_load ~(path : string) ~(fingerprint : string) ~(target : string)
          Some c
        with _ -> None)
     with
-    | Some c
-      when c.vpc_fingerprint = fingerprint
-           && c.vpc_target = target
-           && c.vpc_entry = (match entry with Some e -> e | None -> "")
-           && c.vpc_seed_identity = seed_build_identity () ->
-        Some (c.vpc_program, c.vpc_entry_instance, c.vpc_lang_items)
+    | Some c -> (
+        match seed_build_identity () with
+        | Some identity
+          when c.vpc_fingerprint = fingerprint
+               && c.vpc_target = target
+               && c.vpc_entry = (match entry with Some e -> e | None -> "")
+               && c.vpc_seed_identity = Some identity ->
+            Some (c.vpc_program, c.vpc_entry_instance, c.vpc_lang_items)
+        | _ -> None)
     | _ -> None
 
 let vm_cache_store ~(path : string) ~(fingerprint : string) ~(target : string)
     ~(entry : string option) ~(program : Seed_mir.program)
     ~(entry_instance : Instance_id.t) ~(lang_items : Lang_items.t) : unit =
+  match seed_build_identity () with
+  | None -> () (* no verified identity: never store a reusable cache *)
+  | Some identity ->
   try
     let tmp = path ^ ".tmp" in
     let oc = open_out_bin tmp in
@@ -5451,7 +5459,7 @@ let vm_cache_store ~(path : string) ~(fingerprint : string) ~(target : string)
         vpc_fingerprint = fingerprint;
         vpc_target = target;
         vpc_entry = (match entry with Some e -> e | None -> "");
-        vpc_seed_identity = seed_build_identity ();
+        vpc_seed_identity = Some identity;
         vpc_program = program;
         vpc_entry_instance = entry_instance;
         vpc_lang_items = lang_items;

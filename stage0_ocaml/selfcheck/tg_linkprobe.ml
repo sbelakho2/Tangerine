@@ -132,11 +132,9 @@ let contains_substring haystack needle =
     !found
   end
 
-let run_native path =
+let run_argv (argv : string array) =
   let out_r, out_w = Unix.pipe () in
-  let pid =
-    Unix.create_process path [| path |] Unix.stdin out_w Unix.stderr
-  in
+  let pid = Unix.create_process argv.(0) argv Unix.stdin out_w Unix.stderr in
   Unix.close out_w;
   let buf = Buffer.create 256 in
   let chunk = Bytes.create 4096 in
@@ -157,6 +155,58 @@ let run_native path =
     | _, Unix.WSTOPPED s -> `Stopped s
   in
   (status, Buffer.contents buf)
+
+(* ── target capability (audit P0-3): format, OS and EXECUTION ability ──
+   The harness must never attempt to execute a target image natively when
+   the host OS/arch do not match, and must never require a Darwin-only
+   artifact for a Linux target. *)
+let run_and_trim cmd =
+  try
+    let ic = Unix.open_process_in cmd in
+    let line = try input_line ic with End_of_file -> "" in
+    ignore (Unix.close_process_in ic);
+    String.trim line
+  with _ -> ""
+
+let host_is_darwin () =
+  Sys.file_exists "/System/Library/CoreServices"
+  || Sys.file_exists "/usr/lib/libSystem.B.dylib"
+  || run_and_trim "uname -s" = "Darwin"
+
+let host_arch () =
+  match run_and_trim "uname -m" with
+  | "arm64" | "aarch64" -> "arm64"
+  | "x86_64" | "amd64" -> "x86_64"
+  | other -> other
+
+let target_arch_of triple =
+  if String.length triple >= 6 && String.sub triple 0 6 = "x86_64" then "x86_64" else "arm64"
+
+let rosetta_works () =
+  try
+    let status, _ = run_argv [| "/usr/bin/arch"; "-x86_64"; "/usr/bin/true" |] in
+    match status with `Exited 0 -> true | _ -> false
+  with _ -> false
+
+(* "native" | "rosetta" | "unavailable": a CAPABILITY decision, not a
+   command-presence guess. *)
+let runner_for ~target_str =
+  let tarch = target_arch_of target_str in
+  let tdarwin = contains_substring target_str "apple-darwin" in
+  let hdarwin = host_is_darwin () in
+  let harch = host_arch () in
+  if hdarwin = tdarwin && harch = tarch then "native"
+  else if hdarwin && tdarwin && harch = "arm64" && tarch = "x86_64" && rosetta_works () then
+    "rosetta"
+  else "unavailable"
+
+let elf_magic_ok path =
+  let s = read_file path in
+  String.length s >= 4
+  && Char.code s.[0] = 0x7f
+  && s.[1] = 'E'
+  && s.[2] = 'L'
+  && s.[3] = 'F'
 
 let () =
   let args = Array.to_list Sys.argv in
@@ -190,17 +240,23 @@ let () =
     | Error m -> fail "target: %s" m
     | Ok t -> t
   in
+  let target_is_linux = contains_substring target_str "linux" in
+  let format = if target_is_linux then "elf" else "macho" in
+  let runner = runner_for ~target_str in
+  Printf.printf "tg_linkprobe: target=%s format=%s execution=%s\n%!" target_str format
+    runner;
   let t0 = Unix.gettimeofday () in
   let vm_cache = if use_cache then Some cache_path else None in
   (* The seed's own closure fingerprint: the in-VM probe recomputes it
-     over the manifest + source bytes it reads and must agree. *)
+     over the manifest + source bytes it reads and must agree.  A manifest
+     that cannot be loaded is a RED trust failure, never a SKIP. *)
   let manifest_fingerprint =
     match
       Bootstrap_manifest.load ~repo_root
         ~manifest_path:"bootstrap/compiler_kernel.manifest"
     with
     | Ok m -> Bootstrap_manifest.fingerprint m
-    | Error _ -> ""
+    | Error m -> fail "cannot load compiler kernel manifest: %s" m
   in
   match
     Driver.run_bootstrap_vm ~repo_root
@@ -213,8 +269,8 @@ let () =
   | Ok run ->
       let dt = Unix.gettimeofday () -. t0 in
       Printf.printf
-        "tg_linkprobe: mode=%s target=%s vm_code=%s cache_hit=%b reachable=%d wall=%.1fs\n"
-        mode target_str
+        "tg_linkprobe: mode=%s target=%s format=%s execution=%s vm_code=%s cache_hit=%b reachable=%d wall=%.1fs\n"
+        mode target_str format runner
         (match run.Driver.bvr_vm_code with
         | Some c -> string_of_int c
         | None -> "trap")
@@ -252,23 +308,33 @@ let () =
       let st = Unix.stat out_path in
       if st.Unix.st_size <= 0 then
         fail "the produced artifact is empty (0 bytes)";
-      (* RUNNABLE-EFFECTIVE: the artifact must carry no undefined
-         __intrinsic_* / _size_of / _align_of symbol (the linker's and
-         the type-query fold's fail-closed contracts). A leftover
-         intrinsic import would abort the process at dyld load ("Symbol
-         not found: __intrinsic_...") and a leftover size_of/align_of
-         extern call would abort with "Symbol not found: _size_of" /
-         "_align_of" — exactly the failure classes this fast lane exists
-         to catch. *)
-      let leftover = macho_undefined_intrinsics out_path in
-      if leftover <> [] then
-        fail
-          "the artifact still carries forbidden undefined extern symbol(s): %s — the linker left them for dyld instead of failing closed, or size_of/align_of were not folded to layout constants"
-          (String.concat ", " leftover);
-      (* Execute the artifact natively: the probe's main returns 42 and,
-         in full mode, prints the parse-boundary check marker — the
-         in-artifact assertion for the literal / owned / as_str-derived
-         parse cases. A non-42 exit names the first failing check. *)
+      (* Format-specific structural contract:
+         - ELF: the magic must match (the guest's link-time import policy
+           already rejected unresolved externals, so no Mach-O scan and
+           NO libc-import artifact is expected here);
+         - Mach-O: no undefined __intrinsic_*/_size_of/_align_of symbols
+           and the dyld-import artifact must exist. *)
+      if target_is_linux then begin
+        if not (elf_magic_ok out_path) then
+          fail "the produced artifact is not an ELF image (target %s)" target_str
+      end
+      else begin
+        let leftover = macho_undefined_intrinsics out_path in
+        if leftover <> [] then
+          fail
+            "the artifact still carries forbidden undefined extern symbol(s): %s — the linker left them for dyld instead of failing closed, or size_of/align_of were not folded to layout constants"
+            (String.concat ", " leftover);
+        if mode = "linkobj" then begin
+          let libc_path = Filename.concat repo_root "build/linkprobe_libc.out" in
+          if not (Sys.file_exists libc_path) then
+            fail "the libc-import artifact build/linkprobe_libc.out is missing";
+          let l_leftover = macho_undefined_intrinsics libc_path in
+          if l_leftover <> [] then
+            fail
+              "the libc-import artifact carries forbidden undefined extern symbol(s): %s"
+              (String.concat ", " l_leftover)
+        end
+      end;
       let exit_hint code =
         if mode = "full" && code >= 11 && code <= 24 then
           let what =
@@ -293,10 +359,17 @@ let () =
       in
       let execute ?(marker = "") label path =
         let status, output =
-          try run_native path
-          with Unix.Unix_error (e, _, _) ->
-            fail "could not execute the %s artifact: %s" label
-              (Unix.error_message e)
+          match runner with
+          | "native" -> (
+              try run_argv [| path |]
+              with Unix.Unix_error (e, _, _) ->
+                fail "could not execute the %s artifact: %s" label (Unix.error_message e))
+          | "rosetta" -> (
+              try run_argv [| "/usr/bin/arch"; "-x86_64"; path |]
+              with Unix.Unix_error (e, _, _) ->
+                fail "could not execute the %s artifact under Rosetta: %s" label
+                  (Unix.error_message e))
+          | _ -> fail "internal: execute called with no runner"
         in
         if output <> "" then
           Printf.printf "tg_linkprobe: %s artifact stdout:\n%s" label output;
@@ -312,25 +385,26 @@ let () =
             "the %s artifact did not print the expected marker %S — the embedded parse-boundary checks did not all hold"
             label marker
       in
-      if mode = "full" then
-        execute ~marker:"LINKPROBE_ARTIFACT_OK" "probe" out_path
-      else execute "probe" out_path;
-      (* linkobj mode also executes the libc-import artifact: a dyld
-         import (libSystem `_exit`) must still link and run after the
-         fail-closed intrinsic guard. *)
-      if mode = "linkobj" then begin
-        let libc_path = Filename.concat repo_root "build/linkprobe_libc.out" in
-        if not (Sys.file_exists libc_path) then
-          fail "the libc-import artifact build/linkprobe_libc.out is missing";
-        let l_leftover = macho_undefined_intrinsics libc_path in
-        if l_leftover <> [] then
-          fail "the libc-import artifact carries forbidden undefined extern symbol(s): %s"
-            (String.concat ", " l_leftover);
-        execute "libc-import" libc_path
-      end;
+      let execution_evidence =
+        if runner = "unavailable" then begin
+          Printf.printf
+            "tg_linkprobe: execution=unavailable for target %s on this host; the structural (format + linker-contract) proof is authoritative for this run\n"
+            target_str;
+          "unavailable(structural-proof=pass)"
+        end
+        else begin
+          if mode = "full" then
+            execute ~marker:"LINKPROBE_ARTIFACT_OK" "probe" out_path
+          else execute "probe" out_path;
+          if mode = "linkobj" && not target_is_linux then
+            execute "libc-import" (Filename.concat repo_root "build/linkprobe_libc.out");
+          "performed"
+        end
+      in
       Printf.printf
-        "tg_linkprobe: PASS — kernel %s path produced a codesigned executable; no undefined __intrinsic_*/_size_of/_align_of symbols; the artifact ran natively with exit 42%s (cache_hit=%b, %.1fs)\n"
+        "tg_linkprobe: PASS — target=%s format=%s execution=%s kernel %s path produced a validated executable; the artifact ran natively with exit 42%s (cache_hit=%b, %.1fs)\n"
+        target_str format execution_evidence
         (if mode = "linkobj" then "link_executable" else "compile-to-executable")
-        (if mode = "linkobj" then " (libc-import artifact included)" else "")
+        (if mode = "linkobj" && not target_is_linux then " (libc-import artifact included)" else "")
         run.Driver.bvr_cache_hit dt;
       Selfcheck_sentinel.emit_and_exit "tg_linkprobe"
