@@ -52,96 +52,11 @@ use tg_compiler::token::{Span}
 use tg_compiler::ids::{DefId}
 use tg_compiler::resolver::{resolve_names, resolve_names_partial, ResolvedNames}
 use tg_compiler::types::{type_env_new, type_check_typed}
-
-# ── canonical manifest order (mirrors compiler_core.bootstrap_manifest_sources:
-# sorted std files, then sorted compiler files) ─────────────────────────
-
-def resolution_parity_collect_paths(source: String) -> Vec[String]
-  var std_files = Vec::new()
-  var compiler_files = Vec::new()
-  for line in source.split("\n") do
-    let trimmed = line.trim()
-    if !trimmed.is_empty() && !trimmed.starts_with("#") then
-      match trimmed.split_once(" ")
-      when Option::Some(parts) then
-        let kind = parts.0.trim()
-        let rel = parts.1.trim()
-        if kind == "std:" then
-          std_files.push(rel)
-        elsif kind == "compiler:" then
-          compiler_files.push(rel)
-        end
-      when Option::None then ()
-      end
-    end
-  end
-  std_files.sort()
-  compiler_files.sort()
-  var out = Vec::new()
-  for f in std_files do
-    out.push("std/" + f.clone())
-  end
-  for f in compiler_files do
-    out.push("tg_compiler/" + f.clone())
-  end
-  out
-end
-
-# "std/alloc.tg" -> ["std", "alloc"] (the Module.path the resolver's
-# module-qualified keys are built from — the ".tg" extension is dropped).
-def resolution_parity_module_path(path: String) -> Vec[String]
-  var segs = path.split("/")
-  var out = Vec::new()
-  var i = 0
-  while i < segs.len() do
-    var seg = segs[i].clone()
-    if i == segs.len() - 1 && seg.ends_with(".tg") then
-      seg = seg.slice(0, seg.len() - 3)
-    end
-    out.push(seg)
-    i = i + 1
-  end
-  out
-end
-
-# The Module.imports production's collect_dep_file builds: the path join of
-# every top-level use declaration, in source order.
-def resolution_parity_module_imports(items: Vec[Item]) -> Vec[String]
-  var imports = Vec::new()
-  for item in items do
-    match item.kind
-    when ItemKind::ItemUse(u) then imports.push(u.path.segments.join("::"))
-    when _ then ()
-    end
-  end
-  imports
-end
-
-# Append one parsed file as a module: stamp every item's owner_module,
-# record the module's flat item ids and import joins, and return the new
-# ModuleId (the canonical processing-order id).
-def resolution_parity_merge_parsed(path: String, parsed: Program, inout items: Vec[Item], inout modules: Map[ModuleId, Module]) -> ModuleId
-  let mid = ModuleId { id: modules.len() }
-  var start = items.len()
-  for item in parsed.items do
-    var owned = item.clone()
-    owned.owner_module = ModuleId { id: mid.id }
-    items.push(owned)
-  end
-  var mod_items = Vec::new()
-  var k = start
-  while k < items.len() do
-    mod_items.push(ItemId { id: k })
-    k = k + 1
-  end
-  modules.insert(mid, Module {
-    id: mid,
-    path: resolution_parity_module_path(path.clone()),
-    items: mod_items,
-    imports: resolution_parity_module_imports(&parsed.items)
-  })
-  mid
-end
+use tg_compiler::compiler_core::{
+  merge_imported_deps, apply_cfg_elimination, prepare_parsed, default_options,
+  canonical_kernel_source_path, bootstrap_manifest_sources, read_source_file,
+  StopAfter
+}
 
 # ── the suffix-index scan oracle ───────────────────────────────────────
 # Production: an O(1) bucket lookup in the maintained suffix index.
@@ -277,11 +192,18 @@ def resolution_parity_build_program(label: String, names: Vec[String], sources: 
         mod_items.push(ItemId { id: k })
         k = k + 1
       end
+      var mod_imports = Vec::new()
+      for item in parsed.program.items do
+        match item.kind
+        when ItemKind::ItemUse(u) then mod_imports.push(u.path.segments.join("::"))
+        when _ then ()
+        end
+      end
       modules.insert(mid, Module {
         id: mid,
         path: names[i].clone().split("::"),
         items: mod_items,
-        imports: resolution_parity_module_imports(&parsed.program.items)
+        imports: mod_imports
       })
     end
     i = i + 1
@@ -521,173 +443,110 @@ def resolution_parity_run_microcorpus(inout report: String, inout failures: Int)
 end
 
 # ── main ───────────────────────────────────────────────────────────────
+#
+# CANONICAL PREPARATION (audit follow-up): the probe no longer
+# reconstructs the frontend graph.  It parses the kernel entry, then runs
+# the SAME production helpers the real compiler runs:
+#   merge_imported_deps (manifest-closed, canonical root dedup, real
+#   Module.imports) -> apply_cfg_elimination (target-dependent) ->
+#   prepare_parsed (macro expansion + node IDs) -> resolve_names_partial.
+# Residual macro-call diagnostics are no longer tolerated: macro expansion
+# has actually run, so every resolution diagnostic is real.
 
-def main() -> Int
-  let manifest_src = match read_file("bootstrap/compiler_kernel.manifest")
-  when Result::Ok(s) then s
-  when Result::Err(_) then
-    println("resolution-parity: READ FAIL bootstrap/compiler_kernel.manifest")
-    return 1
-  end
-  let paths = resolution_parity_collect_paths(manifest_src)
-  if paths.is_empty() then
-    println("resolution-parity: FAIL no std:/compiler: closure entries in bootstrap/compiler_kernel.manifest")
-    return 1
-  end
-
+# A UNIQUE entry name: the closure now also contains bootstrap_main::main,
+# and the seed's entry lookup must not pick the kernel driver by accident.
+def resolution_parity_main() -> Int
+  let target = if raw_arg_count() > 2 then raw_arg_copy(2) else "aarch64-apple-darwin".to_string() end
   let report_path = "build/resolution_parity_report.txt"
   var report = ""
   var failures = 0
-  var merged: Vec[Item] = Vec::new()
-  var modules: Map[ModuleId, Module] = Map::new()
-  var bad_parse = 0
 
-  # The loaded-source set: seed it with the ROOT PATH before the manifest
-  # walk — production's merge_imported_deps does the same (P0: the root is
-  # a MEMBER of the closure).  A manifest entry naming the root is a
-  # NO-OP; without this the kernel closure had 46 modules for 45 files
-  # (root + duplicated bootstrap_main dependency).
-  var loaded: Set[String] = Set::new()
-  loaded.insert("tg_compiler/bootstrap_main.tg".to_string())
-
-  # root module id 0: the parsed kernel entry exactly like production's
-  # merge_imported_deps receives the root program.
-  match read_file("tg_compiler/bootstrap_main.tg")
-  when Result::Ok(source) then
-    let parsed = parse(tokenize(source, "tg_compiler/bootstrap_main.tg"))
-    if diag_has_errors(&parsed.diagnostics) then
-      bad_parse = bad_parse + 1
-      report = report + "PARSE FAIL tg_compiler/bootstrap_main.tg (root)\n"
-      println("resolution-parity: PARSE FAIL tg_compiler/bootstrap_main.tg (root)")
-    else
-      let root_id = ModuleId { id: 0 }
-      var root_items = Vec::new()
-      for item in parsed.program.items do
-        var owned = item.clone()
-        owned.owner_module = ModuleId { id: root_id.id }
-        merged.push(owned)
-      end
-      var root_ids = Vec::new()
-      var ri = 0
-      while ri < merged.len() do
-        root_ids.push(ItemId { id: ri })
-        ri = ri + 1
-      end
-      modules.insert(root_id, Module {
-        id: root_id,
-        path: Vec::new(),
-        items: root_ids,
-        imports: resolution_parity_module_imports(&parsed.program.items)
-      })
-    end
+  # 1. the kernel root, exactly as production receives it
+  let root_src = match read_source_file("tg_compiler/bootstrap_main.tg".to_string())
+  when Result::Ok(src) then src
   when Result::Err(_) then
-    bad_parse = bad_parse + 1
-    report = report + "READ FAIL tg_compiler/bootstrap_main.tg (root)\n"
     println("resolution-parity: READ FAIL tg_compiler/bootstrap_main.tg (root)")
+    return 1
   end
-
-  var i = 0
-  while i < paths.len() do
-    let path = paths[i].clone()
-    if loaded.contains(&path) then
-      # A manifest entry naming the root: production's dedup makes this a
-      # no-op.  Record the skip as evidence and count it as a failure if
-      # it is anything but the one expected root entry.
-      report = report + "CANONICAL skip already-loaded root " + path.clone() + "\n"
-    else
-      loaded.insert(path.clone())
-      match read_file(path.clone())
-      when Result::Ok(source) then
-        let parsed = parse(tokenize(source, path.clone()))
-        if diag_has_errors(&parsed.diagnostics) then
-          bad_parse = bad_parse + 1
-          report = report + "PARSE FAIL " + path.clone() + " (" + parsed.diagnostics.len().to_string() + " diagnostics)\n"
-          println("resolution-parity: PARSE FAIL " + path.clone())
-          for d in parsed.diagnostics do
-            report = report + "  " + d.message + "\n"
-          end
-        else
-          let _mid = resolution_parity_merge_parsed(path.clone(), parsed.program, &mut merged, &mut modules)
-        end
-      when Result::Err(_) then
-        bad_parse = bad_parse + 1
-        report = report + "READ FAIL " + path.clone() + "\n"
-        println("resolution-parity: READ FAIL " + path.clone())
-      end
+  let parsed_root = parse(tokenize(root_src, "tg_compiler/bootstrap_main.tg".to_string()))
+  if diag_has_errors(&parsed_root.diagnostics) then
+    println("resolution-parity: PARSE FAIL tg_compiler/bootstrap_main.tg (root)")
+    for d in parsed_root.diagnostics do
+      println("  " + d.message)
     end
-    i = i + 1
+    return 1
   end
 
-  # ── the dedup invariant (P0): 45 unique files = 45 modules ─────────
-  # manifest_entries == modules == unique sources, and NO non-root module
-  # carries the root's module path.  A duplicated root would make modules
-  # 46 and add a ["tg_compiler","bootstrap_main"] file module.
+  # 2. production dependency merge (manifest-closed, canonical root dedup)
+  var program = match merge_imported_deps(
+    parsed_root.program,
+    include_compiler_lib: true,
+    root_path: canonical_kernel_source_path("tg_compiler/bootstrap_main.tg".to_string())
+  )
+  when Result::Ok(p) then p
+  when Result::Err(e) then
+    println("resolution-parity: MERGE FAIL " + e)
+    return 1
+  end
+  let manifest_count = match bootstrap_manifest_sources()
+  when Option::Some(fs) then fs.len()
+  when Option::None then 0
+  end
+  let module_count = program.crate.modules.len()
+  # The dedup invariant is checked on the PRODUCTION graph, before
+  # resolution consumes it.
   var root_dupe_modules = 0
-  for (mid, m) in modules.entries() do
+  for (mid, m) in program.crate.modules.entries() do
     if mid.id != 0 && m.path.len() == 2 && m.path[0] == "tg_compiler" && m.path[1] == "bootstrap_main" then
       root_dupe_modules = root_dupe_modules + 1
     end
   end
-  var loaded_count = 0
-  for p in paths do
-    if loaded.contains(&p) then
-      loaded_count = loaded_count + 1
+
+  # 3. production @cfg elimination for the exact target
+  var opts = default_options()
+  opts.target_triple = Option::Some(target.clone())
+  opts.strict_resolution = true
+  apply_cfg_elimination(&mut program, opts)
+
+  # 4. production macro expansion + node IDs
+  var prep_diags: Vec[Diagnostic] = Vec::new()
+  prepare_parsed(&mut program, &mut prep_diags)
+  var prep_errors = 0
+  if diag_has_errors(&prep_diags) then
+    for d in prep_diags do
+      prep_errors = prep_errors + 1
+      report = report + "PREP " + d.message + "\n"
+      println("resolution-parity: PREP " + d.message)
     end
   end
+
+  # 5. production resolution
+  let partial = resolve_names_partial(program)
+  let resolved = partial.resolved
+  var resolve_errors = 0
+  for err in partial.errors do
+    resolve_errors = resolve_errors + 1
+    report = report + "RESOLVE " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message + "\n"
+    println("resolution-parity: RESOLVE " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message)
+  end
+
+  # 6. the closure-shape invariant: manifest entries == modules, and no
+  # non-root module carries the root's module path.
   if root_dupe_modules != 0 then
     failures = failures + 1
     report = report + "CANONICAL root-duplicate FAIL: " + root_dupe_modules.to_string() + " dependency module(s) carry the root's module path\n"
-  else if modules.len() != paths.len() then
+  elsif module_count != manifest_count then
     failures = failures + 1
-    report = report + "CANONICAL closure FAIL: " + paths.len().to_string() + " manifest entries but " + modules.len().to_string() + " modules (unique load count " + loaded_count.to_string() + ")\n"
+    report = report + "CANONICAL closure FAIL: " + manifest_count.to_string() + " manifest entries but " + module_count.to_string() + " modules\n"
   else
-    report = report + "CANONICAL closure: manifest_entries=" + paths.len().to_string() + " unique_sources=" + modules.len().to_string() + " modules=" + modules.len().to_string() + " root_loads=1 (dedup) PASS\n"
+    report = report + "CANONICAL closure: manifest_entries=" + manifest_count.to_string() + " unique_sources=" + module_count.to_string() + " modules=" + module_count.to_string() + " root_loads=1 (production merge) PASS\n"
   end
 
-  var program = Program {
-    items: merged.clone(),
-    crate: Crate {
-      root: ModuleId { id: 0 },
-      modules: modules
-    },
-    span: Span { file: "resolution-parity".to_string(), start: 0, end_pos: 0 }
-  }
-  assign_node_ids(&mut program)
-
-  var resolve_errors = 0
-  var pre_resolution_macros = 0
-  # partial resolution: the snapshot + diagnostics together, so the
-  # closure symbol-index oracle runs even when a deliberately-skipped
-  # pre-resolution pass (macro expansion) leaves residual artifacts.
-  let partial = resolve_names_partial(program)
-  let resolved = partial.resolved
-  for err in partial.errors do
-    # `debug_assert!` is a compiler builtin macro the real pipeline
-    # expands (compiler_core's expand_macros) BEFORE resolve_names — this
-    # probe deliberately skips the heavy expansion pass, so its residual
-    # macro-call row is a pre-resolution artifact, not a resolution
-    # diagnostic. Every OTHER residual macro spelling still fails the
-    # lane (the resolver's unsupported-construct guard stays enforced).
-    if err.message.contains("residual macro call `debug_assert`") then
-      pre_resolution_macros = pre_resolution_macros + 1
-      report = report + "PRE-RESOLUTION " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message + "\n"
-    else
-      resolve_errors = resolve_errors + 1
-      report = report + "RESOLVE " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message + "\n"
-      println("resolution-parity: RESOLVE " + err.span.file.clone() + ":" + err.span.start.to_string() + " " + err.message)
-    end
-  end
-
-
-  # the real-resolution symbol_suffix_index scan oracle (bounded query
-  # budget: every bucket must equal the full-map scan)
+  # 7. the real-resolution symbol_suffix_index scan oracle
   var symbol_keys = Vec::new()
   for (key, _did) in resolved.module_symbols.entries() do
     symbol_keys.push(key.clone())
   end
-  # symbol_suffix_index buckets hold (key, DefId) pairs; the scan oracle
-  # compares the KEY sequence (candidate identity and order) after
-  # projecting the pairs to keys.
   var symbol_key_index: Map[String, Vec[String]] = Map::new()
   for (suffix, pairs) in resolved.symbol_suffix_index.entries() do
     var keys = Vec::new()
@@ -698,19 +557,16 @@ def main() -> Int
   end
   resolution_parity_check_index("closure/symbol_suffix_index", symbol_key_index, symbol_keys, 400, &mut report, &mut failures)
 
-  # the adversarial microcorpus + synthetic type/callable index oracles
+  # 8. the adversarial microcorpus + synthetic type/callable oracles
   resolution_parity_run_microcorpus(&mut report, &mut failures)
 
-  if bad_parse > 0 || resolve_errors > 0 || failures > 0 then
-    let row = "resolution-parity: FAILED (" + bad_parse.to_string() + " parse failure(s), " + resolve_errors.to_string() + " resolver error(s), " + failures.to_string() + " oracle/corpus failure(s) over " + paths.len().to_string() + " closure files)\n"
+  if prep_errors > 0 || resolve_errors > 0 || failures > 0 then
+    let row = "resolution-parity: FAILED (" + prep_errors.to_string() + " preparation error(s), " + resolve_errors.to_string() + " resolver error(s), " + failures.to_string() + " oracle/corpus failure(s); canonical preparation over " + manifest_count.to_string() + " manifest source(s), " + module_count.to_string() + " module(s))\n"
     report = report + row
     match write_file(report_path.clone(), report)
     when Result::Ok(_) then ()
     when Result::Err(_) then ()
     end
-    # the full row-level evidence goes to stdout as well: a host whose
-    # guest-write path is unavailable (target/host flag mismatch) must
-    # still surface WHICH expectations failed, never just a count.
     println(row.trim())
     println("resolution-parity: full report follows")
     for rline in report.split("\n") do
@@ -720,11 +576,11 @@ def main() -> Int
     end
     return 1
   end
-  let ok_row = "OK " + paths.len().to_string() + " closure files parsed clean; resolver diagnostics 0 (" + pre_resolution_macros.to_string() + " pre-resolution debug_assert macro artifact(s), expanded before resolve_names in the real pipeline); adversarial microcorpus + suffix-index scan oracles: PASS\n"
+  let ok_row = "OK " + manifest_count.to_string() + " manifest source(s), " + module_count.to_string() + " module(s) via CANONICAL preparation (merge -> cfg -> macros -> node ids); resolver diagnostics 0; adversarial microcorpus + suffix-index scan oracles: PASS\n"
   match write_file(report_path.clone(), ok_row + report)
   when Result::Ok(_) then ()
   when Result::Err(_) then ()
   end
-  println("resolution-parity: OK (" + paths.len().to_string() + " closure files, resolver diagnostics 0, " + pre_resolution_macros.to_string() + " pre-resolution debug_assert artifact(s); adversarial microcorpus + suffix-index scan oracles: PASS)")
+  println("resolution-parity: OK (" + manifest_count.to_string() + " manifest source(s), canonical preparation, resolver diagnostics 0; microcorpus + suffix oracles PASS)")
   0
 end

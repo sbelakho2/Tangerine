@@ -5,18 +5,27 @@
 
      seed closure pipeline (front end -> lower -> mono -> reachable-host)
        -> prepared kernel runs in the seed VM
-       -> kernel executes `check --strict-resolution tg_compiler/bootstrap_main.tg`
-       -> the check stops after MIR verification (no codegen/link)
-       -> kernel prints TG_CHECK_OK file=... sources=... modules=... items=...
+       -> kernel executes
+            `check --strict-resolution --bootstrap-proof --stop-after=mono
+             tg_compiler/bootstrap_main.tg`
+       -> the check stops after MONO + the type-query fold + the post-mono
+          MIR verify + the post-mono completeness oracle (NO optimizer,
+          codegen or link)
+       -> kernel prints
+            TG_CHECK_OK file=... stop=mono manifest_entries=45
+                        unique_sources=45 modules=45 items=...
        -> VM exits 0
 
    Exit 0 of the kernel check is the strict-resolution proof: the kernel
-   fails closed on any resolver/type/MIR diagnostic, so exit 0 subsumes
-   "resolver diagnostics 0, type diagnostics 0".  The preflight then
-   additionally requires the machine-readable summary to name
-   tg_compiler/bootstrap_main.tg and to report EXACTLY the manifest
-   closure size (the recorded stage1 closure: 45 sources), so a stale
-   kernel or a different input can never false-green.
+   fails closed on any resolver/type/MIR/post-mono diagnostic, so exit 0
+   subsumes "resolver diagnostics 0, type diagnostics 0" at the MONO
+   depth.  The preflight then additionally requires the machine-readable
+   summary to name stop=mono and tg_compiler/bootstrap_main.tg, and to
+   report EXACTLY the same manifest_entries / unique_sources / modules
+   counts (the recorded stage1 closure: 45 sources), so a stale kernel or
+   a different input can never false-green.  The proof line is emitted
+   only under --bootstrap-proof (ordinary `check` never carries proof
+   output).
 
    This is the last test before the real bootstrap: the actual stage1
    production command happens later in run_bootstrap.sh
@@ -56,27 +65,17 @@ let ensure_dir path =
    this constant pins the exact size the preflight authorizes. *)
 let expected_manifest_sources = 45
 
-let manifest_closure_count ~(repo_root : string) : int =
-  let path = Filename.concat repo_root "bootstrap/compiler_kernel.manifest" in
-  if not (Sys.file_exists path) then fail "missing kernel manifest: %s" path;
-  let ic = open_in path in
-  Fun.protect
-    ~finally:(fun () -> close_in_noerr ic)
-    (fun () ->
-      let count = ref 0 in
-      (try
-         while true do
-           let line = String.trim (input_line ic) in
-           let is_entry =
-             String.length line > 0
-             && line.[0] <> '#'
-             && (String.starts_with ~prefix:"std:" line
-                || String.starts_with ~prefix:"compiler:" line)
-           in
-           if is_entry then incr count
-         done
-       with End_of_file -> ());
-      !count)
+(* The manifest authority: exact entry count + the seed fingerprint the
+   kernel's closure_sha256 must equal. *)
+let manifest_authority ~(repo_root : string) : int * string =
+  match
+    Bootstrap_manifest.load ~repo_root
+      ~manifest_path:"bootstrap/compiler_kernel.manifest"
+  with
+  | Ok m ->
+      ( List.length (Bootstrap_manifest.entries m),
+        Bootstrap_manifest.fingerprint m )
+  | Error m -> fail "cannot load the kernel manifest: %s" m
 
 let summary_field (row : string) (name : string) : string option =
   let prefix = name ^ "=" in
@@ -120,7 +119,7 @@ let () =
   in
   Printf.printf
     "TG SELF-HOST PREFLIGHT (kernel in the seed VM checks tg_compiler/bootstrap_main.tg)\n%!";
-  let manifest_count = manifest_closure_count ~repo_root in
+  let manifest_count, manifest_fingerprint = manifest_authority ~repo_root in
   if manifest_count <> expected_manifest_sources then
     fail
       "manifest closure size changed: bootstrap/compiler_kernel.manifest lists %d sources, the \
@@ -131,7 +130,7 @@ let () =
   let cache_path = Filename.concat repo_root "build/bootstrap_selfcheck.vmcache" in
   let vm_cache = if no_cache then None else Some cache_path in
   let kernel_args =
-    [ "check"; "--strict-resolution"; "--stop-after=mono";
+    [ "check"; "--strict-resolution"; "--bootstrap-proof"; "--stop-after=mono";
       "tg_compiler/bootstrap_main.tg"; "--target"; target_str ]
   in
   match
@@ -204,6 +203,14 @@ let () =
                   fail "kernel merged %s module(s), the deduplicated closure is %d" v
                     expected_manifest_sources
               | None -> fail "kernel summary has no modules= field: %s" row);
+              (match summary_field row "closure_sha256" with
+              | Some fp when fp = manifest_fingerprint -> ()
+              | Some fp ->
+                  fail
+                    "kernel closure_sha256=%s, the seed fingerprint is %s — the guest did not \
+                     process the exact seed closure bytes"
+                    fp manifest_fingerprint
+              | None -> fail "kernel summary has no closure_sha256= field: %s" row);
               Printf.printf
                 "tg_bootstrap_selfcheck: OK — kernel check exit 0 over the exact %d-source \
                  manifest closure (strict resolution; resolver 0, type 0; stop after MONO; \

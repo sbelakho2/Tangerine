@@ -5391,15 +5391,27 @@ type vm_program_cache = {
 
 let vm_cache_schema_version = "1"
 
+let read_file_bytes (path : string) : string option =
+  try
+    let ic = open_in_bin path in
+    let n = in_channel_length ic in
+    let s = really_input_string ic n in
+    close_in ic;
+    Some s
+  with _ -> None
+
+(* Collision-resistant seed build identity: SHA-256 over the executable
+   BYTES (plus path/schema).  Size+mtime is trivially collidable through
+   copies/timestamp restoration, which would let a different seed's
+   prepared program be reused. *)
 let seed_build_identity () : string =
   let exe = Sys.executable_name in
-  let size =
-    try string_of_int (Unix.stat exe).Unix.st_size with _ -> "?"
+  let digest =
+    match read_file_bytes exe with
+    | Some bytes -> Sha256.digest bytes
+    | None -> "unreadable"
   in
-  let mtime =
-    try string_of_float (Unix.stat exe).Unix.st_mtime with _ -> "?"
-  in
-  Printf.sprintf "schema=%s exe=%s size=%s mtime=%s" vm_cache_schema_version exe size mtime
+  Printf.sprintf "schema=%s exe=%s sha256=%s" vm_cache_schema_version exe digest
 
 let vm_cache_fingerprint ~(repo_root : string) ~(manifest_path : string) :
     string option =

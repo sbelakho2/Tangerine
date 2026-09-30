@@ -39,7 +39,7 @@ use tg_compiler::asm::{
 }
 use tg_compiler::object::{object_new, ObjectFile}
 use tg_compiler::linker::{LinkerInput, link_executable}
-use tg_compiler::compiler_core::{compile_startup_entry, default_options, parse_check_cli, CheckCli, StopAfter}
+use tg_compiler::compiler_core::{compile_startup_entry, default_options, parse_check_cli, CheckCli, StopAfter, canonical_kernel_source_path, tg_sha256_hex, bootstrap_closure_fingerprint}
 
 const LINKPROBE_SRC: String = "use std::alloc::{size_of, align_of}\nuse std::io::{println}\n\nstruct ProbePair[T]\n  a: u8\n  b: T\nend\n\ndef q_size[T]() -> Int\n  size_of[T]() as Int\nend\n\ndef q_align[T]() -> Int\n  align_of[T]() as Int\nend\n\ndef main() -> Int effect Io\n  # 1. the parse boundary, LITERAL argument: the MIR literal rule\n  #    materializes it into an owned String object at the by-name\n  #    __intrinsic_str_parse_int parameter (the seed host binding's\n  #    Vm_value.String) — Ok for a valid integer, Err for garbage.\n  let a = match __intrinsic_str_parse_int(\"42\")\n    when Result::Ok(n) then n == 42\n    when Result::Err(_) then false\n    end\n  let b = match __intrinsic_str_parse_int(\"nope\")\n    when Result::Ok(_) then false\n    when Result::Err(_) then true\n    end\n  # 2. the parse boundary, OWNED String OBJECT (non-literal): the\n  #    object handle flows straight to the by-name symbol, which\n  #    unwraps its data pointer itself — Ok for a valid integer, Err\n  #    for garbage (the seed host binding's Result contract).\n  let s_ok = __intrinsic_string_slice(\"43\", 0, 2)\n  let c = match __intrinsic_str_parse_int(s_ok)\n    when Result::Ok(n) then n == 43\n    when Result::Err(_) then false\n    end\n  let s_bad = __intrinsic_string_slice(\"12x\", 0, 3)\n  let d = match __intrinsic_str_parse_int(s_bad)\n    when Result::Ok(_) then false\n    when Result::Err(_) then true\n    end\n  # 3. the parse boundary, `as_str()`-derived RAW VIEW: the borrowed\n  #    bytes are materialized into an owned String object (the explicit\n  #    owned conversion the raw->object boundary requires) and then\n  #    parsed through the object-convention symbol.\n  let s_view_ok = __intrinsic_string_slice(\"43\", 0, 2)\n  let e = match __intrinsic_str_parse_int(__intrinsic_string_from_static(s_view_ok.as_str()))\n    when Result::Ok(n) then n == 43\n    when Result::Err(_) then false\n    end\n  let s_view_bad = __intrinsic_string_slice(\"12x\", 0, 3)\n  let f = match __intrinsic_str_parse_int(__intrinsic_string_from_static(s_view_bad.as_str()))\n    when Result::Ok(_) then false\n    when Result::Err(_) then true\n    end\n  let g = (__intrinsic_float_to_bits(1.5) as Int) == 0x3FF8000000000000\n  let h = __intrinsic_int_to_float(3) == 3.0\n  let i = __intrinsic_float_to_int(2.75) == 2\n  # size_of/align_of: concrete primitives ...\n  let j = (size_of[u8]() == 1) && (align_of[u8]() == 1)\n  let k = (size_of[UInt]() == 8) && (align_of[UInt]() == 8)\n  # ... a concrete INSTANCE of a generic nominal (ProbePair[u8] =\n  # {a: u8 @0, b: u8 @1} -> size 2 / align 1) ...\n  let l = (size_of[ProbePair[u8]]() == 2) && (align_of[ProbePair[u8]]() == 1)\n  # ... and the same instance shapes reached through GENERIC helper\n  # functions (ProbePair[UInt] = {a: u8 @0, b: UInt @8} -> size 16 /\n  # align 8), the generic-instantiation route.\n  let m = (q_size[ProbePair[UInt]]() == 16) && (q_align[ProbePair[UInt]]() == 8)\n  let n = (q_size[UInt]() == 8) && (q_align[UInt]() == 8)\n  # Distinct failure codes name the first failing check (the harness\n  # reports the code; 42 is the all-checks-pass success).\n  if !a then return 11 end\n  if !b then return 12 end\n  if !c then return 13 end\n  if !d then return 14 end\n  if !e then return 15 end\n  if !f then return 16 end\n  if !g then return 17 end\n  if !h then return 18 end\n  if !i then return 19 end\n  if !j then return 20 end\n  if !k then return 21 end\n  if !l then return 22 end\n  if !m then return 23 end\n  if !n then return 24 end\n  println(\"LINKPROBE_ARTIFACT_OK parse_int literal+owned+view\")\n  42\nend\n"
 
@@ -83,7 +83,57 @@ end
 #   3. an unresolved `__intrinsic_str_parse_int` import is REJECTED by
 #      the linker with the symbol named (the fail-closed guard — never a
 #      silent artifact that dies at dyld).
-def linkprobe_run_linkobj() -> Int
+def linkprobe_run_linkobj(target_triple: String) -> Int
+  # ── Linux targets: the ELF minimal object for the TARGET arch ──
+  # (the harness executes build/linkprobe_obj.out and expects exit 42;
+  # the macOS object encodings below cannot link or run there).
+  if target_triple.contains("linux") then
+    var elf_target = asm_target(Arch::AArch64, OsAbi::Linux)
+    if target_triple.starts_with("x86_64") then
+      elf_target = asm_target(Arch::X86_64, OsAbi::Linux)
+    end
+    var eobj = object_new(elf_target)
+    if target_triple.starts_with("x86_64") then
+      # mov eax, 42 ; mov edi, eax ; mov eax, 60 ; syscall  (exit(42))
+      eobj.text.push(0xB8); eobj.text.push(0x2A); eobj.text.push(0x00)
+      eobj.text.push(0x00); eobj.text.push(0x00)
+      eobj.text.push(0x89); eobj.text.push(0xC7)
+      eobj.text.push(0xB8); eobj.text.push(0x3C); eobj.text.push(0x00)
+      eobj.text.push(0x00); eobj.text.push(0x00)
+      eobj.text.push(0x0F); eobj.text.push(0x05)
+    else
+      # mov x0, #42 ; mov x8, #93 ; svc #0  (exit(42))
+      linkprobe_emit_u32_le(&mut eobj.text, 0xD2800540)
+      linkprobe_emit_u32_le(&mut eobj.text, 0xD2800BA8)
+      linkprobe_emit_u32_le(&mut eobj.text, 0xD4000001)
+    end
+    eobj.symbols.push(AsmSymbol {
+      name: "_start",
+      section: Section::Text,
+      offset: 0,
+      size: eobj.text.len(),
+      binding: SymBinding::Global,
+      kind: SymKind::Func
+    })
+    var eobjects: Vec[ObjectFile] = Vec::new()
+    eobjects.push(eobj)
+    let einput = LinkerInput {
+      objects: eobjects,
+      entry: "_start",
+      entry_offset: -1,
+      output: "build/linkprobe_obj.out",
+      target: elf_target
+    }
+    match link_executable(&einput)
+    when Result::Ok(_) then
+      linkprobe_write_report("LINKPROBE linkobj minimal ELF link OK (" + target_triple.clone() + ")\n")
+    when Result::Err(e) then
+      linkprobe_write_report("LINKPROBE linkobj minimal ELF link failed: " + e + "\n")
+      return 1
+    end
+    return linkprobe_elf_import_policy_checks()
+  end
+
   let target = asm_target(Arch::AArch64, OsAbi::MacOS)
 
   # ── 1. the minimal no-import object ─────────────────────────────
@@ -315,6 +365,115 @@ def linkprobe_cli_checks() -> Int
     println("LINKPROBE_CLI stop-after-bogus=FAIL (accepted)")
     return 36
   end
+  # 7. proof output is OPT-IN: without --bootstrap-proof the ordinary
+  # check must not emit the TG_CHECK_OK proof line.
+  let c7 = match parse_check_cli(vec!["foo.tg"])
+  when Result::Err(_) then
+    println("LINKPROBE_CLI proof-opt-in=FAIL (plain check rejected)")
+    return 37
+  when Result::Ok(c) then c
+  end
+  if c7.opts.emit_check_summary then
+    println("LINKPROBE_CLI proof-opt-in=FAIL (summary on by default)")
+    return 37
+  end
+  let c7b = match parse_check_cli(vec!["--bootstrap-proof", "foo.tg"])
+  when Result::Err(_) then
+    println("LINKPROBE_CLI proof-opt-in=FAIL (--bootstrap-proof rejected)")
+    return 37
+  when Result::Ok(c) then c
+  end
+  if !c7b.opts.emit_check_summary then
+    println("LINKPROBE_CLI proof-opt-in=FAIL (--bootstrap-proof did not enable it)")
+    return 37
+  end
+  println("LINKPROBE_CLI proof-opt-in=PASS")
+  0
+end
+
+# ── canonical source identity (audit follow-up): every recognized kernel
+# entry spelling must map to ONE source identity, and a non-kernel path
+# must pass through untouched.
+def linkprobe_canonical_path_checks() -> Int
+  let canonical = canonical_kernel_source_path("tg_compiler/bootstrap_main.tg".to_string())
+  let spellings = vec![
+    "tg_compiler/bootstrap_main.tg",
+    "./tg_compiler/bootstrap_main.tg",
+    "/repo/Tangerine/tg_compiler/bootstrap_main.tg",
+    "tg_compiler/../tg_compiler/bootstrap_main.tg"
+  ]
+  var i = 0
+  while i < spellings.len() do
+    let mapped = canonical_kernel_source_path(spellings[i].clone())
+    if mapped != canonical then
+      println("LINKPROBE_CLI canonical-path=FAIL (" + spellings[i].clone() + " -> " + mapped + ")")
+      return 38
+    end
+    i = i + 1
+  end
+  if canonical != "tg_compiler/bootstrap_main.tg" then
+    println("LINKPROBE_CLI canonical-path=FAIL (canonical spelling changed: " + canonical + ")")
+    return 38
+  end
+  if canonical_kernel_source_path("std/core.tg".to_string()) != "std/core.tg" then
+    println("LINKPROBE_CLI canonical-path=FAIL (non-kernel path rewritten)")
+    return 38
+  end
+  if canonical_kernel_source_path("foo/bootstrap_main.tg".to_string()) != "foo/bootstrap_main.tg" then
+    println("LINKPROBE_CLI canonical-path=FAIL (near-miss rewritten)")
+    return 38
+  end
+  println("LINKPROBE_CLI canonical-path=PASS")
+  0
+end
+
+# ── the closure digest against the SEED fingerprint: the kernel reads
+# the exact bootstrap/compiler_kernel.manifest and the exact source bytes
+# it lists and recomposes the seed's fingerprint.  Equality here means
+# the guest processed the same closure bytes the seed believes constitute
+# this bootstrap (identity, not cardinality) — validated in the cheap
+# linkprobe lane before the expensive mono preflight.
+def linkprobe_closure_digest_checks(expected: String) -> Int
+  if expected.len() == 0 then
+    println("LINKPROBE_CLOSURE_DIGEST=SKIP (no seed fingerprint supplied)")
+    return 0
+  end
+  let got = match bootstrap_closure_fingerprint()
+  when Option::Some(fp) => fp
+  when Option::None =>
+    println("LINKPROBE_CLOSURE_DIGEST=FAIL (kernel could not compute it)")
+    return 40
+  end
+  if got != expected then
+    println("LINKPROBE_CLOSURE_DIGEST=FAIL (got " + got + ", seed " + expected + ")")
+    return 40
+  end
+  println("LINKPROBE_CLOSURE_DIGEST=PASS (kernel recomputation == seed fingerprint)")
+  0
+end
+
+# ── SHA-256 known-answer tests (the closure digest is identity evidence:
+# a wrong digest would either false-fail every preflight or, worse, agree
+# by common-mode bug).  These vectors cover the empty message, the classic
+# "abc", and a two-block message (padding across the 56-byte boundary).
+def linkprobe_sha256_checks() -> Int
+  let cases: [(String, String)] = [
+    ("", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+    ("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+    ("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+     "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+  ]
+  var ci = 0
+  while ci < cases.len() do
+    let case = cases[ci]
+    let got = tg_sha256_hex(case.0.as_bytes())
+    if got != case.1 then
+      println("LINKPROBE_SHA256 FAIL (len " + case.0.len().to_string() + ": got " + got + ", want " + case.1 + ")")
+      return 39
+    end
+    ci = ci + 1
+  end
+  println("LINKPROBE_SHA256=PASS (3 known-answer vectors)")
   0
 end
 
@@ -339,6 +498,12 @@ def linkprobe_elf_import_policy_checks() -> Int
   })
   bad_obj.symbols.push(AsmSymbol {
     name: "_start", section: Section::Text, offset: 0, size: 6,
+    binding: SymBinding::Global, kind: SymKind::Func
+  })
+  # The object validator requires every relocation symbol to have a symbol
+  # table entry; the extern DECLARATION is what makes it an import.
+  bad_obj.symbols.push(AsmSymbol {
+    name: "ruby_init", section: Section::Extern, offset: 0, size: 0,
     binding: SymBinding::Global, kind: SymKind::Func
   })
   var bad_objects: Vec[ObjectFile] = Vec::new()
@@ -377,6 +542,10 @@ def linkprobe_elf_import_policy_checks() -> Int
     name: "_start", section: Section::Text, offset: 0, size: 6,
     binding: SymBinding::Global, kind: SymKind::Func
   })
+  shim_obj.symbols.push(AsmSymbol {
+    name: "memcpy", section: Section::Extern, offset: 0, size: 0,
+    binding: SymBinding::Global, kind: SymKind::Func
+  })
   var shim_objects: Vec[ObjectFile] = Vec::new()
   shim_objects.push(shim_obj)
   let shim_input = LinkerInput {
@@ -407,6 +576,10 @@ def linkprobe_elf_import_policy_checks() -> Int
     name: "_start", section: Section::Text, offset: 0, size: 8,
     binding: SymBinding::Global, kind: SymKind::Func
   })
+  a64_obj.symbols.push(AsmSymbol {
+    name: "ruby_init", section: Section::Extern, offset: 0, size: 0,
+    binding: SymBinding::Global, kind: SymKind::Func
+  })
   var a64_objects: Vec[ObjectFile] = Vec::new()
   a64_objects.push(a64_obj)
   let a64_input = LinkerInput {
@@ -431,15 +604,28 @@ def linkprobe_elf_import_policy_checks() -> Int
 end
 
 def main() -> Int
+  let argc = raw_arg_count()
   let cli_rc = linkprobe_cli_checks()
   if cli_rc != 0 then
     return cli_rc
+  end
+  let path_rc = linkprobe_canonical_path_checks()
+  if path_rc != 0 then
+    return path_rc
+  end
+  let sha_rc = linkprobe_sha256_checks()
+  if sha_rc != 0 then
+    return sha_rc
+  end
+  let digest_rc = linkprobe_closure_digest_checks(
+    if argc > 4 then raw_arg_copy(4) else "".to_string() end)
+  if digest_rc != 0 then
+    return digest_rc
   end
   let policy_rc = linkprobe_elf_import_policy_checks()
   if policy_rc != 0 then
     return policy_rc
   end
-  let argc = raw_arg_count()
   # argv[0] is the program name ("tg-bootstrap"), argv[1] the probe name,
   # argv[2] the mode, argv[3] the optional artifact triple (the harness
   # passes `linkprobe <mode> <triple>` so full mode compiles for the SAME
@@ -449,6 +635,6 @@ def main() -> Int
   if mode == "full" then
     linkprobe_run_full(artifact_triple)
   else
-    linkprobe_run_linkobj()
+    linkprobe_run_linkobj(artifact_triple)
   end
 end

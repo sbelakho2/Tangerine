@@ -179,10 +179,9 @@ if [ "$TEST_RC" -ne 0 ]; then
   echo "$TEST_OUT" | tail -5
   exit 1
 fi
-TESTS="$(grep -oE '[0-9]+ passed, 0 failed' <<<"$TEST_OUT" | head -1)"
-if [ "$(grep -Fxc "${PINNED_TEST_INVENTORY} passed, 0 failed" <<<"$TEST_OUT")" != "1" ]; then
-  echo "check_ocaml_seed_health: FAIL — unit test suite must print exactly one exact summary line '${PINNED_TEST_INVENTORY} passed, 0 failed'; got '$TESTS'"
-  echo "$TEST_OUT" | tail -5
+printf '%s\n' "$TEST_OUT" >/tmp/ocaml_seed_unit_evidence.out
+if ! "$ROOT/scripts/check_unit_test_evidence.sh" /tmp/ocaml_seed_unit_evidence.out "${PINNED_TEST_INVENTORY}"; then
+  echo "check_ocaml_seed_health: FAIL — unit test evidence (exactly one pinned summary line) not satisfied"
   exit 1
 fi
 
@@ -195,6 +194,10 @@ if ! "$ROOT/scripts/test_selfcheck_sentinel.sh"; then
 fi
 if ! "$ROOT/scripts/check_selfcheck_source_sentinels.sh"; then
   echo "check_ocaml_seed_health: FAIL — selfcheck sentinel source invariants"
+  exit 1
+fi
+if ! "$ROOT/scripts/test_prebootstrap_gates.sh"; then
+  echo "check_ocaml_seed_health: FAIL — prebootstrap gate mutation tests"
   exit 1
 fi
 

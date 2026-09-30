@@ -407,15 +407,6 @@ bh_phase_equality() {
   return 0
 }
 
-# Mach-O 64-bit magic bytes: CF FA ED FE.
-bh_is_macho64() {
-  local f="$1"
-  if [ ! -f "$f" ]; then return 1; fi
-  local magic
-  magic="$(od -An -tx1 -N4 "$f" | tr -d ' \n')"
-  [ "$magic" = "cffaedfe" ]
-}
-
 # The bootstrap target's canonical architecture token (the same authority
 # the ladder compiles for).
 bh_target_arch_name() {
@@ -865,7 +856,7 @@ EOF
 # warning — a suite advertised as a bootstrap acceptance gate must be present
 # on the supported host.
 
-CANARY_SUITE_POSITIVE_COUNT=149
+CANARY_SUITE_POSITIVE_COUNT=150
 CANARY_SUITE_NEGATIVE_COUNT=135
 CANARY_SUITE_ARM64_COUNT=2
 CANARY_SUITE_TOTAL=$((CANARY_SUITE_POSITIVE_COUNT + CANARY_SUITE_NEGATIVE_COUNT + CANARY_SUITE_ARM64_COUNT))
@@ -1521,7 +1512,7 @@ run_target_lane_canaries() {
         failures=$((failures + 1))
       fi
     else
-      bh_log "target lane canary $name: no executor for $triple on $host_arch; disassembly/trap-stub gate only"
+      bh_log "target lane canary $name: no executor for $triple on $(bh_host_os_name)/$(bh_host_arch_name); disassembly/trap-stub gate only"
     fi
   done < tests/canary/MANIFEST
 

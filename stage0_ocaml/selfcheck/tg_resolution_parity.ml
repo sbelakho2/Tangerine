@@ -9,18 +9,22 @@
    same-spelled-symbol determinism for size_of/Arch) used to surface only
    after the whole stage1 build — tens of minutes into the ladder.
 
-   This harness runs the REAL kernel front end over every closure source
-   inside the seed VM (bootstrap/resolution_parity_mini.manifest, whose
-   tg_compiler/resolution_parity_probe.tg entry parses the manifest's
-   std:/compiler: entries, merges them into one Program with the per-file
-   Module table, assigns node ids, and runs resolve_names). The manifest
-   paths are resolved from the same single-source manifest the bootstrap
-   resolves, so the gate cannot drift from the closure.
+   This harness runs the REAL kernel CANONICAL PREPARATION over every
+   closure source inside the seed VM: the mini closure is the full kernel
+   closure plus tg_compiler/resolution_parity_probe.tg, and the probe
+   consumes the SAME production helpers the compiler runs —
+   merge_imported_deps (manifest-closed, canonical root dedup, real
+   Module.imports) -> apply_cfg_elimination (target-dependent) ->
+   prepare_parsed (macro expansion + node IDs) -> resolve_names_partial.
+   There is NO handwritten frontend reproduction in the probe, so this
+   lane agrees with production by construction; the probe additionally
+   runs an adversarial microcorpus and suffix-index scan oracles against
+   the O(1) resolver indexes.
 
-   The VM run must exit 0 with a report that records every file parsed
-   clean and ZERO resolver diagnostics; any resolution error (unresolved
-   name/type, ambiguity, unsupported construct other than the known
-   pre-resolution debug_assert macro artifact) fails the lane. *)
+   The VM run must exit 0 with a report that records the canonical
+   preparation and ZERO resolver diagnostics; any preparation or
+   resolution error (unresolved name/type, ambiguity, macro-expansion
+   error) fails the lane. *)
 
 let fail fmt =
   Printf.ksprintf
@@ -107,7 +111,8 @@ let () =
   match
     Driver.run_bootstrap_closure ~repo_root
       ~manifest_path:"bootstrap/resolution_parity_mini.manifest" ~target
-      ~entry:(Some "main") ~kernel_args:[ "resolution-parity" ]
+      ~entry:(Some "resolution_parity_main")
+      ~kernel_args:[ "resolution-parity"; "aarch64-apple-darwin" ]
   with
   | Error m -> fail "closure pipeline: %s" m
   | Ok stages -> (

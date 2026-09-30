@@ -192,11 +192,21 @@ let () =
   in
   let t0 = Unix.gettimeofday () in
   let vm_cache = if use_cache then Some cache_path else None in
+  (* The seed's own closure fingerprint: the in-VM probe recomputes it
+     over the manifest + source bytes it reads and must agree. *)
+  let manifest_fingerprint =
+    match
+      Bootstrap_manifest.load ~repo_root
+        ~manifest_path:"bootstrap/compiler_kernel.manifest"
+    with
+    | Ok m -> Bootstrap_manifest.fingerprint m
+    | Error _ -> ""
+  in
   match
     Driver.run_bootstrap_vm ~repo_root
       ~manifest_path:"bootstrap/linkprobe_mini.manifest" ~target
       ~entry:(Some "main")
-      ~kernel_args:[ "linkprobe"; mode; target_str ]
+      ~kernel_args:[ "linkprobe"; mode; target_str; manifest_fingerprint ]
       ?vm_cache ()
   with
   | Error m -> fail "closure pipeline: %s" m

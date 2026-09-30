@@ -47,17 +47,18 @@ dune build
 # fix lands the full closure — the cap must cover the RUN, not the
 # stall.  A cap is a bound, never a skip.  Re-measure when the closure
 # grows materially.
-# NOTE (audit P0-2): at zero debt the gate now also executes the
-# self-host preflight in a SECOND VM run (the kernel interprets
-# `check --strict-resolution tg_compiler/bootstrap_main.tg` over the
-# 45-source closure).  This cap was calibrated on the artifact VM run
-# alone; re-measure the gate at zero debt and raise the cap only with
-# the instrumented phase numbers (never as a blind timeout increase).
-# Observed while landing P0-2: the standalone preflight did not complete
-# within 70 minutes on the current tree, where the in-VM kernel first
-# fails its own typechecker on std/alloc.tg's `size_of[T]()` (the
-# pre-existing last-mile divergence) — fix that kernel issue and profile
-# the in-VM check before re-pinning this cap.
+# NOTE (audit P0-2 / timeout recalibration): at zero debt the gate runs
+# TWO kernel VM executions:
+#   VM A: the artifact corpus compile+run (native codegen/link evidence)
+#   VM B: the self-host preflight (`check --strict-resolution
+#         --bootstrap-proof --stop-after=mono tg_compiler/bootstrap_main.tg`)
+#         — full front end, lowering, mono, type-query fold, post-mono
+#         verify/oracle, plus the closure-digest recomputation (it reads
+#         and SHA-256s all 45 manifest sources).
+# The historic cap was calibrated on VM A alone.  Re-measure both VMs at
+# zero debt (cold AND warm) and re-pin the cap from the instrumented
+# phase numbers — never as a blind timeout increase.  The gate prints
+# per-phase wall times, including the preflight VM run.
 # An explicit override is for MEASUREMENT runs only (record the gate's
 # instrumented phase lines, then re-pin the default from the numbers).
 GATE_TIMEOUT_S="${TG_GATE_TIMEOUT_S:-4140}"
@@ -102,7 +103,7 @@ fi
 # prepared kernel executes `check --strict-resolution
 # tg_compiler/bootstrap_main.tg` inside the seed VM and the gate requires
 # the exact TG_CHECK_OK summary (45-source manifest closure, strict
-# resolver, stop after MIR) — zero exit alone is not accepted as the
+# resolver, stop after MONO) — zero exit alone is not accepted as the
 # preflight proof.
 if ! grep -q "SELF-HOST PREFLIGHT: PASS" /tmp/ocaml_bootstrap_gate.out; then
   echo "check_ocaml_bootstrap_complete: FAIL — the full closure passed but the self-host preflight did not (the kernel cannot be proven to consume tg_compiler/bootstrap_main.tg)"

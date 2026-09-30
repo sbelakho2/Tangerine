@@ -103,26 +103,18 @@ let fail fmt = Printf.ksprintf (fun s -> Printf.printf "BOOTSTRAP GATE: FAIL: %s
    authorizes, and the extracted manifest count must agree with it. *)
 let expected_manifest_sources = 45
 
-let manifest_closure_count ~(repo_root : string) : int =
-  let path = Filename.concat repo_root "bootstrap/compiler_kernel.manifest" in
-  let ic = open_in path in
-  Fun.protect
-    ~finally:(fun () -> close_in_noerr ic)
-    (fun () ->
-      let count = ref 0 in
-      (try
-         while true do
-           let line = String.trim (input_line ic) in
-           let is_entry =
-             String.length line > 0
-             && line.[0] <> '#'
-             && (String.starts_with ~prefix:"std:" line
-                || String.starts_with ~prefix:"compiler:" line)
-           in
-           if is_entry then incr count
-         done
-       with End_of_file -> ());
-      !count)
+(* The manifest authority: the seed's own loader gives both the exact
+   entry count and the fingerprint the kernel's closure_sha256 must equal
+   (identity evidence, not cardinality). *)
+let manifest_authority ~(repo_root : string) : int * string =
+  match
+    Bootstrap_manifest.load ~repo_root
+      ~manifest_path:"bootstrap/compiler_kernel.manifest"
+  with
+  | Ok m ->
+      ( List.length (Bootstrap_manifest.entries m),
+        Bootstrap_manifest.fingerprint m )
+  | Error m -> fail "cannot load the kernel manifest: %s" m
 
 (* Extract `name=value` from the TG_CHECK_OK summary line (space-separated
    fields).  Returns None when the field is absent or empty. *)
@@ -524,8 +516,10 @@ let () =
            program.  This stage proves the kernel can consume its OWN
            stage1 source graph: the same prepared kernel program is
            executed in a FRESH VM with `check --strict-resolution
-           tg_compiler/bootstrap_main.tg`.  The check stops after MIR
-           verification (no native codegen/link), and the kernel emits
+           tg_compiler/bootstrap_main.tg` with `--bootstrap-proof
+           --stop-after=mono`.  The check stops after MONO + the
+           type-query fold + the post-mono verify + the post-mono
+           completeness oracle (no optimizer/codegen/link), and the kernel emits
            the machine-readable TG_CHECK_OK summary carrying the exact
            manifest closure size.  Exit 0 in strict mode subsumes zero
            resolver and zero type diagnostics (the kernel check fails
@@ -533,8 +527,8 @@ let () =
            summary to name bootstrap_main.tg and the exact 45-source
            closure, so a stale/other input can never false-green. *)
         Printf.printf
-          "  [11/11] self-host preflight: kernel checks tg_compiler/bootstrap_main.tg (strict resolution, stop after MIR)\n";
-        let manifest_count = manifest_closure_count ~repo_root in
+          "  [11/11] self-host preflight: kernel checks tg_compiler/bootstrap_main.tg (strict resolution, stop after MONO)\n";
+        let manifest_count, manifest_fingerprint = manifest_authority ~repo_root in
         if manifest_count <> expected_manifest_sources then
           fail
             "manifest closure size changed: bootstrap/compiler_kernel.manifest lists %d sources, \
@@ -542,7 +536,7 @@ let () =
              (and every pinned count) when the kernel closure grows"
             manifest_count expected_manifest_sources;
         let preflight_args =
-          [ "check"; "--strict-resolution"; "--stop-after=mono";
+          [ "check"; "--strict-resolution"; "--bootstrap-proof"; "--stop-after=mono";
             "tg_compiler/bootstrap_main.tg"; "--target"; target_str ]
         in
         let pre =
@@ -635,6 +629,17 @@ let () =
                         "self-host preflight merged %d module(s), the deduplicated closure is %d"
                         n expected_manifest_sources
                   | None -> fail "self-host preflight summary has no modules= field: %s" row);
+                  (* IDENTITY evidence: the kernel recomputed the closure
+                     digest over the exact manifest + source bytes it
+                     read; it must equal the seed's own fingerprint. *)
+                  (match summary_field row "closure_sha256" with
+                  | Some fp when fp = manifest_fingerprint -> ()
+                  | Some fp ->
+                      fail
+                        "self-host preflight closure_sha256=%s, the seed fingerprint is %s \
+                         — the guest did not process the exact seed closure bytes"
+                        fp manifest_fingerprint
+                  | None -> fail "self-host preflight summary has no closure_sha256= field: %s" row);
                   Printf.printf
                     "  SELF-HOST PREFLIGHT: PASS — kernel check of tg_compiler/bootstrap_main.tg \
                      exit 0 over the exact %d-source manifest closure (manifest_entries=%d, \

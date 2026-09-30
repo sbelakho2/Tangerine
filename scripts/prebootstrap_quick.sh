@@ -121,6 +121,7 @@ run_check "accepted-debt policy regression lane" scripts/test_ocaml_seed_debt_po
 run_check "degraded escape-valve rejection" scripts/prebootstrap_env_gate.sh
 run_check "selfcheck-sentinel verifier meta-test" scripts/test_selfcheck_sentinel.sh
 run_check "selfcheck sentinel source invariants" scripts/check_selfcheck_source_sentinels.sh
+run_check "prebootstrap gate mutation tests" scripts/test_prebootstrap_gates.sh
 
 # static invariants (each is a one-line grep/stat; sub-second)
 CHECKS=$((CHECKS + 1))
@@ -244,10 +245,10 @@ fi
 if [ "$FAILURES" -eq 0 ]; then
   CHECKS=$((CHECKS + 1))
   if (cd stage0_ocaml && timeout 300 "_build/default/test/test_main.exe") >/tmp/prebootstrap_quick_test_main.out 2>&1; then
-    if grep -q '230 passed, 0 failed' /tmp/prebootstrap_quick_test_main.out; then
-      echo "  PASS: unit inventory (230 passed, 0 failed)"
+    if scripts/check_unit_test_evidence.sh /tmp/prebootstrap_quick_test_main.out 230; then
+      echo "  PASS: unit inventory (exactly one '230 passed, 0 failed')"
     else
-      fail "unit inventory is not the exact 230 passed, 0 failed (see /tmp/prebootstrap_quick_test_main.out)"
+      fail "unit inventory evidence not satisfied (see /tmp/prebootstrap_quick_test_main.out)"
     fi
   else
     fail "unit suite exited non-zero (see /tmp/prebootstrap_quick_test_main.out)"
