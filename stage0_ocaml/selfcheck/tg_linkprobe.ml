@@ -17,8 +17,15 @@
 
    Both modes pass only when:
      - the probe VM run exits 0;
-     - the artifact exists with a nonzero size;
-     - executing the artifact natively yields exit code 42.
+     - the probe wrote THIS run's nonce (the outputs are deleted before
+       the run, so existence is evidence of this run, never a stale file);
+     - the probe report and the artifact exist with a nonzero size and a
+       valid structural header;
+     - when the host can execute the target natively (or under Rosetta):
+       executing the artifact yields exit code 42.  When no execution
+       capability exists (cross-target host), the structural proof is the
+       authority and the harness says so explicitly: it never claims the
+       artifact ran.
 
    The prepared-VM program cache (--cache PATH) makes the loop fast: the
    seed front end + lowering + mono run once, every later run re-executes
@@ -54,6 +61,31 @@ let read_file path =
   let s = really_input_string ic n in
   close_in ic;
   s
+
+(* Stale-evidence guard: every output this harness validates is removed
+   before the VM runs, so a mere existence check at the end can only be
+   satisfied by THIS run.  A leftover report/artifact from an earlier
+   successful run must never green a run whose guest skipped the write. *)
+let remove_if_exists path =
+  if Sys.file_exists path then
+    try Sys.remove path with Sys_error _ -> ()
+
+(* The guest's std::fs::create_dir_all prepends "/" to a relative path, so
+   the host materializes the snapshot-probe tree instead: the guest only
+   writes FILES into existing directories. *)
+let rec mkdir_p path =
+  if path = "" || path = "/" || Sys.file_exists path then ()
+  else begin
+    mkdir_p (Filename.dirname path);
+    try Unix.mkdir path 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+  end
+
+(* A per-run nonce the guest must echo into build/linkprobe_nonce.txt: a
+   stronger binding than pre-deletion alone (an unrelated file written by
+   an earlier run has a different nonce and is rejected). *)
+let run_nonce () =
+  Printf.sprintf "%d-%d" (Unix.getpid ())
+    (int_of_float (Unix.gettimeofday () *. 1_000_000.))
 
 (* The Mach-O LC_SYMTAB undefined-symbol scan (little-endian 64-bit):
    returns every undefined external symbol that must NEVER be handed to
@@ -281,11 +313,33 @@ let () =
     | Ok m -> Bootstrap_manifest.fingerprint m
     | Error m -> fail "cannot load compiler kernel manifest: %s" m
   in
+  let report_path = Filename.concat repo_root "build/linkprobe_report.txt" in
+  let nonce_path = Filename.concat repo_root "build/linkprobe_nonce.txt" in
+  let snapshot_probe_root = Filename.concat repo_root "build/linkprobe_snapshot_probe" in
+  let nonce = run_nonce () in
+  (* Stale-evidence guard: delete every output this run is judged on
+     BEFORE the VM starts.  Without this, an earlier successful report or
+     artifact could satisfy the existence checks even when this run's
+     guest write failed silently.  The snapshot-mutation probe's synthetic
+     closure is also refreshed: the guest writes only files, so the host
+     owns the directory layout. *)
+  List.iter remove_if_exists
+    [
+      report_path;
+      nonce_path;
+      Filename.concat repo_root "build/linkprobe_obj.out";
+      Filename.concat repo_root "build/linkprobe.out";
+      Filename.concat repo_root "build/linkprobe_libc.out";
+      Filename.concat snapshot_probe_root "bootstrap/compiler_kernel.manifest";
+      Filename.concat snapshot_probe_root "std/probe.tg";
+    ];
+  mkdir_p (Filename.concat snapshot_probe_root "bootstrap");
+  mkdir_p (Filename.concat snapshot_probe_root "std");
   match
     Driver.run_bootstrap_vm ~repo_root
       ~manifest_path:"bootstrap/linkprobe_mini.manifest" ~target
       ~entry:(Some "main")
-      ~kernel_args:[ "linkprobe"; mode; target_str; manifest_fingerprint ]
+      ~kernel_args:[ "linkprobe"; mode; target_str; manifest_fingerprint; nonce ]
       ?vm_cache ()
   with
   | Error m -> fail "closure pipeline: %s" m
@@ -305,7 +359,6 @@ let () =
       (match run.Driver.bvr_trap with
       | Some t -> Printf.printf "tg_linkprobe: trap: %s\n" t
       | None -> ());
-      let report_path = Filename.concat repo_root "build/linkprobe_report.txt" in
       if Sys.file_exists report_path then
         Printf.printf "tg_linkprobe: probe report:\n%s" (read_file report_path);
       (match run.Driver.bvr_vm_code with
@@ -313,7 +366,17 @@ let () =
           if not (Sys.file_exists report_path) then
             fail
               "VM exit 0 but the expected probe report %s is missing — the probe's write_file failed silently (its parent directory must exist before the guest writes; the guest write error is discarded) or the probe did not reach the write"
-              report_path
+              report_path;
+          (* The run nonce ties the surviving outputs to THIS run: both the
+             report and the nonce were deleted before the VM started, so a
+             stale file from an earlier run cannot satisfy the checks. *)
+          if
+            (not (Sys.file_exists nonce_path))
+            || String.trim (read_file nonce_path) <> nonce
+          then
+            fail
+              "VM exit 0 but the run nonce %s is missing or mismatched at %s — the surviving report/artifact is stale or the guest never ran the probe"
+              nonce nonce_path
       | Some code ->
           fail
             "probe main returned %d — the kernel executable backend failed (see the report above)"

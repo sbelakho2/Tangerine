@@ -3337,6 +3337,18 @@ type mono_outcome = {
    fast and deterministically (the guard stays a bounded resource budget,
    never an unbounded run).  Host calls keep >6x over the worst observed
    30.5e6. *)
+(* (zero-debt self-host preflight scale wall, measured 2026-10-02, x86_64
+   Linux, 45-source compiler_kernel closure): the kernel-in-VM preflight
+   (`check --bootstrap-proof --stop-after=mono tg_compiler/bootstrap_main.tg`,
+   run by tg_bootstrap_selfcheck) does NOT fit the 30e9-step default.  A
+   60e9 measurement run passed 30e9 and then entered a GC/alloc spiral (VM
+   BEACON dt climbing from ~6 s to 1277 s per 100M steps; live_mb 8.7e3,
+   regions 1.06e7), and an A/B control at 8684e13 WITHOUT the closure-
+   snapshot change shows the same wall (dt ~6 s -> ~20 s at ~7.5e3 live_mb).
+   The wall is therefore a pre-existing VM scale/GC problem in the zero-debt
+   preflight, not a cost of the snapshot work.  Recalibrating this cap
+   requires the memory/GC fix and a fresh completing measurement -- never a
+   blind increase; the default stays 30e9 so runaways still fail fast. *)
 (* (recalibrated bootstrap caps): the bootstrap VM budget is overridable via
    the environment so deep corpus+stdlib compiles can be given a larger
    budget without a rebuild; the defaults stay bounded, fail-fast guards. *)

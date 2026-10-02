@@ -12,30 +12,103 @@ type pointer = {
 
 (* The region's byte interpretation:
    - `Serialized` — the region holds Vm_value.serialize images (the
-     computed-value refs allocated by vm_alloc_scalar; derefers use
+     Ref-to-pointer host boundary's copy-in images; derefers use
      Vm_value.deserialize);
    - `Raw` — the region holds raw little-endian storage (host/C byte
      buffers: string/array as_ptr views, mem_alloc blocks, environment
      entries).  The VM's raw-pointer deref decodes the pointee's scalar
-     raw layout from these bytes. *)
+     raw layout from these bytes.
+
+   Computed-value refs no longer allocate regions at all: their
+   snapshot is the captured value itself (Vm_value.region_ref with a
+   `Captured` origin). *)
 type region_kind =
   | Serialized
   | Raw
 
 type region = {
   mutable live : bool;
-  mutable bytes : Bytes.t;
+  mutable bytes : Bytes.t;  (* backing buffer; capacity >= size *)
+  mutable size : int;  (* logical region size (bounds authority) *)
   alignment : int;
   kind : region_kind;
 }
+
+(* ── Backing-buffer pool ─────────────────────────────────────────────
+   The bootstrap VM allocates and frees millions of short-lived regions
+   (raw syscall buffers, mem_alloc blocks, host-call bridge images).  A
+   fresh [Bytes.make] per allocation makes the OCaml major GC run
+   constantly over a multi-GB heap; reusing the buffers keeps the churn
+   and the GC pauses down without changing the observable model: every
+   allocation still gets a FRESH region id, zero-filled logical bytes,
+   and strict liveness.  Only the backing storage is recycled. *)
+let buffer_pool : (int, Bytes.t Queue.t) Hashtbl.t = Hashtbl.create 16
+let buffer_pool_bytes = ref 0
+let buffer_pool_limit = 64 * 1024 * 1024
+let buffer_pool_max_buffer = 1 * 1024 * 1024
+
+let buffer_class (n : int) : int =
+  let rec go c = if c >= n then c else go (c * 2) in
+  go 16
+
+let take_buffer (size : int) : Bytes.t =
+  let key = buffer_class size in
+  (* A capacity class can hold buffers of different exact capacities
+     (class 32 may hold 17- and 25-byte buffers), so pop until one is
+     large enough; too-small buffers are dropped (they are cheaper to
+     reallocate than to re-bucket). *)
+  let rec take () =
+    match Hashtbl.find_opt buffer_pool key with
+    | Some q when not (Queue.is_empty q) ->
+        let b = Queue.pop q in
+        buffer_pool_bytes := !buffer_pool_bytes - Bytes.length b;
+        if Bytes.length b >= size then begin
+          Bytes.fill b 0 size '\000';
+          b
+        end
+        else take ()
+    | _ -> Bytes.make size '\000'
+  in
+  take ()
+
+let release_buffer (b : Bytes.t) : unit =
+  let cap = Bytes.length b in
+  if cap > 0 && cap <= buffer_pool_max_buffer
+     && !buffer_pool_bytes + cap <= buffer_pool_limit
+  then begin
+    let key = buffer_class cap in
+    (match Hashtbl.find_opt buffer_pool key with
+    | Some q -> Queue.push b q
+    | None ->
+        let q = Queue.create () in
+        Queue.push b q;
+        Hashtbl.add buffer_pool key q);
+    buffer_pool_bytes := !buffer_pool_bytes + cap
+  end
 
 type t = {
   mutable regions : region array;  (* capacity >= next_region (geometric) *)
   mutable next_region : int;       (* logical region count / next id *)
 }
 
-(* region-allocation counter (diagnostic; see Vm_value's copy counters) *)
+(* region-allocation counters (diagnostic; see Vm_value's copy
+   counters).  `prof_regions` is cumulative; the per-site table and the
+   free count name WHERE a long run's regions come from (a leak is a
+   site whose allocations outrun its frees). *)
 let prof_regions = ref 0
+let prof_frees = ref 0
+let prof_alloc_sites : (string, int ref) Hashtbl.t = Hashtbl.create 16
+
+let note_alloc (site : string) : unit =
+  match Hashtbl.find_opt prof_alloc_sites site with
+  | Some r -> incr r
+  | None -> Hashtbl.add prof_alloc_sites site (ref 1)
+
+let prof_alloc_sites_summary () : string =
+  let entries = Hashtbl.fold (fun k v acc -> (k, !v) :: acc) prof_alloc_sites [] in
+  let entries = List.sort (fun (a, _) (b, _) -> compare a b) entries in
+  String.concat ","
+    (List.map (fun (k, v) -> Printf.sprintf "%s:%d" k v) entries)
 
 let create () = { regions = [||]; next_region = 0 }
 
@@ -61,17 +134,18 @@ let mem_error_string = function
 
 let is_power_of_two (n : int) : bool = n > 0 && n land (n - 1) = 0
 
-let dead_region = { live = false; bytes = Bytes.empty; alignment = 1; kind = Serialized }
+let dead_region = { live = false; bytes = Bytes.empty; size = 0; alignment = 1; kind = Serialized }
 
-let alloc ?(kind = Serialized) (m : t) (size : int) (alignment : int) :
-    (pointer, mem_error) result =
+let alloc ?(kind = Serialized) ?(site = "other") (m : t) (size : int)
+    (alignment : int) : (pointer, mem_error) result =
   if size < 0 then Error (NegativeSize size)
   else if not (is_power_of_two alignment) then Error (BadAlignment alignment)
   else begin
     let region_id = m.next_region in
     m.next_region <- m.next_region + 1;
-    let region = { live = true; bytes = Bytes.make size '\000'; alignment; kind } in
+    let region = { live = true; bytes = take_buffer size; size; alignment; kind } in
     prof_regions := !prof_regions + 1;
+    note_alloc site;
     (* geometric growth: the table copy is amortized O(1) per region
        (the previous one-element append was quadratic in the region
        count — the kernel's allocator allocates regions in bulk) *)
@@ -98,7 +172,18 @@ let free (m : t) (p : pointer) : (unit, mem_error) result =
     if not r.live then Error (DeadRegion p)
     else if p.offset <> 0 then Error (InvalidFree p)
     else begin
-      r.live <- false;
+      (* Release the region record AND its backing bytes to the OCaml GC by
+         installing the shared dead sentinel.  Region ids are never reused,
+         so stale pointers still hit the liveness check and trap exactly as
+         before (DeadRegion) — but a freed region no longer pins its byte
+         buffer.  Without this, every dropped computed-value ref
+         (Ref (Region p)) and every freed raw block kept its full byte
+         buffer strongly reachable through the region table for the whole
+         run: the zero-debt self-host preflight reached 10.6M regions and
+         ~8.7 GB of live heap, steeped in a major-GC spiral. *)
+      release_buffer r.bytes;
+      m.regions.(p.region) <- dead_region;
+      incr prof_frees;
       Ok ()
     end
 
@@ -114,7 +199,7 @@ let kind_of (m : t) (p : pointer) : (region_kind, mem_error) result =
 let check_bounds (r : region) (p : pointer) (size : int) (alignment : int) :
     (unit, mem_error) result =
   if size < 0 then Error (Overflow "negative size")
-  else if p.offset < 0 || p.offset > Bytes.length r.bytes - size then
+  else if p.offset < 0 || p.offset > r.size - size then
     Error (OutOfBounds (p, size))
   else if alignment > 1 && p.offset mod alignment <> 0 then
     Error (Misaligned (p, alignment))
@@ -145,7 +230,7 @@ let store_bytes (m : t) (p : pointer) (b : Bytes.t) : (unit, mem_error) result =
 let region_length (m : t) (p : pointer) : (int, mem_error) result =
   match region_of m p with
   | Error e -> Error e
-  | Ok r -> Ok (Bytes.length r.bytes)
+  | Ok r -> Ok r.size
 
 (* The GROWING store for the value model's self-describing images
    (Vm_value.serialize): unlike a machine image, a serialized aggregate's
@@ -162,10 +247,12 @@ let store_bytes_grow (m : t) (p : pointer) (b : Bytes.t) : (unit, mem_error) res
       if p.offset < 0 then Error (OutOfBounds (p, blen))
       else begin
         let needed = p.offset + blen in
-        if needed > Bytes.length r.bytes then begin
+        if needed > r.size then begin
           let grown = Bytes.make needed '\000' in
-          Bytes.blit r.bytes 0 grown 0 (Bytes.length r.bytes);
-          r.bytes <- grown
+          Bytes.blit r.bytes 0 grown 0 r.size;
+          release_buffer r.bytes;
+          r.bytes <- grown;
+          r.size <- needed
         end;
         Bytes.blit b 0 r.bytes p.offset blen;
         Ok ()

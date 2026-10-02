@@ -258,7 +258,7 @@ check_pin() { # <label> <file> <regex>
 }
 check_pin "proof root requires the repository entry" tg_compiler/compiler_core.tg   'error: --bootstrap-proof requires the repository kernel entry root'
 check_pin "proof root rejects absolute lookalikes" tg_compiler/compiler_core.tg   'pub def bootstrap_proof_root_ok'
-check_pin "digest is bound to the consumed root bytes" tg_compiler/compiler_core.tg   'tg_is_root_entry\(root_path.clone\(\), rel.clone\(\)\)'
+check_pin "digest is bound to the consumed root bytes" tg_compiler/compiler_core.tg   'tg_is_root_entry\(root_path.clone\(\), snap.sources\[i\].rel.clone\(\)\)'
 check_pin "linkprobe never SKIPs the closure digest" stage0_ocaml/selfcheck/linkprobe.tg   'no seed fingerprint supplied'
 if grep -q 'LINKPROBE_CLOSURE_DIGEST=SKIP' "$ROOT/stage0_ocaml/selfcheck/linkprobe.tg"; then
   bad "contract pin: linkprobe still has a digest SKIP path"
@@ -277,6 +277,61 @@ check_pin "seed identity cannot be faked as unreadable" stage0_ocaml/src/driver.
 check_pin "kernel parses --codegen=direct" tg_compiler/bootstrap_main.tg   '--codegen=lir requires the full driver'
 check_pin "direct allocator canary has route evidence" scripts/bootstrap_helpers.sh   'X64_ALLOCATOR_CANARY route=direct'
 
+# ── closure-snapshot authority (audit P0/P1) ─────────────────────────
+# The proof digest and the dependency parser must consume the SAME loaded
+# snapshot: the fingerprint composer contains no file read, the summary
+# takes the compilation's precomputed digest, and the loader reads only
+# through the snapshot lookup.
+if sed -n '/^pub def emit_check_ok_summary/,/^end$/p' "$ROOT/tg_compiler/compiler_core.tg" | grep -q 'bootstrap_closure_fingerprint'; then
+  bad "closure snapshot: summary recomputes the digest from a fresh read"
+else
+  pass "closure snapshot: summary consumes the compilation's digest"
+fi
+snap_fp_body="$(sed -n '/^pub def bootstrap_closure_fingerprint_snapshot/,/^end$/p' "$ROOT/tg_compiler/compiler_core.tg")"
+if [ -z "$snap_fp_body" ]; then
+  bad "closure snapshot: fingerprint-from-snapshot function missing"
+elif printf '%s\n' "$snap_fp_body" | grep -q 'read_source_file'; then
+  bad "closure snapshot: fingerprint re-reads a source file"
+else
+  pass "closure snapshot: fingerprint hashes the loaded snapshot (no re-read)"
+fi
+check_pin "closure snapshot: dep loader consumes the snapshot" tg_compiler/compiler_core.tg   'bootstrap_closure_snapshot_lookup\(snap, path.clone\(\)\)'
+check_pin "closure snapshot: mutation probe exists" stage0_ocaml/selfcheck/linkprobe.tg   'bootstrap_closure_snapshot_at'
+check_pin "linkprobe deletes stale outputs before the run" stage0_ocaml/selfcheck/tg_linkprobe.ml   'remove_if_exists'
+check_pin "linkprobe validates this run's nonce" stage0_ocaml/selfcheck/tg_linkprobe.ml   'linkprobe_nonce.txt'
+
+# Execution wording: the unavailable branch must never claim a run, and the
+# performed branch must never claim structural-only.
+if grep -n 'execution=unavailable structural-proof=pass' "$ROOT/stage0_ocaml/selfcheck/tg_linkprobe.ml" | grep -qE 'exit=42|performed'; then
+  bad "linkprobe unavailable branch claims execution"
+else
+  pass "linkprobe unavailable branch never claims execution"
+fi
+if grep -n 'execution=performed exit=42' "$ROOT/stage0_ocaml/selfcheck/tg_linkprobe.ml" | grep -q 'unavailable'; then
+  bad "linkprobe performed branch claims unavailability"
+else
+  pass "linkprobe performed branch names the real execution"
+fi
+
+# Direct-route allocator evidence must be counted in the lane totals.
+alloc_block="$(sed -n '/DIRECT-emitter allocator canary/,/^  fi$/p' "$ROOT/scripts/bootstrap_helpers.sh")"
+if printf '%s\n' "$alloc_block" | grep -q 'total=\$((total + 1))'; then
+  pass "direct allocator canary increments the lane total"
+else
+  bad "direct allocator canary is not counted in the lane total"
+fi
+
+# The timeout facility is the single authority; no lane may call the bare
+# `timeout` binary directly (portability: stock macOS has only gtimeout).
+if grep -nE '(^|[;&|(])[[:space:]]*timeout[[:space:]]' \
+  "$ROOT/scripts/prebootstrap_quick.sh" \
+  "$ROOT/scripts/check_ocaml_seed_health.sh" \
+  "$ROOT/scripts/check_ocaml_bootstrap_complete.sh" 2>/dev/null | grep -q .; then
+  bad "a lane calls timeout directly instead of bh_run_with_timeout"
+else
+  pass "all lanes use the portable timeout facility"
+fi
+
 # ── the mixed-architecture fail-closed validator + mutations ─────────
 # The validator checks behavior-bearing shapes case-insensitively; these
 # mutations prove it goes red for every injection class.
@@ -286,10 +341,21 @@ else
   bad "codegen architecture invariants fail on the clean tree"
 fi
 mut_base="$TMP/codegen_mut.tg"
+
+# Portable in-place edit: GNU sed wants `-i EXPR FILE`, BSD/macOS sed wants
+# `-i SUFFIX EXPR FILE`.  A redirected rewrite + mv works on both, so the
+# gate itself is not the thing that fails on a stock Darwin host.
+apply_sed_mutation() { # <file> <sed-expression>
+  local file="$1" expr="$2" tmp
+  tmp="${file}.mut.new"
+  sed "$expr" "$file" >"$tmp"
+  mv "$tmp" "$file"
+}
+
 run_arch_mutation() { # <label> <sed-expression>
   local label="$1" expr="$2"
   cp "$ROOT/tg_compiler/codegen.tg" "$mut_base"
-  sed -i "$expr" "$mut_base"
+  apply_sed_mutation "$mut_base" "$expr"
   if "$ROOT/scripts/check_codegen_arch_invariants.sh" "$mut_base" >/dev/null 2>&1; then
     bad "arch mutation accepted: ${label}"
   else
@@ -300,10 +366,61 @@ run_arch_mutation "uppercase # Tolerance comment" \
   's/# MOV reg, reg/# Tolerance: PhysReg variant mismatch/'
 run_arch_mutation "permissive phys_reg_as_a64 helper" \
   's/^def emit_mov_ri/def phys_reg_as_a64(r: PhysReg) -> A64\n  match r\n  when PhysReg::A64Reg(a) then a\n  when PhysReg::X64Reg(_) then A64::X0\n  end\nend\n\ndef emit_mov_ri/'
+run_arch_mutation "permissive phys_reg_as_x64 helper" \
+  's/^def emit_mov_ri/def phys_reg_as_x64(r: PhysReg) -> X64\n  match r\n  when PhysReg::X64Reg(a) then a\n  when PhysReg::A64Reg(_) then X64::RAX\n  end\nend\n\ndef emit_mov_ri/'
 run_arch_mutation "silent mixed-architecture mov arm" \
   's/panic("codegen ICE: mixed-architecture registers in emit_mov_rr")/()/g'
-run_arch_mutation "silent architecture-mismatch arm" \
+run_arch_mutation "silent architecture-mismatch mov arm" \
   's/when PhysReg::A64Reg(_) then panic("codegen ICE: mixed-architecture registers in emit_mov_rr")/when PhysReg::A64Reg(_) then ()/'
+run_arch_mutation "silent architecture-mismatch load arm" \
+  's/when PhysReg::A64Reg(_) then panic("codegen ICE: mixed-architecture registers in emit_load_mem")/when PhysReg::A64Reg(_) then ()/'
+run_arch_mutation "silent architecture-mismatch store arm" \
+  's/when PhysReg::A64Reg(_) then panic("codegen ICE: mixed-architecture registers in emit_store_mem")/when PhysReg::A64Reg(_) then ()/'
+run_arch_mutation "missing load ICE" \
+  's/panic("codegen ICE: mixed-architecture registers in emit_load_mem")/()/g'
+
+# ── qemu capability must be EXECUTION-based, not presence-based ──────
+# A qemu-<arch> that exists but cannot run the minimal target ELF must not
+# be selected; one that does run it must be (and the aarch64 binary name is
+# qemu-aarch64, never qemu-arm64).
+qemu_mock="$TMP/qemu-mock"
+mkdir -p "$qemu_mock"
+cat >"$qemu_mock/qemu-x86_64" <<'MOCK_FAIL'
+#!/usr/bin/env bash
+exit 1
+MOCK_FAIL
+chmod +x "$qemu_mock/qemu-x86_64"
+if PATH="$qemu_mock:$PATH" bash -c 'source "$1"; bh_qemu_can_execute x86_64' _ "$ROOT/scripts/bootstrap_helpers.sh"; then
+  bad "qemu capability probe accepted a qemu that cannot run the target ELF"
+else
+  pass "qemu capability probe rejects a present-but-broken qemu"
+fi
+
+cat >"$qemu_mock/qemu-x86_64" <<'MOCK_OK'
+#!/usr/bin/env bash
+# Emulates a working qemu deterministically on every host: the capability
+# probe only needs "the resolved binary ran the probe and exited 0".
+exit 0
+MOCK_OK
+chmod +x "$qemu_mock/qemu-x86_64"
+if PATH="$qemu_mock:$PATH" bash -c 'source "$1"; bh_qemu_can_execute x86_64' _ "$ROOT/scripts/bootstrap_helpers.sh"; then
+  pass "qemu capability probe accepts a qemu that runs the target ELF"
+else
+  bad "qemu capability probe rejected a working qemu"
+fi
+
+cat >"$qemu_mock/qemu-aarch64" <<'MOCK_ARM'
+#!/usr/bin/env bash
+[ "$(basename "$0")" = "qemu-aarch64" ] || exit 7
+exit 0
+MOCK_ARM
+chmod +x "$qemu_mock/qemu-aarch64"
+arm_runner="$(PATH="$qemu_mock:$PATH" bash -c 'source "$1"; bh_qemu_runner_for aarch64' _ "$ROOT/scripts/bootstrap_helpers.sh" || true)"
+if [ "$arm_runner" = "qemu-aarch64" ]; then
+  pass "aarch64 runner resolves to qemu-aarch64 (not qemu-arm64)"
+else
+  bad "aarch64 runner resolved to '$arm_runner', want qemu-aarch64"
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "test_prebootstrap_gates: FAIL"

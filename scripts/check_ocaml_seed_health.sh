@@ -51,6 +51,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# The shared bootstrap validation library: the timeout facility is the single
+# authority (GNU timeout / Homebrew gtimeout / TG_TIMEOUT_CMD override).
+# shellcheck source=scripts/bootstrap_helpers.sh
+source "$ROOT/scripts/bootstrap_helpers.sh"
+
 PINNED_TEST_INVENTORY=230
 
 # Harness timeout calibration (re-measured 2026-09-14 on the development
@@ -171,7 +176,7 @@ dune build
 # the text the only signal).  Require rc == 0 and EXACTLY ONE exact-count
 # summary line.
 set +e
-TEST_OUT="$(timeout 120 _build/default/test/test_main.exe 2>&1)"
+TEST_OUT="$(bh_run_with_timeout 120 _build/default/test/test_main.exe 2>&1)"
 TEST_RC=$?
 set -e
 if [ "$TEST_RC" -ne 0 ]; then
@@ -265,7 +270,7 @@ for name in $NAMES; do
   if [ "$name" = "tg_resolution_parity" ]; then
     SC_TIMEOUT_S="$RESOLUTION_PARITY_TIMEOUT_S"
   fi
-  if ! timeout "$SC_TIMEOUT_S" "_build/default/selfcheck/${name}.exe" >"/tmp/ocaml_sc_${name}.out" 2>&1; then
+  if ! bh_run_with_timeout "$SC_TIMEOUT_S" "_build/default/selfcheck/${name}.exe" >"/tmp/ocaml_sc_${name}.out" 2>&1; then
     echo "check_ocaml_seed_health: FAIL — selfcheck ${name} exited non-zero"
     tail -10 "/tmp/ocaml_sc_${name}.out" || true
     SELFCHECK_FAIL=1
@@ -291,7 +296,7 @@ for name in $NAMES; do
   # default lane runs the standalone battery under its calibrated cap and
   # the opt-in runs the full merged workload under its own.
   if [ "$name" = "tg_infer" ] && [ "${TG_INFER_MERGED:-0}" = "1" ]; then
-    if ! timeout "$TG_INFER_MERGED_TIMEOUT_S" \
+    if ! bh_run_with_timeout "$TG_INFER_MERGED_TIMEOUT_S" \
         "_build/default/selfcheck/${name}.exe" .. --merged \
         >/tmp/ocaml_sc_tg_infer_merged.out 2>&1; then
       echo "check_ocaml_seed_health: FAIL — tg_infer --merged exited non-zero"
@@ -305,7 +310,7 @@ done
 # here — it is delegated to tg_bootstrap_gate, the single debt authority
 # (monotonic no-regression vs its checked baseline).
 set +e
-timeout "$BOOTSTRAP_CHECK_TIMEOUT_S" _build/default/bin/tg_stage0.exe bootstrap-check --repo-root .. --target "${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}" >/tmp/ocaml_bootstrap_check.out 2>&1
+bh_run_with_timeout "$BOOTSTRAP_CHECK_TIMEOUT_S" _build/default/bin/tg_stage0.exe bootstrap-check --repo-root .. --target "${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}" >/tmp/ocaml_bootstrap_check.out 2>&1
 BC_STATUS=$?
 set -e
 if [ "$BC_STATUS" -ne 0 ] && [ "$BC_STATUS" -ne 1 ]; then
@@ -390,7 +395,7 @@ fi
 # FULL-COMPLETENESS gate: tg_bootstrap_gate — reported separately,
 # informational only; red by design while the subset is nonzero.
 set +e
-timeout "$GATE_TIMEOUT_S" _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. --target "${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}" >/tmp/ocaml_bootstrap_gate.out 2>&1
+bh_run_with_timeout "$GATE_TIMEOUT_S" _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. --target "${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}" >/tmp/ocaml_bootstrap_gate.out 2>&1
 GATE_STATUS=$?
 set -e
 SUBSET_N="$(grep -oE 'SUBSET_FIREWALL = (PASS|FAIL \([0-9]+ findings)' /tmp/ocaml_bootstrap_check.out 2>/dev/null | head -1 | grep -oE 'PASS|[0-9]+' | head -1 || true)"

@@ -26,6 +26,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# The shared bootstrap validation library: the timeout facility is the single
+# authority (GNU timeout / Homebrew gtimeout / TG_TIMEOUT_CMD override).
+# shellcheck source=scripts/bootstrap_helpers.sh
+source "$ROOT/scripts/bootstrap_helpers.sh"
+
 if [ -f scripts/check_ocaml_toolchain.sh ]; then
   scripts/check_ocaml_toolchain.sh
 fi
@@ -71,7 +76,7 @@ TARGET_TRIPLE="${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}"
 echo "check_ocaml_bootstrap_complete: target $TARGET_TRIPLE"
 
 set +e
-timeout "$GATE_TIMEOUT_S" _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. --target "$TARGET_TRIPLE" >/tmp/ocaml_bootstrap_gate.out 2>&1
+bh_run_with_timeout "$GATE_TIMEOUT_S" _build/default/selfcheck/tg_bootstrap_gate.exe --repo-root .. --target "$TARGET_TRIPLE" >/tmp/ocaml_bootstrap_gate.out 2>&1
 GATE_STATUS=$?
 set -e
 if [ "$GATE_STATUS" -ne 0 ]; then

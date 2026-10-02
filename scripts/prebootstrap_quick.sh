@@ -84,6 +84,11 @@ run_check() { # run_check <label> <command...>
   fi
 }
 
+# The shared bootstrap validation library: the timeout facility, target
+# authority and canary helpers are defined exactly once there.
+# shellcheck source=scripts/bootstrap_helpers.sh
+source "$ROOT/scripts/bootstrap_helpers.sh"
+
 readonly FAST_SELFCHECKS=(
   tg_bootstrap_accepted
   tg_manifest
@@ -114,6 +119,13 @@ for f in run_bootstrap.sh scripts/*.sh; do
   fi
 done
 if [ "$FAILURES" -eq 0 ]; then echo "  PASS: shell syntax (run_bootstrap.sh + scripts/*.sh)"; fi
+
+CHECKS=$((CHECKS + 1))
+if bh_require_timeout_facility; then
+  echo "  PASS: timeout facility ($(bh_timeout_cmd))"
+else
+  fail "required timeout facility unavailable (install GNU coreutils or set TG_TIMEOUT_CMD)"
+fi
 
 run_check "repository artifact hygiene" scripts/check_repo_artifact_hygiene.sh
 run_check "kernel struct integrity" scripts/check_struct_integrity.sh
@@ -244,7 +256,7 @@ fi
 
 if [ "$FAILURES" -eq 0 ]; then
   CHECKS=$((CHECKS + 1))
-  if (cd stage0_ocaml && timeout 300 "_build/default/test/test_main.exe") >/tmp/prebootstrap_quick_test_main.out 2>&1; then
+  if (cd stage0_ocaml && bh_run_with_timeout 300 "_build/default/test/test_main.exe") >/tmp/prebootstrap_quick_test_main.out 2>&1; then
     if scripts/check_unit_test_evidence.sh /tmp/prebootstrap_quick_test_main.out 230; then
       echo "  PASS: unit inventory (exactly one '230 passed, 0 failed')"
     else
@@ -259,7 +271,7 @@ for name in "${FAST_SELFCHECKS[@]}"; do
   [ "$FAILURES" -eq 0 ] || break
   CHECKS=$((CHECKS + 1))
   out="/tmp/prebootstrap_quick_${name}.out"
-  if ! (cd stage0_ocaml && timeout 420 "_build/default/selfcheck/${name}.exe") >"$out" 2>&1; then
+  if ! (cd stage0_ocaml && bh_run_with_timeout 420 "_build/default/selfcheck/${name}.exe") >"$out" 2>&1; then
     fail "selfcheck ${name} exited non-zero (see ${out})"
   elif ! scripts/check_selfcheck_sentinel.sh "$name" "$out"; then
     fail "selfcheck ${name} exited 0 without its exact sentinel (see ${out})"
@@ -275,7 +287,7 @@ if [ "$MODE" = "medium" ] || [ "$MODE" = "final" ]; then
     [ "$FAILURES" -eq 0 ] || break
     CHECKS=$((CHECKS + 1))
     out="/tmp/prebootstrap_quick_${name}.out"
-    if ! (cd stage0_ocaml && timeout 2400 "_build/default/selfcheck/${name}.exe" ..) >"$out" 2>&1; then
+    if ! (cd stage0_ocaml && bh_run_with_timeout 2400 "_build/default/selfcheck/${name}.exe" ..) >"$out" 2>&1; then
       fail "selfcheck ${name} exited non-zero (see ${out})"
     elif ! scripts/check_selfcheck_sentinel.sh "$name" "$out"; then
       fail "selfcheck ${name} exited 0 without its exact sentinel (see ${out})"

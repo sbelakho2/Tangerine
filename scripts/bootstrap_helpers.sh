@@ -35,6 +35,56 @@ bh_log()  { printf '[bootstrap] %s\n' "$*"; }
 bh_err()  { printf '[bootstrap:error] %s\n' "$*" >&2; }
 bh_warn() { printf '[bootstrap:warning] %s\n' "$*" >&2; }
 
+# ── timeout facility (one authority) ───────────────────────────────
+# Bounded external commands are used by every lane.  Stock macOS ships no
+# timeout(1); Homebrew coreutils installs it as gtimeout unless the GNU
+# names are linked into PATH.  Resolve once, allow an explicit
+# TG_TIMEOUT_CMD override, and fail closed with an actionable message
+# instead of a late "command not found".
+BH_TIMEOUT_CMD_RESOLVED="${BH_TIMEOUT_CMD_RESOLVED:-}"
+bh_timeout_cmd() {
+  if [ -n "$BH_TIMEOUT_CMD_RESOLVED" ]; then
+    printf '%s' "$BH_TIMEOUT_CMD_RESOLVED"
+    return 0
+  fi
+  if [ -n "${TG_TIMEOUT_CMD:-}" ]; then
+    if ! command -v "$TG_TIMEOUT_CMD" >/dev/null 2>&1; then
+      bh_err "TG_TIMEOUT_CMD=$TG_TIMEOUT_CMD is not an executable command"
+      return 1
+    fi
+    BH_TIMEOUT_CMD_RESOLVED="$TG_TIMEOUT_CMD"
+  elif command -v timeout >/dev/null 2>&1; then
+    BH_TIMEOUT_CMD_RESOLVED=timeout
+  elif command -v gtimeout >/dev/null 2>&1; then
+    BH_TIMEOUT_CMD_RESOLVED=gtimeout
+  else
+    bh_err "no timeout facility available: install GNU coreutils (timeout/gtimeout) or set TG_TIMEOUT_CMD"
+    return 1
+  fi
+  printf '%s' "$BH_TIMEOUT_CMD_RESOLVED"
+}
+
+# Fail closed early with the same message the runners would produce; Tier 0
+# gates call this so an unusable host is rejected before any expensive lane.
+bh_require_timeout_facility() {
+  local tcmd
+  tcmd="$(bh_timeout_cmd)" || return 1
+  [ -n "$tcmd" ] || {
+    bh_err "no timeout facility available: install GNU coreutils (timeout/gtimeout) or set TG_TIMEOUT_CMD"
+    return 1
+  }
+  return 0
+}
+
+# bh_run_with_timeout <seconds> <command...>
+bh_run_with_timeout() {
+  local seconds="$1"
+  shift
+  local tcmd
+  tcmd="$(bh_timeout_cmd)" || return 1
+  "$tcmd" "$seconds" "$@"
+}
+
 # Portably hash a string to its hex sha256.
 bh_sha256_str() {
   printf '%s' "$1" | bh_sha256_cmd
@@ -507,6 +557,90 @@ bh_target_arch_name_of() {
   esac
 }
 
+# ── qemu-user capability (execution, never mere presence) ──────────
+# A minimal static ELF64 that exits 0 on its target ABI (no dynamic loader,
+# no libc).  Executing one through qemu-<arch> proves the emulator can load
+# and run TARGET code, not merely that a binary named qemu-* exists.
+# Generated from a 64-byte ELF header + one PT_LOAD program header:
+#   x86_64:  mov eax, 60 ; xor edi, edi ; syscall
+#   aarch64: mov x0, #0  ; mov x8, #93  ; svc #0
+BH_QEMU_PROBE_X86_64_HEX="7f454c4602010100000000000000000002003e0001000000780040000000000040000000000000000000000000000000000000004000380001000000000000000100000005000000000000000000000000004000000000000000400000000000810000000000000081000000000000000010000000000000b83c00000031ff0f05"
+BH_QEMU_PROBE_AARCH64_HEX="7f454c460201010000000000000000000200b70001000000780040000000000040000000000000000000000000000000000000004000380001000000000000000100000005000000000000000000000000004000000000000000400000000000840000000000000084000000000000000010000000000000000080d2a81180d2010000d4"
+
+# Write raw bytes from a hex string (bash arithmetic; no xxd dependency).
+bh_write_hex_file() { # <hex> <path>
+  local hex="$1" path="$2" i byte
+  : >"$path"
+  i=0
+  while [ "$i" -lt "${#hex}" ]; do
+    byte="${hex:$i:2}"
+    printf "\\$(printf '%03o' "$((16#$byte))")" >>"$path"
+    i=$((i + 2))
+  done
+}
+
+bh_qemu_probe_hex() { # <target-arch: x86_64|aarch64>
+  case "$1" in
+    x86_64) printf '%s' "$BH_QEMU_PROBE_X86_64_HEX" ;;
+    aarch64) printf '%s' "$BH_QEMU_PROBE_AARCH64_HEX" ;;
+    *) return 1 ;;
+  esac
+}
+
+# The qemu-user binary for a target arch: qemu-<arch> or qemu-<arch>-static.
+# The target arch spelling here is the BINARY convention (aarch64), not the
+# host-arch spelling (arm64) — `qemu-arm64` does not exist.
+bh_qemu_binary_for() { # <x86_64|aarch64>
+  local arch="$1" cand
+  for cand in "qemu-$arch" "qemu-$arch-static"; do
+    if command -v "$cand" >/dev/null 2>&1; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Cached execution probe: true only when the resolved qemu binary actually
+# runs the minimal target ELF to exit 0.
+bh_qemu_can_execute() { # <x86_64|aarch64>
+  local arch="$1" qemu probe cached
+  case "$arch" in
+    x86_64 | aarch64) ;;
+    *) return 1 ;;
+  esac
+  eval "cached=\"\${BH_QEMU_OK_${arch}:-}\""
+  if [ "$cached" = "1" ]; then return 0; fi
+  if [ "$cached" = "0" ]; then return 1; fi
+  qemu="$(bh_qemu_binary_for "$arch")" || {
+    eval "BH_QEMU_OK_${arch}=0"
+    return 1
+  }
+  probe="$(mktemp "${TMPDIR:-/tmp}/bh-qemu-${arch}-probe.XXXXXX")" || {
+    eval "BH_QEMU_OK_${arch}=0"
+    return 1
+  }
+  if bh_write_hex_file "$(bh_qemu_probe_hex "$arch")" "$probe" &&
+    chmod +x "$probe" &&
+    "$qemu" "$probe" >/dev/null 2>&1; then
+    rm -f "$probe"
+    eval "BH_QEMU_OK_${arch}=1"
+    return 0
+  fi
+  rm -f "$probe"
+  eval "BH_QEMU_OK_${arch}=0"
+  return 1
+}
+
+bh_qemu_runner_for() { # <x86_64|aarch64> -> binary name or empty
+  local arch="$1" bin
+  if bh_qemu_can_execute "$arch"; then
+    bin="$(bh_qemu_binary_for "$arch")" && printf '%s' "$bin"
+    return 0
+  fi
+  return 1
+}
+
 # Prints the execution mode for a triple: "native", a runner prefix
 # ("arch -x86_64", "qemu-x86_64", ...), or "UNAVAILABLE".
 bh_target_runner_for() {
@@ -525,9 +659,18 @@ bh_target_runner_for() {
     printf 'arch -x86_64'
     return 0
   fi
-  if command -v "qemu-$ta" >/dev/null 2>&1; then
-    printf 'qemu-%s' "$ta"
-    return 0
+  if [ "$ta" = x86_64 ]; then
+    local q64
+    q64="$(bh_qemu_runner_for x86_64)" && {
+      printf '%s' "$q64"
+      return 0
+    }
+  elif [ "$ta" = arm64 ]; then
+    local qa64
+    qa64="$(bh_qemu_runner_for aarch64)" && {
+      printf '%s' "$qa64"
+      return 0
+    }
   fi
   printf 'UNAVAILABLE'
 }

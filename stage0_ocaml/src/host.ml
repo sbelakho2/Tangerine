@@ -522,8 +522,9 @@ let ptr_arg (v : Vm_value.t) : (Vm_memory.pointer, string) result =
       else Ok p
   | None -> Error ("argument mismatch: expected Ptr (found " ^ value_kind_name v ^ ")")
 
-let arena_alloc (t : t) (size : int) (align : int) : (Vm_memory.pointer, string) result =
-  match Vm_memory.alloc ~kind:Vm_memory.Raw t.memory size align with
+let arena_alloc ?(site = "arena") (t : t) (size : int) (align : int) :
+    (Vm_memory.pointer, string) result =
+  match Vm_memory.alloc ~kind:Vm_memory.Raw ~site t.memory size align with
   | Ok p -> Ok p
   | Error e -> Error (mem_error e)
 
@@ -1191,7 +1192,7 @@ let host_getcwd (t : t) (p : Vm_memory.pointer) (size : int) : int =
 let host_mmap (t : t) (length : int) (fd : int) (offset : int) : int =
   if length <= 0 then -errno_inval
   else
-    match Vm_memory.alloc ~kind:Vm_memory.Raw t.memory length 4096 with
+    match Vm_memory.alloc ~kind:Vm_memory.Raw ~site:"mmap" t.memory length 4096 with
     | Error _ -> -errno_nomem
     | Ok p -> (
         let addr () = Int64.to_int (Vm_memory.pointer_to_int64 p) in
@@ -2841,7 +2842,7 @@ let binding_manifest : binding list =
            match args with
            | [| Vm_value.String s |] ->
                let n = String.length s in
-               (match arena_alloc t (n + 1) 1 with
+               (match arena_alloc ~site:"string_as_ptr" t (n + 1) 1 with
                 | Error e -> Error e
                 | Ok p ->
                     let full = Bytes.make (n + 1) '\000' in
@@ -2962,7 +2963,7 @@ let binding_manifest : binding list =
                match array_raw_image elems with
                | Error e -> Error ("__intrinsic_array_as_ptr: " ^ e)
                | Ok img ->
-                   (match arena_alloc t (max 1 (Bytes.length img)) 8 with
+                   (match arena_alloc ~site:"array_as_ptr" t (max 1 (Bytes.length img)) 8 with
                     | Error e -> Error e
                     | Ok p ->
                         (match arena_store t p img with
@@ -2979,7 +2980,7 @@ let binding_manifest : binding list =
                match array_raw_image elems with
                | Error e -> Error ("__intrinsic_array_as_mut_ptr: " ^ e)
                | Ok img ->
-                   (match arena_alloc t (max 1 (Bytes.length img)) 8 with
+                   (match arena_alloc ~site:"array_as_ptr" t (max 1 (Bytes.length img)) 8 with
                     | Error e -> Error e
                     | Ok p ->
                         (match arena_store t p img with
@@ -3150,7 +3151,7 @@ let binding_manifest : binding list =
                (* the direct kernel's allocator clamps the request to 16
                   bytes and returns a 16-byte aligned block *)
                let size = if size <= 0 then 16 else size in
-               (match arena_alloc t size 16 with
+               (match arena_alloc ~site:"mem_alloc" t size 16 with
                 | Ok p -> Ok (Vm_value.RawPtr p)
                 | Error e -> Error ("__intrinsic_mem_alloc: " ^ e))
            | _ -> arg_mismatch "UInt"));
@@ -3728,7 +3729,7 @@ let binding_manifest : binding list =
                if idx < 0 || idx >= Array.length env then Ok Vm_value.Null
                else begin
                  let s = env.(idx) in
-                 match arena_alloc t (String.length s + 1) 1 with
+                 match arena_alloc ~site:"env_entry" t (String.length s + 1) 1 with
                  | Error e -> Error e
                  | Ok p ->
                      let b = Bytes.make (String.length s + 1) '\000' in

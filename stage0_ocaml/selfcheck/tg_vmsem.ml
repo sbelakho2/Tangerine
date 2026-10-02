@@ -728,7 +728,7 @@ let check_recursive_drop () =
                      Vm_value.String "s";
                      Vm_value.Tuple
                        (Vm_value.agg
-                          [| Vm_value.Ref (Vm_value.Region owned); Vm_value.RawPtr raw |]);
+                          [| Vm_value.Ref (Vm_value.Region (Vm_value.raw_region_ref owned)); Vm_value.RawPtr raw |]);
                    |])
             in
            Vm_value.drop_glue m v;
@@ -1276,7 +1276,8 @@ let main_prog (locals : Type_repr.t array) (blocks : Seed_mir.block array) :
 let int64_value (n : int64) : Vm_value.t =
   Vm_value.Int (Int_value.of_int64 ~width:64 ~signed:true n)
 
-let ref_of (p : Vm_memory.pointer) : Vm_value.t = Vm_value.Ref (Vm_value.Region p)
+let ref_of (p : Vm_memory.pointer) : Vm_value.t =
+  Vm_value.Ref (Vm_value.Region (Vm_value.raw_region_ref p))
 
 type seeded_run = {
   svm : Vm.t;
@@ -3072,7 +3073,8 @@ let dmd_types = [| dmd_enum_def; dmd_s_def |]
 let dmd_dcast (v : int) : Seed_mir.projection =
   Seed_mir.Downcast (Ids.Variant_id.make v)
 
-let dmd_ref (p : Vm_memory.pointer) : Vm_value.t = Vm_value.Ref (Vm_value.Region p)
+let dmd_ref (p : Vm_memory.pointer) : Vm_value.t =
+  Vm_value.Ref (Vm_value.Region (Vm_value.raw_region_ref p))
 
 let dmd_run (what : string) (n : int) (prog : Seed_mir.program)
     (seed : Vm.t -> Vm_value.frame -> Vm_memory.pointer array -> unit) :

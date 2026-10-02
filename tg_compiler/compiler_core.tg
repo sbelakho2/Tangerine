@@ -2534,16 +2534,66 @@ def tg_fingerprint_compose(manifest: String, version: String, path_joins: Vec[St
   tg_sha256_hex(buf)
 end
 
-# The seed-compatible fingerprint of the KERNEL closure: read the exact
-# manifest bytes, hash every listed source's exact bytes, compose in
-# manifest order.  Option::None when the manifest is absent/unreadable (a
-# non-kernel build), so the caller can emit a neutral field.
-pub def bootstrap_closure_fingerprint(root_path: String, root_source: String) -> Option[String]
+# (P0 closure snapshot, mirrors the seed's Bootstrap_manifest): the ONE
+# immutable read of the manifest-closed bootstrap closure.  Every listed
+# source is read exactly once; the dependency loader parses these bytes and
+# the proof composes its digest from these same bytes.  A source that
+# changes (or changes and is restored) while the compiler runs can no
+# longer detach closure_sha256 from what the compilation actually consumed,
+# because nothing re-opens a closure file after this snapshot.
+pub struct BootstrapClosureSource
+  pub rel: String
+  pub path_join: String
+  pub source: String
+end
+
+impl Clone for BootstrapClosureSource
+  def clone(self: Self) -> BootstrapClosureSource
+    BootstrapClosureSource {
+      rel: self.rel.clone(),
+      path_join: self.path_join.clone(),
+      source: self.source.clone()
+    }
+  end
+end
+
+pub struct BootstrapClosureSnapshot
+  pub manifest: String
+  pub version: String
+  pub sources: Vec[BootstrapClosureSource]
+end
+
+impl Clone for BootstrapClosureSnapshot
+  def clone(self: Self) -> BootstrapClosureSnapshot
+    BootstrapClosureSnapshot {
+      manifest: self.manifest.clone(),
+      version: self.version.clone(),
+      sources: self.sources.clone()
+    }
+  end
+end
+
+# Join a snapshot base directory with a repository-relative closure path.
+# The production loader uses the empty base (the repository root); tests
+# load a synthetic closure tree under build/.
+def bootstrap_snapshot_join(base: String, rel: String) -> String
+  if base.len() == 0 then
+    rel
+  else
+    base + "/" + rel
+  end
+end
+
+# Load the manifest + every listed source ONCE.  Option::None when the
+# manifest (or any listed source) is absent/unreadable: a manifest-closed
+# build fails closed, never falling back to a partial closure.
+pub def bootstrap_closure_snapshot_at(base: String) -> Option[BootstrapClosureSnapshot]
   let manifest_rel = "bootstrap/compiler_kernel.manifest"
-  if !file_exists(manifest_rel) then
+  let manifest_path = bootstrap_snapshot_join(base.clone(), manifest_rel.to_string())
+  if !file_exists(manifest_path.clone()) then
     return Option::None
   end
-  let content = match read_source_file(manifest_rel.to_string())
+  let content = match read_source_file(manifest_path)
   when Result::Ok(s) then s
   when Result::Err(_) then return Option::None
   end
@@ -2560,9 +2610,7 @@ pub def bootstrap_closure_fingerprint(root_path: String, root_source: String) ->
     end
     vi = vi + 1
   end
-  var path_joins: Vec[String] = Vec::new()
-  var rels: Vec[String] = Vec::new()
-  var sources: Vec[String] = Vec::new()
+  var sources: Vec[BootstrapClosureSource] = Vec::new()
   var li = 0
   while li < lines.len() do
     let line = lines[li].trim()
@@ -2589,27 +2637,71 @@ pub def bootstrap_closure_fingerprint(root_path: String, root_source: String) ->
             end
             si = si + 1
           end
-          # (P0-1) the ROOT entry hashes the CONSUMED snapshot bytes, not a
-          # re-read: the digest is bound to what the compilation actually
-          # parsed, so a filesystem change between parse and proof cannot
-          # detach the evidence from the root source.
-          let source = if tg_is_root_entry(root_path.clone(), rel.clone()) then
-            root_source.clone()
-          else
-            match read_source_file(rel.clone())
-            when Result::Ok(s) then s
-            when Result::Err(_) then return Option::None
-            end
+          let source_path = bootstrap_snapshot_join(base.clone(), rel.clone())
+          let source = match read_source_file(source_path)
+          when Result::Ok(s) then s
+          when Result::Err(_) then return Option::None
           end
-          path_joins.push(joined)
-          rels.push(rel)
-          sources.push(source)
+          sources.push(BootstrapClosureSource { rel: rel, path_join: joined, source: source })
         end
       end
     end
     li = li + 1
   end
-  Option::Some(tg_fingerprint_compose(content, version, path_joins, rels, sources))
+  Option::Some(BootstrapClosureSnapshot { manifest: content, version: version, sources: sources })
+end
+
+pub def bootstrap_closure_snapshot() -> Option[BootstrapClosureSnapshot]
+  bootstrap_closure_snapshot_at("".to_string())
+end
+
+# The LOOKUP the dependency loader uses: the source bytes for a rel path as
+# loaded, or None.  None is fail-closed — the loader never falls back to
+# the filesystem for a manifest-closed build.
+pub def bootstrap_closure_snapshot_lookup(snap: BootstrapClosureSnapshot, rel: String) -> Option[String]
+  var i = 0
+  while i < snap.sources.len() do
+    if snap.sources[i].rel == rel then
+      return Option::Some(snap.sources[i].source.clone())
+    end
+    i = i + 1
+  end
+  Option::None
+end
+
+# The digest of the LOADED snapshot (no file is opened here): manifest +
+# version + per entry (logical path, relative path, byte length, SHA-256),
+# composed in manifest order.  The ROOT entry hashes the caller's consumed
+# root source, exactly like the seed's fingerprint substitution.
+pub def bootstrap_closure_fingerprint_snapshot(snap: BootstrapClosureSnapshot, root_path: String, root_source: String) -> String
+  var path_joins: Vec[String] = Vec::new()
+  var rels: Vec[String] = Vec::new()
+  var sources: Vec[String] = Vec::new()
+  var i = 0
+  while i < snap.sources.len() do
+    let source = if tg_is_root_entry(root_path.clone(), snap.sources[i].rel.clone()) then
+      root_source.clone()
+    else
+      snap.sources[i].source.clone()
+    end
+    path_joins.push(snap.sources[i].path_join.clone())
+    rels.push(snap.sources[i].rel.clone())
+    sources.push(source)
+    i = i + 1
+  end
+  tg_fingerprint_compose(snap.manifest.clone(), snap.version.clone(), path_joins, rels, sources)
+end
+
+# Compatibility entry for callers that only need the current on-disk
+# digest (the linkprobe recomputation against the seed fingerprint): load
+# a fresh snapshot and compose.  The proof path never uses this — it feeds
+# the compilation's own snapshot to bootstrap_closure_fingerprint_snapshot.
+pub def bootstrap_closure_fingerprint(root_path: String, root_source: String) -> Option[String]
+  match bootstrap_closure_snapshot()
+  when Option::Some(snap) then
+    Option::Some(bootstrap_closure_fingerprint_snapshot(snap, root_path, root_source))
+  when Option::None then Option::None
+  end
 end
 
 # The ONE machine-readable preflight summary (mir + mono stops share it):
@@ -2618,19 +2710,7 @@ end
 # plus one module per DISTINCT dependency file — so a duplicated root can
 # never satisfy the preflight again.  `stop` names the exact depth the
 # summary certifies (a Mir-only image can never masquerade as a mono run).
-pub def emit_check_ok_summary(path: String, ast: Program, stop: String, root_source: String) -> Unit
-  let manifest_entries = match bootstrap_manifest_sources()
-  when Option::Some(files) then files.len()
-  when Option::None then 0
-  end
-  let closure_sha256 = if manifest_entries > 0 then
-    match bootstrap_closure_fingerprint(path.clone(), root_source)
-    when Option::Some(fp) then fp
-    when Option::None then "unavailable".to_string()
-    end
-  else
-    "".to_string()
-  end
+pub def emit_check_ok_summary(path: String, ast: Program, stop: String, manifest_entries: Int, closure_sha256: String) -> Unit
   println("TG_CHECK_OK file=" + path
     + " stop=" + stop
     + " manifest_entries=" + manifest_entries.to_string()
@@ -2756,7 +2836,25 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   else
     "".to_string()
   end
-  var ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: manifest_closed, root_path: root_dedup)
+  # (P0 closure snapshot): the manifest-closed kernel build reads the
+  # manifest + all 45 sources EXACTLY ONCE here.  The same snapshot bytes
+  # feed the dependency parse below and the proof digest at the mir/mono
+  # stops, so a file that changes (or changes and is restored) while this
+  # compiler runs cannot detach closure_sha256 from what was consumed.
+  let closure_snapshot: Option[BootstrapClosureSnapshot] = if manifest_closed then
+    bootstrap_closure_snapshot()
+  else
+    Option::None
+  end
+  var manifest_entries = 0
+  var closure_digest = "".to_string()
+  match closure_snapshot.clone()
+  when Option::Some(snap) then
+    manifest_entries = snap.sources.len()
+    closure_digest = bootstrap_closure_fingerprint_snapshot(snap, path.clone(), source.clone())
+  when Option::None then ()
+  end
+  var ast = match merge_imported_deps_snapshot(ast_with_prelude, manifest_closed, root_dedup, closure_snapshot)
   when Result::Ok(a) then a
   when Result::Err(e) then
     return Result::Err(e)
@@ -2936,7 +3034,7 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
     # bootstrap/compiler_kernel.manifest closure size.  The proof line is
     # emitted only under --bootstrap-proof.
     if opts.emit_check_summary then
-      emit_check_ok_summary(path.clone(), &ast, "mir", source.clone())
+      emit_check_ok_summary(path.clone(), &ast, "mir", manifest_entries, closure_digest.clone())
     end
     return Result::Ok(())
   end
@@ -3026,7 +3124,7 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   # this stop to cover the specialization/query/post-mono failure surface.
   if opts.stop_after == StopAfter::Mono then
     if opts.emit_check_summary then
-      emit_check_ok_summary(path.clone(), &ast, "mono", source.clone())
+      emit_check_ok_summary(path.clone(), &ast, "mono", manifest_entries, closure_digest.clone())
     end
     return Result::Ok(())
   end
@@ -3354,7 +3452,14 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
   else
     "".to_string()
   end
-  var ast = match merge_imported_deps(ast_with_prelude, include_compiler_lib: manifest_closed, root_path: root_dedup)
+  # (P0 closure snapshot): the manifest-closed compile reads the closure
+  # ONCE and parses exactly those bytes (see compile_file_core).
+  let closure_snapshot: Option[BootstrapClosureSnapshot] = if manifest_closed then
+    bootstrap_closure_snapshot()
+  else
+    Option::None
+  end
+  var ast = match merge_imported_deps_snapshot(ast_with_prelude, manifest_closed, root_dedup, closure_snapshot)
   when Result::Ok(a) then a
   when Result::Err(e) then
     println(e)
@@ -3708,6 +3813,15 @@ end
 # so a same-named declaration in a DIFFERENT file module registers its own
 # qualified entry instead of failing the root bare-name occupancy.
 pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false, root_path: String = "") -> Result[Program, String]
+  # The plain (non-snapshot) entry: user/driver builds read dependencies
+  # from the repository as before.  The manifest-closed kernel entries call
+  # merge_imported_deps_snapshot directly with the ONE loaded snapshot.
+  return merge_imported_deps_snapshot(program, include_compiler_lib, root_path, Option::None)
+end
+
+# (P0 closure snapshot): the dependency walk parses ONLY the given loaded
+# snapshot — no closure source is re-opened from the filesystem.
+def merge_imported_deps_snapshot(program: Program, include_compiler_lib: Bool, root_path: String, snapshot: Option[BootstrapClosureSnapshot]) -> Result[Program, String]
   var loaded = Set::new()
   # (P0: the root is a MEMBER of the closure, never an extra) — seed the
   # loaded set with the root source path so a manifest/prelude entry naming
@@ -3759,16 +3873,51 @@ pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false
   # the manifest must fail loudly instead of silently compiling a different
   # dependency closure than the real bootstrap.
   let preludes = if include_compiler_lib then
-    match bootstrap_manifest_sources()
-    when Option::Some(files) then files
+    # (P0 closure snapshot): the prelude list is derived from the SAME
+    # loaded snapshot as the source bytes — a manifest edited between the
+    # snapshot and this walk can neither add nor drop a closure file.  The
+    # canonical order (sorted std, then sorted compiler) is preserved, so
+    # module ids and the 45-source evidence stay identical.
+    match snapshot.clone()
+    when Option::Some(snap) then
+      var std_files: Vec[String] = Vec::new()
+      var compiler_files: Vec[String] = Vec::new()
+      var pi = 0
+      while pi < snap.sources.len() do
+        let rel = snap.sources[pi].rel.clone()
+        if rel.starts_with("std/") then
+          std_files.push(rel)
+        elsif rel.starts_with("tg_compiler/") then
+          compiler_files.push(rel)
+        end
+        pi = pi + 1
+      end
+      std_files.sort()
+      compiler_files.sort()
+      var files: Vec[String] = Vec::new()
+      var fi = 0
+      while fi < std_files.len() do
+        files.push(std_files[fi].clone())
+        fi = fi + 1
+      end
+      fi = 0
+      while fi < compiler_files.len() do
+        files.push(compiler_files[fi].clone())
+        fi = fi + 1
+      end
+      files
     when Option::None then
-      return Result::Err("self-host mode (include_compiler_lib) requires bootstrap/compiler_kernel.manifest — the bootstrap closure is manifest-defined and the prelude fallback is disabled in self-host mode")
+      match bootstrap_manifest_sources()
+      when Option::Some(files) then files
+      when Option::None then
+        return Result::Err("self-host mode (include_compiler_lib) requires bootstrap/compiler_kernel.manifest — the bootstrap closure is manifest-defined and the prelude fallback is disabled in self-host mode")
+      end
     end
   else
     prelude_files()
   end
   for prelude in preludes do
-    match collect_dep_file(prelude, &mut merged_items, &mut loaded, &mut merged_modules)
+    match collect_dep_file_snapshot(prelude, &mut merged_items, &mut loaded, &mut merged_modules, snapshot.clone())
     when Result::Ok(_) then ()
     when Result::Err(e) then
       return Result::Err(dep_error_message(e, prelude))
@@ -3779,13 +3928,13 @@ pub def merge_imported_deps(program: Program, include_compiler_lib: Bool = false
     # the minimal self-hostable module set. The full lib.tg is reserved for
     # user embedding and pulls in non-bootstrap tooling modules. This keeps the
     # bootstrap compiler closure small (bootstrap/compiler_kernel.manifest).
-    match collect_dep_file("tg_compiler/lib_kernel.tg", &mut merged_items, &mut loaded, &mut merged_modules)
+    match collect_dep_file_snapshot("tg_compiler/lib_kernel.tg", &mut merged_items, &mut loaded, &mut merged_modules, snapshot.clone())
     when Result::Ok(_) then ()
     when Result::Err(e) then
       return Result::Err(dep_error_message(e, "tg_compiler/lib_kernel.tg"))
     end
   end
-  match collect_dep_items(&program, &mut merged_items, &mut loaded, &mut merged_modules)
+  match collect_dep_items_snapshot(&program, &mut merged_items, &mut loaded, &mut merged_modules, snapshot)
   when Result::Ok(_) then ()
   when Result::Err(e) then
     return Result::Err(dep_error_message(e, "<program>"))
@@ -3876,6 +4025,11 @@ pub def dep_use_to_file(u: UseDecl) -> Option[String]
 end
 
 pub def collect_dep_items(program: Program, inout out: Vec[Item], inout loaded: Set[String], inout modules: Map[ModuleId, Module]) -> Result[Unit, DependencyError]
+  return collect_dep_items_snapshot(program, out, loaded, modules, Option::None)
+end
+
+# (P0 closure snapshot): the snapshot-aware dependency walk.
+def collect_dep_items_snapshot(program: Program, inout out: Vec[Item], inout loaded: Set[String], inout modules: Map[ModuleId, Module], snapshot: Option[BootstrapClosureSnapshot]) -> Result[Unit, DependencyError]
  # (module table construction site): this drives the recursive
   # dependency walk that merge_imported_deps's Crate consumes. Every distinct
   # dependency file yields exactly one Module (see collect_dep_file); the
@@ -3886,7 +4040,7 @@ pub def collect_dep_items(program: Program, inout out: Vec[Item], inout loaded: 
     when ItemKind::ItemUse(u) then
       match dep_use_to_file(&u)
       when Option::Some(path) then
-        match collect_dep_file(path, out, loaded, modules)
+        match collect_dep_file_snapshot(path, out, loaded, modules, snapshot.clone())
         when Result::Ok(_) then ()
         when Result::Err(e) then
           return Result::Err(e)
@@ -3920,20 +4074,39 @@ def module_path_from_file(path: String) -> Vec[String]
 end
 
 pub def collect_dep_file(path: String, inout out: Vec[Item], inout loaded: Set[String], inout modules: Map[ModuleId, Module]) -> Result[Unit, DependencyError]
+  return collect_dep_file_snapshot(path, out, loaded, modules, Option::None)
+end
+
+# (P0 closure snapshot): the snapshot-aware single-file dependency load.
+pub def collect_dep_file_snapshot(path: String, inout out: Vec[Item], inout loaded: Set[String], inout modules: Map[ModuleId, Module], snapshot: Option[BootstrapClosureSnapshot]) -> Result[Unit, DependencyError]
   if loaded.contains(&path) then
     return Result::Ok(())
   end
   loaded.insert(path.clone())
 
-  # Distinguish a legitimate empty module from a failed read. An empty string
-  # from a non-existent/unreadable file is an error, not an empty module.
-  if !file_exists(path.clone()) then
-    return Result::Err(DependencyError::Read)
-  end
-  let source = match read_source_file(path.clone())
-  when Result::Ok(s) then s
-  when Result::Err(_) then
-    return Result::Err(DependencyError::Read)
+  # (P0 closure snapshot): in the manifest-closed kernel build the source
+  # bytes come from the ONE snapshot; a path outside it fails closed and is
+  # NEVER read from the filesystem (the manifest IS the closure).  The
+  # non-snapshot path (user/driver builds) keeps the on-disk read.
+  let source = match snapshot.clone()
+  when Option::Some(snap) then
+    match bootstrap_closure_snapshot_lookup(snap, path.clone())
+    when Option::Some(s) then s
+    when Option::None then
+      return Result::Err(DependencyError::Read)
+    end
+  when Option::None then
+    # Distinguish a legitimate empty module from a failed read. An empty
+    # string from a non-existent/unreadable file is an error, not an empty
+    # module.
+    if !file_exists(path.clone()) then
+      return Result::Err(DependencyError::Read)
+    end
+    match read_source_file(path.clone())
+    when Result::Ok(s) then s
+    when Result::Err(_) then
+      return Result::Err(DependencyError::Read)
+    end
   end
 
   let tokens = tokenize(source, path.clone())
@@ -3957,7 +4130,7 @@ pub def collect_dep_file(path: String, inout out: Vec[Item], inout loaded: Set[S
 
   let dep_ast = dep_parse.program
   # Recurse into this dependency's own imports
-  match collect_dep_items(&dep_ast, out, loaded, modules)
+  match collect_dep_items_snapshot(&dep_ast, out, loaded, modules, snapshot)
   when Result::Ok(_) then ()
   when Result::Err(e) then
     return Result::Err(e)
@@ -6102,7 +6275,14 @@ pub def compile_multiple_files(opts: CompilerOptions, files: Vec[String], output
   # `var` so the canonical semantic pass below can take &mut ast.
   # compile_multiple_files synthesizes ONE program from several roots:
   # there is no single root path to seed, so no dedup applies here.
-  var ast = match merge_imported_deps(merged_ast, include_compiler_lib: manifest_closed, root_path: "")
+  # (P0 closure snapshot): a manifest-closed multi-file build parses the
+  # snapshot bytes, never a sequence of independent disk reads.
+  let closure_snapshot: Option[BootstrapClosureSnapshot] = if manifest_closed then
+    bootstrap_closure_snapshot()
+  else
+    Option::None
+  end
+  var ast = match merge_imported_deps_snapshot(merged_ast, manifest_closed, "", closure_snapshot)
   when Result::Ok(a) then a
   when Result::Err(e) then
     println(e)

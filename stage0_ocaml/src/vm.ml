@@ -55,11 +55,13 @@
       `Vm_value.Ref (Place (frame, local, projections))` — the target
       frame RECORD is captured, so reads resolve to the target place
       and writes through the ref update the target IN PLACE, even when
-      the ref crosses a call boundary.  `Ref p` whose source has a Deref
-      projection (a computed value, e.g. `&*ptr`) keeps a serialized
-      copy in a fresh region (`Ref (Region ptr)`): reads load the copy
-      back, and WRITES THROUGH IT ARE A DETERMINISTIC TRAP (no silent
-      divergence).
+      the ref crosses a call boundary.        `Ref p` whose source has a Deref
+      projection (a computed value, e.g. `&*ptr`) keeps a shared
+      snapshot of the captured value (`Ref (Region rr)` with a
+      `Captured` origin, GC-managed and marked shared): reads see the
+      snapshot, and WRITES THROUGH IT ARE A DETERMINISTIC TRAP (no
+      silent divergence).  Raw-region refs (`RawRegion`) own a simulated
+      region and free it on drop, unchanged.
 
    4. RECURSIVE DROP.  `Drop`/`Deinit` run the recursive drop glue
       (Vm_value.drop_glue) over the place's value first: aggregates are
@@ -194,7 +196,9 @@ let step_limit (vm : t) : unit =
          !Vm_value.prof_mark_calls !Vm_value.prof_mark_nodes
          !Vm_value.prof_mark_cleared dt
          !Vm_memory.prof_regions
-         (float_of_int st.Gc.live_words *. 8. /. 1048576.)
+         (float_of_int st.Gc.live_words *. 8. /. 1048576.);
+       Printf.eprintf "VM ALLOC SITES frees=%d %s\n%!" !Vm_memory.prof_frees
+         (Vm_memory.prof_alloc_sites_summary ())
    end);
   if vm.steps > vm.limits.max_steps then begin
     (if Array.length vm.step_hist > 0 then begin
@@ -642,7 +646,13 @@ and project_read (vm : t) (frame : frame) (base : Vm_value.t) (base_ty : Type_re
                  | Error e -> err_trap vm (Vm_value.slot_error_string e)
                in
                recurse tv
-           | Vm_value.Ref (Vm_value.Region ptr) -> recurse (memory_load vm ptr)
+           | Vm_value.Ref (Vm_value.Region rr) -> (
+               match rr.Vm_value.origin with
+               | Vm_value.Captured payload ->
+                   if not rr.Vm_value.rlive then
+                     err_trap vm "access to freed region: the computed-value ref was dropped"
+                   else recurse payload
+               | Vm_value.RawRegion ptr -> recurse (memory_load vm ptr))
            | Vm_value.RawPtr ptr -> recurse (memory_load_typed vm ptr deref_ty)
              | Vm_value.Struct fields when is_ptr_handle_ty vm base_ty -> (
                  (* the Ptr[T]/PtrMut[T] handle's value model: a
@@ -1423,7 +1433,7 @@ let rec eval_rvalue (vm : t) (frame : frame) (rv : Seed_mir.rvalue) : Vm_value.t
            local subplace; keep a serialized copy in a fresh region;
            writes through this ref are a deterministic trap *)
         (match read_place vm frame p with
-         | Ok v -> Vm_value.Ref (Vm_value.Region (vm_alloc_scalar vm v))
+         | Ok v -> Vm_value.Ref (Vm_value.Region (Vm_value.alloc_region_ref v))
          | Error e -> err_trap vm (Vm_value.slot_error_string e))
       else
         (* real reference: record the target (frame, root key, projections);
@@ -1660,10 +1670,6 @@ and int_cast (i : Int_value.t) (kind : Type_repr.int_kind) : Int_value.t =
 (* Allocate a region holding the serialized bytes of a value (the
    computed-value refs).  An allocation failure is a deterministic trap,
    never a silent fallback. *)
-and vm_alloc_scalar (vm : t) (v : Vm_value.t) : Vm_memory.pointer =
-  let bytes = Vm_value.serialize v in
-  vm_alloc_bytes vm bytes
-
 (* Allocate a region holding EXACTLY the given bytes (the Ref-to-pointer
    host boundary's copy-in images: the pointee's raw scalar layout when it
    has one, the self-describing serialization otherwise).  Allocation
@@ -1673,7 +1679,7 @@ and vm_alloc_bytes (vm : t) (bytes : Bytes.t) : Vm_memory.pointer =
   let size = Bytes.length bytes in
   vm.alloc_bytes <- vm.alloc_bytes + size;
   if vm.alloc_bytes > vm.limits.max_alloc_bytes then err_trap vm "allocation limit exceeded";
-  match Vm_memory.alloc vm.memory size 8 with
+  match Vm_memory.alloc ~site:"vm_alloc_bytes" vm.memory size 8 with
   | Error e -> err_trap vm ("allocation failed: " ^ Vm_memory.mem_error_string e)
   | Ok ptr -> (
       match Vm_memory.region_of vm.memory ptr with
@@ -1932,7 +1938,7 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
             let hr = call_host vm host_callee host_args in
             List.iter
               (fun (tf, p, pointee_ty, ptr, n) ->
-                match Vm_memory.load_bytes vm.memory ptr n with
+                (match Vm_memory.load_bytes vm.memory ptr n with
                 | Error _ -> ()
                 | Ok bytes ->
                     let v =
@@ -1940,7 +1946,20 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                       | Some (v, _) -> v
                       | None -> Vm_value.deserialize bytes
                     in
-                    write_place vm tf p v)
+                    write_place vm tf p v);
+                (* The bridge image is scoped to THIS host call.  Release
+                   it before the next call: the table never reused ids, so
+                   without this every host call's pointee image stayed
+                   strongly reachable for the whole run (the self-host
+                   preflight allocated 10M+ bridge regions and ~7 GB of
+                   live heap, then stalled in a major-GC cycle).  The
+                   cumulative allocation budget still bounds a runaway. *)
+                match Vm_memory.free vm.memory ptr with
+                | Ok () -> ()
+                | Error e ->
+                    err_trap vm
+                      ("ref bridge region free failed: "
+                      ^ Vm_memory.mem_error_string e))
               (List.rev !ref_bridge);
         (* re-audit P0-3: the writeback application runs the
            ownership-explicit host_result in the audit's ORDER — (1)

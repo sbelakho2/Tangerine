@@ -140,13 +140,28 @@ and set_store = {
      Local | Static root convention), so a `&STATIC` reference reaches
      the global slot.  Reads resolve to the target place and writes
      through a RefMut resolve to it and write there;
-   - `Region p` — a computed-value reference (the source had no place,
-     e.g. `&*ptr`): the value is kept as a copy in a fresh region; reads
-     load the serialized copy back, and WRITES THROUGH IT ARE A
-     DETERMINISTIC TRAP (no silent divergence). *)
+   - `Region rr` — a computed-value reference (the source had no place,
+     e.g. `&*ptr`): the capture keeps a SNAPSHOT of the value; reads see
+     the snapshot and WRITES THROUGH IT ARE A DETERMINISTIC TRAP (no
+     silent divergence).  The snapshot has two origins: a VM capture
+     holds the captured value ITSELF (marked shared, GC-managed — the
+     old serialized region copy pinned gigabytes in the zero-debt
+     self-host preflight), while a raw-region reference (the seed's
+     dynamic-memory lane) owns a simulated raw region exactly as
+     before. *)
 and ref_target =
   | Place of frame * int * Seed_mir.projection list
-  | Region of Vm_memory.pointer
+  | Region of region_ref
+
+and region_ref = {
+  rid : int;  (* Captured identity for eq/hash/wire round-trips *)
+  origin : region_origin;
+  mutable rlive : bool;  (* ownership flag: cleared exactly once by drop *)
+}
+
+and region_origin =
+  | Captured of t  (* VM capture: the shared, marked-shared snapshot *)
+  | RawRegion of Vm_memory.pointer  (* owned raw region (tests/dyn-mem) *)
 
 (* An execution frame identity.  A real reference records the target
    frame RECORD (not a name): the record lives as long as any value
@@ -277,6 +292,30 @@ and mark_agg (a : agg) : unit =
 let arr_mark_shared_value (v : t) : unit =
   incr prof_mark_calls;
   mark_value_shared v
+
+(* Capture a computed-value snapshot: mark the captured value shared (its
+   array cells can no longer be written in place through any holder — a
+   write forks), and return the owning handle.  The value itself is the
+   snapshot, so the OCaml GC reclaims it when the ref becomes
+   unreachable: nothing sits in a side table pinning bytes, and no
+   serialize/deserialize round-trip copies a potentially huge pointee
+   (the old region copy grew the self-host preflight's live heap to
+   gigabytes and stalled the major GC). *)
+let next_region_ref_id = ref 0
+
+let alloc_region_ref (payload : t) : region_ref =
+  mark_value_shared payload;
+  let rid = !next_region_ref_id in
+  incr next_region_ref_id;
+  { rid; origin = Captured payload; rlive = true }
+
+(* A reference that OWNS a simulated raw region (the seed's
+   dynamic-memory lane): dropping it frees the region exactly once, as
+   before. *)
+let raw_region_ref (p : Vm_memory.pointer) : region_ref =
+  let rid = !next_region_ref_id in
+  incr next_region_ref_id;
+  { rid; origin = RawRegion p; rlive = true }
 
 let arr_mark_shared (a : arr) : unit = arr_mark_shared_value (Array a)
 
@@ -483,8 +522,13 @@ let rec equal (a : t) (b : t) : bool =
       match a, b with
       | Place (f1, l1, p1), Place (f2, l2, p2) ->
           f1 == f2 && l1 = l2 && p1 = p2
-      | Region p1, Region p2 ->
-          p1.Vm_memory.region = p2.Vm_memory.region && p1.Vm_memory.offset = p2.Vm_memory.offset
+      | Region p1, Region p2 -> (
+          match p1.origin, p2.origin with
+          | Captured _, Captured _ -> p1.rid = p2.rid
+          | RawRegion a, RawRegion b ->
+              a.Vm_memory.region = b.Vm_memory.region
+              && a.Vm_memory.offset = b.Vm_memory.offset
+          | _ -> false)
       | _ -> false)
   | Null, Null -> true
   | _ -> false
@@ -495,10 +539,11 @@ let rec equal (a : t) (b : t) : bool =
    hash b (a hash collision is fine, a miss is not).  Every constructor
    mirrors equal's comparison key: Int hashes the canonical bits (the
    Int_value invariant already sign/zero-extends width <= 64), Float
-   hashes the compared bit pattern, RawPtr/Ref(Region) hash only the
-   (region, offset) pair equal compares, and the physical-equality /
-   never-equal shapes (Ref(Place), Function, Closure, Set, Map) hash to
-   a constant — equal never holds for them, so a constant is exact. *)
+   hashes the compared bit pattern, RawPtr/RawRegion refs hash only the
+   (region, offset) pair equal compares, Captured refs hash their rid,
+   and the physical-equality / never-equal shapes (Ref(Place), Function,
+   Closure, Set, Map) hash to a constant — equal never holds for them,
+   so a constant is exact. *)
 let mix (a : int) (b : int) : int =
   let a = a * 0x9E3779B1 in
   (a lxor b) land 0x3FFFFFFF
@@ -516,7 +561,10 @@ let rec value_hash (v : t) : int =
   | Array elems -> mix 17 (arr_hash elems)
   | Enum (tag, payload) -> mix 19 (mix tag (array_hash (agg_to_array payload)))
   | RawPtr p -> mix 29 (mix p.Vm_memory.region p.Vm_memory.offset)
-  | Ref (Region p) -> mix 31 (mix p.Vm_memory.region p.Vm_memory.offset)
+  | Ref (Region rr) -> (
+      match rr.origin with
+      | Captured _ -> mix 31 (mix 37 rr.rid)
+      | RawRegion p -> mix 31 (mix p.Vm_memory.region p.Vm_memory.offset))
   | Null -> 41
   | MovedOut -> 43
   | Ref (Place _) | Function _ | Closure _ | Set _ | Map _ -> 47
@@ -799,7 +847,11 @@ let set_drain_one (s : set_store) : (t option * set_store) =
      Enum               0B + 8-byte LE variant tag + 8-byte LE count
                             + elements
      RawPtr             0C + 8-byte LE region + 8-byte LE offset
-     Ref (Region p)     0D + 8-byte LE region + 8-byte LE offset
+     Ref (Region rr)    0D + 1-byte origin
+                           Captured:  8-byte LE rid + 1-byte live
+                                      + serialized payload
+                           RawRegion: 8-byte LE region + 8-byte LE offset
+                                      + 1-byte live
 
    Function / Closure / Ref (Place _) / Null are not serializable (a
    deterministic trap; they are execution-context values). *)
@@ -874,10 +926,19 @@ let rec serialize_value (buf : Buffer.t) (v : t) : unit =
       Buffer.add_char buf (Char.chr 0x0C);
       put_u64 buf (Int64.of_int p.Vm_memory.region);
       put_u64 buf (Int64.of_int p.Vm_memory.offset)
-  | Ref (Region p) ->
+  | Ref (Region rr) -> (
       Buffer.add_char buf (Char.chr 0x0D);
-      put_u64 buf (Int64.of_int p.Vm_memory.region);
-      put_u64 buf (Int64.of_int p.Vm_memory.offset)
+      match rr.origin with
+      | Captured payload ->
+          Buffer.add_char buf (Char.chr 0);
+          put_u64 buf (Int64.of_int rr.rid);
+          Buffer.add_char buf (if rr.rlive then Char.chr 1 else Char.chr 0);
+          serialize_value buf payload
+      | RawRegion p ->
+          Buffer.add_char buf (Char.chr 1);
+          put_u64 buf (Int64.of_int p.Vm_memory.region);
+          put_u64 buf (Int64.of_int p.Vm_memory.offset);
+          Buffer.add_char buf (if rr.rlive then Char.chr 1 else Char.chr 0))
   | Ref (Place _) | Function _ | Closure _ | Null | MovedOut ->
       failwith
         "vm serialization: value is not serializable (ref to a place / function / closure / null / moved-out hole)"
@@ -956,10 +1017,27 @@ let rec deserialize_value (c : cursor) : t =
       let region = cursor_count c in
       let offset = cursor_count c in
       RawPtr { Vm_memory.region; offset }
-  | 0x0D ->
-      let region = cursor_count c in
-      let offset = cursor_count c in
-      Ref (Region { Vm_memory.region; offset })
+  | 0x0D -> (
+      let origin_tag = cursor_u8 c in
+      if origin_tag = 0 then begin
+        let rid = cursor_count c in
+        let live = cursor_u8 c <> 0 in
+        let payload = deserialize_value c in
+        Ref (Region { rid; origin = Captured payload; rlive = live })
+      end
+      else if origin_tag = 1 then begin
+        let region = cursor_count c in
+        let offset = cursor_count c in
+        let live = cursor_u8 c <> 0 in
+        Ref
+          (Region
+             {
+               rid = -1;
+               origin = RawRegion { Vm_memory.region; offset };
+               rlive = live;
+             })
+      end
+      else failwith "vm serialization: unknown ref origin")
   | 0x0E ->
       let rec elems acc n =
         if n = 0 then List.rev acc
@@ -1002,10 +1080,19 @@ let rec drop_glue (m : Vm_memory.t) (v : t) : unit =
   | Map store ->
       List.iter (fun (k, v) -> drop_glue m k; drop_glue m v) (map_pairs store)
   | Enum (_, payload) -> agg_iter (drop_glue m) payload
-  | Ref (Region p) -> (
-      match Vm_memory.free m p with
-      | Ok () -> ()
-      | Error e -> failwith ("vm drop glue: " ^ Vm_memory.mem_error_string e))
+  | Ref (Region rr) ->
+      if not rr.rlive then
+        failwith
+          "vm drop glue: access to freed region (double drop of a computed-value ref)"
+      else begin
+        (match rr.origin with
+        | Captured _ -> ()
+        | RawRegion p -> (
+            match Vm_memory.free m p with
+            | Ok () -> ()
+            | Error e -> failwith ("vm drop glue: " ^ Vm_memory.mem_error_string e)));
+        rr.rlive <- false
+      end
   | Unit | Bool _ | Int _ | Float32 _ | Float64 _ | Char _ | String _
   | Function _ | Closure _ | RawPtr _ | Ref (Place _) | Null | MovedOut ->
       ()
