@@ -200,13 +200,36 @@ let runner_for ~target_str =
     "rosetta"
   else "unavailable"
 
-let elf_magic_ok path =
+(* ELF structural validation with the SAME semantics as the shell gate
+   (audit): ELF64, little-endian, ET_EXEC/ET_DYN, and the TARGET machine
+   (62 x86-64 / 183 AArch64).  When execution is unavailable the
+   structural proof must become STRONGER, never weaker. *)
+let elf_header_ok ~(want_machine : int) path =
   let s = read_file path in
-  String.length s >= 4
-  && Char.code s.[0] = 0x7f
-  && s.[1] = 'E'
-  && s.[2] = 'L'
-  && s.[3] = 'F'
+  let n = String.length s in
+  if n < 20 then false
+  else
+    let b i = Char.code s.[i] in
+    let etype = b 16 lor (b 17 lsl 8) in
+    let machine = b 18 lor (b 19 lsl 8) in
+    b 0 = 0x7f && b 1 = 0x45 && b 2 = 0x4c && b 3 = 0x46
+    && b 4 = 2 (* ELFCLASS64 *)
+    && b 5 = 1 (* ELFDATA2LSB *)
+    && b 6 = 1
+    && (etype = 2 || etype = 3)
+    && machine = want_machine
+
+(* Mach-O 64-bit structural validation: magic AND the TARGET cputype. *)
+let macho_header_ok ~(want_cpu : int) path =
+  let s = read_file path in
+  if String.length s < 8 then false
+  else
+    let b i = Char.code s.[i] in
+    let magic = b 0 lor (b 1 lsl 8) lor (b 2 lsl 16) lor (b 3 lsl 24) in
+    let cpu =
+      b 4 lor (b 5 lsl 8) lor (b 6 lsl 16) lor (b 7 lsl 24)
+    in
+    magic = 0xFEEDFACF && cpu = want_cpu
 
 let () =
   let args = Array.to_list Sys.argv in
@@ -314,11 +337,22 @@ let () =
            NO libc-import artifact is expected here);
          - Mach-O: no undefined __intrinsic_*/_size_of/_align_of symbols
            and the dyld-import artifact must exist. *)
+      let target_machine =
+        if target_arch_of target_str = "x86_64" then 62 else 183
+      in
+      let target_cpu =
+        if target_arch_of target_str = "x86_64" then 0x01000007 else 0x0100000C
+      in
       if target_is_linux then begin
-        if not (elf_magic_ok out_path) then
-          fail "the produced artifact is not an ELF image (target %s)" target_str
+        if not (elf_header_ok ~want_machine:target_machine out_path) then
+          fail
+            "the produced artifact is not a valid ELF64 little-endian executable for machine %d (target %s)"
+            target_machine target_str
       end
       else begin
+        if not (macho_header_ok ~want_cpu:target_cpu out_path) then
+          fail "the produced artifact is not a Mach-O 64-bit image for the target CPU (target %s)"
+            target_str;
         let leftover = macho_undefined_intrinsics out_path in
         if leftover <> [] then
           fail
@@ -385,26 +419,26 @@ let () =
             "the %s artifact did not print the expected marker %S — the embedded parse-boundary checks did not all hold"
             label marker
       in
-      let execution_evidence =
-        if runner = "unavailable" then begin
-          Printf.printf
-            "tg_linkprobe: execution=unavailable for target %s on this host; the structural (format + linker-contract) proof is authoritative for this run\n"
-            target_str;
-          "unavailable(structural-proof=pass)"
-        end
-        else begin
-          if mode = "full" then
-            execute ~marker:"LINKPROBE_ARTIFACT_OK" "probe" out_path
-          else execute "probe" out_path;
-          if mode = "linkobj" && not target_is_linux then
-            execute "libc-import" (Filename.concat repo_root "build/linkprobe_libc.out");
-          "performed"
-        end
-      in
-      Printf.printf
-        "tg_linkprobe: PASS — target=%s format=%s execution=%s kernel %s path produced a validated executable; the artifact ran natively with exit 42%s (cache_hit=%b, %.1fs)\n"
-        target_str format execution_evidence
-        (if mode = "linkobj" then "link_executable" else "compile-to-executable")
-        (if mode = "linkobj" && not target_is_linux then " (libc-import artifact included)" else "")
-        run.Driver.bvr_cache_hit dt;
+      (* Two distinct evidence forms (audit): never claim a native run
+         when only the structural proof was available. *)
+      if runner = "unavailable" then begin
+        Printf.printf
+          "tg_linkprobe: PASS — target=%s format=%s execution=unavailable structural-proof=pass kernel %s path produced a structurally validated executable (format header + linker contract); execution was NOT attempted on this host (cache_hit=%b, %.1fs)\n"
+          target_str format
+          (if mode = "linkobj" then "link_executable" else "compile-to-executable")
+          run.Driver.bvr_cache_hit dt
+      end
+      else begin
+        if mode = "full" then
+          execute ~marker:"LINKPROBE_ARTIFACT_OK" "probe" out_path
+        else execute "probe" out_path;
+        if mode = "linkobj" && not target_is_linux then
+          execute "libc-import" (Filename.concat repo_root "build/linkprobe_libc.out");
+        Printf.printf
+          "tg_linkprobe: PASS — target=%s format=%s execution=performed exit=42 kernel %s path produced a validated executable%s (cache_hit=%b, %.1fs)\n"
+          target_str format
+          (if mode = "linkobj" then "link_executable" else "compile-to-executable")
+          (if mode = "linkobj" && not target_is_linux then " (libc-import artifact included)" else "")
+          run.Driver.bvr_cache_hit dt
+      end;
       Selfcheck_sentinel.emit_and_exit "tg_linkprobe"

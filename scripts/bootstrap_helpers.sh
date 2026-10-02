@@ -1521,6 +1521,8 @@ run_target_lane_canaries() {
   # exercised EXPLICITLY, with route evidence, on x86-64 targets.
   if [ "$target_arch" = "x86_64" ]; then
     local alloc_src="tests/canary/canary_pos_x64_regs_spill_calls.tg"
+    # Route-specific evidence counts as its own test in the lane totals.
+    total=$((total + 1))
     if [ -f "$alloc_src" ]; then
       local alloc_bin="$outdir/.lane_${target_arch}_allocator_direct"
       if "$compiler" compile "$alloc_src" -o "$alloc_bin" --target "$triple" \

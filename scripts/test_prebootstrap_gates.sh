@@ -269,17 +269,41 @@ check_pin "linkprobe manifest load fails closed" stage0_ocaml/selfcheck/tg_linkp
 check_pin "linkprobe is target/format aware" stage0_ocaml/selfcheck/tg_linkprobe.ml   'target_is_linux'
 check_pin "parity harness inherits the bootstrap target" stage0_ocaml/selfcheck/tg_resolution_parity.ml   'resolved_target_str'
 check_pin "parity evidence names the requested target" stage0_ocaml/selfcheck/tg_resolution_parity.ml   'does not name the requested target'
+check_pin "gate rejects closure mutation during the run" stage0_ocaml/selfcheck/tg_bootstrap_gate.ml \
+  'closure changed while the gate ran'
+check_pin "selfcheck rejects closure mutation during the run" stage0_ocaml/selfcheck/tg_bootstrap_selfcheck.ml \
+  'closure changed while the preflight ran'
 check_pin "seed identity cannot be faked as unreadable" stage0_ocaml/src/driver.ml   'vpc_seed_identity : string option'
 check_pin "kernel parses --codegen=direct" tg_compiler/bootstrap_main.tg   '--codegen=lir requires the full driver'
 check_pin "direct allocator canary has route evidence" scripts/bootstrap_helpers.sh   'X64_ALLOCATOR_CANARY route=direct'
 
-# The mixed-architecture "tolerant" allowlist is now EMPTY: every
-# architecture-impossible register combination must fail closed.
-if [ "$(grep -c '# tolerant' "$ROOT/tg_compiler/codegen.tg" || true)" = "0" ]; then
-  pass "mixed-architecture tolerant allowlist is empty"
+# ── the mixed-architecture fail-closed validator + mutations ─────────
+# The validator checks behavior-bearing shapes case-insensitively; these
+# mutations prove it goes red for every injection class.
+if "$ROOT/scripts/check_codegen_arch_invariants.sh" >/dev/null 2>&1; then
+  pass "codegen architecture invariants (clean tree)"
 else
-  bad "mixed-architecture # tolerant branches remain in tg_compiler/codegen.tg"
+  bad "codegen architecture invariants fail on the clean tree"
 fi
+mut_base="$TMP/codegen_mut.tg"
+run_arch_mutation() { # <label> <sed-expression>
+  local label="$1" expr="$2"
+  cp "$ROOT/tg_compiler/codegen.tg" "$mut_base"
+  sed -i "$expr" "$mut_base"
+  if "$ROOT/scripts/check_codegen_arch_invariants.sh" "$mut_base" >/dev/null 2>&1; then
+    bad "arch mutation accepted: ${label}"
+  else
+    pass "arch mutation rejected: ${label}"
+  fi
+}
+run_arch_mutation "uppercase # Tolerance comment" \
+  's/# MOV reg, reg/# Tolerance: PhysReg variant mismatch/'
+run_arch_mutation "permissive phys_reg_as_a64 helper" \
+  's/^def emit_mov_ri/def phys_reg_as_a64(r: PhysReg) -> A64\n  match r\n  when PhysReg::A64Reg(a) then a\n  when PhysReg::X64Reg(_) then A64::X0\n  end\nend\n\ndef emit_mov_ri/'
+run_arch_mutation "silent mixed-architecture mov arm" \
+  's/panic("codegen ICE: mixed-architecture registers in emit_mov_rr")/()/g'
+run_arch_mutation "silent architecture-mismatch arm" \
+  's/when PhysReg::A64Reg(_) then panic("codegen ICE: mixed-architecture registers in emit_mov_rr")/when PhysReg::A64Reg(_) then ()/'
 
 if [ "$fail" -ne 0 ]; then
   echo "test_prebootstrap_gates: FAIL"

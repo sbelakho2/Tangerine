@@ -211,10 +211,22 @@ let () =
                      process the exact seed closure bytes"
                     fp manifest_fingerprint
               | None -> fail "kernel summary has no closure_sha256= field: %s" row);
+              (* (audit P1-6 hardening) closure stability across the run:
+                 a concurrent source mutation would make the kernel's
+                 dependency re-reads describe different bytes than the
+                 seed fingerprint the harness compares against. *)
+              (match manifest_authority ~repo_root with
+              | count_after, fingerprint_after
+                when count_after = manifest_count
+                     && fingerprint_after = manifest_fingerprint -> ()
+              | count_after, fingerprint_after ->
+                  fail
+                    "the closure changed while the preflight ran: manifest fingerprint %s -> %s (%d -> %d entries) — re-run on a quiescent tree"
+                    manifest_fingerprint fingerprint_after manifest_count count_after);
               Printf.printf
                 "tg_bootstrap_selfcheck: OK — kernel check exit 0 over the exact %d-source \
                  manifest closure (strict resolution; resolver 0, type 0; stop after MONO; \
-                 cache_hit=%b)\n"
+                 closure fingerprint stable across the run; cache_hit=%b)\n"
                 manifest_count run.Driver.bvr_cache_hit;
               Selfcheck_sentinel.emit_and_exit "tg_bootstrap_selfcheck")
           | [] ->

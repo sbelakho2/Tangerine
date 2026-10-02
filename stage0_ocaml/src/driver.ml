@@ -5391,7 +5391,10 @@ type vm_program_cache = {
   vpc_lang_items : Lang_items.t;
 }
 
-let vm_cache_schema_version = "1"
+(* Bump whenever the serialized cache record shape or the prepared
+   program's semantic preparation changes materially: an old marshaled
+   value must never look schema-compatible with new preparation. *)
+let vm_cache_schema_version = "2"
 
 let read_file_bytes (path : string) : string option =
   try

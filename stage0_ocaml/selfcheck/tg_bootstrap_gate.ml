@@ -655,5 +655,21 @@ let () =
           Printf.printf "  artifact removed: %s (set TG_BOOTSTRAP_KEEP_GATE_ARTIFACT=1 to retain)\n"
             gate_artifact
         end;
+        (* (audit P1-6 hardening) The kernel's closure digest is bound to
+           the consumed root bytes and re-reads the dependencies at proof
+           time.  A concurrent repository mutation during this long run
+           could therefore make the digest describe different dependency
+           bytes than the compile consumed.  Require the closure
+           fingerprint to be STABLE across the VM run: start == end means
+           no source changed while the proof was produced, so the
+           start-time snapshot the harness compared against and the
+           proof-time bytes are one and the same closure. *)
+        let count_after, fingerprint_after = manifest_authority ~repo_root in
+        if count_after <> manifest_count || fingerprint_after <> manifest_fingerprint then
+          fail
+            "the closure changed while the gate ran: manifest fingerprint %s -> %s (%d -> %d entries) — the in-VM proof may not describe the bytes on disk; re-run on a quiescent tree"
+            manifest_fingerprint fingerprint_after manifest_count count_after;
+        Printf.printf
+          "  closure fingerprint stable across the run: %s\n" manifest_fingerprint;
         Printf.printf "BOOTSTRAP GATE: PASS — full closure through every stage\n";
         Selfcheck_sentinel.emit_and_exit "tg_bootstrap_gate")
