@@ -4067,6 +4067,50 @@ let check_raw_deref_store_boundary () =
              "raw deref boundary: a scalar raw store writes through the pointer and reads back (no displaced drop attempted — the explicit unsafe boundary)"
        | _ -> fail "raw deref store: the raw memory read back did not hold 42"))
 
+(* (g2) CAPTURED-REF LIFETIME SCALE: the value-backed computed-ref
+   representation must recycle: a long capture/drop loop returns the live
+   capture count to baseline and allocates NO simulated VM region, and a
+   dropped capture traps deterministically on a second drop. *)
+let check_captured_ref_lifetime () =
+  let m = Vm_memory.create () in
+  let payload =
+    Vm_value.Tuple
+      (Vm_value.agg [| int64_value 7L; Vm_value.String "captured" |])
+  in
+  let baseline_live = !Vm_value.prof_captured_live in
+  let baseline_regions = !Vm_memory.prof_regions in
+  for _ = 1 to 100_000 do
+    let rr = Vm_value.alloc_region_ref payload in
+    Vm_value.drop_glue m (Vm_value.Ref (Vm_value.Region rr))
+  done;
+  if !Vm_value.prof_captured_live <> baseline_live then
+    fail "captured refs: live count did not return to baseline (%d -> %d)"
+      baseline_live !Vm_value.prof_captured_live
+  else
+    pass
+      "captured refs: 100k capture/drop cycles return the live count to baseline";
+  if !Vm_memory.prof_regions <> baseline_regions then
+    fail "captured refs: capture allocated %d simulated VM region(s)"
+      (!Vm_memory.prof_regions - baseline_regions)
+  else pass "captured refs: no simulated VM region allocation per capture";
+  let rr = Vm_value.alloc_region_ref payload in
+  let v = Vm_value.Ref (Vm_value.Region rr) in
+  Vm_value.drop_glue m v;
+  if rr.Vm_value.rlive then
+    fail "captured refs: drop did not clear the ownership flag"
+  else pass "captured refs: drop clears the ownership flag exactly once";
+  match
+    (try
+       Vm_value.drop_glue m v;
+       `No_trap
+     with Failure msg -> `Trap msg)
+  with
+  | `Trap msg when contains msg "freed region" ->
+      pass "captured refs: a second drop traps deterministically"
+  | `Trap msg ->
+      fail "captured refs: double drop trapped with the wrong message: %s" msg
+  | `No_trap -> fail "captured refs: double drop did not trap"
+
 let () =
   Printf.printf "Seed VM kernel-closure primitive self-check\n";
   check_dyn_index ();
@@ -4116,6 +4160,7 @@ let () =
   check_dmd_field_on_tuple_payload_trap ();
   check_dmd_moved_out_no_double_drop ();
   check_unwind_pair ();
+  check_captured_ref_lifetime ();
   if !failures = 0 then begin
     Printf.printf "ALL PASS\n";
     Selfcheck_sentinel.emit_and_exit "tg_vmsem"

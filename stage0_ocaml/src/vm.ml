@@ -94,6 +94,10 @@ type limits = {
   max_depth : int;
   max_alloc_bytes : int;
   max_host_calls : int;
+  (* Optional hard resident-set ceiling in bytes (0 = disabled).  Linux
+     /proc/self/statm based; used by profiling runs so an overgrown VM
+     fails with a diagnostic instead of OOM-killing the host. *)
+  max_rss_bytes : int;
 }
 
 (* The default resource budget.  The step ceiling has an environment
@@ -111,7 +115,13 @@ let default_limits =
     | Some s -> ( match int_of_string_opt (String.trim s) with Some n -> n | None -> 1_000_000)
     | None -> 1_000_000
   in
-  { max_steps; max_depth = 10_000; max_alloc_bytes = 1_073_741_824; max_host_calls }
+  {
+    max_steps;
+    max_depth = 10_000;
+    max_alloc_bytes = 1_073_741_824;
+    max_host_calls;
+    max_rss_bytes = 0;
+  }
 
 type t = {
   program : Seed_mir.program;
@@ -177,6 +187,21 @@ let host_prof : (string, int * float) Hashtbl.t = Hashtbl.create 256
    module load) *)
 let beacon_prev = ref (Unix.gettimeofday ())
 
+(* Resident set size from /proc/self/statm (Linux); 0 on hosts without
+   it, which disables the optional hard ceiling there. *)
+let current_rss_bytes () : int =
+  match open_in "/proc/self/statm" with
+  | exception _ -> 0
+  | ic ->
+      let line = match input_line ic with s -> s | exception _ -> "" in
+      close_in ic;
+      (match String.split_on_char ' ' line with
+      | _ :: rss :: _ -> (
+          match int_of_string_opt rss with
+          | Some pages -> pages * 4096
+          | None -> 0)
+      | _ -> 0)
+
 let step_limit (vm : t) : unit =
   vm.steps <- vm.steps + 1;
   (if Array.length vm.step_hist > 0 then begin
@@ -190,16 +215,37 @@ let step_limit (vm : t) : unit =
        let dt = now -. !beacon_prev in
        beacon_prev := now;
        Printf.eprintf
-         "VM BEACON steps=%d host=%d pushes=%d push_copies=%d set_copies=%d map_scans=%d set_scans=%d mark_calls=%d mark_nodes=%d mark_cleared=%d dt=%.1fs regions=%d live_mb=%.0f\n%!"
+         "VM BEACON steps=%d host=%d pushes=%d push_copies=%d set_copies=%d map_scans=%d set_scans=%d mark_calls=%d mark_nodes=%d mark_cleared=%d dt=%.1fs regions=%d live_mb=%.0f rss_mb=%.0f reg_live=%d reg_bytes=%.1fMB pool_mb=%.1f cap_live=%d frames=%d\n%!"
          vm.steps vm.host_calls !Vm_value.prof_pushes !Vm_value.prof_push_copies
          !Vm_value.prof_set_copies !Vm_value.prof_map_scans !Vm_value.prof_set_scans
          !Vm_value.prof_mark_calls !Vm_value.prof_mark_nodes
          !Vm_value.prof_mark_cleared dt
          !Vm_memory.prof_regions
-         (float_of_int st.Gc.live_words *. 8. /. 1048576.);
+         (float_of_int st.Gc.live_words *. 8. /. 1048576.)
+         (float_of_int (current_rss_bytes ()) /. 1048576.)
+         (!Vm_memory.prof_regions - !Vm_memory.prof_frees)
+         (float_of_int !Vm_memory.prof_live_bytes /. 1048576.)
+         (float_of_int !Vm_memory.buffer_pool_bytes /. 1048576.)
+         !Vm_value.prof_captured_live
+         (List.length vm.frames);
        Printf.eprintf "VM ALLOC SITES frees=%d %s\n%!" !Vm_memory.prof_frees
          (Vm_memory.prof_alloc_sites_summary ())
    end);
+  (* Optional hard RSS ceiling (Linux): fail with a diagnostic instead of
+     letting the host OOM-killer take the machine down. *)
+  if
+    vm.limits.max_rss_bytes > 0
+    && vm.steps > 0
+    && vm.steps mod 10_000_000 = 0
+  then begin
+    let rss = current_rss_bytes () in
+    if rss > vm.limits.max_rss_bytes then
+      raise
+        (Failure
+           (Printf.sprintf
+              "vm: RSS limit exceeded: %d MiB > %d MiB (TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB)"
+              (rss / 1_048_576) (vm.limits.max_rss_bytes / 1_048_576)))
+  end;
   if vm.steps > vm.limits.max_steps then begin
     (if Array.length vm.step_hist > 0 then begin
        let entries = Hashtbl.fold (fun k v acc -> (k, v) :: acc) host_prof [] in

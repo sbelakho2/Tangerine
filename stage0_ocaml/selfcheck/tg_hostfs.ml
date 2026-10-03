@@ -117,6 +117,37 @@ let check_normal_operation (fs : Host_fs.t) : unit =
       pass "remove_file of an in-root file works"
   | Error e -> fail "remove_file of sub/new.txt failed: %s" e)
 
+(* The RAW syscall-backed route (Host.host_open, the layer every
+   std::fs/raw-open path reaches): a resolver refusal must become an
+   errno, never a lexical repo-root join that the OS would follow through
+   the escaping symlink.  This is exactly the layer above Host_fs where
+   the previous fallback defeated containment. *)
+let check_raw_syscall_route (fs : Host_fs.t) : unit =
+  let host = Host.create ~repo_root:fs.Host_fs.repo_root ~argv:[||] () in
+  (match Host.host_open host "link" 0 0 with
+  | fd when fd >= 0 ->
+      ignore (Host.host_close_fd fd);
+      fail "raw host_open through the escaping symlink was NOT rejected (fd %d)" fd
+  | -13 ->
+      pass "raw host_open through the escaping symlink returns EACCES (no lexical fallback)"
+  | e ->
+      fail "raw host_open through the escaping symlink returned errno %d (want -13 EACCES)" e);
+  (match Host.host_open host "../secret.txt" 0 0 with
+  | fd when fd >= 0 ->
+      ignore (Host.host_close_fd fd);
+      fail "raw host_open through a lexical '..' escape was NOT rejected (fd %d)" fd
+  | -13 -> pass "raw host_open through a lexical '..' escape returns EACCES"
+  | e -> fail "raw '..' open returned errno %d (want -13 EACCES)" e);
+  (match Host.host_open host "missing.txt" 0 0 with
+  | -2 -> pass "raw host_open of a missing path returns ENOENT (errno distinction kept)"
+  | e -> fail "raw host_open of a missing path returned %d (want -2 ENOENT)" e);
+  match Host.host_open host "safe.txt" 0 0 with
+  | fd when fd >= 0 -> (
+      match Host.host_close_fd fd with
+      | 0 -> pass "raw host_open of an in-root file still succeeds"
+      | _ -> fail "raw in-root open succeeded but close failed")
+  | e -> fail "raw host_open of an in-root file failed with errno %d" e
+
 let check_cwd_participation (fs : Host_fs.t) : unit =
   (match Host_fs.write_file fs [ "sub"; "cwd_file.txt" ] "cwd-ok" with
   | Error e -> fail "cwd test setup write failed: %s" e
@@ -144,6 +175,7 @@ let () =
   let tmp, fs = build_tree () in
   let secret = Filename.concat tmp "secret.txt" in
   check_symlink_escape fs secret;
+  check_raw_syscall_route fs;
   check_normal_operation fs;
   check_cwd_participation fs;
   (try rm_rf tmp

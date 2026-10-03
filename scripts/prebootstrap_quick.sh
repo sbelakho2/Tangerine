@@ -215,12 +215,24 @@ manifest_check() {
         return 1
         ;;
     esac
+    # Segment-aware escape check: reject absolute paths, empty segments,
+    # "." and ".." segments.  A filename like `foo..bar.tg` is legal and
+    # must NOT be rejected by a substring test.
+    local seg bad_seg=0
+    local -a segs
+    IFS='/' read -r -a segs <<<"$path"
+    for seg in "${segs[@]}"; do
+      case "$seg" in
+        '' | '.' | '..') bad_seg=1 ;;
+      esac
+    done
     case "$path" in
-      *..* | /*)
-        echo "  manifest path escape: ${path}"
-        return 1
-        ;;
+      /*) bad_seg=1 ;;
     esac
+    if [ "$bad_seg" -ne 0 ]; then
+      echo "  manifest path escape: ${path}"
+      return 1
+    fi
     if [ -L "$path" ]; then
       echo "  manifest entry is a symlink: ${path}"
       return 1

@@ -303,10 +303,18 @@ let arr_mark_shared_value (v : t) : unit =
    gigabytes and stalled the major GC). *)
 let next_region_ref_id = ref 0
 
+(* LIVE captured computed-value refs: incremented at capture and cleared
+   exactly once by the drop glue.  A monotonically growing value is the
+   direct signature of captured snapshots being retained instead of
+   reclaimed — the first thing to look at when the VM's live heap grows
+   with step count. *)
+let prof_captured_live = ref 0
+
 let alloc_region_ref (payload : t) : region_ref =
   mark_value_shared payload;
   let rid = !next_region_ref_id in
   incr next_region_ref_id;
+  incr prof_captured_live;
   { rid; origin = Captured payload; rlive = true }
 
 (* A reference that OWNS a simulated raw region (the seed's
@@ -1086,7 +1094,7 @@ let rec drop_glue (m : Vm_memory.t) (v : t) : unit =
           "vm drop glue: access to freed region (double drop of a computed-value ref)"
       else begin
         (match rr.origin with
-        | Captured _ -> ()
+        | Captured _ -> decr prof_captured_live
         | RawRegion p -> (
             match Vm_memory.free m p with
             | Ok () -> ()

@@ -3352,8 +3352,12 @@ type mono_outcome = {
    pre-existing VM scale problem, not a cost of the snapshot work.
    Recalibrating this cap requires a memory-bounded profiling pass and a
    fresh completing measurement -- never a blind increase and never
-   unbounded GC headroom (use a hard address-space limit when probing);
-   the default stays 30e9 so runaways still fail fast. *)
+   unbounded GC headroom; the default stays 30e9 so runaways still fail
+   fast.  The pass is now supported by the VM beacon's live telemetry
+   (rss_mb, reg_live, reg_bytes, pool_mb, cap_live, frames alongside the
+   cumulative counters) and by the optional hard ceiling
+   TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB (0 = off), which makes an overgrown
+   run fail with an RSS diagnostic instead of OOM-killing the host. *)
 (* (recalibrated bootstrap caps): the bootstrap VM budget is overridable via
    the environment so deep corpus+stdlib compiles can be given a larger
    budget without a rebuild; the defaults stay bounded, fail-fast guards. *)
@@ -3372,12 +3376,20 @@ let bootstrap_vm_max_host_calls =
 let bootstrap_vm_max_alloc_bytes =
   env_budget "TANGERINE_BOOTSTRAP_VM_MAX_ALLOC" 8_589_934_592
 
+(* Optional hard resident-set ceiling (MiB) for profiling runs.  Unset/0
+   keeps the previous behaviour; when set, an overgrown VM fails cleanly
+   with an RSS diagnostic instead of OOM-killing the host (use it with a
+   modest step budget; run 2026-10-03 OOM-crashed at ~28 GB RSS). *)
+let bootstrap_vm_max_rss_bytes =
+  env_budget "TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB" 0 * 1024 * 1024
+
 let bootstrap_vm_limits : Vm.limits =
   {
     Vm.default_limits with
     max_steps = bootstrap_vm_max_steps;
     max_host_calls = bootstrap_vm_max_host_calls;
     max_alloc_bytes = bootstrap_vm_max_alloc_bytes;
+    max_rss_bytes = bootstrap_vm_max_rss_bytes;
   }
 
 (* ── The VM-side layout fold (the TypeQuery resolution) ──────────────

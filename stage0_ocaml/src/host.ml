@@ -790,6 +790,8 @@ let errno_of_unix_error (e : Unix.error) : int =
 
 let errno_badf = 9
 let errno_fault = 14
+let errno_noent = 2
+let errno_acces = 13
 
 let host_read_into (t : t) (fd : int) (p : Vm_memory.pointer) (count : int) : int =
   if count <= 0 then 0
@@ -847,11 +849,28 @@ let host_is_darwin : bool =
    repo_root): the harness runs the kernel with the repository root as
    its working directory, so a repo-relative kernel path resolves to the
    same file while staying contained in the sandbox.  Absolute paths
-   (/dev/null, /tmp, ...) keep their OS meaning.  When virtual resolution
-   cannot produce a path (e.g. a not-yet-existing write target), the
-   lexical repo-root join is used so the OS produces the real errno. *)
-let host_real_path (t : t) (path : string) ~(for_create : bool) : string =
-  if String.length path > 0 && path.[0] = '/' then path
+   (/dev/null, /tmp, ...) keep their OS meaning.  Writes to a not-yet-
+   existing target are handled by resolve_write_target (validated parent
+   + clean final name), so there is NO lexical fallback: a resolver
+   refusal is returned as errno and the OS call is never attempted. *)
+(* Substring test without pulling in Str; used only for resolver-error
+   classification below. *)
+let string_contains (s : string) (sub : string) : bool =
+  let n = String.length s and m = String.length sub in
+  let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in
+  m = 0 || go 0
+
+(* The OS path for a guest path: absolute guest paths keep their OS
+   meaning; repository-relative paths go through the sandbox resolver
+   (lexical resolve -> realpath -> canonical-root containment).  A
+   resolver failure is an ERROR, never a lexical fallback: falling back
+   would let a symlink that escaped the repository — exactly what
+   resolve_existing/resolve_write_target reject — be opened by the OS
+   anyway, defeating the containment guarantee for every raw
+   syscall-backed operation (including std::fs). *)
+let host_real_path (t : t) (path : string) ~(for_create : bool) :
+    (string, int) result =
+  if String.length path > 0 && path.[0] = '/' then Ok path
   else
     let segs =
       String.split_on_char '/' path |> List.filter (fun s -> s <> "")
@@ -861,8 +880,12 @@ let host_real_path (t : t) (path : string) ~(for_create : bool) : string =
       else Host_fs.resolve_existing t.fs segs
     in
     match via_fs with
-    | Ok real -> real
-    | Error _ -> Filename.concat t.fs.Host_fs.repo_root path
+    | Ok real -> Ok real
+    | Error msg ->
+        (* preserve the resolver's not-found distinction; every other
+           refusal (escape, separator, permission) is EACCES *)
+        if string_contains msg "not found" then Error errno_noent
+        else Error errno_acces
 
 let open_flags_of_raw ~(guest_is_darwin : bool) (flags : int) :
     Unix.open_flag list =
@@ -891,20 +914,22 @@ let open_flags_of_raw ~(guest_is_darwin : bool) (flags : int) :
 let host_open (t : t) (path : string) (flags : int) (mode : int) : int =
   let create_bit = if t.guest_is_darwin then 0x200 else 0x40 in
   let for_create = flags land create_bit <> 0 in
-  let real = host_real_path t path ~for_create in
-  try
-    let fd =
-      register_guest_fd
-        (Unix.openfile real
-           (open_flags_of_raw ~guest_is_darwin:t.guest_is_darwin flags)
-           mode)
-    in
-    (try
-       if (Unix.stat real).Unix.st_kind = Unix.S_DIR then
-         Hashtbl.replace dir_paths fd real
-     with Unix.Unix_error _ -> ());
-    fd
-  with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e
+  match host_real_path t path ~for_create with
+  | Error e -> -e
+  | Ok real -> (
+      try
+        let fd =
+          register_guest_fd
+            (Unix.openfile real
+               (open_flags_of_raw ~guest_is_darwin:t.guest_is_darwin flags)
+               mode)
+        in
+        (try
+           if (Unix.stat real).Unix.st_kind = Unix.S_DIR then
+             Hashtbl.replace dir_paths fd real
+         with Unix.Unix_error _ -> ());
+        fd
+      with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e)
 
 let host_close_fd (fd : int) : int =
   if fd >= 0 && fd <= 2 then 0
@@ -963,11 +988,13 @@ let host_dup (fd : int) : int =
       with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e)
 
 let host_chmod (t : t) (path : string) (mode : int) : int =
-  let real = host_real_path t path ~for_create:false in
-  try
-    Unix.chmod real mode;
-    0
-  with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e
+  match host_real_path t path ~for_create:false with
+  | Error e -> -e
+  | Ok real -> (
+      try
+        Unix.chmod real mode;
+        0
+      with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e)
 
 (* ── poll(2) over the guest descriptor table ─────────────────────────
    The guest's pollfd array is a Raw arena region of 8-byte records
@@ -1131,13 +1158,15 @@ let host_stat_bytes_for (t : t) (st : Unix.LargeFile.stats) : Bytes.t =
 
 let host_stat (t : t) (path : string) (kind : [ `Stat | `Lstat ]) :
     (Unix.LargeFile.stats, int) result =
-  let real = host_real_path t path ~for_create:false in
-  try
-    Ok
-      (match kind with
-       | `Stat -> Unix.LargeFile.stat real
-       | `Lstat -> Unix.LargeFile.lstat real)
-  with Unix.Unix_error (e, _, _) -> Error (-errno_of_unix_error e)
+  match host_real_path t path ~for_create:false with
+  | Error e -> Error (-e)
+  | Ok real -> (
+      try
+        Ok
+          (match kind with
+           | `Stat -> Unix.LargeFile.stat real
+           | `Lstat -> Unix.LargeFile.lstat real)
+      with Unix.Unix_error (e, _, _) -> Error (-errno_of_unix_error e))
 
 let host_fstat (fd : int) : (Unix.LargeFile.stats, int) result =
   match guest_fd fd with
@@ -1445,10 +1474,13 @@ let host_syscall (t : t) (n : int) (args : int array) : (int, string) result =
       match path_at 0 with
       | Error e -> Error e
       | Ok path -> (
-          try
-            Unix.unlink (host_real_path t path ~for_create:false);
-            Ok 0
-          with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e)))
+          match host_real_path t path ~for_create:false with
+          | Error e -> Ok (-e)
+          | Ok real -> (
+              try
+                Unix.unlink real;
+                Ok 0
+              with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e))))
   | 12 -> (
       match path_at 0 with
       | Error e -> Error e
@@ -1487,47 +1519,64 @@ let host_syscall (t : t) (n : int) (args : int array) : (int, string) result =
       match (path_at 0, path_at 1) with
       | Error e, _ | _, Error e -> Error e
       | Ok target, Ok link -> (
-          try
-            Unix.symlink target (host_real_path t link ~for_create:true);
-            Ok 0
-          with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e)))
+          match host_real_path t link ~for_create:true with
+          | Error e -> Ok (-e)
+          | Ok real -> (
+              try
+                Unix.symlink target real;
+                Ok 0
+              with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e))))
   | 58 -> (
       match path_at 0 with
       | Error e -> Error e
       | Ok path -> (
-          try
-            let target = Unix.readlink (host_real_path t path ~for_create:false) in
-            let n = min (String.length target) (arg 2) in
-            let b = Bytes.of_string (String.sub target 0 n) in
-            match arena_store t (ptr 1) b with
-            | Ok () -> Ok n
-            | Error _ -> Ok (-errno_fault)
-          with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e)))
+          match host_real_path t path ~for_create:false with
+          | Error e -> Ok (-e)
+          | Ok real -> (
+              try
+                let target = Unix.readlink real in
+                let n = min (String.length target) (arg 2) in
+                let b = Bytes.of_string (String.sub target 0 n) in
+                match arena_store t (ptr 1) b with
+                | Ok () -> Ok n
+                | Error _ -> Ok (-errno_fault)
+              with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e))))
   | 128 -> (
       match (path_at 0, path_at 1) with
       | Error e, _ | _, Error e -> Error e
       | Ok from_, Ok to_ -> (
-          try
-            Unix.rename (host_real_path t from_ ~for_create:false)
-              (host_real_path t to_ ~for_create:true);
-            Ok 0
-          with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e)))
+          match
+            ( host_real_path t from_ ~for_create:false,
+              host_real_path t to_ ~for_create:true )
+          with
+          | Error e, _ | _, Error e -> Ok (-e)
+          | Ok real_from, Ok real_to -> (
+              try
+                Unix.rename real_from real_to;
+                Ok 0
+              with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e))))
   | 136 -> (
       match path_at 0 with
       | Error e -> Error e
       | Ok path -> (
-          try
-            Unix.mkdir (host_real_path t path ~for_create:true) (arg 1);
-            Ok 0
-          with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e)))
+          match host_real_path t path ~for_create:true with
+          | Error e -> Ok (-e)
+          | Ok real -> (
+              try
+                Unix.mkdir real (arg 1);
+                Ok 0
+              with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e))))
   | 137 -> (
       match path_at 0 with
       | Error e -> Error e
       | Ok path -> (
-          try
-            Unix.rmdir (host_real_path t path ~for_create:false);
-            Ok 0
-          with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e)))
+          match host_real_path t path ~for_create:false with
+          | Error e -> Ok (-e)
+          | Ok real -> (
+              try
+                Unix.rmdir real;
+                Ok 0
+              with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e))))
   | 189 | 190 | 191 ->
       (* fstat/lstat/stat (the kernel's SYS_*_MAC values + the codegen
          offset): fill the 160-byte stat buffer at the pointer argument *)

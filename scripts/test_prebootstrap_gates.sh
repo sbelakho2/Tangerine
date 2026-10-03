@@ -310,6 +310,17 @@ check_pin "manifest-closed snapshot is mandatory" tg_compiler/compiler_core.tg  
 check_pin "snapshot fail-closed probe exists" stage0_ocaml/selfcheck/linkprobe.tg   'bootstrap_require_closure_snapshot'
 check_pin "snapshot loader pins the closure cardinality" tg_compiler/compiler_core.tg   'bootstrap_kernel_closure_files'
 check_pin "snapshot structural-reject probe exists" stage0_ocaml/selfcheck/linkprobe.tg   'linkprobe_expect_snapshot_reject'
+
+# (P1 containment): the raw host path resolver must never fall back to an
+# unchecked lexical repo-root join after Host_fs refused the path.
+if grep -q 'Filename.concat t.fs' "$ROOT/stage0_ocaml/src/host.ml"; then
+  bad "host_real_path still falls back to a lexical path after resolver refusal"
+else
+  pass "raw host path resolution is fail-closed (no lexical fallback)"
+fi
+check_pin "raw host path refusal maps to errno" stage0_ocaml/src/host.ml   'Error errno_acces'
+check_pin "profiling runs can bound RSS" stage0_ocaml/src/vm.ml   'max_rss_bytes'
+check_pin "VM beacon reports live region/capture telemetry" stage0_ocaml/src/vm.ml   'reg_live='
 check_pin "linkprobe deletes stale outputs before the run" stage0_ocaml/selfcheck/tg_linkprobe.ml   'remove_if_exists'
 check_pin "linkprobe validates this run's nonce" stage0_ocaml/selfcheck/tg_linkprobe.ml   'linkprobe_nonce.txt'
 

@@ -97,6 +97,10 @@ type t = {
    site whose allocations outrun its frees). *)
 let prof_regions = ref 0
 let prof_frees = ref 0
+(* LIVE logical bytes across all regions (allocated size minus freed /
+   grown deltas).  Distinguishing this from the cumulative counters names
+   a retaining subsystem when it grows monotonically under the beacon. *)
+let prof_live_bytes = ref 0
 let prof_alloc_sites : (string, int ref) Hashtbl.t = Hashtbl.create 16
 
 let note_alloc (site : string) : unit =
@@ -145,6 +149,7 @@ let alloc ?(kind = Serialized) ?(site = "other") (m : t) (size : int)
     m.next_region <- m.next_region + 1;
     let region = { live = true; bytes = take_buffer size; size; alignment; kind } in
     prof_regions := !prof_regions + 1;
+    prof_live_bytes := !prof_live_bytes + size;
     note_alloc site;
     (* geometric growth: the table copy is amortized O(1) per region
        (the previous one-element append was quadratic in the region
@@ -184,6 +189,7 @@ let free (m : t) (p : pointer) : (unit, mem_error) result =
       release_buffer r.bytes;
       m.regions.(p.region) <- dead_region;
       incr prof_frees;
+      prof_live_bytes := !prof_live_bytes - r.size;
       Ok ()
     end
 
@@ -252,6 +258,7 @@ let store_bytes_grow (m : t) (p : pointer) (b : Bytes.t) : (unit, mem_error) res
           Bytes.blit r.bytes 0 grown 0 r.size;
           release_buffer r.bytes;
           r.bytes <- grown;
+          prof_live_bytes := !prof_live_bytes + (needed - r.size);
           r.size <- needed
         end;
         Bytes.blit b 0 r.bytes p.offset blen;
