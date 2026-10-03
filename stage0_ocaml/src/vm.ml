@@ -2084,7 +2084,21 @@ and call_host (vm : t) (callee : Seed_mir.callee) (args : Vm_value.t array) : Ho
            | Some (c, tt) -> (c, tt)
            | None -> (0, 0.0)
          in
-         Hashtbl.replace host_prof b.Host.name (c + 1, tt +. dt)
+         Hashtbl.replace host_prof b.Host.name (c + 1, tt +. dt);
+         (* (slow-call watchdog): name the binding and argument shapes
+            when one host call dominates wall time — the profile alone is
+            only printed at the step-limit trap. *)
+         if dt >= 5.0 then begin
+           let kinds =
+             Array.to_list
+               (Array.mapi
+                  (fun i v ->
+                    Printf.sprintf "#%d:%s" i (Host.value_kind_name v))
+                  args)
+           in
+           Printf.eprintf "HOST SLOW %.1fs %s args=[%s]\n%!" dt b.Host.name
+             (String.concat "," kinds)
+         end
        end);
       r
 

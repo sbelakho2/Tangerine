@@ -297,6 +297,19 @@ else
 fi
 check_pin "closure snapshot: dep loader consumes the snapshot" tg_compiler/compiler_core.tg   'bootstrap_closure_snapshot_lookup\(snap, path.clone\(\)\)'
 check_pin "closure snapshot: mutation probe exists" stage0_ocaml/selfcheck/linkprobe.tg   'bootstrap_closure_snapshot_at'
+
+# (P0 closure authority): a manifest-closed walk REQUIRES the one snapshot.
+# No fallback may re-read the manifest or the per-file sources.
+merge_body="$(sed -n '/^def merge_imported_deps_snapshot/,/^end$/p' "$ROOT/tg_compiler/compiler_core.tg")"
+if printf '%s\n' "$merge_body" | grep -q 'bootstrap_manifest_sources'; then
+  bad "manifest-closed merge still reads bootstrap_manifest_sources() (legacy fallback)"
+else
+  pass "manifest-closed merge has no manifest re-read fallback"
+fi
+check_pin "manifest-closed snapshot is mandatory" tg_compiler/compiler_core.tg   'bootstrap_require_closure_snapshot'
+check_pin "snapshot fail-closed probe exists" stage0_ocaml/selfcheck/linkprobe.tg   'bootstrap_require_closure_snapshot'
+check_pin "snapshot loader pins the closure cardinality" tg_compiler/compiler_core.tg   'bootstrap_kernel_closure_files'
+check_pin "snapshot structural-reject probe exists" stage0_ocaml/selfcheck/linkprobe.tg   'linkprobe_expect_snapshot_reject'
 check_pin "linkprobe deletes stale outputs before the run" stage0_ocaml/selfcheck/tg_linkprobe.ml   'remove_if_exists'
 check_pin "linkprobe validates this run's nonce" stage0_ocaml/selfcheck/tg_linkprobe.ml   'linkprobe_nonce.txt'
 
@@ -420,6 +433,42 @@ if [ "$arm_runner" = "qemu-aarch64" ]; then
   pass "aarch64 runner resolves to qemu-aarch64 (not qemu-arm64)"
 else
   bad "aarch64 runner resolved to '$arm_runner', want qemu-aarch64"
+fi
+
+# The AArch64 probe must encode `movz x8, #93` (exit), not #141: a real
+# qemu-aarch64 would reject the wrong syscall and the capability probe
+# would report UNAVAILABLE.  Decode the second instruction word.
+a64_hex="$(grep -o 'BH_QEMU_PROBE_AARCH64_HEX="[0-9a-f]*"' "$ROOT/scripts/bootstrap_helpers.sh" | head -1 | sed 's/.*="//; s/"//')"
+case "$a64_hex" in
+  *000080d2a80b80d2010000d4)
+    a64_movz_hex="${a64_hex:248:8}"  # instruction 2 of code at byte 124
+    a64_word=$((0x${a64_movz_hex:6:2}${a64_movz_hex:4:2}${a64_movz_hex:2:2}${a64_movz_hex:0:2}))
+    a64_imm=$(((a64_word >> 5) & 0xFFFF))
+    if [ "$a64_imm" -eq 93 ]; then
+      pass "AArch64 qemu probe encodes movz x8,#93 then svc #0 (imm $a64_imm)"
+    else
+      bad "AArch64 qemu probe exit syscall immediate is $a64_imm, want 93"
+    fi
+    ;;
+  *)
+    bad "AArch64 qemu probe code bytes are not movz x8,#93; svc #0"
+    ;;
+esac
+
+# Real-QEMU execution wherever the host provides qemu-aarch64: the shell
+# mock proves the selection/capability plumbing, but only the real
+# emulator proves the embedded machine code runs.  CI hosts without the
+# binary skip this leg (the mock path above still runs everywhere).
+real_qemu="$(command -v qemu-aarch64 2>/dev/null || command -v qemu-aarch64-static 2>/dev/null || true)"
+if [ -n "$real_qemu" ]; then
+  if bash -c 'source "$1"; p="$(mktemp)"; bh_write_hex_file "$BH_QEMU_PROBE_AARCH64_HEX" "$p"; chmod +x "$p"; "$2" "$p"; rc=$?; rm -f "$p"; exit $rc' \
+    _ "$ROOT/scripts/bootstrap_helpers.sh" "$real_qemu"; then
+    pass "real qemu-aarch64 executes the probe ELF to exit 0"
+  else
+    bad "real qemu-aarch64 could not execute the probe ELF (wrong syscall/encoding)"
+  fi
+else
+  pass "real qemu-aarch64 absent on this host (mock capability path only)"
 fi
 
 if [ "$fail" -ne 0 ]; then

@@ -3337,18 +3337,23 @@ type mono_outcome = {
    fast and deterministically (the guard stays a bounded resource budget,
    never an unbounded run).  Host calls keep >6x over the worst observed
    30.5e6. *)
-(* (zero-debt self-host preflight scale wall, measured 2026-10-02, x86_64
-   Linux, 45-source compiler_kernel closure): the kernel-in-VM preflight
-   (`check --bootstrap-proof --stop-after=mono tg_compiler/bootstrap_main.tg`,
-   run by tg_bootstrap_selfcheck) does NOT fit the 30e9-step default.  A
-   60e9 measurement run passed 30e9 and then entered a GC/alloc spiral (VM
-   BEACON dt climbing from ~6 s to 1277 s per 100M steps; live_mb 8.7e3,
-   regions 1.06e7), and an A/B control at 8684e13 WITHOUT the closure-
-   snapshot change shows the same wall (dt ~6 s -> ~20 s at ~7.5e3 live_mb).
-   The wall is therefore a pre-existing VM scale/GC problem in the zero-debt
-   preflight, not a cost of the snapshot work.  Recalibrating this cap
-   requires the memory/GC fix and a fresh completing measurement -- never a
-   blind increase; the default stays 30e9 so runaways still fail fast. *)
+(* (zero-debt self-host preflight scale wall, measured 2026-10-02/03,
+   x86_64 Linux, 45-source compiler_kernel closure): the kernel-in-VM
+   preflight (`check --bootstrap-proof --stop-after=mono
+   tg_compiler/bootstrap_main.tg`, run by tg_bootstrap_selfcheck) does NOT
+   fit the 30e9-step default.  Measured: region/buffer pooling plus the
+   host-call bridge lifetime fix carry the VM through the former 42.8e9
+   stall point (dt 37.5 s at that window vs a >1000 s catch-up before),
+   but the run still does not complete inside this environment's memory
+   budget.  Raising GC headroom (space_overhead=400) made it WORSE: the
+   live heap grew to 15.9e3 MB (28 GB RSS) and OOM-crashed the host, so
+   the GC-tuning wrapper was removed.  An A/B control at 8684e13 WITHOUT
+   the closure-snapshot change showed the same wall, so this is a
+   pre-existing VM scale problem, not a cost of the snapshot work.
+   Recalibrating this cap requires a memory-bounded profiling pass and a
+   fresh completing measurement -- never a blind increase and never
+   unbounded GC headroom (use a hard address-space limit when probing);
+   the default stays 30e9 so runaways still fail fast. *)
 (* (recalibrated bootstrap caps): the bootstrap VM budget is overridable via
    the environment so deep corpus+stdlib compiles can be given a larger
    budget without a rebuild; the defaults stay bounded, fail-fast guards. *)
