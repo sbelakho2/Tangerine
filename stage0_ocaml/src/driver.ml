@@ -3337,27 +3337,32 @@ type mono_outcome = {
    fast and deterministically (the guard stays a bounded resource budget,
    never an unbounded run).  Host calls keep >6x over the worst observed
    30.5e6. *)
-(* (zero-debt self-host preflight scale wall, measured 2026-10-02/03,
+(* (zero-debt self-host preflight scale wall, measured 2026-10-02/04,
    x86_64 Linux, 45-source compiler_kernel closure): the kernel-in-VM
    preflight (`check --bootstrap-proof --stop-after=mono
    tg_compiler/bootstrap_main.tg`, run by tg_bootstrap_selfcheck) does NOT
-   fit the 30e9-step default.  Measured: region/buffer pooling plus the
-   host-call bridge lifetime fix carry the VM through the former 42.8e9
-   stall point (dt 37.5 s at that window vs a >1000 s catch-up before),
-   but the run still does not complete inside this environment's memory
-   budget.  Raising GC headroom (space_overhead=400) made it WORSE: the
-   live heap grew to 15.9e3 MB (28 GB RSS) and OOM-crashed the host, so
-   the GC-tuning wrapper was removed.  An A/B control at 8684e13 WITHOUT
-   the closure-snapshot change showed the same wall, so this is a
-   pre-existing VM scale problem, not a cost of the snapshot work.
-   Recalibrating this cap requires a memory-bounded profiling pass and a
-   fresh completing measurement -- never a blind increase and never
-   unbounded GC headroom; the default stays 30e9 so runaways still fail
-   fast.  The pass is now supported by the VM beacon's live telemetry
-   (rss_mb, reg_live, reg_bytes, pool_mb, cap_live, frames alongside the
-   cumulative counters) and by the optional hard ceiling
-   TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB (0 = off), which makes an overgrown
-   run fail with an RSS diagnostic instead of OOM-killing the host. *)
+   fit the 30e9-step default.
+
+   Progress after the 2026-10-04 fixes: region/buffer pooling, host-call
+   bridge lifetime, value-backed computed refs and O(1) pure-data Map/Set
+   clones bounded the memory (RSS 3-9 GB under the 12 GB cap) and carried
+   the VM through the former 42.8e9 stall; the missing F32/F64/
+   StaticStrPtr arms in the kernel `unify` removed the 43.4e9 `vm: abort`.
+   The run then reaches ~43.5e9 and enters a QUADRATIC SHARED-MARKING zone
+   in the self-host type checker: dt degrades from ~5 s to 52-580 s per
+   100M steps with cumulative mark_nodes ~2.2e10 (arr_mark_shared_value
+   deep walks on repeatedly fetched/copied large aggregates).  It still
+   progresses, but the remaining wall is now kernel-level
+   copy/mark amplification, not VM memory, not the proof architecture and
+   not a step-cap tuning problem.
+
+   Do NOT raise GC headroom (space_overhead=400 grew the live heap to
+   15.9e3 MB / 28 GB RSS and OOM-crashed the host) and do NOT blind-raise
+   the cap; the default stays 30e9 so runaways fail fast.  The next pass
+   is kernel-side: reduce whole-aggregate copies/marks in the type
+   checker's hot paths (the beacon's mark_calls/mark_nodes deltas plus the
+   per-VM live telemetry and TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB ceiling are
+   the measurement tools). *)
 (* (recalibrated bootstrap caps): the bootstrap VM budget is overridable via
    the environment so deep corpus+stdlib compiles can be given a larger
    budget without a rebuild; the defaults stay bounded, fail-fast guards. *)
