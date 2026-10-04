@@ -259,6 +259,10 @@ let manifest : t =
     [
       ( "__intrinsic_map_new",
         sig_ ~params:[||] ~ret:(map_of (param Type_param.k) (param Type_param.v)) );
+      ( "__intrinsic_map_clone_try",
+        sig_
+          ~params:[| map_of (param Type_param.k) (param Type_param.v) |]
+          ~ret:(option_of (map_of (param Type_param.k) (param Type_param.v))) );
       ( "__intrinsic_map_get",
         sig_
           ~params:[| map_of (param Type_param.k) (param Type_param.v); param Type_param.k |]
@@ -282,6 +286,10 @@ let manifest : t =
           ~ret:(vec_of (tuple_of [| param Type_param.k; param Type_param.v |])) );
       ( "__intrinsic_set_new",
         sig_ ~params:[||] ~ret:(set_of (param Type_param.t)) );
+      ( "__intrinsic_set_clone_try",
+        sig_
+          ~params:[| set_of (param Type_param.t) |]
+          ~ret:(option_of (set_of (param Type_param.t))) );
       ( "__intrinsic_set_insert",
         sig_conv
           ~params:

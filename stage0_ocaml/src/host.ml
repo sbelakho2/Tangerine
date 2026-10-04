@@ -2239,6 +2239,18 @@ let binding_manifest : binding list =
            match args with
            | [||] -> Ok Vm_value.map_empty
            | _ -> arg_mismatch "no arguments"));
+    intrinsic_binding "__intrinsic_set_clone_try"
+      (adapter_raw (lets [ set_of p0 ]) (option_of (set_of p0))
+         (fun _ args ->
+           match args with
+           | [| Vm_value.Set store |] ->
+               if store.Vm_value.set_has_owned then
+                 Ok (Vm_value.Enum (1, Vm_value.agg [||]))
+               else
+                 Ok
+                   (Vm_value.Enum
+                      (0, Vm_value.agg [| Vm_value.Set store |]))
+           | _ -> arg_mismatch "(Set)"));
     intrinsic_binding "__intrinsic_set_contains"
       (adapter_raw (lets [ set_of p0; p0 ]) ty_bool (fun _ args ->
            (* pure read: the containment decision uses lookup_eq — a
@@ -2376,6 +2388,27 @@ let binding_manifest : binding list =
            | [| Vm_value.Map store; key |] ->
                Ok (Vm_value.Bool (Vm_value.map_mem store key))
            | _ -> arg_mismatch "(Map, key)"));
+    intrinsic_binding "__intrinsic_map_clone_try"
+      (adapter_raw (lets [ map_of p0 p1 ])
+         (option_of (map_of p0 p1)) (fun _ args ->
+           (* A PURE-DATA store may be shared: its record is immutable and
+              every update returns a NEW store, so the clone is
+              independent; marking the stored keys/values shared keeps
+              nested-array writes forking (COW), and destroy/drain are
+              resource-free.  A store carrying OWNED refs must keep the
+              deep per-entry copy (shared drops would double-free), so it
+              returns None and the std fallback clones explicitly.  This
+              turns the type checker's ResolvedNames clones from
+              deep-copy+rehash into a share + walk. *)
+           match args with
+           | [| Vm_value.Map store |] ->
+               if store.Vm_value.map_has_owned then
+                 Ok (Vm_value.Enum (1, Vm_value.agg [||]))
+               else
+                 Ok
+                   (Vm_value.Enum
+                      (0, Vm_value.agg [| Vm_value.Map store |]))
+           | _ -> arg_mismatch "(Map)"));
     intrinsic_binding "__intrinsic_map_get"
       (adapter_raw (lets [ map_of p0 p1; p0 ]) (option_of p1) (fun _ args ->
            (* pure read (surface-bound V: Copy — the returned value

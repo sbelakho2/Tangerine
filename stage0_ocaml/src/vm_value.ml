@@ -125,12 +125,20 @@ and map_store = {
   map_back : (t * t) list;             (* NEWEST first — the O(1) insert end *)
   map_index : (t * t) list Int_map.t;  (* structural hash -> bucket *)
   map_count : int;
+  (* Monotone "some stored key/value carries an owned ref": false for a
+     pure-data store, which may therefore be SHARED by Clone (the store
+     record is immutable and every update returns a new store).  Removing
+     an owned entry keeps the flag true (conservative: only ever forces
+     the deep-copy clone fallback, never unsafety). *)
+  map_has_owned : bool;
 }
 and set_store = {
   set_front : t list;                  (* OLDEST first — the drain/iteration front *)
   set_back : t list;                   (* NEWEST first — the O(1) insert end *)
   set_index : t list Int_map.t;        (* structural hash -> bucket *)
   set_count : int;
+  (* See map_store.map_has_owned. *)
+  set_has_owned : bool;
 }
 
 (* Reference targets (the audit's real-references rule):
@@ -621,10 +629,10 @@ let lookup_eq (a : t) (b : t) : bool =
 (* ── The store surface (see the store note at the type) ────────────── *)
 
 let map_empty : t =
-  Map { map_front = []; map_back = []; map_index = Int_map.empty; map_count = 0 }
+  Map { map_front = []; map_back = []; map_index = Int_map.empty; map_count = 0; map_has_owned = false }
 
 let set_empty : t =
-  Set { set_front = []; set_back = []; set_index = Int_map.empty; set_count = 0 }
+  Set { set_front = []; set_back = []; set_index = Int_map.empty; set_count = 0; set_has_owned = false }
 
 let bucket_mem_key (bucket : (t * t) list) (key : t) : (t * t) option =
   List.find_opt (fun (k, _) -> lookup_eq k key) bucket
@@ -659,6 +667,8 @@ let map_insert_entry (m : map_store) (key : t) (value : t) : t option * map_stor
           map_back = List.map replace m.map_back;
           map_index = Int_map.add h (List.map replace bucket) m.map_index;
           map_count = m.map_count;
+          map_has_owned =
+            m.map_has_owned || has_owned_ref value;
         } )
   | None ->
       let new_pair = (key, value) in
@@ -668,6 +678,8 @@ let map_insert_entry (m : map_store) (key : t) (value : t) : t option * map_stor
           map_back = new_pair :: m.map_back;
           map_index = Int_map.add h (new_pair :: bucket) m.map_index;
           map_count = m.map_count + 1;
+          map_has_owned =
+            m.map_has_owned || has_owned_ref key || has_owned_ref value;
         } )
 
 let map_insert (m : map_store) (key : t) (value : t) : map_store =
@@ -703,6 +715,7 @@ let map_remove (m : map_store) (key : t) : (t * t) option * map_store =
           map_back = List.filter drop_victim m.map_back;
           map_index = index';
           map_count = m.map_count - 1;
+          map_has_owned = m.map_has_owned;
         } )
 
 let map_len (m : map_store) : int = m.map_count
@@ -741,7 +754,7 @@ let map_drain_one (m : map_store) : (t * t) option * map_store =
       in
       (Some (k, v),
        { map_front = rest; map_back = back; map_index = index';
-         map_count = m.map_count - 1 })
+         map_count = m.map_count - 1; map_has_owned = m.map_has_owned })
 
 (* insert with the std replacement contract: an existing element is
    REPLACED by the incoming item (the caller's moved value becomes the
@@ -762,6 +775,7 @@ let set_insert_entry (s : set_store) (item : t) : bool * t option * set_store =
           set_back = List.map replace s.set_back;
           set_index = Int_map.add h (List.map replace bucket) s.set_index;
           set_count = s.set_count;
+          set_has_owned = s.set_has_owned || has_owned_ref item;
         } )
   | None ->
       ( false,
@@ -771,6 +785,7 @@ let set_insert_entry (s : set_store) (item : t) : bool * t option * set_store =
           set_back = item :: s.set_back;
           set_index = Int_map.add h (item :: bucket) s.set_index;
           set_count = s.set_count + 1;
+          set_has_owned = s.set_has_owned || has_owned_ref item;
         } )
 
 let set_insert (s : set_store) (item : t) : set_store =
@@ -802,6 +817,7 @@ let set_remove (s : set_store) (item : t) : (t option * set_store) =
               set_back = List.filter drop_victim s.set_back;
               set_index = index';
               set_count = s.set_count - 1;
+              set_has_owned = s.set_has_owned;
             } ))
 
 let set_len (s : set_store) : int = s.set_count
@@ -835,7 +851,7 @@ let set_drain_one (s : set_store) : (t option * set_store) =
       in
       (Some x,
        { set_front = rest; set_back = back; set_index = index';
-         set_count = s.set_count - 1 })
+         set_count = s.set_count - 1; set_has_owned = s.set_has_owned })
 
 (* ── Deterministic byte serialization (audit: pointer deref) ─────────
 
