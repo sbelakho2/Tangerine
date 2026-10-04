@@ -2561,6 +2561,9 @@ pub struct BootstrapClosureSnapshot
   pub manifest: String
   pub version: String
   pub sources: Vec[BootstrapClosureSource]
+  # rel -> index in `sources`: O(1) membership/source lookup for the
+  # dependency walk (45-entry linear scans per edge otherwise).
+  pub source_index: Map[String, Int]
 end
 
 impl Clone for BootstrapClosureSnapshot
@@ -2568,7 +2571,8 @@ impl Clone for BootstrapClosureSnapshot
     BootstrapClosureSnapshot {
       manifest: self.manifest.clone(),
       version: self.version.clone(),
-      sources: self.sources.clone()
+      sources: self.sources.clone(),
+      source_index: self.source_index.clone()
     }
   end
 end
@@ -2617,6 +2621,7 @@ pub def bootstrap_closure_snapshot_at(base: String) -> Option[BootstrapClosureSn
   var version = ""
   var version_seen = false
   var sources: Vec[BootstrapClosureSource] = Vec::new()
+  var source_index: Map[String, Int] = Map::new()
   var seen_logical: Vec[String] = Vec::new()
   var li = 0
   while li < lines.len() do
@@ -2704,6 +2709,7 @@ pub def bootstrap_closure_snapshot_at(base: String) -> Option[BootstrapClosureSn
       when Result::Ok(s) then s
       when Result::Err(_) then return Option::None
       end
+      let _ = source_index.insert(rel.clone(), sources.len())
       sources.push(BootstrapClosureSource { rel: rel, path_join: joined, source: source })
       end
     end
@@ -2715,7 +2721,7 @@ pub def bootstrap_closure_snapshot_at(base: String) -> Option[BootstrapClosureSn
   if sources.len() == 0 then
     return Option::None
   end
-  Option::Some(BootstrapClosureSnapshot { manifest: content, version: version, sources: sources })
+  Option::Some(BootstrapClosureSnapshot { manifest: content, version: version, sources: sources, source_index: source_index })
 end
 
 pub def bootstrap_closure_snapshot() -> Option[BootstrapClosureSnapshot]
@@ -2753,14 +2759,11 @@ end
 # loaded, or None.  None is fail-closed — the loader never falls back to
 # the filesystem for a manifest-closed build.
 pub def bootstrap_closure_snapshot_lookup(snap: BootstrapClosureSnapshot, rel: String) -> Option[String]
-  var i = 0
-  while i < snap.sources.len() do
-    if snap.sources[i].rel == rel then
-      return Option::Some(snap.sources[i].source.clone())
-    end
-    i = i + 1
+  match snap.source_index.get(rel)
+  when Option::Some(i) then
+    Option::Some(snap.sources[i].source.clone())
+  when Option::None then Option::None
   end
-  Option::None
 end
 
 # (P0 closure authority): membership in the loaded snapshot.  The
@@ -2768,14 +2771,10 @@ end
 # filesystem, so removing/creating a file after the snapshot cannot
 # change which closure member is parsed.
 pub def bootstrap_snapshot_contains(snap: BootstrapClosureSnapshot, rel: String) -> Bool
-  var i = 0
-  while i < snap.sources.len() do
-    if snap.sources[i].rel == rel then
-      return true
-    end
-    i = i + 1
+  match snap.source_index.get(rel)
+  when Option::Some(_) then true
+  when Option::None then false
   end
-  false
 end
 
 # Path-choice existence test: with a snapshot, membership only; without
@@ -2862,10 +2861,42 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
     println("[diag] compile_file_core entered, path=" + path.clone())
   end
 
-  let source = match read_source_file(path.clone())
-  when Result::Ok(s) then s
-  when Result::Err(e) then
-    return Result::Err("Failed to read file: " + path.clone() + ": " + e.message())
+  # (P0 closure authority): decide the manifest-closed mode and load the
+  # ONE immutable closure snapshot BEFORE parsing.  For a kernel-entry
+  # build the root bytes come FROM that snapshot (the manifest loader is
+  # the single physical read of every member, root included); ordinary
+  # builds read the file directly.  There is no fallback: a kernel-entry
+  # build without a usable snapshot fails closed.
+  let manifest_closed = is_kernel_entry_path(path.clone())
+  let closure_snapshot: Option[BootstrapClosureSnapshot] = if manifest_closed then
+    bootstrap_closure_snapshot()
+  else
+    Option::None
+  end
+  if manifest_closed then
+    match bootstrap_require_closure_snapshot(closure_snapshot.clone())
+    when Result::Ok(_) then ()
+    when Result::Err(e) then
+      return Result::Err(e)
+    end
+  end
+  let source = if manifest_closed then
+    match closure_snapshot.clone()
+    when Option::Some(snap) then
+      match bootstrap_closure_snapshot_lookup(snap, canonical_kernel_source_path(path.clone()))
+      when Option::Some(s) then s
+      when Option::None then
+        return Result::Err("Failed to read file: " + path.clone() + ": root source is not a member of the closure snapshot")
+      end
+    when Option::None then
+      return Result::Err("Failed to read file: " + path.clone() + ": closure snapshot unavailable")
+    end
+  else
+    match read_source_file(path.clone())
+    when Result::Ok(s) then s
+    when Result::Err(e) then
+      return Result::Err("Failed to read file: " + path.clone() + ": " + e.message())
+    end
   end
 
   if opts.verbose then
@@ -2958,11 +2989,6 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   if opts.verbose then
     println("[diag] before merge_imported_deps")
   end
-  # (closure scope): the MANIFEST-CLOSED self-host mode is keyed on the
-  # KERNEL ENTRY root (bootstrap_main.tg — the ladder build). The full
-  # tooling driver (driver.tg) is intentionally out-of-manifest and loads
-  # its imports from the repo like any other program.
-  let manifest_closed = is_kernel_entry_path(path.clone())
   # `var` so the canonical semantic pass below can take &mut ast.
   # The root dedup applies to the MANIFEST-CLOSED kernel-entry build (the
   # root is a member of the manifest closure).  A repo-closure build keeps
@@ -2972,27 +2998,6 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
     canonical_kernel_source_path(path.clone())
   else
     "".to_string()
-  end
-  # (P0 closure snapshot): the manifest-closed kernel build reads the
-  # manifest + every listed source ONCE here (the root was read once
-  # above for parsing; the snapshot's root entry is never used as a
-  # dependency, and the digest substitutes the CONSUMED root bytes, so
-  # there is still exactly one byte authority per member).  The same
-  # snapshot bytes feed the dependency parse below and the proof digest
-  # at the mir/mono stops, so a file that changes (or changes and is
-  # restored) while this compiler runs cannot detach closure_sha256 from
-  # what was consumed.
-  let closure_snapshot: Option[BootstrapClosureSnapshot] = if manifest_closed then
-    bootstrap_closure_snapshot()
-  else
-    Option::None
-  end
-  if manifest_closed then
-    match bootstrap_require_closure_snapshot(closure_snapshot.clone())
-    when Result::Ok(_) then ()
-    when Result::Err(e) then
-      return Result::Err(e)
-    end
   end
   var manifest_entries = 0
   var closure_digest = "".to_string()
@@ -3600,8 +3605,9 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
   else
     "".to_string()
   end
-  # (P0 closure snapshot): the manifest-closed compile reads the closure
-  # ONCE and parses exactly those bytes (see compile_file_core).
+  # (P0 closure snapshot): the manifest-closed compile parses the
+  # dependency closure from the loaded snapshot bytes (the root itself was
+  # read once above; see compile_file_core for the proof path).
   let closure_snapshot: Option[BootstrapClosureSnapshot] = if manifest_closed then
     bootstrap_closure_snapshot()
   else

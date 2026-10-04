@@ -853,12 +853,13 @@ let host_is_darwin : bool =
    existing target are handled by resolve_write_target (validated parent
    + clean final name), so there is NO lexical fallback: a resolver
    refusal is returned as errno and the OS call is never attempted. *)
-(* Substring test without pulling in Str; used only for resolver-error
-   classification below. *)
-let string_contains (s : string) (sub : string) : bool =
-  let n = String.length s and m = String.length sub in
-  let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in
-  m = 0 || go 0
+(* Structured resolver failure -> guest errno.  No diagnostic-string
+   parsing: the resolver's error type is the authority. *)
+let errno_of_fs_error (e : Host_fs.resolve_error) : int =
+  match e with
+  | Host_fs.Not_found -> errno_noent
+  | Host_fs.Escape | Host_fs.Escaped _ | Host_fs.Invalid_path _ -> errno_acces
+  | Host_fs.Io ue -> errno_of_unix_error ue
 
 (* The OS path for a guest path: absolute guest paths keep their OS
    meaning; repository-relative paths go through the sandbox resolver
@@ -880,11 +881,6 @@ let host_dev_facility (path : string) : bool =
       true
   | _ -> false
 
-let classify_resolve_error (msg : string) : int =
-  (* preserve the resolver's not-found distinction; every other refusal
-     (escape, separator, permission) is EACCES *)
-  if string_contains msg "not found" then errno_noent else errno_acces
-
 let host_real_path (t : t) (path : string) ~(for_create : bool) :
     (string, int) result =
   if String.length path > 0 && path.[0] = '/' then begin
@@ -894,24 +890,24 @@ let host_real_path (t : t) (path : string) ~(for_create : bool) :
         String.split_on_char '/' path |> List.filter (fun s -> s <> "")
       in
       let via_fs =
-        if for_create then Host_fs.resolve_write_target_abs t.fs segs
-        else Host_fs.resolve_existing_abs t.fs segs
+        if for_create then Host_fs.resolve_write_target_abs_e t.fs segs
+        else Host_fs.resolve_existing_abs_e t.fs segs
       in
       match via_fs with
       | Ok real -> Ok real
-      | Error msg -> Error (classify_resolve_error msg)
+      | Error e -> Error (errno_of_fs_error e)
   end
   else
     let segs =
       String.split_on_char '/' path |> List.filter (fun s -> s <> "")
     in
     let via_fs =
-      if for_create then Host_fs.resolve_write_target t.fs segs
-      else Host_fs.resolve_existing t.fs segs
+      if for_create then Host_fs.resolve_write_target_e t.fs segs
+      else Host_fs.resolve_existing_e t.fs segs
     in
     match via_fs with
     | Ok real -> Ok real
-    | Error msg -> Error (classify_resolve_error msg)
+    | Error e -> Error (errno_of_fs_error e)
 
 (* NoFollowFinal: containment is proven on the canonicalized PARENT; the
    final component is a clean lexical name that is NOT resolved, so
@@ -919,8 +915,9 @@ let host_real_path (t : t) (path : string) ~(for_create : bool) :
    entry the guest named (POSIX), never on a symlink's target. *)
 let host_real_path_no_follow (t : t) (path : string) : (string, int) result =
   let resolve_parent_fn =
-    if String.length path > 0 && path.[0] = '/' then Host_fs.resolve_parent_abs
-    else Host_fs.resolve_parent
+    if String.length path > 0 && path.[0] = '/' then
+      Host_fs.resolve_parent_abs_e
+    else Host_fs.resolve_parent_e
   in
   if String.length path > 0 && path.[0] = '/' && host_dev_facility path then Ok path
   else
@@ -947,7 +944,7 @@ let host_real_path_no_follow (t : t) (path : string) : (string, int) result =
                   else Error errno_acces
                 with Unix.Unix_error _ -> Error errno_acces)
               else Ok full)
-    | Error msg -> Error (classify_resolve_error msg)
+    | Error e -> Error (errno_of_fs_error e)
 
 let open_flags_of_raw ~(guest_is_darwin : bool) (flags : int) :
     Unix.open_flag list =

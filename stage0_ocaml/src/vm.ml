@@ -171,6 +171,12 @@ type t = {
   (* per-function step histogram (TANGERINE_DEBUG_STEPS diagnostics only;
      empty array when disabled) *)
   mutable step_hist : int array;
+  (* live-memory telemetry baselines captured at construction: the beacon
+     reports per-VM deltas, not process-global totals (several VMs in one
+     process share the underlying counters) *)
+  baseline_regions_live : int;
+  baseline_region_bytes : int;
+  baseline_captured_live : int;
 }
 
 let find_fn (vm : t) (inst : Instance_id.t) : int option =
@@ -241,10 +247,13 @@ let step_limit (vm : t) : unit =
          !Vm_memory.prof_regions
          (float_of_int st.Gc.live_words *. 8. /. 1048576.)
          (float_of_int (current_rss_bytes ()) /. 1048576.)
-         (!Vm_memory.prof_regions - !Vm_memory.prof_frees)
-         (float_of_int !Vm_memory.prof_live_bytes /. 1048576.)
+         ((!Vm_memory.prof_regions - !Vm_memory.prof_frees)
+         - vm.baseline_regions_live)
+         (float_of_int
+            (!Vm_memory.prof_live_bytes - vm.baseline_region_bytes)
+         /. 1048576.)
          (float_of_int !Vm_memory.buffer_pool_bytes /. 1048576.)
-         !Vm_value.prof_captured_live
+         (!Vm_value.prof_captured_live - vm.baseline_captured_live)
          (List.length vm.frames);
        Printf.eprintf "VM ALLOC SITES frees=%d %s\n%!" !Vm_memory.prof_frees
          (Vm_memory.prof_alloc_sites_summary ())
@@ -2521,6 +2530,10 @@ let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
              frames = [];
              depth = 0;
              trace = [];
+             baseline_regions_live =
+               !Vm_memory.prof_regions - !Vm_memory.prof_frees;
+             baseline_region_bytes = !Vm_memory.prof_live_bytes;
+             baseline_captured_live = !Vm_value.prof_captured_live;
              step_hist =
                (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
                   Array.make (Array.length program.Seed_mir.functions) 0

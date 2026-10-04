@@ -651,7 +651,7 @@ let check_mmap () =
   | Error e -> fail "mmap: %s" e);
   (* file-backed: the region carries the file's bytes at the offset, and
      the descriptor offset is unchanged (mmap never moves it) *)
-  let path = Filename.temp_file "tg_host_mmap" ".bin" in
+  let path = Filename.temp_file ~temp_dir:"." "tg_host_mmap" ".bin" in
   let oc = open_out_bin path in
   output_string oc "hello";
   close_out oc;
@@ -736,7 +736,7 @@ let parse_linux_dirents (b : Bytes.t) (n : int) : string list =
 
 let check_getdents () =
   let host = Host.create ~repo_root:"." ~argv:[||] ~guest_is_darwin:true () in
-  let dir = Filename.temp_dir "tg_host_dents" "" in
+  let dir = Filename.temp_dir ~temp_dir:"." "tg_host_dents" "" in
   let touch name =
     let oc = open_out (Filename.concat dir name) in
     output_string oc "x";
