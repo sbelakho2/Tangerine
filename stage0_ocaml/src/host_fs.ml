@@ -48,7 +48,8 @@ let sep_char : char = Filename.dir_sep.[0]
    above the root; "." is dropped; a segment containing a directory
    separator or an empty segment is rejected. Returns the root-relative
    segment list (the empty list is the root itself). *)
-let lexical_resolve (t : t) (path : string list) : (string list, string) result =
+let lexical_resolve_from (base : string list) (path : string list) :
+    (string list, string) result =
   let rec go acc = function
     | [] -> Ok (List.rev acc)
     | ".." :: rest -> (
@@ -62,7 +63,16 @@ let lexical_resolve (t : t) (path : string list) : (string list, string) result 
         else if seg = "" then Error "empty path segment"
         else go (seg :: acc) rest
   in
-  go [] (t.cwd @ path)
+  go [] (base @ path)
+
+let lexical_resolve (t : t) (path : string list) : (string list, string) result =
+  lexical_resolve_from t.cwd path
+
+(* Virtual-ABSOLUTE paths resolve from the virtual root, never the cwd;
+   ".." still cannot climb above the root. *)
+let lexical_resolve_abs (_t : t) (path : string list) :
+    (string list, string) result =
+  lexical_resolve_from [] path
 
 let join_root (t : t) (segs : string list) : string =
   List.fold_left Filename.concat t.repo_root segs
@@ -77,8 +87,9 @@ let escape_error (real : string) : string =
 
 (* Physical resolution of an EXISTING path: lexical resolve, realpath
    the joined path, enforce segment-boundary containment. *)
-let resolve_existing (t : t) (path : string list) : (string, string) result =
-  match lexical_resolve t path with
+let resolve_existing_via (resolve : string list -> (string list, string) result)
+    (t : t) (path : string list) : (string, string) result =
+  match resolve path with
   | Error e -> Error e
   | Ok segs ->
       let joined = join_root t segs in
@@ -94,10 +105,19 @@ let resolve_existing (t : t) (path : string list) : (string, string) result =
             (Printf.sprintf "cannot resolve path '%s': %s" joined
                (Unix.error_message e)))
 
+let resolve_existing (t : t) (path : string list) : (string, string) result =
+  resolve_existing_via (lexical_resolve t) t path
+
+let resolve_existing_abs (t : t) (path : string list) :
+    (string, string) result =
+  resolve_existing_via (lexical_resolve_abs t) t path
+
 (* Parent resolution for WRITES/NEW DIRECTORIES: the parent path is
    canonicalized (realpath) and containment-checked before anything is
    created beneath it. The final segment must be a single clean name. *)
-let resolve_parent (t : t) (path : string list) : (string * string, string) result =
+let resolve_parent_via
+    (resolve_existing_fn : string list -> (string, string) result)
+    (path : string list) : (string * string, string) result =
   let parent_segs, last =
     match List.rev path with
     | [] -> ([], None)
@@ -110,17 +130,27 @@ let resolve_parent (t : t) (path : string list) : (string * string, string) resu
         Error ("path segment contains a directory separator: " ^ name)
       else if name = "" then Error "empty path segment"
       else (
-        match resolve_existing t parent_segs with
+        match resolve_existing_fn parent_segs with
         | Error e -> Error e
         | Ok parent_real -> Ok (parent_real, name))
+
+let resolve_parent (t : t) (path : string list) :
+    (string * string, string) result =
+  resolve_parent_via (resolve_existing t) path
+
+let resolve_parent_abs (t : t) (path : string list) :
+    (string * string, string) result =
+  resolve_parent_via (resolve_existing_abs t) path
 
 (* Final write target: the canonicalized parent is validated by
    resolve_parent; an already-existing final component is itself
    resolved and containment-checked, so a symlink as the last segment
    cannot redirect the write outside the root. A not-yet-existing
    target is created directly under the validated parent. *)
-let resolve_write_target (t : t) (path : string list) : (string, string) result =
-  match resolve_parent t path with
+let resolve_write_target_via
+    (resolve_parent_fn : string list -> (string * string, string) result)
+    (t : t) (path : string list) : (string, string) result =
+  match resolve_parent_fn path with
   | Error e -> Error e
   | Ok (parent_real, name) ->
       let full = Filename.concat parent_real name in
@@ -139,6 +169,13 @@ let resolve_write_target (t : t) (path : string list) : (string, string) result 
               else Error (escape_error real)
             with Unix.Unix_error (e, _, _) ->
               Error (Printf.sprintf "cannot resolve path '%s': %s" full (Unix.error_message e))))
+
+let resolve_write_target (t : t) (path : string list) : (string, string) result =
+  resolve_write_target_via (resolve_parent t) t path
+
+let resolve_write_target_abs (t : t) (path : string list) :
+    (string, string) result =
+  resolve_write_target_via (resolve_parent_abs t) t path
 
 let read_file (t : t) (path : string list) : (string, string) result =
   match resolve_existing t path with

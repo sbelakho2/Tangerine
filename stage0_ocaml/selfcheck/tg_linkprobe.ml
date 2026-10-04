@@ -332,9 +332,12 @@ let () =
       Filename.concat repo_root "build/linkprobe_libc.out";
       Filename.concat snapshot_probe_root "bootstrap/compiler_kernel.manifest";
       Filename.concat snapshot_probe_root "std/probe.tg";
+      Filename.concat snapshot_probe_root "std/foo.tg";
+      Filename.concat snapshot_probe_root "std/foo/bar.tg";
     ];
   mkdir_p (Filename.concat snapshot_probe_root "bootstrap");
   mkdir_p (Filename.concat snapshot_probe_root "std");
+  mkdir_p (Filename.concat snapshot_probe_root "std/foo");
   match
     Driver.run_bootstrap_vm ~repo_root
       ~manifest_path:"bootstrap/linkprobe_mini.manifest" ~target

@@ -64,6 +64,15 @@ let build_tree () : string * Host_fs.t =
   let secret = Filename.concat tmp "secret.txt" in
   write_file secret "TOP SECRET";
   Unix.symlink secret (Filename.concat root "link");
+  (* contained symlink/entry fixtures for the no-follow sysop checks *)
+  Unix.symlink "safe.txt" (Filename.concat root "ilink");
+  Unix.symlink "safe.txt" (Filename.concat root "ilink2");
+  Unix.symlink "safe.txt" (Filename.concat root "ilink3");
+  Unix.mkdir (Filename.concat root "dir") 0o755;
+  Unix.symlink "dir" (Filename.concat root "dlink");
+  Unix.symlink secret (Filename.concat root "link_unlink");
+  Unix.mkdir (Filename.concat root "x") 0o755;
+  Unix.mkdir (Filename.concat root "y") 0o755;
   let fs = Host_fs.create ~repo_root:root in
   (tmp, fs)
 
@@ -85,6 +94,98 @@ let check_symlink_escape (fs : Host_fs.t) (secret : string) : unit =
   if In_channel.with_open_bin secret In_channel.input_all <> "TOP SECRET" then
     fail "the outside file was modified by a rejected write through the symlink";
   pass "the outside target was NOT modified by the rejected write"
+
+(* NoFollowFinal syscall semantics: open/stat follow a contained symlink;
+   lstat/readlink/unlink/rename-source/rmdir act on the named entry; an
+   escaping symlink is refused by every no-follow operation. *)
+let check_raw_symlink_semantics (fs : Host_fs.t) : unit =
+  let host = Host.create ~repo_root:fs.Host_fs.repo_root ~argv:[||] () in
+  (match Host.host_open host "ilink" 0 0 with
+  | fd when fd >= 0 ->
+      ignore (Host.host_close_fd fd);
+      pass "raw open follows a contained symlink"
+  | e -> fail "raw open of a contained symlink returned %d" e);
+  (match Host.host_stat host "ilink" `Stat with
+  | Ok st when st.Unix.LargeFile.st_kind = Unix.S_REG ->
+      pass "raw stat follows a contained symlink (regular target)"
+  | Ok _ -> fail "raw stat of a contained symlink did not report the target kind"
+  | Error e -> fail "raw stat of a contained symlink returned %d" e);
+  (match Host.host_stat host "ilink" `Lstat with
+  | Ok st when st.Unix.LargeFile.st_kind = Unix.S_LNK ->
+      pass "raw lstat does NOT follow a contained symlink"
+  | Ok _ -> fail "raw lstat did not report the symlink itself"
+  | Error e -> fail "raw lstat of a contained symlink returned %d" e);
+  (match Host.host_readlink host "ilink" with
+  | Ok "safe.txt" -> pass "raw readlink returns the link target string"
+  | Ok other -> fail "raw readlink returned %S" other
+  | Error e -> fail "raw readlink returned errno %d" e);
+  (match Host.host_unlink host "ilink2" with
+  | 0 -> pass "raw unlink removes a contained symlink entry"
+  | e -> fail "raw unlink of a contained symlink returned %d" e);
+  (match Host.host_stat host "ilink2" `Lstat with
+  | Error -2 -> pass "raw unlink removed only the directory entry"
+  | _ -> fail "raw unlink did not remove the symlink entry");
+  (match Host.host_stat host "safe.txt" `Stat with
+  | Ok st when st.Unix.LargeFile.st_kind = Unix.S_REG ->
+      pass "raw unlink left the symlink target intact"
+  | _ -> fail "raw unlink destroyed the symlink target");
+  (match Host.host_rename host "ilink3" "moved" with
+  | 0 -> pass "raw rename moves a contained symlink entry"
+  | e -> fail "raw rename of a contained symlink returned %d" e);
+  (match Host.host_stat host "moved" `Lstat with
+  | Ok st when st.Unix.LargeFile.st_kind = Unix.S_LNK ->
+      pass "raw rename moved the symlink itself"
+  | _ -> fail "raw rename did not leave a symlink at the destination");
+  (match Host.host_stat host "safe.txt" `Stat with
+  | Ok _ -> pass "raw rename left the symlink target intact"
+  | _ -> fail "raw rename destroyed the symlink target");
+  (match Host.host_rmdir host "dlink" with
+  | 0 -> fail "raw rmdir REMOVED a symlink to a directory"
+  | _ -> ());
+  (match Host.host_stat host "dir" `Lstat with
+  | Ok st when st.Unix.LargeFile.st_kind = Unix.S_DIR ->
+      pass "raw rmdir on a symlink-to-dir does not remove the target"
+  | _ -> fail "raw rmdir on a symlink-to-dir removed or damaged the target");
+  match Host.host_unlink host "link_unlink" with
+  | -13 -> pass "raw unlink refuses an escaping symlink (fail-closed)"
+  | e -> fail "raw unlink of an escaping symlink returned %d (want -13 EACCES)" e
+
+(* One namespace: absolute guest paths are VIRTUAL-ROOT absolute (the
+   same spelling getcwd returns); /dev/* is an explicit capability; the
+   host /etc is unreachable. *)
+let check_absolute_namespace (fs : Host_fs.t) : unit =
+  let host = Host.create ~repo_root:fs.Host_fs.repo_root ~argv:[||] () in
+  (match Host.host_open host "/etc/passwd" 0 0 with
+  | fd when fd >= 0 ->
+      ignore (Host.host_close_fd fd);
+      fail "absolute /etc/passwd escaped the virtual root"
+  | e -> pass "absolute /etc/passwd cannot escape the virtual root (errno %d)" e);
+  let create_bit = if Host.host_is_darwin then 0x200 else 0x40 in
+  (match Host.host_open host "/dir/abs.txt" (1 lor create_bit) 0o644 with
+  | fd when fd >= 0 ->
+      ignore (Host.host_close_fd fd);
+      pass "absolute virtual path opens/writes under the virtual root"
+  | e -> fail "absolute virtual open returned %d" e);
+  if
+    not
+      (Sys.file_exists
+         (Filename.concat fs.Host_fs.repo_root "dir/abs.txt"))
+  then fail "absolute virtual path did not land under the repo root"
+  else pass "absolute virtual path resolved to <repo>/dir/abs.txt";
+  (match Host.host_open host "/dev/null" 0 0 with
+  | fd when fd >= 0 ->
+      ignore (Host.host_close_fd fd);
+      pass "/dev/null remains an explicit host capability"
+  | e -> fail "/dev/null open returned %d" e);
+  Host_fs.set_cwd host.Host.fs [ "x" ];
+  (match Host.host_chdir host "/y" with
+  | 0 -> pass "absolute chdir resolves from the virtual root"
+  | e -> fail "absolute chdir returned %d" e);
+  if Host_fs.cwd host.Host.fs <> [ "y" ] then
+    fail "absolute chdir produced cwd [%s]"
+      (String.concat "/" (Host_fs.cwd host.Host.fs))
+  else pass "absolute chdir sets the virtual cwd to /y (not /x/y)";
+  Host_fs.set_cwd host.Host.fs []
 
 let check_normal_operation (fs : Host_fs.t) : unit =
   (match Host_fs.read_file fs [ "safe.txt" ] with
@@ -176,6 +277,8 @@ let () =
   let secret = Filename.concat tmp "secret.txt" in
   check_symlink_escape fs secret;
   check_raw_syscall_route fs;
+  check_raw_symlink_semantics fs;
+  check_absolute_namespace fs;
   check_normal_operation fs;
   check_cwd_participation fs;
   (try rm_rf tmp

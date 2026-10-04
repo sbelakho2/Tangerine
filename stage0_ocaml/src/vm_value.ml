@@ -304,10 +304,12 @@ let arr_mark_shared_value (v : t) : unit =
 let next_region_ref_id = ref 0
 
 (* LIVE captured computed-value refs: incremented at capture and cleared
-   exactly once by the drop glue.  A monotonically growing value is the
-   direct signature of captured snapshots being retained instead of
-   reclaimed — the first thing to look at when the VM's live heap grows
-   with step count. *)
+   exactly once by the drop glue.  This is a LANGUAGE-LIFETIME balance
+   counter (captures minus observed drops), not a GC-retention measure:
+   a capture that becomes OCaml-unreachable without a language drop stays
+   counted.  RSS and Gc.live_words remain the memory authority; a slowly
+   growing count means captures are escaping their drop plans.  The
+   counter is process-global (shared by every VM in the process). *)
 let prof_captured_live = ref 0
 
 let alloc_region_ref (payload : t) : region_ref =

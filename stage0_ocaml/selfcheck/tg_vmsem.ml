@@ -4111,6 +4111,38 @@ let check_captured_ref_lifetime () =
       fail "captured refs: double drop trapped with the wrong message: %s" msg
   | `No_trap -> fail "captured refs: double drop did not trap"
 
+(* (g3) RSS GUARD: the parser reads the kB unit (page-size independent),
+   and a requested ceiling is enforced from the first step — or fails
+   closed at VM construction when the host cannot measure RSS. *)
+let check_rss_guard () =
+  (match Vm.vmrss_kb_of_status_line "VmRSS:\t  1234 kB" with
+  | Some 1234 ->
+      pass "RSS parser reads VmRSS kB (page-size independent)"
+  | other ->
+      fail "RSS parser returned %s"
+        (match other with Some n -> string_of_int n | None -> "None"));
+  let prog = dyn_index_fn [| i64 |] [] Seed_mir.Ret in
+  match
+    Vm.entry_frame_of_li
+      ~limits:{ Vm.default_limits with max_rss_bytes = 1 }
+      ~lang_items:Lang_items.seed_defaults ~program:prog
+      ~entry:(entry_of prog) ~argv:[||]
+  with
+  | Error m when contains m "unavailable" ->
+      pass "RSS ceiling fails closed when the host cannot measure RSS"
+  | Error m -> fail "RSS guard: VM construction failed: %s" m
+  | Ok (vm, frame) -> (
+      match
+        (try
+           Vm.run_frame vm frame;
+           `No_trap
+         with Failure m -> `Trap m)
+      with
+      | `Trap m when contains m "RSS limit exceeded" ->
+          pass "RSS ceiling trips from the first step"
+      | `Trap m -> fail "RSS guard trapped with the wrong message: %s" m
+      | `No_trap -> fail "RSS ceiling did not trip")
+
 let () =
   Printf.printf "Seed VM kernel-closure primitive self-check\n";
   check_dyn_index ();
@@ -4161,6 +4193,7 @@ let () =
   check_dmd_moved_out_no_double_drop ();
   check_unwind_pair ();
   check_captured_ref_lifetime ();
+  check_rss_guard ();
   if !failures = 0 then begin
     Printf.printf "ALL PASS\n";
     Selfcheck_sentinel.emit_and_exit "tg_vmsem"

@@ -187,20 +187,38 @@ let host_prof : (string, int * float) Hashtbl.t = Hashtbl.create 256
    module load) *)
 let beacon_prev = ref (Unix.gettimeofday ())
 
-(* Resident set size from /proc/self/statm (Linux); 0 on hosts without
-   it, which disables the optional hard ceiling there. *)
+(* Resident set size from /proc/self/status "VmRSS: N kB" (Linux), a
+   unit independent of the host page size (statm pages would under-report
+   by 16x on 64 KiB-page AArch64 Linux).  0 means "measurement
+   unavailable": requesting a ceiling on such a host is a hard
+   configuration error (see entry_frame_of_li), never a silent no-op. *)
+let vmrss_kb_of_status_line (line : string) : int option =
+  if String.length line >= 6 && String.sub line 0 6 = "VmRSS:" then begin
+    let rest = String.trim (String.sub line 6 (String.length line - 6)) in
+    let digits =
+      match String.index_opt rest ' ' with
+      | Some i -> String.sub rest 0 i
+      | None -> rest
+    in
+    int_of_string_opt digits
+  end
+  else None
+
 let current_rss_bytes () : int =
-  match open_in "/proc/self/statm" with
+  match open_in "/proc/self/status" with
   | exception _ -> 0
   | ic ->
-      let line = match input_line ic with s -> s | exception _ -> "" in
-      close_in ic;
-      (match String.split_on_char ' ' line with
-      | _ :: rss :: _ -> (
-          match int_of_string_opt rss with
-          | Some pages -> pages * 4096
-          | None -> 0)
-      | _ -> 0)
+      let rec scan () =
+        match input_line ic with
+        | exception _ -> 0
+        | line -> (
+            match vmrss_kb_of_status_line line with
+            | Some kb -> kb * 1024
+            | None -> scan ())
+      in
+      let v = scan () in
+      close_in_noerr ic;
+      v
 
 let step_limit (vm : t) : unit =
   vm.steps <- vm.steps + 1;
@@ -236,7 +254,7 @@ let step_limit (vm : t) : unit =
   if
     vm.limits.max_rss_bytes > 0
     && vm.steps > 0
-    && vm.steps mod 10_000_000 = 0
+    && (vm.steps = 1 || vm.steps mod 1_000_000 = 0)
   then begin
     let rss = current_rss_bytes () in
     if rss > vm.limits.max_rss_bytes then
@@ -2453,6 +2471,12 @@ let statics_initial_values (program : Seed_mir.program) : Vm_value.slot array =
 let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
     ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array) :
     (t * frame, string) result =
+  (* A requested RSS ceiling must be enforceable: if the host cannot
+     measure RSS, fail closed instead of pretending the guard exists. *)
+  if limits.max_rss_bytes > 0 && current_rss_bytes () <= 0 then
+    Error
+      "RSS limit requested (TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB) but resident-set measurement is unavailable on this host"
+  else
   let fn_index = Hashtbl.create 64 in
   Array.iteri (fun i fn -> Hashtbl.replace fn_index fn.Seed_mir.instance i) program.Seed_mir.functions;
   match Hashtbl.find_opt fn_index entry with

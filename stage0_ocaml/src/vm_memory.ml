@@ -98,8 +98,11 @@ type t = {
 let prof_regions = ref 0
 let prof_frees = ref 0
 (* LIVE logical bytes across all regions (allocated size minus freed /
-   grown deltas).  Distinguishing this from the cumulative counters names
-   a retaining subsystem when it grows monotonically under the beacon. *)
+   grown deltas), and the free count below.  Process-global language/memory
+   accounting shared by every VM in the process (not per-VM): a discarded
+   VM's still-unfreed regions stay reflected.  Distinguishing live from
+   cumulative names a retaining subsystem when it grows monotonically
+   under the beacon. *)
 let prof_live_bytes = ref 0
 let prof_alloc_sites : (string, int ref) Hashtbl.t = Hashtbl.create 16
 

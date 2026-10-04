@@ -309,6 +309,33 @@ fi
 check_pin "manifest-closed snapshot is mandatory" tg_compiler/compiler_core.tg   'bootstrap_require_closure_snapshot'
 check_pin "snapshot fail-closed probe exists" stage0_ocaml/selfcheck/linkprobe.tg   'bootstrap_require_closure_snapshot'
 check_pin "snapshot loader pins the closure cardinality" tg_compiler/compiler_core.tg   'bootstrap_kernel_closure_files'
+check_pin "snapshot path choice is snapshot-authoritative" tg_compiler/compiler_core.tg   'bootstrap_dep_choose'
+
+# (P0 closure GRAPH): dependency PATH CHOICE must not probe the live
+# filesystem in a manifest-closed walk.
+dep_body="$(sed -n '/^def dep_use_to_file_snapshot/,/^end$/p' "$ROOT/tg_compiler/compiler_core.tg")"
+if printf '%s\n' "$dep_body" | grep -q 'file_exists'; then
+  bad "snapshot dependency resolution still probes the live filesystem"
+else
+  pass "snapshot dependency resolution uses snapshot membership only"
+fi
+items_body="$(sed -n '/^def collect_dep_items_snapshot/,/^end$/p' "$ROOT/tg_compiler/compiler_core.tg")"
+if printf '%s\n' "$items_body" | grep -q 'file_exists'; then
+  bad "snapshot dependency walk still probes the live filesystem"
+else
+  pass "snapshot dependency walk performs no filesystem existence query"
+fi
+
+# (P0/P1 sysops): no-follow final-component resolution and virtual-absolute
+# namespace are wired through the raw syscall layer.
+check_pin "no-follow final-component resolver exists" stage0_ocaml/src/host.ml   'host_real_path_no_follow'
+check_pin "unlink is a no-follow entry operation" stage0_ocaml/src/host.ml   'host_unlink t path)'
+check_pin "rmdir is a no-follow entry operation" stage0_ocaml/src/host.ml   'host_rmdir t path)'
+check_pin "rename is a no-follow entry operation" stage0_ocaml/src/host.ml   'host_rename t from_ to_)'
+check_pin "readlink does not follow the final link" stage0_ocaml/src/host.ml   'host_readlink t path'
+check_pin "virtual-absolute resolution exists" stage0_ocaml/src/host_fs.ml   'resolve_parent_abs'
+check_pin "absolute chdir resolves from the virtual root" stage0_ocaml/src/host.ml   'resolve_existing_abs t.fs segs'
+check_pin "RSS parser reads VmRSS kB" stage0_ocaml/src/vm.ml   'vmrss_kb_of_status_line'
 check_pin "snapshot structural-reject probe exists" stage0_ocaml/selfcheck/linkprobe.tg   'linkprobe_expect_snapshot_reject'
 
 # (P1 containment): the raw host path resolver must never fall back to an

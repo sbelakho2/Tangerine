@@ -868,9 +868,39 @@ let string_contains (s : string) (sub : string) : bool =
    resolve_existing/resolve_write_target reject — be opened by the OS
    anyway, defeating the containment guarantee for every raw
    syscall-backed operation (including std::fs). *)
+(* Host-absolute CAPABILITIES the guest may address verbatim (POSIX
+   device facilities), never a general filesystem namespace.  Every
+   other absolute guest path is a VIRTUAL-ROOT absolute path — the same
+   spelling getcwd() returns ("/sub") — so /etc/passwd cannot bypass the
+   virtual root. *)
+let host_dev_facility (path : string) : bool =
+  match path with
+  | "/dev/null" | "/dev/zero" | "/dev/full" | "/dev/random" | "/dev/urandom"
+  | "/dev/stdin" | "/dev/stdout" | "/dev/stderr" ->
+      true
+  | _ -> false
+
+let classify_resolve_error (msg : string) : int =
+  (* preserve the resolver's not-found distinction; every other refusal
+     (escape, separator, permission) is EACCES *)
+  if string_contains msg "not found" then errno_noent else errno_acces
+
 let host_real_path (t : t) (path : string) ~(for_create : bool) :
     (string, int) result =
-  if String.length path > 0 && path.[0] = '/' then Ok path
+  if String.length path > 0 && path.[0] = '/' then begin
+    if host_dev_facility path then Ok path
+    else
+      let segs =
+        String.split_on_char '/' path |> List.filter (fun s -> s <> "")
+      in
+      let via_fs =
+        if for_create then Host_fs.resolve_write_target_abs t.fs segs
+        else Host_fs.resolve_existing_abs t.fs segs
+      in
+      match via_fs with
+      | Ok real -> Ok real
+      | Error msg -> Error (classify_resolve_error msg)
+  end
   else
     let segs =
       String.split_on_char '/' path |> List.filter (fun s -> s <> "")
@@ -881,11 +911,43 @@ let host_real_path (t : t) (path : string) ~(for_create : bool) :
     in
     match via_fs with
     | Ok real -> Ok real
-    | Error msg ->
-        (* preserve the resolver's not-found distinction; every other
-           refusal (escape, separator, permission) is EACCES *)
-        if string_contains msg "not found" then Error errno_noent
-        else Error errno_acces
+    | Error msg -> Error (classify_resolve_error msg)
+
+(* NoFollowFinal: containment is proven on the canonicalized PARENT; the
+   final component is a clean lexical name that is NOT resolved, so
+   lstat/readlink/unlink/rename-source/rmdir operate on the directory
+   entry the guest named (POSIX), never on a symlink's target. *)
+let host_real_path_no_follow (t : t) (path : string) : (string, int) result =
+  let resolve_parent_fn =
+    if String.length path > 0 && path.[0] = '/' then Host_fs.resolve_parent_abs
+    else Host_fs.resolve_parent
+  in
+  if String.length path > 0 && path.[0] = '/' && host_dev_facility path then Ok path
+  else
+    let segs =
+      String.split_on_char '/' path |> List.filter (fun s -> s <> "")
+    in
+    match resolve_parent_fn t.fs segs with
+    | Ok (parent_real, name) ->
+        if name = "." || name = ".." then Error errno_acces
+        else
+          let full = Filename.concat parent_real name in
+          (* A symlink as the final entry is operated on AS AN ENTRY, but
+             only when its target stays inside the virtual root: the
+             sandbox refuses to act on links that point outside
+             (fail-closed, consistent with Host_fs). *)
+          (match Unix.lstat full with
+          | exception Unix.Unix_error (Unix.ENOENT, _, _) -> Ok full
+          | exception Unix.Unix_error _ -> Error errno_acces
+          | st ->
+              if st.Unix.st_kind = Unix.S_LNK then (
+                try
+                  let target = Unix.realpath full in
+                  if Host_fs.contained t.fs target then Ok full
+                  else Error errno_acces
+                with Unix.Unix_error _ -> Error errno_acces)
+              else Ok full)
+    | Error msg -> Error (classify_resolve_error msg)
 
 let open_flags_of_raw ~(guest_is_darwin : bool) (flags : int) :
     Unix.open_flag list =
@@ -1158,7 +1220,12 @@ let host_stat_bytes_for (t : t) (st : Unix.LargeFile.stats) : Bytes.t =
 
 let host_stat (t : t) (path : string) (kind : [ `Stat | `Lstat ]) :
     (Unix.LargeFile.stats, int) result =
-  match host_real_path t path ~for_create:false with
+  let resolved =
+    match kind with
+    | `Stat -> host_real_path t path ~for_create:false
+    | `Lstat -> host_real_path_no_follow t path
+  in
+  match resolved with
   | Error e -> Error (-e)
   | Ok real -> (
       try
@@ -1174,6 +1241,86 @@ let host_fstat (fd : int) : (Unix.LargeFile.stats, int) result =
   | Some d -> (
       try Ok (Unix.LargeFile.fstat d)
       with Unix.Unix_error (e, _, _) -> Error (-errno_of_unix_error e))
+
+(* Directory-entry operations use NoFollowFinal resolution so they act on
+   the named entry, never on a symlink's target. *)
+let host_unlink (t : t) (path : string) : int =
+  match host_real_path_no_follow t path with
+  | Error e -> -e
+  | Ok real -> (
+      try
+        Unix.unlink real;
+        0
+      with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e)
+
+let host_rmdir (t : t) (path : string) : int =
+  match host_real_path_no_follow t path with
+  | Error e -> -e
+  | Ok real -> (
+      try
+        Unix.rmdir real;
+        0
+      with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e)
+
+let host_mkdir (t : t) (path : string) (mode : int) : int =
+  match host_real_path_no_follow t path with
+  | Error e -> -e
+  | Ok real -> (
+      try
+        Unix.mkdir real mode;
+        0
+      with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e)
+
+let host_symlink (t : t) (target : string) (link : string) : int =
+  match host_real_path_no_follow t link with
+  | Error e -> -e
+  | Ok real -> (
+      try
+        Unix.symlink target real;
+        0
+      with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e)
+
+let host_readlink (t : t) (path : string) : (string, int) result =
+  match host_real_path_no_follow t path with
+  | Error e -> Error e
+  | Ok real -> (
+      try Ok (Unix.readlink real)
+      with Unix.Unix_error (e, _, _) -> Error (-errno_of_unix_error e))
+
+let host_rename (t : t) (from_ : string) (to_ : string) : int =
+  match (host_real_path_no_follow t from_, host_real_path_no_follow t to_) with
+  | Error e, _ | _, Error e -> -e
+  | Ok real_from, Ok real_to -> (
+      try
+        Unix.rename real_from real_to;
+        0
+      with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e)
+
+(* The guest's chdir moves the VIRTUAL cwd (Host_fs), never the seed
+   process's own directory.  An absolute path resolves from the virtual
+   ROOT (matching getcwd()'s "/sub" spelling); a relative path resolves
+   from the current virtual cwd. *)
+let host_chdir (t : t) (path : string) : int =
+  let absolute = String.length path > 0 && path.[0] = '/' in
+  let segs =
+    String.split_on_char '/' path |> List.filter (fun s -> s <> "")
+  in
+  let lexical =
+    if absolute then Host_fs.lexical_resolve_abs t.fs segs
+    else Host_fs.lexical_resolve t.fs segs
+  in
+  match lexical with
+  | Error _ -> -2
+  | Ok resolved -> (
+      let existing =
+        if absolute then Host_fs.resolve_existing_abs t.fs segs
+        else Host_fs.resolve_existing t.fs segs
+      in
+      match existing with
+      | Error _ -> -2
+      | Ok _ ->
+          Host_fs.set_cwd t.fs resolved;
+          0)
 
 (* ── The remaining raw-syscall operations ─────────────────────────────
    mmap, getcwd, getdirentries/getdents64, ioctl and dup complete the
@@ -1473,31 +1620,11 @@ let host_syscall (t : t) (n : int) (args : int array) : (int, string) result =
   | 10 -> (
       match path_at 0 with
       | Error e -> Error e
-      | Ok path -> (
-          match host_real_path t path ~for_create:false with
-          | Error e -> Ok (-e)
-          | Ok real -> (
-              try
-                Unix.unlink real;
-                Ok 0
-              with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e))))
+      | Ok path -> Ok (host_unlink t path))
   | 12 -> (
       match path_at 0 with
       | Error e -> Error e
-      | Ok path -> (
-          (* the guest's chdir moves the VIRTUAL cwd (Host_fs), never the
-             seed process's own directory *)
-          let segs =
-            String.split_on_char '/' path |> List.filter (fun s -> s <> "")
-          in
-          match Host_fs.lexical_resolve t.fs segs with
-          | Error _ -> Ok (-2)
-          | Ok resolved -> (
-              match Host_fs.resolve_existing t.fs segs with
-              | Error _ -> Ok (-2)
-              | Ok _ ->
-                  Host_fs.set_cwd t.fs resolved;
-                  Ok 0)))
+      | Ok path -> Ok (host_chdir t path))
   | 15 -> (
       match path_at 0 with
       | Error e -> Error e
@@ -1518,65 +1645,31 @@ let host_syscall (t : t) (n : int) (args : int array) : (int, string) result =
   | 57 -> (
       match (path_at 0, path_at 1) with
       | Error e, _ | _, Error e -> Error e
-      | Ok target, Ok link -> (
-          match host_real_path t link ~for_create:true with
-          | Error e -> Ok (-e)
-          | Ok real -> (
-              try
-                Unix.symlink target real;
-                Ok 0
-              with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e))))
+      | Ok target, Ok link -> Ok (host_symlink t target link))
   | 58 -> (
       match path_at 0 with
       | Error e -> Error e
       | Ok path -> (
-          match host_real_path t path ~for_create:false with
+          match host_readlink t path with
           | Error e -> Ok (-e)
-          | Ok real -> (
-              try
-                let target = Unix.readlink real in
-                let n = min (String.length target) (arg 2) in
-                let b = Bytes.of_string (String.sub target 0 n) in
-                match arena_store t (ptr 1) b with
-                | Ok () -> Ok n
-                | Error _ -> Ok (-errno_fault)
-              with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e))))
+          | Ok target ->
+              let n = min (String.length target) (arg 2) in
+              let b = Bytes.of_string (String.sub target 0 n) in
+              (match arena_store t (ptr 1) b with
+              | Ok () -> Ok n
+              | Error _ -> Ok (-errno_fault))))
   | 128 -> (
       match (path_at 0, path_at 1) with
       | Error e, _ | _, Error e -> Error e
-      | Ok from_, Ok to_ -> (
-          match
-            ( host_real_path t from_ ~for_create:false,
-              host_real_path t to_ ~for_create:true )
-          with
-          | Error e, _ | _, Error e -> Ok (-e)
-          | Ok real_from, Ok real_to -> (
-              try
-                Unix.rename real_from real_to;
-                Ok 0
-              with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e))))
+      | Ok from_, Ok to_ -> Ok (host_rename t from_ to_))
   | 136 -> (
       match path_at 0 with
       | Error e -> Error e
-      | Ok path -> (
-          match host_real_path t path ~for_create:true with
-          | Error e -> Ok (-e)
-          | Ok real -> (
-              try
-                Unix.mkdir real (arg 1);
-                Ok 0
-              with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e))))
+      | Ok path -> Ok (host_mkdir t path (arg 1)))
   | 137 -> (
       match path_at 0 with
       | Error e -> Error e
-      | Ok path -> (
-          match host_real_path t path ~for_create:false with
-          | Error e -> Ok (-e)
-          | Ok real -> (
-              try
-                Unix.rmdir real;
-                Ok 0
-              with Unix.Unix_error (e, _, _) -> Ok (-errno_of_unix_error e))))
+      | Ok path -> Ok (host_rmdir t path))
   | 189 | 190 | 191 ->
       (* fstat/lstat/stat (the kernel's SYS_*_MAC values + the codegen
          offset): fill the 160-byte stat buffer at the pointer argument *)
