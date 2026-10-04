@@ -226,6 +226,35 @@ let current_rss_bytes () : int =
       close_in_noerr ic;
       v
 
+(* The guest's panic message channel (std/core.tg's `_current_panic`
+   static): read on Abort so a self-host ICE reports its own diagnostic
+   instead of a bare "vm: abort". *)
+let current_panic_text (vm : t) (frame : frame) : string =
+  let bare name =
+    match String.rindex_opt name ':' with
+    | Some k when k + 1 < String.length name ->
+        String.sub name (k + 1) (String.length name - k - 1)
+    | _ -> name
+  in
+  let n = Array.length vm.program.Seed_mir.statics in
+  let rec go i =
+    if i >= n then ""
+    else
+      let name, _ty, _mutable, _init = vm.program.Seed_mir.statics.(i) in
+      if bare name = "_current_panic" then
+        match frame.statics.(i) with
+        | Vm_value.Live (Vm_value.Enum (0, payload)) -> (
+            match payload.Vm_value.agg_elems.(0) with
+            | Vm_value.Enum (0, msg) -> (
+                match msg.Vm_value.agg_elems.(0) with
+                | Vm_value.String s -> s
+                | _ -> "")
+            | _ -> "")
+        | _ -> ""
+      else go (i + 1)
+  in
+  go 0
+
 let step_limit (vm : t) : unit =
   vm.steps <- vm.steps + 1;
   (if Array.length vm.step_hist > 0 then begin
@@ -2101,7 +2130,10 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
       end
       else err_trap vm ("assertion failed: " ^ msg))
   | Seed_mir.Unreachable -> raise (Failure "vm: reached Unreachable")
-  | Seed_mir.Abort -> raise (Failure "vm: abort")
+  | Seed_mir.Abort ->
+      let msg = current_panic_text vm frame in
+      if msg = "" then raise (Failure "vm: abort")
+      else raise (Failure ("vm: abort: " ^ msg))
 
 (* Host boundary: the executable closure is the Host binding table
    (audit §70). Dispatch resolves the registry index to a binding id and

@@ -336,6 +336,9 @@ check_pin "readlink does not follow the final link" stage0_ocaml/src/host.ml   '
 check_pin "virtual-absolute resolution exists" stage0_ocaml/src/host_fs.ml   'resolve_parent_abs'
 check_pin "absolute chdir resolves from the virtual root" stage0_ocaml/src/host.ml   'resolve_existing_abs t.fs segs'
 check_pin "RSS parser reads VmRSS kB" stage0_ocaml/src/vm.ml   'vmrss_kb_of_status_line'
+for _utv in F32 F64 StaticStrPtr; do
+  check_pin "unify covers Type::${_utv}" tg_compiler/types.tg "when Type::${_utv} then"
+done
 check_pin "snapshot structural-reject probe exists" stage0_ocaml/selfcheck/linkprobe.tg   'linkprobe_expect_snapshot_reject'
 
 # (P1 containment): the raw host path resolver must never fall back to an
