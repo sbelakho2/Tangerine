@@ -1146,8 +1146,9 @@ let type_query_kind_of_name (n : string) : Seed_mir.type_query_kind option =
   | "align_of" -> Some Seed_mir.AlignOf
   | _ -> None
 
-let classify_callee ~(hint : call_class_hint) (sig_ : typed_signature)
-    ~(argc : int) ~(type_args : Type_repr.t array) : typed_callee =
+let classify_callee ~(hint : call_class_hint) ~(module_path : string list)
+    (sig_ : typed_signature) ~(argc : int) ~(type_args : Type_repr.t array) :
+    typed_callee =
   let callable = sig_.ts_callable in
   match hint with
   | CCH_query -> (
@@ -1184,11 +1185,23 @@ let classify_callee ~(hint : call_class_hint) (sig_ : typed_signature)
       in
       let rec via_host = function
         | [] -> TC_user (callable, type_args)
-        | n :: rest -> (
-            match host_binding_of_name n sig_ ~argc with
-            | `Intrinsic i -> TC_intrinsic (i, type_args)
-            | `Extern i -> TC_extern (i, type_args)
-            | `None -> via_host rest)
+        | n :: rest ->
+            if
+              Intrinsic_registry.is_compiler_private_name n
+              && not
+                   (Intrinsic_registry.compiler_private_module_allowed
+                      module_path)
+            then
+              (* compiler-private: ordinary source can neither declare nor
+                 reach the name; fall through so a same-named user
+                 function is called, and an undeclared use stays
+                 unresolved. *)
+              via_host rest
+            else (
+              match host_binding_of_name n sig_ ~argc with
+              | `Intrinsic i -> TC_intrinsic (i, type_args)
+              | `Extern i -> TC_extern (i, type_args)
+              | `None -> via_host rest)
       in
       via_host names
 
@@ -7567,8 +7580,8 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
           tn_cast_target = None;
           tn_call =
             Some
-              (classify_callee ~hint sig_ ~argc:(List.length tes)
-                 ~type_args:substitution) };
+              (classify_callee ~hint ~module_path:env.module_path sig_
+                 ~argc:(List.length tes) ~type_args:substitution) };
       (* the integrated access channel (re-audit P0-11): one record per
          argument, in program order, aligned with the recorded effects;
          each record carries the argument's typed type *)
@@ -8575,7 +8588,19 @@ and check_methods (env : env) (owner : string)
 
 and check_function_item (env : env) (mp : string list) (d : Ast.function_decl) :
     (unit, string) result =
-  let qname = qualified_name mp d.fn_sig.sig_name in
+  if
+    d.fn_sig.sig_extern
+    && Intrinsic_registry.is_compiler_private_name d.fn_sig.sig_name
+    && not (Intrinsic_registry.compiler_private_module_allowed mp)
+  then
+    Error
+      (err d.fn_sig.sig_span
+         (Printf.sprintf
+            "`%s` is a compiler-internal intrinsic and may only be declared \
+             by the compiler (`tg_compiler::resolver` / `tg_compiler::types`)"
+            d.fn_sig.sig_name))
+  else
+    let qname = qualified_name mp d.fn_sig.sig_name in
   match function_of_name env qname with
   | None ->
       Error (err d.fn_span (Printf.sprintf "internal: function `%s` was not registered" qname))

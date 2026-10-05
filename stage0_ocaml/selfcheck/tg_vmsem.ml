@@ -2335,10 +2335,21 @@ let check_store_mark_memoization () =
     | x :: _ -> (match x with Vm_value.Array a -> a | _ -> assert false)
     | [] -> assert false
   in
-  ignore (Vm_value.arr_set_direct member 0 (oi 99));
-  if member.Vm_value.cell.Vm_value.owned then
-    fail "Set mark memoization: the first mark did not unset every member's owned flag"
-  else pass "Set mark memoization: the first mark reached every member";
+  (* The fork contract: a direct write on a shared member must return a
+     NEW array (physical cell differs), the new array must hold the new
+     value, and the ORIGINAL member must still read the old value — not
+     merely "the original cell's owned flag is false". *)
+  let before = Vm_value.arr_get member 0 in
+  let after = oi 99 in
+  let updated = Vm_value.arr_set_direct member 0 after in
+  if updated.Vm_value.cell == member.Vm_value.cell then
+    fail "Set mark memoization: the direct write did not fork a shared member"
+  else if Vm_value.arr_get updated 0 <> after then
+    fail "Set mark memoization: the forked array did not receive the new value"
+  else if Vm_value.arr_get member 0 <> before then
+    fail
+      "Set mark memoization: the original array was mutated by a write to the fork"
+  else pass "Set mark memoization: the first mark reached every member (a direct write forks and leaves the original intact)";
   (* insert into a MARKED store marks the incoming member at insert *)
   let extra = Vm_value.arr_of_array [| oi 7; oi 8 |] in
   let _ =

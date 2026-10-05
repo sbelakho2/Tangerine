@@ -70,6 +70,14 @@ dune build
 # An explicit override is for MEASUREMENT runs only (record the gate's
 # instrumented phase lines, then re-pin the default from the numbers).
 GATE_TIMEOUT_S="${TG_GATE_TIMEOUT_S:-4140}"
+# The final authorization ALWAYS installs the bounded RSS policy: this
+# gate must never be able to regress into the historical 28-GB host OOM
+# merely because the caller forgot the environment variable.  The bound
+# is the measured bootstrap ceiling (see driver.ml's budget note);
+# re-pin only from a completed cold+warm run.  A host whose RSS cannot
+# be measured fails closed when a ceiling is requested (the VM's hard
+# error), which is the intended behavior for this Linux/CI lane.
+export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB="${TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB:-12288}"
 # The bootstrap target authority: the SAME triple the ladder compiles for
 # (TG_BOOTSTRAP_TARGET; default aarch64-apple-darwin).  The gate's closure
 # front end is target-parameterized through @cfg elimination, and its

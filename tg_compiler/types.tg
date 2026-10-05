@@ -3512,6 +3512,17 @@ struct TypeEnv
   # Trait implementations
   impls: Vec[ImplInfo]
   method_lookup: Map[Int, Map[String, Vec[Int]]]  # receiver TypeId -> method name -> impl indices
+  # (obligation candidate index): trait_id.id -> impl indices in
+  # REGISTRATION ORDER, plus "<trait_id>::<head bucket>" -> the same,
+  # with a per-trait "wild" bucket for heads whose outer form can unify
+  # with any self (Param/Var/Error/Never/Effect/...).  Built incrementally
+  # at impl registration; solve_obligation_depth consumes it instead of
+  # scanning every impl per obligation (the 50e9-step candidate-scan
+  # wall).  Membership is a SUPERSET proof obligation: a candidate is
+  # dropped only when its outer constructor can never unify with the
+  # obligation self (verified by the probe's IMPL_INDEX_BATTERY).
+  impls_by_trait: Map[Int, Vec[Int]] = Map::new()
+  impl_head_index: Map[String, Vec[Int]] = Map::new()
  # (impl conformance — validate-first-register-second): TraitId -> the
   # trait's declared CONTRACT (the resolved method signatures, the
   # trait-level generic parameter ids, the associated type names).
@@ -4038,6 +4049,8 @@ impl Clone for TypeEnv
       pattern_identity_invariant_reported: self.pattern_identity_invariant_reported.clone(),
       impls: self.impls.clone(),
       method_lookup: self.method_lookup.clone(),
+      impls_by_trait: self.impls_by_trait.clone(),
+      impl_head_index: self.impl_head_index.clone(),
       trait_contracts: self.trait_contracts.clone(),
       trait_registry: self.trait_registry.clone(),
       lang_items: self.lang_items.clone(),
@@ -4274,6 +4287,132 @@ struct MethodInfo
   # keying, so identity is (owner, canonical "$impl$<slot>" name), never
   # a bare name/position match.
   owner: DefId
+end
+
+# ———————————————————————————————————————————————————————————————
+# The obligation candidate index (trait + type head)
+# ———————————————————————————————————————————————————————————————
+#
+# solve_obligation_depth used to probe EVERY impl of the obligation's
+# trait (the ~50e9-step, 50-200 s-per-100M candidate-scan wall).  The
+# index narrows the candidate list to the trait bucket plus the head
+# bucket of the obligation's normalized self type, in registration order.
+#
+# SOUNDNESS: the head bucket is a PRE-FILTER, never a decision.  A
+# candidate may be dropped only when its outer constructor can never
+# unify with the self type: after normalize_adt_for_unify (aliases and
+# primitive spellings expanded), two Adts unify only for the same TypeId,
+# distinct scalar/pointer/ref/fixed-array/dyn buckets never unify, and
+# tuple arity must match.  Every generic/wildcard-headed form (Param,
+# Var, Error, Never, IntLiteral, Effect, callables, unknown) lands in the
+# per-trait "wild" bucket, which is scanned for EVERY self type — and a
+# wildcard SELF scans the whole trait bucket.  The probe's
+# IMPL_INDEX_BATTERY verifies, over a synthetic corpus, that no candidate
+# whose head unifies with the self is ever dropped, that every returned
+# index carries the queried trait, and that the result is ascending
+# registration order.
+def impl_head_bucket(env: TypeEnv, ty: Type) -> String
+  let n = normalize_adt_for_unify(env, ty.clone())
+  match n
+  when Type::Adt(tid, _) then "adt:" + tid.id.to_string()
+  when Type::Bool then "prim:Bool"
+  when Type::Unit then "prim:Unit"
+  when Type::Int then "prim:Int"
+  when Type::UInt then "prim:UInt"
+  when Type::Float then "prim:Float"
+  when Type::Char then "prim:Char"
+  when Type::String then "prim:String"
+  when Type::StaticStrPtr then "prim:StaticStrPtr"
+  when Type::I8 then "prim:I8"
+  when Type::I16 then "prim:I16"
+  when Type::I32 then "prim:I32"
+  when Type::I64 then "prim:I64"
+  when Type::I128 then "prim:I128"
+  when Type::U8 then "prim:U8"
+  when Type::U16 then "prim:U16"
+  when Type::U32 then "prim:U32"
+  when Type::U64 then "prim:U64"
+  when Type::U128 then "prim:U128"
+  when Type::ISize then "prim:ISize"
+  when Type::USize then "prim:USize"
+  when Type::F32 then "prim:F32"
+  when Type::F64 then "prim:F64"
+  when Type::Ptr(_) then "ptr"
+  when Type::PtrMut(_) then "ptrmut"
+  when Type::RefInternal(_, _) then "ref"
+  # fixed-array lengths are compared by the unifier; one bucket keeps the
+  # filter a superset
+  when Type::FixedArray(_, _) then "farr"
+  when Type::FixedArraySym(_, _) then "farr"
+  # tuple arity is exact in unification
+  when Type::Tuple(elems) then "tuple:" + elems.len().to_string()
+  when Type::Dyn(_) then "dyn"
+  # Never/Error unify asymmetrically with many forms, IntLiteral/Const*
+  # carry coercion and symbolic-const semantics, and Effect/callables
+  # cross-unify: all go to the always-scanned wild bucket.
+  when _ then "wild"
+  end  end
+end
+
+def impl_bucket_key(trait_id: Int, bucket: String) -> String
+  trait_id.to_string() + "::" + bucket
+end
+
+# The registration hook: called once per registered impl with its final
+# env.impls index.  Inherent impls (TraitId(-1)) are indexed under their
+# own trait bucket too, so a (degenerate) -1 obligation still sees the
+# same candidates the full scan did.
+def register_impl_candidate_index(inout env: TypeEnv, idx: Int, trait_id: Int) -> Unit
+  let trait_bucket = match env.impls_by_trait.get(trait_id)
+  when Option::Some(v) then v.clone()
+  when Option::None then Vec::new()
+  end
+  var tb = trait_bucket
+  tb.push(idx)
+  env.impls_by_trait.insert(trait_id, tb)
+  let bucket = impl_head_bucket(env, env.impls[idx].for_type.clone())
+  let hkey = impl_bucket_key(trait_id, bucket)
+  let head_bucket = match env.impl_head_index.get(hkey.clone())
+  when Option::Some(v) then v.clone()
+  when Option::None then Vec::new()
+  end
+  var hb = head_bucket
+  hb.push(idx)
+  env.impl_head_index.insert(hkey, hb)
+end
+
+# The solver's candidate list for one obligation: the self type's head
+# bucket plus the trait's wild bucket, merged in ascending registration
+# order.  A wildcard self scans the whole trait bucket.
+def impl_candidate_indices(env: TypeEnv, trait_id: Int, self_ty: Type) -> Vec[Int]
+  let bucket = impl_head_bucket(env, self_ty)
+  if bucket == "wild" then
+    match env.impls_by_trait.get(trait_id)
+    when Option::Some(v) then return v.clone()
+    when Option::None then return Vec::new()
+    end
+  end
+  let concrete = match env.impl_head_index.get(impl_bucket_key(trait_id, bucket))
+  when Option::Some(v) then v.clone()
+  when Option::None then Vec::new()
+  end
+  let wild = match env.impl_head_index.get(impl_bucket_key(trait_id, "wild"))
+  when Option::Some(v) then v.clone()
+  when Option::None then Vec::new()
+  end
+  var out = Vec::new()
+  var i = 0
+  var j = 0
+  while i < concrete.len() || j < wild.len() do
+    if j >= wild.len() || (i < concrete.len() && concrete[i] <= wild[j]) then
+      out.push(concrete[i])
+      i = i + 1
+    else
+      out.push(wild[j])
+      j = j + 1
+    end
+  end
+  out
 end
 
 # ———————————————————————————————————————————————————————————————
@@ -14502,6 +14641,9 @@ def register_impl_head(inout env: TypeEnv, i: ImplDecl) -> Option[ImplRegState]
   # TypeId for a primitive for_type (`impl Clone for String`,
   # `impl Eq for Int` — previously indexed nowhere).
   let registered_idx = env.impls.len() - 1
+  # obligation candidate index (trait + head bucket), appended in the same
+  # registration order env.impls uses.
+  register_impl_candidate_index(env, registered_idx, trait_id.id)
   let index_keys = impl_index_tids(env, self_type)
   var iki = 0
   while iki < index_keys.len() do
@@ -18379,6 +18521,36 @@ end
 # scripts/check_intrinsic_closure.sh as a known exception and must be
 # resolved; every OTHER unknown name fails compilation here, before
 # MIR/codegen.
+# Compiler-private intrinsics (the seed's Intrinsic_registry
+# compiler_private_names is the paired authority): the persistent-map
+# snapshot `__intrinsic_map_clone` is NOT generic Clone semantics — it
+# shares the immutable store subject only to the runtime owned-region
+# refusal — so ordinary source must not be able to bypass
+# K::clone/V::clone/drop by declaring and calling it.  Only the kernel's
+# own modules may name it; every other module's explicit call is a hard
+# error here, and the seed applies the same whitelist at extern
+# declaration and call classification.
+def compiler_private_intrinsic_name(name: String) -> Bool
+  name == "__intrinsic_map_clone"
+end
+
+def compiler_private_module_allowed(path: String) -> Bool
+  path == "tg_compiler::resolver" || path == "tg_compiler::types"
+end
+
+def compiler_module_path_string(path: Vec[String]) -> String
+  var s = ""
+  var i = 0
+  while i < path.len() do
+    if i > 0 then
+      s = s + "::"
+    end
+    s = s + path[i]
+    i = i + 1
+  end
+  s
+end
+
 def record_intrinsic_classification(
   inout env: TypeEnv,
   call_node_id: Int,
@@ -18403,6 +18575,15 @@ def record_intrinsic_classification(
   when _ then false
   end
   let is_explicit = callee_name.starts_with("__intrinsic")
+  # compiler-private intrinsic gate: only the compiler's own modules may
+  # even name the persistent-map snapshot; ordinary source is rejected
+  # with a real diagnostic (never silently classified).
+  if is_explicit
+     && compiler_private_intrinsic_name(callee_name.clone())
+     && !compiler_private_module_allowed(compiler_module_path_string(env.current_module_path.clone())) then
+    type_add_error(env, "`" + callee_name.clone() + "` is a compiler-internal intrinsic and may only be declared/called by the compiler (tg_compiler::resolver / tg_compiler::types)", span)
+    return
+  end
   if is_explicit || receiver_is_builtin_container(env, receiver_ty) then
     match intrinsic_id_of_call(callee_name, receiver_ty, &type_bare_name_of(env, receiver_ty), needle_ty, &type_bare_name_of(env, needle_ty), orig_fn_name, receiver_is_string, needle_is_string)
     when Option::Some(iid) then
@@ -19921,9 +20102,13 @@ def solve_obligation_depth(inout env: TypeEnv, obligation: Obligation, inout vis
   let errs_baseline = env.errors.len()
   var solved_candidates = 0
   var committed_subst: Option[Map[TypeVarId, Type]] = Option::None
+  # Candidate index: only the obligation's trait bucket and the self
+  # type's head bucket (plus the trait's always-scanned wild bucket), in
+  # registration order — never every impl.
+  let cand_indices = impl_candidate_indices(env, obligation.trait_ref.trait_id.id, self_resolved.clone())
   var i = 0
-  while i < env.impls.len() do
-    let imp = env.impls[i]
+  while i < cand_indices.len() do
+    let imp = env.impls[cand_indices[i]]
     if imp.trait_id.id == obligation.trait_ref.trait_id.id then
       # The candidate probes from the SAME baseline as every other.
       subst_restore(env, &baseline)

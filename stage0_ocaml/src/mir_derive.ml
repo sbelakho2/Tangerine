@@ -357,8 +357,9 @@ let renderer_call (env : Typecheck.env) (s : st) (bare : string)
       let cont = new_block s in
       let callee =
         Mir_lower.callee_of_typed
-          (Typecheck.classify_callee ~hint:Typecheck.CCH_function ts
-             ~argc:1 ~type_args:[||])
+          (Typecheck.classify_callee ~hint:Typecheck.CCH_function
+             ~module_path:[ "tg_compiler"; "types" ] ts ~argc:1
+             ~type_args:[||])
       in
       close_with s
         (Seed_mir.Call
@@ -383,8 +384,9 @@ let universal_render_call (env : Typecheck.env) (s : st) (ty : Type_repr.t)
       let cont = new_block s in
       let callee =
         Mir_lower.callee_of_typed
-          (Typecheck.classify_callee ~hint:Typecheck.CCH_function ts
-             ~argc:1 ~type_args:[| ty |])
+          (Typecheck.classify_callee ~hint:Typecheck.CCH_function
+             ~module_path:[ "tg_compiler"; "types" ] ts ~argc:1
+             ~type_args:[| ty |])
       in
       close_with s
         (Seed_mir.Call

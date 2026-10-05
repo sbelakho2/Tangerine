@@ -180,6 +180,20 @@ let () =
                (the grep pin cannot see the bodies). *)
             fail
               "the kernel unify battery failed (expected `UNIFY_BATTERY fails=0`; see the report above)"
+          else if not (contains report "IMPL_INDEX_BATTERY fails=0") then
+            (* the obligation candidate index: over a synthetic corpus,
+               every index must carry the queried trait, be ascending,
+               and never drop a candidate whose head unifies with the
+               obligation's self type (the solver-visible soundness
+               property of the trait+head pre-filter). *)
+            fail
+              "the impl candidate-index battery failed (expected `IMPL_INDEX_BATTERY fails=0`; see the report above)"
+          else if not (contains report "RESTRICTED_INTRINSIC_BATTERY fails=0") then
+            (* compiler-private enforcement: an ordinary source program
+               that declares and calls __intrinsic_map_clone must be
+               rejected by the kernel checker's privacy gate. *)
+            fail
+              "the compiler-private intrinsic battery failed (expected `RESTRICTED_INTRINSIC_BATTERY fails=0`; see the report above)"
           else if not (contains report "TOTALS errors=") then
             fail "the probe produced no TOTALS row"
           else if merged && not (contains report "IMPLCONF=0") then

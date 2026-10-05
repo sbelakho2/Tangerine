@@ -38,7 +38,8 @@ use tg_compiler::parser::{parse, diag_has_errors, Diagnostic}
 use tg_compiler::ast::{assign_node_ids, Program, Item, ItemId, ModuleId, Module, Crate, UseDecl, Span}
 use tg_compiler::token::{span_dummy}
 use tg_compiler::resolver::{resolve_names}
-use tg_compiler::types::{type_env_new, type_check_typed, TypeCheckResult, type_display, unify, TypeEnv}
+use tg_compiler::ids::{TypeId, TraitId}
+use tg_compiler::types::{type_env_new, type_check_typed, TypeCheckResult, type_display, unify, TypeEnv, ImplInfo, TraitRefTemplate, impl_candidate_indices, register_impl_candidate_index, subst_snapshot, subst_restore, errors_truncate, try_head_unify}
 use tg_compiler::compiler_core::{default_options, apply_cfg_elimination, prepare_parsed, analyze_parsed}
 use tg_compiler::mir::{lower_to_mir, verify_mir, MirProgram}
 use tg_compiler::access_check::{access_check, AccessError}
@@ -1217,11 +1218,195 @@ def infer_probe_unify_battery(inout report: String) -> Int
   fails
 end
 
+# ———————————————————————————————————————————————————————————————
+# direct obligation-candidate-index battery (the candidate-scan wall):
+# builds a synthetic impl corpus across three traits and several head
+# shapes, indexes it exactly like registration does, and for a battery of
+# self types verifies:
+#   * every returned index carries the queried trait;
+#   * the result is strictly ascending registration order;
+#   * NO candidate whose head unifies with the self type is ever dropped
+#     (the index may over-include — a pre-filter, never a decision —
+#     but a false negative would change solver results).
+# ———————————————————————————————————————————————————————————————
+def infer_probe_args1(a: Type) -> Vec[Type]
+  var v = Vec::new()
+  v.push(a)
+  v
+end
+
+def infer_probe_args2(a: Type, b: Type) -> Vec[Type]
+  var v = Vec::new()
+  v.push(a)
+  v.push(b)
+  v
+end
+
+def infer_probe_synth_impl(trait_id: Int, head: Type) -> ImplInfo
+  ImplInfo {
+    trait_id: TraitId { id: trait_id },
+    trait_name: "Synthetic",
+    for_type: head,
+    obligations: Vec::new(),
+    methods: Vec::new(),
+    generic_params: Vec::new(),
+    trait_ref: TraitRefTemplate { trait_id: TraitId { id: trait_id }, args: Vec::new() }
+  }
+end
+
+def infer_probe_index_contains(v: Vec[Int], x: Int) -> Bool
+  var i = 0
+  while i < v.len() do
+    if v[i] == x then return true end
+    i = i + 1
+  end
+  false
+end
+
+def infer_probe_impl_index_check(inout env: TypeEnv, inout report: String, trait_id: Int, self_ty: Type, idxs: Vec[Int]) -> Int
+  var fails = 0
+  var prev = -1
+  var k = 0
+  while k < idxs.len() do
+    let idx = idxs[k]
+    if idx <= prev then
+      report = report + "IMPL_INDEX_BATTERY not ascending: trait=" + trait_id.to_string() + " idx=" + idx.to_string() + "\n"
+      fails = fails + 1
+    end
+    prev = idx
+    if env.impls[idx].trait_id.id != trait_id then
+      report = report + "IMPL_INDEX_BATTERY wrong trait: expected=" + trait_id.to_string() + " idx=" + idx.to_string() + "\n"
+      fails = fails + 1
+    end
+    k = k + 1
+  end
+  # completeness: every trait candidate whose head unifies with the self
+  # must be returned.  A dropped unifying candidate is a solver-visible
+  # false negative and fails the battery.
+  var i = 0
+  while i < env.impls.len() do
+    let imp = env.impls[i]
+    if imp.trait_id.id == trait_id then
+      let snap = subst_snapshot(env)
+      let errs = env.errors.len()
+      let unifies = try_head_unify(&mut env, imp.for_type.clone(), self_ty.clone())
+      subst_restore(&mut env, &snap)
+      errors_truncate(&mut env, errs)
+      if unifies && !infer_probe_index_contains(idxs, i) then
+        report = report + "IMPL_INDEX_BATTERY dropped a unifying candidate: trait=" + trait_id.to_string() + " idx=" + i.to_string() + "\n"
+        fails = fails + 1
+      end
+    end
+    i = i + 1
+  end
+  fails
+end
+
+def infer_probe_impl_index_battery(inout report: String) -> Int
+  var env = type_env_new()
+  var heads = Vec::new()
+  heads.push((9001, Type::Int))
+  heads.push((9001, Type::U8))
+  heads.push((9001, Type::String))
+  heads.push((9001, Type::Adt(TypeId { id: 9101 }, infer_probe_args1(Type::Int))))
+  heads.push((9001, Type::Adt(TypeId { id: 9101 }, infer_probe_args1(Type::String))))
+  heads.push((9001, Type::Adt(TypeId { id: 9102 }, infer_probe_args1(Type::Int))))
+  heads.push((9001, Type::Ptr(Type::Int)))
+  heads.push((9001, Type::PtrMut(Type::Int)))
+  heads.push((9001, Type::Tuple(infer_probe_args2(Type::Int, Type::String))))
+  heads.push((9001, Type::FixedArray(Type::Int, 4)))
+  heads.push((9001, Type::Never))
+  heads.push((9001, Type::Error))
+  heads.push((9002, Type::Int))
+  heads.push((9002, Type::Adt(TypeId { id: 9101 }, infer_probe_args1(Type::Int))))
+  heads.push((9003, Type::Adt(TypeId { id: 9103 }, infer_probe_args1(Type::Int))))
+  var i = 0
+  while i < heads.len() do
+    let pair = heads[i]
+    env.impls.push(infer_probe_synth_impl(pair.0, pair.1.clone()))
+    register_impl_candidate_index(&mut env, env.impls.len() - 1, pair.0)
+    i = i + 1
+  end
+  var selves = Vec::new()
+  selves.push(Type::Int)
+  selves.push(Type::U8)
+  selves.push(Type::String)
+  selves.push(Type::Adt(TypeId { id: 9101 }, infer_probe_args1(Type::Int)))
+  selves.push(Type::Adt(TypeId { id: 9101 }, infer_probe_args1(Type::U8)))
+  selves.push(Type::Adt(TypeId { id: 9102 }, infer_probe_args1(Type::Int)))
+  selves.push(Type::Adt(TypeId { id: 9103 }, infer_probe_args1(Type::Int)))
+  selves.push(Type::Ptr(Type::Int))
+  selves.push(Type::PtrMut(Type::Int))
+  selves.push(Type::Tuple(infer_probe_args2(Type::Int, Type::String)))
+  selves.push(Type::Tuple(infer_probe_args1(Type::Int)))
+  selves.push(Type::FixedArray(Type::Int, 4))
+  selves.push(Type::Never)
+  selves.push(Type::Error)
+  var fails = 0
+  var q = 0
+  while q < selves.len() do
+    var tr = 9001
+    while tr <= 9004 do
+      let idxs = impl_candidate_indices(&env, tr, selves[q].clone())
+      fails = fails + infer_probe_impl_index_check(&mut env, &mut report, tr, selves[q].clone(), idxs)
+      tr = tr + 1
+    end
+    q = q + 1
+  end
+  report = report + "IMPL_INDEX_BATTERY fails=" + fails.to_string() + "\n"
+  fails
+end
+
+# ———————————————————————————————————————————————————————————————
+# compiler-private intrinsic enforcement: `__intrinsic_map_clone` is the
+# persistent-map snapshot, NOT generic Clone semantics.  An ordinary
+# (non-compiler) source that declares the extern and calls it must be
+# REJECTED with the compiler-private diagnostic — never silently
+# classified as the host intrinsic (which would let user code bypass
+# K::clone/V::clone/drop).
+# ———————————————————————————————————————————————————————————————
+def infer_probe_restricted_intrinsic_battery(inout report: String) -> Int
+  let source = "extern def __intrinsic_map_clone(v: Vec[Int]) -> Vec[Int]\n\ndef main() -> Int\n  let v: Vec[Int] = Vec::new()\n  let w = __intrinsic_map_clone(v)\n  0\nend\n"
+  let parsed = parse(tokenize(source, "restricted_intrinsic"))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "RESTRICTED_INTRINSIC_BATTERY parse-failed\n"
+    return 1
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    var found = false
+    var i = 0
+    while i < result.errors.len() do
+      if result.errors[i].message.contains("compiler-internal intrinsic") then
+        found = true
+      end
+      i = i + 1
+    end
+    if found then
+      report = report + "RESTRICTED_INTRINSIC_BATTERY fails=0\n"
+      0
+    else
+      report = report + "RESTRICTED_INTRINSIC_BATTERY fails=1 ordinary source declared and called the compiler-private intrinsic without the rejection diagnostic (errors=" + result.errors.len().to_string() + ")\n"
+      1
+    end
+  when Result::Err(errs) then
+    report = report + "RESTRICTED_INTRINSIC_BATTERY resolve-failed=" + errs.len().to_string() + " (the declaration must resolve so the checker's privacy gate is the authority)\n"
+    1
+  end
+end
+
 def main() -> Int
   var report = ""
   # the direct kernel-unify unit battery runs FIRST so its rows precede
   # every checker-family row in the report.
   let _ = infer_probe_unify_battery(&mut report)
+  let _ = infer_probe_impl_index_battery(&mut report)
+  let _ = infer_probe_restricted_intrinsic_battery(&mut report)
   let _ = write_file("build/infer_probe.txt", report.clone())
   var counts = Vec::from([infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0)])
   var rows = Vec::new()

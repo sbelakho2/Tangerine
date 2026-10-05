@@ -3414,7 +3414,28 @@ type mono_outcome = {
    blind-raise the cap.  The beacon's mark_calls/mark_nodes deltas plus
    the per-VM live telemetry and TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB
    ceiling are the measurement tools; re-pin both budgets only from an
-   actual completion plus margin. *)
+   actual completion plus margin.
+
+   Third pass (2026-10-05), targeting the ~50e9-step CPU wall: the
+   obligation solver no longer scans every impl.  register_impl builds
+   a trait bucket plus a normalized outer-head bucket per impl (with a
+   per-trait "wild" bucket for Param/Var/Error/Never/Effect/... heads),
+   and solve_obligation_depth consumes the (head bucket + wild bucket)
+   list in registration order — candidate-scoped, never global, and
+   IMPL_INDEX_BATTERY verifies over a synthetic corpus that no candidate
+   whose head unifies with the self is dropped.  Compiler-private
+   intrinsics are now enforced rather than conventional: the seed
+   rejects an ordinary extern declaration of `__intrinsic_map_clone`
+   (tg_intrinsic_privacy) and skips it at call classification, and the
+   kernel's record_intrinsic_classification gates it by
+   env.current_module_path (RESTRICTED_INTRINSIC_BATTERY).  The final
+   gate (check_ocaml_bootstrap_complete.sh) now INSTALLS the bounded RSS
+   policy by default instead of relying on the operator to remember the
+   environment variable.  Probe-mismatch suppression is not
+   unwind-safe, but the VM's traps are fatal (no catchable recovery
+   around solving), so the counter cannot survive into a reused env.
+   The next measurement run uses the index at 80e9/12 GiB with
+   OCAMLRUNPARAM=o=40. *)
 (* (recalibrated bootstrap caps): the bootstrap VM budget is overridable via
    the environment so deep corpus+stdlib compiles can be given a larger
    budget without a rebuild; the defaults stay bounded, fail-fast guards. *)

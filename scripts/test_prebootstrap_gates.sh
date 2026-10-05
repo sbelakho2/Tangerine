@@ -422,6 +422,17 @@ else
 fi
 # The host binding must fail closed on a resource-bearing store.
 check_pin "the snapshot refuses owned-region stores" stage0_ocaml/src/vm_value.ml   'map snapshot: the store carries an owned region ref'
+# The obligation candidate index (trait + head) and its compiler-private
+# enforcement, plus the discriminating Clone test.
+check_pin "the obligation solver consumes the candidate index" tg_compiler/types.tg   'impl_candidate_indices\(env, obligation\.trait_ref\.trait_id\.id'
+check_pin "the candidate index is maintained at registration" tg_compiler/types.tg   'register_impl_candidate_index\(env, registered_idx'
+check_pin "the kernel gates compiler-private intrinsics" tg_compiler/types.tg   'compiler-private intrinsic gate'
+check_pin "the registry declares the compiler-private name list" stage0_ocaml/src/intrinsic_registry.ml   'compiler_private_names'
+check_pin "the seed rejects compiler-private extern declarations" stage0_ocaml/src/typecheck.ml   'is a compiler-internal intrinsic and may only be declared'
+check_pin "the seed skips compiler-private names at call classification" stage0_ocaml/src/typecheck.ml   'is_compiler_private_name n'
+check_pin "the final gate installs the RSS ceiling by default" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB:-12288'
+check_pin "the Clone value test is discriminating (0/1/2 clones)" tests/unit/test_collections_clone_semantics.tg   'assert_eq\(v.value, 2\)'
+check_pin "the Clone test covers custom KEY Clone" tests/unit/test_collections_clone_semantics.tg   'test_map_clone_invokes_each_key_clone_exactly_once'
 
 
 # (P1 containment): the raw host path resolver must never fall back to an

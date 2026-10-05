@@ -78,6 +78,26 @@ let record_visit_names : string list =
 
 let is_record_visit_name (name : string) : bool = List.mem name record_visit_names
 
+(* Compiler-private intrinsics: the name may only be declared/called by
+   the compiler's own modules.  `__intrinsic_map_clone` is the
+   persistent-map SNAPSHOT, not generic Clone semantics — it shares an
+   immutable store subject only to the runtime owned-region refusal, so
+   ordinary source must not be able to bypass K::clone/V::clone/drop by
+   declaring and calling it.  Enforced by the seed typechecker (extern
+   declaration + call classification) and by the kernel checker
+   (record_intrinsic_classification, keyed by env.current_module_path);
+   the IMPL_INDEX-style behavioral battery proves an ordinary source
+   program is rejected. *)
+let compiler_private_names = [ "__intrinsic_map_clone" ]
+
+let is_compiler_private_name (name : string) : bool =
+  List.mem name compiler_private_names
+
+let compiler_private_module_allowed (path : string list) : bool =
+  match path with
+  | [ "tg_compiler"; ("resolver" | "types") ] -> true
+  | _ -> false
+
 (* ———————————————————————————————————————————————————————————————
    Signature building blocks, shared with Extern_registry and Host.
    Named types are keyed by placeholder Type_ids that are consistent

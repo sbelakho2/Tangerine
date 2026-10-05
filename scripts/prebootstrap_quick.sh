@@ -95,6 +95,7 @@ readonly FAST_SELFCHECKS=(
   tg_subset
   tg_verify
   tg_vmsem
+  tg_intrinsic_privacy
   tg_sigid
   tg_placechain
   tg_boxnominal
