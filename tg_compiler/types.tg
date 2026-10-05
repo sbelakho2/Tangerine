@@ -3182,50 +3182,16 @@ end
 # is_trivially_copyable — raw bit-copy is valid, no retain/clone (—
 #                         THE copy authority; the MIR Copy verifier
 #                         queries THIS axis, never the DeinitPlan).
-# is_transferable      — (concurrency properties) the compiler-derived
-#                         Transferable property: a value may move into
-#                         another execution context. Derived by the
-#                         transferable walk (derive_transferable — the
-#                         single authority; see the concurrency section):
-#                         FALSE when the value contains an
-#                         execution-context-affine native handle (the
-#                         std-marked AffineHandle — the pthread thread
-#                         handle / TLS key — unless the containing type
-#                         explicitly opts in via UnsafeTransferable), the
-#                         active lexical inout state (a closure with an
-#                         inout capture), or a non-transferable captured
-#                         state. TRUE for the scalars, the owned
-#                         containers/strings (ownership moves), and the
-#                         Arc/Box/UniquePtr pointer layer (the pointee
-#                         walk); Rc and the raw pointers (gated) are
-#                         FALSE. A deferred type carries NO concrete
-#                         answer (false + is_deferred).
-# is_shareable          — (concurrency properties) the compiler-derived
-#                         Shareable property: safe simultaneous access
-#                         through a shared representation. Derived by
-#                         the shareable walk (derive_syncable): TRUE for
-#                         the trivially-copyable value types AND the
-#                         recognized synchronized representations (the
-#                         Arc/WeakArc — the shared heap boundary; the
-#                         atomics/Mutex/RwLock/channels reach it
-#                         structurally through their Arc/scalar
-#                         layers). The plain OWNED types (String/Vec/
-#                         owned aggregates) are Transferable but NOT
-#                         Shareable — shared mutable state must go
-#                         through Arc/Mutex/RwLock/atomics/channels.
-#                         Cell/RefCell/UnsafeCell (interior mutability
-#                         without synchronization) and Rc are FALSE.
 #   is_deferred         — the type graph contains an unsubstituted generic
 #                         parameter (Type::Param) or an unresolved inference
-#                         variable (Type::Var): the six semantic fields are
+#                         variable (Type::Var): the semantic fields are
 #                         NOT authoritative — "unknown/deferred", never a
 #                         concrete semantic answer. A generic local may
 #                         require CONDITIONAL drop after substitution, so a
 #                         consumer must check is_deferred FIRST: while
 #                         deferred, a false owns_state/requires_drop_glue/
 #                         is_linear/is_capability/contains_capability/
-#                         is_trivially_copyable/is_transferable/
-#                         is_shareable means "not proven true",
+#                         is_trivially_copyable means "not proven true",
 #                         NOT "definitely false". The concrete answers
 #                         appear only after substitution (the MIR/mono
 #                         consumer wave substitutes the Param and re-queries
@@ -3236,6 +3202,17 @@ end
 #                         keep those fields concrete — the flag marks the
 #                         properties that depend on the unsubstituted
 #                         parameter (e.g. Vec[T].is_linear = T.is_linear).
+#
+# TRANSFERABLE / SHAREABLE are NOT cached here (the former
+# is_transferable/is_shareable fields are removed): their authorities
+# are the standalone derivations is_send/is_sync (— the same
+# derive_transferable/derive_syncable the solver's obligation and
+# capability consumers call).  Computing them at the tail of EVERY
+# type_props_walk node was pure waste (no reader ever consulted the
+# fields), and each computation is a full independently-visited walk of
+# the type graph — the self-host preflight's 60e9-step
+# type-props/derive_transferable frontier.  Derive them at the actual
+# consumer, never speculatively per ownership node.
 struct TypeProperties
   owns_state: Bool
   requires_drop_glue: Bool
@@ -3243,8 +3220,6 @@ struct TypeProperties
   is_capability: Bool
   contains_capability: Bool
   is_trivially_copyable: Bool
-  is_transferable: Bool
-  is_shareable: Bool
   is_deferred: Bool
   # (audit order item 8) THE COMPILER-OWNED VECTOR/SIMD TYPE PROPERTY: TRUE
   # when the CONCRETE type identity is a std::simd wrapper instantiation
@@ -3703,6 +3678,13 @@ struct TypeEnv
   # Diagnostics
   errors: Vec[TypeError]
   warnings: Vec[TypeError]
+  # (probe suppression): > 0 while a transactional candidate probe
+  # (try_head_unify under impl_bounds_satisfied/solve_obligation_depth)
+  # is running: a failed head unification is an ordinary non-match, and
+  # formatting its mismatch diagnostic (type_tag over both types) only to
+  # truncate it was the 46B-step / ~55 s-per-100M allocation+RSS wall.
+  # The counter nests; 0 is the ordinary reporting mode.
+  suppress_mismatch_errors: Int = 0
   typed_expr_types: Map[Int, Type]
   local_id_counter: Int
   local_ids: Vec[Map[String, Int]]
@@ -4074,6 +4056,7 @@ impl Clone for TypeEnv
       impl_pre_registered: self.impl_pre_registered.clone(),
       errors: self.errors.clone(),
       warnings: self.warnings.clone(),
+      suppress_mismatch_errors: self.suppress_mismatch_errors.clone(),
       typed_expr_types: self.typed_expr_types.clone(),
       local_id_counter: self.local_id_counter.clone(),
       local_ids: self.local_ids.clone(),
@@ -7594,6 +7577,20 @@ def get_type_by_id_ref(env: TypeEnv, tid: TypeId) -> Option[TypeDef]
   end  end
 end
 
+# NARROW NAME ACCESSOR for the unify primitive-bridge arms: checking a
+# nominal def's NAME must never materialize the whole TypeDef.  The
+# Option[TypeDef] form deep-copies every field/variant/arg of the def,
+# and unify called it once per Adt-vs-primitive comparison — the
+# 45B-step / ~50 s-per-100M unify/TypeDef-clone RSS wall.  This reads the
+# name field in place and compares it against one accepted spelling;
+# multi-spelling arms OR the calls (short-circuit, no allocation).
+def type_def_name_is(env: TypeEnv, tid: TypeId, name: String) -> Bool
+  match env.type_id_index.get(tid.id)
+  when Option::Some(idx) then env.type_list[idx].name == name
+  when Option::None then false
+  end  end
+end
+
 def get_type_id_by_name(env: TypeEnv, name: String) -> Option[TypeId]
   match env.type_name_index.get(name)
   when Option::Some(idx) then
@@ -8987,12 +8984,14 @@ def normalize_adt_for_unify(inout env: TypeEnv, ty: Type) -> Type
   # Look up the TypeDef via the O(1) id index
   match env.type_id_index.get(id.id)
   when Option::Some(idx) then
-    let td = env.type_list[idx]
-    let name = td.name
+    # Field projections only: binding `let td = env.type_list[idx]` copied
+    # the WHOLE TypeDef (all fields/variants/args) on every unify call —
+    # the same Option[TypeDef]-copy wall as the primitive bridge arms.
+    let name = env.type_list[idx].name
       # Type aliases resolve to their underlying type: typealias Signal = Int.
-      match td.def_kind
+      match env.type_list[idx].def_kind
       when TypeDefKind::Alias(inner) then
-        return subst_type_args(&inner, &td.generic_params, &adt_args)
+        return subst_type_args(&inner, &env.type_list[idx].generic_params, &adt_args)
       when _ then ()
       end
       if name == "Unit" || name == "Nil" then return Type::Unit
@@ -9349,8 +9348,20 @@ def prune_var(inout env: TypeEnv, ty: Type) -> Type
   when Type::Var(id) then
     match env.subst.get(id)
     when Option::Some(resolved) then
+      # Compress ONLY a multi-step chain.  The old unconditional
+      # `insert(id, root)` rewrote the SAME binding on every lookup of
+      # an already-concrete var, and each persistent-map replacement
+      # rebuilds the whole pair list (List.map over front+back + the
+      # index bucket) — the 30M-scans-per-100M-step / ~50 s-per-100M
+      # substitution-churn wall.  A concrete direct binding already IS
+      # the root, so the rewrite proves nothing new.
+      let was_chain =
+        match resolved
+        when Type::Var(_) then true
+        when _ then false
+        end
       let root = prune_var(env, resolved)
-      env.subst.insert(id, root.clone())
+      if was_chain then env.subst.insert(id, root.clone()) end
       root
     when Option::None then ty
     end
@@ -9745,6 +9756,10 @@ end
 # byte-identical to the inline form this helper replaces; only the
 # structured fields are added.
 def type_mismatch_error(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Unit
+  # A suppressed probe failure is an ordinary non-match: do not render
+  # the tags or build the rich TypeError at all (see TypeEnv's probe
+  # suppression note).
+  if env.suppress_mismatch_errors > 0 then return end
   let tag1 = type_tag(env, &t1)
   let tag2 = type_tag(env, &t2)
   # (audit item 24): the typed payload — the same two renders, in the
@@ -9927,68 +9942,36 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
         # Handle Adt(tid, args) unified with primitive types (Int, U64, String, etc.)
         # Occurs when resolve_type_expr or other code creates Adt types for primitives.
         when Type::Unit then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if td.name == "Unit" && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "Unit")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::Bool then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if td.name == "Bool" && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "Bool")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::Int then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "Int" || td.name == "c_int") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "Int") || type_def_name_is(env, &id1, "c_int")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::UInt then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if td.name == "UInt" && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "UInt")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::Float then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if td.name == "Float" && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "Float")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::Char then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if td.name == "Char" && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "Char")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::String then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "String" || td.name == "str") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "String") || type_def_name_is(env, &id1, "str")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::Never then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if td.name == "Never" && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "Never")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::FixedArray(elem2, n2) then
           # Literal-bridge: the heap-vector Adt Array form (the array
@@ -10001,116 +9984,60 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
             false
           end
         when Type::I8 then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "I8" || td.name == "Int8" || td.name == "i8") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "I8") || type_def_name_is(env, &id1, "Int8") || type_def_name_is(env, &id1, "i8")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::I16 then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "I16" || td.name == "Int16" || td.name == "i16") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "I16") || type_def_name_is(env, &id1, "Int16") || type_def_name_is(env, &id1, "i16")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::I32 then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "I32" || td.name == "Int32" || td.name == "i32") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "I32") || type_def_name_is(env, &id1, "Int32") || type_def_name_is(env, &id1, "i32")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::I64 then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "I64" || td.name == "Int64" || td.name == "i64" || td.name == "c_long") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "I64") || type_def_name_is(env, &id1, "Int64") || type_def_name_is(env, &id1, "i64") || type_def_name_is(env, &id1, "c_long")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::I128 then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "I128" || td.name == "Int128" || td.name == "i128") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "I128") || type_def_name_is(env, &id1, "Int128") || type_def_name_is(env, &id1, "i128")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::U8 then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "U8" || td.name == "UInt8" || td.name == "u8" || td.name == "c_char") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "U8") || type_def_name_is(env, &id1, "UInt8") || type_def_name_is(env, &id1, "u8") || type_def_name_is(env, &id1, "c_char")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::U16 then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "U16" || td.name == "UInt16" || td.name == "u16") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "U16") || type_def_name_is(env, &id1, "UInt16") || type_def_name_is(env, &id1, "u16")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::U32 then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "U32" || td.name == "UInt32" || td.name == "u32") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "U32") || type_def_name_is(env, &id1, "UInt32") || type_def_name_is(env, &id1, "u32")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::U64 then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "U64" || td.name == "UInt64" || td.name == "u64" || td.name == "c_ulong") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "U64") || type_def_name_is(env, &id1, "UInt64") || type_def_name_is(env, &id1, "u64") || type_def_name_is(env, &id1, "c_ulong")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::U128 then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "U128" || td.name == "UInt128" || td.name == "u128") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "U128") || type_def_name_is(env, &id1, "UInt128") || type_def_name_is(env, &id1, "u128")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::ISize then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "ISize" || td.name == "isize") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "ISize") || type_def_name_is(env, &id1, "isize")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::USize then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "USize" || td.name == "usize") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "USize") || type_def_name_is(env, &id1, "usize")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::F32 then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "F32" || td.name == "f32" || td.name == "c_float") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "F32") || type_def_name_is(env, &id1, "f32") || type_def_name_is(env, &id1, "c_float")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         when Type::F64 then
-          match get_type_by_id_ref(env, &id1)
-          when Option::Some(td) then
-            if (td.name == "F64" || td.name == "f64" || td.name == "c_double") && args1.len() == 0 then true
-            else type_mismatch_error(env, &a, &b, span); false
-            end
-          when Option::None then type_mismatch_error(env, &a, &b, span); false
+          if (type_def_name_is(env, &id1, "F64") || type_def_name_is(env, &id1, "f64") || type_def_name_is(env, &id1, "c_double")) && args1.len() == 0 then true
+          else type_mismatch_error(env, &a, &b, span); false
           end
         # Handle Named(tid, args) unified with a callable type.
         when Type::FnPtr(params2, ret2, _) then
@@ -19181,12 +19108,24 @@ end
 # The subst map is the ONLY inference state the unifier mutates (bindings
 # plus path compression); diagnostics are handled separately by truncating
 # env.errors to the attempt's pre-count.
+#
+# The snapshot/restore pair goes through the compiler-internal persistent
+# map snapshot (the same facility ResolvedNames::clone uses; declared in
+# resolver.tg): the Map store is immutable, so sharing it is an O(1)
+# transactional rollback and no substitution from a rejected candidate can
+# survive.  A deep copy — or even a per-restore purity walk — of the
+# growing subst map was the 45B-step / ~50 s-per-100M obligation-probe
+# wall (millions of candidate probes, each copying every current binding).
+# The flag-guarded share is pure data by construction: subst binds Type
+# values, which never carry a runtime region ref.
+extern def __intrinsic_map_clone[K, V](m: Map[K, V]) -> Map[K, V]
+
 def subst_snapshot(env: TypeEnv) -> Map[TypeVarId, Type]
-  env.subst.clone()
+  __intrinsic_map_clone(env.subst)
 end
 
 def subst_restore(inout env: TypeEnv, snap: Map[TypeVarId, Type]) -> Unit
-  env.subst = snap.clone()
+  env.subst = __intrinsic_map_clone(snap)
 end
 
 def errors_truncate(inout env: TypeEnv, len: Int) -> Unit
@@ -19205,7 +19144,12 @@ end
 # global inference state.
 def try_head_unify(inout env: TypeEnv, t1: Type, t2: Type) -> Bool
   let errors_before = env.errors.len()
+  # suppress the discarded-diagnostic construction for the probe: a failed
+  # head unification is a non-match, never a user error (the mismatch
+  # text is truncated below anyway).
+  env.suppress_mismatch_errors = env.suppress_mismatch_errors + 1
   let ok = unify(env, t1, t2, Span { file: "", start: 0, end_pos: 0 })
+  env.suppress_mismatch_errors = env.suppress_mismatch_errors - 1
   if !ok then
     while env.errors.len() > errors_before do
       env.errors.pop()
@@ -20478,7 +20422,7 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
         # container's own arm claimed owns_state/requires_drop_glue; the
         # element's linearity/capability containment was decided by the
         # boundary-crossing arm's first visit).
-        return TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_transferable: false, is_shareable: false, is_deferred: false }
+        return TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_deferred: false }
       end
       # Recursion through INLINE storage: infinitely sized recursive type.
       # The layout engine panics on such types; the property engine reports
@@ -20492,12 +20436,12 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
         span: Span { file: "", start: 0, end_pos: 0 },
         code: Option::None
       })
-      return TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_transferable: false, is_shareable: false, is_deferred: false }
+      return TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_deferred: false }
     end
   when Option::None then ()
   end
   visiting.insert(key.clone(), TypePropVisitState::Visiting)
-  var props = TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_transferable: false, is_shareable: false, is_deferred: false }
+  var props = TypeProperties { owns_state: false, requires_drop_glue: false, is_linear: false, is_capability: false, contains_capability: false, is_trivially_copyable: false, is_deferred: false }
   match ty
   # Plain data: no drop, not linear, not a capability, bit-copyable.
   when Type::Unit then ()
@@ -20641,15 +20585,15 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
  # is_trivially_copyable comes from FIX 1: the decided bit-copy set.
   # A deferred type carries NO concrete answer here — the field stays false
   # (non-authoritative; the is_deferred flag is set) until substitution.
-  # (concurrency properties): the concurrency properties are the derived
-  # queries — the transferable walk and the shareable walk (the single
-  # authority; the engine answers through the SAME derivation the solver
-  # uses, so the two paths cannot disagree by construction). Deferred
-  # types carry no concrete answer (false + is_deferred).
+  # Transferable/Shareable are NOT computed here: they have no cached
+  # field in TypeProperties anymore (see the struct note) — their
+  # authorities are the standalone is_send/is_sync derivations at the
+  # real consumers.  The old per-node calls here ran a full
+  # independently-visited type-graph walk for every ownership node and
+  # were the self-host preflight's 60e9-step derive_transferable
+  # frontier.
   if !props.is_deferred then
     props.is_trivially_copyable = is_trivially_copyable(env, ty)
-    props.is_transferable = is_send(env, ty)
-    props.is_shareable = is_sync(env, ty)
   end
   visiting.insert(key.clone(), TypePropVisitState::Resolved)
   env.type_prop_cache.insert(key, props.clone())

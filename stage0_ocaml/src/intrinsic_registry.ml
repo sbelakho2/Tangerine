@@ -259,10 +259,6 @@ let manifest : t =
     [
       ( "__intrinsic_map_new",
         sig_ ~params:[||] ~ret:(map_of (param Type_param.k) (param Type_param.v)) );
-      ( "__intrinsic_map_clone_try",
-        sig_
-          ~params:[| map_of (param Type_param.k) (param Type_param.v) |]
-          ~ret:(option_of (map_of (param Type_param.k) (param Type_param.v))) );
       ( "__intrinsic_map_get",
         sig_
           ~params:[| map_of (param Type_param.k) (param Type_param.v); param Type_param.k |]
@@ -286,10 +282,6 @@ let manifest : t =
           ~ret:(vec_of (tuple_of [| param Type_param.k; param Type_param.v |])) );
       ( "__intrinsic_set_new",
         sig_ ~params:[||] ~ret:(set_of (param Type_param.t)) );
-      ( "__intrinsic_set_clone_try",
-        sig_
-          ~params:[| set_of (param Type_param.t) |]
-          ~ret:(option_of (set_of (param Type_param.t))) );
       ( "__intrinsic_set_insert",
         sig_conv
           ~params:
@@ -693,6 +685,15 @@ let manifest : t =
       ("__intrinsic_vec_filled",
         sig_ ~params:[| ty_int; param Type_param.t |]
           ~ret:(vec_of (param Type_param.t)));
+
+      (* The compiler-internal persistent-map snapshot (ResolvedNames::
+         clone and friends): the host shares the immutable store O(1)
+         with every reachable array deep-marked shared, and refuses a
+         store carrying an owned region ref fail-closed.  NOT the public
+         generic Map::clone contract. *)
+      ("__intrinsic_map_clone",
+        sig_ ~params:[| map_of (param Type_param.k) (param Type_param.v) |]
+          ~ret:(map_of (param Type_param.k) (param Type_param.v)));
     ]
   in
   let tbl = ref empty in

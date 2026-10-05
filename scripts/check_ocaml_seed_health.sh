@@ -75,13 +75,15 @@ PINNED_TEST_INVENTORY=230
 # bound, never a skip: the full check still runs under it, and the debt
 # predicate is unchanged. Re-measure when the closure grows materially.
 BOOTSTRAP_CHECK_TIMEOUT_S=1620
-# The gate cap was re-measured 2026-09-27 after the post-mono deep-share
-# mark fix landed the full closure: 2759.9 s wall (closure front end
-# 1419.5 + lower 22.2 + mono 53.7 + reachable-host 0.2 + fold 0.0 + VM
-# run 1264.3) -> 4139.9 -> the same 4140 s cap as
-# check_ocaml_bootstrap_complete.sh.  The pre-fix 1860 s cap is
-# superseded (the frozen tree stalled in the post-mono segment and never
-# reached the VM; the cap must cover the run, not the stall).
+# The gate cap was measured 2026-09-27 (2759.9 s) on a tree whose
+# in-VM self-host preflight did NOT fit the 30e9-step VM default (the
+# quadratic shared-marking frontier recorded in driver.ml), so that
+# number is NOT a completed-closure calibration for the current
+# algorithm.  The current pass memoizes the Map/Set deep mark and
+# removes the unsafe O(1) pure-data clone fast path; both the wall time
+# and the VM step count must be re-measured from a completed cold and
+# warm run.  For now 4140 s (shared with check_ocaml_bootstrap_complete.sh)
+# stays as a provisional bound: a cap is a bound, never a skip.
 GATE_TIMEOUT_S=4140
 EVIDENCE_TIMEOUT_S=1920
 

@@ -341,9 +341,96 @@ for _utv in F32 F64 StaticStrPtr; do
 done
 check_pin "snapshot structural-reject probe exists" stage0_ocaml/selfcheck/linkprobe.tg   'linkprobe_expect_snapshot_reject'
 
+# ── P0 host-device capability authority ──────────────────────────────
+# /dev/* facilities are OPEN/STAT/LSTAT/READLINK capabilities only.
+# Every mutating resolver call site must use the non-dev default; a
+# mutation that opts a mutating op into host-device authority goes red
+# here even if no lane happens to execute that path.
+dev_authority_ok() { # <host.ml path>
+  local f="$1" ok=1 op body
+  if ! grep -qF 'let host_real_path ?(allow_dev = false)' "$f"; then ok=0; fi
+  if ! grep -qF 'let host_real_path_no_follow ?(allow_dev = false)' "$f"; then ok=0; fi
+  for op in host_unlink host_rmdir host_mkdir host_symlink host_rename host_chmod; do
+    body="$(sed -n "/^let ${op} /,/^let [a-z_]* /p" "$f")"
+    if printf '%s\n' "$body" | grep -q 'allow_dev'; then ok=0; fi
+  done
+  local calls
+  calls="$(grep -cE 'host_real_path(_no_follow)? ~allow_dev:true' "$f" || true)"
+  [ "$calls" = 4 ] || ok=0
+  [ "$ok" = 1 ]
+}
+if dev_authority_ok "$ROOT/stage0_ocaml/src/host.ml"; then
+  pass "host-device authority is open-only (defaults refuse; 4 opt-in call sites; no mutating op opts in)"
+else
+  bad "host-device authority leaked into a mutating resolver path"
+fi
+# Mutation self-tests: the check must go red both when a mutating op opts
+# in and when a resolver default is flipped to allow.
+dev_mut="$TMP/host_dev_mut.ml"
+cp "$ROOT/stage0_ocaml/src/host.ml" "$dev_mut"
+sed 's/match host_real_path_no_follow t path with/match host_real_path_no_follow ~allow_dev:true t path with/' \
+  "$dev_mut" >"$dev_mut.new" && mv "$dev_mut.new" "$dev_mut"
+if dev_authority_ok "$dev_mut"; then
+  bad "host-device mutation accepted: unlink/rmdir/mkdir opted into allow_dev"
+else
+  pass "host-device mutation rejected: a mutating op opted into allow_dev"
+fi
+cp "$ROOT/stage0_ocaml/src/host.ml" "$dev_mut"
+sed 's/?(allow_dev = false)/?(allow_dev = true)/' "$dev_mut" >"$dev_mut.new" && mv "$dev_mut.new" "$dev_mut"
+if dev_authority_ok "$dev_mut"; then
+  bad "host-device mutation accepted: resolver default flipped to allow_dev"
+else
+  pass "host-device mutation rejected: resolver default flipped to allow_dev"
+fi
+# True NoFollowFinal: the final component is never realpath'd, so
+# dangling and escaping symlinks can be lstat'd, readlink'd, renamed and
+# unlinked as the directory entries they are.
+nf_body="$(sed -n '/^let host_real_path_no_follow/,/^let host_open /p' "$ROOT/stage0_ocaml/src/host.ml")"
+if printf '%s\n' "$nf_body" | grep -q 'Unix.realpath'; then
+  bad "no-follow resolution still realpaths a final component"
+else
+  pass "no-follow resolution never realpaths the final component"
+fi
+check_pin "absolute symlink targets are virtualized at creation" stage0_ocaml/src/host.ml   'virtual_abs_physical'
+check_pin "readlink re-spells targets into the guest namespace" stage0_ocaml/src/host.ml   'virtual_abs_guest'
+
+# ── P0 generic Map/Set Clone contract ────────────────────────────────
+# The O(1) pure-data clone fast path is REMOVED: no intrinsic may
+# reappear and the generic clone must walk every element through its own
+# Clone impl (tests/unit/test_collections_clone_semantics.tg is the
+# behavioral proof; these pins keep the implementation surface).
+if grep -qE '__intrinsic_(map|set)_clone_try' \
+  "$ROOT/std/collections.tg" \
+  "$ROOT/stage0_ocaml/src/host.ml" \
+  "$ROOT/stage0_ocaml/src/intrinsic_registry.ml"; then
+  bad "the removed Map/Set clone-try intrinsic is referenced again"
+else
+  pass "the generic Map/Set clone does not use the runtime pure-data fast path"
+fi
+check_pin "Map::clone clones every key and value exactly once" std/collections.tg   'result.insert\(key_ref.clone\(\), val_ref.clone\(\)\)'
+check_pin "Set::clone clones every element exactly once" std/collections.tg   'result.insert\(item_ref.clone\(\)\)'
+# The compiler-internal persistent-map snapshot (option-3 Clone
+# performance recovery) MUST stay confined to the audited internal
+# carrier: ResolvedNames/StableIdMap clone through it, the PUBLIC
+# generic Map/Set clone surface never references it.
+check_pin "ResolvedNames clones through the compiler-internal snapshot" tg_compiler/resolver.tg   '__intrinsic_map_clone\(self\.expr_resolutions\)'
+check_pin "the snapshot intrinsic is declared compiler-internally" tg_compiler/resolver.tg   'extern def __intrinsic_map_clone'
+if grep -q '__intrinsic_map_clone' "$ROOT/std/collections.tg"; then
+  bad "the public generic Map/Set clone surface references the internal snapshot"
+else
+  pass "the internal snapshot is not reachable from the public generic Clone surface"
+fi
+# The host binding must fail closed on a resource-bearing store.
+check_pin "the snapshot refuses owned-region stores" stage0_ocaml/src/vm_value.ml   'map snapshot: the store carries an owned region ref'
+
+
 # (P1 containment): the raw host path resolver must never fall back to an
-# unchecked lexical repo-root join after Host_fs refused the path.
-if grep -q 'Filename.concat t.fs' "$ROOT/stage0_ocaml/src/host.ml"; then
+# unchecked lexical repo-root join after Host_fs refused the path.  The
+# check is scoped to the resolver body: virtual_abs_physical DOES perform
+# the intentional lexical mapping of absolute guest symlink targets (its
+# ".."-rejecting hygiene is proven behaviorally by tg_hostfs).
+hrp_body="$(sed -n '/^let host_real_path /,/^let host_real_path_no_follow /p' "$ROOT/stage0_ocaml/src/host.ml")"
+if printf '%s\n' "$hrp_body" | grep -q 'Filename.concat'; then
   bad "host_real_path still falls back to a lexical path after resolver refusal"
 else
   pass "raw host path resolution is fail-closed (no lexical fallback)"

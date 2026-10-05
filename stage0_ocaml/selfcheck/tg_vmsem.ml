@@ -2296,6 +2296,130 @@ let check_cyclic_mark () =
   pass
     "cycle-safe deep mark: marking an array whose element contains the array's own cell terminates"
 
+(* ── persistent Map/Set store-mark memoization (the O(N*M) wall) ──
+   The deep mark is memoized per STORE (map_marked/set_marked): the
+   first alias of a large table walks every member, a repeated alias is
+   O(1), so repeatedly fetched/copied resolver/typechecker tables are
+   not re-walked mark after mark (the self-host preflight's quadratic
+   shared-marking zone, mark_nodes ~2.2e10).  The frontier rule keeps
+   the invariant: a member inserted into a marked store is marked at
+   insert, so a later direct write through an alias forks. *)
+let check_store_mark_memoization () =
+  let array_member i = Vm_value.array [| oi i; oi (i + 1) |] in
+  let set = Vm_value.set_of_list (List.init 200 array_member) in
+  Vm_value.arr_mark_shared_value set;
+  let after_first = !Vm_value.prof_mark_nodes in
+  Vm_value.arr_mark_shared_value set;
+  let after_second = !Vm_value.prof_mark_nodes in
+  if after_second - after_first > 3 then
+    fail "Set mark memoization: a repeated mark of a 200-member Set visited %d nodes"
+      (after_second - after_first)
+  else pass "Set mark memoization: a repeated mark of a 200-member Set is O(1)";
+  let map =
+    Vm_value.map_of_pairs
+      (List.init 200 (fun i ->
+           (Vm_value.String (string_of_int i), array_member i)))
+  in
+  Vm_value.arr_mark_shared_value map;
+  let after_third = !Vm_value.prof_mark_nodes in
+  Vm_value.arr_mark_shared_value map;
+  let after_fourth = !Vm_value.prof_mark_nodes in
+  if after_fourth - after_third > 3 then
+    fail "Map mark memoization: a repeated mark of a 200-entry Map visited %d nodes"
+      (after_fourth - after_third)
+  else pass "Map mark memoization: a repeated mark of a 200-entry Map is O(1)";
+  (* the first mark must have reached every member: extracting one and
+     taking the direct write path forks *)
+  let member =
+    match Vm_value.set_elems (match set with Vm_value.Set s -> s | _ -> assert false) with
+    | x :: _ -> (match x with Vm_value.Array a -> a | _ -> assert false)
+    | [] -> assert false
+  in
+  ignore (Vm_value.arr_set_direct member 0 (oi 99));
+  if member.Vm_value.cell.Vm_value.owned then
+    fail "Set mark memoization: the first mark did not unset every member's owned flag"
+  else pass "Set mark memoization: the first mark reached every member";
+  (* insert into a MARKED store marks the incoming member at insert *)
+  let extra = Vm_value.arr_of_array [| oi 7; oi 8 |] in
+  let _ =
+    Vm_value.set_insert
+      (match set with Vm_value.Set s -> s | _ -> assert false)
+      (Vm_value.Array extra)
+  in
+  let updated = Vm_value.arr_set_direct extra 0 (oi 99) in
+  if extra.Vm_value.cell == updated.Vm_value.cell then
+    fail
+      "Set frontier maintenance: an inserted member stayed owned — a later alias could be mutated in place"
+  else
+    pass
+      "Set frontier maintenance: a member inserted into a marked store is marked at insert (the direct write forks)"
+
+(* (g5) the compiler-internal PERSISTENT-MAP SNAPSHOT (ResolvedNames and
+   the other compiler carriers): the immutable store is shared O(1) with
+   every reachable array marked shared, a later insert creates a new
+   store and leaves the snapshot unchanged, and a store carrying an owned
+   region ref is refused fail-closed (sharing it would double-drop the
+   region).  This is the option-3 Clone performance recovery, NOT the
+   public generic Clone. *)
+let check_map_snapshot () =
+  let arr = Vm_value.arr_of_array [| oi 1; oi 2 |] in
+  let empty =
+    match Vm_value.map_empty with Vm_value.Map s -> s | _ -> assert false
+  in
+  let _, store =
+    Vm_value.map_insert_entry empty (Vm_value.String "k") (Vm_value.Array arr)
+  in
+  (match Vm_value.map_snapshot store with
+  | Error e -> fail "map snapshot refused a pure store: %s" e
+  | Ok shared ->
+      if not (shared == store) then
+        fail "map snapshot copied the store instead of sharing it O(1)"
+      else pass "map snapshot shares the immutable pure store O(1)";
+      let updated = Vm_value.arr_set_direct arr 0 (oi 9) in
+      if updated.Vm_value.cell == arr.Vm_value.cell then
+        fail "map snapshot did not deep-mark reachable arrays shared"
+      else
+        pass
+          "map snapshot deep-marks reachable arrays shared (the direct write forks)";
+      let _, store2 =
+        Vm_value.map_insert_entry store (Vm_value.String "k2") (oi 5)
+      in
+      if Vm_value.map_len store2 = 2 && Vm_value.map_len store = 1 then
+        pass
+          "map snapshot persistence: a later insert leaves the snapshot unchanged"
+      else fail "map snapshot persistence broken");
+  let rr = Vm_value.alloc_region_ref (oi 7) in
+  let empty2 =
+    match Vm_value.map_empty with Vm_value.Map s -> s | _ -> assert false
+  in
+  let _, store3 =
+    Vm_value.map_insert_entry empty2 (Vm_value.String "r")
+      (Vm_value.Ref (Vm_value.Region rr))
+  in
+  (match Vm_value.map_snapshot store3 with
+  | Error _ ->
+      pass
+        "map snapshot refuses a store carrying an owned region ref (fail-closed)"
+  | Ok _ ->
+      fail
+        "map snapshot shared a resource-bearing store (double-drop hazard)");
+  (* the incremental purity flag: an insert of an owned ref flips it on
+     the RESULT store; removal is conservative (a false stays false) *)
+  let rr2 = Vm_value.alloc_region_ref (oi 11) in
+  let _, impure =
+    Vm_value.map_insert_entry store (Vm_value.String "r")
+      (Vm_value.Ref (Vm_value.Region rr2))
+  in
+  (match Vm_value.map_snapshot impure with
+  | Error _ ->
+      pass "inserting an owned region ref flips the incremental purity flag"
+  | Ok _ -> fail "an impure insert stayed snapshot-able");
+  let _, after_removal = Vm_value.map_remove impure (Vm_value.String "r") in
+  match Vm_value.map_snapshot after_removal with
+  | Error _ ->
+      pass "purity stays conservative across removal (impure stays impure)"
+  | Ok _ -> fail "removal re-proved purity without a walk"
+
 (* ── the VM-level nested-alias battery (guest-expressible shapes) ── *)
 
 let nested_arr_ty = Type_repr.Fixed_array (i64, 2)
@@ -4164,6 +4288,8 @@ let () =
   check_nested_sharing_tracking ();
   check_push_sharing_maintenance ();
   check_cyclic_mark ();
+  check_store_mark_memoization ();
+  check_map_snapshot ();
   check_nested_array_vm_alias ();
   check_nested_map_vm_alias ();
   check_nested_set_vm_alias ();

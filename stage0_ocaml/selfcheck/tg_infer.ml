@@ -171,6 +171,15 @@ let () =
             fail
               "the expected-type shapes are not clean: %s (see the report above)"
               (String.concat ", " missing)
+          else if not (contains report "UNIFY_BATTERY fails=0") then
+            (* the direct kernel-unify unit battery: F32/F64/StaticStrPtr
+               self-unification plus the exact single mismatch diagnostic
+               for F32-vs-F64, F64-vs-Float and StaticStrPtr-vs-String.
+               A wrong or missing arm reports a nonzero row here even
+               though the Type::F32/F64/StaticStrPtr `when` arms exist
+               (the grep pin cannot see the bodies). *)
+            fail
+              "the kernel unify battery failed (expected `UNIFY_BATTERY fails=0`; see the report above)"
           else if not (contains report "TOTALS errors=") then
             fail "the probe produced no TOTALS row"
           else if merged && not (contains report "IMPLCONF=0") then

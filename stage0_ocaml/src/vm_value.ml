@@ -125,20 +125,32 @@ and map_store = {
   map_back : (t * t) list;             (* NEWEST first — the O(1) insert end *)
   map_index : (t * t) list Int_map.t;  (* structural hash -> bucket *)
   map_count : int;
-  (* Monotone "some stored key/value carries an owned ref": false for a
-     pure-data store, which may therefore be SHARED by Clone (the store
-     record is immutable and every update returns a new store).  Removing
-     an owned entry keeps the flag true (conservative: only ever forces
-     the deep-copy clone fallback, never unsafety). *)
-  map_has_owned : bool;
+  (* The completed deep-sharing marker (the array/agg frontier invariant
+     applied to the persistent store): the first mark walks every stored
+     key/value, a repeated mark is O(1), so repeatedly fetched/copied
+     large tables are not re-walked mark-after-mark.  The flag lives on
+     the STORE object, which updates share: an insert into a marked store
+     marks only the new members and stays marked; an insert/remove on an
+     unmarked store keeps the result unmarked. *)
+  mutable map_marked : bool;
+  (* The incremental PURITY flag for the compiler-internal persistent
+     snapshot (map_snapshot): TRUE only while no stored key/value carries
+     an owned region ref, so sharing the store can never double-drop.
+     Maintained at insert (true && both members pure) and preserved by
+     removal/drain (conservative: removing can never introduce a ref, so
+     a false stays false and a true stays true).  This is the O(1)
+     guard the obligation solver's subst_snapshot/subst_restore need:
+     a per-snapshot has_owned_ref walk over a growing substitution map
+     was the 45B-step / 50 s-per-100M transactional-probe wall. *)
+  map_pure : bool;
 }
 and set_store = {
   set_front : t list;                  (* OLDEST first — the drain/iteration front *)
   set_back : t list;                   (* NEWEST first — the O(1) insert end *)
   set_index : t list Int_map.t;        (* structural hash -> bucket *)
   set_count : int;
-  (* See map_store.map_has_owned. *)
-  set_has_owned : bool;
+  (* See map_store.map_marked. *)
+  mutable set_marked : bool;
 }
 
 (* Reference targets (the audit's real-references rule):
@@ -280,11 +292,23 @@ let rec mark_value_shared (v : t) : unit =
       end
   | Tuple a | Struct a | Enum (_, a) | Closure (_, a) -> mark_agg a
   | Set s ->
-      List.iter mark_value_shared s.set_front;
-      List.iter mark_value_shared s.set_back
+      (* store-level completion marker: the first mark walks the members,
+         a repeated mark is O(1); the flag is set BEFORE recursion so a
+         cycle through the store terminates.  Without this, repeatedly
+         fetched/copied large resolver tables were re-walked mark after
+         mark — the O(N*M) shared-marking zone in the self-host
+         preflight (mark_nodes ~2.2e10). *)
+      if not s.set_marked then begin
+        s.set_marked <- true;
+        List.iter mark_value_shared s.set_front;
+        List.iter mark_value_shared s.set_back
+      end
   | Map m ->
-      List.iter (fun (k, v) -> mark_value_shared k; mark_value_shared v) m.map_front;
-      List.iter (fun (k, v) -> mark_value_shared k; mark_value_shared v) m.map_back
+      if not m.map_marked then begin
+        m.map_marked <- true;
+        List.iter (fun (k, v) -> mark_value_shared k; mark_value_shared v) m.map_front;
+        List.iter (fun (k, v) -> mark_value_shared k; mark_value_shared v) m.map_back
+      end
   | Unit | Bool _ | Int _ | Float32 _ | Float64 _ | Char _ | String _
   | Function _ | RawPtr _ | Ref _ | Null | MovedOut ->
       ()
@@ -626,13 +650,46 @@ let rec has_owned_ref (v : t) : bool =
 let lookup_eq (a : t) (b : t) : bool =
   not (has_owned_ref a) && not (has_owned_ref b) && equal a b
 
+(* ── The compiler-internal persistent-map snapshot (the deferred Clone
+   performance recovery, option 3) ────────────────────────────────────
+
+   The store is IMMUTABLE: every insert/remove/drain returns a NEW store
+   record, so sharing the record is observationally a clone for pure
+   members — at O(1) instead of a deep element-by-element copy.  This is
+   what the compilers' hot carrier (ResolvedNames, six large tables)
+   needs; the PUBLIC generic Map::clone / Set::clone never takes this
+   path (it clones every element through its own Clone implementation —
+   a runtime ownership heuristic cannot prove K::clone/V::clone/T::clone
+   are identity operations).
+
+   Safety: `arr_mark_shared_value` deep-marks the store first, so a
+   later in-place write to ANY array reachable from the shared members
+   forks exactly like any aliased value.  A store whose incremental
+   purity flag is false (a member carries an OWNED region ref) is
+   REFUSED (fail-closed): sharing it would double-drop the region when
+   both holders drop.  The flag makes both the snapshot and a repeated
+   restore O(1) — a per-call walk of a growing substitution map was the
+   obligation solver's 45B-step transactional-probe wall.
+   ResolvedNames' tables and TypeEnv.subst are pure data by
+   construction, so their audited call sites always take the share
+   path. *)
+let map_snapshot (m : map_store) : (map_store, string) result =
+  if not m.map_pure then
+    Error
+      "map snapshot: the store carries an owned region ref (sharing would \
+       double-drop the region)"
+  else begin
+    arr_mark_shared_value (Map m);
+    Ok m
+  end
+
 (* ── The store surface (see the store note at the type) ────────────── *)
 
 let map_empty : t =
-  Map { map_front = []; map_back = []; map_index = Int_map.empty; map_count = 0; map_has_owned = false }
+  Map { map_front = []; map_back = []; map_index = Int_map.empty; map_count = 0; map_marked = true; map_pure = true }
 
 let set_empty : t =
-  Set { set_front = []; set_back = []; set_index = Int_map.empty; set_count = 0; set_has_owned = false }
+  Set { set_front = []; set_back = []; set_index = Int_map.empty; set_count = 0; set_marked = true }
 
 let bucket_mem_key (bucket : (t * t) list) (key : t) : (t * t) option =
   List.find_opt (fun (k, _) -> lookup_eq k key) bucket
@@ -649,6 +706,14 @@ let set_seq (s : set_store) : t list = s.set_front @ List.rev s.set_back
    (the displaced value is reported to the caller for the language's
    Option[old V]).  A fresh key is appended at the back (O(1)). *)
 let map_insert_entry (m : map_store) (key : t) (value : t) : t option * map_store =
+  (* a MARKED store stays marked: inserted members are marked before they
+     join it; an unmarked store stays unmarked (its full walk covers
+     them).  Marking at insert is what keeps the completion invariant
+     true across the persistent update. *)
+  if m.map_marked then begin
+    mark_value_shared key;
+    mark_value_shared value
+  end;
   let h = value_hash key in
   let bucket = match Int_map.find_opt h m.map_index with Some b -> b | None -> [] in
   match bucket_mem_key bucket key with
@@ -667,8 +732,9 @@ let map_insert_entry (m : map_store) (key : t) (value : t) : t option * map_stor
           map_back = List.map replace m.map_back;
           map_index = Int_map.add h (List.map replace bucket) m.map_index;
           map_count = m.map_count;
-          map_has_owned =
-            m.map_has_owned || has_owned_ref value;
+          map_marked = m.map_marked;
+          map_pure =
+            m.map_pure && (not (has_owned_ref key)) && not (has_owned_ref value);
         } )
   | None ->
       let new_pair = (key, value) in
@@ -678,8 +744,9 @@ let map_insert_entry (m : map_store) (key : t) (value : t) : t option * map_stor
           map_back = new_pair :: m.map_back;
           map_index = Int_map.add h (new_pair :: bucket) m.map_index;
           map_count = m.map_count + 1;
-          map_has_owned =
-            m.map_has_owned || has_owned_ref key || has_owned_ref value;
+          map_marked = m.map_marked;
+          map_pure =
+            m.map_pure && (not (has_owned_ref key)) && not (has_owned_ref value);
         } )
 
 let map_insert (m : map_store) (key : t) (value : t) : map_store =
@@ -715,7 +782,8 @@ let map_remove (m : map_store) (key : t) : (t * t) option * map_store =
           map_back = List.filter drop_victim m.map_back;
           map_index = index';
           map_count = m.map_count - 1;
-          map_has_owned = m.map_has_owned;
+          map_marked = m.map_marked;
+          map_pure = m.map_pure;
         } )
 
 let map_len (m : map_store) : int = m.map_count
@@ -754,13 +822,17 @@ let map_drain_one (m : map_store) : (t * t) option * map_store =
       in
       (Some (k, v),
        { map_front = rest; map_back = back; map_index = index';
-         map_count = m.map_count - 1; map_has_owned = m.map_has_owned })
+         map_count = m.map_count - 1; map_marked = m.map_marked;
+         map_pure = m.map_pure })
 
 (* insert with the std replacement contract: an existing element is
    REPLACED by the incoming item (the caller's moved value becomes the
    stored element) keeping its position; the presence Bool reports
    whether it already existed. *)
 let set_insert_entry (s : set_store) (item : t) : bool * t option * set_store =
+  if s.set_marked then begin
+    mark_value_shared item
+  end;
   let h = value_hash item in
   let bucket = match Int_map.find_opt h s.set_index with Some b -> b | None -> [] in
   match List.find_opt (fun e -> lookup_eq e item) bucket with
@@ -775,7 +847,7 @@ let set_insert_entry (s : set_store) (item : t) : bool * t option * set_store =
           set_back = List.map replace s.set_back;
           set_index = Int_map.add h (List.map replace bucket) s.set_index;
           set_count = s.set_count;
-          set_has_owned = s.set_has_owned || has_owned_ref item;
+          set_marked = s.set_marked;
         } )
   | None ->
       ( false,
@@ -785,7 +857,7 @@ let set_insert_entry (s : set_store) (item : t) : bool * t option * set_store =
           set_back = item :: s.set_back;
           set_index = Int_map.add h (item :: bucket) s.set_index;
           set_count = s.set_count + 1;
-          set_has_owned = s.set_has_owned || has_owned_ref item;
+          set_marked = s.set_marked;
         } )
 
 let set_insert (s : set_store) (item : t) : set_store =
@@ -817,7 +889,7 @@ let set_remove (s : set_store) (item : t) : (t option * set_store) =
               set_back = List.filter drop_victim s.set_back;
               set_index = index';
               set_count = s.set_count - 1;
-              set_has_owned = s.set_has_owned;
+              set_marked = s.set_marked;
             } ))
 
 let set_len (s : set_store) : int = s.set_count
@@ -851,7 +923,7 @@ let set_drain_one (s : set_store) : (t option * set_store) =
       in
       (Some x,
        { set_front = rest; set_back = back; set_index = index';
-         set_count = s.set_count - 1; set_has_owned = s.set_has_owned })
+         set_count = s.set_count - 1; set_marked = s.set_marked })
 
 (* ── Deterministic byte serialization (audit: pointer deref) ─────────
 

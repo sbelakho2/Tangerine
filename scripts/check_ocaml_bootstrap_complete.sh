@@ -38,20 +38,23 @@ fi
 cd stage0_ocaml
 dune build
 
-# Harness timeout calibration (shared with check_ocaml_seed_health.sh;
-# re-measured 2026-09-27 on the development host, tree at the
-# post-mono-mark-memoization seed + the active workstream changes, under
-# background load): tg_bootstrap_gate measured 2759.9 s wall (sum of the
-# driver phase prints: closure front end 1419.5 s, lower 22.2 s, mono
-# 53.7 s, reachable-host 0.2 s, closure check 0.0 s, layout fold 0.0 s,
-# VM run 1264.3 s); the cap is the measurement x 1.5 rounded up to the
-# next 60 s (4139.9 -> 4140 s), matching the health script's calibrated
-# gate cap (the host carries unrelated background load).  The pre-fix
-# 1860 s cap is superseded: the frozen tree stalled in the post-mono
-# segment (the deep-share mark's redundant aggregate re-walks) and the
-# fix lands the full closure — the cap must cover the RUN, not the
-# stall.  A cap is a bound, never a skip.  Re-measure when the closure
-# grows materially.
+# Harness timeout calibration (shared with check_ocaml_seed_health.sh).
+# The 2026-09-27 measurement (tg_bootstrap_gate 2759.9 s wall: closure
+# front end 1419.5 s, lower 22.2 s, mono 53.7 s, reachable-host 0.2 s,
+# VM run 1264.3 s) belongs to a tree BEFORE the current algorithm: the
+# in-VM self-host preflight then entered a quadratic shared-marking zone
+# and did NOT fit the 30e9-step VM default (driver.ml records the
+# ~43.5e9 frontier), so the "fix lands the full closure" narrative that
+# used to live here described a completion this algorithm state cannot
+# reproduce.  The current pass replaced the redundant deep re-walks with
+# the memoized Map/Set store markers AND removed the unsafe O(1)
+# pure-data Clone fast path (generic Map::clone/Set::clone clone every
+# element again), so BOTH the wall time and the VM step count must be
+# re-measured from a completed cold and warm run before the caps mean
+# anything.  4140 s stays as the provisional upper bound (a cap is a
+# bound, never a skip, and it still fails closed); it is NOT evidence of
+# a completed route.  Re-measure and re-pin both budgets only after the
+# preflight actually completes.
 # NOTE (audit P0-2 / timeout recalibration): at zero debt the gate runs
 # TWO kernel VM executions:
 #   VM A: the artifact corpus compile+run (native codegen/link evidence)

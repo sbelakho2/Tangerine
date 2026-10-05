@@ -253,9 +253,8 @@ type adapter = {
    strings, plain records/enums/arrays/sets/maps of them) compare with
    the plain structural equality. *)
 (* The lookup equality now lives beside the value type (vm_value.ml) so
-   the hash-indexed Map/Set stores can use it without a host dependency;
-   the host keeps these aliases for its own containment decisions. *)
-let has_owned_ref : Vm_value.t -> bool = Vm_value.has_owned_ref
+    the hash-indexed Map/Set stores can use it without a host dependency;
+    the host keeps this alias for its own containment decisions. *)
 let lookup_eq (a : Vm_value.t) (b : Vm_value.t) : bool = Vm_value.lookup_eq a b
 
 let arg_mismatch expected : (Vm_value.t, string) result =
@@ -873,7 +872,14 @@ let errno_of_fs_error (e : Host_fs.resolve_error) : int =
    device facilities), never a general filesystem namespace.  Every
    other absolute guest path is a VIRTUAL-ROOT absolute path — the same
    spelling getcwd() returns ("/sub") — so /etc/passwd cannot bypass the
-   virtual root. *)
+   virtual root.
+
+   The capability is OPERATION-SPECIFIC, not pathname-wide: the
+   resolvers default to refusing a host device (EACCES) and only
+   open/stat/lstat/readlink pass ~allow_dev:true.  unlink, rmdir, mkdir,
+   chmod, rename (source and destination) and symlink (link path) never
+   opt in, so a guest cannot reach a real host device node through a
+   mutating syscall even in a privileged/container bootstrap context. *)
 let host_dev_facility (path : string) : bool =
   match path with
   | "/dev/null" | "/dev/zero" | "/dev/full" | "/dev/random" | "/dev/urandom"
@@ -881,10 +887,11 @@ let host_dev_facility (path : string) : bool =
       true
   | _ -> false
 
-let host_real_path (t : t) (path : string) ~(for_create : bool) :
-    (string, int) result =
+let host_real_path ?(allow_dev = false) (t : t) (path : string)
+    ~(for_create : bool) : (string, int) result =
   if String.length path > 0 && path.[0] = '/' then begin
-    if host_dev_facility path then Ok path
+    if host_dev_facility path then
+      if allow_dev then Ok path else Error errno_acces
     else
       let segs =
         String.split_on_char '/' path |> List.filter (fun s -> s <> "")
@@ -909,17 +916,24 @@ let host_real_path (t : t) (path : string) ~(for_create : bool) :
     | Ok real -> Ok real
     | Error e -> Error (errno_of_fs_error e)
 
-(* NoFollowFinal: containment is proven on the canonicalized PARENT; the
-   final component is a clean lexical name that is NOT resolved, so
-   lstat/readlink/unlink/rename-source/rmdir operate on the directory
-   entry the guest named (POSIX), never on a symlink's target. *)
-let host_real_path_no_follow (t : t) (path : string) : (string, int) result =
+(* TRUE NoFollowFinal: containment is proven on the canonicalized PARENT
+   plus a clean lexical final name.  The final component is never
+   resolved — not even lstat/realpath'd — so dangling and escaping
+   symlinks can be lstat'd, readlink'd, renamed and unlinked as the
+   directory entries they are (following their target is the business of
+   the follow-final operations, which apply their own containment).
+   allow_dev defaults to false: no-follow callers are entry operations
+   (lstat/readlink aside, the mutating ones), so host devices stay
+   refused unless the caller explicitly opts in. *)
+let host_real_path_no_follow ?(allow_dev = false) (t : t) (path : string) :
+    (string, int) result =
   let resolve_parent_fn =
     if String.length path > 0 && path.[0] = '/' then
       Host_fs.resolve_parent_abs_e
     else Host_fs.resolve_parent_e
   in
-  if String.length path > 0 && path.[0] = '/' && host_dev_facility path then Ok path
+  if String.length path > 0 && path.[0] = '/' && host_dev_facility path then
+    if allow_dev then Ok path else Error errno_acces
   else
     let segs =
       String.split_on_char '/' path |> List.filter (fun s -> s <> "")
@@ -927,24 +941,45 @@ let host_real_path_no_follow (t : t) (path : string) : (string, int) result =
     match resolve_parent_fn t.fs segs with
     | Ok (parent_real, name) ->
         if name = "." || name = ".." then Error errno_acces
-        else
-          let full = Filename.concat parent_real name in
-          (* A symlink as the final entry is operated on AS AN ENTRY, but
-             only when its target stays inside the virtual root: the
-             sandbox refuses to act on links that point outside
-             (fail-closed, consistent with Host_fs). *)
-          (match Unix.lstat full with
-          | exception Unix.Unix_error (Unix.ENOENT, _, _) -> Ok full
-          | exception Unix.Unix_error _ -> Error errno_acces
-          | st ->
-              if st.Unix.st_kind = Unix.S_LNK then (
-                try
-                  let target = Unix.realpath full in
-                  if Host_fs.contained t.fs target then Ok full
-                  else Error errno_acces
-                with Unix.Unix_error _ -> Error errno_acces)
-              else Ok full)
+        else Ok (Filename.concat parent_real name)
     | Error e -> Error (errno_of_fs_error e)
+
+(* A guest-absolute symlink target is VIRTUAL-root absolute, exactly like
+   every other absolute guest path: store the physical path under the
+   virtual root so `open` on the link follows it through the same
+   namespace (a literal "/safe.txt" would point at the host root and look
+   like an escape).  Lexical mapping only: targets may not exist yet. *)
+let virtual_abs_physical (t : t) (path : string) : (string, int) result =
+  let segs =
+    String.split_on_char '/' path |> List.filter (fun s -> s <> "")
+  in
+  let hygienic = ref true in
+  List.iter
+    (fun seg -> if seg = "." || seg = ".." then hygienic := false)
+    segs;
+  if not !hygienic then Error errno_acces
+  else Ok (List.fold_left Filename.concat t.fs.Host_fs.repo_root segs)
+
+(* The inverse of virtual_abs_physical for guest-visible readlink: an
+   absolute stored target under the canonical root is re-spelled as a
+   VIRTUAL-root absolute path ("/sub/file"), so create_symlink("/x")
+   then readlink round-trips through the same namespace open/getcwd use
+   instead of leaking the host repository root.  Relative targets and
+   outside-root targets (pre-existing host links) are returned verbatim:
+   readlink is a no-follow entry read and must work on dangling and
+   escaping links. *)
+let virtual_abs_guest (t : t) (stored : string) : string =
+  if
+    String.length stored > 0 && stored.[0] = '/'
+    && Host_fs.contained t.fs stored
+  then
+    let root = t.fs.Host_fs.repo_root in
+    if stored = root then "/"
+    else
+      let prefix = root ^ Filename.dir_sep in
+      let plen = String.length prefix in
+      "/" ^ String.sub stored plen (String.length stored - plen)
+  else stored
 
 let open_flags_of_raw ~(guest_is_darwin : bool) (flags : int) :
     Unix.open_flag list =
@@ -973,7 +1008,7 @@ let open_flags_of_raw ~(guest_is_darwin : bool) (flags : int) :
 let host_open (t : t) (path : string) (flags : int) (mode : int) : int =
   let create_bit = if t.guest_is_darwin then 0x200 else 0x40 in
   let for_create = flags land create_bit <> 0 in
-  match host_real_path t path ~for_create with
+  match host_real_path ~allow_dev:true t path ~for_create with
   | Error e -> -e
   | Ok real -> (
       try
@@ -1219,8 +1254,8 @@ let host_stat (t : t) (path : string) (kind : [ `Stat | `Lstat ]) :
     (Unix.LargeFile.stats, int) result =
   let resolved =
     match kind with
-    | `Stat -> host_real_path t path ~for_create:false
-    | `Lstat -> host_real_path_no_follow t path
+    | `Stat -> host_real_path ~allow_dev:true t path ~for_create:false
+    | `Lstat -> host_real_path_no_follow ~allow_dev:true t path
   in
   match resolved with
   | Error e -> Error (-e)
@@ -1272,16 +1307,26 @@ let host_symlink (t : t) (target : string) (link : string) : int =
   match host_real_path_no_follow t link with
   | Error e -> -e
   | Ok real -> (
-      try
-        Unix.symlink target real;
-        0
-      with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e)
+      let physical_target =
+        if
+          String.length target > 0 && target.[0] = '/'
+          && not (host_dev_facility target)
+        then virtual_abs_physical t target
+        else Ok target
+      in
+      match physical_target with
+      | Error e -> -e
+      | Ok stored -> (
+          try
+            Unix.symlink stored real;
+            0
+          with Unix.Unix_error (e, _, _) -> -errno_of_unix_error e))
 
 let host_readlink (t : t) (path : string) : (string, int) result =
-  match host_real_path_no_follow t path with
+  match host_real_path_no_follow ~allow_dev:true t path with
   | Error e -> Error e
   | Ok real -> (
-      try Ok (Unix.readlink real)
+      try Ok (virtual_abs_guest t (Unix.readlink real))
       with Unix.Unix_error (e, _, _) -> Error (-errno_of_unix_error e))
 
 let host_rename (t : t) (from_ : string) (to_ : string) : int =
@@ -2239,18 +2284,6 @@ let binding_manifest : binding list =
            match args with
            | [||] -> Ok Vm_value.map_empty
            | _ -> arg_mismatch "no arguments"));
-    intrinsic_binding "__intrinsic_set_clone_try"
-      (adapter_raw (lets [ set_of p0 ]) (option_of (set_of p0))
-         (fun _ args ->
-           match args with
-           | [| Vm_value.Set store |] ->
-               if store.Vm_value.set_has_owned then
-                 Ok (Vm_value.Enum (1, Vm_value.agg [||]))
-               else
-                 Ok
-                   (Vm_value.Enum
-                      (0, Vm_value.agg [| Vm_value.Set store |]))
-           | _ -> arg_mismatch "(Set)"));
     intrinsic_binding "__intrinsic_set_contains"
       (adapter_raw (lets [ set_of p0; p0 ]) ty_bool (fun _ args ->
            (* pure read: the containment decision uses lookup_eq — a
@@ -2388,27 +2421,6 @@ let binding_manifest : binding list =
            | [| Vm_value.Map store; key |] ->
                Ok (Vm_value.Bool (Vm_value.map_mem store key))
            | _ -> arg_mismatch "(Map, key)"));
-    intrinsic_binding "__intrinsic_map_clone_try"
-      (adapter_raw (lets [ map_of p0 p1 ])
-         (option_of (map_of p0 p1)) (fun _ args ->
-           (* A PURE-DATA store may be shared: its record is immutable and
-              every update returns a NEW store, so the clone is
-              independent; marking the stored keys/values shared keeps
-              nested-array writes forking (COW), and destroy/drain are
-              resource-free.  A store carrying OWNED refs must keep the
-              deep per-entry copy (shared drops would double-free), so it
-              returns None and the std fallback clones explicitly.  This
-              turns the type checker's ResolvedNames clones from
-              deep-copy+rehash into a share + walk. *)
-           match args with
-           | [| Vm_value.Map store |] ->
-               if store.Vm_value.map_has_owned then
-                 Ok (Vm_value.Enum (1, Vm_value.agg [||]))
-               else
-                 Ok
-                   (Vm_value.Enum
-                      (0, Vm_value.agg [| Vm_value.Map store |]))
-           | _ -> arg_mismatch "(Map)"));
     intrinsic_binding "__intrinsic_map_get"
       (adapter_raw (lets [ map_of p0 p1; p0 ]) (option_of p1) (fun _ args ->
            (* pure read (surface-bound V: Copy — the returned value
@@ -2476,6 +2488,21 @@ let binding_manifest : binding list =
                  (Vm_value.Int
                     (Int_value.of_int64 ~width:64 ~signed:true
                        (Int64.of_int (Vm_value.map_len store))))
+            | _ -> arg_mismatch "(Map)"));
+    intrinsic_binding "__intrinsic_map_clone"
+      (adapter_raw (lets [ map_of p0 p1 ]) (map_of p0 p1) (fun _ args ->
+           (* The compiler-internal PERSISTENT-MAP SNAPSHOT (see
+              vm_value.ml map_snapshot): O(1) share of the immutable
+              store with every reachable array deep-marked shared; a
+              store carrying an owned region ref is refused fail-closed
+              (sharing would double-drop).  This is NOT the public
+              generic Map::clone contract — the public clone clones
+              every element through its own Clone implementation. *)
+           match args with
+           | [| Vm_value.Map store |] -> (
+               match Vm_value.map_snapshot store with
+               | Ok store -> Ok (Vm_value.Map store)
+               | Error m -> Error m)
            | _ -> arg_mismatch "(Map)"));
     intrinsic_binding "__intrinsic_map_entries"
       (adapter_raw (lets [ map_of p0 p1 ])

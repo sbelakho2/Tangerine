@@ -3344,25 +3344,77 @@ type mono_outcome = {
    fit the 30e9-step default.
 
    Progress after the 2026-10-04 fixes: region/buffer pooling, host-call
-   bridge lifetime, value-backed computed refs and O(1) pure-data Map/Set
-   clones bounded the memory (RSS 3-9 GB under the 12 GB cap) and carried
-   the VM through the former 42.8e9 stall; the missing F32/F64/
-   StaticStrPtr arms in the kernel `unify` removed the 43.4e9 `vm: abort`.
-   The run then reaches ~43.5e9 and enters a QUADRATIC SHARED-MARKING zone
-   in the self-host type checker: dt degrades from ~5 s to 52-580 s per
-   100M steps with cumulative mark_nodes ~2.2e10 (arr_mark_shared_value
-   deep walks on repeatedly fetched/copied large aggregates).  It still
-   progresses, but the remaining wall is now kernel-level
-   copy/mark amplification, not VM memory, not the proof architecture and
-   not a step-cap tuning problem.
+   bridge lifetime, value-backed computed refs bounded the memory (RSS
+   3-9 GB under the 12 GB cap) and carried the VM through the former
+   42.8e9 stall; the missing F32/F64/StaticStrPtr arms in the kernel
+   `unify` removed the 43.4e9 `vm: abort`.  The run then reached ~43.5e9
+   and entered a QUADRATIC SHARED-MARKING zone (dt degrading from ~5 s
+   to 52-580 s per 100M steps, cumulative mark_nodes ~2.2e10): repeated
+   deep marks re-walked the same large Map/Set tables because only array
+   cells and aggregate payloads carried completion markers.
 
-   Do NOT raise GC headroom (space_overhead=400 grew the live heap to
-   15.9e3 MB / 28 GB RSS and OOM-crashed the host) and do NOT blind-raise
-   the cap; the default stays 30e9 so runaways fail fast.  The next pass
-   is kernel-side: reduce whole-aggregate copies/marks in the type
-   checker's hot paths (the beacon's mark_calls/mark_nodes deltas plus the
-   per-VM live telemetry and TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB ceiling are
-   the measurement tools). *)
+   The latest pass fixes that wall at the source: Map/Set stores now
+   carry a memoized deep-mark completion flag (`map_marked`/`set_marked`,
+   set before recursion and maintained across every persistent update —
+   a member inserted into a marked store is marked at insert), and the
+   UNSAFE O(1) pure-data Clone fast path (`__intrinsic_map_clone_try` /
+   `__intrinsic_set_clone_try`, which shared a store whenever no
+   Ref(Region) ownership was found — a runtime heuristic that cannot
+   prove K::clone/V::clone/T::clone are identity operations) is removed,
+   so generic Map::clone / Set::clone again clone every element through
+   its own Clone implementation, exactly once per element straight out
+   of the live record slots (no intermediate entries_cloned Vec, whose
+   cloned copy plus the result's was the first post-marking RSS wall:
+   the 60e9/12 GiB profile tripped inside derived::ResolvedNames::clone
+   at ~42.8e9 steps with the quadratic mark gone).  The per-element
+   clone cost on the hot tables now needs the safe recovery: a
+   compiler-proven Copy / TriviallyCloneable property or an internal
+   persistent-map snapshot facility (future work), never a runtime
+   ownership-content test.
+
+   Measured 2026-10-04 with both fixes at a 60e9-step / 12288 MiB RSS
+   bound: the quadratic zone is GONE (mark_nodes ~4.0e9 total at the
+   ~42.8e9 frontier, mark_calls/mark_nodes ~1.1, dt ~7 s per 100M
+   steps; the old profile degraded to 52-580 s per 100M with ~2.2e10
+   marks), and the run now trips the RSS guard inside
+   derived::ResolvedNames::clone (type_check_typed_mode ->
+   ResolvedNames::clone -> Map::clone) at ~42.8e9 steps with live
+   ~6.3e3 MB and a between-beacon RSS spike just over 12 GiB — the
+   deep element clones retained by that hot path, not re-walking.  The
+   preflight therefore STILL does not complete under the 12 GiB bound;
+   do not repin the step/wall budgets or authorize the final gate until
+   the safe clone recovery lands and a cold and warm run complete.
+
+   Second measured pass (2026-10-05), after the safe recovery landed:
+   the compiler-internal PERSISTENT-MAP SNAPSHOT facility
+   (__intrinsic_map_clone -> vm_value.map_snapshot: O(1) share of the
+   immutable store, reachable arrays deep-marked shared, an
+   incrementally-maintained purity flag refuses a store carrying an
+   owned region ref fail-closed) now backs ResolvedNames/StableIdMap
+   clone and the obligation solver's subst_snapshot/subst_restore.  The
+   ownership engine no longer computes the never-read
+   Transferable/Shareable properties per node; unify's primitive bridge
+   and normalize_adt_for_unify read names through the narrow
+   type_def_name_is accessor instead of deep-copying whole TypeDefs;
+   failed candidate probes suppress the discarded mismatch-diagnostic
+   construction; and prune_var compresses only real var chains (the
+   unconditional re-insert rebuilt the whole persistent pair list per
+   lookup).  Measured with OCAMLRUNPARAM=o=40 at 80e9/12 GiB: the run
+   passes every former 42.8-46B trap at RSS ~6.4e3 MB / live ~4.3e3 MB
+   and reaches ~50e9 steps, where the remaining wall is the obligation
+   solver's repeated candidate scanning (dt 50-200 s per 100M steps,
+   CPU-bound, memory flat).  Defaults stay 30e9/12288 until a completed
+   cold and warm run measures the true completion + margin; the
+   positive-only obligation memo considered there still needs a
+   substitution-side-effect audit before it can land.
+
+   The default stays 30e9 until a COMPLETED cold and warm run is
+   measured; do NOT raise GC headroom (space_overhead=400 grew the live
+   heap to 15.9e3 MB / 28 GB RSS and OOM-crashed the host) and do NOT
+   blind-raise the cap.  The beacon's mark_calls/mark_nodes deltas plus
+   the per-VM live telemetry and TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB
+   ceiling are the measurement tools; re-pin both budgets only from an
+   actual completion plus margin. *)
 (* (recalibrated bootstrap caps): the bootstrap VM budget is overridable via
    the environment so deep corpus+stdlib compiles can be given a larger
    budget without a rebuild; the defaults stay bounded, fail-fast guards. *)
