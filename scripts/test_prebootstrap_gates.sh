@@ -449,6 +449,16 @@ else
 fi
 check_pin "the final gate installs the RSS ceiling unconditionally" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB=12288'
 check_pin "the authorization gate accepts no RSS override" scripts/check_ocaml_bootstrap_complete.sh   'accepts NO resource-budget override'
+check_pin "authorization pins the VM step budget" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_STEPS=30000000000'
+check_pin "authorization pins the VM host-call budget" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS=1000000000'
+check_pin "authorization pins the VM alloc budget" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_ALLOC=8589934592'
+check_pin "authorization pins the outer gate timeout" scripts/check_ocaml_bootstrap_complete.sh   'GATE_TIMEOUT_S=4140'
+check_pin "the profile entry point is explicitly non-authorizing" scripts/profile_ocaml_bootstrap.sh   'NON-AUTHORIZING'
+if grep -q 'BOOTSTRAP COMPLETE: PASS' "$ROOT/scripts/profile_ocaml_bootstrap.sh"; then
+  bad "the profile entry point can emit an authorization sentinel"
+else
+  pass "the profile entry point cannot emit an authorization sentinel"
+fi
 check_pin "authorization refuses unbounded hosts (no escape)" scripts/check_ocaml_bootstrap_complete.sh   'unbounded authorization path'
 check_pin "the env gate rejects unbounded final runs" scripts/prebootstrap_env_gate.sh   'TG_ALLOW_UNBOUNDED_FINAL'
 check_pin "RSS measurement is declared Linux-only" stage0_ocaml/src/vm.ml   'Measurement is Linux-only'

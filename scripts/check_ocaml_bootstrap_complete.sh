@@ -69,7 +69,16 @@ dune build
 # per-phase wall times, including the preflight VM run.
 # An explicit override is for MEASUREMENT runs only (record the gate's
 # instrumented phase lines, then re-pin the default from the numbers).
-GATE_TIMEOUT_S="${TG_GATE_TIMEOUT_S:-4140}"
+GATE_TIMEOUT_S=4140
+# Resource-affecting VM budgets are PINNED for authorization: ambient
+# TANGERINE_BOOTSTRAP_VM_MAX_* / TG_GATE_TIMEOUT_S cannot alter a
+# reproducible authorization run.  Bounded profiling measures the
+# selfcheck directly with explicit env, never through this script, so no
+# measurement configuration can emit an authorization PASS.  Re-pin the
+# step/host-call/alloc limits only from a completed cold+warm calibration.
+export TANGERINE_BOOTSTRAP_VM_MAX_STEPS=30000000000
+export TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS=1000000000
+export TANGERINE_BOOTSTRAP_VM_MAX_ALLOC=8589934592
 # The final authorization ALWAYS installs the measured RSS ceiling on
 # Linux and accepts NO resource-budget override: an ambient environment
 # cannot disable the guard (0 = disabled), raise it, or turn this script
