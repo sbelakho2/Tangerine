@@ -38,10 +38,10 @@ use tg_compiler::parser::{parse, diag_has_errors, Diagnostic}
 use tg_compiler::ast::{assign_node_ids, Program, Item, ItemId, ModuleId, Module, Crate, UseDecl, Span}
 use tg_compiler::token::{span_dummy}
 use tg_compiler::resolver::{resolve_names}
-use tg_compiler::ids::{TypeId, TraitId, GenericParamId, DefId, ModuleId, ClosureId}
-use tg_compiler::types::{type_env_new, type_check_typed, TypeCheckResult, type_display, unify, TypeEnv, ImplInfo, TraitRefTemplate, impl_candidate_indices, register_impl_candidate_index, subst_snapshot, subst_restore, errors_truncate, try_head_unify, impl_head_bucket, TypeVarId}
+use tg_compiler::ids::{TypeId, TraitId, GenericParamId, DefId, ModuleId, ClosureId, def_id_numeric}
+use tg_compiler::types::{type_env_new, type_check_typed, TypeCheckResult, type_display, unify, TypeEnv, ImplInfo, TraitRefTemplate, impl_candidate_indices, register_impl_candidate_index, subst_snapshot, subst_restore, errors_truncate, try_head_unify, impl_head_bucket, TypeVarId, GlobalBinding}
 use tg_compiler::compiler_core::{default_options, apply_cfg_elimination, prepare_parsed, analyze_parsed}
-use tg_compiler::mir::{lower_to_mir, verify_mir, MirProgram}
+use tg_compiler::mir::{lower_to_mir, verify_mir, MirProgram, MirRvalue, MirOperand, MirStatementKind, MirRvalueKind, MirOperandKind, MirConstantKind}
 use tg_compiler::access_check::{access_check, AccessError}
 use tg_compiler::resource_check::{resource_check, build_typed_cfg, analysis_context_new, ResourceError, engine_env_empty}
 
@@ -1583,6 +1583,187 @@ def infer_probe_default_field_battery(inout report: String) -> Int
 end
 
 # ———————————————————————————————————————————————————————————————
+# (semantic field defaults): the declaration-bound default battery.
+#
+# Shape (the seed's tg_struct_literals F/G program): `const X: Int = 1`,
+# `struct Inner v: Int = 2`, `struct Outer n: Int = Inner {}.v + X`, and a
+# `main` that declares a LOCAL `X: Int = 99` before constructing `Outer {}`.
+# The default's `X` must resolve to the DECLARED const, never the use-site
+# local (the pre-fix capture evaluated the field to 101 instead of 3).
+#
+# Two witnesses, both required:
+#   1. the checker's typed_global_bindings record for the default's X node
+#      is the GbConst identity — exactly one global binding in the program,
+#      and it is a const (a local capture records no global binding);
+#   2. the lowered `main` contains a MirStaticRef to that exact DefId — the
+#      MIR consumption is identity-keyed; with the consumption removed the
+#      use-site local wins and no static ref to the const appears.
+# The battery fails if EITHER the recording or the consumption is removed.
+# ———————————————————————————————————————————————————————————————
+def infer_probe_operand_has_static_ref(op: MirOperand, did_num: Int) -> Bool
+  match op.kind
+  when MirOperandKind::MirConstant(c) then
+    match c.kind
+    when MirConstantKind::MirStaticRef(did) then def_id_numeric(&did) == did_num
+    when MirConstantKind::MirStaticAddr(did) then def_id_numeric(&did) == did_num
+    when _ then false
+    end
+  when _ then false
+  end
+end
+
+def infer_probe_rvalue_has_static_ref(rv: MirRvalue, did_num: Int) -> Bool
+  match rv.kind
+  when MirRvalueKind::MirMove(op) then infer_probe_operand_has_static_ref(op, did_num)
+  when MirRvalueKind::MirBinOp(_, l, r) then infer_probe_operand_has_static_ref(l, did_num) || infer_probe_operand_has_static_ref(r, did_num)
+  when MirRvalueKind::MirUnOp(_, o) then infer_probe_operand_has_static_ref(o, did_num)
+  when MirRvalueKind::MirAggregate(_, ops) then
+    var ag_found = false
+    for o in ops do
+      if infer_probe_operand_has_static_ref(o, did_num) then ag_found = true end
+    end
+    ag_found
+  when MirRvalueKind::MirCast(_, o2, _) then infer_probe_operand_has_static_ref(o2, did_num)
+  when MirRvalueKind::MirRepeat(a, b) then infer_probe_operand_has_static_ref(a, did_num) || infer_probe_operand_has_static_ref(b, did_num)
+  when _ then false
+  end
+end
+
+# Scan one lowered function's statements for a MirStaticRef to `did_num`.
+# Only the operand-bearing statement forms are walked (the assignment
+# rvalue recursively); the default's read is stored through a MirAssign
+# whose rvalue is the binary operation carrying the static-ref operand.
+def infer_probe_mir_has_static_ref(mir: MirProgram, fn_name: String, did_num: Int) -> Bool
+  var found = false
+  var fi = 0
+  while fi < mir.functions.len() do
+    let f = mir.functions[fi]
+    if f.name == fn_name || f.name.ends_with("::" + fn_name) then
+      var bi = 0
+      while bi < f.blocks.len() do
+        var si = 0
+        while si < f.blocks[bi].statements.len() do
+          let st = f.blocks[bi].statements[si]
+          match st.kind
+          when MirStatementKind::MirAssign(_, rv) then
+            if infer_probe_rvalue_has_static_ref(rv, did_num) then found = true end
+          when MirStatementKind::MirContractCheck(_, op) then
+            if infer_probe_operand_has_static_ref(op, did_num) then found = true end
+          when MirStatementKind::MirEffectRecord(_, op) then
+            if infer_probe_operand_has_static_ref(op, did_num) then found = true end
+          when MirStatementKind::MirEffectPerform(_, _, _, a, bop) then
+            if infer_probe_operand_has_static_ref(a, did_num) || infer_probe_operand_has_static_ref(bop, did_num) then found = true end
+          when MirStatementKind::MirEffectFrameEnter(_, _, _, _, op) then
+            if infer_probe_operand_has_static_ref(op, did_num) then found = true end
+          when _ then ()
+          end
+          si = si + 1
+        end
+        bi = bi + 1
+      end
+    end
+    fi = fi + 1
+  end
+  found
+end
+
+def infer_probe_semantic_default_battery(inout report: String) -> Int
+  var fails = 0
+  let source = "const X: Int = 1\n\nstruct Inner\n  v: Int = 2\nend\n\nstruct Outer\n  n: Int = Inner {}.v + X\nend\n\ndef main() -> Int\n  let X: Int = 99\n  let o = Outer {}\n  o.n\nend\n"
+  let parsed = parse(tokenize(source.clone(), "semantic_default"))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "SEMANTIC_DEFAULT_BATTERY: parse failed\n"
+    return 1
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Err(errs) then
+    report = report + "SEMANTIC_DEFAULT_BATTERY: resolve failed=" + errs.len().to_string() + "\n"
+    fails = fails + 1
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    if result.errors.len() != 0 then
+      report = report + "SEMANTIC_DEFAULT_BATTERY: typecheck errors=" + result.errors.len().to_string() + "\n"
+      var ei = 0
+      while ei < result.errors.len() && ei < 4 do
+        report = report + "    TE " + result.errors[ei].message.clone() + "\n"
+        ei = ei + 1
+      end
+      fails = fails + 1
+    end
+    var const_bindings = 0
+    var other_bindings = 0
+    var x_did_num = -1
+    let entries = env.typed_global_bindings.entries()
+    var bi = 0
+    while bi < entries.len() do
+      match entries[bi].1
+      when GlobalBinding::GbConst(did) then
+        const_bindings = const_bindings + 1
+        x_did_num = def_id_numeric(&did)
+      when _ then other_bindings = other_bindings + 1
+      end
+      bi = bi + 1
+    end
+    if const_bindings != 1 || other_bindings != 0 then
+      report = report + "SEMANTIC_DEFAULT_BATTERY: expected exactly one global binding (the default's X -> the const identity), got const=" + const_bindings.to_string() + " other=" + other_bindings.to_string() + "\n"
+      fails = fails + 1
+    end
+    if x_did_num < 0 then
+      report = report + "SEMANTIC_DEFAULT_BATTERY: no recorded GbConst identity to verify in the lowered MIR\n"
+    else
+      let opts = default_options()
+      var lower_prog = program
+      # a FRESH env: analyze_parsed typechecks internally, and the checker
+      # env is not re-entrant over an already-checked program (type
+      # registration is append-only).
+      var lower_env = type_env_new()
+      lower_env.strict_resolution = true
+      match analyze_parsed(&mut lower_env, &mut lower_prog, opts)
+      when Result::Ok(analyzed) then
+        # the lowering run's OWN recorded binding is the identity lr_ident
+        # consumes (the two runs are separate checks of the same source).
+        var lower_did_num = -1
+        var lower_consts = 0
+        let lower_entries = analyzed.typed.global_bindings.entries()
+        var lei = 0
+        while lei < lower_entries.len() do
+          match lower_entries[lei].1
+          when GlobalBinding::GbConst(did) then
+            lower_consts = lower_consts + 1
+            lower_did_num = def_id_numeric(&did)
+          when _ then ()
+          end
+          lei = lei + 1
+        end
+        if lower_consts != 1 then
+          report = report + "SEMANTIC_DEFAULT_BATTERY: the lowering run recorded " + lower_consts.to_string() + " const global binding(s), expected exactly 1\n"
+          fails = fails + 1
+        end
+        match lower_to_mir(&lower_prog, &analyzed)
+        when Result::Ok(mir) then
+          if !infer_probe_mir_has_static_ref(mir, "main", lower_did_num) then
+            report = report + "SEMANTIC_DEFAULT_BATTERY: the lowered main has no static reference to the default's const identity (first-run def " + x_did_num.to_string() + ", lowering-run def " + lower_did_num.to_string() + ") — the declaration-bound default was captured by the use-site local\n"
+            fails = fails + 1
+          end
+        when Result::Err(e) then
+          report = report + "SEMANTIC_DEFAULT_BATTERY: lower failed: " + e.clone() + "\n"
+          fails = fails + 1
+        end
+      when Result::Err(diags) then
+        report = report + "SEMANTIC_DEFAULT_BATTERY: analyze failed=" + diags.len().to_string() + "\n"
+        fails = fails + 1
+      end
+    end
+  end
+  report = report + "SEMANTIC_DEFAULT_BATTERY fails=" + fails.to_string() + "\n"
+  fails
+end
+
+# ———————————————————————————————————————————————————————————————
 # pending_call_instances / finalize channel: a generic constructor whose
 # argument is solvable ONLY from the caller's context — the annotation,
 # the dest, or a later method use — must be SOLVED before readiness,
@@ -1624,6 +1805,88 @@ def infer_probe_pending_inference_battery(inout report: String) -> Int
   fails
 end
 
+# ———————————————————————————————————————————————————————————————
+# KERNEL semantic defaults: the checker records a node-keyed resolution
+# for the default's identifiers (typed_ident_resolutions, consumed by
+# lr_ident BEFORE any use-site name lookup), so a declaration-bound
+# default must resolve identically whether or not the constructor site
+# has a shadowing local.  This battery pins that identity recording: a
+# missing record fails, and a use-site-dependent resolution (the capture
+# class) fails because the plain and shadowed programs would disagree.
+# (The lowering-consumption half is the kernel's own `lr_ident` order —
+# typed local id by NODE before lookup_current_local_id_by_name.)
+# ———————————————————————————————————————————————————————————————
+def infer_probe_default_x_node(program: Program) -> Int
+  for item in program.items do
+    match item.kind
+    when ItemKind::ItemStruct(sd) then
+      if sd.name == "Outer" then
+        for f in sd.fields do
+          if f.name == "n" then
+            match f.default
+            when Option::Some(e) then
+              match e.kind
+              when ExprKind::ExprBinaryOp(_op, _lhs, rhs) then
+                match rhs.get().kind
+                when ExprKind::ExprIdent(_) then
+                  return rhs.get().node_id
+                when _ then ()
+                end
+              when _ then ()
+              end
+            when Option::None then ()
+            end
+          end
+        end
+      end
+    when _ then ()
+    end
+  end
+  -1
+end
+
+def infer_probe_semantic_default_probe(source: String) -> (Bool, Int)
+  let parsed = parse(tokenize(source, "defaultprobe"))
+  if diag_has_errors(&parsed.diagnostics) then
+    return (false, -1)
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  let node = infer_probe_default_x_node(&program)
+  if node < 0 then
+    return (false, -1)
+  end
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let _result = type_check_typed(&mut env, &program, &res)
+    match env.typed_ident_resolutions.get(node)
+    when Option::Some(lid) then (true, lid)
+    when Option::None then (false, -1)
+    end
+  when Result::Err(_errs) then
+    (false, -1)
+  end
+end
+
+def infer_probe_semantic_default_battery(inout report: String) -> Int
+  var fails = 0
+  let plain = "const X: Int = 1\n\nstruct Inner\n  v: Int = 2\nend\n\nstruct Outer\n  n: Int = Inner {}.v + X\nend\n\ndef main() -> Int\n  let o = Outer {}\n  o.n\nend\n"
+  let shadowed = "const X: Int = 1\n\nstruct Inner\n  v: Int = 2\nend\n\nstruct Outer\n  n: Int = Inner {}.v + X\nend\n\ndef main() -> Int\n  let X: Int = 99\n  let o = Outer {}\n  o.n + X\nend\n"
+  let (p_ok, p_id) = infer_probe_semantic_default_probe(plain)
+  let (s_ok, s_id) = infer_probe_semantic_default_probe(shadowed)
+  if !p_ok || !s_ok then
+    report = report + "SEMANTIC_DEFAULT_BATTERY: the default's X node has no checker-recorded resolution (plain=" + p_ok.to_string() + " shadowed=" + s_ok.to_string() + ")\n"
+    fails = fails + 1
+  elsif p_id != s_id then
+    report = report + "SEMANTIC_DEFAULT_BATTERY: the declaration-bound default resolved differently under a use-site local (plain=" + p_id.to_string() + " shadowed=" + s_id.to_string() + ")\n"
+    fails = fails + 1
+  end
+  report = report + "SEMANTIC_DEFAULT_BATTERY fails=" + fails.to_string() + "\n"
+  fails
+end
+
 def main() -> Int
   var report = ""
   # the direct kernel-unify unit battery runs FIRST so its rows precede
@@ -1633,7 +1896,9 @@ def main() -> Int
   let _ = infer_probe_restricted_intrinsic_battery(&mut report)
   let _ = infer_probe_head_cross_product(&mut report)
   let _ = infer_probe_default_field_battery(&mut report)
+  let _ = infer_probe_semantic_default_battery(&mut report)
   let _ = infer_probe_pending_inference_battery(&mut report)
+  let _ = infer_probe_semantic_default_battery(&mut report)
   let _ = write_file("build/infer_probe.txt", report.clone())
   var counts = Vec::from([infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0)])
   var rows = Vec::new()

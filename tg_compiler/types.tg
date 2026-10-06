@@ -3366,6 +3366,32 @@ def type_query_kind_of_callee(callee: Expr) -> Option[TypeQueryKind]
   end  end
 end
 
+# ———————————————————————————————————————————————————————————————
+# (semantic field defaults): the checker's resolved GLOBAL identity of a
+# source identifier node. A struct field default is a raw Expr stored in
+# the declaration; the MIR materializes it at the USE SITE, where a local
+# with the same spelling can be in scope. Re-resolving the default's
+# identifiers by name at that point captured the declaration-bound global
+# (`const X ... struct Outer n: Int = X` reading a use-site `let X`).
+# The checker records, per ExprIdent node id, the global binding it
+# actually took during the DECLARATION-scope check; lr_ident consumes the
+# record before any scope/name lookup, so lowering is identity-keyed.
+#   - GbStatic — a static (MirStaticRef(DefId))
+#   - GbVariant — an enum variant value (owner TypeId id, variant index)
+#   - GbCallable — a program-level function value (DefId)
+#   - GbConst — a const declaration (lowered as a static reference, the
+#     kernel's const model — lower_const produces a MirStatic, so the
+#     recorded DefId reproduces the exact lowering path by identity)
+# A node with a recorded binding NEVER reaches the name-based local lookup
+# (see mir.tg's lr_ident), and a recorded binding that cannot be lowered is
+# a fail-closed internal error naming the node and the identity.
+enum GlobalBinding
+  GbStatic(DefId)
+  GbVariant(Int, Int)
+  GbCallable(DefId)
+  GbConst(DefId)
+end
+
 struct TypeEnv
   type_list: Vec[TypeDef]              # Single source of truth, insertion order
   type_name_index: Map[String, Int]    # name -> index into type_list
@@ -3814,6 +3840,15 @@ struct TypeEnv
   # body check (nesting-safe).
   current_item_label: String = ""
   typed_ident_resolutions: Map[Int, Int]
+  # (semantic field defaults): expr node id -> the checker's resolved
+  # GLOBAL binding for that identifier (GlobalBinding — a static, an enum
+  # variant, a program-level callable, or a const). Recorded at the
+  # ExprIdent checking branch for every global resolution actually taken,
+  # so the MIR consumes the DECLARATION-scope identity by DefId and a
+  # struct field default cannot be captured by a use-site local. Defaulted
+  # so every TypeEnv construction site (the engine snapshot literals)
+  # stays legal; populated only on the checker's live env.
+  typed_global_bindings: Map[Int, GlobalBinding] = Map::new()
   # Two SEPARATE binding-resolution maps: parameters and pattern bindings are
   # keyed in entirely different domains (owner DefId + positional index vs
   # pattern node id). Keeping them in one map allowed a parameter key to
@@ -4110,6 +4145,7 @@ impl Clone for TypeEnv
       typed_static_spans: self.typed_static_spans.clone(),
       current_item_label: self.current_item_label.clone(),
       typed_ident_resolutions: self.typed_ident_resolutions.clone(),
+      typed_global_bindings: self.typed_global_bindings.clone(),
       param_binding_resolutions: self.param_binding_resolutions.clone(),
       pattern_binding_resolutions: self.pattern_binding_resolutions.clone(),
       typed_access_effects: self.typed_access_effects.clone(),
@@ -6952,6 +6988,12 @@ struct TypedProgram
   handler_captures: Map[Int, Vec[Map[Int, AccessEffect]]] = Map::new()
   local_bindings: Map[Int, LocalBinding]
   ident_resolutions: Map[Int, Int]
+  # (semantic field defaults): expr node id -> the checker's resolved
+  # GLOBAL binding (GlobalBinding) the MIR's lr_ident consumes before any
+  # scope/name lookup. Defaulted so every existing TypedProgram
+  # construction stays unchanged; populated at type_check_typed's tail
+  # from env.typed_global_bindings.
+  global_bindings: Map[Int, GlobalBinding] = Map::new()
   # (§20 const generics, slice 3): expr node id -> the numeric
   # GenericParamId of every IN-SCOPE const generic parameter VALUE read
   # (the checker's record the MIR lowering resolves to the symbolic
@@ -7148,6 +7190,7 @@ def type_env_new() -> TypeEnv
     typed_field_targets: Map::new(),
     typed_local_bindings: Map::new(),
     typed_ident_resolutions: Map::new(),
+    typed_global_bindings: Map::new(),
     param_binding_resolutions: Map::new(),
     pattern_binding_resolutions: Map::new(),
     typed_access_effects: Map::new(),
@@ -8452,6 +8495,61 @@ def resolve_bare_callable(inout env: TypeEnv, name: String, span: Span, fallback
     end
   when Option::None then
     fallback
+  end  end
+end
+
+# (semantic field defaults): record the GLOBAL binding the checker actually
+# took for a program-level identifier (the var_is_global_callable arm of the
+# ExprIdent branch). The identity resolution mirrors resolve_bare_callable's
+# authority order — the current module's own qualified key, then the module's
+# explicit import, then the single recovery candidate
+# (bare_callable_def_recovery) — and the resolver's DefKind metadata
+# classifies the binding. An identity the resolver does not classify is NOT
+# recorded (conservative: the ordinary name-based path keeps its behavior;
+# the ambiguity/unknown diagnostics own that case). The recorded DefId is
+# the DECLARATION identity, so lowering is reproducible at any use site —
+# never a use-site lookup.
+def record_global_binding(inout env: TypeEnv, node_id: Int, name: String) -> Unit
+  match env.resolutions
+  when Option::None then ()
+  when Option::Some(res) then
+    var did_opt: Option[DefId] = Option::None
+    let own_key = module_qualified_key(&env.current_module_path, &name)
+    match res.module_symbols.get(own_key)
+    when Option::Some(did) then did_opt = Option::Some(did.clone())
+    when Option::None then
+      match imported_callable_key_of(env, name.clone())
+      when Option::Some(key) then
+        match res.module_symbols.get(key)
+        when Option::Some(did2) then did_opt = Option::Some(did2.clone())
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
+    if !did_opt.is_some() then
+      match bare_callable_def_recovery(env, name.clone())
+      when Option::Some(did3) then did_opt = Option::Some(did3)
+      when Option::None then ()
+      end
+    end
+    match did_opt
+    when Option::Some(did_v) then
+      match def_kind_of(&res, &did_v)
+      when Option::Some(kind) then
+        if kind == DefKind::Static then
+          env.typed_global_bindings.insert(node_id, GlobalBinding::GbStatic(did_v))
+        elsif kind == DefKind::Constant then
+          env.typed_global_bindings.insert(node_id, GlobalBinding::GbConst(did_v))
+        elsif kind == DefKind::Function then
+          env.typed_global_bindings.insert(node_id, GlobalBinding::GbCallable(did_v))
+        else
+          ()
+        end
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
   end  end
 end
 
@@ -10687,6 +10785,101 @@ end
 # Type Checking
 # ———————————————————————————————————————————————————————————————
 
+# (semantic field defaults — pass 3c): the declaration-time default CHECK,
+# deferred until after pass 3 has bound the program-level callables
+# (consts/statics/functions) in scope 0 and pass 3b has registered the impl
+# heads. The struct registration pass (collect_type_def) records the
+# defaults in typed_field_defaults but does NOT check them: pass 2 runs
+# before the globals exist, so `const X ... struct S n: Int = X` would be
+# an unknown symbol — the seed's semantic-defaults model resolves at the
+# declaration, after the declaration's bindings exist.
+#
+# The pass re-walks the struct declarations, rebinds each declaration's
+# generic parameters (the same ids pass 2 interned — the stored
+# td.generic_params), and checks every default against the field's
+# REGISTERED resolved type (td.def_kind's field table — the pass-2
+# resolution, never a TypeExpr re-resolution). The declaration rules are
+# unchanged: the check runs in the declaration's scope, a wrong-typed
+# default is the same unify diagnostic even when no literal omits the
+# field, and the recorded typed channels (typed_expr_types, typed_exprs,
+# typed_global_bindings, ...) now carry the declaration scope's GLOBAL
+# identities, which the MIR consumes by identity at every use site.
+def check_declared_field_defaults(inout env: TypeEnv, program: Program) -> Unit
+  var module_ptr = 0
+  var i = 0
+  while i < program.items.len() do
+    let item = program.items[i]
+    let (owner_path, next_module_ptr) = module_path_of_item(program, module_ptr, i)
+    module_ptr = next_module_ptr
+    env.current_module_path = owner_path.clone()
+    match item.kind
+    when ItemKind::ItemStruct(s) then
+      var has_default = false
+      var dhi = 0
+      while dhi < s.fields.len() do
+        match s.fields[dhi].default.clone()
+        when Option::Some(_) then has_default = true
+        when Option::None then ()
+        end
+        dhi = dhi + 1
+      end
+      if has_default then
+        let tid_opt = get_type_id_by_qualified_name(env, s.name.clone(), owner_path.clone())
+        match tid_opt
+        when Option::Some(tid) then
+          match get_type_by_id_ref(env, tid.clone())
+          when Option::Some(td) then
+            let prev_label = env.current_item_label.clone()
+            env.current_item_label = "field defaults of struct " + s.name.clone()
+            push_scope(env)
+            bind_generic_params(env, &s.generic_params, &td.generic_params)
+            push_unit_const_param_scope(env, td.generic_params.clone())
+            # the declaration's registered field table (the pass-2 resolved
+            # field types, keyed positionally in declaration order) — read
+            # ONCE, outside the field loop (matching a moved enum field
+            # repeatedly is not legal).
+            let decl_fields = match td.def_kind
+            when TypeDefKind::Struct(fs) then fs
+            when _ then Vec::new()
+            end
+            var fi = 0
+            while fi < s.fields.len() do
+              match s.fields[fi].default.clone()
+              when Option::Some(d) then
+                var field_ty = Type::Unit
+                var have_ty = false
+                var ffi = 0
+                while ffi < decl_fields.len() do
+                  if decl_fields[ffi].name == s.fields[fi].name then
+                    field_ty = decl_fields[ffi].ty.clone()
+                    have_ty = true
+                  end
+                  ffi = ffi + 1
+                end
+                if have_ty then
+                  let dty = check_expr_expected(env, d, Option::Some(field_ty.clone()))
+                  unify(env, dty, field_ty.clone(), s.fields[fi].span)
+                else
+                  type_add_error(env, "internal error: declared field `" + s.fields[fi].name + "` of struct `" + s.name.clone() + "` has no registered resolved type for its default check", s.fields[fi].span)
+                end
+              when Option::None then ()
+              end
+              fi = fi + 1
+            end
+            pop_unit_const_param_scope(env)
+            pop_scope(env)
+            env.current_item_label = prev_label
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      end
+    when _ then ()
+    end
+    i = i + 1
+  end
+end
+
 def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
   push_scope(env)
 
@@ -10986,6 +11179,12 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
     end
     i = i + 1
   end
+  # (semantic field defaults — pass 3c): the declaration-time default check
+  # runs HERE, after pass 3 bound the program-level callables (scope 0) and
+  # pass 3b registered the impl heads, so a default referencing a global
+  # resolves (and records) its DECLARATION-scope identity.
+  env.check_ctx = "pass3c-field-defaults"
+  check_declared_field_defaults(env, program)
   i = 0
   env.check_ctx = "pass4-check"
   module_ptr = 0
@@ -11405,16 +11604,17 @@ def collect_type_def(inout env: TypeEnv, item: Item, module_path: Vec[String]) -
       let fdef = s.fields[i].default.clone()
       match fdef
       when Option::Some(d) then
-        # (declaration-time default typing): the default expression is
-        # checked IN THE DECLARATION'S SCOPE (the struct's generics are
-        # bound above) against the DECLARED field type — a wrong-typed
-        # default fails even when no literal ever omits the field, and a
-        # module-local name in the default binds at the declaration, never
-        # re-interpreted at a use site.  The typed channel records carry
-        # the declaration-context types; lowering instantiates them per
-        # use.
-        let dty = check_expr_expected(env, &d, Option::Some(ty.clone()))
-        unify(env, dty, ty.clone(), s.fields[i].span)
+        # (semantic field defaults — deferred declaration-time check): the
+        # default expression is checked by the post-pass-3 default pass
+        # (check_declared_field_defaults), NOT here: pass 2 runs before
+        # pass 3 binds the program-level callables (consts/statics/
+        # functions) in scope 0, so a default referencing a global
+        # (`const X ... = X`) would resolve before the global existed.
+        # The default is still recorded here (the declaration's
+        # complete-except-defaulted-field record) and the MIR still lowers
+        # it at the use site; the deferred pass runs in the declaration's
+        # generic scope against the DECLARED field type, so a wrong-typed
+        # default fails at the declaration exactly as before.
         fdefaults.push((fname.clone(), d))
       when Option::None then ()
       end
@@ -22862,13 +23062,19 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
       when _ then
       let lid = local_id_of(env, name)
       env.typed_ident_resolutions.insert(expr.node_id, lid)
-  # (final layer): a bare name resolved from the pass-3
+   # (final layer): a bare name resolved from the pass-3
       # program-level callable bindings (scope 0) goes through the
       # module-qualified identity check — the current module's own
       # definition wins when several modules define the name; otherwise an
       # ambiguous bare name is diagnosed and the first-wins entry is the
       # fallback (see resolve_bare_callable).
       if var_is_global_callable(env, &name) then
+        # (semantic field defaults): record the resolved GLOBAL identity
+        # for this node (statics / consts / program callables) so the MIR
+        # lowering consumes the declaration identity before any use-site
+        # scope or name lookup — a struct field default checked in its
+        # declaration scope keeps that scope's global at every use site.
+        record_global_binding(env, expr.node_id, name.clone())
         resolve_bare_callable(env, name.clone(), expr.span, ty.clone())
       else
         ty
@@ -22888,8 +23094,12 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
       when Option::None then
         # Check if the name refers to an enum variant (e.g., Some, None, Ok, Err)
         # in expression position — treat bare variant names as constructor functions.
-        match find_enum_variant(env, name)
-        when Option::Some((enum_td, variant)) then
+        match find_enum_variant_indexed(env, name)
+        when Option::Some((enum_td, variant, variant_idx)) then
+          # (semantic field defaults): record the resolved variant identity
+          # (owner TypeId id, declaration index) — the MIR's bare-variant
+          # value path consumes it by identity instead of a name scan.
+          env.typed_global_bindings.insert(expr.node_id, GlobalBinding::GbVariant(enum_td.id.id, variant_idx))
           # Construct a function type: (variant_field_types...) -> enum_type
           let enum_type_args = fresh_type_args_for(env, &enum_td)
           let enum_type = Type::Adt(enum_td.id, enum_type_args)
@@ -31153,6 +31363,7 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
   env.typed_static_spans.clear()
   env.current_item_label = ""
   env.typed_ident_resolutions.clear()
+  env.typed_global_bindings.clear()
   env.param_binding_resolutions.clear()
   env.pattern_binding_resolutions.clear()
   env.typed_access_effects.clear()
@@ -31491,6 +31702,7 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
     handler_captures: env.handler_captures.clone(),
     local_bindings: env.typed_local_bindings.clone(),
     ident_resolutions: env.typed_ident_resolutions.clone(),
+    global_bindings: env.typed_global_bindings.clone(),
     const_param_reads: env.const_param_reads.clone(),
     param_binding_resolutions: env.param_binding_resolutions.clone(),
     pattern_binding_resolutions: env.pattern_binding_resolutions.clone(),
@@ -31543,6 +31755,7 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
     handler_captures: env.handler_captures.clone(),
     local_bindings: env.typed_local_bindings.clone(),
     ident_resolutions: env.typed_ident_resolutions.clone(),
+    global_bindings: env.typed_global_bindings.clone(),
     const_param_reads: env.const_param_reads.clone(),
     param_binding_resolutions: env.param_binding_resolutions.clone(),
     pattern_binding_resolutions: env.pattern_binding_resolutions.clone(),

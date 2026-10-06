@@ -211,6 +211,26 @@ let () =
                the declaration. *)
             fail
               "the defaulted-field battery failed (expected `DEFAULT_FIELD_BATTERY fails=0`; see the report above)"
+          else if not (contains report "SEMANTIC_DEFAULT_BATTERY fails=0") then
+            (* semantic field defaults: the checker records the default's
+               declaration-scope GLOBAL identity per node and the MIR
+               lowering consumes it before any scope/name lookup — the
+               seed's tg_struct_literals G shape (a use-site local shadow
+               must not capture the declared const). The battery checks
+               the recorded GbConst identity for the default's X node AND
+               a MirStaticRef to that DefId in the lowered main, so it
+               fails if either the recording or the consumption is
+               removed. *)
+            fail
+              "the semantic default battery failed (expected `SEMANTIC_DEFAULT_BATTERY fails=0`; see the report above)"
+          else if not (contains report "SEMANTIC_DEFAULT_BATTERY fails=0") then
+            (* the kernel's node-keyed identity recording for a declaration-
+               bound field default: the default's identifier must have a
+               checker-recorded resolution and must resolve identically
+               with and without a shadowing use-site local (lr_ident
+               consumes the node record before any name lookup). *)
+            fail
+              "the kernel semantic-default battery failed (expected `SEMANTIC_DEFAULT_BATTERY fails=0`; see the report above)"
           else if not (contains report "PENDING_INFERENCE_BATTERY fails=0") then
             (* the pending_call_instances channel: annotation-, dest-,
                return- and later-use-driven generic constructor

@@ -65,7 +65,11 @@ use tg_compiler::types::{
   # (P0-4/P0-5) the checker's bound-contract identity carriers: the
   # per-call contract records and the per-impl-method contract identities
   # (the tokens the devirtualization candidate index keys by).
-  ContractCallRecord, ImplContractMethod, is_contract_method_token
+  ContractCallRecord, ImplContractMethod, is_contract_method_token,
+  # (semantic field defaults) the checker's per-node GLOBAL binding record
+  # (static / enum variant / program callable / const) that lr_ident
+  # consumes before any scope or name lookup.
+  GlobalBinding
 }
 use tg_compiler::ids::{
   FieldId, VariantId, DefId, DefKind, CallableId, InstanceId, ModuleId,
@@ -2139,6 +2143,15 @@ struct MirBuilder
   # SYMBOLIC MirConstParamValue constant (the generic body lowers once;
   # mono substitutes the concrete value per instance).
   const_param_reads: Map[Int, Int]
+  # (semantic field defaults): expr node id -> the checker's resolved GLOBAL
+  # binding (GlobalBinding — a static, an enum variant, a program-level
+  # callable, or a const). lr_ident consumes the record BEFORE the typed
+  # local resolution and BEFORE any scope/name lookup, so a struct field
+  # default materialized at a use site keeps its DECLARATION-scope global
+  # and can never be captured by a same-named use-site local. A recorded
+  # binding that cannot be lowered is a fail-closed internal error naming
+  # the node and the identity.
+  global_bindings: Map[Int, GlobalBinding]
   # MirReturn blocks created by return-EDGE cleanup chains: their locals were
   # already finalized on that edge, so the function-level finalization pass
   # must not re-finalize them (double-deinit of sink params).
@@ -2443,6 +2456,7 @@ def builder_new() -> MirBuilder
     type_queries: Map::new(),
     ident_resolutions: Map::new(),
     const_param_reads: Map::new(),
+    global_bindings: Map::new(),
     closure_captures: Map::new(),
     typed_effects: Map::new(),
     effect_name_index: Map::new(),
@@ -6050,6 +6064,11 @@ def lower_program(program: Program, analyzed: AnalyzedProgram, hir_view: HirNode
 
   b.ident_resolutions = analyzed.typed.ident_resolutions.clone()
   b.const_param_reads = analyzed.typed.const_param_reads.clone()
+  # (semantic field defaults): the checker's per-node global binding record
+  # (consts/statics/variants/callables) — lr_ident consumes it before any
+  # scope/name lookup, so a declaration-bound default cannot be captured by
+  # a use-site local.
+  b.global_bindings = analyzed.typed.global_bindings.clone()
   b.item_defs = analyzed.typed.resolutions.item_defs.clone()
   b.closure_captures = analyzed.typed.closure_captures.clone()
   b.typed_effects = analyzed.typed.typed_effects.clone()
@@ -6081,39 +6100,7 @@ def lower_program(program: Program, analyzed: AnalyzedProgram, hir_view: HirNode
   b.typed_type_fields = analyzed.typed.type_fields.clone()
   b.typed_type_params = analyzed.typed.type_params.clone()
   b.typed_type_layout_attrs = analyzed.typed.type_layout_attrs.clone()
-  # (defaulted struct fields): build TypeId -> declared defaults from the
-  # declaration AST — the same authority the seed's struct_fields_of
-  # builds.  The literal lowering materializes an omitted default so the
-  # aggregate matches the seed's lowering exactly.
-  var field_defaults: Map[Int, Vec[(String, Expr)]] = Map::new()
-  var pdi = 0
-  while pdi < program.items.len() do
-    match program.items[pdi].kind
-    when ItemKind::ItemStruct(sd) then
-      let tid = match b.type_name_to_id.get(sd.name.clone())
-      when Option::Some(t) then t
-      when Option::None then -1
-      end
-      if tid >= 0 then
-        var defs: Vec[(String, Expr)] = Vec::new()
-        var sfi = 0
-        while sfi < sd.fields.len() do
-          match sd.fields[sfi].default.clone()
-          when Option::Some(d) then defs.push((sd.fields[sfi].name.clone(), d))
-          when Option::None then ()
-          end
-          sfi = sfi + 1
-        end
-        if defs.len() > 0 then
-          field_defaults.insert(tid, defs)
-        end
-      end
-    when _ then ()
-    end
-    pdi = pdi + 1
-  end
-  b.field_defaults = field_defaults
- # (partial moves): the semantic per-place move registry — the frame's
+  # (partial moves): the semantic per-place move registry — the frame's
   # per-field states serialized by the checker's pattern-binding sites
   # (types.tg's record_place_moves). The drop sites consult it for the
   # partial-drop masks.
@@ -6145,6 +6132,42 @@ def lower_program(program: Program, analyzed: AnalyzedProgram, hir_view: HirNode
     when Option::None then b.type_name_to_id.insert(sem_name.clone(), sem_tid)
     end
   end
+  # (defaulted struct fields): build TypeId -> declared defaults from the
+  # declaration AST — the same authority the seed's struct_fields_of
+  # builds. The literal lowering materializes an omitted default so the
+  # aggregate matches the seed's lowering exactly. This build MUST run
+  # AFTER the name -> TypeId inverse above: the former placement ran before
+  # the inverse was populated, so every lookup returned -1 and
+  # b.field_defaults was always EMPTY — the struct-literal fill never
+  # fired.
+  var field_defaults: Map[Int, Vec[(String, Expr)]] = Map::new()
+  var pdi = 0
+  while pdi < program.items.len() do
+    match program.items[pdi].kind
+    when ItemKind::ItemStruct(sd) then
+      let tid = match b.type_name_to_id.get(sd.name.clone())
+      when Option::Some(t) then t
+      when Option::None then -1
+      end
+      if tid >= 0 then
+        var defs: Vec[(String, Expr)] = Vec::new()
+        var sfi = 0
+        while sfi < sd.fields.len() do
+          match sd.fields[sfi].default.clone()
+          when Option::Some(d) then defs.push((sd.fields[sfi].name.clone(), d))
+          when Option::None then ()
+          end
+          sfi = sfi + 1
+        end
+        if defs.len() > 0 then
+          field_defaults.insert(tid, defs)
+        end
+      end
+    when _ then ()
+    end
+    pdi = pdi + 1
+  end
+  b.field_defaults = field_defaults
 
   # Pre-populate enum variant map so lower_expr can resolve ExprKind::AstPath.
   # (No TypeIds are assigned here — struct/enum ids come from the semantic
@@ -11993,11 +12016,92 @@ def lr_self_ref(inout b: MirBuilder) -> MirRvalue
   end  end
 end
 
+# (semantic field defaults): the MirStaticRef operand for a static/const
+# reference keyed by the checker's recorded DefId. The typed type is the
+# node's own recorded type (the declaration's resolved type, chased by the
+# checker) — the name-keyed static_types table is not consulted (identity,
+# never a name).
+def mir_static_ref_operand(did: DefId, ty: Type) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirStaticRef(DefId { module: ModuleId { id: did.module.id }, index: did.index }),
+      ty: ty,
+      instance: Option::None
+    })
+  }
+end
+
+# (semantic field defaults): the variant identity check for the recorded
+# GbVariant — the typed variant table's entry at the recorded declaration
+# index must carry the identifier's name. Identity-keyed (owner TypeId +
+# index), never the flat bare-name scan.
+def mir_recorded_variant_matches(b: MirBuilder, owner_tid: Int, variant_index: Int, name: String) -> Bool
+  match b.typed_type_variants.get(owner_tid)
+  when Option::Some(variants) then
+    if variant_index >= 0 && variant_index < variants.len() then
+      variants[variant_index].0 == name
+    else
+      false
+    end
+  when Option::None then false
+  end
+end
+
+# (semantic field defaults): lower a node that carries a recorded GLOBAL
+# binding. This is consumed BEFORE the typed local resolution and BEFORE
+# lookup_current_local_id_by_name — the critical no-capture invariant: a
+# node with a recorded global binding never reaches the name-based local
+# lookup. Every arm either reproduces the pre-fix lowering by identity or
+# fails closed with a precise internal error naming the node and identity.
+def lr_global_binding(inout b: MirBuilder, binding: GlobalBinding, name: String, node_id: Int, ty: Type, span: Span) -> MirRvalue
+  match binding
+  when GlobalBinding::GbStatic(did) then
+    # the same MirStaticRef shape the static name branch emitted, keyed by
+    # the recorded resolver DefId.
+    move_rvalue(mir_static_ref_operand(did, ty))
+  when GlobalBinding::GbConst(did) then
+    # the kernel's const model lowers a const as a static (lower_const
+    # produces a MirStatic; a const read is a MirStaticRef of the same
+    # DefId) — the recorded identity reproduces that path exactly, never
+    # the use-site scope.
+    move_rvalue(mir_static_ref_operand(did, ty))
+  when GlobalBinding::GbCallable(did) then
+    # a program-level function VALUE has no MIR value-operand lowering:
+    # only direct calls lower (through the recorded call target, not
+    # lr_ident). Preserve the pre-fix fail-closed behavior, keyed by the
+    # recorded identity.
+    b.errors.push("internal error: function value `" + name + "` (node " + node_id.to_string() + ", def " + def_id_numeric(&did).to_string() + ") reached MIR lowering without a resolved callable instance at " + span.file.clone() + ":" + span.start.to_string() + " during MIR lowering (" + mir_local_lookup_context(b) + ", fn " + b.current_fn_key.clone() + "); only a direct call lowers a program function")
+    move_rvalue(operand_unit())
+  when GlobalBinding::GbVariant(owner_tid, variant_index) then
+    if mir_recorded_variant_matches(b, owner_tid, variant_index, name.clone()) then
+      # the existing bare-variant-value path: the pre-fix lr_ident tail
+      # produced Unit for a payload-less variant value in this position —
+      # keep that shape, now keyed by the recorded identity and never
+      # shadowed by a same-named use-site local.
+      move_rvalue(operand_unit())
+    else
+      b.errors.push("internal error: recorded enum-variant binding (owner " + owner_tid.to_string() + ", index " + variant_index.to_string() + ") does not match identifier `" + name + "` at node " + node_id.to_string() + " during MIR lowering; the recorded identity is not a variant of its owner enum")
+      move_rvalue(operand_unit())
+    end
+  end
+end
+
 # Lower an identifier to its place value. The typed ident_resolutions
 # (node id -> local id) are authoritative when available; the name-based
 # scope lookup is a fallback for synthetic/source-less code.
 def lr_ident(inout b: MirBuilder, name: String, node_id: Int, ty: Type, span: Span) -> MirRvalue
   if node_id != 0 then
+    # (semantic field defaults): a node with a recorded GLOBAL binding
+    # (static / enum variant / program callable / const) lowers by that
+    # identity FIRST — before the typed local resolution and before any
+    # scope/name lookup. This is the no-capture invariant for struct field
+    # defaults materialized at a use site: the declaration-scope global is
+    # never overridden by a same-named use-site local.
+    match b.global_bindings.get(node_id)
+    when Option::Some(binding) then
+      return lr_global_binding(b, binding, name, node_id, ty, span)
+    when Option::None then ()
+    end
     # (§20 const generics, slice 3): an identifier the checker recorded as
     # an IN-SCOPE const generic parameter VALUE read (node -> numeric
     # GenericParamId) lowers to the SYMBOLIC MirConstParamValue constant —
@@ -16365,6 +16469,26 @@ def mir_type_id_with_variants(b: MirBuilder, name: String) -> Option[Int]
   Option::None
 end
 
+# (semantic field defaults): the MirStaticAddr place for a static/const
+# PLACE demand (a store target / inout argument) keyed by the checker's
+# recorded DefId — the same shape the name-keyed static branch emits (a
+# temp holding MirStaticAddr; the returned place derefs through it), with
+# the pointee type supplied by the caller (the node's recorded type).
+def lr_static_addr_place(inout b: MirBuilder, did: DefId, pointee_ty: Type) -> Place
+  let addr_ptr_ty = Type::Ptr(pointee_ty.clone())
+  let addr_tmp = add_temp(b, addr_ptr_ty.clone(), Span { file: "", start: 0, end_pos: 0 })
+  push_assign(b, place_local(addr_tmp), MirRvalue {
+    kind: MirRvalueKind::MirMove(MirOperand {
+      kind: MirOperandKind::MirConstant(MirConstant {
+        kind: MirConstantKind::MirStaticAddr(DefId { module: ModuleId { id: did.module.id }, index: did.index }),
+        ty: addr_ptr_ty,
+        instance: Option::None
+      })
+    })
+  }, Span { file: "", start: 0, end_pos: 0 })
+  place_deref(place_local(addr_tmp))
+end
+
 def lower_place(inout b: MirBuilder, expr: Expr) -> Place
   let kind_name = expr_kind_name(&expr.kind)
   if kind_name == "ExprHole" then
@@ -16390,6 +16514,24 @@ def lower_place(inout b: MirBuilder, expr: Expr) -> Place
     when Option::Some(_) then
       b.errors.push("internal error: const generic parameter `" + name + "` used as a mutable place during MIR lowering (const-parameter values are per-instantiation compile-time values with no storage; the checker must reject every place demand)")
       return place_local(MirLocalId { id: 0 })
+    when Option::None then ()
+    end
+    # (semantic field defaults): a recorded GLOBAL binding has no place
+    # lookup by name — a static/const place demand goes through the
+    # recorded DefId (the same MirStaticAddr shape the name branch emits);
+    # every other global kind is not a place (fail closed, never local 0
+    # by capture).
+    match b.global_bindings.get(expr.node_id)
+    when Option::Some(gb) then
+      match gb
+      when GlobalBinding::GbStatic(did) then
+        return lr_static_addr_place(b, did, mir_source_expr_ty(b, &expr))
+      when GlobalBinding::GbConst(did) then
+        return lr_static_addr_place(b, did, mir_source_expr_ty(b, &expr))
+      when _ then
+        b.errors.push("internal error: identifier `" + name + "` (node " + expr.node_id.to_string() + ") carries a recorded global binding that is not a static/const and has no place during MIR lowering")
+        return place_local(MirLocalId { id: 0 })
+      end
     when Option::None then ()
     end
     match lookup_current_local_id_by_name(b, name.clone())
