@@ -138,7 +138,10 @@ type func_env = {
      (tid, params) entries, which the driver keeps aligned with the
      nominals — the same scheme type_of_syntax uses). *)
   struct_fields :
-    (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t * Ast.expr option) list) list;
+    (Ids.Type_id.t *
+     (string * Ids.Field_id.t * Type_repr.t * (string list * Ast.expr) option)
+     list)
+    list;
   (* the enum defs' variant payload shapes (name -> variant names with
      their DECLARATION-scope payload types), for the copyability rule —
      an enum is bit-copyable iff every variant's payload is bit-copyable
@@ -397,6 +400,12 @@ type lower_state = {
   mutable break_target : int option;
   mutable continue_target : int option;
   variants : variant_table;              (* enum variant/constructor identity *)
+  (* (declaration-bound defaults): while lowering a struct field's
+     DEFAULT expression, names resolve in the DECLARING item's
+     identity context — use-site locals are invisible and the
+     declaration module's qualified entries win over bare ones. *)
+  mutable in_field_default : bool;
+  mutable field_default_module : string list;
   mutable defer_stack : Ast.block_body list;  (* function-level defer bodies; head = most recent *)
   (* the persistent typed-node channel: NodeId -> the typechecker's
      resolved node (distinct empty table = channel absent) *)
@@ -1204,91 +1213,20 @@ let registry_field_of (env : func_env) (tid : Ids.Type_id.t) (fname : string) :
   | None -> None
   | Some fields -> go fields
 
+(* (declaration-bound defaults): resolve a NAME in a field default's
+   declaration context — qualified-first, and never the use-site locals. *)
+let lookup_decl_name (in_default : bool) (mod_path : string list) (n : string)
+    (table : (string * 'a) list) : 'a option =
+  if in_default then
+    match List.assoc_opt (Ast.qualified_key mod_path n) table with
+    | Some v -> Some v
+    | None -> List.assoc_opt n table
+  else List.assoc_opt n table
+
 (* Resolve `fname` on `bty`: the projection chain to APPEND to the base
    place and the field's type (the nominal's params substituted with the
    base type's arguments).  Fails closed on every unresolvable case. *)
-(* re-audit P12: the per-type DEFAULT VALUE operand — what the native
-   fills a literal-omitted field with (the recursive struct aggregate
-   covers `lang_items: LangItems` in the MirProgram literals) *)
-let rec default_operand_of (env : func_env) (st : lower_state)
-    (lit_name : string) (fname : string) (t : Type_repr.t) : Seed_mir.operand =
-  match t with
-  | Type_repr.Unit -> Seed_mir.Constant Seed_mir.Unit
-  | Type_repr.Bool -> Seed_mir.Constant (Seed_mir.Bool false)
-  | Type_repr.Char -> Seed_mir.Constant (Seed_mir.Char (Uchar.of_int 0))
-  | Type_repr.Int k -> Seed_mir.Constant (int_constant_of k 0L)
-  | Type_repr.Float Type_repr.F32 -> Seed_mir.Constant (Seed_mir.Float32 0l)
-  | Type_repr.Float Type_repr.F64 -> Seed_mir.Constant (Seed_mir.Float64 0L)
-  | Type_repr.String -> Seed_mir.Constant (Seed_mir.String "")
-  | Type_repr.Named (tid, args)
-    when is_vec_langitem env tid ->
-      Seed_mir.Constant (Seed_mir.Array (Type_repr.Named (tid, args)))
-  | Type_repr.Named (tid, args)
-    when is_map_langitem env tid ->
-      Seed_mir.Constant (Seed_mir.Map (Type_repr.Named (tid, args)))
-  | Type_repr.Named (tid, args)
-    when is_set_langitem env tid ->
-      Seed_mir.Constant (Seed_mir.Set (Type_repr.Named (tid, args)))
-  | Type_repr.Named (tid, args)
-    when is_option_langitem env tid ->
-      Seed_mir.Constant (Seed_mir.Enum (Ids.Variant_index.make 0, Type_repr.Named (tid, args)))
-  | Type_repr.Fixed_array (e, n) ->
-      Seed_mir.Constant (Seed_mir.Array (Type_repr.Fixed_array (e, n)))
-  | Type_repr.Tuple elems ->
-      (* a tuple default: the per-component defaults aggregated *)
-      if
-        Array.for_all
-          (fun c ->
-            match c with
-            | Type_repr.Int _ | Type_repr.Bool | Type_repr.Char | Type_repr.Float _
-            | Type_repr.Unit ->
-                true
-            | _ -> false)
-          elems
-      then Seed_mir.Constant (Seed_mir.Struct (Type_repr.Tuple elems))
-      else
-        seed_bug
-          "struct literal `%s` is missing the field `%s`: no declared default and the type %s has no seed type-default"
-          lit_name fname (Seed_mir.print_type t)
-  | Type_repr.Named (tid, _args) -> (
-      (* a STRUCT-typed field: the all-defaulted aggregate (every field
-         defaulted recursively) *)
-      match List.assoc_opt tid env.struct_fields with
-      | Some reg when reg <> [] -> (
-          let ops =
-            List.mapi
-              (fun i (fn, _fid, _fty, _de) ->
-                match List.nth reg i with
-                | (_, _, _, Some de) -> fst (lower_expr env st de)
-                | (_, _, _fty2, None) ->
-                    (* fail closed: the checker enforces E0203, so an
-                       omitted source field always has a DECLARED default;
-                       a None here is an internal inconsistency, never a
-                       silent type-default. *)
-                    seed_bug
-                      "struct literal `%s` is missing the required field `%s` (no declared default; E0203)"
-                      lit_name fn)
-              reg
-          in
-          let id = fresh_local st t in
-          emit st
-            (Seed_mir.Assign
-               ( cur_place st id,
-                 Seed_mir.Aggregate
-                   ( Seed_mir.StructCtor
-                       (tid, Array.init (List.length reg) (fun i -> Ids.Field_index.make i)),
-                     ops ) ));
-          copy_place st (cur_place st id))
-      | _ ->
-          seed_bug
-            "struct literal `%s` is missing the field `%s`: no declared default and the type %s has no seed type-default"
-            lit_name fname (Seed_mir.print_type t))
-  | _ ->
-      seed_bug
-        "struct literal `%s` is missing the field `%s`: no declared default and the type %s has no seed type-default"
-        lit_name fname (Seed_mir.print_type t)
-
-and field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string) :
+let rec field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string) :
     Seed_mir.projection list * Type_repr.t =
   match int_of_string_opt fname with
   | Some i when i >= 0 -> (
@@ -1578,7 +1516,14 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
       | Error _ -> seed_bug "invalid char literal")
   | Ast.BoolLit (_, b, _) -> (Seed_mir.Constant (Seed_mir.Bool b), Type_repr.Bool)
   | Ast.Name (nid, n, _) -> (
-      match List.assoc_opt n st.scope with
+      (* (declaration-bound defaults): while lowering a field DEFAULT the
+         use-site locals are invisible (a default can never reference the
+         constructor's variables), and the DECLARING module's qualified
+         entries are preferred over bare flat-table entries. *)
+      let local =
+        if st.in_field_default then None else List.assoc_opt n st.scope
+      in
+      match local with
       | Some id -> (
           match local_type st id with
           | Some ty -> (copy_place st (cur_place st id), ty)
@@ -1610,7 +1555,7 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                           [] ) ));
                (copy_place st (cur_place st id), ty)
           | None -> (
-              match List.assoc_opt n env.statics with
+              match lookup_decl_name st.in_field_default st.field_default_module n env.statics with
               | Some (idx, ty) ->
                   (* the GLOBAL read: the place.local convention
                      -1 - idx addresses the VM's statics slot — the
@@ -1618,10 +1563,10 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                   ( Seed_mir.Copy { Seed_mir.root = Seed_mir.Static idx; projections = [] },
                     ty )
               | None -> (
-                  match List.assoc_opt n env.consts with
+                  match lookup_decl_name st.in_field_default st.field_default_module n env.consts with
                       | Some (ty, c) -> (Seed_mir.Constant c, ty)
                       | None -> (
-                          match List.assoc_opt n env.values with
+                          match lookup_decl_name st.in_field_default st.field_default_module n env.values with
                           | Some _ ->
                               seed_bug "function value `%s` reached lowering without a resolved callable identity" n
                           | None -> seed_bug "unknown value '%s' in lowering" n)))))
@@ -3028,7 +2973,12 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                         | _ -> op)
                     | None -> (
                         match List.nth reg i with
-                        | (_, _, _, Some de) ->
+                        | (_, _, _, Some (dmod, de)) ->
+                            (* DECLARATION CONTEXT: the default's names
+                               resolve at its declaring module — the
+                               constructor site's locals are invisible. *)
+                            st.in_field_default <- true;
+                            st.field_default_module <- dmod;
                             (* the declared-default value is lowered like
                                an explicit field value: an OWNING default
                                (the MirProgram `engine_env: TypeEnv =
@@ -3039,6 +2989,7 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                                — the same conversion the explicit-field
                                branch applies) *)
                             let dop, doty = lower_expr env st de in
+                            st.in_field_default <- false;
                             (match dop with
                              | Seed_mir.Copy p when not (copyable_ty env doty) ->
                                  Seed_mir.Read p
@@ -6286,6 +6237,8 @@ let lower_function_with_variants
       break_target = None;
       continue_target = None;
       variants;
+      in_field_default = false;
+      field_default_module = [];
       defer_stack = [];
       typed_nodes;
       typed_patterns;

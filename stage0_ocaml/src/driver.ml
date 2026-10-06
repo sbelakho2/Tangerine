@@ -423,14 +423,22 @@ let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
        env.Typecheck.nominals)
 
 let struct_fields_of ?(items : Ast.item list = []) (env : Typecheck.env) :
-    (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t * Ast.expr option) list) list =
+    (Ids.Type_id.t *
+     (string * Ids.Field_id.t * Type_repr.t * (string list * Ast.expr) option)
+     list)
+    list =
   (* re-audit P12: the struct-literal DEFAULTS — a field declared with
      `= <expr>` (`place_move_states: Map[...] = Map::new()`) is
      optional in literals; the literal lowering fills the missing
      fields with the default expression.  The defaults come from the
      closure's struct DECLARATIONS (the checker's nominal table carries
      no defaults). *)
-  let defaults : (string * (string * Ast.expr) list) list =
+  (* (declaration-bound defaults): each default carries the DECLARING
+     ITEM'S module path alongside the expression, so lowering can resolve
+     its names in the declaration's identity context (qualified-first)
+     instead of re-resolving the raw spelling at the constructor site —
+     the local-shadow capture fix. *)
+  let defaults : (string * (string * (string list * Ast.expr)) list) list =
     List.filter_map
       (fun (it : Ast.item) ->
         match it.Ast.kind with
@@ -440,13 +448,14 @@ let struct_fields_of ?(items : Ast.item list = []) (env : Typecheck.env) :
                 List.filter_map
                   (fun (fd : Ast.field_decl) ->
                     match fd.Ast.f_default with
-                    | Some e -> Some (fd.Ast.f_name, e)
+                    | Some e -> Some (fd.Ast.f_name, (it.Ast.module_path, e))
                     | None -> None)
                   d.Ast.s_fields )
         | _ -> None)
       items
   in
-  let default_of (oname : string) (fname : string) : Ast.expr option =
+  let default_of (oname : string) (fname : string) :
+      (string list * Ast.expr) option =
     match List.assoc_opt oname defaults with
     | Some fs -> List.assoc_opt fname fs
     | None -> None
@@ -1140,10 +1149,20 @@ let cmd_interpret (args : string list) : int =
       report_errors diags sm;
       if Diagnostic.has_errors diags then 1
       else begin
-        let env = Typecheck.initial_env () in
+      let env = Typecheck.initial_env () in
+      (* the driver's DECLARATION FIXPOINT: a single check pass reports
+         transient ordering diagnostics (a struct's nominal is filled by
+         a later registration round), so iterate to the stable env like
+         run_closure_pipeline_impl does before lowering. *)
+      let rec fix env n =
         match Typecheck.check_program env program with
-        | Error m -> die "typecheck failed: %s" m
-        | Ok (env, errors) ->
+        | Error m -> Error m
+        | Ok (env', errors) ->
+            if errors = [] || n = 0 then Ok (env', errors) else fix env' (n - 1)
+      in
+      match fix env 6 with
+      | Error m -> die "typecheck failed: %s" m
+      | Ok (env, errors) ->
             if errors <> [] then begin
               List.iter (fun e -> Printf.printf "  %s\n" e) (List.rev errors);
               1
@@ -3512,7 +3531,30 @@ type mono_outcome = {
    completeness).  Next pass: reproduce the HIR-record misses on a
    minimal case from one failing site (`rs_resolve_imports`'s
    `var keys = Vec::new()` + entries/push shape) and fix the channel
-   recording, not the individual items. *)
+   recording, not the individual items.
+
+   Field-default binding pass 2026-10-06 (audit P0): the seed lowering
+   previously stored a RAW default expression and re-resolved its source
+   spelling at each constructor site, where `Ast.Name` checked the
+   use-site locals first — a local shadowing a declaration const captured
+   the default (`s.n` lowered the local 99 instead of the declared 1).
+   Defaults now carry their DECLARING ITEM'S module path
+   (struct_fields_of -> `(module, expr)`), and while a default lowers,
+   `lower_state.in_field_default` makes use-site locals invisible and
+   prefers the declaring module's qualified table entry
+   (lookup_decl_name) — the same identity-first rule the checker uses.
+   `tg_struct_literals` case F proves it END-TO-END (typecheck -> lower ->
+   VM: interpret prints 1).  Struct `..` spread is now REJECTED by the
+   checker (case E) instead of the previous typecheck-only false green
+   (the seed lowering has no spread channel).  A bare-name collision
+   tripwire (scripts/closure_bare_name_collisions.py + a gate pin) pins
+   the closure's five KNOWN duplicate nominal names — AbiReturn, Arch,
+   Error, ErrorCode, Span — so a NEW latent identity hazard (the
+   EnumLayout incident class) fails the gate; eliminating bare-name
+   authority in the seed's const/static/nominal tables is the tracked
+   follow-up.  The kernel-side default capture (raw Expr re-lowered at
+   use sites in mir.tg) is NOT yet fixed and is explicitly unproven: it
+   needs the same declaration-context flag plus a lower+VM probe. *)
 (* (recalibrated bootstrap caps): the bootstrap VM budget is overridable via
    the environment so deep corpus+stdlib compiles can be given a larger
    budget without a rebuild; the defaults stay bounded, fail-fast guards. *)

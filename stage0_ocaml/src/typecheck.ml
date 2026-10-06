@@ -4596,21 +4596,28 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
             | Error m -> Error m
             | Ok fes -> (
                 (* (E0203 required-field completeness): every declared
-                   field must be supplied — by the literal or a `..rest`
-                   spread — EXCEPT a field with a DECLARED default
-                   (`= <expr>`), which may be omitted and is materialized
-                   by lowering from the declaration-typed default.  A
-                   missing required field is an error HERE; it is never
-                   silently given a type-default. *)
+                   field must be supplied — EXCEPT a field with a DECLARED
+                   default (`= <expr>`), which may be omitted and is
+                   materialized by lowering from the declaration-typed
+                   default.  A missing required field is an error HERE; it
+                   is never silently given a type-default.  A `..` spread
+                   is REJECTED (the seed lowering has no spread channel —
+                   accepting it here was a front-end-only false green). *)
+                match rest with
+                | Some _ ->
+                    Error
+                      (err span
+                         (Printf.sprintf
+                            "struct literal `%s` with a `..` spread is not supported (no lowering channel)"
+                            name))
+                | None ->
                 let supplied = List.map fst fields in
                 let missing_required =
-                  if rest <> None then None
-                  else
-                    List.find_opt
-                      (fun (n, _) ->
-                        (not (List.mem_assoc n nom.nom_defaults))
-                        && not (List.mem n supplied))
-                      nom.nom_fields
+                  List.find_opt
+                    (fun (n, _) ->
+                      (not (List.mem_assoc n nom.nom_defaults))
+                      && not (List.mem n supplied))
+                    nom.nom_fields
                 in
                 match missing_required with
                 | Some (mn, _) ->

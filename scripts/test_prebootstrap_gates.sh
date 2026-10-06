@@ -437,8 +437,18 @@ check_pin "the kernel rejects private declarations by provenance" tg_compiler/ty
 check_pin "the kernel records struct field defaults" tg_compiler/types.tg   'typed_field_defaults'
 check_pin "the kernel enforces required fields (E0203)" tg_compiler/types.tg   'missing required field'
 check_pin "the MIR aggregate fill materializes defaults" tg_compiler/mir.tg   'field_defaults'
+# bare-name collision tripwire: the seed's nominal/flat tables are
+# bare-keyed, so a NEW duplicate nominal is a latent identity hazard (the
+# EnumLayout incident).  The pinned set is the closure's known five; the
+# collision-parity corpus tracks fixing them properly.
+closure_collisions="$(python3 "$ROOT/scripts/closure_bare_name_collisions.py" 2>/dev/null)"
+if [ "$closure_collisions" = "AbiReturn Arch Error ErrorCode Span" ]; then
+  pass "closure bare-name collisions are the pinned known set (no new identity hazard)"
+else
+  bad "closure bare-name collisions changed: '${closure_collisions}' (pin: 'AbiReturn Arch Error ErrorCode Span')"
+fi
 check_pin "the final gate installs the RSS ceiling unconditionally" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB=12288'
-check_pin "RSS measurement override is explicit and validated" scripts/check_ocaml_bootstrap_complete.sh   'TG_FINAL_RSS_MEASUREMENT'
+check_pin "the authorization gate accepts no RSS override" scripts/check_ocaml_bootstrap_complete.sh   'accepts NO resource-budget override'
 check_pin "authorization refuses unbounded hosts (no escape)" scripts/check_ocaml_bootstrap_complete.sh   'unbounded authorization path'
 check_pin "the env gate rejects unbounded final runs" scripts/prebootstrap_env_gate.sh   'TG_ALLOW_UNBOUNDED_FINAL'
 check_pin "RSS measurement is declared Linux-only" stage0_ocaml/src/vm.ml   'Measurement is Linux-only'

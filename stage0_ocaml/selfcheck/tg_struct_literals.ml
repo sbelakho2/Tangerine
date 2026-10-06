@@ -130,7 +130,7 @@ let () =
         List.iter (Printf.printf "    %s\n") errors;
         exit 1
       end);
-  (* E. `..rest` spread supplies the remaining required fields *)
+  (* E. `..rest` spread is REJECTED before lowering (no false green) *)
   (match
      check_source
        "struct S\n  a: Int\n  b: Int\nend\n\n\
@@ -143,12 +143,47 @@ let () =
    with
   | Error m -> fail "spread probe: %s" m
   | Ok errors ->
-      if errors = [] then
-        Printf.printf "PASS E: a `..rest` spread supplies required fields\n"
+      if has errors "spread is not supported" then
+        Printf.printf "PASS E: a `..` spread is rejected before lowering\n"
       else begin
-        Printf.printf "FAIL E: spread literal produced errors (errors=%d)\n"
+        Printf.printf
+          "FAIL E: spread literal was not rejected (errors=%d)\n"
           (List.length errors);
         List.iter (Printf.printf "    %s\n") errors;
         exit 1
       end);
+  (* F. DECLARATION-BOUND default end-to-end (typecheck -> lower -> VM):
+     a use-site local shadowing the declaration's const must NOT capture
+     the default. *)
+  let shadow_src =
+    "const X: Int = 1\n\n\
+     struct S\n  n: Int = X\nend\n\n\
+     def main() -> Int\n\
+    \  let X: Int = 99\n\
+    \  let s = S { }\n\
+    \  s.n\n\
+     end\n"
+  in
+  let tmp = Filename.temp_file "tg_struct_shadow" ".tg" in
+  let oc = open_out_bin tmp in
+  output_string oc shadow_src;
+  close_out oc;
+  let exe = Filename.concat (Sys.getcwd ()) "_build/default/bin/tg_stage0.exe" in
+  let ic = Unix.open_process_in (Printf.sprintf "%s interpret %s" exe tmp) in
+  let out = In_channel.input_all ic in
+  let status = Unix.close_process_in ic in
+  let got = String.trim out in
+  if status <> Unix.WEXITED 0 || got <> "1" then begin
+    Printf.printf
+      "FAIL F: declaration-bound default captured the use-site local (interpret output=%S status=%s)\n"
+      got
+      (match status with
+      | Unix.WEXITED c -> string_of_int c
+      | Unix.WSIGNALED s -> "sig" ^ string_of_int s
+      | Unix.WSTOPPED s -> "stop" ^ string_of_int s);
+    exit 1
+  end
+  else
+    Printf.printf
+      "PASS F: a field default is declaration-bound end-to-end (local shadow ignored)\n";
   Selfcheck_sentinel.emit_and_exit "tg_struct_literals"
