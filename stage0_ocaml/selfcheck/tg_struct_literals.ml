@@ -186,4 +186,90 @@ let () =
   else
     Printf.printf
       "PASS F: a field default is declaration-bound end-to-end (local shadow ignored)\n";
+  (* G. NESTED default re-entrancy: lowering `Outer.n`'s default evaluates
+     `Inner {}.v` (which lowers Inner.v's own default) and then `+ X`; the
+     declaration context must SURVIVE the nested default (save/restore, not
+     blind reset).  A non-re-entrant context reads the use-site local X and
+     returns 101 instead of 3. *)
+  let nested_src =
+    "const X: Int = 1\n\n\
+     struct Inner\n  v: Int = 2\nend\n\n\
+     struct Outer\n  n: Int = Inner {}.v + X\nend\n\n\
+     def main() -> Int\n\
+    \  let X: Int = 99\n\
+    \  let o = Outer {}\n\
+    \  o.n\n\
+     end\n"
+  in
+  let tmp2 = Filename.temp_file "tg_struct_nested" ".tg" in
+  let oc2 = open_out_bin tmp2 in
+  output_string oc2 nested_src;
+  close_out oc2;
+  let exe2 = Filename.concat (Sys.getcwd ()) "_build/default/bin/tg_stage0.exe" in
+  let ic2 = Unix.open_process_in (Printf.sprintf "%s interpret %s" exe2 tmp2) in
+  let out2 = In_channel.input_all ic2 in
+  let status2 = Unix.close_process_in ic2 in
+  let got2 = String.trim out2 in
+  if status2 <> Unix.WEXITED 0 || got2 <> "3" then begin
+    Printf.printf
+      "FAIL G: nested default lost the declaration context (interpret output=%S, want \"3\" — 101 means the context was overwritten)\n"
+      got2;
+    exit 1
+  end
+  else
+    Printf.printf
+      "PASS G: a nested default keeps the declaration context end-to-end\n";
+  (* H. a CALL inside a default: the callee identity is the checker's
+     (the typed-call channel), not re-resolved text. *)
+  let call_src =
+    "def base() -> Int\n  3\nend\n\n\
+     struct S\n  n: Int = base()\nend\n\n\
+     def main() -> Int\n\
+    \  let s = S { }\n\
+    \  s.n\n\
+     end\n"
+  in
+  let tmp3 = Filename.temp_file "tg_struct_calldefault" ".tg" in
+  let oc3 = open_out_bin tmp3 in
+  output_string oc3 call_src;
+  close_out oc3;
+  let exe3 = Filename.concat (Sys.getcwd ()) "_build/default/bin/tg_stage0.exe" in
+  let ic3 = Unix.open_process_in (Printf.sprintf "%s interpret %s" exe3 tmp3) in
+  let out3 = In_channel.input_all ic3 in
+  let status3 = Unix.close_process_in ic3 in
+  let got3 = String.trim out3 in
+  if status3 <> Unix.WEXITED 0 || got3 <> "3" then begin
+    Printf.printf
+      "FAIL H: a call in a field default did not lower/execute correctly (output=%S)\n"
+      got3;
+    exit 1
+  end
+  else
+    Printf.printf "PASS H: a call in a field default resolves semantically\n";
+  (* I. an OWNING default (String coerced from a literal) must be
+     constructed and owned correctly by the aggregate. *)
+  let owned_src =
+    "struct Owned\n  n: Int = 7\n  text: String = \"d\"\nend\n\n\
+     def main() -> Int\n\
+    \  let o = Owned { }\n\
+    \  o.text.len() + o.n - 6\n\
+     end\n"
+  in
+  let tmp4 = Filename.temp_file "tg_struct_owned" ".tg" in
+  let oc4 = open_out_bin tmp4 in
+  output_string oc4 owned_src;
+  close_out oc4;
+  let exe4 = Filename.concat (Sys.getcwd ()) "_build/default/bin/tg_stage0.exe" in
+  let ic4 = Unix.open_process_in (Printf.sprintf "%s interpret %s" exe4 tmp4) in
+  let out4 = In_channel.input_all ic4 in
+  let status4 = Unix.close_process_in ic4 in
+  let got4 = String.trim out4 in
+  if status4 <> Unix.WEXITED 0 || got4 <> "2" then begin
+    Printf.printf
+      "FAIL I: an owning String default did not construct/own correctly (output=%S, want \"2\")\n"
+      got4;
+    exit 1
+  end
+  else
+    Printf.printf "PASS I: an owning String default constructs and executes\n";
   Selfcheck_sentinel.emit_and_exit "tg_struct_literals"

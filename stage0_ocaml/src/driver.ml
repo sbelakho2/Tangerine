@@ -424,8 +424,7 @@ let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
 
 let struct_fields_of ?(items : Ast.item list = []) (env : Typecheck.env) :
     (Ids.Type_id.t *
-     (string * Ids.Field_id.t * Type_repr.t * (string list * Ast.expr) option)
-     list)
+     (string * Ids.Field_id.t * Type_repr.t * Ast.expr option) list)
     list =
   (* re-audit P12: the struct-literal DEFAULTS — a field declared with
      `= <expr>` (`place_move_states: Map[...] = Map::new()`) is
@@ -433,12 +432,12 @@ let struct_fields_of ?(items : Ast.item list = []) (env : Typecheck.env) :
      fields with the default expression.  The defaults come from the
      closure's struct DECLARATIONS (the checker's nominal table carries
      no defaults). *)
-  (* (declaration-bound defaults): each default carries the DECLARING
-     ITEM'S module path alongside the expression, so lowering can resolve
-     its names in the declaration's identity context (qualified-first)
-     instead of re-resolving the raw spelling at the constructor site —
-     the local-shadow capture fix. *)
-  let defaults : (string * (string * (string list * Ast.expr)) list) list =
+  (* the struct-literal DEFAULTS come from the closure's struct
+     declarations (the checker's nominal table carries no defaults); each
+     default's NAME IDENTITIES are the checker's recorded bindings
+     (typed_name_bindings), consumed by lowering — the default expression
+     itself is only the lowering body, never a source of re-resolution. *)
+  let defaults : (string * (string * Ast.expr) list) list =
     List.filter_map
       (fun (it : Ast.item) ->
         match it.Ast.kind with
@@ -448,14 +447,13 @@ let struct_fields_of ?(items : Ast.item list = []) (env : Typecheck.env) :
                 List.filter_map
                   (fun (fd : Ast.field_decl) ->
                     match fd.Ast.f_default with
-                    | Some e -> Some (fd.Ast.f_name, (it.Ast.module_path, e))
+                    | Some e -> Some (fd.Ast.f_name, e)
                     | None -> None)
                   d.Ast.s_fields )
         | _ -> None)
       items
   in
-  let default_of (oname : string) (fname : string) :
-      (string list * Ast.expr) option =
+  let default_of (oname : string) (fname : string) : Ast.expr option =
     match List.assoc_opt oname defaults with
     | Some fs -> List.assoc_opt fname fs
     | None -> None
@@ -738,6 +736,7 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
     methods;
     fn_ret = Type_repr.Unit;
     struct_fields = struct_fields_of ~items env;
+    name_bindings = env.Typecheck.typed_name_bindings;
     enum_payloads = enum_payloads_of env;
     lang_items = Typecheck.lang_items_of_env env;
     copy_cache = Type_properties.create_cache ();
@@ -3554,7 +3553,36 @@ type mono_outcome = {
    authority in the seed's const/static/nominal tables is the tracked
    follow-up.  The kernel-side default capture (raw Expr re-lowered at
    use sites in mir.tg) is NOT yet fixed and is explicitly unproven: it
-   needs the same declaration-context flag plus a lower+VM probe. *)
+   needs the same declaration-context flag plus a lower+VM probe.
+
+   context-freedom follow-up 2026-10-06: the declaration-context toggle
+   is now PUSH/POP (save/restore), so a default that itself lowers a
+   nested default (Outer.n = Inner{}.v + X) keeps the declaration context
+   through the recursion — without it the inner default's reset made the
+   outer `X` see the constructor site's local (3 vs 101).  Cases F/G/H
+   run typecheck -> lower -> MIR verify -> VM through `interpret`:
+   local-shadow (1), nested default (3), call-in-default (3).  The
+   collision scanner now also reports the wider
+   const/static/def/typealias/variant duplicate set informationally
+   (stderr) while gating only the nominal five.  Final authorization
+   seals EVERY resource-affecting budget (VM steps/host-calls/alloc +
+   GATE_TIMEOUT_S pinned; RSS 12288; TG_* overrides rejected by
+   prebootstrap_env_gate.sh), so no ambient or measurement configuration
+   can emit an authorization PASS.
+
+   STILL OPEN (architecture, next): the seed's field-default lowering
+   reconstructs identifier bindings from spelling + declaring-module
+   string (`lookup_decl_name`); an imported/aliased const
+   (`use values::DEFAULT_N as X`) is not that spelling, and the default
+   registry `struct_fields_of` is still keyed by the BARE owner name.
+   The correct channel is the checker's resolved identity per Name node
+   (a `tn_name_binding = NB_const key | NB_static key | NB_ctor(en,vn)`
+   recorded in check_name, consumed by lowering; calls already carry
+   `tn_call`).  The KERNEL has the same raw-Expr/default-capture risk in
+   mir.tg and is explicitly unproven.  The five known nominal collisions
+   (AbiReturn, Arch, Error, ErrorCode, Span) need adversarial
+   multi-module execution tests, and the 78B HIR frontier
+   (`argument N has no typed HIR record`) is untouched by this pass. *)
 (* (recalibrated bootstrap caps): the bootstrap VM budget is overridable via
    the environment so deep corpus+stdlib compiles can be given a larger
    budget without a rebuild; the defaults stay bounded, fail-fast guards. *)

@@ -106,6 +106,7 @@ let () =
           callables_by_callable = [];
           fn_ret = Type_repr.Int Type_repr.Int;
           struct_fields = [];
+          name_bindings = Hashtbl.create 1;
                 enum_payloads = [];
           copy_cache = Type_properties.create_cache ();
           lang_items = Lang_items.seed_defaults;

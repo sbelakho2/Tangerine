@@ -138,10 +138,11 @@ type func_env = {
      (tid, params) entries, which the driver keeps aligned with the
      nominals — the same scheme type_of_syntax uses). *)
   struct_fields :
-    (Ids.Type_id.t *
-     (string * Ids.Field_id.t * Type_repr.t * (string list * Ast.expr) option)
-     list)
-    list;
+    (Ids.Type_id.t * (string * Ids.Field_id.t * Type_repr.t * Ast.expr option) list) list;
+  (* (semantic name identity): NodeId -> the checker's resolved global
+     binding for a Name node; lowering consumes it instead of
+     re-resolving source text (declaration-bound defaults). *)
+  name_bindings : (Ids.Node_id.t, Typecheck.name_binding) Hashtbl.t;
   (* the enum defs' variant payload shapes (name -> variant names with
      their DECLARATION-scope payload types), for the copyability rule —
      an enum is bit-copyable iff every variant's payload is bit-copyable
@@ -400,12 +401,6 @@ type lower_state = {
   mutable break_target : int option;
   mutable continue_target : int option;
   variants : variant_table;              (* enum variant/constructor identity *)
-  (* (declaration-bound defaults): while lowering a struct field's
-     DEFAULT expression, names resolve in the DECLARING item's
-     identity context — use-site locals are invisible and the
-     declaration module's qualified entries win over bare ones. *)
-  mutable in_field_default : bool;
-  mutable field_default_module : string list;
   mutable defer_stack : Ast.block_body list;  (* function-level defer bodies; head = most recent *)
   (* the persistent typed-node channel: NodeId -> the typechecker's
      resolved node (distinct empty table = channel absent) *)
@@ -1213,19 +1208,49 @@ let registry_field_of (env : func_env) (tid : Ids.Type_id.t) (fname : string) :
   | None -> None
   | Some fields -> go fields
 
-(* (declaration-bound defaults): resolve a NAME in a field default's
-   declaration context — qualified-first, and never the use-site locals. *)
-let lookup_decl_name (in_default : bool) (mod_path : string list) (n : string)
-    (table : (string * 'a) list) : 'a option =
-  if in_default then
-    match List.assoc_opt (Ast.qualified_key mod_path n) table with
-    | Some v -> Some v
-    | None -> List.assoc_opt n table
-  else List.assoc_opt n table
-
 (* Resolve `fname` on `bty`: the projection chain to APPEND to the base
    place and the field's type (the nominal's params substituted with the
    base type's arguments).  Fails closed on every unresolvable case. *)
+(* (semantic name identity): the lowering-side consumers of the
+   checker's recorded global bindings.  The recorded key is the CHECKER's
+   resolution; the flat lowering tables key consts by qualified+bare and
+   statics by BARE name (the bare-name authority Commit B removes), so
+   consumption falls back from the exact key to its bare suffix — never
+   to the source spelling of a different expression. *)
+let bare_key_of (key : string) : string =
+  match String.rindex_opt key ':' with
+  | Some i -> String.sub key (i + 1) (String.length key - i - 1)
+  | None -> key
+
+let recorded_const_operand (env : func_env) (key : string) :
+    Seed_mir.operand * Type_repr.t =
+  let found =
+    match List.assoc_opt key env.consts with
+    | Some r -> Some r
+    | None -> List.assoc_opt (bare_key_of key) env.consts
+  in
+  match found with
+  | Some (ty, c) -> (Seed_mir.Constant c, ty)
+  | None ->
+      seed_bug
+        "recorded const binding `%s` is absent from the lowering consts table"
+        key
+
+let recorded_static_operand (env : func_env) (key : string) :
+    Seed_mir.operand * Type_repr.t =
+  let found =
+    match List.assoc_opt key env.statics with
+    | Some r -> Some r
+    | None -> List.assoc_opt (bare_key_of key) env.statics
+  in
+  match found with
+  | Some (idx, ty) ->
+      (Seed_mir.Copy { Seed_mir.root = Seed_mir.Static idx; projections = [] }, ty)
+  | None ->
+      seed_bug
+        "recorded static binding `%s` is absent from the lowering statics table"
+        key
+
 let rec field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string) :
     Seed_mir.projection list * Type_repr.t =
   match int_of_string_opt fname with
@@ -1516,13 +1541,26 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
       | Error _ -> seed_bug "invalid char literal")
   | Ast.BoolLit (_, b, _) -> (Seed_mir.Constant (Seed_mir.Bool b), Type_repr.Bool)
   | Ast.Name (nid, n, _) -> (
-      (* (declaration-bound defaults): while lowering a field DEFAULT the
-         use-site locals are invisible (a default can never reference the
-         constructor's variables), and the DECLARING module's qualified
-         entries are preferred over bare flat-table entries. *)
-      let local =
-        if st.in_field_default then None else List.assoc_opt n st.scope
+      (* (semantic name identity): consume the checker's recorded binding.
+         A global Name (const/static/ctor/value) resolves by IDENTITY, so
+         a declaration-bound default keeps its declaration's meaning and
+         can never be captured by a use-site local or a same-spelled name
+         from another module.  NB_local / absent (hand-built envs) fall
+         back to the ordinary scope resolution. *)
+      let n =
+        match Hashtbl.find_opt env.name_bindings nid with
+        | Some (Typecheck.NB_ctor key) -> key
+        | _ -> n
       in
+      match Hashtbl.find_opt env.name_bindings nid with
+      | Some (Typecheck.NB_const key) -> recorded_const_operand env key
+      | Some (Typecheck.NB_static key) -> recorded_static_operand env key
+      | Some (Typecheck.NB_value key) ->
+          seed_bug
+            "function value `%s` reached lowering without a resolved callable identity"
+            key
+      | Some (Typecheck.NB_ctor _) | Some Typecheck.NB_local | None ->
+      let local = List.assoc_opt n st.scope in
       match local with
       | Some id -> (
           match local_type st id with
@@ -1555,7 +1593,7 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                           [] ) ));
                (copy_place st (cur_place st id), ty)
           | None -> (
-              match lookup_decl_name st.in_field_default st.field_default_module n env.statics with
+              match List.assoc_opt n env.statics with
               | Some (idx, ty) ->
                   (* the GLOBAL read: the place.local convention
                      -1 - idx addresses the VM's statics slot — the
@@ -1563,10 +1601,10 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                   ( Seed_mir.Copy { Seed_mir.root = Seed_mir.Static idx; projections = [] },
                     ty )
               | None -> (
-                  match lookup_decl_name st.in_field_default st.field_default_module n env.consts with
+                  match List.assoc_opt n env.consts with
                       | Some (ty, c) -> (Seed_mir.Constant c, ty)
                       | None -> (
-                          match lookup_decl_name st.in_field_default st.field_default_module n env.values with
+                          match List.assoc_opt n env.values with
                           | Some _ ->
                               seed_bug "function value `%s` reached lowering without a resolved callable identity" n
                           | None -> seed_bug "unknown value '%s' in lowering" n)))))
@@ -2973,12 +3011,7 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                         | _ -> op)
                     | None -> (
                         match List.nth reg i with
-                        | (_, _, _, Some (dmod, de)) ->
-                            (* DECLARATION CONTEXT: the default's names
-                               resolve at its declaring module — the
-                               constructor site's locals are invisible. *)
-                            st.in_field_default <- true;
-                            st.field_default_module <- dmod;
+                        | (_, _, _, Some de) ->
                             (* the declared-default value is lowered like
                                an explicit field value: an OWNING default
                                (the MirProgram `engine_env: TypeEnv =
@@ -2989,7 +3022,6 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                                — the same conversion the explicit-field
                                branch applies) *)
                             let dop, doty = lower_expr env st de in
-                            st.in_field_default <- false;
                             (match dop with
                              | Seed_mir.Copy p when not (copyable_ty env doty) ->
                                  Seed_mir.Read p
@@ -6237,8 +6269,6 @@ let lower_function_with_variants
       break_target = None;
       continue_target = None;
       variants;
-      in_field_default = false;
-      field_default_module = [];
       defer_stack = [];
       typed_nodes;
       typed_patterns;

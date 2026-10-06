@@ -243,6 +243,7 @@ let program_of (env : Typecheck.env) (prog_ast : Ast.program) : Seed_mir.program
       callables_by_callable = [];
       fn_ret = Type_repr.Int Type_repr.Int;
       struct_fields = Driver.struct_fields_of env;
+      name_bindings = env.Typecheck.typed_name_bindings;
       enum_payloads = Driver.enum_payloads_of env;
       copy_cache = Type_properties.create_cache ();
       lang_items = Lang_items.of_types env.Typecheck.types;

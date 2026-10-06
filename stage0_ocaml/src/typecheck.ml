@@ -133,6 +133,18 @@ type nominal = {
   nom_defaults : (string * Ast.expr) list;           (* declared field default expressions *)
 }
 
+(* (SEMANTIC FIELD DEFAULTS / no-text-reconstruction): the checker's
+   resolved GLOBAL identity for a Name-value node.  Lowering consumes
+   this instead of re-resolving the source spelling, so a declaration-
+   bound default can never be captured by a use-site local or a
+   same-spelled name from another module. *)
+type name_binding =
+  | NB_local                      (* local/param/self: lowering's own scope *)
+  | NB_const of string            (* the consts-table key actually used *)
+  | NB_static of string           (* the statics-table key actually used *)
+  | NB_ctor of string             (* the resolved constructor key *)
+  | NB_value of string            (* the resolved function/value key *)
+
 type typed_expr = {
   te_type : Type_repr.t;
   te_effects : Access_effect.read_effect array;
@@ -493,6 +505,9 @@ type env = {
      across the `{ env with ... }` record updates, so the final env the
      driver receives holds every accepted node's channel entry. *)
   typed_nodes : (Ids.Node_id.t, typed_node) Hashtbl.t;
+  (* (semantic name identity): NodeId -> the resolved global binding
+     of a Name-value node (locals record NB_local). *)
+  typed_name_bindings : (Ids.Node_id.t, name_binding) Hashtbl.t;
   (* the typed-pattern channel (re-audit P0 #3): (match NodeId, arm
      index) -> the arm's SEMANTIC pattern tree, resolved ONCE by
      check_pattern (the same mutable-table sharing as typed_nodes).  MIR
@@ -2325,6 +2340,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None)
     resolved;
     module_path = [];
     typed_nodes = Hashtbl.create 256;
+    typed_name_bindings = Hashtbl.create 256;
     typed_patterns = Hashtbl.create 256;
     typed_for_patterns = Hashtbl.create 64;
     typed_let_patterns = Hashtbl.create 64;
@@ -6748,26 +6764,30 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
       let qualified =
         match env.module_path with
         | [] -> None
-        | mp -> static_of_name env (String.concat "::" (mp @ [ n ]))
+        | mp ->
+            let k = String.concat "::" (mp @ [ n ]) in
+            (match static_of_name env k with Some t -> Some (k, t) | None -> None)
       in
       match qualified with
-      | Some t -> Some t
+      | Some r -> Some r
       | None -> (
           match static_of_name env n with
-          | Some t -> Some t
+          | Some t -> Some (n, t)
           | None -> (
               let suffix = "::" ^ n in
               match List.find_opt (fun (k, _) -> Util.has_suffix k suffix) env.statics with
-              | Some (_, t) -> Some t
+              | Some (k, t) -> Some (k, t)
               | None -> None))
     in
     match found with
-    | Some t ->
+    | Some (key, t) ->
+        Hashtbl.replace env.typed_name_bindings node_id (NB_static key);
         Some (Ok { te_type = t; te_effects = [| Access_effect.Read |]; te_span = span; te_flow = normal_flow (t) })
     | None -> None
   in
   match assoc_local n scope.locals with
       | Some (t, _) ->
+      Hashtbl.replace env.typed_name_bindings node_id NB_local;
       let subst = ref [] in
       let* _ =
         match expected with
@@ -6823,6 +6843,7 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
              without declaring it — the impl target is the type *)
           match env.current_self with
           | Some t ->
+              Hashtbl.replace env.typed_name_bindings node_id NB_local;
               Ok { te_type = t; te_effects = [| Access_effect.Read |]; te_span = span; te_flow = normal_flow (t) }
           | None ->
               Error (err span "unknown name `self` (not inside an impl)"))
@@ -6837,6 +6858,11 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
              | mp -> const_of_name env (String.concat "::" (mp @ [ n ]))
            with
            | Some t ->
+               Hashtbl.replace env.typed_name_bindings node_id
+                 (NB_const
+                    (match env.module_path with
+                     | [] -> n
+                     | mp -> String.concat "::" (mp @ [ n ])));
                let subst = ref [] in
                let* _ =
                  match expected with
@@ -6865,15 +6891,16 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                   VERSION, SYNTHETIC_MODULE_* — the flat-name rule) *)
                (match
                   match const_of_name env n with
-                  | Some t -> Some t
+                  | Some t -> Some (n, t)
                   | None -> (
                       match
                         List.filter (fun (k, _) -> Util.has_suffix k ("::" ^ n)) env.consts
                       with
-                      | [ (_, t) ] -> Some t
+                      | [ (k, t) ] -> Some (k, t)
                       | _ -> None)
                 with
-                | Some t ->
+                | Some (key, t) ->
+                    Hashtbl.replace env.typed_name_bindings node_id (NB_const key);
                     let subst = ref [] in
                     let* _ =
                       match expected with
@@ -6893,11 +6920,13 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                 | None ->
                     (match constructor_of_name env n with
                      | Some cs ->
+                         Hashtbl.replace env.typed_name_bindings node_id (NB_ctor n);
                          check_call_sig env scope expected node_id cs [] [] span
                            ~hint:CCH_constructor
                      | None -> (
                          match function_of_name env n with
                          | Some fs ->
+                             Hashtbl.replace env.typed_name_bindings node_id (NB_value n);
                              let fn_ty = Type_repr.Function (fs.ts_params, fs.ts_return) in
                              (match expected with
                               | Some (Type_repr.Function (ps, r)) ->

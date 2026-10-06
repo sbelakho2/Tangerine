@@ -2290,6 +2290,7 @@ end
           callables_by_callable = [];
           fn_ret = int_ty;
           struct_fields = Driver.struct_fields_of tcheck_env;
+           name_bindings = tcheck_env.Typecheck.typed_name_bindings;
           enum_payloads = Driver.enum_payloads_of tcheck_env;
           copy_cache = Type_properties.create_cache ();
           lang_items = Lang_items.of_types (tcheck_env).Typecheck.types;
@@ -3236,6 +3237,7 @@ end
           callables_by_callable = [];
           fn_ret = int_ty;
           struct_fields = Driver.struct_fields_of fenv;
+           name_bindings = fenv.Typecheck.typed_name_bindings;
           enum_payloads = Driver.enum_payloads_of fenv;
           copy_cache = Type_properties.create_cache ();
           lang_items = Lang_items.of_types (fenv).Typecheck.types;
@@ -3572,6 +3574,7 @@ end
           callables_by_callable = [];
           fn_ret = int_ty;
           struct_fields = Driver.struct_fields_of wbenv;
+           name_bindings = wbenv.Typecheck.typed_name_bindings;
           enum_payloads = Driver.enum_payloads_of wbenv;
 
                   copy_cache = Type_properties.create_cache ();
@@ -4399,6 +4402,7 @@ end
           callables_by_callable = [];
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of lenv;
+           name_bindings = lenv.Typecheck.typed_name_bindings;
           enum_payloads = Driver.enum_payloads_of lenv;
 
                    copy_cache = Type_properties.create_cache ();
@@ -4831,6 +4835,7 @@ end
            callables_by_callable = [];
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of menv;
+           name_bindings = menv.Typecheck.typed_name_bindings;
           enum_payloads = Driver.enum_payloads_of menv;
 
                    copy_cache = Type_properties.create_cache ();
@@ -5108,6 +5113,7 @@ end
                 fn_ret = int_ty;
                 struct_fields =
                   [ (fs_tid, [ ("a", l_fid_a, int_ty, None); ("b", l_fid_b, int_ty, None) ]) ];
+                name_bindings = Hashtbl.create 1;
                 enum_payloads = [];
               copy_cache = Type_properties.create_cache ();
           lang_items = Lang_items.seed_defaults;
@@ -5274,6 +5280,7 @@ end
                 methods = [];
                 fn_ret = int_ty;
                 struct_fields = [];
+           name_bindings = Hashtbl.create 1;
                 enum_payloads = [];
               copy_cache = Type_properties.create_cache ();
           lang_items = Lang_items.seed_defaults;
@@ -5593,6 +5600,7 @@ end
            callables_by_callable = [];
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of qenv;
+           name_bindings = qenv.Typecheck.typed_name_bindings;
           enum_payloads = Driver.enum_payloads_of qenv;
 
                    copy_cache = Type_properties.create_cache ();
@@ -5846,6 +5854,7 @@ end
              ];
            fn_ret = int_ty;
            struct_fields = [ (va_tid, [ ("data", va_fid, int_ty, None) ]) ];
+           name_bindings = Hashtbl.create 1;
                 enum_payloads = [];
          copy_cache = Type_properties.create_cache ();
           lang_items = Lang_items.seed_defaults;
@@ -6110,6 +6119,7 @@ end
            callables_by_callable = [];
            fn_ret = int_ty;
            struct_fields = [];
+           name_bindings = Hashtbl.create 1;
                 enum_payloads = [];
          copy_cache = Type_properties.create_cache ();
           lang_items = Lang_items.seed_defaults;
@@ -6333,6 +6343,7 @@ end
           callables_by_callable = [];
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of qc_env;
+           name_bindings = qc_env.Typecheck.typed_name_bindings;
           enum_payloads = Driver.enum_payloads_of qc_env;
 
                    copy_cache = Type_properties.create_cache ();
@@ -6555,6 +6566,7 @@ end
            callables_by_callable = [];
            fn_ret = int_ty;
            struct_fields = Driver.struct_fields_of w_env;
+           name_bindings = w_env.Typecheck.typed_name_bindings;
           enum_payloads = Driver.enum_payloads_of w_env;
 
                    copy_cache = Type_properties.create_cache ();
