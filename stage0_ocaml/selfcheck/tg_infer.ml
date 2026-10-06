@@ -206,10 +206,18 @@ let () =
               "the head-bucket cross-product battery failed (expected `HEAD_CROSS_PRODUCT fails=0`; see the report above)"
           else if not (contains report "DEFAULT_FIELD_BATTERY fails=0") then
             (* defaulted struct fields: omitting a defaulted field is
-               legal and the default is checked in place; omitting a
-               required field is still an error. *)
+               legal and the default is declaration-typed; omitting a
+               required field is E0203; a wrong-typed default fails at
+               the declaration. *)
             fail
               "the defaulted-field battery failed (expected `DEFAULT_FIELD_BATTERY fails=0`; see the report above)"
+          else if not (contains report "PENDING_INFERENCE_BATTERY fails=0") then
+            (* the pending_call_instances channel: annotation-, dest-,
+               return- and later-use-driven generic constructor
+               inference must solve or bottom out, never leave
+               Type::Var/Type::Error before readiness. *)
+            fail
+              "the pending-inference battery failed (expected `PENDING_INFERENCE_BATTERY fails=0`; see the report above)"
           else if not (contains report "TOTALS errors=") then
             fail "the probe produced no TOTALS row"
           else if merged && not (contains report "IMPLCONF=0") then

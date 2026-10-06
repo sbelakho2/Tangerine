@@ -1260,7 +1260,14 @@ let rec default_operand_of (env : func_env) (st : lower_state)
               (fun i (fn, _fid, _fty, _de) ->
                 match List.nth reg i with
                 | (_, _, _, Some de) -> fst (lower_expr env st de)
-                | (_, _, fty2, None) -> default_operand_of env st lit_name fn fty2)
+                | (_, _, _fty2, None) ->
+                    (* fail closed: the checker enforces E0203, so an
+                       omitted source field always has a DECLARED default;
+                       a None here is an internal inconsistency, never a
+                       silent type-default. *)
+                    seed_bug
+                      "struct literal `%s` is missing the required field `%s` (no declared default; E0203)"
+                      lit_name fn)
               reg
           in
           let id = fresh_local st t in
@@ -3036,14 +3043,15 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                              | Seed_mir.Copy p when not (copyable_ty env doty) ->
                                  Seed_mir.Read p
                              | _ -> dop)
-                        | (fname, _, fty, None) ->
-                            (* re-audit P12: the TYPE default — the native
-                               fills a literal-omitted field with the
-                               field type's default value (empty
-                               containers, zero scalars, None, "", and
-                               STRUCT fields as the all-defaulted
-                               aggregate) *)
-                            default_operand_of env st name fname fty))
+                        | (fname, _, _fty, None) ->
+                            (* fail closed: the checker enforces E0203 —
+                               an omitted source field always carries a
+                               DECLARED default, lowered above; a None
+                               here is an internal inconsistency, never a
+                               silent type-default. *)
+                            seed_bug
+                              "struct literal `%s` is missing the required field `%s` (no declared default; E0203)"
+                              name fname))
             in
            let id = fresh_local st rt in
            emit st

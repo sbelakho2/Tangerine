@@ -1372,10 +1372,10 @@ end
 # is origin-first, so an untrusted spoofed path is rejected by the same
 # untrusted gate as A/B.
 # ———————————————————————————————————————————————————————————————
-def infer_probe_private_run(source: String, trusted: Bool) -> (Int, Bool)
+def infer_probe_private_run(source: String, trusted: Bool) -> (Int, Bool, Int)
   let parsed = parse(tokenize(source, "privacy"))
   if diag_has_errors(&parsed.diagnostics) then
-    return (1, false)
+    return (1, false, 0)
   end
   var program = parsed.program
   assign_node_ids(&mut program)
@@ -1393,35 +1393,71 @@ def infer_probe_private_run(source: String, trusted: Bool) -> (Int, Bool)
       end
       i = i + 1
     end
-    (result.errors.len(), found)
+    (result.errors.len(), found, typed_intrinsic_classification_count(&env))
   when Result::Err(errs) then
-    (errs.len() + 1000, false)
+    (errs.len() + 1000, false, 0)
+  end
+end
+
+# whether any checker diagnostic contains `needle` (a fresh check pass).
+def infer_probe_has_error(source: String, needle: String) -> Bool
+  let parsed = parse(tokenize(source, "battery"))
+  if diag_has_errors(&parsed.diagnostics) then
+    return false
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    var found = false
+    var i = 0
+    while i < result.errors.len() do
+      if result.errors[i].message.contains(needle.clone()) then
+        found = true
+      end
+      i = i + 1
+    end
+    found
+  when Result::Err(_errs) then
+    false
   end
 end
 
 def infer_probe_restricted_intrinsic_battery(inout report: String) -> Int
   var fails = 0
   let a_src = "extern def __intrinsic_map_clone(v: Int) -> Int\n\ndef main() -> Int\n  let w = __intrinsic_map_clone(1)\n  0\nend\n"
-  let (a_n, a_found) = infer_probe_private_run(a_src, false)
+  let (a_n, a_found, _ai) = infer_probe_private_run(a_src, false)
   if !a_found then
     report = report + "RESTRICTED_INTRINSIC_BATTERY A: ordinary declaration+call was not rejected (errors=" + a_n.to_string() + ")\n"
     fails = fails + 1
   end
   let b_src = "extern def __intrinsic_map_clone(v: Int) -> Int\n\ndef main() -> Int\n  0\nend\n"
-  let (b_n, b_found) = infer_probe_private_run(b_src, false)
+  let (b_n, b_found, _bi) = infer_probe_private_run(b_src, false)
   if !b_found then
     report = report + "RESTRICTED_INTRINSIC_BATTERY B: declaration-only was not rejected (errors=" + b_n.to_string() + ")\n"
     fails = fails + 1
   end
   let c_src = "def __intrinsic_map_clone(v: Int) -> Int\n  v\nend\n\ndef main() -> Int\n  let w = __intrinsic_map_clone(1)\n  0\nend\n"
-  let (c_n, c_found) = infer_probe_private_run(c_src, false)
-  if c_n != 0 || c_found then
-    report = report + "RESTRICTED_INTRINSIC_BATTERY C: same-named ordinary function was not ACCEPTED (errors=" + c_n.to_string() + ")\n"
+  let (c_n, c_found, c_i) = infer_probe_private_run(c_src, false)
+  if c_n != 0 || c_found || c_i != 0 then
+    report = report + "RESTRICTED_INTRINSIC_BATTERY C: same-named ordinary function was not ACCEPTED as a user call (errors=" + c_n.to_string() + " intrinsics=" + c_i.to_string() + ")\n"
+    fails = fails + 1
+  end
+  # C2 (identity-level parity): a SIGNATURE-COMPATIBLE same-named user
+  # function resolves to the user callable and must never be re-stamped
+  # by the name-based intrinsic router (intrinsics=0).
+  let c2_src = "def __intrinsic_map_clone[K, V](m: Map[K, V]) -> Map[K, V]\n  m\nend\n\ndef main() -> Int\n  var m: Map[Int, Int] = Map::new()\n  let m2 = __intrinsic_map_clone(m)\n  0\nend\n"
+  let (c2_n, c2_found, c2_i) = infer_probe_private_run(c2_src, false)
+  if c2_n != 0 || c2_found || c2_i != 0 then
+    report = report + "RESTRICTED_INTRINSIC_BATTERY C2: signature-compatible same-named function was re-interpreted (errors=" + c2_n.to_string() + " intrinsics=" + c2_i.to_string() + ")\n"
     fails = fails + 1
   end
   # F: trusted origin, but the item's module is not a compiler module —
   # the second authorization factor must still reject the declaration.
-  let (f_n, f_found) = infer_probe_private_run(a_src, true)
+  let (f_n, f_found, _fi) = infer_probe_private_run(a_src, true)
   if !f_found then
     report = report + "RESTRICTED_INTRINSIC_BATTERY F: trusted origin without the exact compiler module was not rejected (errors=" + f_n.to_string() + ")\n"
     fails = fails + 1
@@ -1510,27 +1546,81 @@ def infer_probe_head_cross_product(inout report: String) -> Int
 end
 
 # ———————————————————————————————————————————————————————————————
-# struct-literal completeness (seed/self-host parity): the checker
-# checks only the fields a literal PROVIDES — an omitted field is not a
-# checker error (declared defaults and type-defaults are materialized by
-# LOWERING, the seed's architecture), while an UNKNOWN field is still
-# rejected.
+# struct-literal completeness (E0203): a supplied field is checked; an
+# omitted field WITH a declaration default is legal (the default is
+# declared-typed at registration and materialized by lowering); an
+# omitted field with NO declaration default is a checker error; an
+# unknown field is rejected; a wrong-typed default fails at the
+# DECLARATION even when no literal ever omits it.
 # ———————————————————————————————————————————————————————————————
 def infer_probe_default_field_battery(inout report: String) -> Int
   var fails = 0
-  let ok_src = "struct Holder\n  value: Int\n  tag: String = \"none\"\n  items: Vec[Int] = Vec::new()\n  other: Int\nend\n\ndef main() -> Int\n  let h = Holder { value: 3 }\n  0\nend\n"
-  let (ok_n, _) = infer_probe_private_run(ok_src, false)
+  let ok_src = "struct Holder\n  value: Int\n  tag: String = \"none\"\n  items: Vec[Int] = Vec::new()\nend\n\ndef main() -> Int\n  let h = Holder { value: 3 }\n  0\nend\n"
+  let (ok_n, _ok_f, _ok_i) = infer_probe_private_run(ok_src, false)
   if ok_n != 0 then
-    report = report + "DEFAULT_FIELD_BATTERY: omitting defaulted/required fields was not accepted (errors=" + ok_n.to_string() + ")\n"
+    report = report + "DEFAULT_FIELD_BATTERY: omitting a DEFAULTED field was not accepted (errors=" + ok_n.to_string() + ")\n"
     fails = fails + 1
   end
-  let bad_src = "struct Strict\n  value: Int\nend\n\ndef main() -> Int\n  let s = Strict { value: 3, nope: 4 }\n  0\nend\n"
-  let (bad_n, _) = infer_probe_private_run(bad_src, false)
+  let missing_src = "struct Strict\n  value: Int\n  other: Int\nend\n\ndef main() -> Int\n  let s = Strict { value: 3 }\n  0\nend\n"
+  let (missing_n, _missing_f, _missing_i) = infer_probe_private_run(missing_src, false)
+  if missing_n == 0 || !infer_probe_has_error(missing_src, "missing required field") then
+    report = report + "DEFAULT_FIELD_BATTERY: omitting a REQUIRED field was not rejected with E0203\n"
+    fails = fails + 1
+  end
+  let bad_default_src = "struct Bad\n  x: Int = \"abc\"\nend\n\ndef main() -> Int\n  0\nend\n"
+  let (bad_n, _bad_f, _bad_i) = infer_probe_private_run(bad_default_src, false)
   if bad_n == 0 then
+    report = report + "DEFAULT_FIELD_BATTERY: a WRONG-TYPED default was accepted at the declaration\n"
+    fails = fails + 1
+  end
+  let unknown_src = "struct Strict2\n  value: Int\nend\n\ndef main() -> Int\n  let s = Strict2 { value: 3, nope: 4 }\n  0\nend\n"
+  if !infer_probe_has_error(unknown_src, "unknown field") then
     report = report + "DEFAULT_FIELD_BATTERY: an UNKNOWN field was accepted\n"
     fails = fails + 1
   end
   report = report + "DEFAULT_FIELD_BATTERY fails=" + fails.to_string() + "\n"
+  fails
+end
+
+# ———————————————————————————————————————————————————————————————
+# pending_call_instances / finalize channel: a generic constructor whose
+# argument is solvable ONLY from the caller's context — the annotation,
+# the dest, or a later method use — must be SOLVED before readiness,
+# never left as Type::Var or poisoned into Type::Error.
+# ———————————————————————————————————————————————————————————————
+def infer_probe_pending_inference_battery(inout report: String) -> Int
+  var fails = 0
+  let case_a = "def a() -> Int\n  var xs: Vec[Int] = Vec::new()\n  0\nend\n"
+  let (a_n, _af, _ai) = infer_probe_private_run(case_a, false)
+  if a_n != 0 then
+    report = report + "PENDING_INFERENCE_BATTERY A: annotation-only Vec inference failed (errors=" + a_n.to_string() + ")\n"
+    fails = fails + 1
+  end
+  let case_b = "def b() -> Int\n  var xs = Vec::new()\n  xs.push(1)\n  0\nend\n"
+  let (b_n, _bf, _bi) = infer_probe_private_run(case_b, false)
+  if b_n != 0 then
+    report = report + "PENDING_INFERENCE_BATTERY B: later-method-use Vec inference failed (errors=" + b_n.to_string() + ")\n"
+    fails = fails + 1
+  end
+  let case_c = "def c() -> Vec[Int]\n  Vec::new()\nend\n"
+  let (c_n, _cf, _ci) = infer_probe_private_run(case_c, false)
+  if c_n != 0 then
+    report = report + "PENDING_INFERENCE_BATTERY C: return-type Vec inference failed (errors=" + c_n.to_string() + ")\n"
+    fails = fails + 1
+  end
+  let case_d = "def d() -> Int\n  var m: Map[String, Int] = Map::new()\n  0\nend\n"
+  let (d_n, _df, _di) = infer_probe_private_run(case_d, false)
+  if d_n != 0 then
+    report = report + "PENDING_INFERENCE_BATTERY D: Map constructor inference failed (errors=" + d_n.to_string() + ")\n"
+    fails = fails + 1
+  end
+  let case_e = "def e() -> Int\n  var v: Vec[Vec[Int]] = Vec::new()\n  var inner: Vec[Int] = Vec::new()\n  inner.push(1)\n  v.push(inner)\n  0\nend\n"
+  let (e_n, _ef, _ei) = infer_probe_private_run(case_e, false)
+  if e_n != 0 then
+    report = report + "PENDING_INFERENCE_BATTERY E: nested generic constructor inference failed (errors=" + e_n.to_string() + ")\n"
+    fails = fails + 1
+  end
+  report = report + "PENDING_INFERENCE_BATTERY fails=" + fails.to_string() + "\n"
   fails
 end
 
@@ -1543,6 +1633,7 @@ def main() -> Int
   let _ = infer_probe_restricted_intrinsic_battery(&mut report)
   let _ = infer_probe_head_cross_product(&mut report)
   let _ = infer_probe_default_field_battery(&mut report)
+  let _ = infer_probe_pending_inference_battery(&mut report)
   let _ = write_file("build/infer_probe.txt", report.clone())
   var counts = Vec::from([infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0)])
   var rows = Vec::new()

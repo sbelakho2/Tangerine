@@ -76,37 +76,31 @@ GATE_TIMEOUT_S="${TG_GATE_TIMEOUT_S:-4140}"
 # explicit, validated bound:
 #   TG_FINAL_RSS_MEASUREMENT=1 TG_FINAL_RSS_MB=<1..16384>
 # RSS measurement is /proc-based (Linux).  On a host without it the gate
-# REFUSES to authorize rather than run unbounded (the historical 28-GB
-# host OOM); an explicit measurement escape hatch exists for developing
-# the Darwin RSS route:
-#   TG_ALLOW_UNBOUNDED_FINAL=1
+# REFUSES to authorize — there is NO unbounded authorization path (an
+# unbounded run is a separate, non-authorizing measurement activity).
 case "$(uname -s 2>/dev/null)" in
   Linux) FINAL_RSS_SUPPORTED=1 ;;
   *) FINAL_RSS_SUPPORTED=0 ;;
 esac
 if [ "$FINAL_RSS_SUPPORTED" != "1" ]; then
-  if [ "${TG_ALLOW_UNBOUNDED_FINAL:-0}" != "1" ]; then
-    echo "check_ocaml_bootstrap_complete: FAIL — final authorization requires an RSS ceiling, but this host has no RSS measurement (/proc); run on Linux or set TG_ALLOW_UNBOUNDED_FINAL=1 for an explicit unbounded measurement run" >&2
+  echo "check_ocaml_bootstrap_complete: FAIL — final authorization requires an RSS ceiling, but this host has no RSS measurement (/proc). Run the authorization gate on Linux; unbounded measurement is a separate, explicitly non-authorizing activity." >&2
+  exit 1
+fi
+if [ "${TG_FINAL_RSS_MEASUREMENT:-0}" = "1" ]; then
+  TG_FINAL_RSS_MB="${TG_FINAL_RSS_MB:-12288}"
+  case "$TG_FINAL_RSS_MB" in
+    '' | *[!0-9]*)
+      echo "check_ocaml_bootstrap_complete: FAIL — TG_FINAL_RSS_MB must be an integer" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$TG_FINAL_RSS_MB" -lt 1 ] || [ "$TG_FINAL_RSS_MB" -gt 16384 ]; then
+    echo "check_ocaml_bootstrap_complete: FAIL — TG_FINAL_RSS_MB must be within 1..16384" >&2
     exit 1
   fi
-  echo "check_ocaml_bootstrap_complete: WARNING — no RSS measurement on this host; running UNBOUNDED because TG_ALLOW_UNBOUNDED_FINAL=1"
+  export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB="$TG_FINAL_RSS_MB"
 else
-  if [ "${TG_FINAL_RSS_MEASUREMENT:-0}" = "1" ]; then
-    TG_FINAL_RSS_MB="${TG_FINAL_RSS_MB:-12288}"
-    case "$TG_FINAL_RSS_MB" in
-      '' | *[!0-9]*)
-        echo "check_ocaml_bootstrap_complete: FAIL — TG_FINAL_RSS_MB must be an integer" >&2
-        exit 1
-        ;;
-    esac
-    if [ "$TG_FINAL_RSS_MB" -lt 1 ] || [ "$TG_FINAL_RSS_MB" -gt 16384 ]; then
-      echo "check_ocaml_bootstrap_complete: FAIL — TG_FINAL_RSS_MB must be within 1..16384" >&2
-      exit 1
-    fi
-    export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB="$TG_FINAL_RSS_MB"
-  else
-    export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB=12288
-  fi
+  export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB=12288
 fi
 # The bootstrap target authority: the SAME triple the ladder compiles for
 # (TG_BOOTSTRAP_TARGET; default aarch64-apple-darwin).  The gate's closure

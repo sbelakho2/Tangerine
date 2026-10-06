@@ -3469,26 +3469,50 @@ type mono_outcome = {
    Measured 2026-10-05 (literal-completeness pass, 120e9 plan / 14 GiB
    / OCAMLRUNPARAM=o=40): the run reaches 78.0e9 steps with live
    ~6.6e3 MB / RSS ~1.25e4 MB (no RSS trap) and ZERO missing-field
-   diagnostics — the 2108-diagnostic strict-literal wall is fully
-   cleared.  Declared defaults are recorded and materialized by the MIR
-   aggregate fill (DEFAULT_FIELD_BATTERY), and the omitted fields the
-   run's log identified (11 struct/field pairs: TypeEnv suffix/layout/
-   wcet/trait-contract/scoped-access/pattern-const tables,
-   MirProgram.lang_items, ResolverLocalBinding.local_id,
-   ImplDecl.trait_type_args, LirStmt.div, and LangItems' id fields) now
-   carry declaration defaults whose values match the seed's synthesized
-   type-defaults, so both compilers fill them identically.
+   diagnostics.
 
-   The remaining frontier at ~78e9 is a DISTINCT inference-parity gap:
-   the kernel checker reports 132 `unresolved Type::Error` readiness
-   findings plus ~458 typed-HIR assembly errors, concentrated on
-   `Vec::new()` calls whose element type the kernel's inference leaves
-   unsolved (`rs_resolve_imports`, `assign_pattern_ids`,
-   `type_registration_module_path`, `check_effect_sets`,
-   `missing_struct_fields_desc`, `verify_mir`, `merge_code_buffer`, ...)
-   — the seed's checker solves these from surrounding usage.  That
-   inference gap, not literal completeness, is now the blocker; budgets
-   stay unre-pinned and the final gate is not authorized. *)
+   Corrective pass 2026-10-06 (audit ordering): E0203 is RESTORED on
+   both compilers — a supplied field is checked, an omitted field with a
+   DECLARED default is legal (checked in the declaration scope and
+   materialized by lowering), an omitted field with no declaration
+   default is an error, and the seed lowering's type-default fallback is
+   fail-closed seed_bug.  Required-field checking exposed a PRE-EXISTING
+   bare-name collision the old leniency hid: std/alloc.tg and
+   tg_compiler/layout_engine.tg both declared `EnumLayout`, and the
+   seed's bare-keyed nominal table picked std's — the closure now shows
+   0 errors after renaming the compiler-internal type
+   `CompilerEnumLayout`.  The compiler-private gate now lets the RESOLVED
+   identity win (a same-named user function is never re-classified by
+   the name router), the kernel origin requires the kernel-entry root as
+   well as the bootstrap-proof flag, and final authorization has NO
+   unbounded path (non-Linux refuses; TG_ALLOW_UNBOUNDED_FINAL /
+   TG_FINAL_RSS_MEASUREMENT are rejected by prebootstrap_env_gate.sh).
+   LangItems' id fields default to the -1 sentinel, not a plausible
+   type id 0.  tg_infer passes with six batteries (UNIFY, IMPL_INDEX,
+   HEAD_CROSS_PRODUCT, RESTRICTED_INTRINSIC incl. the
+   signature-compatible user-identity case, DEFAULT_FIELD/E0203,
+   PENDING_INFERENCE); the quick ladder is green at 70 checks.
+
+   Remaining frontier to re-measure: the full-closure inference findings
+   (~132 `unresolved Type::Error` + typed-HIR assembly errors in the
+   previous run, mostly `Vec::new()` element inference in complex
+   contexts) — the cheap pending-inference battery passes, so the next
+   bounded profile re-quantifies what remains.  Budgets stay unre-pinned
+   and the final gate is not authorized until a completed cold+warm
+   measurement.
+
+   Re-measured 2026-10-06 after the corrective pass (120e9 plan / 14 GiB
+   / OCAMLRUNPARAM=o=40): 78.2e9 steps, live ~6.3e3 MB, RSS ~1.24e4 MB,
+   ZERO missing-field diagnostics — and the SAME independent frontier:
+   132 `unresolved Type::Error` readiness findings plus ~460
+   typed-HIR assembly errors (`argument N has no typed HIR record`)
+   across std/time, std/bench, tg_compiler/resolver and others.  The
+   E0203/parity/provenance fixes did not move it (as expected: it is a
+   kernel checker typed-channel completeness gap, not literal
+   completeness).  Next pass: reproduce the HIR-record misses on a
+   minimal case from one failing site (`rs_resolve_imports`'s
+   `var keys = Vec::new()` + entries/push shape) and fix the channel
+   recording, not the individual items. *)
 (* (recalibrated bootstrap caps): the bootstrap VM budget is overridable via
    the environment so deep corpus+stdlib compiles can be given a larger
    budget without a rebuild; the defaults stay bounded, fail-fast guards. *)
@@ -5725,7 +5749,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
         Debt_report.sum_reports
           (List.map snd ctx.ctx_env.Typecheck.state.debt_by_module)
       in
-      if ctx.ctx_type_errors <> [] then
+      if ctx.ctx_type_errors <> [] then begin
         Ok
           {
             bs_ctx = ctx;
@@ -5740,6 +5764,7 @@ let run_bootstrap_closure ~(repo_root : string) ~(manifest_path : string)
             bs_stdout = "";
             bs_stderr = "";
           }
+      end
       else begin
         match (try Ok (phase_time ~label:"lower_closure (Seed MIR)" (fun () -> lower_closure ctx)) with e -> Error (Printexc.to_string e)) with
         | Error _ ->

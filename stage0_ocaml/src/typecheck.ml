@@ -130,6 +130,7 @@ type nominal = {
       (* resolved where predicates *)
   nom_field_ids : Ids.Field_id.t list;               (* resolver identities, parallel to nom_fields *)
   nom_variant_ids : Ids.Variant_id.t list;           (* resolver identities, parallel to nom_variants *)
+  nom_defaults : (string * Ast.expr) list;           (* declared field default expressions *)
 }
 
 type typed_expr = {
@@ -2161,6 +2162,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None)
       nom_where = [];
       nom_field_ids = [];
       nom_variant_ids = [];
+      nom_defaults = []
     }
   in
   let instant_types = ("Instant", Type_repr.Named (instant_tid, [||])) in
@@ -2181,6 +2183,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None)
       nom_where = [];
       nom_field_ids = [];
       nom_variant_ids = [];
+      nom_defaults = []
     }
   in
   let types =
@@ -2240,6 +2243,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None)
       nom_where = [];
       nom_field_ids = [];
       nom_variant_ids = [];
+      nom_defaults = []
     }
   in
   let res_nominal : nominal =
@@ -2256,6 +2260,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None)
       nom_where = [];
       nom_field_ids = [];
       nom_variant_ids = [];
+      nom_defaults = []
     }
   in
   (* the source declarations of Option/Result adopt the builtin LangItem
@@ -2282,6 +2287,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None)
       nom_where = [];
       nom_field_ids = [];
       nom_variant_ids = [];
+      nom_defaults = []
     }
   in
   {
@@ -4589,6 +4595,30 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
             match go [] fields with
             | Error m -> Error m
             | Ok fes -> (
+                (* (E0203 required-field completeness): every declared
+                   field must be supplied — by the literal or a `..rest`
+                   spread — EXCEPT a field with a DECLARED default
+                   (`= <expr>`), which may be omitted and is materialized
+                   by lowering from the declaration-typed default.  A
+                   missing required field is an error HERE; it is never
+                   silently given a type-default. *)
+                let supplied = List.map fst fields in
+                let missing_required =
+                  if rest <> None then None
+                  else
+                    List.find_opt
+                      (fun (n, _) ->
+                        (not (List.mem_assoc n nom.nom_defaults))
+                        && not (List.mem n supplied))
+                      nom.nom_fields
+                in
+                match missing_required with
+                | Some (mn, _) ->
+                    Error
+                      (err span
+                         (Printf.sprintf "missing required field `%s` of struct `%s`"
+                            mn name))
+                | None ->
                 let lit_ty = Type_repr.Named (tid, lit_args) in
                 let rest_ok =
                   match rest with
@@ -8664,8 +8694,22 @@ and check_struct (env : env) (d : Ast.struct_decl) : (unit, string) result =
                     match List.assoc_opt f.f_name nom.nom_fields with
                     | None -> Error (err f.f_span (Printf.sprintf "unknown field `%s`" f.f_name))
                     | Some ft -> (
+                        (* the declared default must have EXACTLY the
+                           declared field type: the expected-type check
+                           alone leaves literal coercions open, so unify
+                           the checked type explicitly (the struct-literal
+                           field rule). *)
                         match check_expr env scope (Some ft) e with
-                        | Ok _ -> go rest
+                        | Ok te -> (
+                            let s2 = ref !var_journal in
+                            match unify env.state.box_tid s2 ft te.te_type with
+                            | Ok () -> go rest
+                            | Error m ->
+                                Error
+                                  (err (Ast.expr_span e)
+                                     (Printf.sprintf
+                                        "field `%s` default type mismatch: expected %s (%s)"
+                                        f.f_name (type_to_string ft) m)))
                         | Error m -> Error m)))
           in
           go d.s_fields
@@ -9260,7 +9304,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             (if d.s_name = "Box" then env.state.box_tid <- Some tid);
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
-              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
+              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = []; nom_defaults = [] }
             in
             (* a user definition of a builtin name REPLACES the builtin *)
             let env' =
@@ -9312,6 +9356,14 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             | None -> Ids.Field_id.make (i + 1))
           fields
       in
+      let nom_defaults =
+        List.filter_map
+          (fun (f : Ast.field_decl) ->
+            match f.Ast.f_default with
+            | Some e -> Some (f.Ast.f_name, e)
+            | None -> None)
+          d.s_fields
+      in
       let nom : nominal =
         {
           nom_kind = `Struct;
@@ -9322,6 +9374,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
           nom_where = where;
           nom_field_ids = field_ids;
           nom_variant_ids = [];
+          nom_defaults = nom_defaults;
         }
       in
       let env1 = { env_fwd with nominals = (d.s_name, nom) :: List.remove_assoc d.s_name env_fwd.nominals } in
@@ -9357,7 +9410,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
-              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
+              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = []; nom_defaults = [] }
             in
             let env' =
               {
@@ -9433,6 +9486,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
           nom_where = where;
           nom_field_ids = [];
           nom_variant_ids = variant_ids;
+          nom_defaults = []
         }
       in
       let env1 = { env_fwd with nominals = (d.e_name, nom) :: List.remove_assoc d.e_name env_fwd.nominals } in
@@ -9483,6 +9537,7 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
                 nom_where = [];
                 nom_field_ids = [];
                 nom_variant_ids = [];
+                nom_defaults = []
               }
             in
             {
@@ -10047,7 +10102,7 @@ let rec register_headers (env : env) (acc : string list) = function
             (if d.s_name = "Box" then env.state.box_tid <- Some tid);
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
-              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
+              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = []; nom_defaults = [] }
             in
             let env' =
               {
@@ -10086,7 +10141,7 @@ let rec register_headers (env : env) (acc : string list) = function
             in
             let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
             let nom : nominal =
-              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = [] }
+              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = []; nom_defaults = [] }
             in
             let env' =
               {
