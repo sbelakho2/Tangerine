@@ -315,6 +315,12 @@ let fresh_lookup_cache () : lookup_cache =
 
 (* Mutable check state (per check_program run). *)
 type state = {
+  (* provenance for compiler-private intrinsics: TRUE only for the
+     bootstrap manifest-closure compilation (run_closure_pipeline_impl).
+     User-facing single-file checks keep it false, so a source-declared
+     `module tg_compiler::types` cannot claim the private namespace —
+     authorization follows the compile origin, never the module string. *)
+  mutable trusted_compiler_origin : bool;
   mutable next_type_id : int;
   mutable next_param_id : int;
   mutable next_var_id : int;
@@ -1146,7 +1152,8 @@ let type_query_kind_of_name (n : string) : Seed_mir.type_query_kind option =
   | "align_of" -> Some Seed_mir.AlignOf
   | _ -> None
 
-let classify_callee ~(hint : call_class_hint) ~(module_path : string list)
+let classify_callee ~(hint : call_class_hint)
+    ~(trusted_compiler_origin : bool) ~(module_path : string list)
     (sig_ : typed_signature) ~(argc : int) ~(type_args : Type_repr.t array) :
     typed_callee =
   let callable = sig_.ts_callable in
@@ -1189,12 +1196,14 @@ let classify_callee ~(hint : call_class_hint) ~(module_path : string list)
             if
               Intrinsic_registry.is_compiler_private_name n
               && not
-                   (Intrinsic_registry.compiler_private_module_allowed
-                      module_path)
+                   (trusted_compiler_origin
+                   && Intrinsic_registry.compiler_private_module_allowed
+                        module_path)
             then
-              (* compiler-private: ordinary source can neither declare nor
-                 reach the name; fall through so a same-named user
-                 function is called, and an undeclared use stays
+              (* compiler-private: only the manifest-closure compilation
+                 (provenance, not the module string) may bind the name;
+                 ordinary source falls through so a same-named user
+                 function is called and an undeclared use stays
                  unresolved. *)
               via_host rest
             else (
@@ -1819,13 +1828,15 @@ let builtin_constructors (st : state) (opt_p : Ids.Generic_param_id.t)
   ]
 
 (* The initial env: the compiler-registered prelude. *)
-let initial_env ?(resolved : Resolver.resolved_program option = None) () : env =
+let initial_env ?(resolved : Resolver.resolved_program option = None)
+    ?(trusted_compiler_origin = false) () : env =
   var_journal := [];
   Hashtbl.reset journal_var_tbl;
   realign_depth := 0;
   Hashtbl.reset err_span_journal;
   let st =
     {
+      trusted_compiler_origin = trusted_compiler_origin;
       next_type_id = 100;
       next_param_id = 1000;
       next_var_id = 0;
@@ -7580,7 +7591,9 @@ and check_call_sig (env : env) (scope : scope) (expected : Type_repr.t option)
           tn_cast_target = None;
           tn_call =
             Some
-              (classify_callee ~hint ~module_path:env.module_path sig_
+              (classify_callee ~hint
+                 ~trusted_compiler_origin:env.state.trusted_compiler_origin
+                 ~module_path:env.module_path sig_
                  ~argc:(List.length tes) ~type_args:substitution) };
       (* the integrated access channel (re-audit P0-11): one record per
          argument, in program order, aligned with the recorded effects;
@@ -8591,7 +8604,9 @@ and check_function_item (env : env) (mp : string list) (d : Ast.function_decl) :
   if
     d.fn_sig.sig_extern
     && Intrinsic_registry.is_compiler_private_name d.fn_sig.sig_name
-    && not (Intrinsic_registry.compiler_private_module_allowed mp)
+    && not
+         (env.state.trusted_compiler_origin
+         && Intrinsic_registry.compiler_private_module_allowed mp)
   then
     Error
       (err d.fn_sig.sig_span

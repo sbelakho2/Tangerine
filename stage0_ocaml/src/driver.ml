@@ -1904,6 +1904,21 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
       Printf.printf "  manifest: %d entries, version %s\n" n
         (match Bootstrap_manifest.version_of manifest with Some v -> v | None -> "(none)");
        Printf.printf "  fingerprint: %s\n" (Bootstrap_manifest.fingerprint manifest);
+        (* PROVENANCE for compiler-private intrinsics: the trusted origin
+           is a property of the loaded CLOSURE (every member is std/ or
+           tg_compiler/), not of any source-declared module path.  A
+           user-supplied manifest mixing their own modules in gets
+           trusted_compiler_origin=false, so declaring
+           `module tg_compiler::types` can never claim the private
+           namespace. *)
+        let trusted_compiler_origin =
+          List.for_all
+            (fun (e : Bootstrap_manifest.module_entry) ->
+              match e.path with
+              | "std" :: _ | "tg_compiler" :: _ -> true
+              | _ -> false)
+            (Bootstrap_manifest.entries manifest)
+        in
        let diags = Diagnostic.create_bag () in
        (* audit P0 fix: the strict-mode audit findings are stashed here
           (recovery-mode runs; in strict mode the audit IS the semantic
@@ -1974,7 +1989,11 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
         Printf.printf "  diagnostics: 0\n";
         (* identity handoff (audit Fix 2): the typechecker consumes the
            resolver's semantic identities instead of rediscovering them *)
-        let env = ref (Typecheck.initial_env ~resolved:(Some resolved) ()) in
+        let env =
+          ref
+            (Typecheck.initial_env ~resolved:(Some resolved)
+               ~trusted_compiler_origin ())
+        in
         Typecheck.debug_source_map := Some (Module_graph.source_map graph);
         let errs_by_mod : (string, string list) Hashtbl.t = Hashtbl.create 64 in
         let items = ref 0 in
@@ -3423,19 +3442,53 @@ type mono_outcome = {
    and solve_obligation_depth consumes the (head bucket + wild bucket)
    list in registration order — candidate-scoped, never global, and
    IMPL_INDEX_BATTERY verifies over a synthetic corpus that no candidate
-   whose head unifies with the self is dropped.  Compiler-private
-   intrinsics are now enforced rather than conventional: the seed
-   rejects an ordinary extern declaration of `__intrinsic_map_clone`
-   (tg_intrinsic_privacy) and skips it at call classification, and the
-   kernel's record_intrinsic_classification gates it by
-   env.current_module_path (RESTRICTED_INTRINSIC_BATTERY).  The final
-   gate (check_ocaml_bootstrap_complete.sh) now INSTALLS the bounded RSS
-   policy by default instead of relying on the operator to remember the
-   environment variable.  Probe-mismatch suppression is not
-   unwind-safe, but the VM's traps are fatal (no catchable recovery
-   around solving), so the counter cannot survive into a reused env.
-   The next measurement run uses the index at 80e9/12 GiB with
-   OCAMLRUNPARAM=o=40. *)
+   whose head unifies with the self is dropped; HEAD_CROSS_PRODUCT
+   proves the same prefilter invariant over a representative Type
+   cross-product.
+
+   Compiler-private intrinsics are gated by PROVENANCE and resolved
+   identity, not spelling: the seed trusts only the manifest-closure
+   compilation (every member std/ or tg_compiler/, established by
+   run_closure_pipeline_impl), the kernel trusts only
+   opts.emit_check_summary (--bootstrap-proof on the kernel entry), the
+   declaration is rejected at registration for an unauthorized origin,
+   and a call that resolved to a declared callable is ordinary
+   semantics (so a same-named user function is seed/kernel equivalent).
+   tg_intrinsic_privacy and RESTRICTED_INTRINSIC_BATTERY pin the A-E
+   matrix (declaration+call rejected, declaration-only rejected,
+   same-name function accepted, spoofed tg_compiler::types rejected,
+   trusted origin accepted).  The final gate INSTALLS an unconditional
+   12288-MiB RSS ceiling on Linux (validated, explicit measurement
+   override only) and REFUSES to authorize on hosts without /proc
+   measurement instead of running unbounded.
+
+   Probe-mismatch suppression is not unwind-safe, but the VM's traps
+   are fatal (no catchable recovery around solving), so the counter
+   cannot survive into a reused env.
+
+   Measured 2026-10-05 (literal-completeness pass, 120e9 plan / 14 GiB
+   / OCAMLRUNPARAM=o=40): the run reaches 78.0e9 steps with live
+   ~6.6e3 MB / RSS ~1.25e4 MB (no RSS trap) and ZERO missing-field
+   diagnostics — the 2108-diagnostic strict-literal wall is fully
+   cleared.  Declared defaults are recorded and materialized by the MIR
+   aggregate fill (DEFAULT_FIELD_BATTERY), and the omitted fields the
+   run's log identified (11 struct/field pairs: TypeEnv suffix/layout/
+   wcet/trait-contract/scoped-access/pattern-const tables,
+   MirProgram.lang_items, ResolverLocalBinding.local_id,
+   ImplDecl.trait_type_args, LirStmt.div, and LangItems' id fields) now
+   carry declaration defaults whose values match the seed's synthesized
+   type-defaults, so both compilers fill them identically.
+
+   The remaining frontier at ~78e9 is a DISTINCT inference-parity gap:
+   the kernel checker reports 132 `unresolved Type::Error` readiness
+   findings plus ~458 typed-HIR assembly errors, concentrated on
+   `Vec::new()` calls whose element type the kernel's inference leaves
+   unsolved (`rs_resolve_imports`, `assign_pattern_ids`,
+   `type_registration_module_path`, `check_effect_sets`,
+   `missing_struct_fields_desc`, `verify_mir`, `merge_code_buffer`, ...)
+   — the seed's checker solves these from surrounding usage.  That
+   inference gap, not literal completeness, is now the blocker; budgets
+   stay unre-pinned and the final gate is not authorized. *)
 (* (recalibrated bootstrap caps): the bootstrap VM budget is overridable via
    the environment so deep corpus+stdlib compiles can be given a larger
    budget without a rebuild; the defaults stay bounded, fail-fast guards. *)

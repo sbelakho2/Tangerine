@@ -358,6 +358,7 @@ let renderer_call (env : Typecheck.env) (s : st) (bare : string)
       let callee =
         Mir_lower.callee_of_typed
           (Typecheck.classify_callee ~hint:Typecheck.CCH_function
+             ~trusted_compiler_origin:true
              ~module_path:[ "tg_compiler"; "types" ] ts ~argc:1
              ~type_args:[||])
       in
@@ -385,6 +386,7 @@ let universal_render_call (env : Typecheck.env) (s : st) (ty : Type_repr.t)
       let callee =
         Mir_lower.callee_of_typed
           (Typecheck.classify_callee ~hint:Typecheck.CCH_function
+             ~trusted_compiler_origin:true
              ~module_path:[ "tg_compiler"; "types" ] ts ~argc:1
              ~type_args:[| ty |])
       in

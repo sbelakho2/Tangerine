@@ -70,14 +70,44 @@ dune build
 # An explicit override is for MEASUREMENT runs only (record the gate's
 # instrumented phase lines, then re-pin the default from the numbers).
 GATE_TIMEOUT_S="${TG_GATE_TIMEOUT_S:-4140}"
-# The final authorization ALWAYS installs the bounded RSS policy: this
-# gate must never be able to regress into the historical 28-GB host OOM
-# merely because the caller forgot the environment variable.  The bound
-# is the measured bootstrap ceiling (see driver.ml's budget note);
-# re-pin only from a completed cold+warm run.  A host whose RSS cannot
-# be measured fails closed when a ceiling is requested (the VM's hard
-# error), which is the intended behavior for this Linux/CI lane.
-export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB="${TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB:-12288}"
+# The final authorization ALWAYS installs the measured RSS ceiling on
+# Linux: an ambient environment cannot disable the guard (0 = disabled)
+# or raise it to an absurd value.  A MEASUREMENT run may override with an
+# explicit, validated bound:
+#   TG_FINAL_RSS_MEASUREMENT=1 TG_FINAL_RSS_MB=<1..16384>
+# RSS measurement is /proc-based (Linux).  On a host without it the gate
+# REFUSES to authorize rather than run unbounded (the historical 28-GB
+# host OOM); an explicit measurement escape hatch exists for developing
+# the Darwin RSS route:
+#   TG_ALLOW_UNBOUNDED_FINAL=1
+case "$(uname -s 2>/dev/null)" in
+  Linux) FINAL_RSS_SUPPORTED=1 ;;
+  *) FINAL_RSS_SUPPORTED=0 ;;
+esac
+if [ "$FINAL_RSS_SUPPORTED" != "1" ]; then
+  if [ "${TG_ALLOW_UNBOUNDED_FINAL:-0}" != "1" ]; then
+    echo "check_ocaml_bootstrap_complete: FAIL — final authorization requires an RSS ceiling, but this host has no RSS measurement (/proc); run on Linux or set TG_ALLOW_UNBOUNDED_FINAL=1 for an explicit unbounded measurement run" >&2
+    exit 1
+  fi
+  echo "check_ocaml_bootstrap_complete: WARNING — no RSS measurement on this host; running UNBOUNDED because TG_ALLOW_UNBOUNDED_FINAL=1"
+else
+  if [ "${TG_FINAL_RSS_MEASUREMENT:-0}" = "1" ]; then
+    TG_FINAL_RSS_MB="${TG_FINAL_RSS_MB:-12288}"
+    case "$TG_FINAL_RSS_MB" in
+      '' | *[!0-9]*)
+        echo "check_ocaml_bootstrap_complete: FAIL — TG_FINAL_RSS_MB must be an integer" >&2
+        exit 1
+        ;;
+    esac
+    if [ "$TG_FINAL_RSS_MB" -lt 1 ] || [ "$TG_FINAL_RSS_MB" -gt 16384 ]; then
+      echo "check_ocaml_bootstrap_complete: FAIL — TG_FINAL_RSS_MB must be within 1..16384" >&2
+      exit 1
+    fi
+    export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB="$TG_FINAL_RSS_MB"
+  else
+    export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB=12288
+  fi
+fi
 # The bootstrap target authority: the SAME triple the ladder compiles for
 # (TG_BOOTSTRAP_TARGET; default aarch64-apple-darwin).  The gate's closure
 # front end is target-parameterized through @cfg elimination, and its

@@ -191,9 +191,25 @@ let () =
           else if not (contains report "RESTRICTED_INTRINSIC_BATTERY fails=0") then
             (* compiler-private enforcement: an ordinary source program
                that declares and calls __intrinsic_map_clone must be
-               rejected by the kernel checker's privacy gate. *)
+               rejected by the kernel checker's provenance gate, a
+               same-named ordinary function must be accepted, and a
+               spoofed tg_compiler::types module must not claim the
+               private namespace. *)
             fail
               "the compiler-private intrinsic battery failed (expected `RESTRICTED_INTRINSIC_BATTERY fails=0`; see the report above)"
+          else if not (contains report "HEAD_CROSS_PRODUCT fails=0") then
+            (* the head-bucket prefilter property: over a representative
+               Type cross-product, no pair accepted by the ordinary
+               unifier may land in separated non-wild buckets (the
+               index's only solver-visible failure mode). *)
+            fail
+              "the head-bucket cross-product battery failed (expected `HEAD_CROSS_PRODUCT fails=0`; see the report above)"
+          else if not (contains report "DEFAULT_FIELD_BATTERY fails=0") then
+            (* defaulted struct fields: omitting a defaulted field is
+               legal and the default is checked in place; omitting a
+               required field is still an error. *)
+            fail
+              "the defaulted-field battery failed (expected `DEFAULT_FIELD_BATTERY fails=0`; see the report above)"
           else if not (contains report "TOTALS errors=") then
             fail "the probe produced no TOTALS row"
           else if merged && not (contains report "IMPLCONF=0") then

@@ -38,8 +38,8 @@ use tg_compiler::parser::{parse, diag_has_errors, Diagnostic}
 use tg_compiler::ast::{assign_node_ids, Program, Item, ItemId, ModuleId, Module, Crate, UseDecl, Span}
 use tg_compiler::token::{span_dummy}
 use tg_compiler::resolver::{resolve_names}
-use tg_compiler::ids::{TypeId, TraitId}
-use tg_compiler::types::{type_env_new, type_check_typed, TypeCheckResult, type_display, unify, TypeEnv, ImplInfo, TraitRefTemplate, impl_candidate_indices, register_impl_candidate_index, subst_snapshot, subst_restore, errors_truncate, try_head_unify}
+use tg_compiler::ids::{TypeId, TraitId, GenericParamId, DefId, ModuleId, ClosureId}
+use tg_compiler::types::{type_env_new, type_check_typed, TypeCheckResult, type_display, unify, TypeEnv, ImplInfo, TraitRefTemplate, impl_candidate_indices, register_impl_candidate_index, subst_snapshot, subst_restore, errors_truncate, try_head_unify, impl_head_bucket, TypeVarId}
 use tg_compiler::compiler_core::{default_options, apply_cfg_elimination, prepare_parsed, analyze_parsed}
 use tg_compiler::mir::{lower_to_mir, verify_mir, MirProgram}
 use tg_compiler::access_check::{access_check, AccessError}
@@ -1359,18 +1359,23 @@ end
 
 # ———————————————————————————————————————————————————————————————
 # compiler-private intrinsic enforcement: `__intrinsic_map_clone` is the
-# persistent-map snapshot, NOT generic Clone semantics.  An ordinary
-# (non-compiler) source that declares the extern and calls it must be
-# REJECTED with the compiler-private diagnostic — never silently
-# classified as the host intrinsic (which would let user code bypass
-# K::clone/V::clone/drop).
+# persistent-map snapshot, NOT generic Clone semantics.  The kernel
+# matrix proves seed/kernel parity and the two-factor authorization:
+#   A. untrusted declaration + call             -> REJECTED
+#   B. untrusted declaration only               -> REJECTED
+#   C. same-named ordinary user FUNCTION        -> ACCEPTED (parity)
+#   F. trusted origin + NON-compiler module     -> REJECTED (trust alone
+#      is insufficient; the exact compiler module is also required)
+# The module-path spoofing cases live in the seed matrix
+# (tg_intrinsic_privacy D/E), where the parse entry can carry a
+# synthetic `tg_compiler::types` module path; the kernel's authorization
+# is origin-first, so an untrusted spoofed path is rejected by the same
+# untrusted gate as A/B.
 # ———————————————————————————————————————————————————————————————
-def infer_probe_restricted_intrinsic_battery(inout report: String) -> Int
-  let source = "extern def __intrinsic_map_clone(v: Vec[Int]) -> Vec[Int]\n\ndef main() -> Int\n  let v: Vec[Int] = Vec::new()\n  let w = __intrinsic_map_clone(v)\n  0\nend\n"
-  let parsed = parse(tokenize(source, "restricted_intrinsic"))
+def infer_probe_private_run(source: String, trusted: Bool) -> (Int, Bool)
+  let parsed = parse(tokenize(source, "privacy"))
   if diag_has_errors(&parsed.diagnostics) then
-    report = report + "RESTRICTED_INTRINSIC_BATTERY parse-failed\n"
-    return 1
+    return (1, false)
   end
   var program = parsed.program
   assign_node_ids(&mut program)
@@ -1378,6 +1383,7 @@ def infer_probe_restricted_intrinsic_battery(inout report: String) -> Int
   when Result::Ok(res) then
     var env = type_env_new()
     env.strict_resolution = true
+    env.trusted_compiler_origin = trusted
     let result = type_check_typed(&mut env, &program, &res)
     var found = false
     var i = 0
@@ -1387,17 +1393,145 @@ def infer_probe_restricted_intrinsic_battery(inout report: String) -> Int
       end
       i = i + 1
     end
-    if found then
-      report = report + "RESTRICTED_INTRINSIC_BATTERY fails=0\n"
-      0
-    else
-      report = report + "RESTRICTED_INTRINSIC_BATTERY fails=1 ordinary source declared and called the compiler-private intrinsic without the rejection diagnostic (errors=" + result.errors.len().to_string() + ")\n"
-      1
-    end
+    (result.errors.len(), found)
   when Result::Err(errs) then
-    report = report + "RESTRICTED_INTRINSIC_BATTERY resolve-failed=" + errs.len().to_string() + " (the declaration must resolve so the checker's privacy gate is the authority)\n"
-    1
+    (errs.len() + 1000, false)
   end
+end
+
+def infer_probe_restricted_intrinsic_battery(inout report: String) -> Int
+  var fails = 0
+  let a_src = "extern def __intrinsic_map_clone(v: Int) -> Int\n\ndef main() -> Int\n  let w = __intrinsic_map_clone(1)\n  0\nend\n"
+  let (a_n, a_found) = infer_probe_private_run(a_src, false)
+  if !a_found then
+    report = report + "RESTRICTED_INTRINSIC_BATTERY A: ordinary declaration+call was not rejected (errors=" + a_n.to_string() + ")\n"
+    fails = fails + 1
+  end
+  let b_src = "extern def __intrinsic_map_clone(v: Int) -> Int\n\ndef main() -> Int\n  0\nend\n"
+  let (b_n, b_found) = infer_probe_private_run(b_src, false)
+  if !b_found then
+    report = report + "RESTRICTED_INTRINSIC_BATTERY B: declaration-only was not rejected (errors=" + b_n.to_string() + ")\n"
+    fails = fails + 1
+  end
+  let c_src = "def __intrinsic_map_clone(v: Int) -> Int\n  v\nend\n\ndef main() -> Int\n  let w = __intrinsic_map_clone(1)\n  0\nend\n"
+  let (c_n, c_found) = infer_probe_private_run(c_src, false)
+  if c_n != 0 || c_found then
+    report = report + "RESTRICTED_INTRINSIC_BATTERY C: same-named ordinary function was not ACCEPTED (errors=" + c_n.to_string() + ")\n"
+    fails = fails + 1
+  end
+  # F: trusted origin, but the item's module is not a compiler module —
+  # the second authorization factor must still reject the declaration.
+  let (f_n, f_found) = infer_probe_private_run(a_src, true)
+  if !f_found then
+    report = report + "RESTRICTED_INTRINSIC_BATTERY F: trusted origin without the exact compiler module was not rejected (errors=" + f_n.to_string() + ")\n"
+    fails = fails + 1
+  end
+  report = report + "RESTRICTED_INTRINSIC_BATTERY fails=" + fails.to_string() + "\n"
+  fails
+end
+
+# ———————————————————————————————————————————————————————————————
+# head-bucket CROSS-PRODUCT property (future-proofing the candidate
+# prefilter against new Type variants): for every representative pair
+# (A as candidate head, B as obligation self), if the ordinary unifier
+# accepts A against B then the bucket prefilter must NOT separate them
+# (bucket(A) == bucket(B), or either side is the always-scanned wild
+# bucket).  A deliberate under-inclusion — the only solver-visible
+# failure mode of the index — is reported per pair.
+# ———————————————————————————————————————————————————————————————
+def infer_probe_head_cross_product(inout report: String) -> Int
+  var env = type_env_new()
+  let gpid = GenericParamId { owner: DefId { module: ModuleId { id: 0 }, index: 0 }, index: 0 }
+  var reps = Vec::new()
+  reps.push(Type::Unit)
+  reps.push(Type::Bool)
+  reps.push(Type::Int)
+  reps.push(Type::UInt)
+  reps.push(Type::Float)
+  reps.push(Type::Char)
+  reps.push(Type::String)
+  reps.push(Type::StaticStrPtr)
+  reps.push(Type::Never)
+  reps.push(Type::I8)
+  reps.push(Type::I64)
+  reps.push(Type::U8)
+  reps.push(Type::U64)
+  reps.push(Type::ISize)
+  reps.push(Type::USize)
+  reps.push(Type::F32)
+  reps.push(Type::F64)
+  reps.push(Type::IntLiteral(5))
+  reps.push(Type::Ptr(Type::Int))
+  reps.push(Type::PtrMut(Type::Int))
+  reps.push(Type::RefInternal(Type::Int, false))
+  reps.push(Type::RefInternal(Type::Int, true))
+  reps.push(Type::Tuple(infer_probe_args1(Type::Int)))
+  reps.push(Type::Tuple(infer_probe_args2(Type::Int, Type::String)))
+  reps.push(Type::FixedArray(Type::Int, 4))
+  reps.push(Type::FixedArraySym(Type::Int, gpid.clone()))
+  reps.push(Type::FnPtr(Vec::new(), Type::Int, Vec::new()))
+  reps.push(Type::Closure(ClosureId { id: 1 }, Vec::new(), Type::Int, Type::Int, Vec::new()))
+  reps.push(Type::Dyn(TypeId { id: 9101 }))
+  reps.push(Type::Dyn(TypeId { id: 9102 }))
+  reps.push(Type::Effect(Vec::new(), Type::Int))
+  reps.push(Type::Var(TypeVarId { id: 7001 }))
+  reps.push(Type::Param(gpid.clone()))
+  reps.push(Type::Const(3))
+  reps.push(Type::ConstParam(gpid.clone()))
+  reps.push(Type::Adt(TypeId { id: 9101 }, infer_probe_args1(Type::Int)))
+  reps.push(Type::Adt(TypeId { id: 9102 }, infer_probe_args1(Type::Int)))
+  reps.push(Type::Error)
+  var fails = 0
+  var ai = 0
+  while ai < reps.len() do
+    var bi = 0
+    while bi < reps.len() do
+      let a = reps[ai]
+      let b = reps[bi]
+      let snap = subst_snapshot(env)
+      let errs = env.errors.len()
+      let unifies = try_head_unify(&mut env, a.clone(), b.clone())
+      subst_restore(&mut env, &snap)
+      errors_truncate(&mut env, errs)
+      if unifies then
+        let ba = impl_head_bucket(&env, a.clone())
+        let bb = impl_head_bucket(&env, b.clone())
+        if ba != "wild" && bb != "wild" && ba != bb then
+          report = report + "HEAD_CROSS_PRODUCT underincludes: head=" + type_display(env, a.clone()) + " self=" + type_display(env, b.clone()) + " bucket(head)=" + ba + " bucket(self)=" + bb + "\n"
+          fails = fails + 1
+        end
+      end
+      bi = bi + 1
+    end
+    ai = ai + 1
+  end
+  report = report + "HEAD_CROSS_PRODUCT fails=" + fails.to_string() + "\n"
+  fails
+end
+
+# ———————————————————————————————————————————————————————————————
+# struct-literal completeness (seed/self-host parity): the checker
+# checks only the fields a literal PROVIDES — an omitted field is not a
+# checker error (declared defaults and type-defaults are materialized by
+# LOWERING, the seed's architecture), while an UNKNOWN field is still
+# rejected.
+# ———————————————————————————————————————————————————————————————
+def infer_probe_default_field_battery(inout report: String) -> Int
+  var fails = 0
+  let ok_src = "struct Holder\n  value: Int\n  tag: String = \"none\"\n  items: Vec[Int] = Vec::new()\n  other: Int\nend\n\ndef main() -> Int\n  let h = Holder { value: 3 }\n  0\nend\n"
+  let (ok_n, _) = infer_probe_private_run(ok_src, false)
+  if ok_n != 0 then
+    report = report + "DEFAULT_FIELD_BATTERY: omitting defaulted/required fields was not accepted (errors=" + ok_n.to_string() + ")\n"
+    fails = fails + 1
+  end
+  let bad_src = "struct Strict\n  value: Int\nend\n\ndef main() -> Int\n  let s = Strict { value: 3, nope: 4 }\n  0\nend\n"
+  let (bad_n, _) = infer_probe_private_run(bad_src, false)
+  if bad_n == 0 then
+    report = report + "DEFAULT_FIELD_BATTERY: an UNKNOWN field was accepted\n"
+    fails = fails + 1
+  end
+  report = report + "DEFAULT_FIELD_BATTERY fails=" + fails.to_string() + "\n"
+  fails
 end
 
 def main() -> Int
@@ -1407,6 +1541,8 @@ def main() -> Int
   let _ = infer_probe_unify_battery(&mut report)
   let _ = infer_probe_impl_index_battery(&mut report)
   let _ = infer_probe_restricted_intrinsic_battery(&mut report)
+  let _ = infer_probe_head_cross_product(&mut report)
+  let _ = infer_probe_default_field_battery(&mut report)
   let _ = write_file("build/infer_probe.txt", report.clone())
   var counts = Vec::from([infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0)])
   var rows = Vec::new()

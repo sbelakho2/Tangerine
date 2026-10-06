@@ -195,9 +195,13 @@ let beacon_prev = ref (Unix.gettimeofday ())
 
 (* Resident set size from /proc/self/status "VmRSS: N kB" (Linux), a
    unit independent of the host page size (statm pages would under-report
-   by 16x on 64 KiB-page AArch64 Linux).  0 means "measurement
-   unavailable": requesting a ceiling on such a host is a hard
-   configuration error (see entry_frame_of_li), never a silent no-op. *)
+   by 16x on 64 KiB-page AArch64 Linux).  Measurement is Linux-only:
+   returns 0 ("unavailable") on hosts without /proc, and requesting a
+   ceiling there is a hard configuration error (see entry_frame_of_li),
+   never a silent no-op.  The final authorization gate
+   (scripts/check_ocaml_bootstrap_complete.sh) installs an unconditional
+   ceiling on Linux and REFUSES to authorize on hosts without
+   measurement rather than running unbounded. *)
 let vmrss_kb_of_status_line (line : string) : int option =
   if String.length line >= 6 && String.sub line 0 6 = "VmRSS:" then begin
     let rest = String.trim (String.sub line 6 (String.length line - 6)) in
