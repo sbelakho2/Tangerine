@@ -641,6 +641,20 @@ else
   pass "real qemu-aarch64 absent on this host (mock capability path only)"
 fi
 
+# ── 8. dependency-closed bootstrap slices + stable fingerprints ──────
+# The slice generator and its runner are evidence-producing tools, never
+# authorization: pin their entry points and ensure neither can emit an
+# authorization-like sentinel.
+check_pin "slice generator exists and prints SLICE lines" scripts/bootstrap_slices.py 'SLICE K='
+check_pin "slice runner exists and checks the semantic gate" scripts/run_bootstrap_slices.sh 'FRONTEND_SEMANTIC_GATE'
+for _slice_tool in scripts/bootstrap_slices.py scripts/run_bootstrap_slices.sh; do
+  if grep -q 'BOOTSTRAP COMPLETE' "$ROOT/$_slice_tool" 2>/dev/null; then
+    bad "slice tool can emit an authorization sentinel: ${_slice_tool}"
+  else
+    pass "slice tool cannot emit an authorization sentinel: ${_slice_tool}"
+  fi
+done
+
 if [ "$fail" -ne 0 ]; then
   echo "test_prebootstrap_gates: FAIL"
   exit 1
