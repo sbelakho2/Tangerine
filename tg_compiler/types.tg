@@ -11149,6 +11149,49 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
       when Option::Some(st) then env.impl_reg_states.insert(i, st)
       when Option::None then ()
       end
+    when ItemKind::ItemFunction(f) then
+      # (bare-qualified method declarations — the seed's register_item
+      # method form): a top-level `def Type::method(...)` is a METHOD of
+      # Type (std/time.tg's 68 `def Timespec::...` declarations). The
+      # kernel parser holds the source-spelling as the mangled name
+      # "Type__method", so split on the first "__": the owner names the
+      # impl head, the remainder is the method name under which
+      # method_lookup must answer. Bodyless synthetic impl: pass 4's
+      # ItemFunction arm still checks the body once through
+      # check_function (the ORIGINAL name keeps its resolver identity);
+      # register_impl_head only builds the signature and the
+      # method_lookup entry.
+      match method_decl_owner_and_name(f.name.clone())
+      when Option::Some(owner_and_name) then
+        let owner_name = owner_and_name.0.clone()
+        let method_name = owner_and_name.1.clone()
+        match get_type_id_by_name(env, owner_name.clone())
+        when Option::Some(owner_tid) then
+          var syn_fn_decl = f.clone()
+          syn_fn_decl.name = method_name.clone()
+          let res_for_type = TypeExpr { kind: TypeExprKind::Named(owner_name.clone(), Vec::new()), span: f.span }
+          let syn_fn = ImplDecl {
+            vis: f.vis,
+            generic_params: Vec::new(),
+            trait_name: Option::None,
+            for_type: res_for_type.clone(),
+            self_type: res_for_type,
+            where_clause: Vec::new(),
+            methods: Vec::from([syn_fn_decl]),
+            assoc_types: Vec::new(),
+            span: f.span
+          }
+          env.impl_pre_registered.insert(i)
+          match register_impl_head(env, &syn_fn)
+          when Option::Some(stf) then
+            method_decl_index_folded(env, stf.clone(), owner_tid)
+            env.impl_reg_states.insert(i, stf)
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
     when ItemKind::ItemStruct(s) then
       if s.methods.len() > 0 then
         var type_args = Vec::new()
@@ -13246,6 +13289,7 @@ end
 # the signature pass and the body pass of check_impl, so the interning
 # and the id reconstruction agree.
 def impl_method_owner_def(env: TypeEnv, for_type: TypeExpr, method: FunctionDecl, impl_idx: Int, method_idx: Int) -> DefId
+  let fallback = DefId { module: ModuleId { id: SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK }, index: ((impl_idx as UInt) << 16) + (method_idx as UInt) }
   match env.resolutions
   when Option::Some(res) then
     let mkey = impl_registry_method_key(for_type, &method.name)
@@ -13254,17 +13298,116 @@ def impl_method_owner_def(env: TypeEnv, for_type: TypeExpr, method: FunctionDecl
     when Option::Some(did) then
       match def_kind_of(&res, &did)
       when Option::Some(k) then
-        if k == DefKind::Method then
-          did
-        else
-          DefId { module: ModuleId { id: SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK }, index: ((impl_idx as UInt) << 16) + (method_idx as UInt) }
+        # (bare-qualified method identity): DefKind::Method is an impl/
+        # struct method; DefKind::Function at the SAME "path::Type::method"
+        # key is the seed's top-level `def Type::method` declaration form —
+        # the resolver registers those as functions, but they ARE the
+        # method's semantic identity (its call target must be this DefId,
+        # not a synthetic fallback, so the MIR's emission name agrees).
+        if k == DefKind::Method || k == DefKind::Function then
+          return did
         end
-      when Option::None then DefId { module: ModuleId { id: SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK }, index: ((impl_idx as UInt) << 16) + (method_idx as UInt) }
+      when Option::None then ()
       end
-    when Option::None then DefId { module: ModuleId { id: SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK }, index: ((impl_idx as UInt) << 16) + (method_idx as UInt) }
+    when Option::None then ()
     end
-  when Option::None then DefId { module: ModuleId { id: SYNTHETIC_MODULE_IMPL_METHOD_FALLBACK }, index: ((impl_idx as UInt) << 16) + (method_idx as UInt) }
-  end  end
+    # (kernel-parser qualified-name fold): parser.tg rewrites
+    # `def Type::method(...)` to the source name "Type__method", so the
+    # resolver's module_symbols key is the "Type__method" spelling (with
+    # the same DefKind::Function). A synthetic inherent impl for such a
+    # declaration must adopt THAT DefId — it is the identity the function
+    # item's own lowering/definition uses.
+    let bare_key = match for_type.kind
+    when TypeExprKind::Named(name, _) then name + "__" + method.name.clone()
+    when TypeExprKind::Path(path) then path.segments.join("::") + "__" + method.name.clone()
+    when _ then "".to_string()
+    end
+    if bare_key != "" && bare_key != mkey then
+      let qkey2 = module_qualified_key(&env.current_module_path, &bare_key)
+      match res.module_symbols.get(&qkey2)
+      when Option::Some(did2) then
+        match def_kind_of(&res, &did2)
+        when Option::Some(k2) then
+          if k2 == DefKind::Function then
+            return did2
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
+    fallback
+  when Option::None then fallback
+  end
+end
+
+# (bare-qualified method declarations): the seed's register_item treats a
+# top-level `def Type::method(...)` as a METHOD of Type (its Ast.Function
+# arm splits at the first "::" and installs (owner, method) into the
+# name-keyed method table) — the shape std/time.tg's 68 `def
+# Timespec::...` declarations rely on. The KERNEL parser has ALREADY
+# folded the spelling into the mangled source name "Type__method"
+# (parser.tg's qualified-name rewrite), so this helper splits on the
+# FIRST "__" and returns (owner, method). A name without "__" — every
+# ordinary free function — returns Option::None. The owner is then
+# validated against the type registry before any registration.
+def method_decl_owner_and_name(fn_name: String) -> Option[(String, String)]
+  match fn_name.find("__")
+  when Option::Some(pos) then
+    if pos > 0 then
+      let owner = fn_name.slice(0, pos)
+      let mname = fn_name.slice(pos + 2, fn_name.len())
+      if mname.len() > 0 then Option::Some((owner, mname)) else Option::None end
+    else
+      Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
+# The static-path/folded index: a bare method declared on an ALIAS owner
+# is registered under the alias TypeId (static `Dur::method(...)` and the
+# impl's own spelling resolve there); the receiver-style resolution folds
+# the receiver to the underlying nominal, so index the same impl under the
+# folded TypeId too (impl_for_type_matches_env folds the candidate's
+# for_type the same way).
+def method_decl_index_folded(inout env: TypeEnv, st: ImplRegState, owner_tid: TypeId) -> Unit
+  match st.self_type
+  when Type::Adt(reg_tid, _) then
+    if reg_tid.id == owner_tid.id then
+      match get_type_by_id_ref(env, owner_tid)
+      when Option::Some(td) then
+        match td.def_kind
+        when TypeDefKind::Alias(inner) then
+          match inner
+          when Type::Adt(inner_tid, _) then
+            if inner_tid.id != reg_tid.id then
+              var mmap = match env.method_lookup.get(inner_tid.id)
+              when Option::Some(mm) then mm.clone()
+              when Option::None then Map::new()
+              end
+              var mi = 0
+              while mi < env.impls[st.impl_idx].methods.len() do
+                let mname = env.impls[st.impl_idx].methods[mi].name.clone()
+                var cands = match mmap.get(mname.clone())
+                when Option::Some(cv) then cv.clone()
+                when Option::None then Vec::new()
+                end
+                cands.push(st.impl_idx)
+                mmap.insert(mname, cands)
+                mi = mi + 1
+              end
+              env.method_lookup.insert(inner_tid.id, mmap)
+            end
+          when _ then ()
+          end
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+    end
+  when _ then ()
+  end
 end
 
 # Intern a declaration's generic parameters in declaration order under
@@ -17956,8 +18099,12 @@ def type_registration_module_path(env: TypeEnv, tid: TypeId) -> Vec[String]
 end
 
 # The exact module-qualified method lookup: the module_symbols entry for
-# "path::Type::method", filtered to DefKind::Method (a same-spelled
-# non-method registration never answers through this path).
+# "path::Type::method", filtered to the two method-declaration kinds — a
+# same-spelled non-method registration never answers through this path.
+# (bare-qualified methods): DefKind::Function at a "Type::method" key IS
+# the seed's top-level method declaration form (register_item's
+# Ast.Function arm installs it in the method table); impl methods carry
+# DefKind::Method. Both are legitimate method identities.
 def qualified_method_def(env: TypeEnv, path: Vec[String], key: String) -> Option[DefId]
   match env.resolutions
   when Option::Some(res) then
@@ -17966,7 +18113,7 @@ def qualified_method_def(env: TypeEnv, path: Vec[String], key: String) -> Option
     when Option::Some(did) then
       match def_kind_of(&res, &did)
       when Option::Some(k) then
-        if k == DefKind::Method then Option::Some(did) else Option::None end
+        if k == DefKind::Method || k == DefKind::Function then Option::Some(did) else Option::None end
       when Option::None then Option::None
       end
     when Option::None then Option::None
@@ -17977,9 +18124,10 @@ end
 
 # The qualified-scan fallback: the 0/1/>1 rule over the module_symbols
 # entries whose key IS the bare "Type::method" (the root module's
-# registration) or ends with "::Type::method", filtered to DefKind::Method
-# and deduplicated by DefId. 0 -> None, exactly 1 -> that DefId, >= 2 ->
-# None (ambiguous — a silent first-wins pick is never made).
+# registration) or ends with "::Type::method", filtered to the
+# method-declaration kinds and deduplicated by DefId. 0 -> None, exactly
+# 1 -> that DefId, >= 2 -> None (ambiguous — a silent first-wins pick is
+# never made).
 def scan_qualified_method_def(env: TypeEnv, key: String) -> Option[DefId]
   match env.resolutions
   when Option::Some(res) then
@@ -18002,7 +18150,7 @@ def scan_qualified_method_def(env: TypeEnv, key: String) -> Option[DefId]
       if matches then
         match def_kind_of(&res, &ms_did)
         when Option::Some(k) then
-          if k == DefKind::Method then
+          if k == DefKind::Method || k == DefKind::Function then
             var dup = false
             match found
             when Option::Some(fd) then
@@ -18075,6 +18223,19 @@ def method_alias_resolver_keys(env: TypeEnv, recv_base: Type, method: String) ->
   out
 end
 
+def method_def_bare_key_applies(key: String) -> Bool
+  var ok = false
+  match key.find("[")
+  when Option::None then
+    match key.find("::")
+    when Option::Some(_) then ok = true
+    when Option::None then ()
+    end
+  when Option::Some(_) then ()
+  end
+  ok
+end
+
 def method_def_for(env: TypeEnv, recv_type: Type, method: String) -> Option[DefId]
   let key = resolver_method_key(env, recv_type, method)
   if key != "" then
@@ -18109,6 +18270,27 @@ def method_def_for(env: TypeEnv, recv_type: Type, method: String) -> Option[DefI
       when Option::None then ()
       end
       aki = aki + 1
+    end
+    # 2c. (bare-qualified method declarations — the kernel parser's
+    # "Type__method" source-name fold): a top-level `def Type::method`
+    # registers under the MANGLED "Type__method" spelling, not the
+    # impl-style "Type::method" key. Only for non-generic keys (the
+    # kernel parser's qualified form is ident-final, never generic).
+    if method_def_bare_key_applies(&key) then
+      let bare_key = key.replace("::", "__")
+      match recv_type
+      when Type::Adt(tid, _) then
+        let bpath = type_registration_module_path(env, tid)
+        match qualified_method_def(env, &bpath, &bare_key)
+        when Option::Some(did) then return Option::Some(did)
+        when Option::None then ()
+        end
+      when _ then ()
+      end
+      match scan_qualified_method_def(env, &bare_key)
+      when Option::Some(did) then return Option::Some(did)
+      when Option::None then ()
+      end
     end
   end
  # extension-impl methods — the receiver-based key cannot match an
@@ -25220,7 +25402,24 @@ def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, 
                                 when Option::Some(sp_mdid2) then
                                   env.typed_call_targets.insert(expr.node_id, sp_mdid2.clone())
                                   record_effect_call(env, Option::Some(sp_mdid2))
-                                when Option::None then ()
+                                when Option::None then
+                                  # (bare-qualified method declarations): the
+                                  # kernel parser's "Type__method" registration
+                                  # — retry the same two lookups with the
+                                  # mangled key.
+                                  let imp_bare = imp_key.replace("::", "__")
+                                  match qualified_method_def(env, &imp_path, &imp_bare)
+                                  when Option::Some(sp_mdidb) then
+                                    env.typed_call_targets.insert(expr.node_id, sp_mdidb.clone())
+                                    record_effect_call(env, Option::Some(sp_mdidb))
+                                  when Option::None then
+                                    match scan_qualified_method_def(env, &imp_bare)
+                                    when Option::Some(sp_mdidb2) then
+                                      env.typed_call_targets.insert(expr.node_id, sp_mdidb2.clone())
+                                      record_effect_call(env, Option::Some(sp_mdidb2))
+                                    when Option::None then ()
+                                    end
+                                  end
                                 end
                               end
                             when _ then
@@ -25228,7 +25427,14 @@ def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, 
                               when Option::Some(sp_mdid3) then
                                 env.typed_call_targets.insert(expr.node_id, sp_mdid3.clone())
                                 record_effect_call(env, Option::Some(sp_mdid3))
-                              when Option::None then ()
+                              when Option::None then
+                                let imp_bare2 = imp_key.replace("::", "__")
+                                match scan_qualified_method_def(env, &imp_bare2)
+                                when Option::Some(sp_mdidb3) then
+                                  env.typed_call_targets.insert(expr.node_id, sp_mdidb3.clone())
+                                  record_effect_call(env, Option::Some(sp_mdidb3))
+                                when Option::None then ()
+                                end
                               end
                             end
                           end
@@ -25668,7 +25874,25 @@ end
 # builtin name), and primitive-vs-primitive by variant. User same-named
 # types in different modules never unify here (only builtin names fold).
 def impl_for_type_matches_env(env: TypeEnv, impl_for_type: Type, recv_ty: Type) -> Bool
-  match impl_for_type
+  # The impl's for_type may itself be a TYPEALIAS spelling (`typealias
+  # Duration = Timespec`; std/time.tg declares methods as
+  # `def Duration::...`): the alias folds to its underlying nominal before
+  # matching — receiver-side resolution already folds receivers through
+  # aliases (resolved_receiver_base), so an un-folded impl head would never
+  # match a folded receiver. Non-alias heads keep their own identity.
+  let impl_ty = match impl_for_type
+  when Type::Adt(tid1, _) then
+    match get_type_by_id_ref(env, &tid1)
+    when Option::Some(td1) then
+      match td1.def_kind
+      when TypeDefKind::Alias(inner) then inner.clone()
+      when _ then impl_for_type.clone()
+      end
+    when Option::None then impl_for_type.clone()
+    end
+  when _ then impl_for_type.clone()
+  end
+  match impl_ty
   when Type::Adt(tid1, _) then
     match recv_ty
     when Type::Adt(tid2, _) then
@@ -27072,6 +27296,35 @@ def param_bound_contract_method_ret(
   end  end
 end
 
+# (registered-clone discharge): the seed's clone_value_obligation checks
+# registered_clone_method BEFORE its structural walk — a nominal with a
+# registered `clone` (the std's manual Clone impls: ast.tg's `impl Clone
+# for Pattern`, `impl Clone for Expr`, types.tg's `impl Clone for
+# TypeDefKind`, ...) discharges the component without walking it. The
+# walk alone fails these (a cycle through the type graph, or a reachable
+# non-langitem opaque such as Any) even though the program's clone call
+# is perfectly legal in the seed. `recv_ty` is the concrete Adt; any
+# receiver-indexed candidate with a clone method whose impl bounds the
+# concrete receiver satisfies discharges the component.
+def registered_clone_component_ok(inout env: TypeEnv, recv_ty: Type) -> Bool
+  let cands = method_candidate_impls(env, recv_ty.clone(), "clone".to_string())
+  var ci = 0
+  while ci < cands.len() do
+    let imp = env.impls[cands[ci].0]
+    var mi = 0
+    var has_clone = false
+    while mi < imp.methods.len() do
+      if imp.methods[mi].name == "clone" then has_clone = true end
+      mi = mi + 1
+    end
+    if has_clone && impl_bounds_satisfied(env, &imp, &recv_ty) then
+      return true
+    end
+    ci = ci + 1
+  end
+  false
+end
+
 # (C3 — the seed's derived-mint fallback): one component of a cloneable
 # receiver discharges as Clone or Copy. The walk mirrors the seed's
 # derived_clone_obligations (tc_is_copy_seen + registered-clone check):
@@ -27082,11 +27335,13 @@ end
 #     obligation); a deferred inference Var is admitted (the seed defers);
 #   - the builtin container/pointer LangItems have registered clone
 #     surfaces (the builtin method tables);
-#   - a nominal walks its struct fields / enum variants with the concrete
-#     args substituted; a cycle is refused (the seed's conservative
+#   - a nominal with a REGISTERED clone discharges immediately (the seed's
+#     registered_clone_method-first order);
+#   - otherwise a nominal walks its struct fields / enum variants with the
+#     concrete args substituted; a cycle is refused (the seed's conservative
 #     P0-2 cycle answer — a self-referential type without a registered
 #     clone is not mintable).
-def derived_clone_component_ok(env: TypeEnv, ty: Type, inout visiting: Set[Int]) -> Bool
+def derived_clone_component_ok(inout env: TypeEnv, ty: Type, inout visiting: Set[Int]) -> Bool
   match ty
   when Type::Unit | Type::Bool | Type::Int | Type::UInt | Type::Float |
        Type::Char | Type::Never | Type::I8 | Type::I16 | Type::I32 | Type::I64 |
@@ -27139,6 +27394,13 @@ def derived_clone_component_ok(env: TypeEnv, ty: Type, inout visiting: Set[Int])
        tid.id == env.lang_items.ptr_mut then
       return true
     end
+    # The seed's registered_clone_method: a registered clone discharges
+    # BEFORE the structural walk (and before the cycle guard) — the
+    # Program/Pattern/TypeDef manual Clone impls break their type graph's
+    # cycles exactly here.
+    if registered_clone_component_ok(env, Type::Adt(tid.clone(), args.clone())) then
+      return true
+    end
     if visiting.contains(&tid.id) then
       return false
     end
@@ -27174,7 +27436,7 @@ def derived_clone_component_ok(env: TypeEnv, ty: Type, inout visiting: Set[Int])
   end  end
 end
 
-def derived_clone_mintable(env: TypeEnv, ty: Type) -> Bool
+def derived_clone_mintable(inout env: TypeEnv, ty: Type) -> Bool
   var visiting: Set[Int] = Set::new()
   derived_clone_component_ok(env, ty.clone(), &mut visiting)
 end
@@ -27190,7 +27452,7 @@ end
 # Self/RefInternal receivers are already deref'd by resolve_method_type
 # (base); the classes above are the seed's mint guard, minus the internal
 # StaticStrPtr (never a checker receiver).
-def derived_mint_ret(env: TypeEnv, recv_ty: Type, method: String) -> Option[Type]
+def derived_mint_ret(inout env: TypeEnv, recv_ty: Type, method: String) -> Option[Type]
   if method == "to_string" then
     return Option::Some(Type::String)
   end
@@ -27599,6 +27861,20 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
       if method == "truncate" then return Type::Unit end
       if method == "sort" then return Type::Unit end
       if method == "as_ptr_address" then return Type::Ptr(inner) end
+      # (self-host parity — the std impls' Copy-gated raw span ops): the
+      # seed selects methods by NAME and never gates the std's inline
+      # `impl[T: Copy] Array[T]` bounds; the kernel's structural Copy gate
+      # (the RingBuffer/SlabPool canaries) blocks the impl candidate for a
+      # non-Copy element, so the BUILTIN surface must answer exactly like
+      # the other Vec builtins. `path.slice(a, b)`/`v.extend(other)` on
+      # Vec[String] are the compiler's own shapes (resolver.tg / linker.tg).
+      # The intrinsic router already classifies both by name
+      # (ArraySlice/ArrayExtend), so the call lowers on the intrinsic path
+      # like every other builtin-container method; the explicit unsafe/raw
+      # views (as_slice/copied_slice/slice_pin/get on the raw Slice) stay
+      # gated — they are not part of this surface.
+      if method == "slice" then return Type::Adt(tid.clone(), args.clone()) end
+      if method == "extend" then return Type::Unit end
     elsif _nn == "UnsafeSlice" then
       # The RAW view's method table — the compiler-scoped loop-consumed
       # iterable forms (iter/map/filter/clone/keys/values) produce raw
@@ -27715,6 +27991,17 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
       if method == "is_empty" then return Type::Bool end
       if method == "keys" then return builtin_adt(env, "UnsafeSlice".to_string(), [k]) end
       if method == "values" then return builtin_adt(env, "UnsafeSlice".to_string(), [v]) end
+      # (self-host parity — Map::entries): the std entries impl lives in
+      # `impl[K: Hash + Eq + Copy, V: Copy] Map[K, V]`; the kernel's Copy
+      # gate blocks it for the compiler's own Map[String, ...] receivers
+      # (resolver.tg/types.tg/mir.tg/asm.tg/linker.tg), while the seed's
+      # name-keyed resolution accepts. The builtin surface answers with
+      # the declared Vec[(K, V)] — the resource-element check above is
+      # unchanged, and the intrinsic router already classifies `entries`
+      # (MapEntries), so the call lowers on the intrinsic path.
+      if method == "entries" then
+        return builtin_adt(env, "Vec".to_string(), [Type::Tuple(Vec::from([k.clone(), v.clone()]))])
+      end
       if method == "clone" then return builtin_adt(env, "Map".to_string(), [k, v]) end
     elsif _nn == "Set" then
       let elem = if args.len() >= 1 then args[0].clone() else fresh_type_var(env) end

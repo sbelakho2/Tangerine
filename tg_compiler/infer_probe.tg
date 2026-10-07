@@ -1764,6 +1764,92 @@ def infer_probe_semantic_default_battery(inout report: String) -> Int
 end
 
 # ———————————————————————————————————————————————————————————————
+# The self-host channel probe: run one shape and return the CHANNEL
+# counters, not merely the diagnostic count — (errors, expr_error_nodes,
+# expr_var_nodes, bad_call_instance_args, readiness_ok, first_gate_detail).
+# The readiness leg is the kernel's own verify_typed_channel_completeness
+# (the same verifier whose HIR_INVALID rows the closure preflight prints).
+# ———————————————————————————————————————————————————————————————
+def infer_probe_type_has_error_state(ty: Type) -> Bool
+  match ty
+  when Type::Error then true
+  when Type::Adt(_, args) then
+    var found = false
+    for a in args do
+      if infer_probe_type_has_error_state(a) then found = true end
+    end
+    found
+  when Type::Ptr(inner) then infer_probe_type_has_error_state(inner)
+  when Type::PtrMut(inner) then infer_probe_type_has_error_state(inner)
+  when Type::RefInternal(inner, _) then infer_probe_type_has_error_state(inner)
+  when Type::Tuple(fs) then
+    var found2 = false
+    for f in fs do
+      if infer_probe_type_has_error_state(f) then found2 = true end
+    end
+    found2
+  when Type::FixedArray(elem, _) then infer_probe_type_has_error_state(elem)
+  when Type::FixedArraySym(elem, _) then infer_probe_type_has_error_state(elem)
+  when Type::FnPtr(ps, ret, _) then
+    var found3 = infer_probe_type_has_error_state(ret)
+    for p in ps do
+      if infer_probe_type_has_error_state(p.ty.clone()) then found3 = true end
+    end
+    found3
+  when Type::Closure(_, ps, ret, _, _) then
+    var found4 = infer_probe_type_has_error_state(ret)
+    for p in ps do
+      if infer_probe_type_has_error_state(p.ty.clone()) then found4 = true end
+    end
+    found4
+  when Type::Effect(_, inner) then infer_probe_type_has_error_state(inner)
+  when _ then false
+  end
+end
+
+def infer_probe_channel_probe(source: String) -> (Int, Int, Int, Int, Bool, String)
+  let parsed = parse(tokenize(source, "selfhostchannels"))
+  if diag_has_errors(&parsed.diagnostics) then
+    return (1, -1, -1, -1, false, "parse failed")
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    var expr_err = 0
+    var expr_var = 0
+    for (_nid, ty) in env.typed_expr_types.entries() do
+      if infer_probe_type_has_error_state(ty.clone()) then expr_err = expr_err + 1 end
+      if infer_probe_has_var(ty.clone()) then expr_var = expr_var + 1 end
+    end
+    var inst_bad = 0
+    for (_nid2, args) in env.typed_call_instances.entries() do
+      for a in args do
+        match a
+        when GenericArg::Type(aty) then
+          if infer_probe_type_has_error_state(aty.clone()) || infer_probe_has_var(aty.clone()) then
+            inst_bad = inst_bad + 1
+          end
+        when GenericArg::Const(_) then ()
+        end
+      end
+    end
+    let errs_before = env.errors.len()
+    let readiness_ok = verify_typed_channel_completeness(&mut env, &program)
+    var detail = ""
+    if !readiness_ok && env.errors.len() > errs_before then
+      detail = env.errors[env.errors.len() - 1].message.clone()
+    end
+    (result.errors.len(), expr_err, expr_var, inst_bad, readiness_ok, detail)
+  when Result::Err(errs) then
+    (errs.len() + 1000, -1, -1, -1, false, "resolve failed")
+  end
+end
+
+# ———————————————————————————————————————————————————————————————
 # pending_call_instances / finalize channel: a generic constructor whose
 # argument is solvable ONLY from the caller's context — the annotation,
 # the dest, or a later method use — must be SOLVED before readiness,
@@ -1799,6 +1885,89 @@ def infer_probe_pending_inference_battery(inout report: String) -> Int
   let (e_n, _ef, _ei) = infer_probe_private_run(case_e, false)
   if e_n != 0 then
     report = report + "PENDING_INFERENCE_BATTERY E: nested generic constructor inference failed (errors=" + e_n.to_string() + ")\n"
+    fails = fails + 1
+  end
+  # (self-host channel legs): the closure preflight's exact failing forms —
+  # annotate every channel so a Type::Error/Type::Var in a solved generic-call
+  # substitution (or a readiness HIR_INVALID row) fails the battery even when
+  # the diagnostic COUNT alone would pass.
+  # F: the annotated `Vec[String] = Vec::new()` + push + len baseline (the
+  #    seed accepts; the kernel must keep it accepted with concrete channels).
+  let case_f = "def build() -> Int\n  var keys: Vec[String] = Vec::new()\n  keys.push(\"a\".to_string())\n  keys.len()\nend\n\ndef main() -> Int\n  build()\nend\n"
+  let (f_n, f_e, f_v, f_i, f_ok, f_d) = infer_probe_channel_probe(case_f)
+  if f_n != 0 || f_e != 0 || f_v != 0 || f_i != 0 || !f_ok then
+    report = report + "PENDING_INFERENCE_BATTERY F: annotated Vec[String] channels not concrete (errors=" + f_n.to_string() + " expr_error=" + f_e.to_string() + " expr_var=" + f_v.to_string() + " inst_bad=" + f_i.to_string() + " readiness=" + f_ok.to_string() + " detail=" + f_d.clone() + ")\n"
+    fails = fails + 1
+  end
+  # G: the resolver.tg:1854 shape — unannotated `var keys = Vec::new()` filled
+  #    from a Copy-gated Map.entries() for-loop over non-Copy K/V (String
+  #    keys): the seed's name-keyed resolution accepts; the kernel must not
+  #    reject the entries candidate and poison the Vec element with Error.
+  #    The inline Hash/Eq impls mirror std/core's so the first unsatisfied
+  #    bound is exactly `K: Copy` (the closure's diagnostic).
+  let case_g = "struct Mods\n  name: String\nend\n\nimpl Eq for String\n  def eq(self: Self, other: Self) -> Bool\n    self == other\n  end\nend\n\nimpl Hash for String\n  def hash(self: Self) -> Int\n    0\n  end\nend\n\nimpl[K: Hash + Eq + Copy, V: Copy] Map[K, V]\n  def entries(self: Self) -> Vec[(K, V)]\n    Vec::new()\n  end\nend\n\ndef collect(inout tables: Map[String, Mods]) -> Int\n  var keys = Vec::new()\n  for (k, m) in tables.entries() do\n    keys.push(k.clone())\n    let _ = m\n  end\n  var ki = 0\n  while ki < keys.len() do\n    ki = ki + 1\n  end\n  ki\nend\n\ndef main() -> Int\n  var t: Map[String, Mods] = Map::new()\n  collect(&t)\nend\n"
+  let (g_n, g_e, g_v, g_i, g_ok, g_d) = infer_probe_channel_probe(case_g)
+  if g_n != 0 || g_e != 0 || g_v != 0 || g_i != 0 || !g_ok then
+    report = report + "PENDING_INFERENCE_BATTERY G: Map[String,..].entries() loop channels not concrete (errors=" + g_n.to_string() + " expr_error=" + g_e.to_string() + " expr_var=" + g_v.to_string() + " inst_bad=" + g_i.to_string() + " readiness=" + g_ok.to_string() + " detail=" + g_d.clone() + ")\n"
+    fails = fails + 1
+  end
+  # H: std/time.tg's Timespec::lt shape — bare-qualified method declarations
+  #    (`def Type::method`) with a method call compared against `0`. The
+  #    seed registers these as methods (Ast.Function's "::" arm); the kernel
+  #    must resolve them or the `<` operand records Type::Error.
+  let case_h = "struct TS\n  a: Int\nend\n\ndef TS::compare(self: TS, other: TS) -> Int\n  self.a - other.a\nend\n\ndef TS::lt(self: TS, other: TS) -> Bool\n  self.compare(other) < 0\nend\n\ndef main() -> Int\n  let x = TS { a: 1 }\n  let y = TS { a: 2 }\n  if x.lt(y) then 1 else 0 end\nend\n"
+  let (h_n, h_e, h_v, h_i, h_ok, h_d) = infer_probe_channel_probe(case_h)
+  if h_n != 0 || h_e != 0 || h_v != 0 || h_i != 0 || !h_ok then
+    report = report + "PENDING_INFERENCE_BATTERY H: bare-qualified method channels not concrete (errors=" + h_n.to_string() + " expr_error=" + h_e.to_string() + " expr_var=" + h_v.to_string() + " inst_bad=" + h_i.to_string() + " readiness=" + h_ok.to_string() + " detail=" + h_d.clone() + ")\n"
+    fails = fails + 1
+  end
+  # H2: the Duration shape — a typealias owner with its own bare method and a
+  #     same-named-free static call (`Dur::from_n`) alongside a receiver-style
+  #     call on the alias (`d.total()`), both routed through the folded
+  #     nominal identity.
+  let case_h2 = "struct TS\n  a: Int\nend\n\ntypealias Dur = TS\n\ndef TS::total(self: TS) -> Int\n  self.a\nend\n\ndef Dur::from_n(n: Int) -> Dur\n  TS { a: n }\nend\n\ndef Dur::double(self: Dur) -> Dur\n  TS { a: self.a * 2 }\nend\n\ndef main() -> Int\n  let d = Dur::from_n(3)\n  let e = d.double()\n  d.total() + e.total()\nend\n"
+  let (h2_n, h2_e, h2_v, h2_i, h2_ok, h2_d) = infer_probe_channel_probe(case_h2)
+  if h2_n != 0 || h2_e != 0 || h2_v != 0 || h2_i != 0 || !h2_ok then
+    report = report + "PENDING_INFERENCE_BATTERY H2: alias-owner bare-method channels not concrete (errors=" + h2_n.to_string() + " expr_error=" + h2_e.to_string() + " expr_var=" + h2_v.to_string() + " inst_bad=" + h2_i.to_string() + " readiness=" + h2_ok.to_string() + " detail=" + h2_d.clone() + ")\n"
+    fails = fails + 1
+  end
+  # H3: the std/time.tg static self-less surface — `Type::zero()` /
+  #     `Type::from_n(...)` declarations without a self receiver
+  #     (Timespec::zero / Instant::now / SystemTime::now shapes), plus a
+  #     receiver-style call on the same type.
+  let case_h3 = "struct Clock\n  base: Int\nend\n\ndef Clock::zero() -> Clock\n  Clock { base: 0 }\nend\n\ndef Clock::from_n(n: Int) -> Clock\n  Clock { base: n }\nend\n\ndef Clock::base_of(self: Clock) -> Int\n  self.base\nend\n\ndef main() -> Int\n  let c = Clock::from_n(4)\n  let z = Clock::zero()\n  c.base_of() + z.base_of()\nend\n"
+  let (h3_n, h3_e, h3_v, h3_i, h3_ok, h3_d) = infer_probe_channel_probe(case_h3)
+  if h3_n != 0 || h3_e != 0 || h3_v != 0 || h3_i != 0 || !h3_ok then
+    report = report + "PENDING_INFERENCE_BATTERY H3: static bare-method channels not concrete (errors=" + h3_n.to_string() + " expr_error=" + h3_e.to_string() + " expr_var=" + h3_v.to_string() + " inst_bad=" + h3_i.to_string() + " readiness=" + h3_ok.to_string() + " detail=" + h3_d.clone() + ")\n"
+    fails = fails + 1
+  end
+  # I: std/ast.tg's assign_pattern_ids shape — `(String, Nominal).clone()`
+  #    where the nominal (like Pattern) has a REGISTERED clone impl while the
+  #    structural derived-clone walk fails (here through the non-langitem
+  #    opaque `Any` payload). The seed discharges registered clones first.
+  let case_i = "struct Inner\n  kind: Int\nend\n\nenum Holder\n  A(Inner, Any)\n  B\nend\n\nimpl Clone for Holder\n  def clone(self: Self) -> Holder\n    Holder::B\n  end\nend\n\ndef f() -> Int\n  let p = (\"a\".to_string(), Holder::B)\n  let q = p.clone()\n  match q.1\n  when Holder::A(_i, _x) then 1\n  when Holder::B then 0\n  end\nend\n\ndef main() -> Int\n  f()\nend\n"
+  let (i_n, i_e, i_v, i_i, i_ok, i_d) = infer_probe_channel_probe(case_i)
+  if i_n != 0 || i_e != 0 || i_v != 0 || i_i != 0 || !i_ok then
+    report = report + "PENDING_INFERENCE_BATTERY I: tuple clone over registered-clone nominal channels not concrete (errors=" + i_n.to_string() + " expr_error=" + i_e.to_string() + " expr_var=" + i_v.to_string() + " inst_bad=" + i_i.to_string() + " readiness=" + i_ok.to_string() + " detail=" + i_d.clone() + ")\n"
+    fails = fails + 1
+  end
+  # J: the nested generic push — an unannotated `Vec::new()` fed a whole
+  #    `Vec[String]` value (the task's shape d).
+  let case_j = "def f(other: Vec[String]) -> Vec[String]\n  var xs = Vec::new()\n  xs.push(other)\n  xs\nend\n\ndef main() -> Int\n  var v: Vec[String] = Vec::new()\n  let r = f(v)\n  r.len()\nend\n"
+  let (j_n, j_e, j_v, j_i, j_ok, j_d) = infer_probe_channel_probe(case_j)
+  if j_n != 0 || j_e != 0 || j_v != 0 || j_i != 0 || !j_ok then
+    report = report + "PENDING_INFERENCE_BATTERY J: nested generic push channels not concrete (errors=" + j_n.to_string() + " expr_error=" + j_e.to_string() + " expr_var=" + j_v.to_string() + " inst_bad=" + j_i.to_string() + " readiness=" + j_ok.to_string() + " detail=" + j_d.clone() + ")\n"
+    fails = fails + 1
+  end
+  # K: the linker.tg/resolver.tg Copy-gated span ops — `Vec[String].slice`
+  #    and `Vec[String].extend` on a NON-Copy element, where the std impl's
+  #    `impl[T: Copy] Array[T]` bounds block the candidate but the seed
+  #    selects by name. The builtin surface must answer (ArraySlice /
+  #    ArrayExtend are already the intrinsic classifications).
+  let case_k = "def cp(v: Vec[String], more: Vec[String]) -> Int\n  v.extend(more)\n  let s = v.slice(0, v.len())\n  s.len()\nend\n\ndef main() -> Int\n  var a: Vec[String] = Vec::new()\n  var b: Vec[String] = Vec::new()\n  cp(a, b)\nend\n"
+  let (k_n, k_e, k_v, k_i, k_ok, k_d) = infer_probe_channel_probe(case_k)
+  if k_n != 0 || k_e != 0 || k_v != 0 || k_i != 0 || !k_ok then
+    report = report + "PENDING_INFERENCE_BATTERY K: Vec[String] slice/extend channels not concrete (errors=" + k_n.to_string() + " expr_error=" + k_e.to_string() + " expr_var=" + k_v.to_string() + " inst_bad=" + k_i.to_string() + " readiness=" + k_ok.to_string() + " detail=" + k_d.clone() + ")\n"
     fails = fails + 1
   end
   report = report + "PENDING_INFERENCE_BATTERY fails=" + fails.to_string() + "\n"
