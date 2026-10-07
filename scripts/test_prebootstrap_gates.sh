@@ -725,6 +725,20 @@ check_pin "kernel PARITY battery mutations present" tg_compiler/infer_probe.tg  
 check_pin "tg_infer asserts the parity battery" stage0_ocaml/selfcheck/tg_infer.ml   'PARITY_BATTERY fails=0'
 check_pin "prebootstrap runs the parity selfcheck" scripts/prebootstrap_quick.sh   'tg_semantic_parity'
 
+# ── 10. profiling/repin tooling (plan steps 13+14) ───────────────────
+# The metrics recorder and the repin tool are measurement-only: pin their
+# machine-readable markers and ensure neither can emit an authorization
+# sentinel even when pointed at a passing log.
+check_pin "metrics recorder emits the peak RSS field" scripts/profile_record_metrics.sh 'PEAK_RSS_MIB='
+check_pin "repin tool emits the steps-limited proposal" scripts/repin_bootstrap_limits.py 'steps_limit'
+for _repin_tool in scripts/profile_record_metrics.sh scripts/repin_bootstrap_limits.py; do
+  if grep -q 'BOOTSTRAP COMPLETE' "$ROOT/$_repin_tool" 2>/dev/null; then
+    bad "profiling/repin tool can emit an authorization sentinel: ${_repin_tool}"
+  else
+    pass "profiling/repin tool cannot emit an authorization sentinel: ${_repin_tool}"
+  fi
+done
+
 if [ "$fail" -ne 0 ]; then
   echo "test_prebootstrap_gates: FAIL"
   exit 1
