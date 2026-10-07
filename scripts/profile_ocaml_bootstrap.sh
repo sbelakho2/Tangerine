@@ -28,7 +28,13 @@ case "$ALLOC_BYTES" in '' | *[!0-9]*) echo "profile: alloc_bytes must be an inte
 if [ "$RSS_MIB" -lt 1024 ]; then echo "profile: rss_mib too small" >&2; exit 2; fi
 
 cd "$ROOT/stage0_ocaml"
-echo "profile_ocaml_bootstrap: steps=${STEPS} rss=${RSS_MIB}MiB host_calls=${HOST_CALLS} alloc=${ALLOC_BYTES} (NON-AUTHORIZING)"
+# Measurement GC policy: o=40 keeps the major-heap slop near 1.2x live
+# (the default space_overhead lets RSS reach ~1.5-2x live and trips the
+# RSS cap before the semantic completion point).  Override-able for A/B
+# measurement, documented in the recorded metric block.
+OCAMLRUNPARAM="${OCAMLRUNPARAM:-o=40}"
+export OCAMLRUNPARAM
+echo "profile_ocaml_bootstrap: steps=${STEPS} rss=${RSS_MIB}MiB host_calls=${HOST_CALLS} alloc=${ALLOC_BYTES} gc=${OCAMLRUNPARAM} (NON-AUTHORIZING)"
 TANGERINE_BOOTSTRAP_VM_MAX_STEPS="$STEPS" \
 TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB="$RSS_MIB" \
 TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS="$HOST_CALLS" \
