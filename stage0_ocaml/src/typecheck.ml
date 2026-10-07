@@ -10389,6 +10389,365 @@ let finalize_inference (env : env) : env =
       Hashtbl.reset journal_var_tbl;
       env'
 
+(* ── the mandatory typed-channel completeness verifier (pre-MIR) ──────
+
+   Runs after finalize_inference and before MIR lowering (the driver's
+   closure pipeline and cmd_interpret).  It walks every declaration body
+   the typechecker ACCEPTED (the typed_profile domain rule:
+   state.checked_fn_spans — a declaration that failed checking is debt
+   and is never lowered), and enforces the EXACT channel consumption
+   contract of the seed lowering:
+
+     - every expression node the lowering can consume has a typed_nodes
+       entry (missing = HIR_MISSING; the kernel's
+       `argument N has no typed HIR record` class is exactly a missing
+       entry for a call argument);
+     - every Ast.Call carries a resolved callee class (tn_call = Some),
+       except a call through a function-typed VALUE (a closure call: the
+       lowering consumes the callee's Function type through FnValue and
+       never a tn_call);
+     - no recorded type (tn_type / tn_cast_target / a call's solved
+       substitution) contains Type_repr.Error or an unresolved
+       Infer_var in a concrete position (Type_param and Int_literal are
+       legal recorded forms; finalize_inference already chased every
+       journaled var, so a surviving Infer_var is dangling).
+
+   On the FIRST violation it returns the stable fingerprint
+
+     HIR_MISSING|<module>|<item>|Node=<id>|<kind>|<detail>
+     HIR_INVALID|<module>|<item>|Node=<id>|<kind>|<detail>
+
+   (HIR_INVALID for a recorded Error / unresolved Infer_var / a call
+   with no resolved class).  None = the channels are complete. *)
+
+exception Hir_channel_finding of string
+
+let rec ty_unresolved_reason (ty : Type_repr.t) : string option =
+  match ty with
+  | Type_repr.Error -> Some "Type_repr.Error"
+  | Type_repr.Infer_var _ -> Some "an unresolved inference variable"
+  | Type_repr.Raw_ptr (_, t) | Type_repr.Ref_internal (_, t) -> ty_unresolved_reason t
+  | Type_repr.Tuple ts -> ty_array_unresolved_reason ts
+  | Type_repr.Fixed_array (t, _) -> ty_unresolved_reason t
+  | Type_repr.Named (_, ts) -> ty_array_unresolved_reason ts
+  | Type_repr.Function (ps, r) ->
+      let rec go i =
+        if i >= Array.length ps then ty_unresolved_reason r
+        else
+          match ty_unresolved_reason ps.(i).Type_repr.pt_type with
+          | Some _ as s -> s
+          | None -> go (i + 1)
+      in
+      go 0
+  | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
+  | Type_repr.Float _ | Type_repr.String | Type_repr.Type_param _
+  | Type_repr.Int_literal _ | Type_repr.Never ->
+      None
+
+and ty_array_unresolved_reason (ts : Type_repr.t array) : string option =
+  let rec go i =
+    if i >= Array.length ts then None
+    else
+      match ty_unresolved_reason ts.(i) with
+      | Some _ as s -> s
+      | None -> go (i + 1)
+  in
+  go 0
+
+let verify_typed_channel_completeness (env : env) (program : Ast.program) :
+    string option =
+  let module_label =
+    match program.Ast.prog_module_path with
+    | [] -> "<root>"
+    | segs -> String.concat "::" segs
+  in
+  let item_label = ref "<item>" in
+  let finding prefix nid kind detail =
+    raise
+      (Hir_channel_finding
+         (Printf.sprintf "HIR_%s|%s|%s|Node=%d|%s|%s" prefix module_label
+            !item_label nid kind detail))
+  in
+  let loc (sp : Span.span) : string =
+    Printf.sprintf " at %d:%d" sp.Span.file_id sp.Span.start
+  in
+  let fail nid kind detail span = finding "MISSING" nid kind (detail ^ loc span) in
+  let fail_invalid nid kind detail span =
+    finding "INVALID" nid kind (detail ^ loc span)
+  in
+  let expr_kind_name (e : Ast.expr) : string =
+    match e with
+    | Ast.IntLit _ -> "int-literal"
+    | Ast.FloatLit _ -> "float-literal"
+    | Ast.StringLit _ -> "string-literal"
+    | Ast.CharLit _ -> "char-literal"
+    | Ast.BoolLit _ -> "bool-literal"
+    | Ast.Name _ -> "name"
+    | Ast.Path _ -> "path"
+    | Ast.Array _ -> "array-literal"
+    | Ast.ArrayRepeat _ -> "array-repeat"
+    | Ast.Tuple _ -> "tuple-literal"
+    | Ast.StructLit _ -> "struct-literal"
+    | Ast.Block _ -> "block"
+    | Ast.UnsafeBlock _ -> "unsafe-block"
+    | Ast.IfExpr _ -> "if"
+    | Ast.Call _ -> "call"
+    | Ast.Index _ -> "index"
+    | Ast.Range _ -> "range"
+    | Ast.MatchExpr _ -> "match"
+    | Ast.Cast _ -> "cast"
+    | Ast.TryOp _ -> "try-op"
+    | Ast.Closure _ -> "closure"
+    | Ast.Unary _ -> "unary"
+    | Ast.Field _ -> "field"
+    | Ast.Binary _ -> "binary"
+    | Ast.AwaitExpr _ -> "await"
+    | Ast.MacroCall _ -> "macro-call"
+    | Ast.Assign _ -> "assign"
+    | Ast.CompoundAssign _ -> "compound-assign"
+    | Ast.ReturnExpr _ -> "return"
+    | Ast.BreakExpr _ -> "break"
+    | Ast.NextExpr _ -> "next"
+    | Ast.ForExpr _ -> "for"
+    | Ast.WhileExpr _ -> "while"
+    | Ast.LoopExpr _ -> "loop"
+    | Ast.HandleExpr _ -> "handle"
+    | Ast.UnlessExpr _ -> "unless"
+    | Ast.UntilExpr _ -> "until"
+    | Ast.TryBlock _ -> "try-block"
+    | Ast.ComptimeBlock _ -> "comptime"
+  in
+  (* A call through a function-typed VALUE (a closure call) has no
+     resolved callee class by design: the seed lowering consumes the
+     callee's Function type through the FnValue channel.  A syntactic
+     method-callee (Name/Path/Field) is a value only when its own typed
+     entry is a Function type; any other unresolved callee is a gap. *)
+  let callee_is_fn_value (callee : Ast.expr) : bool =
+    let cnid =
+      match callee with
+      | Ast.Name (n, _, _) | Ast.Field (n, _, _, _) | Ast.Path (n, _, _, _) -> Some n
+      | _ -> None
+    in
+    match cnid with
+    | Some n -> (
+        match Hashtbl.find_opt env.typed_nodes n with
+        | Some tn -> ( match tn.tn_type with Type_repr.Function _ -> true | _ -> false)
+        | None -> false)
+    | None -> true
+  in
+  let check_node (e : Ast.expr) ~(arg : bool) : unit =
+    let nid = Ast.expr_node_id e in
+    let sp = Ast.expr_span e in
+    if Ids.Node_id.to_int nid < 0 then ()
+    else begin
+      (* SCOPE (the seed consumption contract): the entries the lowering
+         requires are the CALL node's resolved callee class (tn_call) and
+         every CALL ARGUMENT child's entry — a missing argument record is
+         exactly the kernel's `argument N has no typed HIR record` class.
+         Other nodes' entries are validated when present (Error/Infer_var
+         must never survive), but the seed checker legitimately does not
+         record every syntactic position (an assignment target Name is
+         resolved through the place path, never a value read), so absence
+         is only a finding for the scoped positions. *)
+      let require_entry =
+        arg || match e with Ast.Call _ -> true | _ -> false
+      in
+      match Hashtbl.find_opt env.typed_nodes nid with
+      | None ->
+          if require_entry then
+            fail (Ids.Node_id.to_int nid) (expr_kind_name e)
+              "no typed channel record for this node (the seed lowering's typed_nodes consumption requires one)"
+              sp
+      | Some tn ->
+          (match ty_unresolved_reason tn.tn_type with
+          | Some reason ->
+              fail_invalid (Ids.Node_id.to_int nid) (expr_kind_name e)
+                ("recorded type contains " ^ reason) sp
+          | None -> ());
+          (match tn.tn_cast_target with
+          | Some t -> (
+              match ty_unresolved_reason t with
+              | Some reason ->
+                  fail_invalid (Ids.Node_id.to_int nid) (expr_kind_name e)
+                    ("recorded cast target contains " ^ reason) sp
+              | None -> ())
+          | None -> ());
+          (match tn.tn_call with
+          | Some c ->
+              let targs =
+                match c with
+                | TC_user (_, a) | TC_intrinsic (_, a) | TC_extern (_, a)
+                | TC_derived (_, a) | TC_type_query (_, a) -> a
+              in
+              (match ty_array_unresolved_reason targs with
+              | Some reason ->
+                  fail_invalid (Ids.Node_id.to_int nid) (expr_kind_name e)
+                    ("solved call substitution contains " ^ reason) sp
+              | None -> ())
+          | None -> ());
+          (match e with
+          | Ast.Call (_, callee, _, _, _) -> (
+              match tn.tn_call with
+              | Some _ -> ()
+              | None ->
+                  if not (callee_is_fn_value callee) then
+                    fail_invalid (Ids.Node_id.to_int nid) "call"
+                      "Ast.Call has no resolved callee class (tn_call=None) and the callee is not a function-typed value"
+                      sp)
+          | _ -> ())
+    end
+  in
+  let rec check_block (b : Ast.block_body) : unit =
+    List.iter check_stmt b.Ast.b_stmts;
+    match b.Ast.b_tail with Some e -> check_expr e | None -> ()
+  and check_stmt (st : Ast.stmt) : unit =
+    match st with
+    | Ast.ExprStmt (e, _) -> check_expr e
+    | Ast.LetBinding (pat, _, _, value, _) ->
+        check_expr value;
+        check_pattern pat
+    | Ast.Attributed (_, inner, _) -> check_stmt inner
+    | Ast.DeferStmt (b, _) -> check_block b
+    | Ast.AttributeStmt _ -> ()
+    | Ast.Item i -> check_item i
+  and check_pattern (p : Ast.pattern) : unit =
+    (* pattern nodes carry no typed_nodes entry of their own (their
+       semantic channel is typed_patterns); only the literal
+       sub-expressions are typed-node consumers here. *)
+    match p with
+    | Ast.Wildcard _ | Ast.PatIdent _ | Ast.RefPattern _ | Ast.RefMutPattern _ -> ()
+    | Ast.PatLiteral (e, _) -> check_expr e
+    | Ast.PatVariant (_, _, ps, _) | Ast.PatTuple (ps, _) -> List.iter check_pattern ps
+    | Ast.StructPattern (_, fields, _) ->
+        List.iter
+          (fun (_, po) -> match po with Some p -> check_pattern p | None -> ())
+          fields
+    | Ast.OrPattern (a, b, _) | Ast.RangePattern (a, b, _) ->
+        check_pattern a;
+        check_pattern b
+  and check_expr ?(arg = false) (e : Ast.expr) : unit =
+    check_node e ~arg;
+    match e with
+    | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _ | Ast.CharLit _
+    | Ast.BoolLit _ | Ast.Name _ | Ast.Path _ | Ast.NextExpr _ ->
+        ()
+    | Ast.Array (_, elems, _) | Ast.Tuple (_, elems, _) -> List.iter check_expr elems
+    | Ast.ArrayRepeat (_, v, c, _) ->
+        check_expr v;
+        check_expr c
+    | Ast.StructLit (_, _, _, fields, rest, _) ->
+        List.iter (fun (_, fe) -> check_expr fe) fields;
+        (match rest with Some r -> check_expr r | None -> ())
+    | Ast.Block (_, b, _) | Ast.UnsafeBlock (_, _, b, _) | Ast.LoopExpr (_, b, _)
+    | Ast.ComptimeBlock (_, b, _) ->
+        check_block b
+    | Ast.IfExpr (_, ie) ->
+        check_expr ie.Ast.if_condition;
+        (match ie.Ast.if_let_pattern with Some p -> check_pattern p | None -> ());
+        (match ie.Ast.if_let_value with Some v -> check_expr v | None -> ());
+        check_block ie.Ast.if_then;
+        List.iter (fun (c, b) -> check_expr c; check_block b) ie.Ast.if_elsif;
+        (match ie.Ast.if_else with Some b -> check_block b | None -> ())
+    | Ast.Call (_, callee, _, args, _) ->
+        (* callee SYNTAX: a method-call Field/Name/Path callee is not
+           itself a checked value (the checker records the receiver and
+           the call node); a computed callee is a value. *)
+        (match callee with
+        | Ast.Field (_, base, _, _) -> check_expr base
+        | Ast.Name _ | Ast.Path _ -> ()
+        | _ -> check_expr callee);
+        List.iter (fun a -> check_expr ~arg:true a.Ast.ca_value) args
+    | Ast.Index (_, base, ix, _) ->
+        check_expr base;
+        check_expr ix
+    | Ast.Range (_, a, b, _, _) ->
+        check_expr a;
+        check_expr b
+    | Ast.MatchExpr (_, me) ->
+        check_expr me.Ast.m_subject;
+        List.iter
+          (fun arm ->
+            check_pattern arm.Ast.ma_pattern;
+            (match arm.Ast.ma_guard with Some g -> check_expr g | None -> ());
+            check_expr arm.Ast.ma_body)
+          me.Ast.m_arms
+    | Ast.Cast (_, inner, _, _) | Ast.TryOp (_, inner, _)
+    | Ast.AwaitExpr (_, inner, _) | Ast.Unary (_, _, inner, _)
+    | Ast.Field (_, inner, _, _) ->
+        check_expr inner
+    | Ast.Closure (_, cl) -> check_expr cl.Ast.cl_body
+    | Ast.Binary (_, l, _, r, _) | Ast.Assign (_, l, r, _) ->
+        check_expr l;
+        check_expr r
+    | Ast.CompoundAssign (_, l, _, r, _) ->
+        check_expr l;
+        check_expr r
+    | Ast.ReturnExpr (_, v, _) | Ast.BreakExpr (_, v, _) -> (
+        match v with Some v -> check_expr v | None -> ())
+    | Ast.MacroCall _ -> ()
+    | Ast.WhileExpr (_, we) ->
+        check_expr we.Ast.wh_condition;
+        check_block we.Ast.wh_body
+    | Ast.ForExpr (_, fe) ->
+        check_pattern fe.Ast.for_pattern;
+        check_expr fe.Ast.for_iterable;
+        check_block fe.Ast.for_body
+    | Ast.HandleExpr (_, he) ->
+        check_expr he.Ast.h_expr;
+        List.iter
+          (fun (_, pats, body) ->
+            List.iter check_pattern pats;
+            check_expr body)
+          he.Ast.h_arms
+    | Ast.UnlessExpr (_, ue) ->
+        check_expr ue.Ast.un_condition;
+        check_block ue.Ast.un_body;
+        (match ue.Ast.un_else with Some b -> check_block b | None -> ())
+    | Ast.UntilExpr (_, ue) ->
+        check_expr ue.Ast.ut_condition;
+        check_block ue.Ast.ut_body
+    | Ast.TryBlock (_, tb) ->
+        check_block tb.Ast.tr_body;
+        List.iter (fun (p, b) -> check_pattern p; check_block b) tb.Ast.tr_catches;
+        (match tb.Ast.tr_finally with Some b -> check_block b | None -> ())
+  and check_fn_body (fb : Ast.function_body) : unit =
+    match fb with
+    | Ast.FnBlock b -> check_block b
+    | Ast.FnExpr e -> check_expr e
+    | Ast.FnSignatureOnly -> ()
+  and check_item (i : Ast.item) : unit =
+    match i.Ast.kind with
+    | Ast.Function fd ->
+        if Hashtbl.mem env.state.checked_fn_spans (fn_decl_key fd.Ast.fn_span) then begin
+          item_label := fd.Ast.fn_sig.Ast.sig_name;
+          check_fn_body fd.Ast.fn_body
+        end
+    | Ast.StructDef d ->
+        List.iter
+          (fun (m : Ast.function_decl) ->
+            if Hashtbl.mem env.state.checked_fn_spans (fn_decl_key m.Ast.fn_span) then begin
+              item_label := d.Ast.s_name ^ "::" ^ m.Ast.fn_sig.Ast.sig_name;
+              check_fn_body m.Ast.fn_body
+            end)
+          d.Ast.s_methods
+    | Ast.ImplBlock d ->
+        List.iter
+          (fun (m : Ast.function_decl) ->
+            if Hashtbl.mem env.state.checked_fn_spans (fn_decl_key m.Ast.fn_span) then begin
+              item_label := d.Ast.i_target_type ^ "::" ^ m.Ast.fn_sig.Ast.sig_name;
+              check_fn_body m.Ast.fn_body
+            end)
+          d.Ast.i_methods
+    | Ast.ExternBlock ex -> List.iter check_item ex.Ast.ex_items
+    | Ast.ModuleDef m -> (
+        match m.Ast.m_items with Some items -> List.iter check_item items | None -> ())
+    | _ -> ()
+  in
+  try
+    List.iter check_item program.Ast.items;
+    None
+  with Hir_channel_finding fp -> Some fp
+
 (* ────────────────────────────────────────────────────────────────
    Public API *)
 

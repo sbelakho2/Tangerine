@@ -1128,7 +1128,7 @@ let lower_and_report (path : string) (env : Typecheck.env) (program : Ast.progra
         let conventions =
           Array.map (fun p -> p.Type_repr.pt_convention) ts.Typecheck.ts_params
         in
-        Mir_lower.lower_function_with_variants ~typed_nodes_tbl
+        Mir_lower.lower_function_with_variants ~typed_bindings_complete:true ~typed_nodes_tbl
                     ~typed_patterns_tbl ~typed_for_patterns_tbl
                     ~typed_let_patterns_tbl
           (user_variant_table env)
@@ -1253,6 +1253,15 @@ let cmd_interpret (args : string list) : int =
               1
             end
             else begin
+              (* the mandatory typed-channel completeness gate (pre-MIR):
+                 every call/argument the lowering consumes must have its
+                 typed_nodes record before any lowering runs. *)
+              match Typecheck.verify_typed_channel_completeness env program with
+              | Some fp ->
+                  Printf.eprintf "  HIR_COMPLETENESS = FAIL (%s)\n" fp;
+                  1
+              | None ->
+              Printf.eprintf "  HIR_COMPLETENESS = PASS\n";
               let funcs =
                 List.filter_map
                   (fun i -> match i.Ast.kind with Ast.Function d -> Some d | _ -> None)
@@ -1271,7 +1280,7 @@ let cmd_interpret (args : string list) : int =
                       | Some ts -> (ts.Typecheck.ts_return, Ids.Callable_id.to_int ts.Typecheck.ts_callable)
                       | None -> (Type_repr.Unit, i)
                     in
-                    Mir_lower.lower_function_with_variants ~typed_nodes_tbl
+                    Mir_lower.lower_function_with_variants ~typed_bindings_complete:true ~typed_nodes_tbl
                     ~typed_patterns_tbl ~typed_for_patterns_tbl
                     ~typed_let_patterns_tbl
                       (user_variant_table env)
@@ -2216,6 +2225,35 @@ let run_closure_pipeline_impl ~(repo_root : string) ~(manifest_path : string)
            mono-poison debug) read the ALREADY-FINAL channel contents
            and never chase a mutable historical journal again. *)
         (if type_errors = [] then env := Typecheck.finalize_inference !env);
+        (* ── the mandatory typed-channel completeness gate (pre-MIR):
+           runs after finalize_inference and before lower_closure.  A
+           missing typed_nodes entry for a call/argument (the kernel's
+           `argument N has no typed HIR record` class) or an Error/
+           unresolved Infer_var in a recorded type fails HERE with the
+           exact HIR_MISSING/HIR_INVALID fingerprint instead of late at
+           MIR lowering.  The gate is skipped only when the closure
+           already carries typecheck debt (nothing is lowered then). *)
+        let type_errors =
+          if type_errors <> [] then type_errors
+          else
+            let hir_finding =
+              List.fold_left
+                (fun acc node ->
+                  match acc with
+                  | Some _ -> acc
+                  | None ->
+                      Typecheck.verify_typed_channel_completeness !env
+                        node.Module_graph.node_program)
+                None (topological_nodes graph)
+            in
+            match hir_finding with
+            | Some fp ->
+                Printf.printf "  HIR_COMPLETENESS = FAIL (%s)\n" fp;
+                [ fp ]
+            | None ->
+                Printf.printf "  HIR_COMPLETENESS = PASS\n";
+                type_errors
+        in
         (* ── the TYPED-PROFILE firewall (the audit's P0): the
            syntactic subset gate says the parser sees no categorically
            forbidden AST form — it does NOT prove every TYPED use of
@@ -2446,6 +2484,7 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
           if is_canonical_decl ("fn::" ^ qname) fd.Ast.fn_span then begin
             let f =
               Mir_lower.lower_function_with_variants
+                ~typed_bindings_complete:true
                 ~typed_nodes_tbl
                 ~typed_patterns_tbl
                 ~typed_for_patterns_tbl
@@ -2505,6 +2544,7 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
                       if is_canonical_decl reg_key m.Ast.fn_span then begin
                         let f =
                           Mir_lower.lower_function_with_variants
+                            ~typed_bindings_complete:true
                             ~typed_nodes_tbl
                             ~typed_patterns_tbl
                             ~typed_for_patterns_tbl
@@ -2552,7 +2592,7 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
   List.iter
     (fun (qname, ts, fd : string * Typecheck.typed_signature * Ast.function_decl) ->
       let f =
-        Mir_lower.lower_function_with_variants ~typed_nodes_tbl
+        Mir_lower.lower_function_with_variants ~typed_bindings_complete:true ~typed_nodes_tbl
                     ~typed_patterns_tbl ~typed_for_patterns_tbl
                     ~typed_let_patterns_tbl
           variants

@@ -29,7 +29,11 @@
 #     - the cheap blocker selfchecks, each required to exit 0 AND print
 #       EXACTLY ONE sentinel (TANGERINE_SELFCHECK_PASS name=... version=1):
 #       tg_bootstrap_accepted, tg_manifest, tg_subset, tg_verify,
-#       tg_vmsem, tg_sigid, tg_placechain, tg_boxnominal, tg_type_props
+#       tg_vmsem, tg_sigid, tg_placechain, tg_boxnominal, tg_type_props,
+#       tg_identity_collision, tg_hir_complete, tg_semantic_parity.
+#       tg_semantic_parity compiles + runs the real kernel closure in the
+#       seed VM (the tg_infer workload class) and therefore gets its own
+#       900 s component cap instead of the generic 420 s.
 #
 #   --with-medium (adds the 10-minute-class lanes):
 #     tg_parse_parity, tg_resolution_parity, the self-host grammar gate;
@@ -102,6 +106,8 @@ readonly FAST_SELFCHECKS=(
   tg_boxnominal
   tg_type_props
   tg_identity_collision
+  tg_hir_complete
+  tg_semantic_parity
 )
 
 # ── TIER 0 ────────────────────────────────────────────────────────────
@@ -286,7 +292,15 @@ for name in "${FAST_SELFCHECKS[@]}"; do
   [ "$FAILURES" -eq 0 ] || break
   CHECKS=$((CHECKS + 1))
   out="/tmp/prebootstrap_quick_${name}.out"
-  if ! (cd stage0_ocaml && bh_run_with_timeout 420 "_build/default/selfcheck/${name}.exe") >"$out" 2>&1; then
+  # tg_semantic_parity compiles + runs the REAL kernel closure in the seed
+  # VM (the same workload class as tg_infer, whose component-lane cap is
+  # 900 s in check_ocaml_seed_health.sh); the generic 420 s bound is too
+  # tight for it under load.
+  check_timeout=420
+  case "$name" in
+    tg_semantic_parity) check_timeout=900 ;;
+  esac
+  if ! (cd stage0_ocaml && bh_run_with_timeout "$check_timeout" "_build/default/selfcheck/${name}.exe") >"$out" 2>&1; then
     fail "selfcheck ${name} exited non-zero (see ${out})"
   elif ! scripts/check_selfcheck_sentinel.sh "$name" "$out"; then
     fail "selfcheck ${name} exited 0 without its exact sentinel (see ${out})"

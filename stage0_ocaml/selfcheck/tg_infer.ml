@@ -231,6 +231,17 @@ let () =
                consumes the node record before any name lookup). *)
             fail
               "the kernel semantic-default battery failed (expected `SEMANTIC_DEFAULT_BATTERY fails=0`; see the report above)"
+          else if not (contains report "PARITY_BATTERY fails=0") then
+            (* the seed-vs-kernel parity battery + the no-fallback mutation
+               witnesses: the kernel checker's verdict rows for the parity
+               cases (consumed by tg_semantic_parity) plus the two deleted-
+               typed-record mutations, which must fail closed with an
+               internal error naming the node (never a silent name-based
+               fallback). `cases=0` is legal for a standalone run (no
+               build/parity_cases.txt) and is reported explicitly as
+               no-cases, never as agreement. *)
+            fail
+              "the seed-vs-kernel parity battery failed (expected `PARITY_BATTERY fails=0`; see the report above)"
           else if not (contains report "PENDING_INFERENCE_BATTERY fails=0") then
             (* the pending_call_instances channel: annotation-, dest-,
                return- and later-use-driven generic constructor
@@ -238,6 +249,15 @@ let () =
                Type::Var/Type::Error before readiness. *)
             fail
               "the pending-inference battery failed (expected `PENDING_INFERENCE_BATTERY fails=0`; see the report above)"
+          else if not (contains report "HIR_COMPLETE_BATTERY fails=0") then
+            (* the mandatory typed-channel completeness verifier: the
+               positive leg asserts the constructor/later-use/argument
+               typed records + concrete finalized substitution directly by
+               NodeId, and the mutation leg deletes the argument's typed
+               HIR record and requires the exact HIR_MISSING fingerprint
+               naming that node. *)
+            fail
+              "the typed-channel completeness battery failed (expected `HIR_COMPLETE_BATTERY fails=0`; see the report above)"
           else if not (contains report "TOTALS errors=") then
             fail "the probe produced no TOTALS row"
           else if merged && not (contains report "IMPLCONF=0") then

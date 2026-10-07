@@ -655,6 +655,76 @@ for _slice_tool in scripts/bootstrap_slices.py scripts/run_bootstrap_slices.sh; 
   fi
 done
 
+# ── 9. MIR no-fallback pins (seed + kernel) ──────────────────────────
+# The plan-step-6 audit makes MIR lowering a pure consumer of typed
+# semantics: a checker-recorded binding/identity is consumed by identity,
+# and a missing record is an internal error, never a spelling-based
+# re-resolution. These pins are STRUCTURAL (they extract the exact
+# function/branch bodies, so a re-introduced fallback elsewhere does not
+# mask a regression inside the pinned scope), and two mutation self-tests
+# prove each pin goes red when the guard is removed.
+no_fallback_pins_ok() { # <mir_lower.ml> <mir.tg>
+  local ml="$1" mt="$2" ok=1
+  # seed: the Name branch's completeness gate + fail-closed message, and
+  # the ONE spelling fallback confined to lower_by_spelling (the bare
+  # const-table lookup must appear inside it, after its definition)
+  local nbody
+  nbody="$(sed -n '/| Ast.Name (nid, n, span) -> (/,/| Ast.Path (_, a, b, span) ->/p' "$ml")"
+  printf '%s\n' "$nbody" | grep -qF 'if st.bindings_complete && nid <> Ast.synthetic_node_id && not place_base' || ok=0
+  printf '%s\n' "$nbody" | grep -qF 'has no checker-recorded name binding' || ok=0
+  printf '%s\n' "$nbody" | grep -qF 'let lower_by_spelling' || ok=0
+  [ "$(printf '%s\n' "$nbody" | grep -cF 'List.assoc_opt n env.consts')" = 1 ] || ok=0
+  local lb_line const_line
+  lb_line="$(printf '%s\n' "$nbody" | grep -nF 'let lower_by_spelling' | head -1 | cut -d: -f1)"
+  const_line="$(printf '%s\n' "$nbody" | grep -nF 'List.assoc_opt n env.consts' | head -1 | cut -d: -f1)"
+  if [ -z "$lb_line" ] || [ -z "$const_line" ] || [ "$lb_line" -ge "$const_line" ]; then ok=0; fi
+  # seed: the driver marks the channel complete for checked envs
+  grep -qF '~typed_bindings_complete:true' "$ROOT/stage0_ocaml/src/driver.ml" || ok=0
+  # kernel lr_ident: the checker-typed guard precedes the name-based lookup
+  local rid
+  rid="$(sed -n '/^def lr_ident/,/^end$/p' "$mt")"
+  printf '%s\n' "$rid" | grep -qF 'has no MIR local mapping' || ok=0
+  printf '%s\n' "$rid" | grep -qF 'the name-based scope fallback is not applied to checker-typed nodes' || ok=0
+  local g_line f_line
+  g_line="$(printf '%s\n' "$rid" | grep -nF 'checker-typed identifier' | head -1 | cut -d: -f1)"
+  f_line="$(printf '%s\n' "$rid" | grep -nF 'lookup_current_local_id_by_name(b, name)' | head -1 | cut -d: -f1)"
+  if [ -z "$g_line" ] || [ -z "$f_line" ] || [ "$g_line" -ge "$f_line" ]; then ok=0; fi
+  # kernel place path: the guard marker exists exactly once
+  [ "$(grep -cF 'has no place identity' "$mt")" = 1 ] || ok=0
+  [ "$ok" = 1 ]
+}
+if no_fallback_pins_ok "$ROOT/stage0_ocaml/src/mir_lower.ml" "$ROOT/tg_compiler/mir.tg"; then
+  pass "no-fallback pins: seed Name channel + kernel lr_ident/place guards"
+else
+  bad "no-fallback pins: a typed-record fail-closed guard is missing (seed Name branch or kernel lr_ident/lower_place)"
+fi
+# Mutation A: drop the seed completeness gate -> the pin must go red.
+mut_seed="$TMP/mir_lower_nofb_mut.ml"
+cp "$ROOT/stage0_ocaml/src/mir_lower.ml" "$mut_seed"
+sed 's/if st.bindings_complete && nid <> Ast.synthetic_node_id && not place_base/if false then/' \
+  "$mut_seed" >"$mut_seed.new" && mv "$mut_seed.new" "$mut_seed"
+if no_fallback_pins_ok "$mut_seed" "$ROOT/tg_compiler/mir.tg"; then
+  bad "no-fallback mutation accepted: seed typed-name channel gate removed"
+else
+  pass "no-fallback mutation rejected: seed typed-name channel gate removed"
+fi
+# Mutation B: remove the kernel checker-typed guard marker -> pin red.
+mut_mir="$TMP/mir_nofb_mut.tg"
+cp "$ROOT/tg_compiler/mir.tg" "$mut_mir"
+sed 's/the name-based scope fallback is not applied to checker-typed nodes/name fallback allowed/' \
+  "$mut_mir" >"$mut_mir.new" && mv "$mut_mir.new" "$mut_mir"
+if no_fallback_pins_ok "$ROOT/stage0_ocaml/src/mir_lower.ml" "$mut_mir"; then
+  bad "no-fallback mutation accepted: kernel lr_ident checker-typed guard removed"
+else
+  pass "no-fallback mutation rejected: kernel lr_ident checker-typed guard removed"
+fi
+# The mutation/battery wiring is itself pinned (a dropped assertion must
+# go red even when no lane happens to run).
+check_pin "tg_semantic_parity seed mutation witness present" stage0_ocaml/selfcheck/tg_semantic_parity.ml   'MUTATION seed_global_deleted: PASS'
+check_pin "kernel PARITY battery mutations present" tg_compiler/infer_probe.tg   'PARITY_MUTATION'
+check_pin "tg_infer asserts the parity battery" stage0_ocaml/selfcheck/tg_infer.ml   'PARITY_BATTERY fails=0'
+check_pin "prebootstrap runs the parity selfcheck" scripts/prebootstrap_quick.sh   'tg_semantic_parity'
+
 if [ "$fail" -ne 0 ]; then
   echo "test_prebootstrap_gates: FAIL"
   exit 1

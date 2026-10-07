@@ -30600,6 +30600,567 @@ def verify_codegen_readiness(inout env: TypeEnv) -> Unit
   end
 end
 
+# ———————————————————————————————————————————————————————————————
+# The typed-channel completeness verifier (mandatory, pre-MIR)
+# ———————————————————————————————————————————————————————————————
+#
+# The invariant: an ACCEPTED program's lowering must find a typed record
+# for every node it consumes. The checker records the typed HIR tree
+# bottom-up (record_typed_hir / typed_kind_for), but a program that
+# already carries errors can silently lose child records (a rejected
+# child's record is skipped and the parent's assembly reports a late
+# ICE), and the 78B-step frontier shows exactly that soup: `unresolved
+# Type::Error ... would reach MIR/codegen` readiness rows plus
+# `argument N has no typed HIR record` assembly rows spanning many
+# modules. This verifier runs ONCE per compilation, after
+# finalize_typed_channels + verify_codegen_readiness and before the
+# TypedProgram is assembled (the last front-end step before MIR
+# lowering). On the FIRST node whose lowering-required record is missing
+# or invalid it records EXACTLY ONE stable fingerprint diagnostic and
+# returns false:
+#
+#   HIR_MISSING|<module>|<item>|Node=<id>|<kind>|<detail>
+#   HIR_INVALID|<module>|<item>|Node=<id>|<kind>|<detail>
+#
+# SCOPE (mirrors typed_kind_for's child requirements exactly): every
+# expression node the lowering consumes — the node's typed_exprs record,
+# a Def/EffectPerform call's callable identity and solved substitution,
+# and each call argument's recorded access effect. The walk recurses
+# through the SAME children typed_kind_for looks up, so a synthesized
+# AST shape the checker never typed (a turbofish call's bracketed index
+# payload, an ExprError sentinel, node id 0) is never required and never
+# false-positives; patterns are walked only for their literal
+# sub-expressions (their semantic channel is typed_patterns, consumed
+# through the typed expression tree). Type::Var/Type::Error anywhere in
+# a recorded type is the HIR_INVALID class (Param/ConstParam stay legal:
+# generic bodies carry them by construction).
+def hir_expr_kind_name(kind: ExprKind) -> String
+  match kind
+  when ExprKind::ExprIntLit(_) then "int-literal"
+  when ExprKind::ExprFloatLit(_) then "float-literal"
+  when ExprKind::ExprStringLit(_) then "string-literal"
+  when ExprKind::ExprCharLit(_) then "char-literal"
+  when ExprKind::ExprBoolLit(_) then "bool-literal"
+  when ExprKind::ExprNilLit then "nil-literal"
+  when ExprKind::ExprArrayLit(_) then "array-literal"
+  when ExprKind::ExprArrayRepeat(_, _) then "array-repeat"
+  when ExprKind::ExprTupleLit(_) then "tuple-literal"
+  when ExprKind::ExprStructLit(_, _) then "struct-literal"
+  when ExprKind::ExprMapLit(_) then "map-literal"
+  when ExprKind::ExprIdent(_) then "ident"
+  when ExprKind::ExprPath(_) then "path"
+  when ExprKind::ExprSelfRef then "self-ref"
+  when ExprKind::ExprBinaryOp(_, _, _) then "binary-op"
+  when ExprKind::ExprUnaryOp(_, _) then "unary-op"
+  when ExprKind::ExprFieldAccess(_, _) then "field-access"
+  when ExprKind::ExprMethodCall(_, _, _, _) then "method-call"
+  when ExprKind::ExprIndex(_, _) then "index"
+  when ExprKind::ExprCall(_, _) then "call"
+  when ExprKind::ExprClosure(_, _, _) then "closure"
+  when ExprKind::ExprAccess(_) then "access"
+  when ExprKind::ExprRawDeref(_) then "raw-deref"
+  when ExprKind::ExprIf(_) then "if"
+  when ExprKind::ExprMatch(_) then "match"
+  when ExprKind::ExprBlock(_) then "block"
+  when ExprKind::ExprUnsafe(_, _) then "unsafe"
+  when ExprKind::ExprAsync(_) then "async"
+  when ExprKind::ExprAwait(_) then "await"
+  when ExprKind::ExprTry(_) then "try"
+  when ExprKind::ExprRange(_, _, _) then "range"
+  when ExprKind::ExprCast(_, _) then "cast"
+  when ExprKind::ExprTypeCheck(_, _) then "type-check"
+  when ExprKind::ExprComptime(_) then "comptime"
+  when ExprKind::ExprEnumVariant(_, _, _) then "enum-variant"
+  when ExprKind::ExprAssign(_, _) then "assign"
+  when ExprKind::ExprPipe(_, _) then "pipe"
+  when ExprKind::ExprMacroCall(_, _) then "macro-call"
+  when ExprKind::ExprHole then "hole"
+  when ExprKind::ExprError(_) then "error"
+  end  end
+end
+
+# The ONE fingerprint diagnostic: exactly one error is recorded at the
+# first missing/invalid node, then the verifier returns false.
+def verify_hir_fail(inout env: TypeEnv, module_label: String, item_label: String, node_id: Int, kind_name: String, prefix: String, detail: String, span: Span) -> Bool
+  let module_field = if module_label.len() > 0 then module_label.clone() else "<root>".to_string() end
+  add_error_with_code(env, prefix + "|" + module_field + "|" + item_label + "|Node=" + node_id.to_string() + "|" + kind_name + "|" + detail, span, "ICE")
+  false
+end
+
+# The node's own record + the lowering-required derived channels.
+def verify_hir_node(inout env: TypeEnv, module_label: String, item_label: String, expr: Expr) -> Bool
+  if expr.node_id == 0 then return true end
+  match expr.kind
+  when ExprKind::ExprError(_) then return true
+  when _ then ()
+  end
+  let kind_name = hir_expr_kind_name(expr.kind.clone())
+  match env.typed_expr_types.get(expr.node_id)
+  when Option::Some(ty) then
+    var he = false
+    var hv = false
+    var hp = false
+    scan_codegen_type(env, &ty, &mut he, &mut hv, &mut hp, true)
+    if he then
+      return verify_hir_fail(env, module_label.clone(), item_label.clone(), expr.node_id, kind_name.clone(), "HIR_INVALID", "recorded type is Type::Error (a rejected node can never satisfy the lowering's typed-channel contract)", expr.span.clone())
+    end
+    if hv then
+      return verify_hir_fail(env, module_label.clone(), item_label.clone(), expr.node_id, kind_name.clone(), "HIR_INVALID", "recorded type contains an unresolved inference variable (Type::Var) in a lowering position", expr.span.clone())
+    end
+  when Option::None then ()
+  end
+  if !env.typed_exprs.contains_key(expr.node_id) then
+    return verify_hir_fail(env, module_label.clone(), item_label.clone(), expr.node_id, kind_name.clone(), "HIR_MISSING", "no typed HIR record for the node (the lowering's typed-child lookup fails here)", expr.span.clone())
+  end
+  match env.typed_exprs.get(expr.node_id)
+  when Option::Some(te) then
+    match te.kind
+    when TypedExprKind::Call(tc) then
+      # (a) the callable identity: a Def callee's typed_call_targets
+      # entry is read directly by the MIR call lowering.
+      match tc.callee
+      when TypedCallee::Def(_) then
+        if !env.typed_call_targets.contains_key(expr.node_id) then
+          return verify_hir_fail(env, module_label.clone(), item_label.clone(), expr.node_id, kind_name.clone(), "HIR_INVALID", "typed call record has a Def callee but no typed_call_targets entry (the callable identity would be lost before MIR)", expr.span.clone())
+        end
+      when _ then ()
+      end
+      # (b) the solved generic-call substitution (zero-inference at MIR).
+      match env.typed_call_instances.get(expr.node_id)
+      when Option::Some(inst_args) then
+        var ai = 0
+        while ai < inst_args.len() do
+          match inst_args[ai].clone()
+          when GenericArg::Type(aty) then
+            var ahe = false
+            var ahv = false
+            var ahp = false
+            scan_codegen_type(env, &aty, &mut ahe, &mut ahv, &mut ahp, true)
+            if ahe || ahv then
+              return verify_hir_fail(env, module_label.clone(), item_label.clone(), expr.node_id, kind_name.clone(), "HIR_INVALID", "solved generic-call substitution carries unresolved state (Type::Error/Type::Var) on a call the monomorphizer consumes with zero inference", expr.span.clone())
+            end
+          when GenericArg::Const(_) then ()
+          end
+          ai = ai + 1
+        end
+      when Option::None then ()
+      end
+      # (c) every call argument's recorded access effect (mir.tg's call
+      # lowering reads the effect per argument).
+      var aai = 0
+      while aai < tc.args.len() do
+        let arg_node = tc.args[aai].value.id
+        if !env.typed_access_effects.contains_key(arg_node) then
+          return verify_hir_fail(env, module_label.clone(), item_label.clone(), arg_node, "call-argument", "HIR_MISSING", "call argument has no recorded access effect (the MIR call lowering reads it directly)", expr.span.clone())
+        end
+        aai = aai + 1
+      end
+    when _ then ()
+    end
+  when Option::None then ()
+  end
+  true
+end
+
+def verify_hir_block(inout env: TypeEnv, module_label: String, item_label: String, block: Block) -> Bool
+  var i = 0
+  while i < block.stmts.len() do
+    if !verify_hir_stmt(env, module_label.clone(), item_label.clone(), &block.stmts[i]) then return false end
+    i = i + 1
+  end
+  true
+end
+
+def verify_hir_pattern(inout env: TypeEnv, module_label: String, item_label: String, pat: Pattern) -> Bool
+  match pat.kind
+  when PatternKind::Wildcard then ()
+  when PatternKind::Ident(_, _) then ()
+  when PatternKind::Literal(e) then
+    return verify_hir_expr(env, module_label, item_label, &e)
+  when PatternKind::Tuple(pats) then
+    var i = 0
+    while i < pats.len() do
+      if !verify_hir_pattern(env, module_label.clone(), item_label.clone(), &pats[i]) then return false end
+      i = i + 1
+    end
+  when PatternKind::Array(pats) then
+    var i = 0
+    while i < pats.len() do
+      if !verify_hir_pattern(env, module_label.clone(), item_label.clone(), &pats[i]) then return false end
+      i = i + 1
+    end
+  when PatternKind::Struct(_, fields) then
+    var i = 0
+    while i < fields.len() do
+      if !verify_hir_pattern(env, module_label.clone(), item_label.clone(), &fields[i].1) then return false end
+      i = i + 1
+    end
+  when PatternKind::Variant(_, pats) then
+    var i = 0
+    while i < pats.len() do
+      if !verify_hir_pattern(env, module_label.clone(), item_label.clone(), &pats[i]) then return false end
+      i = i + 1
+    end
+  when PatternKind::Or(pats) then
+    var i = 0
+    while i < pats.len() do
+      if !verify_hir_pattern(env, module_label.clone(), item_label.clone(), &pats[i]) then return false end
+      i = i + 1
+    end
+  when PatternKind::Range(lo, hi, _) then
+    match lo
+    when Option::Some(e) then
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &e) then return false end
+    when Option::None then ()
+    end
+    match hi
+    when Option::Some(e) then
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &e) then return false end
+    when Option::None then ()
+    end
+  end
+  true
+end
+
+def verify_hir_if(inout env: TypeEnv, module_label: String, item_label: String, if_stmt: IfStmt) -> Bool
+  if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &if_stmt.cond) then return false end
+  if !verify_hir_block(env, module_label.clone(), item_label.clone(), &if_stmt.then_block) then return false end
+  var i = 0
+  while i < if_stmt.elsif_branches.len() do
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &if_stmt.elsif_branches[i].0) then return false end
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &if_stmt.elsif_branches[i].1) then return false end
+    i = i + 1
+  end
+  match if_stmt.else_block
+  when Option::Some(eb) then
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &eb) then return false end
+  when Option::None then ()
+  end
+  true
+end
+
+def verify_hir_match(inout env: TypeEnv, module_label: String, item_label: String, m: MatchExpr) -> Bool
+  if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &m.scrutinee) then return false end
+  var i = 0
+  while i < m.arms.len() do
+    if !verify_hir_pattern(env, module_label.clone(), item_label.clone(), &m.arms[i].pattern) then return false end
+    match m.arms[i].guard_expr
+    when Option::Some(g) then
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &g) then return false end
+    when Option::None then ()
+    end
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &m.arms[i].body) then return false end
+    i = i + 1
+  end
+  true
+end
+
+def verify_hir_expr(inout env: TypeEnv, module_label: String, item_label: String, expr: Expr) -> Bool
+  if !verify_hir_node(env, module_label.clone(), item_label.clone(), &expr) then return false end
+  match expr.kind
+  when ExprKind::ExprIntLit(_) then ()
+  when ExprKind::ExprFloatLit(_) then ()
+  when ExprKind::ExprStringLit(_) then ()
+  when ExprKind::ExprCharLit(_) then ()
+  when ExprKind::ExprBoolLit(_) then ()
+  when ExprKind::ExprNilLit then ()
+  when ExprKind::ExprIdent(_) then ()
+  when ExprKind::ExprPath(_) then ()
+  when ExprKind::ExprSelfRef then ()
+  when ExprKind::ExprHole then ()
+  when ExprKind::ExprArrayLit(elems) then
+    var i = 0
+    while i < elems.len() do
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &elems[i]) then return false end
+      i = i + 1
+    end
+  when ExprKind::ExprArrayRepeat(elem, count) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *elem.get()) then return false end
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *count.get()) then return false end
+  when ExprKind::ExprTupleLit(elems) then
+    var i = 0
+    while i < elems.len() do
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &elems[i]) then return false end
+      i = i + 1
+    end
+  when ExprKind::ExprStructLit(_, fields) then
+    var i = 0
+    while i < fields.len() do
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &fields[i].1) then return false end
+      i = i + 1
+    end
+  when ExprKind::ExprMapLit(entries) then
+    var i = 0
+    while i < entries.len() do
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &entries[i].0) then return false end
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &entries[i].1) then return false end
+      i = i + 1
+    end
+  when ExprKind::ExprBinaryOp(_, left, right) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *left.get()) then return false end
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *right.get()) then return false end
+  when ExprKind::ExprUnaryOp(_, operand) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *operand.get()) then return false end
+  when ExprKind::ExprFieldAccess(base, _) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *base.get()) then return false end
+  when ExprKind::ExprMethodCall(recv, _, _, args) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *recv.get()) then return false end
+    var i = 0
+    while i < args.len() do
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &args[i]) then return false end
+      i = i + 1
+    end
+  when ExprKind::ExprIndex(base, index) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *base.get()) then return false end
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *index.get()) then return false end
+  when ExprKind::ExprCall(func, args) then
+    # (turbofish): `f[T](args)` parses as ExprCall(ExprIndex(f, payload)):
+    # the bracketed payload is a TYPE-ARGUMENT list, never a checked
+    # value — the checker checks the BASE in the callee's place and the
+    # index node carries no typed record. Walk the base only.
+    let func_expr = *func.get()
+    match func_expr.kind
+    when ExprKind::ExprIndex(_, _) then
+      if callee_index_is_direct_callable(env, &func_expr) then
+        match func_expr.kind
+        when ExprKind::ExprIndex(base, _) then
+          if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *base.get()) then return false end
+        when _ then ()
+        end
+      else
+        if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &func_expr) then return false end
+      end
+    when _ then
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &func_expr) then return false end
+    end
+    var i = 0
+    while i < args.len() do
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &args[i]) then return false end
+      i = i + 1
+    end
+  when ExprKind::ExprClosure(params, _, body) then
+    var i = 0
+    while i < params.len() do
+      if !verify_hir_pattern(env, module_label.clone(), item_label.clone(), &params[i].pat) then return false end
+      i = i + 1
+    end
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *body.get()) then return false end
+  when ExprKind::ExprAccess(inner) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *inner.get()) then return false end
+  when ExprKind::ExprRawDeref(inner) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *inner.get()) then return false end
+  when ExprKind::ExprIf(if_stmt) then
+    if !verify_hir_if(env, module_label.clone(), item_label.clone(), &if_stmt) then return false end
+  when ExprKind::ExprMatch(m) then
+    if !verify_hir_match(env, module_label.clone(), item_label.clone(), &m) then return false end
+  when ExprKind::ExprBlock(block) then
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &block) then return false end
+  when ExprKind::ExprUnsafe(_, block) then
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &block) then return false end
+  when ExprKind::ExprAsync(block) then
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &block) then return false end
+  when ExprKind::ExprAwait(inner) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *inner.get()) then return false end
+  when ExprKind::ExprTry(inner) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *inner.get()) then return false end
+  when ExprKind::ExprRange(start, end_, _) then
+    match start
+    when Option::Some(s) then
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *s.get()) then return false end
+    when Option::None then ()
+    end
+    match end_
+    when Option::Some(e) then
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *e.get()) then return false end
+    when Option::None then ()
+    end
+  when ExprKind::ExprCast(inner, _) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *inner.get()) then return false end
+  when ExprKind::ExprTypeCheck(inner, _) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *inner.get()) then return false end
+  when ExprKind::ExprComptime(block) then
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &block) then return false end
+  when ExprKind::ExprEnumVariant(_, _, args) then
+    var i = 0
+    while i < args.len() do
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &args[i]) then return false end
+      i = i + 1
+    end
+  when ExprKind::ExprAssign(target, value) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *target.get()) then return false end
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *value.get()) then return false end
+  when ExprKind::ExprPipe(lhs, rhs) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *lhs.get()) then return false end
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), *rhs.get()) then return false end
+  when ExprKind::ExprMacroCall(_, args) then
+    var i = 0
+    while i < args.len() do
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &args[i]) then return false end
+      i = i + 1
+    end
+  when ExprKind::ExprError(_) then ()
+  end
+  true
+end
+
+def verify_hir_stmt(inout env: TypeEnv, module_label: String, item_label: String, stmt: Stmt) -> Bool
+  match stmt.kind
+  when StmtKind::StmtLet(pattern, _, value, _) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &value) then return false end
+    if !verify_hir_pattern(env, module_label.clone(), item_label.clone(), &pattern) then return false end
+  when StmtKind::StmtAssign(target, value) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &target) then return false end
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &value) then return false end
+  when StmtKind::StmtCompoundAssign(_, target, value) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &target) then return false end
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &value) then return false end
+  when StmtKind::StmtIf(if_stmt) then
+    if !verify_hir_if(env, module_label.clone(), item_label.clone(), &if_stmt) then return false end
+  when StmtKind::StmtMatch(m) then
+    if !verify_hir_match(env, module_label.clone(), item_label.clone(), &m) then return false end
+  when StmtKind::StmtWhile(cond, body) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &cond) then return false end
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &body) then return false end
+  when StmtKind::StmtFor(for_stmt) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &for_stmt.iter) then return false end
+    if !verify_hir_pattern(env, module_label.clone(), item_label.clone(), &for_stmt.pattern) then return false end
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &for_stmt.body) then return false end
+  when StmtKind::StmtLoop(body) then
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &body) then return false end
+  when StmtKind::StmtReturn(val_opt) then
+    match val_opt
+    when Option::Some(v) then
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &v) then return false end
+    when Option::None then ()
+    end
+  when StmtKind::StmtBreak(val_opt) then
+    match val_opt
+    when Option::Some(v) then
+      if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &v) then return false end
+    when Option::None then ()
+    end
+  when StmtKind::StmtContinue then ()
+  when StmtKind::StmtExpr(e) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &e) then return false end
+  when StmtKind::StmtUnsafe(_, body) then
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &body) then return false end
+  when StmtKind::StmtDefer(body) then
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &body) then return false end
+  when StmtKind::StmtGuard(cond, else_action) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &cond) then return false end
+    match else_action
+    when GuardElse::Return(val_opt) then
+      match val_opt
+      when Option::Some(v) then
+        if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &v) then return false end
+      when Option::None then ()
+      end
+    when GuardElse::Panic(_) then ()
+    when GuardElse::Break(val_opt) then
+      match val_opt
+      when Option::Some(v) then
+        if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &v) then return false end
+      when Option::None then ()
+      end
+    when GuardElse::Continue then ()
+    end
+  when StmtKind::StmtTry(body, catches, finally_block) then
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &body) then return false end
+    var i = 0
+    while i < catches.len() do
+      if !verify_hir_pattern(env, module_label.clone(), item_label.clone(), &catches[i].pattern) then return false end
+      if !verify_hir_block(env, module_label.clone(), item_label.clone(), &catches[i].body) then return false end
+      i = i + 1
+    end
+    match finally_block
+    when Option::Some(fb) then
+      if !verify_hir_block(env, module_label.clone(), item_label.clone(), &fb) then return false end
+    when Option::None then ()
+    end
+  when StmtKind::StmtWith(expr, pat, body) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &expr) then return false end
+    if !verify_hir_pattern(env, module_label.clone(), item_label.clone(), &pat) then return false end
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &body) then return false end
+  when StmtKind::StmtHandleWith(expr, handlers) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &expr) then return false end
+    var i = 0
+    while i < handlers.len() do
+      var j = 0
+      while j < handlers[i].arms.len() do
+        var k = 0
+        while k < handlers[i].arms[j].params.len() do
+          if !verify_hir_pattern(env, module_label.clone(), item_label.clone(), &handlers[i].arms[j].params[k]) then return false end
+          k = k + 1
+        end
+        if !verify_hir_block(env, module_label.clone(), item_label.clone(), &handlers[i].arms[j].body) then return false end
+        j = j + 1
+      end
+      i = i + 1
+    end
+  end
+  true
+end
+
+def verify_hir_fn(inout env: TypeEnv, module_label: String, item_label: String, f: FunctionDecl) -> Bool
+  match f.body
+  when FnBody::FnBlock(b) then
+    if !verify_hir_block(env, module_label.clone(), item_label.clone(), &b) then return false end
+  when FnBody::FnExpr(e) then
+    if !verify_hir_expr(env, module_label.clone(), item_label.clone(), &e) then return false end
+  when FnBody::FnExtern(_) then ()
+  when FnBody::FnNone then ()
+  end
+  true
+end
+
+pub def verify_typed_channel_completeness(inout env: TypeEnv, program: Program) -> Bool
+  var i = 0
+  while i < program.items.len() do
+    let item = program.items[i].clone()
+    let module_label = crate_module_path_of(program, &item.owner_module).join("::")
+    match item.kind
+    when ItemKind::ItemFunction(f) then
+      if !verify_hir_fn(env, module_label.clone(), f.name.clone(), &f) then return false end
+    when ItemKind::ItemStruct(s) then
+      var fi = 0
+      while fi < s.fields.len() do
+        match s.fields[fi].default
+        when Option::Some(d) then
+          if !verify_hir_expr(env, module_label.clone(), s.name.clone() + "::" + s.fields[fi].name.clone(), &d) then return false end
+        when Option::None then ()
+        end
+        fi = fi + 1
+      end
+      var mi = 0
+      while mi < s.methods.len() do
+        if !verify_hir_fn(env, module_label.clone(), s.name.clone() + "::" + s.methods[mi].name.clone(), &s.methods[mi]) then return false end
+        mi = mi + 1
+      end
+    when ItemKind::ItemImpl(imp) then
+      let owner = type_expr_name_of(&imp.for_type)
+      var mi = 0
+      while mi < imp.methods.len() do
+        if !verify_hir_fn(env, module_label.clone(), owner.clone() + "::" + imp.methods[mi].name.clone(), &imp.methods[mi]) then return false end
+        mi = mi + 1
+      end
+    # trait DEFAULT bodies are deliberately NOT walked: the kernel never
+    # type-checks them at declaration time (type traits register only the
+    # method contract — see the TraitMethodContract construction) and no
+    # lowering/mono path consumes `TraitMethod.default_body` (grep:
+    # mono.tg/mir.tg read impl method bodies, never the trait default), so
+    # requiring typed records there would flag dead AST (the std::core
+    # `Error::source` `Option::None` class), not a lowering input.
+    when ItemKind::ItemConst(c) then
+      if !verify_hir_expr(env, module_label.clone(), c.name.clone(), &c.value) then return false end
+    when ItemKind::ItemStatic(sd) then
+      if !verify_hir_expr(env, module_label.clone(), sd.name.clone(), &sd.value) then return false end
+    when _ then ()
+    end
+    i = i + 1
+  end
+  true
+end
+
 def scan_deinit_plan_types(env: TypeEnv, plan: DeinitPlan, inout has_error: Bool, inout has_var: Bool) -> Unit
   match plan
   when DeinitPlan::Trivial then ()
@@ -31406,6 +31967,13 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
   # survives in a codegenable TypedProgram. Each finding records a TypeError
   # so compilation aborts before MIR lowering.
   verify_codegen_readiness(env)
+  # (mandatory typed-channel completeness — the 78B-class front door):
+  # after finalize + readiness and before the TypedProgram is assembled
+  # (the last front-end step the MIR lowering consumes), require the
+  # exact lowering-required records. The first missing/invalid node
+  # records ONE stable HIR_MISSING/HIR_INVALID fingerprint so the late
+  # 78B archaeology is replaced by an exact front-end failure.
+  let _hir_complete = verify_typed_channel_completeness(env, program)
   var kinds = Map::new()
   var type_names = Map::new()
   var deinit_targets = Map::new()

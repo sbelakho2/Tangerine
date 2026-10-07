@@ -449,6 +449,13 @@ type lower_state = {
      consumes this instead of re-interpreting the raw pattern syntax *)
   typed_for_patterns : (Ids.Node_id.t, Typecheck.typed_for) Hashtbl.t;
   typed_let_patterns : (Ids.Node_id.t, Typed_pattern.t) Hashtbl.t;
+  (* (no-fallback audit): the driver's checked-env path sets this when
+     the name_bindings channel is CHECKER-COMPLETE for every accepted
+     source Name node; the identifier path then fails closed on a
+     missing record instead of falling back to the source spelling.
+     false = hand-built selfcheck environments (and synthetic nodes),
+     where the documented spelling fallback is retained. *)
+  bindings_complete : bool;
 }
 
 (* The typed-iterable lookup: the ForExpr's semantic pattern + element
@@ -1488,7 +1495,14 @@ and lower_inout_address_argument (env : func_env) (st : lower_state)
    checker checks arguments against a fresh inference var and records the
    literal as Int_literal, solving the kind only later through the
    enclosing call/return context). *)
-and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state)
+and lower_expr ?(expect : Type_repr.t option)
+    (* (no-fallback audit scope): true ONLY along an assignment target's
+       place spine.  The checker's check_place resolves target bases
+       (typecheck.ml check_place: Name/Field/Index/Deref roots) WITHOUT
+       recording typed_name_bindings, so those nodes legitimately lack a
+       record; every checker-recorded READ context keeps place_base=false
+       and stays fail-closed on a missing record. *)
+    ?(place_base = false) (env : func_env) (st : lower_state)
     (e : Ast.expr) : Seed_mir.operand * Type_repr.t =
   match e with
   | Ast.IntLit (nid, lit, _) -> (
@@ -1573,17 +1587,98 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
       | Ok (u, _) -> (Seed_mir.Constant (Seed_mir.Char u), Type_repr.Char)
       | Error _ -> seed_bug "invalid char literal")
   | Ast.BoolLit (_, b, _) -> (Seed_mir.Constant (Seed_mir.Bool b), Type_repr.Bool)
-  | Ast.Name (nid, n, _) -> (
-      (* (semantic name identity): consume the checker's recorded binding.
-         A global Name (const/static/ctor/value) resolves by IDENTITY, so
-         a declaration-bound default keeps its declaration's meaning and
-         can never be captured by a use-site local or a same-spelled name
-         from another module.  NB_local / absent (hand-built envs) fall
-         back to the ordinary scope resolution. *)
-      let n =
-        match Hashtbl.find_opt env.name_bindings nid with
-        | Some (Typecheck.NB_ctor key) -> key
-        | _ -> n
+  | Ast.Name (nid, n, span) -> (
+      (* (semantic name identity — the no-fallback audit): when the driver
+         supplies the CHECKER-COMPLETE name-binding channel
+         (st.bindings_complete), every accepted source Name node carries
+         exactly one record — check_name records NB_local / NB_const /
+         NB_static / NB_ctor / NB_value at every accepting exit.  A
+         missing record, and a recorded NB_local absent from the lowering
+         scope, are then checker/lowerer contradictions and fail closed
+         naming the node — NEVER re-resolved from the source spelling.
+         The spelling/table fallback below survives ONLY for hand-built
+         selfcheck environments (empty channel, bindings_complete=false),
+         for synthetic nodes (Ast.synthetic_node_id) the checker never
+         saw, and for the place base of an assignment target
+         (place_base=true: the checker's check_place does not record name
+         bindings for target roots — a documented checker gap, NOT a
+         recorded identity being ignored). *)
+      let lower_local () : Seed_mir.operand * Type_repr.t =
+        match List.assoc_opt n st.scope with
+        | Some id -> (
+            match local_type st id with
+            | Some ty -> (copy_place st (cur_place st id), ty)
+            | None -> seed_bug "local _%d has no type in lowering" id)
+        | None ->
+            seed_bug
+              "identifier `%s` (node #%d, file#%d:%d) is checker-resolved as a LOCAL but the lowering scope has no binding — checker/lowerer scope mismatch"
+              n (Ids.Node_id.to_int nid) span.Span.file_id span.Span.start
+      in
+      let ctor_operand (key : string) : (Seed_mir.operand * Type_repr.t) option =
+        match ctor_of st.variants key with
+        | None -> None
+        | Some (enum_name, vname) ->
+            (* a nullary enum constructor in value position, e.g. `None` *)
+            let ty =
+              match List.assoc_opt key env.values with
+              | Some t -> t
+              | None ->
+                  seed_bug "enum constructor `%s` has no registered result type in the lowering env" key
+            in
+            (* the checker's resolved result type (the value's node
+               record, journal-substituted) is authoritative when the
+               typed channel is present — a nullary ctor declares a
+               generic param (`Option::None` declares T) that no
+               argument can bind, so the raw declaration form must
+               never reach a local *)
+            let ty = call_result_ty st nid ty in
+            let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:ty in
+            let id = fresh_local st ty in
+            emit st
+              (Seed_mir.Assign
+                 ( cur_place st id,
+                   Seed_mir.Aggregate
+                     ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_index.make spec.vs_index),
+                       [] ) ));
+            Some (copy_place st (cur_place st id), ty)
+      in
+      let lower_ctor_key (key : string) : Seed_mir.operand * Type_repr.t =
+        match ctor_operand key with
+        | Some r -> r
+        | None ->
+            seed_bug
+              "recorded constructor binding `%s` (node #%d, file#%d:%d) has no variant-table entry in lowering — the checker recorded NB_ctor but the table lacks the key"
+              key (Ids.Node_id.to_int nid) span.Span.file_id span.Span.start
+      in
+      let lower_by_spelling () : Seed_mir.operand * Type_repr.t =
+        (* documented fallback scope: hand-built selfcheck envs and
+           synthetic nodes only.  The driver's checked-env path
+           (bindings_complete=true) never reaches this function for a
+           checker-seen source node. *)
+        match List.assoc_opt n st.scope with
+        | Some id -> (
+            match local_type st id with
+            | Some ty -> (copy_place st (cur_place st id), ty)
+            | None -> seed_bug "local _%d has no type in lowering" id)
+        | None -> (
+            match ctor_operand n with
+            | Some r -> r
+            | None -> (
+                match List.assoc_opt n env.statics with
+                | Some (idx, ty) ->
+                    (* the GLOBAL read: the place.local convention
+                       -1 - idx addresses the VM's statics slot — the
+                       read is stateful, NOT the const fold *)
+                    ( Seed_mir.Copy { Seed_mir.root = Seed_mir.Static idx; projections = [] },
+                      ty )
+                | None -> (
+                    match List.assoc_opt n env.consts with
+                    | Some (ty, c) -> (Seed_mir.Constant c, ty)
+                    | None -> (
+                        match List.assoc_opt n env.values with
+                        | Some _ ->
+                            seed_bug "function value `%s` reached lowering without a resolved callable identity" n
+                        | None -> seed_bug "unknown value '%s' in lowering" n))))
       in
       match Hashtbl.find_opt env.name_bindings nid with
       | Some (Typecheck.NB_const key) -> recorded_const_operand env key
@@ -1592,55 +1687,16 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
           seed_bug
             "function value `%s` reached lowering without a resolved callable identity"
             key
-      | Some (Typecheck.NB_ctor _) | Some Typecheck.NB_local | None ->
-      let local = List.assoc_opt n st.scope in
-      match local with
-      | Some id -> (
-          match local_type st id with
-          | Some ty -> (copy_place st (cur_place st id), ty)
-          | None -> seed_bug "local _%d has no type in lowering" id)
-      | None -> (
-          match ctor_of st.variants n with
-          | Some (enum_name, vname) ->
-              (* a nullary enum constructor in value position, e.g. `None` *)
-              let ty =
-                match List.assoc_opt n env.values with
-                | Some t -> t
-                | None ->
-                    seed_bug "enum constructor `%s` has no registered result type in the lowering env" n
-              in
-              (* the checker's resolved result type (the value's node
-                 record, journal-substituted) is authoritative when the
-                 typed channel is present — a nullary ctor declares a
-                 generic param (`Option::None` declares T) that no
-                 argument can bind, so the raw declaration form must
-                 never reach a local *)
-              let ty = call_result_ty st nid ty in
-            let spec = variant_spec_of env st.variants ~enum_name ~vname ~repr:ty in
-            let id = fresh_local st ty in
-               emit st
-                 (Seed_mir.Assign
-                    ( cur_place st id,
-                      Seed_mir.Aggregate
-                        ( Seed_mir.EnumCtor (enum_tid_of env enum_name, Ids.Variant_index.make spec.vs_index),
-                          [] ) ));
-               (copy_place st (cur_place st id), ty)
-          | None -> (
-              match List.assoc_opt n env.statics with
-              | Some (idx, ty) ->
-                  (* the GLOBAL read: the place.local convention
-                     -1 - idx addresses the VM's statics slot — the
-                     read is stateful, NOT the const fold *)
-                  ( Seed_mir.Copy { Seed_mir.root = Seed_mir.Static idx; projections = [] },
-                    ty )
-              | None -> (
-                  match List.assoc_opt n env.consts with
-                      | Some (ty, c) -> (Seed_mir.Constant c, ty)
-                      | None -> (
-                          match List.assoc_opt n env.values with
-                          | Some _ ->
-                              seed_bug "function value `%s` reached lowering without a resolved callable identity" n
-                          | None -> seed_bug "unknown value '%s' in lowering" n)))))
+      | Some (Typecheck.NB_ctor key) -> lower_ctor_key key
+      | Some Typecheck.NB_local ->
+          if st.bindings_complete then lower_local () else lower_by_spelling ()
+      | None ->
+          if st.bindings_complete && nid <> Ast.synthetic_node_id && not place_base
+          then
+            seed_bug
+              "identifier `%s` (node #%d, file#%d:%d) has no checker-recorded name binding — the typed channel is complete for this compilation, so this is a checker/lowerer contradiction (fail-closed; no spelling-based fallback)"
+              n (Ids.Node_id.to_int nid) span.Span.file_id span.Span.start
+          else lower_by_spelling ())
   | Ast.Path (_, a, b, span) -> (
       ignore span;
       seed_bug "path value `%s::%s` reached lowering without a resolved callable identity" a b)
@@ -1735,7 +1791,7 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
              by its container); it is never a bitwise Copy of a
              possibly-owning pointee and never a Move (a Move would
              write the Moved hole into the payload). *)
-          let io, it = lower_expr env st inner in
+          let io, it = lower_expr ~place_base env st inner in
           let p = materialize_place st io in
           (* the generic-pointer model: a deref of an UNINSTANTIATED
              generic operand passes the operand through (`*item` in
@@ -1963,7 +2019,7 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
           (copy_place st (cur_place st id), rt)
       | other -> seed_bug "macro invocation `%s!` is not lowered (only vec! is available)" other)
   | Ast.Index (_, base, idx, _) -> (
-      let base_op, base_ty = lower_expr env st base in
+      let base_op, base_ty = lower_expr ~place_base env st base in
       let bp = materialize_place st base_op in
       let elem_ty = element_type_of env base_ty in
       match idx with
@@ -2005,7 +2061,7 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
          registry (func_env.struct_fields) and emit the semantic FieldId
          projection with the derived type (tuples project positionally
          with ConstantIndex).  Every unresolvable field fails closed. *)
-      let bop, bty = lower_expr env st base in
+      let bop, bty = lower_expr ~place_base env st base in
       let bp = materialize_place st bop in
       let projs, fty = field_projection_of env bty fname in
       (* the field VALUE of a non-Copy field type is a place READ, never
@@ -2120,10 +2176,10 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
               verifier checks the projected destination (owner identity
               + initialization).  The writeback re-initializes the
               projected component (the moved-remainder semantics: the
-              root aggregate stays initialized). *)
-           let bop, bty = lower_expr env st base in
-           let bp = materialize_place st bop in
-           let projs, fty = field_projection_of env bty fname in
+               root aggregate stays initialized). *)
+            let bop, bty = lower_expr ~place_base:true env st base in
+            let bp = materialize_place st bop in
+            let projs, fty = field_projection_of env bty fname in
            ignore fty;
            let dst = { bp with Seed_mir.projections = bp.Seed_mir.projections @ projs } in
            emit st (Seed_mir.Assign (dst, Seed_mir.Use vo))
@@ -2133,10 +2189,10 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
               nonconstant index is evaluated exactly once into a fresh
               local and emits the dynamic `Index <local>` projection —
               the same scheme as the read path (the VM bounds-checks the
-              runtime index value at execution). *)
-           let bop, bty = lower_expr env st base in
-           let bp = materialize_place st bop in
-           let elem_ty = element_type_of env bty in
+               runtime index value at execution). *)
+            let bop, bty = lower_expr ~place_base:true env st base in
+            let bp = materialize_place st bop in
+            let elem_ty = element_type_of env bty in
            ignore elem_ty;
            match idx with
            | Ast.IntLit (_, s, _) -> (
@@ -2169,9 +2225,9 @@ and lower_expr ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
               the write is the operand place itself (a projection over
               the non-pointer local would be the verifier's
               deref-on-non-pointer finding — the mirror of the
-              read-side pass-through below). *)
-           let bop, bty = lower_expr env st base in
-           let bp = materialize_place st bop in
+               read-side pass-through below). *)
+            let bop, bty = lower_expr ~place_base:true env st base in
+            let bp = materialize_place st bop in
            let pointer_base =
              match bty with
              | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _ -> true
@@ -6260,6 +6316,12 @@ let lower_function_with_variants
        selfcheck callers) the list converts exactly as before. *)
     ?typed_nodes_tbl ?typed_patterns_tbl ?typed_for_patterns_tbl
     ?typed_let_patterns_tbl
+    (* (no-fallback audit): set by the driver's checked-env paths — the
+       name_bindings channel is complete for every accepted source Name
+       node, so the identifier path fails closed on a missing record
+       rather than re-resolving the source spelling.  Hand-built
+       selfchecks omit it and keep the documented fallback. *)
+    ?(typed_bindings_complete = false)
     ?(param_tys_opt : Type_repr.t array option) (variants : variant_table)
     (env : func_env) (name : string)
     (callable : int) (template_args : Type_repr.t array)
@@ -6307,6 +6369,7 @@ let lower_function_with_variants
       typed_patterns;
       typed_for_patterns;
       typed_let_patterns;
+      bindings_complete = typed_bindings_complete;
     }
   in
   (* local 0 = return slot *)

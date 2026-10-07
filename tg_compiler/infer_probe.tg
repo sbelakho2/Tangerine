@@ -38,8 +38,8 @@ use tg_compiler::parser::{parse, diag_has_errors, Diagnostic}
 use tg_compiler::ast::{assign_node_ids, Program, Item, ItemId, ModuleId, Module, Crate, UseDecl, Span}
 use tg_compiler::token::{span_dummy}
 use tg_compiler::resolver::{resolve_names}
-use tg_compiler::ids::{TypeId, TraitId, GenericParamId, DefId, ModuleId, ClosureId, def_id_numeric}
-use tg_compiler::types::{type_env_new, type_check_typed, TypeCheckResult, type_display, unify, TypeEnv, ImplInfo, TraitRefTemplate, impl_candidate_indices, register_impl_candidate_index, subst_snapshot, subst_restore, errors_truncate, try_head_unify, impl_head_bucket, TypeVarId, GlobalBinding}
+use tg_compiler::ids::{TypeId, TraitId, GenericParamId, DefId, ModuleId, ClosureId, GenericArg, def_id_numeric}
+use tg_compiler::types::{type_env_new, type_check_typed, verify_typed_channel_completeness, TypeCheckResult, type_display, unify, TypeEnv, ImplInfo, TraitRefTemplate, impl_candidate_indices, register_impl_candidate_index, subst_snapshot, subst_restore, errors_truncate, try_head_unify, impl_head_bucket, TypeVarId, GlobalBinding, fn_owner_key_of_def}
 use tg_compiler::compiler_core::{default_options, apply_cfg_elimination, prepare_parsed, analyze_parsed}
 use tg_compiler::mir::{lower_to_mir, verify_mir, MirProgram, MirRvalue, MirOperand, MirStatementKind, MirRvalueKind, MirOperandKind, MirConstantKind}
 use tg_compiler::access_check::{access_check, AccessError}
@@ -1887,6 +1887,627 @@ def infer_probe_semantic_default_battery(inout report: String) -> Int
   fails
 end
 
+# ———————————————————————————————————————————————————————————————
+# PARITY battery (the seed-vs-kernel semantic parity lane):
+# stage0_ocaml/selfcheck/tg_semantic_parity.ml writes the case sources to
+# build/parity_cases.txt (length-prefixed, one CASE record per program) and
+# runs this probe inside the VM; the rows below are the KERNEL checker's
+# verdicts on exactly those sources, compared against the seed's own
+# check+lower+verify+VM verdict by the OCaml lane.
+#
+#   PARITY <label> verdict=accept|reject|parse-reject|resolve-reject
+#          errors=N main_ret=<display|-> first=<normalized first message|->
+#
+# The battery ALSO runs the no-fallback mutation cases (deliverable 6):
+# after a real analyze_parsed, one checker-recorded typed record is deleted
+# for one node and the lowering MUST fail closed with an internal error
+# naming that node — never a silent name-based fallback and never a wrong
+# value. The rows are PARITY_MUTATION ..., and the battery's fails counter
+# (asserted by tg_infer's PARITY_BATTERY fails=0) is nonzero if any
+# mutation lowers successfully or the error does not name the node.
+#
+# When build/parity_cases.txt is absent (a standalone tg_infer run) the
+# battery still runs the mutations and emits an explicit
+# `PARITY_BATTERY no-cases ... cases=0` row — zero compared cases is
+# reported as no-cases, NEVER as semantic agreement.
+# ———————————————————————————————————————————————————————————————
+def infer_probe_parity_parse_cases(source: String) -> Vec[(String, String)]
+  var cases: Vec[(String, String)] = Vec::new()
+  var pos = 0
+  let n = source.len()
+  while pos < n do
+    var le = pos
+    while le < n && source.slice(le, le + 1) != "\n" do
+      le = le + 1
+    end
+    let line = source.slice(pos, le)
+    pos = if le < n then le + 1 else le end
+    if line.starts_with("CASE ") then
+      var sp = -1
+      var i = line.len() - 1
+      while i >= 5 do
+        if line.slice(i, i + 1) == " " then
+          sp = i
+          break
+        end
+        i = i - 1
+      end
+      if sp > 5 then
+        let label = line.slice(5, sp)
+        let lenstr = line.slice(sp + 1, line.len())
+        match lenstr.parse_int()
+        when Result::Ok(clen) then
+          if clen >= 0 && pos + clen <= n then
+            cases.push((label.clone(), source.slice(pos, pos + clen)))
+            pos = pos + clen
+            # one optional separator newline follows each payload
+            if pos < n && source.slice(pos, pos + 1) == "\n" then
+              pos = pos + 1
+            end
+          end
+        when Result::Err(_) then ()
+        end
+      end
+    end
+  end
+  cases
+end
+
+def infer_probe_parity_case(label: String, source: String, inout report: String) -> Unit
+  let parsed = parse(tokenize(source.clone(), label.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "PARITY " + label.clone() + " verdict=parse-reject errors=" + parsed.diagnostics.len().to_string() + " main_ret=- first=parse\n"
+    return ()
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Err(errs) then
+    var rfirst = "-"
+    if errs.len() > 0 then rfirst = infer_probe_norm_ids(errs[0].message.clone()) end
+    report = report + "PARITY " + label.clone() + " verdict=resolve-reject errors=" + errs.len().to_string() + " main_ret=- first=" + rfirst.clone() + "\n"
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    if result.errors.len() == 0 then
+      # main's resolved return type: typed_fn_signatures keys are
+      # DefId-rendered (fn::<module>::<index>), so compute the key from
+      # the resolver's item_defs entry for the main item — never a
+      # name-based scan.
+      var ret = "-"
+      var main_idx = -1
+      var mi = 0
+      while mi < program.items.len() do
+        match program.items[mi].kind
+        when ItemKind::ItemFunction(f) then
+          if f.name == "main" then main_idx = mi end
+        when _ then ()
+        end
+        mi = mi + 1
+      end
+      if main_idx >= 0 then
+        match res.item_defs.get(main_idx)
+        when Option::Some(dids) then
+          if dids.len() > 0 then
+            let did0 = dids[0].clone()
+            let mk = fn_owner_key_of_def(program, &res, &did0)
+            match env.typed_fn_signatures.get(&mk)
+            when Option::Some(sig) then ret = type_display(engine_env_empty(), sig.ret_type.clone())
+            when Option::None then ()
+            end
+          end
+        when Option::None then ()
+        end
+      end
+      report = report + "PARITY " + label.clone() + " verdict=accept errors=0 main_ret=" + ret.clone() + " first=-\n"
+    else
+      report = report + "PARITY " + label.clone() + " verdict=reject errors=" + result.errors.len().to_string() + " main_ret=- first=" + infer_probe_norm_ids(result.errors[0].message.clone()) + "\n"
+    end
+  end
+end
+
+# The mutation witnesses: delete one checker-recorded typed record for one
+# node after a REAL analyze_parsed and require lower_to_mir to fail closed
+# with an internal error naming that node. A successful lowering (silent
+# name fallback) or a non-naming error is a battery failure.
+def infer_probe_parity_mutation_check(label: String, node: Int, lower: Result[MirProgram, String], inout report: String) -> Int
+  match lower
+  when Result::Ok(_) then
+    report = report + "PARITY_MUTATION " + label.clone() + " FAIL: lowering silently accepted a deleted typed record (node " + node.to_string() + ") — a name-based fallback or a wrong value\n"
+    1
+  when Result::Err(e) then
+    if e.contains("internal error") && e.contains(node.to_string()) then
+      report = report + "PARITY_MUTATION " + label.clone() + " PASS node=" + node.to_string() + " error=" + e.clone() + "\n"
+      0
+    else
+      report = report + "PARITY_MUTATION " + label.clone() + " FAIL: the error neither names the node nor is an internal error: " + e.clone() + "\n"
+      1
+    end
+  end
+end
+
+def infer_probe_parity_mutation_global(inout report: String) -> Int
+  let label = "mut_global_const_deleted"
+  let source = "const X: Int = 1\n\ndef add(a: Int, b: Int) -> Int\n  a + b\nend\n\ndef main() -> Int\n  add(X, 2)\nend\n"
+  let parsed = parse(tokenize(source.clone(), label.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "PARITY_MUTATION " + label.clone() + " FAIL: parse failed\n"
+    return 1
+  end
+  var program = parsed.program
+  var env = type_env_new()
+  env.strict_resolution = true
+  let opts = default_options()
+  match analyze_parsed(&mut env, &mut program, opts)
+  when Result::Err(_diags) then
+    report = report + "PARITY_MUTATION " + label.clone() + " FAIL: analyze failed\n"
+    1
+  when Result::Ok(a) then
+    var analyzed = a
+    let entries = analyzed.typed.global_bindings.entries()
+    # the program records a global binding for the const read AND (as the
+    # checker's value-position callable recording) for the `add` callee;
+    # the mutation deletes EVERY typed record for the GbConst node(s).
+    var const_nodes: Vec[Int] = Vec::new()
+    var const_def_nums: Vec[Int] = Vec::new()
+    var gi = 0
+    while gi < entries.len() do
+      match entries[gi].1
+      when GlobalBinding::GbConst(did) then
+        const_nodes.push(entries[gi].0)
+        const_def_nums.push(def_id_numeric(&did))
+      when _ then ()
+      end
+      gi = gi + 1
+    end
+    if const_nodes.len() == 0 then
+      report = report + "PARITY_MUTATION " + label.clone() + " FAIL: no recorded GbConst binding to delete (" + entries.len().to_string() + " binding(s))\n"
+      return 1
+    end
+    # CONTROL: the unmutated lowering consumes the recorded identity (a
+    # static reference to the const's DefId appears in main).
+    var control = "-"
+    match lower_to_mir(&program, &analyzed)
+    when Result::Ok(mir) then
+      if infer_probe_mir_has_static_ref(mir, "main", const_def_nums[0]) then
+        control = "static-ref"
+      else
+        control = "no-static-ref"
+      end
+    when Result::Err(e) then control = "err:" + e.clone()
+    end
+    if control != "static-ref" then
+      report = report + "PARITY_MUTATION " + label.clone() + " FAIL: the control lowering does not consume the recorded const identity (" + control.clone() + ")\n"
+      return 1
+    end
+    # MUTATE: delete every typed record for the GbConst node(s).
+    var typed = analyzed.typed
+    var di = 0
+    while di < const_nodes.len() do
+      let dn = const_nodes[di]
+      let _ = typed.global_bindings.remove(dn)
+      let _ = typed.const_param_reads.remove(dn)
+      let _ = typed.ident_resolutions.remove(dn)
+      let _ = typed.typed_exprs.remove(dn)
+      di = di + 1
+    end
+    analyzed.typed = typed
+    match lower_to_mir(&program, &analyzed)
+    when Result::Ok(mir) then
+      var still = false
+      if infer_probe_mir_has_static_ref(mir, "main", const_def_nums[0]) then still = true end
+      report = report + "PARITY_MUTATION " + label.clone() + " FAIL: lowering silently accepted deleted GbConst records (" + const_nodes.len().to_string() + " node(s); control=" + control.clone() + " still_static_ref=" + still.to_string() + ")\n"
+      1
+    when Result::Err(e) then
+      var matched2 = 0
+      var mk = 0
+      while mk < const_nodes.len() do
+        if e.contains(const_nodes[mk].to_string()) then matched2 = matched2 + 1 end
+        mk = mk + 1
+      end
+      if e.contains("internal error") && matched2 > 0 then
+        report = report + "PARITY_MUTATION " + label.clone() + " PASS nodes=" + const_nodes.len().to_string() + " matched=" + matched2.to_string() + " error=" + e.clone() + "\n"
+        0
+      else
+        report = report + "PARITY_MUTATION " + label.clone() + " FAIL: the error neither names a deleted node nor is an internal error: " + e.clone() + "\n"
+        1
+      end
+    end
+  end
+end
+
+def infer_probe_parity_mutation_local(inout report: String) -> Int
+  let label = "mut_local_resolution_deleted"
+  let source = "def main() -> Int\n  let a = 3\n  a + 1\nend\n"
+  let parsed = parse(tokenize(source.clone(), label.clone()))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "PARITY_MUTATION " + label.clone() + " FAIL: parse failed\n"
+    return 1
+  end
+  var program = parsed.program
+  var env = type_env_new()
+  env.strict_resolution = true
+  let opts = default_options()
+  match analyze_parsed(&mut env, &mut program, opts)
+  when Result::Err(_diags) then
+    report = report + "PARITY_MUTATION " + label.clone() + " FAIL: analyze failed\n"
+    1
+  when Result::Ok(a) then
+    var analyzed = a
+    let entries = analyzed.typed.ident_resolutions.entries()
+    if entries.len() == 0 then
+      report = report + "PARITY_MUTATION " + label.clone() + " FAIL: no recorded local resolution to delete\n"
+      return 1
+    end
+    var typed = analyzed.typed
+    var ei = 0
+    while ei < entries.len() do
+      let node = entries[ei].0
+      let _ = typed.ident_resolutions.remove(node)
+      let _ = typed.typed_exprs.remove(node)
+      ei = ei + 1
+    end
+    analyzed.typed = typed
+    # at least one removed node is actually lowered; the lowering must fail
+    # closed naming it.  Check every removed node id for a naming witness.
+    var matched = 0
+    match lower_to_mir(&program, &analyzed)
+    when Result::Ok(_) then
+      report = report + "PARITY_MUTATION " + label.clone() + " FAIL: lowering silently accepted deleted local resolutions (" + entries.len().to_string() + " node(s))\n"
+      1
+    when Result::Err(e) then
+      if !e.contains("internal error") then
+        report = report + "PARITY_MUTATION " + label.clone() + " FAIL: not an internal error: " + e.clone() + "\n"
+        return 1
+      end
+      var ei2 = 0
+      while ei2 < entries.len() do
+        if e.contains(entries[ei2].0.to_string()) then matched = matched + 1 end
+        ei2 = ei2 + 1
+      end
+      if matched == 0 then
+        report = report + "PARITY_MUTATION " + label.clone() + " FAIL: the error names no deleted node: " + e.clone() + "\n"
+        1
+      else
+        report = report + "PARITY_MUTATION " + label.clone() + " PASS nodes=" + entries.len().to_string() + " matched=" + matched.to_string() + " error=" + e.clone() + "\n"
+        0
+      end
+    end
+  end
+end
+
+# The duplicate-names-across-modules dimension cannot ride the
+# single-program cases file: the kernel resolver's get_current_module
+# Option::expect traps on inline `module ... end` blocks in the
+# standalone probe surface (observed: host call __intrinsic_option_expect
+# module not found), and the parity lane must not fake the row.  Build
+# the two-module program with the same crate scaffolding
+# resolution_parity_probe uses, resolve/typecheck it, and emit the
+# PARITY row directly (the OCaml lane compares it like any other row).
+def infer_probe_parity_multi_program(label: String, names: Vec[String], sources: Vec[String]) -> Option[Program]
+  var items = Vec::new()
+  var modules: Map[ModuleId, Module] = Map::new()
+  var bad = false
+  var i = 0
+  while i < names.len() do
+    let parsed = parse(tokenize(sources[i].clone(), label.clone() + "::" + names[i].clone()))
+    if diag_has_errors(&parsed.diagnostics) then
+      bad = true
+    else
+      var mid = ModuleId { id: i }
+      var start = items.len()
+      for item in parsed.program.items do
+        var owned = item.clone()
+        owned.owner_module = ModuleId { id: mid.id }
+        items.push(owned)
+      end
+      var mod_items = Vec::new()
+      var k = start
+      while k < items.len() do
+        mod_items.push(ItemId { id: k })
+        k = k + 1
+      end
+      var mod_imports = Vec::new()
+      for item in parsed.program.items do
+        match item.kind
+        when ItemKind::ItemUse(u) then mod_imports.push(u.path.segments.join("::"))
+        when _ then ()
+        end
+      end
+      modules.insert(mid, Module {
+        id: mid,
+        path: names[i].clone().split("::"),
+        items: mod_items,
+        imports: mod_imports
+      })
+    end
+    i = i + 1
+  end
+  if bad then
+    Option::None
+  else
+    Option::Some(Program {
+      items: items,
+      crate: Crate { root: ModuleId { id: 0 }, modules: modules },
+      span: Span { file: label.clone(), start: 0, end_pos: 0 }
+    })
+  end
+end
+
+def infer_probe_parity_multi_module_case(inout report: String) -> Unit
+  let label = "dup_names_across_modules"
+  let names = vec!["a", "b"]
+  let sources = vec![
+    "const X: Int = 1\nconst STATE: Int = 10\n\nstruct Config\n  n: Int = 111\n  only_a: Int\nend\n\nstruct State\n  count: Int\nend\n\nenum Ready\n  Ready(Int)\n  Idle\nend\n\ndef make() -> Int\n  let c = Config { n: 1, only_a: 2 }\n  c.n * 10 + c.only_a\nend\n\ndef value() -> Int = X + STATE\n",
+    "const X: Int = 2\nconst STATE: Int = 20\n\nstruct Config\n  text: String\n  flag: Bool = false\nend\n\nstruct State\n  label: String\nend\n\nenum Ready\n  Ready(Bool)\n  Done\nend\n\ndef make() -> Int\n  let c = Config { text: \"b\" }\n  let base = c.text.len()\n  if c.flag then base + 100 else base end\nend\n\ndef value() -> Int = X + STATE\n"
+  ]
+  match infer_probe_parity_multi_program(label, names, sources)
+  when Option::None then
+    report = report + "PARITY " + label + " verdict=parse-reject errors=1 main_ret=- first=parse\n"
+  when Option::Some(program) then
+    var program = program
+    assign_node_ids(&mut program)
+    match resolve_names(program)
+    when Result::Err(errs) then
+      var rfirst = "-"
+      if errs.len() > 0 then rfirst = infer_probe_norm_ids(errs[0].message.clone()) end
+      report = report + "PARITY " + label + " verdict=resolve-reject errors=" + errs.len().to_string() + " main_ret=- first=" + rfirst.clone() + "\n"
+    when Result::Ok(res) then
+      var env = type_env_new()
+      env.strict_resolution = true
+      let result = type_check_typed(&mut env, &program, &res)
+      if result.errors.len() == 0 then
+        report = report + "PARITY " + label + " verdict=accept errors=0 main_ret=- first=-\n"
+      else
+        report = report + "PARITY " + label + " verdict=reject errors=" + result.errors.len().to_string() + " main_ret=- first=" + infer_probe_norm_ids(result.errors[0].message.clone()) + "\n"
+      end
+    end
+  end
+end
+
+def infer_probe_parity_battery(inout report: String) -> Int
+  var fails = 0
+  fails = fails + infer_probe_parity_mutation_global(&mut report)
+  fails = fails + infer_probe_parity_mutation_local(&mut report)
+  # the multi-module dimension built with the crate scaffolding (never
+  # shipped in the single-program cases file — see the builder comment)
+  infer_probe_parity_multi_module_case(&mut report)
+  var cases: Vec[(String, String)] = Vec::new()
+  if file_exists("build/parity_cases.txt") then
+    let source = match read_file("build/parity_cases.txt")
+    when Result::Ok(s) then s
+    when Result::Err(_) then ""
+    end
+    cases = infer_probe_parity_parse_cases(source)
+    if cases.len() == 0 then
+      report = report + "PARITY_BATTERY FAIL: build/parity_cases.txt present but no CASE record parsed\n"
+      fails = fails + 1
+    end
+  else
+    report = report + "PARITY_BATTERY no-cases: build/parity_cases.txt absent (tg_semantic_parity writes it) — cases=0 is NOT a semantic agreement claim\n"
+  end
+  var i = 0
+  while i < cases.len() do
+    infer_probe_parity_case(cases[i].0.clone(), cases[i].1.clone(), &mut report)
+    i = i + 1
+  end
+  report = report + "PARITY_BATTERY fails=" + fails.to_string() + " cases=" + cases.len().to_string() + "\n"
+  fails
+end
+
+# ———————————————————————————————————————————————————————————————
+# HIR_COMPLETE battery (the mandatory typed-channel completeness
+# verifier): a generic constructor whose type parameter is only solvable
+# from a LATER use — the `var keys = Vec::new()` + `push(x)` shape of the
+# 78B frontier's `rs_resolve_imports` site — typechecked through the REAL
+# checker. The positive leg asserts the channels DIRECTLY by exact
+# NodeId: the constructor call node's typed record, its concrete
+# finalized type and solved substitution, the parent later-use call's
+# typed record + call-target identity, and the argument's typed record +
+# recorded access effect. The mutation leg deletes the argument's typed
+# HIR record and requires verify_typed_channel_completeness to fail with
+# the EXACT HIR_MISSING fingerprint naming that node (a verifier that
+# were removed or false-green cannot pass this branch).
+# ———————————————————————————————————————————————————————————————
+def infer_probe_ty_has_error(ty: Type) -> Bool
+  match ty
+  when Type::Error then true
+  when Type::Adt(_, args) then
+    var found = false
+    for a in args do
+      if infer_probe_ty_has_error(a) then found = true end
+    end
+    found
+  when Type::Ptr(inner) then infer_probe_ty_has_error(inner)
+  when Type::PtrMut(inner) then infer_probe_ty_has_error(inner)
+  when Type::RefInternal(inner, _) then infer_probe_ty_has_error(inner)
+  when Type::Tuple(fs) then
+    var found2 = false
+    for f in fs do
+      if infer_probe_ty_has_error(f) then found2 = true end
+    end
+    found2
+  when Type::FixedArray(elem, _) then infer_probe_ty_has_error(elem)
+  when Type::FixedArraySym(elem, _) then infer_probe_ty_has_error(elem)
+  when Type::FnPtr(ps, ret, _) then
+    var found3 = infer_probe_ty_has_error(ret)
+    for p in ps do
+      if infer_probe_ty_has_error(p.ty.clone()) then found3 = true end
+    end
+    found3
+  when Type::Closure(_, ps, ret, _, _) then
+    var found4 = infer_probe_ty_has_error(ret)
+    for p in ps do
+      if infer_probe_ty_has_error(p.ty.clone()) then found4 = true end
+    end
+    found4
+  when _ then false
+  end
+end
+
+def infer_probe_hir_complete_battery(inout report: String) -> Int
+  var fails = 0
+  let source = "struct Bag[T]\n  count: Int = 0\nend\n\ndef bag_new[T]() -> Bag[T]\n  Bag { count: 0 }\nend\n\ndef bag_push[T](inout b: Bag[T], v: T) -> Unit\nend\n\ndef collect(n: Int) -> Int\n  var keys = bag_new()\n  var i = 0\n  while i < n do\n    bag_push(keys, i)\n    i = i + 1\n  end\n  keys.count\nend\n\ndef main() -> Int\n  collect(3)\nend\n"
+  let parsed = parse(tokenize(source, "hir_complete"))
+  if diag_has_errors(&parsed.diagnostics) then
+    report = report + "HIR_COMPLETE_BATTERY: parse failed\n"
+    return 1
+  end
+  var program = parsed.program
+  assign_node_ids(&mut program)
+  match resolve_names(program)
+  when Result::Err(errs) then
+    report = report + "HIR_COMPLETE_BATTERY: resolve failed=" + errs.len().to_string() + "\n"
+    return 1
+  when Result::Ok(res) then
+    var env = type_env_new()
+    env.strict_resolution = true
+    let result = type_check_typed(&mut env, &program, &res)
+    if result.errors.len() != 0 then
+      report = report + "HIR_COMPLETE_BATTERY: positive shape rejected errors=" + result.errors.len().to_string() + " first=" + result.errors[0].message.clone() + "\n"
+      return 1
+    end
+    # locate the shape by exact node id: `bag_new()` (constructor),
+    # `bag_push(keys, i)` (later use), and its first argument.
+    var new_node = -1
+    var push_node = -1
+    var arg_node = -1
+    for item in program.items do
+      match item.kind
+      when ItemKind::ItemFunction(f) then
+        match f.body
+        when FnBody::FnBlock(b) then
+          var si = 0
+          while si < b.stmts.len() do
+            match b.stmts[si].kind
+            when StmtKind::StmtLet(_, _, value, _) then
+              match value.kind
+              when ExprKind::ExprCall(callee, _) then
+                match callee.get().kind
+                when ExprKind::ExprIdent(name) then
+                  if name == "bag_new" then new_node = value.node_id end
+                when _ then ()
+                end
+              when _ then ()
+              end
+            when StmtKind::StmtWhile(_, body) then
+              var sj = 0
+              while sj < body.stmts.len() do
+                match body.stmts[sj].kind
+                when StmtKind::StmtExpr(e) then
+                  match e.kind
+                  when ExprKind::ExprCall(callee2, args) then
+                    match callee2.get().kind
+                    when ExprKind::ExprIdent(name2) then
+                      if name2 == "bag_push" then
+                        push_node = e.node_id
+                        if args.len() > 0 then arg_node = args[0].node_id end
+                      end
+                    when _ then ()
+                    end
+                  when _ then ()
+                  end
+                when _ then ()
+                end
+                sj = sj + 1
+              end
+            when _ then ()
+            end
+            si = si + 1
+          end
+        when _ then ()
+        end
+      when _ then ()
+      end
+    end
+    if new_node < 0 || push_node < 0 || arg_node < 0 then
+      report = report + "HIR_COMPLETE_BATTERY: node scan failed new=" + new_node.to_string() + " push=" + push_node.to_string() + " arg=" + arg_node.to_string() + "\n"
+      return 1
+    end
+    # (1) the constructor call node: typed record + concrete finalized
+    # type + concrete solved substitution.
+    if !env.typed_exprs.contains_key(new_node) then
+      report = report + "HIR_COMPLETE_BATTERY: constructor call node " + new_node.to_string() + " has no typed HIR record\n"
+      fails = fails + 1
+    end
+    match env.typed_expr_types.get(new_node)
+    when Option::Some(ty) then
+      if infer_probe_has_var(ty.clone()) || infer_probe_ty_has_error(ty.clone()) then
+        report = report + "HIR_COMPLETE_BATTERY: constructor call node " + new_node.to_string() + " finalized type is not concrete: " + infer_probe_render(ty.clone()) + "\n"
+        fails = fails + 1
+      end
+    when Option::None then
+      report = report + "HIR_COMPLETE_BATTERY: constructor call node " + new_node.to_string() + " has no recorded type\n"
+      fails = fails + 1
+    end
+    match env.typed_call_instances.get(new_node)
+    when Option::Some(inst_args) then
+      var gi = 0
+      while gi < inst_args.len() do
+        let gi_arg = inst_args[gi].clone()
+        match gi_arg
+        when GenericArg::Type(aty) then
+          if infer_probe_has_var(aty.clone()) || infer_probe_ty_has_error(aty.clone()) then
+            report = report + "HIR_COMPLETE_BATTERY: constructor node " + new_node.to_string() + " solved substitution is not concrete: " + infer_probe_render(aty.clone()) + "\n"
+            fails = fails + 1
+          end
+        when GenericArg::Const(_) then ()
+        end
+        gi = gi + 1
+      end
+    when Option::None then
+      report = report + "HIR_COMPLETE_BATTERY: constructor node " + new_node.to_string() + " has no solved call substitution\n"
+      fails = fails + 1
+    end
+    # (2) the parent later-use call + its argument.
+    if !env.typed_exprs.contains_key(push_node) then
+      report = report + "HIR_COMPLETE_BATTERY: parent call node " + push_node.to_string() + " has no typed HIR record\n"
+      fails = fails + 1
+    end
+    if !env.typed_call_targets.contains_key(push_node) then
+      report = report + "HIR_COMPLETE_BATTERY: parent call node " + push_node.to_string() + " has no call-target identity\n"
+      fails = fails + 1
+    end
+    if !env.typed_exprs.contains_key(arg_node) then
+      report = report + "HIR_COMPLETE_BATTERY: argument node " + arg_node.to_string() + " has no typed HIR record\n"
+      fails = fails + 1
+    end
+    if !env.typed_access_effects.contains_key(arg_node) then
+      report = report + "HIR_COMPLETE_BATTERY: argument node " + arg_node.to_string() + " has no recorded access effect\n"
+      fails = fails + 1
+    end
+    # (3) the verifier passes on the accepted channels.
+    let pre_ok = env.errors.len()
+    let ok = verify_typed_channel_completeness(&mut env, &program)
+    if !ok || env.errors.len() != pre_ok then
+      report = report + "HIR_COMPLETE_BATTERY: positive verifier leg failed (ok=" + ok.to_string() + " delta=" + (env.errors.len() - pre_ok).to_string() + ")\n"
+      fails = fails + 1
+    end
+    # (4) the mutation: delete the argument record and require the EXACT
+    # HIR_MISSING fingerprint naming that node.
+    let _ = env.typed_exprs.remove(arg_node)
+    let before = env.errors.len()
+    let ok2 = verify_typed_channel_completeness(&mut env, &program)
+    let delta = env.errors.len() - before
+    if ok2 || delta != 1 then
+      report = report + "HIR_COMPLETE_BATTERY: mutation was not rejected (ok=" + ok2.to_string() + " delta=" + delta.to_string() + ")\n"
+      fails = fails + 1
+    else
+      let got = env.errors[env.errors.len() - 1].message.clone()
+      let node_mark = "|collect|Node=" + arg_node.to_string() + "|ident|no typed HIR record"
+      if !got.starts_with("HIR_MISSING|") || !got.contains(node_mark) then
+        report = report + "HIR_COMPLETE_BATTERY: mutation fingerprint mismatch: " + got.clone() + "\n"
+        fails = fails + 1
+      else
+        report = report + "HIR_COMPLETE_MUTATION PASS node=" + arg_node.to_string() + " fp=" + got.clone() + "\n"
+      end
+    end
+  end
+  report = report + "HIR_COMPLETE_BATTERY fails=" + fails.to_string() + "\n"
+  fails
+end
+
 def main() -> Int
   var report = ""
   # the direct kernel-unify unit battery runs FIRST so its rows precede
@@ -1899,6 +2520,10 @@ def main() -> Int
   let _ = infer_probe_semantic_default_battery(&mut report)
   let _ = infer_probe_pending_inference_battery(&mut report)
   let _ = infer_probe_semantic_default_battery(&mut report)
+  # the seed-vs-kernel parity battery + the no-fallback mutation witnesses
+  let _ = infer_probe_parity_battery(&mut report)
+  # the typed-channel completeness verifier + its deleted-record mutation
+  let _ = infer_probe_hir_complete_battery(&mut report)
   let _ = write_file("build/infer_probe.txt", report.clone())
   var counts = Vec::from([infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0), infer_probe_n(0)])
   var rows = Vec::new()
