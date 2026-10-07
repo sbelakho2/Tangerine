@@ -608,6 +608,15 @@ let nominal_by_name (env : env) (name : string) : nominal option =
   end;
   Hashtbl.find_opt c.lc_nominal_by_name name
 
+(* compiler-seeded type names (initial_env): a source declaration of one
+   of these adopts the builtin TypeId (LangItem identity), never a fresh
+   per-module identity.  Mirrors type_ids_of_builtins + Any/Instant. *)
+let is_builtin_type_name (name : string) : bool =
+  name = "Any" || name = "Instant"
+  || List.mem name
+       [ "Array"; "Vec"; "List"; "Map"; "HashMap"; "Set"; "HashSet"; "Option"; "Result";
+         "Ptr"; "PtrMut" ]
+
 (* The (name, nominal) pair nominal_of_tid returns: the FIRST nominal in
    env.nominals whose name maps to tid through the FIRST type_ids entry
    for that name.  Both list walks are mirrored exactly. *)
@@ -636,6 +645,24 @@ let nominal_entry_of_tid (env : env) (tid : Ids.Type_id.t) :
     c.lc_nom_by_tid_type_ids_src <- env.type_ids
   end;
   Hashtbl.find_opt c.lc_nominal_by_tid tid
+
+(* the module-qualified registry key of a declared (non-builtin) type,
+   searched directly: it is the key the constructors/methods of a
+   module-scoped declaration are registered under (the bare alias is the
+   first-wins compatibility spelling, not the declaration's identity) *)
+let qualified_key_of_tid (env : env) (tid : Ids.Type_id.t) : string option =
+  let rec go = function
+    | [] -> None
+    | (name, _) :: rest ->
+        if
+          String.contains name ':'
+          && (match type_id_by_name env name with
+              | Some t -> Ids.Type_id.compare t tid = 0
+              | None -> false)
+        then Some name
+        else go rest
+  in
+  go env.nominals
 
 let type_by_name (env : env) (name : string) : Type_repr.t option =
   let c = env.state.lookup in
@@ -716,6 +743,210 @@ let constructor_of_name (env : env) (name : string) : typed_signature option =
     c.lc_constructors_src <- env.constructors
   end;
   Hashtbl.find_opt c.lc_constructor_by_name name
+
+(* ── module-scoped nominal identity (identity-collision fix) ─────────
+   Two modules may declare the same BARE nominal name; each declaration
+   owns a QUALIFIED key (module path @ [name]) with its own TypeId and
+   shape.  These helpers resolve a type/nominal/constructor name in the
+   CURRENT module context: the current module's qualified key first, then
+   an import-resolved declaration (when the resolver is present), then a
+   UNIQUE qualified declaration anywhere; an ambiguous bare name (several
+   declarations, no module/import tie) resolves to None instead of the
+   old first-wins cross-wire.  A name with no qualified declaration at
+   all falls back to the bare registry (builtins, single-module envs,
+   hand-built envs), preserving prior behavior. *)
+
+let qkey_of_path (mp : string list) (n : string) : string =
+  match mp with [] -> n | segs -> String.concat "::" (segs @ [ n ])
+
+let qualified_nominal_keys (env : env) : string list =
+  List.filter_map
+    (fun (k, _) -> if String.contains k ':' then Some k else None)
+    env.nominals
+
+(* the semantically-distinct qualified keys whose LAST segment is name *)
+let qualified_keys_for (env : env) (name : string) : string list =
+  let suffix = "::" ^ name in
+  List.filter (fun k -> Util.has_suffix k suffix) (qualified_nominal_keys env)
+
+(* the declaration's qualified key for a resolver type DefId (the DefId's
+   module node + the declaration item at its recorded index), together
+   with whether the declaration is a TYPE ALIAS (aliases keep their bare
+   registry key, so an alias target is resolvable immediately; a
+   struct/enum/trait target may simply not be registered yet in an early
+   declaration-fixpoint round and must defer instead of latching another
+   module's same-named identity) *)
+let def_decl_qkey (env : env) (def : Ids.def_id) : (string * bool) option =
+  match env.resolved with
+  | None -> None
+  | Some rp -> (
+      match Module_graph.find_module_by_id rp.Resolver.graph def.Ids.module_id with
+      | None -> None
+      | Some node -> (
+          match List.nth_opt node.Module_graph.node_items def.Ids.index with
+          | None -> None
+          | Some it ->
+              let name, is_alias =
+                match it.Ast.kind with
+                | Ast.StructDef d -> (Some d.Ast.s_name, false)
+                | Ast.EnumDef d -> (Some d.Ast.e_name, false)
+                | Ast.TraitDef d -> (Some d.Ast.t_name, false)
+                | Ast.TypeAlias d -> (Some d.Ast.ta_name, true)
+                | _ -> (None, false)
+              in
+              (match name with
+               | Some n -> Some (qkey_of_path node.Module_graph.node_path n, is_alias)
+               | None -> None)))
+
+let imported_type_qkey (env : env) (name : string) : (string * bool) option =
+  match env.resolved with
+  | None -> None
+  | Some rp -> (
+      match Resolver.resolve_type_name rp env.module_id name with
+      | Resolver.Resolved def -> def_decl_qkey env def
+      | _ -> (
+          (* a fully-qualified spelling (`std::gfx_errors::ErrorCode`): the
+             resolver's module-path lookup names the declaration directly *)
+          if String.contains name ':' then
+            match
+              Resolver.resolve_qualified rp env.module_id (String.split_on_char ':' name
+                |> List.filter (fun s -> s <> ""))
+            with
+            | Resolver.Resolved (Resolver.PTItem def) -> def_decl_qkey env def
+            | _ -> None
+          else None))
+
+(* the base resolution chain shared by types and nominals: returns
+   (registry_key, entry, nominal_option) *)
+let type_entity_here (env : env) (name : string) :
+    (string * Type_repr.t * nominal option) option =
+  let own = qkey_of_path env.module_path name in
+  match type_by_name env own with
+  | Some t -> Some (own, t, nominal_by_name env own)
+  | None -> (
+      (* the unique/bare fallback is shared: it is the legacy path for
+         names with no module-scoped registration (builtins, aliases,
+         hand-built envs); an ambiguous bare name resolves to None *)
+      let fallback () =
+        match qualified_keys_for env name with
+        | [ k ] -> (
+            match type_by_name env k with
+            | Some t -> Some (k, t, nominal_by_name env k)
+            | None -> None)
+        | [] -> (
+            match type_by_name env name with
+            | Some t -> Some (name, t, nominal_by_name env name)
+            | None -> None)
+        | _ -> None (* ambiguous across modules: never first-wins *)
+      in
+      match imported_type_qkey env name with
+      | Some (k, is_alias) -> (
+          match type_by_name env k with
+          | Some t -> Some (k, t, nominal_by_name env k)
+          (* an alias target resolves through the bare compatibility key
+             (aliases keep it); a struct/enum/trait target that is not
+             registered YET must defer (None) — falling back here would
+             latch another module's same-named identity in an early
+             declaration-fixpoint round *)
+          | None -> if is_alias then fallback () else None)
+      | None -> fallback ())
+
+let type_entry_here (env : env) (name : string) : (string * Type_repr.t) option =
+  match type_entity_here env name with
+  | Some (k, t, _) -> Some (k, t)
+  | None -> None
+
+let nominal_entry_here (env : env) (name : string) : (string * nominal) option =
+  match type_entity_here env name with
+  | Some (k, _, Some nom) -> Some (k, nom)
+  | _ -> None
+
+let nominal_type_entry_here (env : env) (name : string) :
+    (string * Type_repr.t * nominal) option =
+  match type_entity_here env name with
+  | Some (k, t, Some nom) -> Some (k, t, nom)
+  | _ -> None
+
+(* split `Qualifier::Variant` (the LAST `::` pair) *)
+let split_qualified (n : string) : (string * string) option =
+  let len = String.length n in
+  let rec last_pair i =
+    if i <= 0 then None
+    else if n.[i] = ':' && n.[i - 1] = ':' then Some i
+    else last_pair (i - 1)
+  in
+  match last_pair (len - 1) with
+  | Some i when i + 1 < len ->
+      Some (String.sub n 0 (i - 1), String.sub n (i + 1) (len - i - 1))
+  | _ -> None
+
+(* constructor resolution in the current module context: the module's own
+   `mp @ [variant]` key, then a qualified spelling whose qualifier
+   resolves as a type (the enum's qualified key + "::" + variant), then
+   the legacy exact key. *)
+let constructor_entry_here (env : env) (n : string) : (string * typed_signature) option =
+  let own = qkey_of_path env.module_path n in
+  match constructor_of_name env own with
+  | Some cs -> Some (own, cs)
+  | None -> (
+      match split_qualified n with
+      | Some (qual, vname) -> (
+          match type_entry_here env qual with
+          | Some (qk, Type_repr.Named (_, _)) -> (
+              let ck = qk ^ "::" ^ vname in
+              match constructor_of_name env ck with
+              | Some cs -> Some (ck, cs)
+              | None -> (
+                  match constructor_of_name env n with
+                  | Some cs -> Some (n, cs)
+                  | None -> None))
+          | _ -> (
+              match constructor_of_name env n with
+              | Some cs -> Some (n, cs)
+              | None -> None))
+      | None -> (
+          match constructor_of_name env n with
+          | Some cs -> Some (n, cs)
+          | None -> None))
+
+(* method resolution in the current module context: the module's own
+   qualified method key first, then the legacy bare/alias key *)
+let method_of_key_here (env : env) (owner : string) (mname : string) :
+    (string * typed_signature) option =
+  let okey = qkey_of_path env.module_path owner in
+  match method_of_key env okey mname with
+  | Some ts -> Some (okey, ts)
+  | None -> (
+      match method_of_key env owner mname with
+      | Some ts -> Some (owner, ts)
+      | None -> None)
+
+let last_segment (n : string) : string =
+  match split_qualified n with Some (_, v) -> v | None -> n
+
+(* EXPECTED-TYPE-DIRECTED constructor resolution: when the context
+   already determines the enum (a comparison against a field of that
+   enum type, a literal position, an annotated binding), the variant
+   belongs to THAT enum's semantic identity — even when the bare name is
+   also declared elsewhere and an import spelling points at a different
+   declaration.  Falls through to the module-scoped/import chain when
+   the expected type is absent or is not an enum carrying the variant. *)
+let constructor_via_expected (env : env) (expected : Type_repr.t option) (n : string) :
+    (string * typed_signature) option =
+  match expected with
+  | Some (Type_repr.Named (tid, _)) -> (
+      match nominal_entry_of_tid env tid with
+      | Some (ename, nom) when nom.nom_kind = `Enum && nom.nom_params = [] ->
+          let ename =
+            match qualified_key_of_tid env tid with Some k -> k | None -> ename
+          in
+          let vname = last_segment n in
+          if List.mem_assoc vname nom.nom_variants then
+            let ck = ename ^ "::" ^ vname in
+            (match constructor_of_name env ck with Some cs -> Some (ck, cs) | None -> None)
+          else None
+      | _ -> None)
+  | _ -> None
 
 let const_of_name (env : env) (name : string) : Type_repr.t option =
   let c = env.state.lookup in
@@ -2938,14 +3169,14 @@ and resolve_named (env : env) (scope : scope) (span : Span.span) (name : string)
                         in
                         if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then
                           Printf.eprintf "DEBUG-QUAL name=%s head=%s last=%s found=%b\n" name head
-                            last ((type_by_name env last <> None));
-                        match type_by_name env last with
-                        | Some entry -> Ok entry
+                            last ((type_entry_here env last <> None));
+                        match type_entry_here env last with
+                        | Some (_, entry) -> Ok entry
                         | None -> Error (err span ("unknown type `" ^ name ^ "`")))))
           | None -> (
-              match type_by_name env name with
+              match type_entry_here env name with
               | None -> Error (err span ("unknown type `" ^ name ^ "`"))
-              | Some entry -> (
+              | Some (_, entry) -> (
                   let resolved_args =
                     let rec go acc = function
                       | [] -> Ok (List.rev acc)
@@ -3181,7 +3412,13 @@ let access_item_key (env : env) : string =
    given Type_id (nom_field_ids is the resolver's identity list,
    parallel to nom_fields). *)
 let field_id_of (env : env) (owner_name : string) (fname : string) : Ids.Field_id.t option =
-  match nominal_by_name env owner_name with
+  let nom_opt =
+    match nominal_by_name env owner_name with
+    | Some nom -> Some nom
+    | None -> (
+        match nominal_entry_here env owner_name with Some (_, n) -> Some n | None -> None)
+  in
+  match nom_opt with
   | None -> None
   | Some nom -> (
       let rec index_of i = function
@@ -3219,15 +3456,12 @@ let rec static_type_of (env : env) (scope : scope) (e : Ast.expr) : Type_repr.t 
           in
           match bt with
           | Type_repr.Named (tid, _args) -> (
-              match name_by_tid env tid with
-              | Some owner -> (
-                  match nominal_by_name env owner with
-                  | Some nom when nom.nom_kind = `Struct -> (
-                      match List.assoc_opt fname nom.nom_fields with
-                      | Some ft -> Some ft
-                      | None -> None)
-                  | _ -> None)
-              | None -> None)
+              match nominal_entry_of_tid env tid with
+              | Some (_, nom) when nom.nom_kind = `Struct -> (
+                  match List.assoc_opt fname nom.nom_fields with
+                  | Some ft -> Some ft
+                  | None -> None)
+              | _ -> None)
           | _ -> None))
   | Ast.Index (_, base, _, _) -> (
       match static_type_of env scope base with
@@ -3262,8 +3496,16 @@ let rec place_of_expr (env : env) (scope : scope) (e : Ast.expr) : Access_check.
           let fid =
             match static_type_of env scope base with
             | Some (Type_repr.Named (tid, _)) -> (
-                match name_by_tid env tid with
-                | Some oname -> field_id_of env oname fname
+                match nominal_entry_of_tid env tid with
+                | Some (_, nom) -> (
+                    let rec index_of i = function
+                      | [] -> None
+                      | (n, _) :: rest -> if n = fname then Some i else index_of (i + 1) rest
+                    in
+                    match index_of 0 nom.nom_fields with
+                    | Some i when i < List.length nom.nom_field_ids ->
+                        Some (List.nth nom.nom_field_ids i)
+                    | _ -> None)
                 | None -> None)
             | _ -> None
           in
@@ -3418,21 +3660,18 @@ let nullary_variant_of_subject (env : env) (subject : Type_repr.t) (name : strin
     Ids.Variant_id.t option =
   match subject with
   | Type_repr.Named (tid, _) -> (
-      match name_by_tid env tid with
-      | Some ename -> (
-          match nominal_by_name env ename with
-          | Some nom when nom.nom_kind = `Enum -> (
-              let rec find i = function
-                | [] -> None
-                | (vname, pty) :: rest ->
-                    if vname = name then
-                      if Array.length pty = 0 then Some (variant_id_of_nominal nom i)
-                      else None
-                    else find (i + 1) rest
-              in
-              find 0 nom.nom_variants)
-          | _ -> None)
-      | None -> None)
+      match nominal_entry_of_tid env tid with
+      | Some (_, nom) when nom.nom_kind = `Enum -> (
+          let rec find i = function
+            | [] -> None
+            | (vname, pty) :: rest ->
+                if vname = name then
+                  if Array.length pty = 0 then Some (variant_id_of_nominal nom i)
+                  else None
+                else find (i + 1) rest
+          in
+          find 0 nom.nom_variants)
+      | _ -> None)
   | _ -> None
 
 (* ────────────────────────────────────────────────────────────────
@@ -4047,27 +4286,54 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
   if seg1 = "" then begin
     match subject with
     | Type_repr.Named (tid, args) -> (
-        match name_by_tid env tid with
-        | Some name -> (
-            match nominal_by_name env name with
-            | Some nom when nom.nom_kind = `Enum -> (
-                match List.assoc_opt seg2 nom.nom_variants with
-                | Some field_tys ->
-                    let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list args) in
-                    let vid =
-                      match find_variant nom seg2 with
-                      | Some i -> variant_id_of_nominal nom i
-                      | None -> Ids.Variant_id.make 1
-                    in
-                    Ok (Array.map (substitute_fixpoint subst) field_tys, name, vid)
-                | None ->
-                    env.state.oracle.o_unknown_variants <- env.state.oracle.o_unknown_variants + 1;
-                    Error (err span (Printf.sprintf "unknown variant `%s` of enum `%s`" seg2 name)))
-            | _ -> Error (err span "pattern subject is not an enum"))
+        match nominal_entry_of_tid env tid with
+        | Some (name, nom) when nom.nom_kind = `Enum -> (
+            match List.assoc_opt seg2 nom.nom_variants with
+            | Some field_tys ->
+                let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list args) in
+                let vid =
+                  match find_variant nom seg2 with
+                  | Some i -> variant_id_of_nominal nom i
+                  | None -> Ids.Variant_id.make 1
+                in
+                Ok (Array.map (substitute_fixpoint subst) field_tys, name, vid)
+            | None ->
+                env.state.oracle.o_unknown_variants <- env.state.oracle.o_unknown_variants + 1;
+                Error (err span (Printf.sprintf "unknown variant `%s` of enum `%s`" seg2 name)))
+        | Some _ -> Error (err span "pattern subject is not an enum")
         | None -> Error (err span "pattern subject has unknown type identity"))
     | _ -> Error (err span "variant pattern requires an enum subject")
   end
   else begin
+    (* a qualified variant pattern (`Arch::AArch64`) must belong to the
+       SUBJECT ENUM: the qualifier is a spelling that can name a
+       same-named declaration from another module (an import chain), but
+       the typed pattern's semantic VariantId must come from the enum the
+       checker is matching on, or the lowering's id-keyed variant spec
+       lookup (the subject enum's table) misses.  Non-generic subject
+       enums resolve directly; generic builtins keep the legacy
+       reconciliation path below. *)
+    let via_subject =
+      match subject with
+      | Type_repr.Named (stid, sargs) -> (
+          match nominal_entry_of_tid env stid with
+          | Some (sname, snom)
+            when snom.nom_kind = `Enum && snom.nom_params = []
+                 && List.mem_assoc seg2 snom.nom_variants ->
+              Some (snom, sargs, sname)
+          | _ -> None)
+      | _ -> None
+    in
+    match via_subject with
+    | Some (nom, _sargs, sname) -> (
+        let field_tys = List.assoc seg2 nom.nom_variants in
+        let vid =
+          match find_variant nom seg2 with
+          | Some i -> variant_id_of_nominal nom i
+          | None -> Ids.Variant_id.make 1
+        in
+        Ok (field_tys, sname, vid))
+    | None -> (
     match resolve_nominal env span seg1 with
     | Error m -> Error m
     | Ok (nom, tid, args) when nom.nom_kind = `Enum -> (
@@ -4096,48 +4362,33 @@ and resolve_variant (env : env) (_scope : scope) (span : Span.span) (seg1 : stri
         | None ->
             env.state.oracle.o_unknown_variants <- env.state.oracle.o_unknown_variants + 1;
             Error (err span (Printf.sprintf "unknown variant `%s` of enum `%s`" seg2 seg1)))
-    | Ok _ -> Error (err span (Printf.sprintf "`%s` is not an enum" seg1))
+    | Ok _ -> Error (err span (Printf.sprintf "`%s` is not an enum" seg1)))
   end
 
 and resolve_nominal (env : env) (span : Span.span) (name : string) :
     (nominal * Ids.Type_id.t * Type_repr.t array, string) result =
-  match nominal_by_name env name with
-  | Some nom -> (
-      match type_by_name env name with
-      | Some (Type_repr.Named (tid, args)) -> Ok (nom, tid, args)
-      | _ -> Error (err span (Printf.sprintf "`%s` is not a nominal type" name)))
+  match nominal_type_entry_here env name with
+  | Some (_, Type_repr.Named (tid, args), nom) -> Ok (nom, tid, args)
+  | Some _ -> Error (err span (Printf.sprintf "`%s` is not a nominal type" name))
   | None -> (
       (* the qualified braces-form: `Enum::Variant { .. }` patterns and
          `mod::path::Struct { .. }` literals join the full name; split
          the LAST `::` pair and resolve the qualifier as a nominal (the
          variant/field is resolved by the caller) or the last segment
-         flat (module-qualified structs) *)
-      let len = String.length name in
-      let rec last_pair i =
-        if i <= 0 then None
-        else if name.[i] = ':' && name.[i - 1] = ':' then Some i
-        else last_pair (i - 1)
-      in
-      match last_pair (len - 1) with
-      | Some i when i + 1 < len -> (
-          let qualifier = String.sub name 0 (i - 1) in
-          let member = String.sub name (i + 1) (len - i - 1) in
-          match nominal_by_name env qualifier with
-          | Some nom -> (
-              match type_by_name env qualifier with
-              | Some (Type_repr.Named (tid, args)) -> Ok (nom, tid, args)
-              | _ -> Error (err span (Printf.sprintf "`%s` is not a nominal type" qualifier)))
+         (module-qualified structs) through the module-aware chain *)
+      match split_qualified name with
+      | Some (qualifier, member) -> (
+          match nominal_type_entry_here env qualifier with
+          | Some (_, Type_repr.Named (tid, args), nom) -> Ok (nom, tid, args)
+          | Some _ ->
+              Error (err span (Printf.sprintf "`%s` is not a nominal type" qualifier))
           | None -> (
-              (* the qualifier is a module path: resolve the last segment
-                 flat (the module-qualified struct form) *)
-              match nominal_by_name env member with
-              | Some nom -> (
-                  match type_by_name env member with
-                  | Some (Type_repr.Named (tid, args)) -> Ok (nom, tid, args)
-                  | _ -> Error (err span (Printf.sprintf "`%s` is not a nominal type" member)))
-              | None ->
-                  Error (err span (Printf.sprintf "unknown nominal type `%s`" name))))
-      | _ -> Error (err span (Printf.sprintf "unknown nominal type `%s`" name)))
+              match nominal_type_entry_here env member with
+              | Some (_, Type_repr.Named (tid, args), nom) -> Ok (nom, tid, args)
+              | Some _ ->
+                  Error (err span (Printf.sprintf "`%s` is not a nominal type" member))
+              | None -> Error (err span (Printf.sprintf "unknown nominal type `%s`" name))))
+      | None -> Error (err span (Printf.sprintf "unknown nominal type `%s`" name)))
 
 
 (* ────────────────────────────────────────────────────────────────
@@ -4542,8 +4793,8 @@ and check_expr_inner (env : env) (scope : scope) (use : expr_use)
                        raises the closure debt to 259; kept with its
                        reachability reported until the kernel's literals
                        pass explicit type arguments *)
-                    match type_by_name env name with
-                    | Some (Type_repr.Named (_, a)) ->
+                    match type_entry_here env name with
+                    | Some (_, Type_repr.Named (_, a)) ->
                         Ok
                           (Array.of_list
                              (List.map2
@@ -6716,28 +6967,26 @@ and check_field (env : env) (_scope : scope) (span : Span.span) (base : typed_ex
               | None -> check_field env _scope span { base with te_type = inner } fname)
           | _ -> check_field env _scope span { base with te_type = inner } fname)
       | Type_repr.Named (tid, args) -> (
-          match name_by_tid env tid with
-          | Some owner -> (
-              match nominal_by_name env owner with
-              | Some nom when nom.nom_kind = `Struct -> (
-                  match List.assoc_opt fname nom.nom_fields with
-                  | Some ft ->
-          let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list args) in
-                      Ok
-                        {
-                          te_type = substitute_fixpoint subst ft;
-                          te_effects = Array.append base.te_effects [| Access_effect.Read |];
-                          te_span = span;
-                          te_flow = normal_flow (substitute_fixpoint subst ft);
-                        }
-                  | None ->
-                      env.state.oracle.o_unknown_fields <- env.state.oracle.o_unknown_fields + 1;
-                      Error (err span (Printf.sprintf "unknown field `%s` of struct `%s`" fname owner)))
-              | _ ->
-                  Error
-                    (err span
-                       (Printf.sprintf "cannot project `.%s` from non-struct type %s" fname
-                          (type_to_string base.te_type))))
+          match nominal_entry_of_tid env tid with
+          | Some (owner, nom) when nom.nom_kind = `Struct -> (
+              match List.assoc_opt fname nom.nom_fields with
+              | Some ft ->
+                  let subst = List.map2 (fun (_, p) a -> (Type_repr.KParam p, a)) nom.nom_params (Array.to_list args) in
+                  Ok
+                    {
+                      te_type = substitute_fixpoint subst ft;
+                      te_effects = Array.append base.te_effects [| Access_effect.Read |];
+                      te_span = span;
+                      te_flow = normal_flow (substitute_fixpoint subst ft);
+                    }
+              | None ->
+                  env.state.oracle.o_unknown_fields <- env.state.oracle.o_unknown_fields + 1;
+                  Error (err span (Printf.sprintf "unknown field `%s` of struct `%s`" fname owner)))
+          | Some (_, _) ->
+              Error
+                (err span
+                   (Printf.sprintf "cannot project `.%s` from non-struct type %s" fname
+                      (type_to_string base.te_type)))
           | None -> Error (err span "field projection on a type with unknown identity"))
       | Type_repr.Ref_internal (_, inner) ->
           (* a field through a reference derefs the pointee
@@ -6918,9 +7167,13 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                         te_flow = normal_flow (substitute_fixpoint !subst t);
                       }
                 | None ->
-                    (match constructor_of_name env n with
-                     | Some cs ->
-                         Hashtbl.replace env.typed_name_bindings node_id (NB_ctor n);
+                    (match
+                       (match constructor_via_expected env expected n with
+                        | Some hit -> Some hit
+                        | None -> constructor_entry_here env n)
+                     with
+                     | Some (ck, cs) ->
+                         Hashtbl.replace env.typed_name_bindings node_id (NB_ctor ck);
                          check_call_sig env scope expected node_id cs [] [] span
                            ~hint:CCH_constructor
                      | None -> (
@@ -6959,8 +7212,8 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                          | None -> (
                              (* a type name used as a value: the static method
                                 dispatch's synthetic receiver (`Type::method`) *)
-                             match type_by_name env n with
-                             | Some ty ->
+                             match type_entry_here env n with
+                             | Some (_, ty) ->
                                  Ok
                                    {
                                      te_type = ty;
@@ -7058,8 +7311,13 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
       | Some (t, _) ->
           Error (err span (Printf.sprintf "cannot call a value of type %s" (type_to_string t)))
       | None -> (
-          match constructor_of_name env n with
-          | Some cs ->
+          match
+            (match constructor_via_expected env expected n with
+             | Some hit -> Some hit
+             | None -> constructor_entry_here env n)
+          with
+          | Some (ck, cs) ->
+              Hashtbl.replace env.typed_name_bindings (Ast.expr_node_id callee) (NB_ctor ck);
               check_call_sig env scope expected node_id cs targs args span ~hint:CCH_constructor
           | None -> (
               match lookup_function env n with
@@ -7100,8 +7358,8 @@ and check_call (env : env) (scope : scope) (expected : Type_repr.t option)
                                  argument) must not receive a synthetic
                                  receiver. *)
                               let self_is_owner =
-                                match type_by_name env owner with
-                                | Some (Type_repr.Named (tid1, _)) -> (
+                                match type_entry_here env owner with
+                                | Some (_, Type_repr.Named (tid1, _)) -> (
                                     match sig_.ts_params.(0).Type_repr.pt_type with
                                     | Type_repr.Named (tid2, _) ->
                                         Ids.Type_id.compare tid1 tid2 = 0
@@ -7700,9 +7958,16 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   let owner_name =
     match owner_ty with
     | Type_repr.Named (tid, _) -> (
-        match name_by_tid env tid with
-        | Some n -> Some n
-        | None -> primitive_name owner_ty)
+        (* the registry key of the receiver's semantic nominal (the bare
+           alias for the first declaration, the module-qualified key for
+           later same-named declarations) — this is the key the methods
+           are registered under *)
+        match nominal_entry_of_tid env tid with
+        | Some (n, _) -> Some n
+        | None -> (
+            match name_by_tid env tid with
+            | Some n -> Some n
+            | None -> primitive_name owner_ty))
     | Type_repr.Fixed_array _ -> Some "Array"
     | _ -> primitive_name owner_ty
   in
@@ -8441,6 +8706,74 @@ let empty_scope : scope =
 let qualified_name (mp : string list) (n : string) : string =
   match mp with [] -> n | segs -> String.concat "::" (segs @ [ n ])
 
+(* ── module-scoped nominal identity installation (identity-collision
+   fix) ─────────────────────────────────────────────────────────────
+   Every source declaration owns its QUALIFIED registry key with its own
+   TypeId; a builtin-named declaration adopts the compiler-seeded TypeId
+   (LangItem identity).  The bare key is only ever a compatibility alias
+   for the FIRST declaration of that bare name (never a cross-module
+   merge): it is installed when free and left untouched when another
+   declaration owns it. *)
+let ensure_nominal_identity (env : env) ~(mp : string list) ~(name : string)
+    ~(kind : [ `Struct | `Enum ]) ~(params : (string * Ids.Generic_param_id.t) list) :
+    Ids.Type_id.t * env =
+  let qk = qkey_of_path mp name in
+  let placeholder () : nominal =
+    {
+      nom_kind = kind;
+      nom_params = params;
+      nom_fields = [];
+      nom_variants = [];
+      nom_variant_field_names = [];
+      nom_where = [];
+      nom_field_ids = [];
+      nom_variant_ids = [];
+      nom_defaults = [];
+    }
+  in
+  let ensure_nom env =
+    if nominal_by_name env qk <> None then env
+    else { env with nominals = (qk, placeholder ()) :: List.remove_assoc qk env.nominals }
+  in
+  match type_id_by_name env qk with
+  | Some t -> (t, ensure_nom env)
+  | None ->
+      let tid =
+        if is_builtin_type_name name then
+          match type_id_by_name env name with
+          | Some t -> t
+          | None -> fresh_type_id env.state
+        else fresh_type_id env.state
+      in
+      (if name = "Box" then env.state.box_tid <- Some tid);
+      let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+      let env' =
+        {
+          env with
+          types = (qk, Type_repr.Named (tid, param_tys)) :: List.remove_assoc qk env.types;
+          type_ids = (qk, tid) :: List.remove_assoc qk env.type_ids;
+          type_names = (tid, qk) :: env.type_names;
+          nominals = (qk, placeholder ()) :: List.remove_assoc qk env.nominals;
+        }
+      in
+      type_names_global := (tid, name) :: !type_names_global;
+      (tid, env')
+
+(* install/replace the bare first-wins alias only when it is free or
+   already points at THIS declaration's TypeId *)
+let install_bare_alias (env : env) ~(name : string) ~(tid : Ids.Type_id.t)
+    ~(param_tys : Type_repr.t array) ~(nom : nominal) : env =
+  match type_id_by_name env name with
+  | Some t when Ids.Type_id.compare t tid <> 0 -> env
+  | _ ->
+      {
+        env with
+        types = (name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc name env.types;
+        type_ids = (name, tid) :: List.remove_assoc name env.type_ids;
+        type_names = (tid, name) :: env.type_names;
+        nominals = (name, nom) :: List.remove_assoc name env.nominals;
+      }
+
 (* audit P0-6: function declarations carry no parser-minted NodeId (the
    parser mints ids for EXPRESSION nodes only), so the per-declaration
    identity of the checker's registration is the fn-decl span key
@@ -8635,7 +8968,7 @@ and check_methods (env : env) (owner : string)
   let rec go = function
     | [] -> Ok ()
     | (m : Ast.function_decl) :: rest -> (
-        match method_of_key env owner m.fn_sig.sig_name with
+        match method_of_key_here env owner m.fn_sig.sig_name with
         | None ->
             if Sys.getenv_opt "TANGERINE_DEBUG_CALL" <> None then begin
               let matching =
@@ -8649,14 +8982,14 @@ and check_methods (env : env) (owner : string)
               (err m.fn_span
                  (Printf.sprintf "internal: method `%s::%s` was not registered" owner
                     m.fn_sig.sig_name))
-        | Some sig_ -> (
+        | Some (okey, sig_) -> (
             (* audit P0-6: the method's AST declaration must be the
                CANONICAL registration of (owner, name); a duplicate
                declaration that lost the registration (the key is held
                by a different decl) is never body-checked — its calls
                must not enter the typed channels, because the seed never
                emits its body *)
-            let reg_key = "method::" ^ owner ^ "::" ^ m.fn_sig.sig_name in
+            let reg_key = "method::" ^ okey ^ "::" ^ m.fn_sig.sig_name in
             if not (is_canonical_decl env reg_key m.fn_span) then go rest
             else
               match check_function_body env extra_tp_bounds sig_ m with
@@ -8709,8 +9042,8 @@ and check_function_item (env : env) (mp : string list) (d : Ast.function_decl) :
         check_function_body env [] sig_ d)
 
 and check_struct (env : env) (d : Ast.struct_decl) : (unit, string) result =
-  match nominal_by_name env d.s_name, type_by_name env d.s_name with
-  | Some nom, Some (Type_repr.Named (tid, args)) -> (
+  match nominal_type_entry_here env d.s_name with
+  | Some (_, Type_repr.Named (tid, args), nom) -> (
       let self_ty = Type_repr.Named (tid, args) in
       let tp_bounds =
         List.map (fun (tp : Ast.type_param) -> (tp.tp_name, tp.tp_bounds)) d.s_type_params
@@ -8757,9 +9090,9 @@ and check_struct (env : env) (d : Ast.struct_decl) : (unit, string) result =
   | _ -> Error (err d.s_span (Printf.sprintf "internal: struct `%s` was not registered" d.s_name))
 
 and check_enum (env : env) (d : Ast.enum_decl) : (unit, string) result =
-  match nominal_by_name env d.e_name with
+  match nominal_entry_here env d.e_name with
   | None -> Error (err d.e_span (Printf.sprintf "internal: enum `%s` was not registered" d.e_name))
-  | Some nom -> (
+  | Some (_, nom) -> (
       let tp_bounds =
         List.map (fun (tp : Ast.type_param) -> (tp.tp_name, tp.tp_bounds)) d.e_type_params
       in
@@ -8790,12 +9123,12 @@ and check_trait (env : env) (d : Ast.trait_decl) : (unit, string) result =
           match m.fn_body with
           | Ast.FnSignatureOnly -> go rest
           | _ -> (
-              match method_of_key env' d.t_name m.fn_sig.sig_name with
+              match method_of_key_here env' d.t_name m.fn_sig.sig_name with
               | None -> Error (err m.fn_span "internal: trait method was not registered")
-              | Some sig_ -> (
+              | Some (okey, sig_) -> (
                   (* audit P0-6: default bodies of non-canonical duplicate
                      trait-method declarations are never checked *)
-                  let reg_key = "method::" ^ d.t_name ^ "::" ^ m.fn_sig.sig_name in
+                  let reg_key = "method::" ^ okey ^ "::" ^ m.fn_sig.sig_name in
                   if not (is_canonical_decl env' reg_key m.fn_span) then go rest
                   else
                     match check_function_body env' tp_bounds sig_ m with
@@ -8903,6 +9236,12 @@ and check_module (env : env) (item : Ast.item) : (unit, string) result =
   | _ -> Error (err item.span "internal: not a module")
 
 and check_item (env : env) (item : Ast.item) : (unit, string) result =
+  (* per-item module context: item.module_path is the parser's ground
+     truth.  The driver's with_module sets the same value before checking
+     a node, but a merged check_program (or any walk over items of
+     several modules) would otherwise keep env.module_path stale and
+     cross-wire module-scoped name resolution. *)
+  let env = { env with module_path = item.Ast.module_path } in
   match item.Ast.kind with
   | Ast.Function d -> check_function_item env item.module_path d
   | Ast.TestDecl d -> (
@@ -8990,10 +9329,12 @@ and resolve_where (env : env) (scope : scope) (wps : Ast.where_predicate list) :
   in
   go [] wps
 
-and register_methods (env : env) (owner : string) (methods : Ast.function_decl list)
+and register_methods ?(mp : string list = []) (env : env) (owner : string)
+    (methods : Ast.function_decl list)
     (extra_params : (string * Ids.Generic_param_id.t) list)
     (where_extra : (Type_repr.t * (string * Type_repr.t array) list) list)
     : (env, string) result =
+  let okey = qkey_of_path mp owner in
   let rec go env = function
     | [] -> Ok env
     | (m : Ast.function_decl) :: rest -> (
@@ -9007,7 +9348,7 @@ and register_methods (env : env) (owner : string) (methods : Ast.function_decl l
            driver never lowers it.  The typed universe therefore holds
            one semantic declaration per key, and two genuinely distinct
            declarations can never collapse onto one callable identity. *)
-        let reg_key = "method::" ^ owner ^ "::" ^ m.Ast.fn_sig.Ast.sig_name in
+        let reg_key = "method::" ^ okey ^ "::" ^ m.Ast.fn_sig.Ast.sig_name in
         let decl_here = fn_decl_key m.Ast.fn_span in
         match Hashtbl.find_opt env.state.decl_keys reg_key with
         | Some canon when canon <> decl_here ->
@@ -9085,22 +9426,32 @@ and register_methods (env : env) (owner : string) (methods : Ast.function_decl l
                 in
                 let sig_ = { sig_ with ts_where = where_extra @ sig_.ts_where } in
                 let key = (owner, sig_.ts_name) in
+                let key_q = (okey, sig_.ts_name) in
                 (* idempotent registration (audit Fix 3): re-registration
-                   replaces, never appends a duplicate declaration *)
+                   replaces, never appends a duplicate declaration; the
+                   qualified key carries the module-scoped identity and the
+                   bare key the last-wins compatibility alias *)
                 let env' =
-                  { env with methods = (key, sig_) :: List.remove_assoc key env.methods }
+                  {
+                    env with
+                    methods =
+                      (key, sig_)
+                      :: (key_q, sig_)
+                      :: List.remove_assoc key (List.remove_assoc key_q env.methods);
+                  }
                 in
                 go env' rest))
   in
   go env methods
 
-and register_constructors (env : env) (ename : string) (tid : Ids.Type_id.t)
-    (params : (string * Ids.Generic_param_id.t) list)
+and register_constructors ?(mp : string list = []) (env : env) (ename : string)
+    (tid : Ids.Type_id.t) (params : (string * Ids.Generic_param_id.t) list)
     (variants : (string * Type_repr.t array) list) : (env, string) result =
   let ret_ty =
     Type_repr.Named
       (tid, Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params))
   in
+  let ekey = qkey_of_path mp ename in
   let rec go env = function
     | [] -> Ok env
     | (vname, field_tys) :: rest -> (
@@ -9112,20 +9463,22 @@ and register_constructors (env : env) (ename : string) (tid : Ids.Type_id.t)
                  (Array.to_list field_tys))
             ~ret:ret_ty ~where:[]
         in
-        let env' =
-          {
-            env with
-            constructors =
-              (ename ^ "::" ^ vname, sig_)
-              :: List.remove_assoc (ename ^ "::" ^ vname) env.constructors
-              |> fun l -> (vname, sig_) :: List.remove_assoc vname l;
-          }
+        (* the module-scoped keys (this enum's qualified key, and the
+           module-local bare-variant key) plus the legacy exact keys kept
+           for single-module/hand-built envs *)
+        let add k l = (k, sig_) :: List.remove_assoc k l in
+        let constructors =
+          env.constructors
+          |> add (ekey ^ "::" ^ vname)
+          |> add (qkey_of_path mp vname)
+          |> add (ename ^ "::" ^ vname)
+          |> add vname
         in
-        go env' rest)
+        go { env with constructors } rest)
   in
   go env variants
 
-and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
+and register_impl ?(mp : string list = []) (env : env) (d : Ast.impl_decl) : (env, string) result =
   let impl_params =
     let key = impl_param_key env d in
     match Hashtbl.find_opt env.state.sig_param_ids key with
@@ -9243,7 +9596,7 @@ and register_impl (env : env) (d : Ast.impl_decl) : (env, string) result =
                 (err d.i_span
                    (Printf.sprintf "impl of trait `%s` declares methods not in the trait contract" t))))
   in
-  register_methods env2 d.i_target_type d.i_methods impl_params impl_where
+  register_methods ~mp env2 d.i_target_type d.i_methods impl_params impl_where
 
 and register_item (env : env) (item : Ast.item) : (env, string) result =
   match item.Ast.kind with
@@ -9324,58 +9677,35 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             ids
       in
       let scope = { empty_scope with generics = params } in
-      (* re-registration merges newly resolvable fields into the nominal *)
-      let existing, env_base =
-        match nominal_by_name env d.s_name with
-        | Some nom -> (Some nom, env)
-        | None ->
-            (* LangItem tid adoption (audit Fix 4): a source declaration of
-               a builtin standard type reuses the builtin's TypeId, so
-               Vec/Map/Set/Option/Result/Ptr have ONE identity *)
-            let tid =
-              match type_id_by_name env d.s_name with
-              | Some t -> t
-              | None -> fresh_type_id env.state
-            in
-            (if d.s_name = "Box" then env.state.box_tid <- Some tid);
-            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
-            let nom : nominal =
-              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = []; nom_defaults = [] }
-            in
-            (* a user definition of a builtin name REPLACES the builtin *)
-            let env' =
-              {
-                env with
-                types = (d.s_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.s_name env.types;
-                type_ids = (d.s_name, tid) :: List.remove_assoc d.s_name env.type_ids;
-                type_names = (tid, d.s_name) :: env.type_names;
-                nominals = (d.s_name, nom) :: env.nominals;
-              }
-            in
-            type_names_global := (tid, d.s_name) :: !type_names_global;
-            (None, env')
+      (* module-scoped identity: this declaration owns qk; a builtin name
+         adopts the builtin TypeId; the bare key is installed only when no
+         other declaration owns it (first-wins compatibility alias) *)
+      let qk = qkey_of_path item.Ast.module_path d.s_name in
+      let tid, env_base =
+        ensure_nominal_identity env ~mp:item.Ast.module_path ~name:d.s_name
+          ~kind:`Struct ~params
       in
-      let tid =
-        match type_id_by_name env_base d.s_name with
-        | Some t -> t
-        | None -> raise Not_found
-      in
-      let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
+      (* re-registration of THIS declaration (qk) merges newly resolvable
+         fields; never across modules *)
+      let existing = nominal_by_name env_base qk in
       let env_fwd = env_base in
       (* resolve fields one by one; unresolvable ones are reported and
-         retried by the driver *)
+         retried by the driver.  The merge is ORDER-STABLE: existing
+         fields keep their positions and genuinely new fields append, so
+         re-registration across the driver's declaration fixpoint can
+         never permute the shape *)
       let fields_acc, errs =
         List.fold_left
           (fun (acc, errs) (f : Ast.field_decl) ->
             if List.mem_assoc f.f_name acc then (acc, errs)
             else
               match resolve_type env_fwd scope f.f_type with
-              | Ok ft -> ((f.f_name, ft) :: acc, errs)
+              | Ok ft -> (acc @ [ (f.f_name, ft) ], errs)
               | Error m -> (acc, err item.span m :: errs))
           (match existing with Some nom -> (nom.nom_fields, []) | None -> ([], []))
           d.s_fields
       in
-      let fields = List.rev fields_acc in
+      let fields = fields_acc in
       let* where =
         match resolve_where env_fwd scope d.s_where with
         | Ok w -> Ok w
@@ -9413,9 +9743,11 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
           nom_defaults = nom_defaults;
         }
       in
-      let env1 = { env_fwd with nominals = (d.s_name, nom) :: List.remove_assoc d.s_name env_fwd.nominals } in
+      let env1 = { env_fwd with nominals = (qk, nom) :: List.remove_assoc qk env_fwd.nominals } in
+      let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+      let env1 = install_bare_alias env1 ~name:d.s_name ~tid ~param_tys ~nom in
       let env2 = { env1 with current_self = Some (Type_repr.Named (tid, param_tys)) } in
-      match register_methods env2 d.s_name d.s_methods params where with
+      match register_methods ~mp:item.Ast.module_path env2 d.s_name d.s_methods params where with
       | Ok env3 -> (match errs with [] -> Ok env3 | e :: _ -> Error e)
       | Error m -> Error m)
   | Ast.EnumDef d -> (
@@ -9432,39 +9764,12 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
             ids
       in
       let scope = { empty_scope with generics = params } in
-      let existing, env_base =
-        match nominal_by_name env d.e_name with
-        | Some nom -> (Some nom, env)
-        | None ->
-            (* LangItem tid adoption (audit Fix 4): a source declaration of
-               a builtin standard type reuses the builtin's TypeId, so
-               Vec/Map/Set/Option/Result/Ptr have ONE identity *)
-            let tid =
-              match type_id_by_name env d.e_name with
-              | Some t -> t
-              | None -> fresh_type_id env.state
-            in
-            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
-            let nom : nominal =
-              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = []; nom_defaults = [] }
-            in
-            let env' =
-              {
-                env with
-                types = (d.e_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.e_name env.types;
-                type_ids = (d.e_name, tid) :: List.remove_assoc d.e_name env.type_ids;
-                type_names = (tid, d.e_name) :: env.type_names;
-                nominals = (d.e_name, nom) :: env.nominals;
-              }
-            in
-            (None, env')
+      let qk = qkey_of_path item.Ast.module_path d.e_name in
+      let tid, env_base =
+        ensure_nominal_identity env ~mp:item.Ast.module_path ~name:d.e_name
+          ~kind:`Enum ~params
       in
-      let tid =
-        match type_id_by_name env_base d.e_name with
-        | Some t -> t
-        | None -> raise Not_found
-      in
-      let _param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
+      let existing = nominal_by_name env_base qk in
       let env_fwd = env_base in
       let variants_acc, errs =
         List.fold_left
@@ -9480,12 +9785,15 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
                   ([], [])
                   v.v_fields
               in
-              ( (v.v_name, Array.of_list (List.rev field_tys)) :: acc,
+              ( acc @ [ (v.v_name, Array.of_list (List.rev field_tys)) ],
                 ferrs @ errs ))
           (match existing with Some nom -> (nom.nom_variants, []) | None -> ([], []))
           d.e_variants
       in
-      let variants = List.rev variants_acc in
+      (* ORDER-STABLE merge (see the struct-field merge): existing
+         variants keep their declaration-order positions — the positions
+         ARE the runtime tags — and new variants append *)
+      let variants = variants_acc in
       let* where =
         match resolve_where env_fwd scope d.e_where with
         | Ok w -> Ok w
@@ -9525,8 +9833,12 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
           nom_defaults = []
         }
       in
-      let env1 = { env_fwd with nominals = (d.e_name, nom) :: List.remove_assoc d.e_name env_fwd.nominals } in
-      match register_constructors env1 d.e_name tid params variants with
+      let env1 = { env_fwd with nominals = (qk, nom) :: List.remove_assoc qk env_fwd.nominals } in
+      let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+      let env1 = install_bare_alias env1 ~name:d.e_name ~tid ~param_tys ~nom in
+      match
+        register_constructors ~mp:item.Ast.module_path env1 d.e_name tid params variants
+      with
       | Ok env2 -> (match errs with [] -> Ok env2 | e :: _ -> Error e)
       | Error m -> Error m)
   | Ast.TraitDef d ->      let env1 =
@@ -9551,41 +9863,18 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
          materialization and the template verifier's TypeId registry
          carry it — a trait mentioned in a local/return type with no
          def is the verifier's unknown-TypeId class *)
-      let env1 =
-        match nominal_by_name env1 d.t_name with
-        | Some _ -> env1
-        | None ->
-            let tid =
-              match type_id_by_name env1 d.t_name with
-              | Some t -> t
-              | None -> fresh_type_id env1.state
-            in
-            let param_tys =
-              Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params)
-            in
-            let nom : nominal =
-              {
-                nom_kind = `Struct;
-                nom_params = params;
-                nom_fields = [];
-                nom_variants = [];
-                nom_variant_field_names = [];
-                nom_where = [];
-                nom_field_ids = [];
-                nom_variant_ids = [];
-                nom_defaults = []
-              }
-            in
-            {
-              env1 with
-              types =
-                (d.t_name, Type_repr.Named (tid, param_tys))
-                :: List.remove_assoc d.t_name env1.types;
-              type_ids = (d.t_name, tid) :: List.remove_assoc d.t_name env1.type_ids;
-              type_names = (tid, d.t_name) :: env1.type_names;
-              nominals = (d.t_name, nom) :: env1.nominals;
-            }
+      let qk = qkey_of_path item.Ast.module_path d.t_name in
+      let tid, env1 =
+        ensure_nominal_identity env1 ~mp:item.Ast.module_path ~name:d.t_name
+          ~kind:`Struct ~params
       in
+      let nom =
+        match nominal_by_name env1 qk with
+        | Some nom -> nom
+        | None -> raise Not_found
+      in
+      let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+      let env1 = install_bare_alias env1 ~name:d.t_name ~tid ~param_tys ~nom in
       let scope = { empty_scope with generics = params } in
       let* where = resolve_where env1 scope d.t_where in
       (* the trait's SELF is a real binder of every trait method signature:
@@ -9601,10 +9890,10 @@ and register_item (env : env) (item : Ast.item) : (env, string) result =
          body — fails the argument check against it. *)
       let trait_self_p = fresh_param_id env1.state in
       let env2 = { env1 with current_self = Some (Type_repr.Type_param trait_self_p) } in
-      register_methods env2 d.t_name d.t_methods
+      register_methods ~mp:item.Ast.module_path env2 d.t_name d.t_methods
         (params @ [ ("Self", trait_self_p) ])
         where
-  | Ast.ImplBlock d -> register_impl env d
+  | Ast.ImplBlock d -> register_impl ~mp:item.Ast.module_path env d
   | Ast.ConstDecl d ->
       let qname = qualified_name item.module_path d.c_name in
       let* ty = resolve_type env empty_scope d.c_type in
@@ -9696,8 +9985,8 @@ let item_param_ids (env : env) (item : Ast.item) : Ids.Generic_param_id.t list =
   | Ast.TraitDef d ->
       List.concat_map
         (fun (m : Ast.function_decl) ->
-          match method_of_key env d.t_name m.fn_sig.sig_name with
-          | Some s ->
+          match method_of_key_here env d.t_name m.fn_sig.sig_name with
+          | Some (_, s) ->
               List.map snd s.ts_params_decl
               @ List.concat_map (fun p -> params_in p.Type_repr.pt_type) (Array.to_list s.ts_params)
               @ params_in s.ts_return
@@ -9706,8 +9995,8 @@ let item_param_ids (env : env) (item : Ast.item) : Ids.Generic_param_id.t list =
   | Ast.ImplBlock d ->
       List.concat_map
         (fun (m : Ast.function_decl) ->
-          match method_of_key env d.i_target_type m.fn_sig.sig_name with
-          | Some s ->
+          match method_of_key_here env d.i_target_type m.fn_sig.sig_name with
+          | Some (_, s) ->
               (* the impl's own type parameters appear in the method
                  signature (self type, params, return): they are bound by
                  the impl, so the oracle must not flag them *)
@@ -10113,7 +10402,8 @@ let rec register_headers (env : env) (acc : string list) = function
   | item :: rest -> (
       match item.Ast.kind with
       | Ast.StructDef d ->
-          if (nominal_by_name env d.s_name <> None) then register_headers env acc rest
+          let qk = qkey_of_path item.Ast.module_path d.s_name in
+          if (nominal_by_name env qk <> None) then register_headers env acc rest
           else begin
             let params =
               let key = "nominal::" ^ d.s_name in
@@ -10127,33 +10417,20 @@ let rec register_headers (env : env) (acc : string list) = function
                   Hashtbl.add env.state.sig_param_ids key ids;
                   ids
             in
-            (* LangItem tid adoption (audit Fix 4): a source declaration of
-               a builtin standard type reuses the builtin's TypeId, so
-               Vec/Map/Set/Option/Result/Ptr have ONE identity *)
-            let tid =
-              match type_id_by_name env d.s_name with
-              | Some t -> t
-              | None -> fresh_type_id env.state
+            let tid, env' =
+              ensure_nominal_identity env ~mp:item.Ast.module_path
+                ~name:d.s_name ~kind:`Struct ~params
             in
-            (if d.s_name = "Box" then env.state.box_tid <- Some tid);
-            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
-            let nom : nominal =
-              { nom_kind = `Struct; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = []; nom_defaults = [] }
+            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+            let nom =
+              match nominal_by_name env' qk with Some n -> n | None -> raise Not_found
             in
-            let env' =
-              {
-                env with
-                types = (d.s_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.s_name env.types;
-                type_ids = (d.s_name, tid) :: List.remove_assoc d.s_name env.type_ids;
-                type_names = (tid, d.s_name) :: env.type_names;
-                nominals = (d.s_name, nom) :: env.nominals;
-              }
-            in
-            type_names_global := (tid, d.s_name) :: !type_names_global;
+            let env' = install_bare_alias env' ~name:d.s_name ~tid ~param_tys ~nom in
             register_headers env' acc rest
           end
       | Ast.EnumDef d ->
-          if (nominal_by_name env d.e_name <> None) then register_headers env acc rest
+          let qk = qkey_of_path item.Ast.module_path d.e_name in
+          if (nominal_by_name env qk <> None) then register_headers env acc rest
           else begin
             let params =
               let key = "nominal::" ^ d.e_name in
@@ -10167,27 +10444,15 @@ let rec register_headers (env : env) (acc : string list) = function
                   Hashtbl.add env.state.sig_param_ids key ids;
                   ids
             in
-            (* LangItem tid adoption (audit Fix 4): a source declaration of
-               a builtin standard type reuses the builtin's TypeId, so
-               Vec/Map/Set/Option/Result/Ptr have ONE identity *)
-            let tid =
-              match type_id_by_name env d.e_name with
-              | Some t -> t
-              | None -> fresh_type_id env.state
+            let tid, env' =
+              ensure_nominal_identity env ~mp:item.Ast.module_path
+                ~name:d.e_name ~kind:`Enum ~params
             in
-            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
-            let nom : nominal =
-              { nom_kind = `Enum; nom_params = params; nom_fields = []; nom_variants = []; nom_variant_field_names = []; nom_where = []; nom_field_ids = []; nom_variant_ids = []; nom_defaults = [] }
+            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+            let nom =
+              match nominal_by_name env' qk with Some n -> n | None -> raise Not_found
             in
-            let env' =
-              {
-                env with
-                types = (d.e_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.e_name env.types;
-                type_ids = (d.e_name, tid) :: List.remove_assoc d.e_name env.type_ids;
-                type_names = (tid, d.e_name) :: env.type_names;
-                nominals = (d.e_name, nom) :: env.nominals;
-              }
-            in
+            let env' = install_bare_alias env' ~name:d.e_name ~tid ~param_tys ~nom in
             register_headers env' acc rest
           end
       | Ast.TraitDef d ->
@@ -10195,7 +10460,8 @@ let rec register_headers (env : env) (acc : string list) = function
              `-> Iterator[T]` return positions); register the trait in the
              type tables so resolve_named finds it (traits are never
              value-lowered, but the signature surface resolves) *)
-          if (type_by_name env d.t_name <> None) then register_headers env acc rest
+          let qk = qkey_of_path item.Ast.module_path d.t_name in
+          if (type_by_name env qk <> None) then register_headers env acc rest
           else begin
             let params =
               let key = "trait::" ^ d.t_name in
@@ -10210,20 +10476,17 @@ let rec register_headers (env : env) (acc : string list) = function
                   Hashtbl.add env.state.sig_param_ids key ids;
                   ids
             in
-            let tid =
-              match type_id_by_name env d.t_name with
-              | Some t -> t
-              | None -> fresh_type_id env.state
+            let tid, env' =
+              ensure_nominal_identity env ~mp:item.Ast.module_path
+                ~name:d.t_name ~kind:`Struct ~params
             in
-            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param (p)) params) in
-            let env' =
-              {
-                env with
-                types = (d.t_name, Type_repr.Named (tid, param_tys)) :: List.remove_assoc d.t_name env.types;
-                type_ids = (d.t_name, tid) :: List.remove_assoc d.t_name env.type_ids;
-                type_names = (tid, d.t_name) :: env.type_names;
-              }
+            let param_tys = Array.of_list (List.map (fun (_, p) -> Type_repr.Type_param p) params) in
+            (* traits only register a type entry + empty nominal; the bare
+               alias follows the same first-wins rule *)
+            let nom =
+              match nominal_by_name env' qk with Some n -> n | None -> raise Not_found
             in
+            let env' = install_bare_alias env' ~name:d.t_name ~tid ~param_tys ~nom in
             register_headers env' acc rest
           end
       | _ -> register_headers env acc rest)

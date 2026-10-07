@@ -339,10 +339,27 @@ let variant_spec_of_id (_env : func_env) (tbl : variant_table) ~(enum_name : str
           seed_bug
             "enum `%s` has no SEMANTIC VariantId registry in the variant table (the typed-pattern path needs the driver's registry channel)"
             enum_name)
-
-let ctor_of (tbl : variant_table) (n : string) : (string * string) option =  match List.assoc_opt n tbl.vt_ctors with
+let ctor_of (tbl : variant_table) (n : string) : (string * string) option =
+  match List.assoc_opt n tbl.vt_ctors with
   | Some pair -> Some pair
   | None -> (
+      (* a fully-qualified ctor spelling (`std::core::Option::None` — the
+         checker records the resolved declaration key in NB_ctor): reduce
+         to the last two segments for the builtin Option/Result channel,
+         whose variants live in vt_builtin rather than vt_ctors *)
+      let last_two =
+        match
+          List.rev (String.split_on_char ':' n |> List.filter (fun s -> s <> ""))
+        with
+        | v :: e :: _ -> Some (e, v)
+        | _ -> None
+      in
+      match last_two with
+      | Some ("Option", "Some") -> Some ("Option", "Some")
+      | Some ("Option", "None") -> Some ("Option", "None")
+      | Some ("Result", "Ok") -> Some ("Result", "Ok")
+      | Some ("Result", "Err") -> Some ("Result", "Err")
+      | _ -> (
       match n with
       | "Some" | "Option::Some" -> Some ("Option", "Some")
       | "None" | "Option::None" -> Some ("Option", "None")
@@ -364,12 +381,28 @@ let ctor_of (tbl : variant_table) (n : string) : (string * string) option =  mat
                | Some vmap ->
                    if List.mem_assoc rest vmap then Some (qual, rest) else None
                | None -> None)
-          | _ -> None))
+          | _ -> None)))
 
 let enum_tid_of (env : func_env) (enum_name : string) : Ids.Type_id.t =
   match List.assoc_opt enum_name env.types with
   | Some (Type_repr.Named (tid, _)) -> tid
-  | _ -> seed_bug "enum `%s` has no type identity in the lowering env" enum_name
+  | _ ->
+      (* a module-qualified registry name from the variant table while a
+         hand-built lowering env (selfcheck-style) carries only the bare
+         compatibility alias of the same declaration *)
+      let bare =
+        match
+          List.rev (String.split_on_char ':' enum_name |> List.filter (fun s -> s <> ""))
+        with
+        | last :: _ -> Some last
+        | _ -> None
+      in
+      (match bare with
+       | Some last -> (
+           match List.assoc_opt last env.types with
+           | Some (Type_repr.Named (tid, _)) -> tid
+           | _ -> seed_bug "enum `%s` has no type identity in the lowering env" enum_name)
+       | None -> seed_bug "enum `%s` has no type identity in the lowering env" enum_name)
 
 let enum_name_of_ty (env : func_env) (t : Type_repr.t) : string =
   match t with

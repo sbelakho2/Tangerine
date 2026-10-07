@@ -101,6 +101,7 @@ readonly FAST_SELFCHECKS=(
   tg_placechain
   tg_boxnominal
   tg_type_props
+  tg_identity_collision
 )
 
 # ── TIER 0 ────────────────────────────────────────────────────────────

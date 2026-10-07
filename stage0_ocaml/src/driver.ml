@@ -364,10 +364,38 @@ let closure_statics (env : Typecheck.env) (items : Ast.item list) :
          else Some (n, ty, mutable_of n, init_of n))
        env.Typecheck.statics)
 
+(* ── module-scoped nominal materialization (identity-collision fix) ──
+   env.Typecheck.nominals carries one entry per registry key: the bare
+   first-wins compatibility alias plus each declaration's qualified key.
+   Downstream materialization (closure_types / struct_fields_of /
+   enum_payloads_of / user_variant_table) must emit exactly ONE def per
+   semantic TypeId with the DECLARATION's shape, so collapse by TypeId,
+   preferring a qualified declaration key over the bare alias. *)
+let nominal_entries_by_tid (env : Typecheck.env) :
+    (Ids.Type_id.t * string * Typecheck.nominal) list =
+  let tbl : (int, int * Ids.Type_id.t * string * Typecheck.nominal) Hashtbl.t =
+    Hashtbl.create 256
+  in
+  List.iteri
+    (fun idx (name, nom : string * Typecheck.nominal) ->
+      match Typecheck.type_id_by_name env name with
+      | None -> ()
+      | Some tid -> (
+          let key = Ids.Type_id.to_int tid in
+          let qualified = String.contains name ':' in
+          let replace =
+            match Hashtbl.find_opt tbl key with
+            | None -> true
+            | Some (_, _, prev, _) -> qualified && not (String.contains prev ':')
+          in
+          if replace then Hashtbl.replace tbl key (idx, tid, name, nom)))
+    env.Typecheck.nominals;
+  Hashtbl.fold (fun _ (_, tid, name, nom) acc -> (tid, name, nom) :: acc) tbl []
+
 let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
   Array.of_list
     (List.filter_map
-       (fun (name, nom : string * Typecheck.nominal) ->
+       (fun (_tid0, name, nom : Ids.Type_id.t * string * Typecheck.nominal) ->
          match Typecheck.type_id_by_name env name with
          | None -> None
          | Some tid ->
@@ -420,7 +448,7 @@ let closure_types (env : Typecheck.env) : Seed_mir.type_def array =
                                  })
                                nom.Typecheck.nom_variants;
                          })))
-       env.Typecheck.nominals)
+       (nominal_entries_by_tid env))
 
 let struct_fields_of ?(items : Ast.item list = []) (env : Typecheck.env) :
     (Ids.Type_id.t *
@@ -438,19 +466,22 @@ let struct_fields_of ?(items : Ast.item list = []) (env : Typecheck.env) :
      (typed_name_bindings), consumed by lowering — the default expression
      itself is only the lowering body, never a source of re-resolution. *)
   let defaults : (string * (string * Ast.expr) list) list =
-    List.filter_map
+    List.concat_map
       (fun (it : Ast.item) ->
         match it.Ast.kind with
         | Ast.StructDef d ->
-            Some
-              ( d.Ast.s_name,
-                List.filter_map
-                  (fun (fd : Ast.field_decl) ->
-                    match fd.Ast.f_default with
-                    | Some e -> Some (fd.Ast.f_name, e)
-                    | None -> None)
-                  d.Ast.s_fields )
-        | _ -> None)
+            let fs =
+              List.filter_map
+                (fun (fd : Ast.field_decl) ->
+                  match fd.Ast.f_default with
+                  | Some e -> Some (fd.Ast.f_name, e)
+                  | None -> None)
+                d.Ast.s_fields
+            in
+            let qk = Typecheck.qualified_name it.Ast.module_path d.Ast.s_name in
+            if qk = d.Ast.s_name then [ (d.Ast.s_name, fs) ]
+            else [ (qk, fs); (d.Ast.s_name, fs) ]
+        | _ -> [])
       items
   in
   let default_of (oname : string) (fname : string) : Ast.expr option =
@@ -482,7 +513,7 @@ let struct_fields_of ?(items : Ast.item list = []) (env : Typecheck.env) :
                   (fun i (fname, fty) ->
                     (fname, List.nth fids i, fty, default_of name fname))
                   nom.Typecheck.nom_fields ))
-    env.Typecheck.nominals
+    (List.map (fun (_tid, name, nom) -> (name, nom)) (nominal_entries_by_tid env))
 
 (* The ENUM defs' variant payload shapes for the lowering's copyability
    rule (mirror of the reference's recursive enum rule: an enum is Copy
@@ -498,7 +529,7 @@ let enum_payloads_of (env : Typecheck.env) :
           | None -> None
           | Some tid ->
               Some (tid, List.map (fun (vname, pty) -> (vname, Array.to_list pty)) nom.Typecheck.nom_variants)))
-    env.Typecheck.nominals
+    (List.map (fun (_tid, name, nom) -> (name, nom)) (nominal_entries_by_tid env))
 
 
 (* ── The persistent typed-node bridge (audit P0-8: the ALREADY-FINAL
@@ -762,9 +793,14 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
    independent coordinates).  The nominal is validated against its
    semantic variant-id registry (fail closed on a length mismatch). *)
 let user_variant_table (env : Typecheck.env) : Mir_lower.variant_table =
-  let enums =
+  (* one spec set per concrete (non-generic) enum TypeId, with its
+     declaration's own shape; vt_enums is then registered under EVERY
+     registry name that maps to that TypeId (the qualified declaration
+     key and, where it exists, the bare first-wins alias), so
+     enum_name_of_ty / enum_tid_of always find the right def *)
+  let enum_specs =
     List.filter_map
-      (fun (name, nom : string * Typecheck.nominal) ->
+      (fun (tid, name, nom : Ids.Type_id.t * string * Typecheck.nominal) ->
         match nom.Typecheck.nom_kind with
         | `Struct -> None
         | `Enum ->
@@ -775,7 +811,8 @@ let user_variant_table (env : Typecheck.env) : Mir_lower.variant_table =
                 die "enum `%s`: %d variants but %d semantic VariantIds" name nvar
                   (List.length nom.Typecheck.nom_variant_ids);
               Some
-                ( name,
+                ( tid,
+                  name,
                   List.mapi
                     (fun i (vname, pty) ->
                       ( vname,
@@ -790,7 +827,37 @@ let user_variant_table (env : Typecheck.env) : Mir_lower.variant_table =
                         } ))
                     nom.Typecheck.nom_variants )
             end)
-      env.Typecheck.nominals
+      (nominal_entries_by_tid env)
+  in
+  let enums =
+    List.concat_map
+      (fun (tid, name, specs) ->
+        let aliases =
+          List.filter_map
+            (fun (n, t) ->
+              match t with
+              | Type_repr.Named (t2, _) when Ids.Type_id.compare t2 tid = 0 -> Some n
+              | _ -> None)
+            env.Typecheck.types
+        in
+        let names =
+          List.fold_left
+            (fun acc n -> if List.mem n acc then acc else n :: acc)
+            [ name ] aliases
+        in
+        List.map (fun n -> (n, specs)) (List.rev names))
+      enum_specs
+  in
+  let split_last (n : string) : (string * string) option =
+    let len = String.length n in
+    let rec lp i =
+      if i <= 0 then None
+      else if n.[i] = ':' && n.[i - 1] = ':' then Some i
+      else lp (i - 1)
+    in
+    match lp (len - 1) with
+    | Some i when i + 1 < len -> Some (String.sub n 0 (i - 1), String.sub n (i + 1) (len - i - 1))
+    | _ -> None
   in
   (* the builtin Option/Result semantic identities: the SAME typed
      registry channel.  A bare compiler-seeded nominal (no source
@@ -818,9 +885,28 @@ let user_variant_table (env : Typecheck.env) : Mir_lower.variant_table =
   in
   let ctors =
     List.concat_map
-      (fun (ename, specs) ->
-        List.map (fun (vname, _) -> (vname, (ename, vname))) specs)
-      enums
+      (fun (_tid, ename, specs) ->
+        let module_prefix, short_name =
+          match split_last ename with
+          | Some (mp, last) -> (Some mp, last)
+          | None -> (None, ename)
+        in
+        List.concat_map
+          (fun (vname, _) ->
+            let exact = (ename ^ "::" ^ vname, (ename, vname)) in
+            let scoped =
+              match module_prefix with
+              | Some mp -> [ (mp ^ "::" ^ vname, (ename, vname)) ]
+              | None -> []
+            in
+            let legacy =
+              if short_name = ename then []
+              else [ (short_name ^ "::" ^ vname, (ename, vname)) ]
+            in
+            let bare_variant = (vname, (ename, vname)) in
+            exact :: (scoped @ (legacy @ [ bare_variant ])))
+          specs)
+      enum_specs
   in
   { Mir_lower.vt_enums = enums; vt_ctors = ctors; vt_builtin = builtin_ids }
 
@@ -2388,15 +2474,33 @@ let lower_closure (ctx : closure_ctx) : Seed_mir.program =
         (fun i ->
           match i.Ast.kind with
           | Ast.ImplBlock d -> (
+              (* the method's owner key in THIS module — same-named
+                 owners in different modules are distinct (the
+                 identity-collision fix); the bare (owner, name) key
+                 remains as a legacy fallback *)
+              let okey =
+                Typecheck.qualified_name node.Module_graph.node_path d.Ast.i_target_type
+              in
               List.iter
                 (fun (m : Ast.function_decl) ->
-                  match
-                    List.assoc_opt (d.Ast.i_target_type, m.Ast.fn_sig.Ast.sig_name)
-                      ctx.ctx_env.Typecheck.methods
-                  with
-                  | Some ts ->
+                  let ts_opt =
+                    match
+                      List.assoc_opt (okey, m.Ast.fn_sig.Ast.sig_name)
+                        ctx.ctx_env.Typecheck.methods
+                    with
+                    | Some ts -> Some (okey, ts)
+                    | None -> (
+                        match
+                          List.assoc_opt (d.Ast.i_target_type, m.Ast.fn_sig.Ast.sig_name)
+                            ctx.ctx_env.Typecheck.methods
+                        with
+                        | Some ts -> Some (d.Ast.i_target_type, ts)
+                        | None -> None)
+                  in
+                  match ts_opt with
+                  | Some (mkey, ts) ->
                       let reg_key =
-                        "method::" ^ d.Ast.i_target_type ^ "::" ^ m.Ast.fn_sig.Ast.sig_name
+                        "method::" ^ mkey ^ "::" ^ m.Ast.fn_sig.Ast.sig_name
                       in
                       if is_canonical_decl reg_key m.Ast.fn_span then begin
                         let f =
