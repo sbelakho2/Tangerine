@@ -94,9 +94,11 @@ type limits = {
   max_depth : int;
   max_alloc_bytes : int;
   max_host_calls : int;
-  (* Optional hard resident-set ceiling in bytes (0 = disabled).  Linux
-     /proc/self/statm based; used by profiling runs so an overgrown VM
-     fails with a diagnostic instead of OOM-killing the host. *)
+  (* Optional hard resident-set ceiling in bytes (0 = disabled).
+     Measurement is three-tier (current_rss_bytes): Linux /proc, macOS
+     Mach task_info, else unavailable; used by profiling runs so an
+     overgrown VM fails with a diagnostic instead of OOM-killing the
+     host. *)
   max_rss_bytes : int;
 }
 
@@ -193,15 +195,20 @@ let host_prof : (string, int * float) Hashtbl.t = Hashtbl.create 256
    module load) *)
 let beacon_prev = ref (Unix.gettimeofday ())
 
-(* Resident set size from /proc/self/status "VmRSS: N kB" (Linux), a
-   unit independent of the host page size (statm pages would under-report
-   by 16x on 64 KiB-page AArch64 Linux).  Measurement is Linux-only:
-   returns 0 ("unavailable") on hosts without /proc, and requesting a
-   ceiling there is a hard configuration error (see entry_frame_of_li),
-   never a silent no-op.  The final authorization gate
-   (scripts/check_ocaml_bootstrap_complete.sh) installs an unconditional
-   ceiling on Linux and REFUSES to authorize on hosts without
-   measurement rather than running unbounded. *)
+(* Resident set size, three-tier measurement:
+     1. Linux /proc/self/status "VmRSS: N kB" — a unit independent of
+        the host page size (statm pages would under-report by 16x on
+        64 KiB-page AArch64 Linux).
+     2. macOS the native stub (rss_stubs.c): Mach task_info
+        MACH_TASK_BASIC_INFO.resident_size, in bytes.
+     3. otherwise 0 ("unavailable"); requesting a ceiling there is a
+        hard configuration error (see entry_frame_of_li), never a
+        silent no-op.
+   Ordering: Linux /proc -> Mach task_info -> 0 (unavailable, hard
+   error if a ceiling is requested).  The final authorization gate
+   (scripts/check_ocaml_bootstrap_complete.sh) installs an
+   unconditional ceiling on Linux and macOS and REFUSES to authorize
+   on hosts with neither rather than running unbounded. *)
 let vmrss_kb_of_status_line (line : string) : int option =
   if String.length line >= 6 && String.sub line 0 6 = "VmRSS:" then begin
     let rest = String.trim (String.sub line 6 (String.length line - 6)) in
@@ -214,7 +221,19 @@ let vmrss_kb_of_status_line (line : string) : int option =
   end
   else None
 
-let current_rss_bytes () : int =
+(* The native RSS stub (rss_stubs.c): on macOS it reports Mach
+   task_info MACH_TASK_BASIC_INFO.resident_size (bytes); elsewhere it is
+   unavailable.  The wrapper returns a nativeint: > 0 = bytes,
+   0 = measured zero, -1 = unavailable. *)
+external tg_rss_bytes : unit -> nativeint = "tg_current_rss_bytes_ml"
+
+(* The stub's OCaml-value contract: a positive measurement is bytes;
+   zero or the -1 unavailable sentinel stay "unavailable" for the
+   ceiling gate. *)
+let rss_of_stub (v : nativeint) : int =
+  if Nativeint.compare v Nativeint.zero > 0 then Nativeint.to_int v else 0
+
+let rss_from_proc_status () : int =
   match open_in "/proc/self/status" with
   | exception _ -> 0
   | ic ->
@@ -229,6 +248,14 @@ let current_rss_bytes () : int =
       let v = scan () in
       close_in_noerr ic;
       v
+
+(* The fallback ordering: Linux /proc first; if that is unavailable the
+   native stub (macOS Mach); if neither measures, 0 (which the ceiling
+   check in entry_frame_of_li turns into a hard error — never a silent
+   unbounded run). *)
+let current_rss_bytes () : int =
+  let proc = rss_from_proc_status () in
+  if proc > 0 then proc else rss_of_stub (tg_rss_bytes ())
 
 (* The guest's panic message channel (std/core.tg's `_current_panic`
    static): read on Abort so a self-host ICE reports its own diagnostic
@@ -291,7 +318,8 @@ let step_limit (vm : t) : unit =
        Printf.eprintf "VM ALLOC SITES frees=%d %s\n%!" !Vm_memory.prof_frees
          (Vm_memory.prof_alloc_sites_summary ())
    end);
-  (* Optional hard RSS ceiling (Linux): fail with a diagnostic instead of
+  (* Optional hard RSS ceiling (Linux /proc or macOS Mach — whichever
+     current_rss_bytes can measure): fail with a diagnostic instead of
      letting the host OOM-killer take the machine down. *)
   if
     vm.limits.max_rss_bytes > 0
@@ -2517,7 +2545,8 @@ let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
     ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array) :
     (t * frame, string) result =
   (* A requested RSS ceiling must be enforceable: if the host cannot
-     measure RSS, fail closed instead of pretending the guard exists. *)
+     measure RSS (/proc on Linux, Mach task_info on macOS), fail closed
+     instead of pretending the guard exists. *)
   if limits.max_rss_bytes > 0 && current_rss_bytes () <= 0 then
     Error
       "RSS limit requested (TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB) but resident-set measurement is unavailable on this host"

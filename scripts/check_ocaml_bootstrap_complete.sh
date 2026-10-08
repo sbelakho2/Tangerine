@@ -79,21 +79,22 @@ GATE_TIMEOUT_S=4140
 export TANGERINE_BOOTSTRAP_VM_MAX_STEPS=30000000000
 export TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS=1000000000
 export TANGERINE_BOOTSTRAP_VM_MAX_ALLOC=8589934592
-# The final authorization ALWAYS installs the measured RSS ceiling on
-# Linux and accepts NO resource-budget override: an ambient environment
-# cannot disable the guard (0 = disabled), raise it, or turn this script
-# into a measurement run.  Bounded-profiling measurements run the
-# selfcheck directly (tg_bootstrap_selfcheck with an explicit
+# The final authorization ALWAYS installs the measured RSS ceiling and
+# accepts NO resource-budget override: an ambient environment cannot
+# disable the guard (0 = disabled), raise it, or turn this script into a
+# measurement run.  Bounded-profiling measurements run the selfcheck
+# directly (tg_bootstrap_selfcheck with an explicit
 # TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB), never through the authorization
 # script — no measurement configuration can emit an authorization PASS.
-# RSS measurement is /proc-based (Linux); a host without it REFUSES to
-# authorize (there is no unbounded authorization path).
+# RSS measurement is three-tier: Linux /proc/self/status VmRSS, or the
+# seed's native Mach task_info stub on macOS (rss_stubs.c).  A host
+# with neither REFUSES to authorize — there is no unbounded authorization path.
 case "$(uname -s 2>/dev/null)" in
-  Linux) FINAL_RSS_SUPPORTED=1 ;;
+  Linux | Darwin) FINAL_RSS_SUPPORTED=1 ;;
   *) FINAL_RSS_SUPPORTED=0 ;;
 esac
 if [ "$FINAL_RSS_SUPPORTED" != "1" ]; then
-  echo "check_ocaml_bootstrap_complete: FAIL — final authorization requires an RSS ceiling, but this host has no RSS measurement (/proc). Run the authorization gate on Linux; unbounded measurement is a separate, explicitly non-authorizing activity." >&2
+  echo "check_ocaml_bootstrap_complete: FAIL — final authorization requires an RSS ceiling, but this host has no RSS measurement (/proc on Linux, Mach task_info on macOS). Run the authorization gate on Linux or macOS; unbounded measurement is a separate, explicitly non-authorizing activity." >&2
   exit 1
 fi
 export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB=12288

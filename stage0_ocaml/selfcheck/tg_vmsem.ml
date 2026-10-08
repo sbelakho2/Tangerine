@@ -4247,8 +4247,11 @@ let check_captured_ref_lifetime () =
   | `No_trap -> fail "captured refs: double drop did not trap"
 
 (* (g3) RSS GUARD: the parser reads the kB unit (page-size independent),
-   and a requested ceiling is enforced from the first step — or fails
-   closed at VM construction when the host cannot measure RSS. *)
+   the stub contract maps nativeint > 0 to bytes and the -1/0 sentinels
+   to unavailable, the /proc-first ordering measures > 0 wherever
+   /proc/self/status exists (Linux), and a requested ceiling is enforced
+   from the first step — or fails closed at VM construction when the
+   host cannot measure RSS. *)
 let check_rss_guard () =
   (match Vm.vmrss_kb_of_status_line "VmRSS:\t  1234 kB" with
   | Some 1234 ->
@@ -4256,6 +4259,29 @@ let check_rss_guard () =
   | other ->
       fail "RSS parser returned %s"
         (match other with Some n -> string_of_int n | None -> "None"));
+  (match Vm.rss_of_stub (-1n) with
+  | 0 -> pass "RSS stub: the -1 unavailable sentinel maps to 0"
+  | n -> fail "RSS stub: -1 mapped to %d, want 0" n);
+  (match Vm.rss_of_stub 1_048_576n with
+  | 1048576 -> pass "RSS stub: a positive nativeint maps to its bytes"
+  | n -> fail "RSS stub: 1048576n mapped to %d" n);
+  if Sys.file_exists "/proc/self/status" then begin
+    let rss = Vm.current_rss_bytes () in
+    if rss > 0 then
+      pass "RSS ordering: /proc present, current_rss_bytes > 0"
+    else
+      fail "RSS ordering: /proc/self/status present but current_rss_bytes = %d" rss
+  end
+  else
+    pass "RSS ordering: no /proc/self/status on this host (stub tier only)";
+  let stub = Vm.tg_rss_bytes () in
+  if Nativeint.compare stub Nativeint.zero > 0 then
+    pass "RSS stub: the linked native call measures this host (Mach tier)"
+  else if Nativeint.equal stub (-1n) then
+    pass "RSS stub: the linked native call reports unavailable on this host (non-Apple tier)"
+  else
+    fail "RSS stub: the linked native call returned unexpected %d"
+      (Nativeint.to_int stub);
   let prog = dyn_index_fn [| i64 |] [] Seed_mir.Ret in
   match
     Vm.entry_frame_of_li
