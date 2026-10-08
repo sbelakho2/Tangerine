@@ -12,7 +12,7 @@ use std::fs::{read_file}
 use tg_compiler::token::{Span, span_dummy, ParsedIntegerLiteral, ParsedFloatLiteral, parsed_int_to_host, parsed_int_fits_host, parsed_int_decimal, parsed_int_is_zero, parsed_float_f32_overflow, parsed_float_f64_overflow}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::parser::{parse, DiagnosticSemanticData, EffectViolationData, TypeMismatchData, TraitFailureData, CapabilityDiagnosticData}
-use tg_compiler::resolver::{ResolvedNames, def_id_of_item, def_kind_of, module_qualified_key, imported_target_key}
+use tg_compiler::resolver::{ResolvedNames, BuiltinBinding, def_id_of_item, def_kind_of, module_qualified_key, imported_target_key}
 use tg_compiler::ids::{
   DefId, DefKind, FieldId, ModuleId, TypeId, TraitId, GenericParamId, GenericParamTable,
   CallableId, InstanceId, GenericArg, ConstValue, VariantId, LocalId, NodeId, AccessRoot, ClosureId, EffectId, EffectRegistry,
@@ -3534,6 +3534,20 @@ struct TypeEnv
   # broken id assignment is reported once (the first offender) instead of
   # once per pattern node.
   pattern_identity_invariant_reported: Bool = false
+  # (patch 3 item A — all-failures enumeration mode): the typed-channel
+  # completeness verifier's report state.  The default is the historical
+  # fail-fast behavior (ONE fingerprint recorded, verifier returns false).
+  # When TANGERINE_HIR_REPORT=all (read once per verifier run from the
+  # host environment via std::env::get_env), the verifier walks the WHOLE
+  # program, appending every failure fingerprint to
+  # hir_report_fingerprints (sorted/deduped/capped when the report is
+  # emitted), while still recording exactly ONE error (the first failure)
+  # so compilation keeps failing at the same coordinate.  hir_report_base
+  # is the fingerprint count at the start of the current verifier run —
+  # the "first failure of THIS run" marker.
+  hir_report_all: Bool = false
+  hir_report_base: Int = 0
+  hir_report_fingerprints: Vec[String] = Vec::new()
   
   # Trait implementations
   impls: Vec[ImplInfo]
@@ -8418,6 +8432,47 @@ end
 # tables). Fewer than 2 distinct qualified definitions — the bootstrap's
 # module_symbols holds at most one per bare callable name — resolve
 # unchanged. Conservative: never errors on a single definition.
+# (imported / aliased values — patch 3 item D): resolve a bare name that
+# the current module's EXPLICIT import binds to a declaration in another
+# module (`use values::{X}` and `use values::{X as Y}`).  The resolver's
+# import_bindings snapshot + the module_callable_types registration are
+# the authority.  Aliased bindings (Y) never appear as a declaration's
+# bare name, so the scope-0 lookup cannot see them; this arm types them
+# and records the DECLARATION's global identity for the lowering exactly
+# like record_global_binding does for a plain bare name.
+def try_imported_callable_value(inout env: TypeEnv, name: String, node_id: Int) -> Option[Type]
+  match imported_callable_key_of(env, name.clone())
+  when Option::Some(key) then
+    match env.module_callable_types.get(key.clone())
+    when Option::Some(ty) then
+      match env.resolutions
+      when Option::Some(res) then
+        match res.module_symbols.get(key)
+        when Option::Some(did) then
+          match def_kind_of(&res, &did)
+          when Option::Some(kind) then
+            if kind == DefKind::Static then
+              env.typed_global_bindings.insert(node_id, GlobalBinding::GbStatic(did))
+            elsif kind == DefKind::Constant then
+              env.typed_global_bindings.insert(node_id, GlobalBinding::GbConst(did))
+            elsif kind == DefKind::Function then
+              env.typed_global_bindings.insert(node_id, GlobalBinding::GbCallable(did))
+            else
+              ()
+            end
+          when Option::None then ()
+          end
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+      Option::Some(ty)
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end  end
+end
+
 def resolve_bare_callable(inout env: TypeEnv, name: String, span: Span, fallback: Type) -> Type
   match env.resolutions
   when Option::Some(res) then
@@ -18907,41 +18962,61 @@ def frontend_intrinsic_fn_type(name: String) -> Option[Type]
   Option::None
 end
 
-# (std::time builtin module symbols): the HOST/RUNTIME-provided module
-# symbols the resolver accepts as ITBuiltin (is_builtin_module_symbol)
-# and the seed types from its builtin signature table (typecheck.ml's
-# str_misc_builtins: duration_nanos/duration_millis; the instant_now_sig
-# returning the Instant nominal the source `struct Instant` adopts).
-# std/time.tg declares no source definition for them, so a bare call
-# reaches the checker as an ordinary ident — without this bridge the
-# ident recorded `unknown symbol` + Type::Error and the std/bench.tg
-# measure_single closure failed the HIR_INVALID|ident channel
-# (Node=10362). The signatures mirror the seed byte-for-byte:
+# (std::time builtin module symbols — SEMANTIC identity, patch 3 item E):
+# the HOST/RUNTIME-provided module symbols the resolver accepts as
+# ITBuiltin (is_builtin_module_symbol). std/time.tg declares no source
+# definition for them.  The resolver records WHICH builtin it resolved
+# (BuiltinBinding::InstantNow / DurationNanos / DurationMillis) in
+# ResolvedNames.builtin_bindings keyed by the resolved expression's NODE
+# id — so the checker's signature lookup is keyed by the semantic
+# resolution, never by the source spelling: the exact import, an ALIASED
+# import (`use std::time::instant_now as now`), and a fully-qualified
+# path (`std::time::instant_now()`) all type from the same recorded
+# binding, while an UNIMPORTED bare spelling records no binding and
+# stays the fail-closed unknown-symbol error.
+# The signatures mirror the seed byte-for-byte:
 #   instant_now()            -> Instant (the source nominal of that name;
 #                               the seed's builtin nominal is adopted by
-#                               the source declaration of the same name)
+#                               the source declaration of the same name —
+#                               a MISSING canonical Instant TypeId is a
+#                               hard semantic error, never a fresh
+#                               inference variable)
 #   duration_nanos[T](ts: T) -> UInt
 #   duration_millis[T](ts: T) -> UInt
 # duration_secs_f64 stays OUT: the seed's functions table carries no
 # signature for it (the resolver's builtin-module-symbol acceptance is
 # resolution-only), so a call keeps the fail-closed unknown-symbol rule.
-def builtin_module_symbol_fn_type(inout env: TypeEnv, name: String) -> Option[Type]
-  if name == "instant_now" then
-    let ret_ty = match get_type_id_by_name(env, "Instant".to_string())
-    when Option::Some(tid) then Type::Adt(tid, Vec::new())
-    when Option::None then fresh_type_var(env)
+def builtin_binding_of_node(env: TypeEnv, node_id: Int) -> Option[BuiltinBinding]
+  match env.resolutions
+  when Option::Some(res) then res.builtin_bindings.get(node_id)
+  when Option::None then Option::None
+  end  end
+end
+
+def try_builtin_binding_fn_type(inout env: TypeEnv, node_id: Int, span: Span) -> Option[Type]
+  match builtin_binding_of_node(env, node_id)
+  when Option::Some(binding) then Option::Some(builtin_binding_fn_type(env, binding.clone(), span))
+  when Option::None then Option::None
+  end  end
+end
+
+def builtin_binding_fn_type(inout env: TypeEnv, binding: BuiltinBinding, span: Span) -> Type
+  match binding
+  when BuiltinBinding::InstantNow then
+    match get_type_id_by_name(env, "Instant".to_string())
+    when Option::Some(tid) then Type::FnPtr(Vec::new(), Type::Adt(tid, Vec::new()), Vec::new())
+    when Option::None then
+      type_add_error(env, "internal error: the std::time builtin `instant_now` requires the canonical `Instant` nominal, which is not registered in this compilation (a builtin identity is never substituted by a fresh inference variable)", span)
+      Type::Error
     end
-    return Option::Some(Type::FnPtr(Vec::new(), ret_ty, Vec::new()))
-  end
-  if name == "duration_nanos" || name == "duration_millis" then
+  when BuiltinBinding::DurationNanos | BuiltinBinding::DurationMillis then
     # the seed's duration queries are generic over the input's type and
     # return UInt (str_misc_builtins' params_decl [("T", ts_p2)]).
-    return Option::Some(Type::FnPtr(
+    Type::FnPtr(
       Vec::from([ParamType { ty: fresh_type_var(env), convention: AccessConvention::Let }]),
       Type::UInt,
-      Vec::new()))
+      Vec::new())
   end
-  Option::None
 end
 
 # The bare registered name of a receiver Adt (the type-directed alias
@@ -23300,6 +23375,13 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
       end
       end
     when Option::None then
+      # (imported / aliased values): the current module's explicit import
+      # of this name (the seed's sc_imports authority) types it before the
+      # type-name/variant/unknown chain — an aliased binding has no
+      # scope-0 entry, so this is its only path (part D).
+      match try_imported_callable_value(env, name.clone(), expr.node_id)
+      when Option::Some(ty) then ty
+      when Option::None then
       # Check if the name refers to a registered type (e.g., Vec in Vec::new(),
       # u8 in u8::MAX, etc.) — when a type name appears in expression position
       # as the receiver of a method call or path, treat it as a type reference.
@@ -23351,25 +23433,27 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
           match frontend_intrinsic_fn_type(name.clone())
           when Option::Some(fn_ty) then fn_ty
           when Option::None then
-            # (std::time builtin module symbols): the host/runtime-provided
-            # names the seed's builtin signature table types (instant_now /
-            # duration_nanos / duration_millis). The resolver accepted the
-            # import as ITBuiltin and recorded the synthetic call target;
-            # the TYPE must come from the same signature table, never the
-            # unknown-symbol path (std/bench.tg's measure_single).
-            match builtin_module_symbol_fn_type(env, name.clone())
-            when Option::Some(fn_ty) then fn_ty
+            # (std::time builtin module symbols — SEMANTIC identity): the
+            # resolver recorded WHICH builtin this node resolved from its
+            # import binding (BuiltinBinding per node id). The TYPE comes
+            # from that recorded identity, never from the source spelling:
+            # an unimported bare `instant_now` records no binding and stays
+            # the fail-closed unknown-symbol error (std/bench.tg's
+            # measure_single types through the recorded binding).
+            match builtin_binding_of_node(env, expr.node_id)
+            when Option::Some(binding) then builtin_binding_fn_type(env, binding.clone(), expr.span)
             when Option::None then
               # Unknown identifier: a name that survives type-name, enum-variant
               # and scope lookup is unresolvable. A fresh type variable here has
               # no equation to solve it and would let the construct silently
-  # type-check. Record a TypeError and produce Type::Error so
+   # type-check. Record a TypeError and produce Type::Error so
               # compilation aborts before codegen.
-              type_add_error(env, "unknown symbol `" + name + "`", expr.span)
+               type_add_error(env, "unknown symbol `" + name + "`", expr.span)
               Type::Error
             end
           end
         end
+      end
       end
     end
   when ExprKind::ExprSelfRef then
@@ -24977,6 +25061,13 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
       Type::Error
     end
   when ExprKind::ExprPath(path) then
+    # (std::time builtin module symbols — SEMANTIC identity): a qualified
+    # path the resolver recorded a builtin binding for types from that
+    # binding (std::time::instant_now as a value); the spelling alone is
+    # never the authority.
+    match try_builtin_binding_fn_type(env, expr.node_id, expr.span.clone())
+    when Option::Some(fn_ty) then fn_ty
+    when Option::None then
     match lookup_var(env, path.segments[0])
     when Option::Some(ty) then
  # (final layer): a path whose first segment is a program-level
@@ -25044,7 +25135,27 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
         fresh_type_var(env)
       end
     end
+    end
   when ExprKind::ExprEnumVariant(path, path_type_args, args) then
+    # (std::time builtin module symbols — SEMANTIC identity): the
+    # module-qualified call path shape (`std::time::instant_now()`) types
+    # from the resolver-recorded builtin binding FIRST; every other
+    # 3-segment path keeps the variant/effect surface.
+    match try_builtin_binding_fn_type(env, expr.node_id, expr.span.clone())
+    when Option::Some(fn_ty) then
+      # the builtin callee's arity is checked exactly like any call (the
+      # binding is not a constructor: the argument check is the call's).
+      match fn_ty
+      when Type::FnPtr(params, ret, _) then
+        var bi = 0
+        while bi < args.len() && bi < params.len() do
+          let _ = check_expr(env, &args[bi])
+          bi = bi + 1
+        end
+        ret
+      when _ then fn_ty
+      end
+    when Option::None then
     # The operation-call surface: a std::effects::perform(EFFECT.op, ...)
     # call parses as an ExprEnumVariant (the 3-segment module-qualified
     # call path) — typed against the declared effect's op table BEFORE the
@@ -25058,6 +25169,7 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
       end
     else
       check_enum_variant_construct(env, expr, &path, &path_type_args, &args, expected.clone())
+    end
     end
   when ExprKind::ExprComptime(block) then
     # Rejected at check time with an explicit diagnostic: the MIR has no
@@ -27750,20 +27862,51 @@ def resolve_method_type(inout env: TypeEnv, recv_type: Type, method: String, arg
   # rather than the first `clone` defined in any trait impl.
   match base
   when Type::String then
+    # (String/str builtin surface — the seed's m_string table, typecheck.ml
+    # builtin_methods): the kernel must answer the SAME receiver surface as
+    # the seed for the methods std declares AND the methods std relies on
+    # the builtin table for (parse_float is a FREE function in std/core.tg
+    # but a receiver method in the seed's table; bench.tg's
+    # `parts[1].trim().parse_float()` is the canonical shape). Missing
+    # entries here record `no method ...` + Type::Error and fail the
+    # typed-channel completeness gate late
+    # (HIR_INVALID|std::bench|load_baseline|tuple-literal). The signatures
+    # mirror std/str.tg + std/core.tg byte-for-byte (impl String / impl str)
+    # and the seed's builtin table:
+    #   parse_int()   -> Result[Int, String]
+    #   parse_float() -> Option[Float]
+    #   find(rfind)   -> Option[Int]
+    #   lines/as_bytes/split/chars/bytes -> the RAW view builtin (the
+    #   compiler-scoped loop-consumed iterable form; the SAFE Slice is the
+    #   std shared struct, resolved by impl identity).
     if method == "len" then return Type::Int end
+    if method == "is_empty" then return Type::Bool end
     if method == "to_string" then return Type::String end
+    if method == "as_str" then return Type::String end
     if method == "contains" then return Type::Bool end
     if method == "starts_with" then return Type::Bool end
     if method == "ends_with" then return Type::Bool end
     if method == "slice" then return Type::String end
     if method == "trim" then return Type::String end
+    if method == "trim_matches" then return Type::String end
+    if method == "to_lowercase" then return Type::String end
+    if method == "to_uppercase" then return Type::String end
+    if method == "replace" then return Type::String end
+    if method == "find" then return builtin_adt(env, "Option".to_string(), [Type::Int]) end
+    if method == "rfind" then return builtin_adt(env, "Option".to_string(), [Type::Int]) end
+    if method == "parse_int" then return builtin_adt(env, "Result".to_string(), [Type::Int, Type::String]) end
+    if method == "parse_float" then return builtin_adt(env, "Option".to_string(), [Type::Float]) end
     # The split/chars/bytes results are the Adt form of the registered RAW
     # view builtin (UnsafeSlice — the compiler-scoped loop-consumed
     # iterable forms; the SAFE source-spelled Slice is the shared struct).
     if method == "split" then return builtin_adt(env, "UnsafeSlice".to_string(), [Type::String]) end
+    if method == "lines" then return builtin_adt(env, "UnsafeSlice".to_string(), [Type::String]) end
+    if method == "split_once" then return builtin_adt(env, "Option".to_string(), [Type::Tuple(Vec::from([Type::String, Type::String]))]) end
     if method == "chars" then return builtin_adt(env, "UnsafeSlice".to_string(), [Type::Char]) end
     if method == "bytes" then return builtin_adt(env, "UnsafeSlice".to_string(), [Type::Int]) end
+    if method == "as_bytes" then return builtin_adt(env, "UnsafeSlice".to_string(), [Type::U8]) end
     if method == "push" then return Type::Unit end
+    if method == "push_str" then return Type::Unit end
     # (C3): the seed's String::char_at (its m_string table: the index
     # read yields Char) — the canonical string indexing surface.
     if method == "char_at" then return Type::Char end
@@ -31013,12 +31156,52 @@ def hir_expr_kind_name(kind: ExprKind) -> String
   end  end
 end
 
-# The ONE fingerprint diagnostic: exactly one error is recorded at the
-# first missing/invalid node, then the verifier returns false.
+# The ONE fingerprint diagnostic per failure.  In the default fail-fast
+# mode it records the error and returns false (the walker aborts).  In the
+# all-failures mode (TANGERINE_HIR_REPORT=all) it appends the fingerprint
+# to the report channel and returns TRUE so every walker keeps walking —
+# exactly ONE error (the first failure of the run) is still recorded, so
+# the pre-MIR gate keeps failing the compile at the same coordinate and
+# the report lists everything.
 def verify_hir_fail(inout env: TypeEnv, module_label: String, item_label: String, node_id: Int, kind_name: String, prefix: String, detail: String, span: Span) -> Bool
   let module_field = if module_label.len() > 0 then module_label.clone() else "<root>".to_string() end
-  add_error_with_code(env, prefix + "|" + module_field + "|" + item_label + "|Node=" + node_id.to_string() + "|" + kind_name + "|" + detail, span, "ICE")
-  false
+  let fingerprint = prefix + "|" + module_field + "|" + item_label + "|Node=" + node_id.to_string() + "|" + kind_name + "|" + detail
+  if env.hir_report_all then
+    let is_first = env.hir_report_fingerprints.len() == env.hir_report_base
+    env.hir_report_fingerprints.push(fingerprint.clone())
+    if is_first then
+      add_error_with_code(env, fingerprint, span, "ICE")
+    end
+    true
+  else
+    add_error_with_code(env, fingerprint, span, "ICE")
+    false
+  end
+end
+
+# (all-failures report emission): sorted, deduplicated, capped at 200
+# fingerprints.  Each row is printed as `HIR_REPORT <fingerprint>` (sorted
+# unique) preceded by one `HIR_REPORT mode=all total=<n> shown=<n>` row,
+# so a full closure run's stderr carries the whole enumeration in one
+# pass.
+def verify_hir_emit_report(env: TypeEnv, new_fingerprints: Vec[String]) -> Unit
+  var uniq: Map[String, Bool] = Map::new()
+  for fp in new_fingerprints do
+    uniq.insert(fp.clone(), true)
+  end
+  var rows: Vec[String] = Vec::new()
+  for (k, _v) in uniq.entries() do
+    rows.push(k.clone())
+  end
+  rows.sort()
+  var shown = rows.len()
+  if shown > 200 then shown = 200 end
+  std::io::eprintln("HIR_REPORT mode=all total=" + rows.len().to_string() + " shown=" + shown.to_string())
+  var ri = 0
+  while ri < shown do
+    std::io::eprintln("HIR_REPORT " + rows[ri])
+    ri = ri + 1
+  end
 end
 
 # The node's own record + the lowering-required derived channels.
@@ -31448,33 +31631,68 @@ def verify_hir_fn(inout env: TypeEnv, module_label: String, item_label: String, 
 end
 
 pub def verify_typed_channel_completeness(inout env: TypeEnv, program: Program) -> Bool
+  # (patch 3 item A — all-failures enumeration gate): read the host
+  # environment flag ONCE per run when the mode is not already set.  The
+  # default (unset / any other value) is the historical fail-fast walk.
+  #
+  # The seed VM's closure path does not surface the host process
+  # environment to the guest (probed: std::env::get_env returns None for
+  # PATH too, while the raw extern works in a single-file interpret), so
+  # the same gate is ALSO honored through a flag file the host gates on:
+  # build/hir_report_all.flag.  Either signal turns the mode on; the env
+  # flap stays the documented primary gate.
+  if !env.hir_report_all then
+    match std::env::get_env("TANGERINE_HIR_REPORT")
+    when Option::Some(v) then
+      if v == "all" then env.hir_report_all = true end
+    when Option::None then ()
+    end
+    if !env.hir_report_all && std::fs::file_exists("build/hir_report_all.flag".to_string()) then
+      env.hir_report_all = true
+    end
+  end
+  let base = env.hir_report_fingerprints.len()
+  env.hir_report_base = base
+  var ok = true
   var i = 0
   while i < program.items.len() do
     let item = program.items[i].clone()
     let module_label = crate_module_path_of(program, &item.owner_module).join("::")
     match item.kind
     when ItemKind::ItemFunction(f) then
-      if !verify_hir_fn(env, module_label.clone(), f.name.clone(), &f) then return false end
+      if !verify_hir_fn(env, module_label.clone(), f.name.clone(), &f) then
+        ok = false
+        if !env.hir_report_all then return false end
+      end
     when ItemKind::ItemStruct(s) then
       var fi = 0
       while fi < s.fields.len() do
         match s.fields[fi].default
         when Option::Some(d) then
-          if !verify_hir_expr(env, module_label.clone(), s.name.clone() + "::" + s.fields[fi].name.clone(), &d) then return false end
+          if !verify_hir_expr(env, module_label.clone(), s.name.clone() + "::" + s.fields[fi].name.clone(), &d) then
+            ok = false
+            if !env.hir_report_all then return false end
+          end
         when Option::None then ()
         end
         fi = fi + 1
       end
       var mi = 0
       while mi < s.methods.len() do
-        if !verify_hir_fn(env, module_label.clone(), s.name.clone() + "::" + s.methods[mi].name.clone(), &s.methods[mi]) then return false end
+        if !verify_hir_fn(env, module_label.clone(), s.name.clone() + "::" + s.methods[mi].name.clone(), &s.methods[mi]) then
+          ok = false
+          if !env.hir_report_all then return false end
+        end
         mi = mi + 1
       end
     when ItemKind::ItemImpl(imp) then
       let owner = type_expr_name_of(&imp.for_type)
       var mi = 0
       while mi < imp.methods.len() do
-        if !verify_hir_fn(env, module_label.clone(), owner.clone() + "::" + imp.methods[mi].name.clone(), &imp.methods[mi]) then return false end
+        if !verify_hir_fn(env, module_label.clone(), owner.clone() + "::" + imp.methods[mi].name.clone(), &imp.methods[mi]) then
+          ok = false
+          if !env.hir_report_all then return false end
+        end
         mi = mi + 1
       end
     # trait DEFAULT bodies are deliberately NOT walked: the kernel never
@@ -31485,14 +31703,27 @@ pub def verify_typed_channel_completeness(inout env: TypeEnv, program: Program) 
     # requiring typed records there would flag dead AST (the std::core
     # `Error::source` `Option::None` class), not a lowering input.
     when ItemKind::ItemConst(c) then
-      if !verify_hir_expr(env, module_label.clone(), c.name.clone(), &c.value) then return false end
+      if !verify_hir_expr(env, module_label.clone(), c.name.clone(), &c.value) then
+        ok = false
+        if !env.hir_report_all then return false end
+      end
     when ItemKind::ItemStatic(sd) then
-      if !verify_hir_expr(env, module_label.clone(), sd.name.clone(), &sd.value) then return false end
+      if !verify_hir_expr(env, module_label.clone(), sd.name.clone(), &sd.value) then
+        ok = false
+        if !env.hir_report_all then return false end
+      end
     when _ then ()
     end
     i = i + 1
   end
-  true
+  if env.hir_report_all then
+    let new_fps = env.hir_report_fingerprints.slice(base, env.hir_report_fingerprints.len())
+    if new_fps.len() > 0 then
+      verify_hir_emit_report(env, new_fps)
+    end
+    return !(env.hir_report_fingerprints.len() > base)
+  end
+  ok
 end
 
 def scan_deinit_plan_types(env: TypeEnv, plan: DeinitPlan, inout has_error: Bool, inout has_var: Bool) -> Unit

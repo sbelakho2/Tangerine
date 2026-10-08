@@ -133,6 +133,13 @@ let () =
     if lower then (try Sys.remove lower_flag with Sys_error _ -> ());
     if lower_merged then (try Sys.remove lower_merged_flag with Sys_error _ -> ())
   in
+  (* (patch 3 item A): exercise the kernel verifier's all-failures mode
+     END TO END through the host environment read (the guest's
+     std::env::get_env maps to the process environment). The mode only
+     changes REPORTING: the first failure still records exactly one error
+     and the verifier still returns false, so every existing assertion
+     keeps its verdict. *)
+  Unix.putenv "TANGERINE_HIR_REPORT" "all";
   match
     Driver.run_bootstrap_closure ~repo_root
       ~manifest_path:"bootstrap/infer_mini.manifest" ~target ~entry:None
@@ -258,6 +265,43 @@ let () =
                naming that node. *)
             fail
               "the typed-channel completeness battery failed (expected `HIR_COMPLETE_BATTERY fails=0`; see the report above)"
+          else if not (contains report "HIR_ALL_FAILURES_BATTERY fails=0") then
+            (* patch 3 item A: with the all-failures mode forced, two
+               deleted typed records must produce >= 2 unique fingerprints
+               while exactly one error (the first failure) is recorded and
+               the verifier still fails. *)
+            fail
+              "the all-failures enumeration battery failed (expected `HIR_ALL_FAILURES_BATTERY fails=0`; see the report above)"
+          else if not (contains report "BUILTIN_STRING_BATTERY fails=0") then
+            (* patch 3 item B: the kernel builtin String/str surface —
+               split/index/trim/parse_float (the std/bench.tg
+               load_baseline shape) and the parse_int/replace/is_empty/
+               prefix family must type Error/Var-free with readiness. *)
+            fail
+              "the builtin String surface battery failed (expected `BUILTIN_STRING_BATTERY fails=0`; see the report above)"
+          else if not (contains report "IMPORTED_DEFAULTS_BATTERY fails=0") then
+            (* patch 3 item D: imported (`use values::{X}`) and aliased
+               (`use values::X as Y`) values in a field default must
+               resolve/typecheck/verify with the recorded GbConst identity,
+               and inline-module resolution must never abort the VM. *)
+            fail
+              "the imported/aliased defaults battery failed (expected `IMPORTED_DEFAULTS_BATTERY fails=0`; see the report above)"
+          else if not (contains report "TIME_BINDING_BATTERY fails=0") then
+            (* patch 3 item E: std::time builtin identities by semantic
+               binding — exact/alias/qualified/local-shadow accepted; the
+               unimported spelling and a missing canonical Instant are
+               rejected (never a fresh inference variable). *)
+            fail
+              "the std::time semantic binding battery failed (expected `TIME_BINDING_BATTERY fails=0`; see the report above)"
+          else if not (contains report "RUNTIME_PARITY_BATTERY fails=0") then
+            (* Patch 4: the kernel runtime-parity battery — the kernel's
+               lowered aggregate operands / static identities / solved
+               channels for the tg_kernel_runtime_parity corpus must
+               equal the expected observables shared with the OCaml lane
+               (a blocked or mismatched case, or a byte-drift of the
+               cases file, reports a nonzero row here). *)
+            fail
+              "the kernel runtime-parity battery failed (expected `RUNTIME_PARITY_BATTERY fails=0`; see the report above)"
           else if not (contains report "TOTALS errors=") then
             fail "the probe produced no TOTALS row"
           else if merged && not (contains report "IMPLCONF=0") then

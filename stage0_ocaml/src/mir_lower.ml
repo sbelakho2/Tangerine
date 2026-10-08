@@ -1253,43 +1253,34 @@ let registry_field_of (env : func_env) (tid : Ids.Type_id.t) (fname : string) :
    base type's arguments).  Fails closed on every unresolvable case. *)
 (* (semantic name identity): the lowering-side consumers of the
    checker's recorded global bindings.  The recorded key is the CHECKER's
-   resolution; the flat lowering tables key consts by qualified+bare and
-   statics by BARE name (the bare-name authority Commit B removes), so
-   consumption falls back from the exact key to its bare suffix — never
-   to the source spelling of a different expression. *)
-let bare_key_of (key : string) : string =
-  match String.rindex_opt key ':' with
-  | Some i -> String.sub key (i + 1) (String.length key - i - 1)
-  | None -> key
-
+   resolution and MUST match the lowering table exactly: the flat
+   lowering consts table carries qualified+bare keys (const_values), and
+   the statics table carries the checker's exact registry keys
+   (lowering_env_of emits every entry under its own key — the former
+   bare-only spelling that forced a suffix fallback is gone).  A
+   recorded key absent from the table is a checker/lowerer contradiction
+   and fails closed; NEVER re-resolve from a bare suffix. *)
 let recorded_const_operand (env : func_env) (key : string) :
     Seed_mir.operand * Type_repr.t =
-  let found =
-    match List.assoc_opt key env.consts with
-    | Some r -> Some r
-    | None -> List.assoc_opt (bare_key_of key) env.consts
-  in
-  match found with
+  match List.assoc_opt key env.consts with
   | Some (ty, c) -> (Seed_mir.Constant c, ty)
   | None ->
       seed_bug
         "recorded const binding `%s` is absent from the lowering consts table"
         key
 
-let recorded_static_operand (env : func_env) (key : string) :
-    Seed_mir.operand * Type_repr.t =
-  let found =
-    match List.assoc_opt key env.statics with
-    | Some r -> Some r
-    | None -> List.assoc_opt (bare_key_of key) env.statics
-  in
-  match found with
-  | Some (idx, ty) ->
-      (Seed_mir.Copy { Seed_mir.root = Seed_mir.Static idx; projections = [] }, ty)
+let recorded_static_slot (env : func_env) (key : string) : int * Type_repr.t =
+  match List.assoc_opt key env.statics with
+  | Some slot -> slot
   | None ->
       seed_bug
-        "recorded static binding `%s` is absent from the lowering statics table"
+        "recorded static binding `%s` is absent from the lowering statics table (exact-key lookup; no bare-suffix fallback)"
         key
+
+let recorded_static_operand (env : func_env) (key : string) :
+    Seed_mir.operand * Type_repr.t =
+  let idx, ty = recorded_static_slot env key in
+  (Seed_mir.Copy { Seed_mir.root = Seed_mir.Static idx; projections = [] }, ty)
 
 let rec field_projection_of (env : func_env) (bty : Type_repr.t) (fname : string) :
     Seed_mir.projection list * Type_repr.t =
@@ -1496,13 +1487,7 @@ and lower_inout_address_argument (env : func_env) (st : lower_state)
    literal as Int_literal, solving the kind only later through the
    enclosing call/return context). *)
 and lower_expr ?(expect : Type_repr.t option)
-    (* (no-fallback audit scope): true ONLY along an assignment target's
-       place spine.  The checker's check_place resolves target bases
-       (typecheck.ml check_place: Name/Field/Index/Deref roots) WITHOUT
-       recording typed_name_bindings, so those nodes legitimately lack a
-       record; every checker-recorded READ context keeps place_base=false
-       and stays fail-closed on a missing record. *)
-    ?(place_base = false) (env : func_env) (st : lower_state)
+    (env : func_env) (st : lower_state)
     (e : Ast.expr) : Seed_mir.operand * Type_repr.t =
   match e with
   | Ast.IntLit (nid, lit, _) -> (
@@ -1597,12 +1582,13 @@ and lower_expr ?(expect : Type_repr.t option)
          scope, are then checker/lowerer contradictions and fail closed
          naming the node — NEVER re-resolved from the source spelling.
          The spelling/table fallback below survives ONLY for hand-built
-         selfcheck environments (empty channel, bindings_complete=false),
-         for synthetic nodes (Ast.synthetic_node_id) the checker never
-         saw, and for the place base of an assignment target
-         (place_base=true: the checker's check_place does not record name
-         bindings for target roots — a documented checker gap, NOT a
-         recorded identity being ignored). *)
+         selfcheck environments (empty channel, bindings_complete=false)
+         and for synthetic nodes (Ast.synthetic_node_id) the checker never
+         saw.  Assignment-target place roots (`x.f = v`, `*p = v`) now
+         record NB_local / NB_static in check_place exactly like reads, so
+         the former place_base exemption is gone: with bindings_complete a
+         checker-seen Name in ANY position must have a binding or the
+         lowering fails closed naming the node. *)
       let lower_local () : Seed_mir.operand * Type_repr.t =
         match List.assoc_opt n st.scope with
         | Some id -> (
@@ -1691,7 +1677,7 @@ and lower_expr ?(expect : Type_repr.t option)
       | Some Typecheck.NB_local ->
           if st.bindings_complete then lower_local () else lower_by_spelling ()
       | None ->
-          if st.bindings_complete && nid <> Ast.synthetic_node_id && not place_base
+          if st.bindings_complete && nid <> Ast.synthetic_node_id
           then
             seed_bug
               "identifier `%s` (node #%d, file#%d:%d) has no checker-recorded name binding — the typed channel is complete for this compilation, so this is a checker/lowerer contradiction (fail-closed; no spelling-based fallback)"
@@ -1791,7 +1777,7 @@ and lower_expr ?(expect : Type_repr.t option)
              by its container); it is never a bitwise Copy of a
              possibly-owning pointee and never a Move (a Move would
              write the Moved hole into the payload). *)
-          let io, it = lower_expr ~place_base env st inner in
+          let io, it = lower_expr env st inner in
           let p = materialize_place st io in
           (* the generic-pointer model: a deref of an UNINSTANTIATED
              generic operand passes the operand through (`*item` in
@@ -2019,7 +2005,7 @@ and lower_expr ?(expect : Type_repr.t option)
           (copy_place st (cur_place st id), rt)
       | other -> seed_bug "macro invocation `%s!` is not lowered (only vec! is available)" other)
   | Ast.Index (_, base, idx, _) -> (
-      let base_op, base_ty = lower_expr ~place_base env st base in
+      let base_op, base_ty = lower_expr env st base in
       let bp = materialize_place st base_op in
       let elem_ty = element_type_of env base_ty in
       match idx with
@@ -2061,7 +2047,7 @@ and lower_expr ?(expect : Type_repr.t option)
          registry (func_env.struct_fields) and emit the semantic FieldId
          projection with the derived type (tuples project positionally
          with ConstantIndex).  Every unresolvable field fails closed. *)
-      let bop, bty = lower_expr ~place_base env st base in
+      let bop, bty = lower_expr env st base in
       let bp = materialize_place st bop in
       let projs, fty = field_projection_of env bty fname in
       (* the field VALUE of a non-Copy field type is a place READ, never
@@ -2147,24 +2133,70 @@ and lower_expr ?(expect : Type_repr.t option)
        let vo, vt = lower_expr env st value in
       let vo = assign_value vt vo in
       (match target with
-  | Ast.Name (_, n, _) -> (
-           match List.assoc_opt n st.scope with
-           | Some id ->
-               emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo))
-           | None -> (
-               match List.assoc_opt n env.statics with
-               | Some (idx, _) ->
-                   (* the GLOBAL write: store into the statics slot *)
-                   emit st
-                     (Seed_mir.Assign
-                        ( { Seed_mir.root = Seed_mir.Static idx; projections = [] },
-                          Seed_mir.Use vo ))
-               | None -> (
-                  match List.assoc_opt n env.values with
-                      | Some ty ->
-                          let id = fresh_local st ty in
-                          emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo))
-                      | None -> seed_bug "assignment to unknown value '%s'" n)))
+  | Ast.Name (nid, n, span) -> (
+            (* (semantic assignment targets — patch 3 item C + F): the
+               checker's check_place records the place root's semantic
+               binding (NB_local for locals, the exact NB_static key for
+               mutable statics).  The lowering consumes THAT record — two
+               modules' same-named `static mut CELL` never alias (each
+               NB_static key names its own lowering slot).  With
+               bindings_complete a checker-seen target Name has a record
+               or the lowering fails closed; the spelling/table fallback
+               survives only for hand-built selfcheck envs and synthetic
+               nodes. *)
+            match Hashtbl.find_opt env.name_bindings nid with
+            | Some (Typecheck.NB_static key) ->
+                let idx, _ty = recorded_static_slot env key in
+                emit st
+                  ( Seed_mir.Assign
+                      ( { Seed_mir.root = Seed_mir.Static idx; projections = [] },
+                        Seed_mir.Use vo ) )
+            | Some Typecheck.NB_local ->
+                (match List.assoc_opt n st.scope with
+                 | Some id ->
+                     emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo))
+                 | None ->
+                     if st.bindings_complete then
+                       seed_bug
+                         "identifier `%s` (node #%d, file#%d:%d) is checker-resolved as a LOCAL on an assignment target but the lowering scope has no binding — checker/lowerer scope mismatch (fail-closed)"
+                         n (Ids.Node_id.to_int nid) span.Span.file_id span.Span.start
+                     else
+                       seed_bug "assignment to unknown local '%s'" n)
+            | Some (Typecheck.NB_const key) ->
+                seed_bug
+                  "assignment target `%s` (node #%d) resolved to const `%s` — a const is not an assignable place (checker/lowerer contradiction)"
+                  n (Ids.Node_id.to_int nid) key
+            | Some (Typecheck.NB_value key) ->
+                seed_bug
+                  "assignment target `%s` (node #%d) resolved to function value `%s` (checker/lowerer contradiction)"
+                  n (Ids.Node_id.to_int nid) key
+            | Some (Typecheck.NB_ctor key) ->
+                seed_bug
+                  "assignment target `%s` (node #%d) resolved to constructor `%s` (checker/lowerer contradiction)"
+                  n (Ids.Node_id.to_int nid) key
+            | None ->
+                if st.bindings_complete && nid <> Ast.synthetic_node_id then
+                  seed_bug
+                    "identifier `%s` (node #%d, file#%d:%d) has no checker-recorded name binding on an assignment target — the typed channel is complete for this compilation (fail-closed; no spelling-based fallback)"
+                    n (Ids.Node_id.to_int nid) span.Span.file_id span.Span.start
+                else
+                  (match List.assoc_opt n st.scope with
+                   | Some id ->
+                       emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo))
+                   | None -> (
+                       match List.assoc_opt n env.statics with
+                       | Some (idx, _) ->
+                           (* the GLOBAL write: store into the statics slot *)
+                           emit st
+                             ( Seed_mir.Assign
+                                 ( { Seed_mir.root = Seed_mir.Static idx; projections = [] },
+                                   Seed_mir.Use vo ) )
+                       | None -> (
+                           match List.assoc_opt n env.values with
+                           | Some ty ->
+                               let id = fresh_local st ty in
+                               emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use vo))
+                           | None -> seed_bug "assignment to unknown value '%s'" n))))
        | Ast.Field (_, base, fname, _) ->
            (* the typed-place writeback rule (E9036 retirement): the
               target base lowers to a place and the field resolves
@@ -2177,7 +2209,7 @@ and lower_expr ?(expect : Type_repr.t option)
               + initialization).  The writeback re-initializes the
               projected component (the moved-remainder semantics: the
                root aggregate stays initialized). *)
-            let bop, bty = lower_expr ~place_base:true env st base in
+            let bop, bty = lower_expr env st base in
             let bp = materialize_place st bop in
             let projs, fty = field_projection_of env bty fname in
            ignore fty;
@@ -2190,7 +2222,7 @@ and lower_expr ?(expect : Type_repr.t option)
               local and emits the dynamic `Index <local>` projection —
               the same scheme as the read path (the VM bounds-checks the
                runtime index value at execution). *)
-            let bop, bty = lower_expr ~place_base:true env st base in
+            let bop, bty = lower_expr env st base in
             let bp = materialize_place st bop in
             let elem_ty = element_type_of env bty in
            ignore elem_ty;
@@ -2226,7 +2258,7 @@ and lower_expr ?(expect : Type_repr.t option)
               the non-pointer local would be the verifier's
               deref-on-non-pointer finding — the mirror of the
                read-side pass-through below). *)
-            let bop, bty = lower_expr ~place_base:true env st base in
+            let bop, bty = lower_expr env st base in
             let bp = materialize_place st bop in
            let pointer_base =
              match bty with

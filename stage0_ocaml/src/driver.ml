@@ -338,9 +338,11 @@ let closure_statics (env : Typecheck.env) (items : Ast.item list) :
   let mutable_of (n : string) : bool =
     (* re-audit review fix: the registry key is module-qualified
        (`mod::X`) while the decl's st_name is the bare identifier —
-       match on the bare-name suffix, and FAIL CLOSED (immutable) when
-       no declaration is found, so the MIR verifier's write rejection
-       is the defense, never bypassed by a name-shape miss *)
+       match the EXACT qualified declaration first (patch 3 item C: two
+       modules' same-named statics must take their own mutability), then
+       the bare-name suffix, and FAIL CLOSED (immutable) when no
+       declaration is found, so the MIR verifier's write rejection is
+       the defense, never bypassed by a name-shape miss *)
     let bare_of name =
       match String.rindex_opt name ':' with
       | Some k when k + 1 < String.length name ->
@@ -348,14 +350,26 @@ let closure_statics (env : Typecheck.env) (items : Ast.item list) :
       | _ -> name
     in
     let nbare = bare_of n in
-    let rec find_mut = function
-      | [] -> false
+    let rec find_exact = function
+      | [] -> None
       | i :: rest -> (
           match i.Ast.kind with
-          | Ast.StaticDecl d when bare_of d.Ast.st_name = nbare -> d.Ast.st_mutable
-          | _ -> find_mut rest)
+          | Ast.StaticDecl d
+            when Typecheck.qualified_name i.Ast.module_path d.Ast.st_name = n ->
+              Some d.Ast.st_mutable
+          | _ -> find_exact rest)
     in
-    find_mut items
+    match find_exact items with
+    | Some m -> m
+    | None ->
+        let rec find_mut = function
+          | [] -> false
+          | i :: rest -> (
+              match i.Ast.kind with
+              | Ast.StaticDecl d when bare_of d.Ast.st_name = nbare -> d.Ast.st_mutable
+              | _ -> find_mut rest)
+        in
+        find_mut items
   in
   Array.of_list
     (List.filter_map
@@ -725,13 +739,15 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
   (* the GLOBAL-storage channel (the audit's mutable statics): the
      static name -> (program.statics index, type) — the SAME filtered
      order closure_statics builds (non-generic consts), so -1 - idx
-     addresses the VM's statics slot *)
+     addresses the VM's statics slot.
+
+     (semantic assignment targets — patch 3 item C): the checker records
+     the EXACT statics-registry key it used (NB_static; check_place and
+     check_name share the key), so the lowering table must carry exactly
+     that key.  The former bare-only keying aliased two modules'
+     same-named `static mut CELL` onto the first slot (the mutable-static
+     collision); every entry now resolves under its own registry key. *)
   let statics =
-    let bare_of (q : string) : string =
-      match List.rev (String.split_on_char ':' q) with
-      | x :: _ -> x
-      | [] -> q
-    in
     (* the STATICS registry is the assignable global universe (the
        ConstId vs StaticId separation) — the lowering's global slots
        come from here, never from the immutable consts *)
@@ -745,9 +761,7 @@ let lowering_env_of ?(items : Ast.item list = []) (env : Typecheck.env) : Mir_lo
           let idx =
             List.length (List.filter (fun (_, t) -> not (Type_repr.has_type_param t)) prefix)
           in
-          (* the lowering addresses globals by their BARE name — the
-             same single-file module-path convention the checker uses *)
-          Some (bare_of n, (idx, ty)))
+          Some (n, (idx, ty)))
       env.Typecheck.statics
   in
   {

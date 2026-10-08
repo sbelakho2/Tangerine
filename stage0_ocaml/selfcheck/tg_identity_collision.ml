@@ -37,6 +37,7 @@ let src = {|
 module a
   const X: Int = 1
   const STATE: Int = 10
+  static mut CELL: Int = 10
 
   struct Config
     n: Int = 111
@@ -58,11 +59,19 @@ module a
   end
 
   def value() -> Int = X + STATE
+
+  def set() -> Int
+    CELL = 11
+    CELL
+  end
+
+  def cell() -> Int = CELL
 end
 
 module b
   const X: Int = 2
   const STATE: Int = 20
+  static mut CELL: Int = 20
 
   struct Config
     text: String
@@ -85,6 +94,60 @@ module b
   end
 
   def value() -> Int = X + STATE
+
+  def set() -> Int
+    CELL = 22
+    CELL
+  end
+
+  def cell() -> Int = CELL
+
+  # (patch 3 item F): sequence BOTH modules' writes and reads inside ONE
+  # VM entry — `a::set`/`a::cell` are spelled module-qualified (module `a`
+  # has no parser ambiguity), while the bare `set`/`cell` resolve to THIS
+  # module's own items (module b). The seed parser reserves the bare
+  # prefix `b` for byte-string literals, so `b::set()` cannot be spelled
+  # at the root; the module-local spelling is the exact same semantic
+  # call. The combined value encodes xa=11, xb=22, read_a=11, read_b=22.
+  def run_both() -> Int
+    let xa = a::set()
+    let xb = set()
+    let read_a = a::cell()
+    let read_b = cell()
+    xa * 1000000 + xb * 10000 + read_a * 100 + read_b
+  end
+end
+|}
+
+(* (patch 3 item D — imported / aliased values): a two-FILE in-memory
+   closure. The manifest is built over a throwaway repo root containing
+   `stage0_ocaml/selfcheck/values.tg` and `stage0_ocaml/selfcheck/main.tg`
+   (the manifest loader's `selfcheck:` record kind), so module `main`
+   imports the sibling `values` with an exact group import and an ALIASED
+   group import, and two struct-field DEFAULTS consume them. The whole
+   chain check -> lower -> verify -> VM is exercised (compute must return
+   X*100 + W = 705). *)
+let import_values_src = {|
+const X: Int = 7
+const W: Int = 5
+|}
+
+let import_main_src = {|
+use stage0_ocaml::selfcheck::values::{X}
+use stage0_ocaml::selfcheck::values::{W as Y}
+
+struct S
+  base: Int = X
+end
+
+struct T
+  extra: Int = Y
+end
+
+def compute() -> Int
+  let s = S {}
+  let t = T {}
+  s.base * 100 + t.extra
 end
 |}
 
@@ -94,11 +157,11 @@ let fail (msg : string) : 'a =
 
 (* ── parse -> graph -> resolver -> checker fixpoint over the closure ── *)
 
-let build () :
+let build_snapshot (source : string) :
     Typecheck.env * Ast.program * Module_graph.t * Bootstrap_manifest.t =
   let file = Filename.temp_file "tg_identity_collision" ".tg" in
   let oc = open_out_bin file in
-  output_string oc src;
+  output_string oc source;
   close_out oc;
   let manifest =
     match Bootstrap_manifest.single ~file ~path:[] () with
@@ -139,6 +202,82 @@ let build () :
   let env = fix (Typecheck.initial_env ~resolved:(Some resolved) ()) 6 in
   Sys.remove file;
   (env, prog_ast, graph, manifest)
+
+let build () = build_snapshot src
+
+(* Two-file in-memory closure behind a throwaway repo root. The merged
+   program concatenates both file modules' items (each item keeps its
+   graph-stamped module_path), and the checker fixpoint runs over it. *)
+let build_imports () :
+    Typecheck.env * Ast.program * Module_graph.t * Bootstrap_manifest.t =
+  let root = Filename.temp_file "tg_identity_imports" "" in
+  Sys.remove root;
+  Unix.mkdir root 0o755;
+  let rec ensure p =
+    if not (Sys.file_exists p) then begin
+      ensure (Filename.dirname p);
+      try Unix.mkdir p 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+    end
+  in
+  let dir = Filename.concat root "stage0_ocaml/selfcheck" in
+  ensure dir;
+  let write path s =
+    let oc = open_out_bin path in
+    output_string oc s;
+    close_out oc
+  in
+  write (Filename.concat dir "values.tg") import_values_src;
+  write (Filename.concat dir "main.tg") import_main_src;
+  let manifest_path = Filename.concat root "manifest.txt" in
+  write manifest_path "version: 1\nselfcheck: values.tg\nselfcheck: main.tg\n";
+  let manifest =
+    match Bootstrap_manifest.load ~repo_root:root ~manifest_path with
+    | Ok m -> m
+    | Error e -> fail ("imports manifest: " ^ e)
+  in
+  let diags = Diagnostic.create_bag () in
+  let graph = Module_graph.create_with_sources manifest diags in
+  if Diagnostic.has_errors diags then begin
+    Printf.printf "%s\n" (Diagnostic.render (Module_graph.source_map graph) diags);
+    fail "imports parse errors"
+  end;
+  let resolved = Resolver.resolve manifest graph diags in
+  if Diagnostic.has_errors diags then begin
+    Printf.printf "%s\n" (Diagnostic.render (Module_graph.source_map graph) diags);
+    fail "imports resolution errors"
+  end;
+  let values_node =
+    match Module_graph.find_module_by_path graph [ "stage0_ocaml"; "selfcheck"; "values" ] with
+    | Some n -> n
+    | None -> fail "no values module node"
+  in
+  let main_node =
+    match Module_graph.find_module_by_path graph [ "stage0_ocaml"; "selfcheck"; "main" ] with
+    | Some n -> n
+    | None -> fail "no main module node"
+  in
+  let merged =
+    {
+      (values_node.Module_graph.node_program) with
+      Ast.items =
+        values_node.Module_graph.node_program.Ast.items
+        @ main_node.Module_graph.node_program.Ast.items;
+    }
+  in
+  let rec fix env n =
+    match Typecheck.check_program env merged with
+    | Error m -> fail ("imports typecheck: " ^ m)
+    | Ok (env', errors) ->
+        if errors = [] then env'
+        else if n = 0 then begin
+          Printf.printf "imports check errors:\n";
+          List.iter (fun e -> Printf.printf "  %s\n" e) errors;
+          fail (Printf.sprintf "%d imports checker error(s)" (List.length errors))
+        end
+        else fix env' (n - 1)
+  in
+  let env = fix (Typecheck.initial_env ~resolved:(Some resolved) ()) 6 in
+  (env, merged, graph, manifest)
 
 (* ── semantic-separation assertions on the typed env ────────────────── *)
 
@@ -195,11 +334,26 @@ let assert_separation (env : Typecheck.env) : unit =
   let tb = List.assoc "b::make" env.Typecheck.functions in
   (match ta.Typecheck.ts_return, tb.Typecheck.ts_return with
    | Type_repr.Int _, Type_repr.Int _ -> ()
-   | _ -> fail "make does not return Int in both modules")
+   | _ -> fail "make does not return Int in both modules");
+  (* (patch 3 item F): the two mutable statics are DISTINCT registry
+     entries under their module-qualified keys — the lowering must never
+     alias them. *)
+  if not (List.mem_assoc "a::CELL" env.Typecheck.statics) then
+    fail "a::CELL is not registered under its qualified static key";
+  if not (List.mem_assoc "b::CELL" env.Typecheck.statics) then
+    fail "b::CELL is not registered under its qualified static key";
+  let a_cell_idx =
+    List.find_index (fun (k, _) -> k = "a::CELL") env.Typecheck.statics
+  and b_cell_idx =
+    List.find_index (fun (k, _) -> k = "b::CELL") env.Typecheck.statics
+  in
+  if a_cell_idx = b_cell_idx then fail "a::CELL and b::CELL share one registry row"
 
 (* ── lowering + MIR verify + VM execution ──────────────────────────── *)
 
-let lower_and_run (env : Typecheck.env) (graph : Module_graph.t) : unit =
+let lower_and_run (env : Typecheck.env) (graph : Module_graph.t)
+    (targets_expect : (string * string) list) :
+    (string * Type_repr.t * Seed_mir.function_) list =
   (* every declaration item of the closure (the root file node carries
      the module wrappers; the inline child nodes carry the inner items) *)
   let all_items =
@@ -212,7 +366,7 @@ let lower_and_run (env : Typecheck.env) (graph : Module_graph.t) : unit =
   let typed_for_patterns_tbl = Driver.typed_for_patterns_table_of env in
   let typed_let_patterns_tbl = Driver.typed_let_patterns_table_of env in
   let variants = Driver.user_variant_table env in
-  let targets = [ "a::make"; "b::make"; "a::value"; "b::value" ] in
+  let targets = List.map fst targets_expect in
   let decl_of (qname : string) : Ast.function_decl =
     let rec find = function
       | [] -> fail ("no AST declaration for `" ^ qname ^ "`")
@@ -287,9 +441,7 @@ let lower_and_run (env : Typecheck.env) (graph : Module_graph.t) : unit =
        Printf.printf "MIR template verify errors:\n";
        List.iter (fun e -> Printf.printf "  %s\n" e) errs;
        fail "Mir_verify.require_valid_template rejected the program");
-  let expect =
-    [ ("a::make", "12"); ("b::make", "1"); ("a::value", "11"); ("b::value", "22") ]
-  in
+  let expect = targets_expect in
   List.iter
     (fun qname ->
       match List.assoc_opt qname expect with
@@ -312,12 +464,79 @@ let lower_and_run (env : Typecheck.env) (graph : Module_graph.t) : unit =
                   if got <> expected then
                     fail
                       (Printf.sprintf "`%s` returned %s, expected %s" qname got expected)))
-    targets
+    targets;
+  lowered
+
+(* (patch 3 item F): after lowering, the two same-named mutable statics
+   must address DISTINCT static slots — if the lowering had aliased them
+   to one slot, b::set would clobber a::CELL and the VM reads below would
+   report 22/22. *)
+let assert_static_slot_separation (lowered : (string * Type_repr.t * Seed_mir.function_) list) : unit =
+  let static_write_index (fn : Seed_mir.function_) : int =
+    let rec scan_stmts = function
+      | [] -> None
+      | (st : Seed_mir.statement) :: rest -> (
+          match st with
+          | Seed_mir.Assign ({ Seed_mir.root = Seed_mir.Static idx; _ }, _) -> Some idx
+          | _ -> scan_stmts rest)
+    in
+    let rec scan_blocks i =
+      if i >= Array.length fn.Seed_mir.blocks then None
+      else
+        match scan_stmts fn.Seed_mir.blocks.(i).Seed_mir.statements with
+        | Some idx -> Some idx
+        | None -> scan_blocks (i + 1)
+    in
+    match scan_blocks 0 with
+    | Some idx -> idx
+    | None -> fail ("no static Assign found in `" ^ fn.Seed_mir.name ^ "`")
+  in
+  let fn_of qname =
+    let _, _, f = List.find (fun (n, _, _) -> n = qname) lowered in
+    f
+  in
+  let idx_a = static_write_index (fn_of "a::set") in
+  let idx_b = static_write_index (fn_of "b::set") in
+  if idx_a = idx_b then
+    fail
+      (Printf.sprintf
+         "a::set and b::set write the SAME static slot %d (mutable-static aliasing)"
+         idx_a);
+  Printf.printf "static slots: a::CELL=%d b::CELL=%d (distinct) PASS\n" idx_a idx_b
 
 let () =
   let env, _prog_ast, graph, _manifest = build () in
   assert_separation env;
-  lower_and_run env graph;
+  let collision_targets =
+    [
+      ("a::make", "12");
+      ("b::make", "1");
+      ("a::value", "11");
+      ("b::value", "22");
+      (* item F: each module's set() returns its OWN cell value ... *)
+      ("a::set", "11");
+      ("b::set", "22");
+      (* ... cell() in a fresh VM reads the INITIAL value of its OWN
+         module's static (10 / 20), and b::run_both's single VM observes
+         the write sequence: xa=11, xb=22, read_a=11, read_b=22 ->
+         11221122. *)
+      ("a::cell", "10");
+      ("b::cell", "20");
+      ("b::run_both", "11221122");
+    ]
+  in
+  let lowered = lower_and_run env graph collision_targets in
+  assert_static_slot_separation lowered;
+  (* item D: imported + aliased defaults resolve/typecheck/lower/execute. *)
+  let ienv, _iprog, igraph, _imanifest = build_imports () in
+  let _ =
+    lower_and_run ienv igraph
+      [ ("stage0_ocaml::selfcheck::main::compute", "705") ]
+  in
   Printf.printf
     "PASS: identity collision modules a/b are semantically separated (check+lower+verify+VM)\n";
+  Printf.printf
+    "PASS: mutable statics a::CELL/b::CELL stay distinct through both writes\n";
+  Printf.printf
+    "PASS: imported/aliased defaults (use values::{X}, use values::{W as Y}) execute (705)\n";
   Selfcheck_sentinel.emit_and_exit "tg_identity_collision"

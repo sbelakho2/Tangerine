@@ -816,6 +816,53 @@ let imported_type_qkey (env : env) (name : string) : (string * bool) option =
             | _ -> None
           else None))
 
+(* (patch 3 item D — imported / aliased values): the VALUE counterpart of
+   def_decl_qkey: map a resolver value DefId (function / test / const /
+   static) to the checker's qualified registry key.  The resolver's
+   explicit/aliased/group import bindings are then consulted by name, so
+   `use values::{X}` and `use values::{W as Y}` type the imported name in
+   the importing module's scope (declaration-scope struct-field defaults
+   included). *)
+let def_value_qkey (env : env) (def : Ids.def_id) : string option =
+  match env.resolved with
+  | None -> None
+  | Some rp -> (
+      match Module_graph.find_module_by_id rp.Resolver.graph def.Ids.module_id with
+      | None -> None
+      | Some node -> (
+          match List.nth_opt node.Module_graph.node_items def.Ids.index with
+          | None -> None
+          | Some it ->
+              let name =
+                match it.Ast.kind with
+                | Ast.Function d -> Some d.Ast.fn_sig.Ast.sig_name
+                | Ast.TestDecl d -> Some d.Ast.test_name
+                | Ast.ConstDecl d -> Some d.Ast.c_name
+                | Ast.StaticDecl d -> Some d.Ast.st_name
+                | _ -> None
+              in
+              (match name with
+               | Some n -> Some (qkey_of_path node.Module_graph.node_path n)
+               | None -> None)))
+
+let imported_value_qkey (env : env) (name : string) : string option =
+  match env.resolved with
+  | None -> None
+  | Some rp -> (
+      match Resolver.resolve_value_name rp env.module_id name with
+      | Resolver.Resolved def -> def_value_qkey env def
+      | _ -> (
+          (* a fully-qualified spelling (`mod::sub::name`) names the
+             declaration directly *)
+          if String.contains name ':' then
+            match
+              Resolver.resolve_qualified rp env.module_id
+                (String.split_on_char ':' name |> List.filter (fun s -> s <> ""))
+            with
+            | Resolver.Resolved (Resolver.PTItem def) -> def_value_qkey env def
+            | _ -> None
+          else None))
+
 (* the base resolution chain shared by types and nominals: returns
    (registry_key, entry, nominal_option) *)
 let type_entity_here (env : env) (name : string) :
@@ -6817,36 +6864,48 @@ and check_binary (box_tid : Ids.Type_id.t option)
 
 and check_place (env : env) (scope : scope) (e : Ast.expr) : (Type_repr.t * bool, string) result =
   match e with
-  | Ast.Name (_, n, span) -> (
+  | Ast.Name (nid, n, span) -> (
       match assoc_local n scope.locals with
-      | Some (t, mutable_) -> Ok (t, mutable_)
+      | Some (t, mutable_) ->
+          (* (semantic assignment targets — patch 3 item C): the place
+             ROOT records its semantic binding exactly like check_name:
+             the lowering consumes the checker's record by node id and
+             never re-resolves the source spelling. *)
+          Hashtbl.replace env.typed_name_bindings nid NB_local;
+          Ok (t, mutable_)
       | None -> (
           (* a MUTABLE STATIC is an assignable global — a CONST is
              immutable and must never be a place (the audit's ConstId
              vs StaticId separation): resolve through the statics
              registry (module-qualified, then the bare name, then the
-             unique `::name` suffix for the single-file path mismatch) *)
+             unique `::name` suffix for the single-file path mismatch).
+             The helper returns the key ACTUALLY USED, so the recorded
+             NB_static identity is the lowering table's exact key. *)
           let statics_lookup n =
             let qualified =
               match env.module_path with
               | [] -> None
-              | mp -> static_of_name env (String.concat "::" (mp @ [ n ]))
+              | mp ->
+                  let k = String.concat "::" (mp @ [ n ]) in
+                  (match static_of_name env k with Some t -> Some (k, t) | None -> None)
             in
             match qualified with
-            | Some t -> Some t
+            | Some r -> Some r
             | None -> (
                 match static_of_name env n with
-                | Some t -> Some t
+                | Some t -> Some (n, t)
                 | None -> (
                     let suffix = "::" ^ n in
                     match
                       List.find_opt (fun (k, _) -> Util.has_suffix k suffix) env.statics
                     with
-                    | Some (_, t) -> Some t
+                    | Some (k, t) -> Some (k, t)
                     | None -> None))
           in
           match statics_lookup n with
-          | Some t -> Ok (t, true)
+          | Some (key, t) ->
+              Hashtbl.replace env.typed_name_bindings nid (NB_static key);
+              Ok (t, true)
           | None ->
               (* a CONST read is a VALUE, not a place *)
               Error (err span (Printf.sprintf "unknown variable `%s`" n))))
@@ -7221,11 +7280,107 @@ and check_name (env : env) (scope : scope) (expected : Type_repr.t option)
                                      te_span = span;
                                      te_flow = normal_flow (ty);
                                    }
-                             | None ->
-                                 env.state.oracle.o_unresolved_calls <-
-                                   env.state.oracle.o_unresolved_calls + 1;
-                                 Error
-                                   (err span (Printf.sprintf "unknown name `%s`" n)))))))))
+                              | None -> (
+                                  (* (patch 3 item D — imported / aliased
+                                     values): the name may be an explicit
+                                     or ALIASED module import (the
+                                     resolver's sc_imports authority) with
+                                     no bare declaration; type it from the
+                                     imported declaration's registry key.
+                                     An aliased const has no scope-0 entry,
+                                     so this is its only checker path. *)
+                                  match imported_value_qkey env n with
+                                  | Some key -> (
+                                      match const_of_name env key with
+                                      | Some t ->
+                                          Hashtbl.replace env.typed_name_bindings node_id
+                                            (NB_const key);
+                                          let subst = ref [] in
+                                          let* _ =
+                                            match expected with
+                                            | Some exp -> (
+                                                match unify env.state.box_tid subst t exp with
+                                                | Ok () -> Ok ()
+                                                | Error m -> Error m)
+                                            | None -> Ok ()
+                                          in
+                                          Ok
+                                            {
+                                              te_type = substitute_fixpoint !subst t;
+                                              te_effects = [| Access_effect.Read |];
+                                              te_span = span;
+                                              te_flow = normal_flow (substitute_fixpoint !subst t);
+                                            }
+                                      | None -> (
+                                          match static_of_name env key with
+                                          | Some t ->
+                                              Hashtbl.replace env.typed_name_bindings node_id
+                                                (NB_static key);
+                                              let subst = ref [] in
+                                              let* _ =
+                                                match expected with
+                                                | Some exp -> (
+                                                    match unify env.state.box_tid subst t exp with
+                                                    | Ok () -> Ok ()
+                                                    | Error m -> Error m)
+                                                | None -> Ok ()
+                                              in
+                                              Ok
+                                                {
+                                                  te_type = substitute_fixpoint !subst t;
+                                                  te_effects = [| Access_effect.Read |];
+                                                  te_span = span;
+                                                  te_flow = normal_flow (substitute_fixpoint !subst t);
+                                                }
+                                          | None -> (
+                                              match function_of_name env key with
+                                              | Some fs ->
+                                                  Hashtbl.replace env.typed_name_bindings node_id
+                                                    (NB_value key);
+                                                  let fn_ty = Type_repr.Function (fs.ts_params, fs.ts_return) in
+                                                  (match expected with
+                                                   | Some (Type_repr.Function (ps, r)) ->
+                                                       let subst = ref [] in
+                                                       (match
+                                                          unify env.state.box_tid subst fn_ty
+                                                            (Type_repr.Function (ps, r))
+                                                        with
+                                                        | Ok () ->
+                                                            Ok
+                                                              {
+                                                                te_type = fn_ty;
+                                                                te_effects = [| Access_effect.Read |];
+                                                                te_span = span;
+                                                                te_flow = normal_flow (fn_ty);
+                                                              }
+                                                        | Error m ->
+                                                            Error
+                                                              (err span
+                                                                 (Printf.sprintf
+                                                                    "imported function `%s` has type %s, incompatible with the expected function type (%s)"
+                                                                    n (type_to_string fn_ty) m)))
+                                                   | _ ->
+                                                       if Array.length fs.ts_params = 0 then
+                                                         check_call_sig env scope expected node_id fs
+                                                           [] [] span ~hint:CCH_function
+                                                       else
+                                                         Error
+                                                           (err span
+                                                              (Printf.sprintf
+                                                                 "`%s` is an imported function; call it with arguments (or pass it where a function type is expected)"
+                                                                 n)))
+                                              | None ->
+                                                  env.state.oracle.o_unresolved_calls <-
+                                                    env.state.oracle.o_unresolved_calls + 1;
+                                                  Error
+                                                    (err span
+                                                       (Printf.sprintf
+                                                          "unknown name `%s` (import binding `%s` names no registered value)"
+                                                          n key)))))
+                                  | None ->
+                                      env.state.oracle.o_unresolved_calls <-
+                                        env.state.oracle.o_unresolved_calls + 1;
+                                      Error (err span (Printf.sprintf "unknown name `%s`" n))))))))))
 
 and return_unify_err (span : Span.span) (a : Type_repr.t) (b : Type_repr.t) (m : string) :
     (typed_expr, string) result =
@@ -9242,6 +9397,19 @@ and check_item (env : env) (item : Ast.item) : (unit, string) result =
      several modules) would otherwise keep env.module_path stale and
      cross-wire module-scoped name resolution. *)
   let env = { env with module_path = item.Ast.module_path } in
+  (* (import bindings): module_id must follow the item's owner module too
+     — the resolver's resolve_value_name/type_name APIs are keyed by
+     ModuleId, and a merged walk over several modules must not query the
+     previous item's module.  Derived from the item's module path through
+     the resolved graph. *)
+  let env =
+    match env.resolved with
+    | Some rp -> (
+        match Module_graph.module_id_of_path rp.Resolver.graph item.Ast.module_path with
+        | Some mid -> { env with module_id = mid }
+        | None -> env)
+    | None -> env
+  in
   match item.Ast.kind with
   | Ast.Function d -> check_function_item env item.module_path d
   | Ast.TestDecl d -> (

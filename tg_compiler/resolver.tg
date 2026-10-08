@@ -192,6 +192,18 @@ struct ImportSymbol
   span: Span
 end
 
+# (patch 3 item E — std::time builtin module symbols): the SEMANTIC
+# identity of a host/runtime-provided module symbol the resolver accepted
+# as ITBuiltin (is_builtin_module_symbol). Recorded per resolved
+# expression NODE id in ResolvedNames.builtin_bindings, so the type
+# checker's signature lookup is keyed by the resolution (exact import,
+# aliased import, or qualified path), never by the source spelling.
+enum BuiltinBinding
+  InstantNow
+  DurationNanos
+  DurationMillis
+end
+
 # ———————————————————————————————————————————————————————————————
 # Resolved References
 # ———————————————————————————————————————————————————————————————
@@ -271,6 +283,13 @@ struct ResolvedNames
   # resolver's own bare_name_index stays the phase-3 lookup).
   symbol_suffix_index: Map[String, Vec[(String, DefId)]]
 
+  # (patch 3 item E — std::time builtin identity): resolved expression
+  # node id -> the semantic BuiltinBinding the resolver accepted for it
+  # (exact import / aliased import / qualified path). The type checker
+  # types the node from THIS record; an unimported spelling has no entry
+  # and stays the fail-closed unknown-symbol error.
+  builtin_bindings: Map[Int, BuiltinBinding]
+
   # Stable IDs for incremental compilation
   stable_ids: StableIdMap
 end
@@ -322,6 +341,7 @@ impl Clone for ResolvedNames
     out.def_kinds = __intrinsic_map_clone(self.def_kinds)
     out.import_bindings = __intrinsic_map_clone(self.import_bindings)
     out.symbol_suffix_index = __intrinsic_map_clone(self.symbol_suffix_index)
+    out.builtin_bindings = __intrinsic_map_clone(self.builtin_bindings)
     out.stable_ids = self.stable_ids.clone()
     out
   end
@@ -763,6 +783,7 @@ pub def resolved_names_empty() -> ResolvedNames
     def_kinds: Map::new(),
     import_bindings: Map::new(),
     symbol_suffix_index: Map::new(),
+    builtin_bindings: Map::new(),
     stable_ids: stable_id_map_new()
   }
 end
@@ -1324,11 +1345,25 @@ def add_item_to_symbols(inout ctx: ResolutionContext, item: Item, module_path: V
     qualified_path.push(seg.clone())
   end
   var qualified_regs = Vec::new()
- # The root-tree current module (inline-nested): it carries NO name
+  # The root-tree current module (inline-nested): it carries NO name
   # maps anymore (the bare-name mirror is are not part of the model) — it survives ONLY as
   # the inline-module structure (ItemModule's submodule registration) and
   # the import lists (ItemUse).
-  let module = get_current_module(&mut ctx.symbols)
+  #
+  # (fail-closed, NEVER a VM abort): the ModuleSymbols copies threaded
+  # through this walk do not always persist their submodule inserts, so an
+  # inner item of an inline module can find its chain missing.  A missing
+  # chain records a resolver diagnostic here and continues registration on
+  # the per-module table (module_table_for — the registration authority),
+  # instead of the former Option::expect trap
+  # ("module not found in add_item_to_symbols").
+  let module = match get_current_module(&mut ctx.symbols)
+  when Option::Some(m) then m
+  when Option::None then
+    rs_add_error(&mut ctx.symbols, ResolutionErrorKind::UnresolvedModule,
+      "internal resolver error: the inline-module tree has no entry for `" + qualified_path.join("::") + "`; registration continues on the per-module symbol table", item.span.clone())
+    module_symbols_new(qualified_path.join("::"), owner_module.id)
+  end
   let mtab = module_table_for(ctx, &qualified_path, owner_module)
 
   match item.kind
@@ -1736,12 +1771,15 @@ def add_item_to_symbols(inout ctx: ResolutionContext, item: Item, module_path: V
   end
 end
 
-def get_current_module(inout symbols: SymbolTable) -> ModuleSymbols
+def get_current_module(inout symbols: SymbolTable) -> Option[ModuleSymbols]
   var module = symbols.root
   for segment in symbols.current_module do
-    module = module.submodules.get(&segment).expect("module not found")
+    match module.submodules.get(&segment)
+    when Option::Some(sub) then module = sub
+    when Option::None then return Option::None
+    end
   end
-  module
+  Option::Some(module)
 end
 
 def extract_params(params: Vec[Param]) -> Vec[(String, Option[TypeExpr])]
@@ -2494,7 +2532,13 @@ def resolve_path(inout ctx: ResolutionContext, path: Vec[String], node_id: Int, 
   end
 
   # Try resolving as module path
- # record the call target when the path names a registered top-level
+  # (std::time builtin qualified path — semantic identity): a path that
+  # spells a bound builtin module symbol directly
+  # (`std::time::instant_now`) records the BuiltinBinding for its node so
+  # the checker types it from the resolution; no import is required for
+  # the fully-qualified form.
+  record_builtin_path_binding(ctx, path.clone(), node_id)
+  # record the call target when the path names a registered top-level
   # function (full-path or import-alias form) — purely additive; a path that
   # names no registered function records nothing and keeps the name-based
   # fallback, and no new error behavior is introduced.
@@ -2625,6 +2669,47 @@ def is_builtin_module_symbol(path: Vec[String], name: String) -> Bool
        name == "duration_millis" || name == "duration_secs_f64")) ||
    (path[0] == "tg_compiler" && path[1] == "ast" && name == "Function") ||
    (path[0] == "tg_compiler" && path[1] == "parser" && (name == "Parser" || name == "ParseError")))
+end
+
+# (patch 3 item E — std::time builtin identity): map a builtin module
+# path + target name to its semantic BuiltinBinding. The only bound
+# identities: std::time::instant_now / duration_nanos / duration_millis.
+# duration_secs_f64 stays OUT (the seed's functions table carries no
+# signature for it — resolution-only acceptance).
+def builtin_binding_of_module_path(module_path: Vec[String], target_name: String) -> Option[BuiltinBinding]
+  if module_path.len() == 2 && module_path[0] == "std" && module_path[1] == "time" then
+    if target_name == "instant_now" then return Option::Some(BuiltinBinding::InstantNow) end
+    if target_name == "duration_nanos" then return Option::Some(BuiltinBinding::DurationNanos) end
+    if target_name == "duration_millis" then return Option::Some(BuiltinBinding::DurationMillis) end
+  end
+  Option::None
+end
+
+def builtin_binding_of_import(imp: ImportSymbol) -> Option[BuiltinBinding]
+  if imp.path.len() < 2 then return Option::None end
+  var mp = Vec::new()
+  var i = 0
+  while i < imp.path.len() - 1 do
+    mp.push(imp.path[i].clone())
+    i = i + 1
+  end
+  builtin_binding_of_module_path(mp, imp.path[imp.path.len() - 1])
+end
+
+# Record the semantic binding for a resolved expression node when the
+# (module path, target name) pair is a bound builtin; no-op otherwise.
+def record_builtin_path_binding(inout ctx: ResolutionContext, path: Vec[String], node_id: Int) -> Unit
+  if path.len() < 2 then return end
+  var mp = Vec::new()
+  var i = 0
+  while i < path.len() - 1 do
+    mp.push(path[i].clone())
+    i = i + 1
+  end
+  match builtin_binding_of_module_path(mp, path[path.len() - 1])
+  when Option::Some(binding) then ctx.resolved.builtin_bindings.insert(node_id, binding)
+  when Option::None then ()
+  end
 end
 
 # The bound NAME of one flattened use-import (flatten_use_decl's binding
@@ -2889,6 +2974,20 @@ def resolve_via_imports(inout ctx: ResolutionContext, name: String, node_id: Int
     # is the typed authority). Record the synthetic runtime-intrinsic
     # DefId (the same identity domain the __intrinsic_* registrations
     # use) so the call keeps an ID-based target.
+    #
+    # (semantic builtin identity — patch 3 item E): also record WHICH
+    # builtin this node resolved (BuiltinBinding keyed by node id) so the
+    # type checker's signature lookup is keyed by the resolution, never
+    # by the source spelling. An aliased import (`use std::time::
+    # instant_now as now`) arrives here through the same binding.
+    match explicit_import_for(ctx, name.clone())
+    when Option::Some(imp) then
+      match builtin_binding_of_import(imp)
+      when Option::Some(binding) then ctx.resolved.builtin_bindings.insert(node_id, binding)
+      when Option::None then ()
+      end
+    when Option::None then ()
+    end
     let bidx = ctx.next_builtin_index
     ctx.next_builtin_index = ctx.next_builtin_index + 1
     let bdid = DefId {
@@ -2953,7 +3052,10 @@ def resolve_via_imports_path(inout ctx: ResolutionContext, path: Vec[String], sp
     return false
   end
 
-  let module = get_current_module_ref(&mut ctx.symbols)
+  let module = match get_current_module_ref(&mut ctx.symbols)
+  when Option::Some(m) then m
+  when Option::None then return false
+  end
 
   # Check exact imports (use foo::bar::Baz)
   for import in module.imports do
@@ -3033,22 +3135,28 @@ def record_path_call_target(inout ctx: ResolutionContext, path: Vec[String], nod
   if path.len() < 2 then return end
   var key_attempts: Vec[Vec[String]] = Vec::new()
   key_attempts.push(path.clone())
-  let module = get_current_module_ref(&mut ctx.symbols)
-  for import in module.imports do
-    if import.path.is_empty() then next end
-    let import_alias = match import.alias_name
-    when Option::Some(alias_val) then alias_val.clone()
-    when Option::None then import.path[import.path.len() - 1].clone()
-    end
-    if import_alias == path[0] then
-      var cand = import.path.clone()
-      var pi = 1
-      while pi < path.len() do
-        cand.push(path[pi].clone())
-        pi = pi + 1
+  # (import-alias expansion): visible imports of the current module — a
+  # missing inline-tree chain simply means no visible imports (never an
+  # abort).
+  match get_current_module_ref(&mut ctx.symbols)
+  when Option::Some(module) then
+    for import in module.imports do
+      if import.path.is_empty() then next end
+      let import_alias = match import.alias_name
+      when Option::Some(alias_val) then alias_val.clone()
+      when Option::None then import.path[import.path.len() - 1].clone()
       end
-      key_attempts.push(cand)
+      if import_alias == path[0] then
+        var cand = import.path.clone()
+        var pi = 1
+        while pi < path.len() do
+          cand.push(path[pi].clone())
+          pi = pi + 1
+        end
+        key_attempts.push(cand)
+      end
     end
+  when Option::None then ()
   end
   for cand in key_attempts do
     if cand.len() < 2 then next end
@@ -3099,7 +3207,10 @@ end
 
 def resolve_type_via_imports(inout ctx: ResolutionContext, path: Vec[String]) -> Bool
   # Check if type is imported
-  let module = get_current_module_ref(&mut ctx.symbols)
+  let module = match get_current_module_ref(&mut ctx.symbols)
+  when Option::Some(m) then m
+  when Option::None then return false
+  end
 
   for import in module.imports do
     if import.path == path.clone() then
@@ -3147,12 +3258,15 @@ def lookup_local(inout ctx: ResolutionContext, name: String) -> Option[ResolverL
   Option::None
 end
 
-def get_current_module_ref(inout symbols: SymbolTable) -> ModuleSymbols
+def get_current_module_ref(inout symbols: SymbolTable) -> Option[ModuleSymbols]
   var module = symbols.root
   for seg in symbols.current_module do
-    module = module.submodules.get(&seg).expect("module not found")
+    match module.submodules.get(&seg)
+    when Option::Some(sub) then module = sub
+    when Option::None then return Option::None
+    end
   end
-  module
+  Option::Some(module)
 end
 
 def symbol_index_of(module: ModuleSymbols, name: String) -> Option[UInt]
@@ -3504,6 +3618,10 @@ def resolve_expr(inout ctx: ResolutionContext, expr: Expr) -> Unit
     # name from its DefId. No error is added for unresolvable paths (the
     # pre-existing behavior for this expression form is silent; the MIR
     # name-based fallback covers those shapes).
+    # (std::time builtin identity — patch 3 item E): a fully-qualified
+    # builtin call path (`std::time::instant_now(...)`) records its
+    # semantic BuiltinBinding for the checker's signature lookup.
+    record_builtin_path_binding(ctx, path.segments.clone(), expr.node_id)
     record_path_call_target(ctx, &path.segments, expr.node_id)
 
   when ExprKind::ExprStructLit(path, fields) then

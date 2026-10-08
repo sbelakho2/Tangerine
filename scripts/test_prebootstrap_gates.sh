@@ -461,7 +461,12 @@ else
 fi
 check_pin "authorization refuses unbounded hosts (no escape)" scripts/check_ocaml_bootstrap_complete.sh   'unbounded authorization path'
 check_pin "the env gate rejects unbounded final runs" scripts/prebootstrap_env_gate.sh   'TG_ALLOW_UNBOUNDED_FINAL'
-check_pin "RSS measurement is declared Linux-only" stage0_ocaml/src/vm.ml   'Measurement is Linux-only'
+check_pin "RSS measurement is three-tier (/proc -> Mach -> unavailable)" stage0_ocaml/src/vm.ml   'Linux /proc -> Mach task_info -> 0'
+check_pin "the seed builds the native RSS stub" stage0_ocaml/src/dune   '\(foreign_stubs'
+check_pin "the seed stub file is rss_stubs" stage0_ocaml/src/dune   '\(names rss_stubs\)'
+check_pin "the stub measures via Mach task_info on Apple" stage0_ocaml/src/rss_stubs.c   'task_info\(mach_task_self\(\), MACH_TASK_BASIC_INFO,'
+check_pin "the stub keeps the non-Apple branch unavailable" stage0_ocaml/src/rss_stubs.c   'return 1;'
+check_pin "the seed VM selfcheck exercises the linked RSS stub" stage0_ocaml/selfcheck/tg_vmsem.ml   'Vm.tg_rss_bytes'
 check_pin "the Clone value test is discriminating (0/1/2 clones)" tests/unit/test_collections_clone_semantics.tg   'assert_eq\(v.value, 2\)'
 check_pin "the Clone test covers custom KEY Clone" tests/unit/test_collections_clone_semantics.tg   'test_map_clone_invokes_each_key_clone_exactly_once'
 
@@ -647,8 +652,12 @@ fi
 # authorization-like sentinel.
 check_pin "slice generator exists and prints SLICE lines" scripts/bootstrap_slices.py 'SLICE K='
 check_pin "slice runner exists and checks the semantic gate" scripts/run_bootstrap_slices.sh 'FRONTEND_SEMANTIC_GATE'
+# The sentinel hunt is word-bounded: a tool legitimately mentioning the
+# gate's own banner ("BOOTSTRAP COMPLETENESS GATE") is not claiming the
+# authorization line; "BOOTSTRAP COMPLETE" as a standalone token (at
+# line end or followed by punctuation, e.g. ": PASS") is.
 for _slice_tool in scripts/bootstrap_slices.py scripts/run_bootstrap_slices.sh; do
-  if grep -q 'BOOTSTRAP COMPLETE' "$ROOT/$_slice_tool" 2>/dev/null; then
+  if grep -qE 'BOOTSTRAP COMPLETE([^A-Za-z]|$)' "$ROOT/$_slice_tool" 2>/dev/null; then
     bad "slice tool can emit an authorization sentinel: ${_slice_tool}"
   else
     pass "slice tool cannot emit an authorization sentinel: ${_slice_tool}"
@@ -669,8 +678,12 @@ no_fallback_pins_ok() { # <mir_lower.ml> <mir.tg>
   # the ONE spelling fallback confined to lower_by_spelling (the bare
   # const-table lookup must appear inside it, after its definition)
   local nbody
-  nbody="$(sed -n '/| Ast.Name (nid, n, span) -> (/,/| Ast.Path (_, a, b, span) ->/p' "$ml")"
-  printf '%s\n' "$nbody" | grep -qF 'if st.bindings_complete && nid <> Ast.synthetic_node_id && not place_base' || ok=0
+  # (patch 3 item C): anchor the range on the read arm's unique
+  # no-fallback comment — the assignment-target Name arm now shares the
+  # `| Ast.Name (nid, n, span) -> (` spelling, and a plain sed range would
+  # restart there and run to EOF (pipefail + grep -q SIGPIPE).
+  nbody="$(sed -n '/(semantic name identity — the no-fallback audit)/,/| Ast.Path (_, a, b, span) ->/p' "$ml")"
+  printf '%s\n' "$nbody" | grep -qF 'if st.bindings_complete && nid <> Ast.synthetic_node_id' || ok=0
   printf '%s\n' "$nbody" | grep -qF 'has no checker-recorded name binding' || ok=0
   printf '%s\n' "$nbody" | grep -qF 'let lower_by_spelling' || ok=0
   [ "$(printf '%s\n' "$nbody" | grep -cF 'List.assoc_opt n env.consts')" = 1 ] || ok=0
@@ -701,7 +714,7 @@ fi
 # Mutation A: drop the seed completeness gate -> the pin must go red.
 mut_seed="$TMP/mir_lower_nofb_mut.ml"
 cp "$ROOT/stage0_ocaml/src/mir_lower.ml" "$mut_seed"
-sed 's/if st.bindings_complete && nid <> Ast.synthetic_node_id && not place_base/if false then/' \
+sed 's/if st.bindings_complete && nid <> Ast.synthetic_node_id/if false then/' \
   "$mut_seed" >"$mut_seed.new" && mv "$mut_seed.new" "$mut_seed"
 if no_fallback_pins_ok "$mut_seed" "$ROOT/tg_compiler/mir.tg"; then
   bad "no-fallback mutation accepted: seed typed-name channel gate removed"
@@ -732,12 +745,88 @@ check_pin "prebootstrap runs the parity selfcheck" scripts/prebootstrap_quick.sh
 check_pin "metrics recorder emits the peak RSS field" scripts/profile_record_metrics.sh 'PEAK_RSS_MIB='
 check_pin "repin tool emits the steps-limited proposal" scripts/repin_bootstrap_limits.py 'steps_limit'
 for _repin_tool in scripts/profile_record_metrics.sh scripts/repin_bootstrap_limits.py; do
-  if grep -q 'BOOTSTRAP COMPLETE' "$ROOT/$_repin_tool" 2>/dev/null; then
+  if grep -qE 'BOOTSTRAP COMPLETE([^A-Za-z]|$)' "$ROOT/$_repin_tool" 2>/dev/null; then
     bad "profiling/repin tool can emit an authorization sentinel: ${_repin_tool}"
   else
     pass "profiling/repin tool cannot emit an authorization sentinel: ${_repin_tool}"
   fi
 done
+
+# ── 11. final-gate RSS host classification (three-tier) ──────────────
+# The authorization gate must treat Darwin as RSS-measurable (the seed's
+# native Mach task_info stub) while still refusing hosts with neither
+# /proc nor Mach.  This evaluates the gate script's OWN case statement
+# with a mocked uname, so the check cannot drift from the implementation
+# it guards.
+rss_case_src="$(sed -n '/^case "\$(uname -s/,/^esac$/p' "$ROOT/scripts/check_ocaml_bootstrap_complete.sh")"
+if [ -z "$rss_case_src" ]; then
+  bad "final-gate RSS case block not found"
+else
+  rss_classify() { # <uname -s output> -> "1" supported / "0" refused
+    local os="$1"
+    (
+      uname() { printf '%s' "$os"; }
+      FINAL_RSS_SUPPORTED=0
+      eval "$rss_case_src"
+      printf '%s' "$FINAL_RSS_SUPPORTED"
+    )
+  }
+  for spec in Linux:1 Darwin:1 FreeBSD:0; do
+    os="${spec%%:*}"
+    want="${spec##*:}"
+    got="$(rss_classify "$os")"
+    if [ "$got" = "$want" ]; then
+      pass "final-gate RSS host classification: ${os} -> supported=${want}"
+    else
+      bad "final-gate RSS host classification: ${os} -> supported=${got}, want ${want}"
+    fi
+  done
+fi
+
+# ── 12. calibration authority (schema-2 evidence) ────────────────────
+# The standalone and aggregate profilers own the calibration input: the
+# pinned toolchain check + dune build run BEFORE any measurement header,
+# the header carries the repo/seed/manifest identity, and the child exit
+# code is appended.  The repinner accepts ONLY strict schema-2 PASS
+# evidence (the mutation matrix below proves it), and neither profiler
+# can emit the authorization line.
+check_pin "standalone profiler verifies the pinned toolchain" scripts/profile_ocaml_bootstrap.sh 'check_ocaml_toolchain.sh'
+check_pin "standalone profiler builds before measuring" scripts/profile_ocaml_bootstrap.sh 'dune build'
+check_pin "standalone profiler emits the schema-2 header" scripts/profile_ocaml_bootstrap.sh 'PROFILE_SCHEMA=2'
+check_pin "standalone profiler emits the seed hash" scripts/profile_ocaml_bootstrap.sh 'SEED_SHA256='
+check_pin "standalone profiler emits the manifest hash" scripts/profile_ocaml_bootstrap.sh 'MANIFEST_SHA256='
+check_pin "standalone profiler emits the tree-clean bit" scripts/profile_ocaml_bootstrap.sh 'RUN_TREE_CLEAN='
+check_pin "standalone profiler emits the child exit code" scripts/profile_ocaml_bootstrap.sh 'RUN_EXIT='
+check_pin "aggregate profiler runs the real gate executable" scripts/profile_ocaml_bootstrap_gate.sh 'tg_bootstrap_gate.exe'
+check_pin "aggregate profiler has a non-executing dry run" scripts/profile_ocaml_bootstrap_gate.sh -- '--dry-run'
+check_pin "aggregate profiler appends the gate wall clock" scripts/profile_ocaml_bootstrap_gate.sh 'AGGREGATE_WALL_S='
+check_pin "recorder recognizes only the exact standalone sentinel" scripts/profile_record_metrics.sh 'TANGERINE_SELFCHECK_PASS name=tg_bootstrap_selfcheck version=1'
+check_pin "recorder emits the selfcheck result" scripts/profile_record_metrics.sh 'SELFCHECK_RESULT='
+check_pin "recorder emits the schema-2 RUN_EXIT" scripts/profile_record_metrics.sh 'RUN_EXIT='
+check_pin "recorder sections the aggregate VMs" scripts/profile_record_metrics.sh 'VM_A_FINAL_STEPS='
+check_pin "recorder detects the log kind" scripts/profile_record_metrics.sh 'LOG_KIND='
+check_pin "recorder parses the gate wall clock" scripts/profile_record_metrics.sh 'AGGREGATE_WALL_S='
+check_pin "repinner derives GATE_TIMEOUT_S from aggregate wall" scripts/repin_bootstrap_limits.py 'AGGREGATE_WALL_S'
+check_pin "repinner requires a clean tree" scripts/repin_bootstrap_limits.py 'RUN_TREE_CLEAN'
+check_pin "repinner rejects failure fingerprints" scripts/repin_bootstrap_limits.py 'FAILURE_FINGERPRINT'
+for _cal_tool in scripts/profile_ocaml_bootstrap.sh scripts/profile_ocaml_bootstrap_gate.sh; do
+  if grep -qE 'BOOTSTRAP COMPLETE([^A-Za-z]|$)' "$ROOT/$_cal_tool" 2>/dev/null; then
+    bad "calibration profiler can emit an authorization sentinel: ${_cal_tool}"
+  else
+    pass "calibration profiler cannot emit an authorization sentinel: ${_cal_tool}"
+  fi
+done
+# No echo/printf seam may synthesize the authorization line either.
+if grep -qE 'echo.*BOOTSTRAP COMPLETE|printf.*BOOTSTRAP COMPLETE' "$ROOT/scripts/profile_ocaml_bootstrap_gate.sh"; then
+  bad "aggregate profiler has an echo/printf seam for the authorization sentinel"
+else
+  pass "aggregate profiler has no echo/printf seam for the authorization sentinel"
+fi
+if bash "$ROOT/scripts/test_repin_evidence.sh"; then
+  pass "repin evidence mutation matrix (all cases correct)"
+else
+  bad "repin evidence mutation matrix failed"
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "test_prebootstrap_gates: FAIL"
