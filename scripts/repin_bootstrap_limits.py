@@ -15,6 +15,25 @@ with the plan's margins:
                      (only when BOTH logs carry WALL_PHASE_SUM_S; otherwise
                      the existing outer timeout is left unchanged with a note)
 
+CALIBRATION EVIDENCE (unconditional, dry-run AND --apply): a metric
+block is calibration material only when BOTH runs report
+STATUS=COMPLETED, RUN_OUTCOME=PASS, SELFCHECK_RESULT=PASS, RUN_EXIT=0,
+FAILURE_FINGERPRINT=NONE and RUN_TREE_CLEAN=1, and when every identity
+field (RUN_SHA, RUN_TARGET, CLOSURE_FINGERPRINT, RUN_GC_POLICY,
+SEED_SHA256, MANIFEST_SHA256) is present (non-UNKNOWN) and EQUAL across
+the pair.  UNKNOWN/missing/mismatch is a HARD failure — there is no
+warning fallback (an earlier revision accepted STATUS=COMPLETED plus
+RUN_OUTCOME=FAIL, i.e. a failed compiler run, as calibration material).
+
+Proposals map the block kind (LOG_KIND):
+  standalone  FINAL_STEPS/HOST_CALLS/ALLOC_BYTES/PEAK_RSS_MIB and
+              WALL_PHASE_SUM_S of the single preflight VM (VM B).
+  aggregate   max over the relevant VM A + VM B measurements
+              (VM_*_FINAL_STEPS / VM_*_HOST_CALLS / VM_*_ALLOC_BYTES /
+              VM_*_PEAK_RSS_MIB) and AGGREGATE_WALL_S for GATE_TIMEOUT_S;
+              when an aggregate field is absent the standalone field of
+              the same metric is used with an explicit note.
+
 The dry run is the default: it prints the proposal table and a unified
 diff of the pinned constants.  --apply rewrites ONLY those constants in
 the gate script (scripts/check_ocaml_bootstrap_complete.sh by default;
@@ -58,6 +77,18 @@ DRIVER_PINS = {
     "alloc_bytes": r'(env_budget "TANGERINE_BOOTSTRAP_VM_MAX_ALLOC" )(\d[\d_]*)()',
     "rss_mib": r'(env_budget "TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB" )(\d[\d_]*)( \* 1024 \* 1024)',
 }
+
+# Identity fields that must be present and equal across the cold+warm pair.
+IDENTITY_EQUAL_FIELDS = (
+    "RUN_SHA",
+    "RUN_TARGET",
+    "CLOSURE_FINGERPRINT",
+    "RUN_GC_POLICY",
+    "SEED_SHA256",
+    "MANIFEST_SHA256",
+)
+
+UNKNOWN_TOKENS = ("", "UNKNOWN", "none", "NONE")
 
 
 def usage(msg: str | None = None) -> "NoReturn":  # noqa: F821
@@ -160,145 +191,282 @@ def ceil10pct(x: int) -> int:
 
 
 def validate(cold: dict[str, str], warm: dict[str, str], opts: dict) -> list[str]:
-    """Returns warnings; exits 2 on a hard validation failure."""
+    """Unconditional strict validation: exits 2 on ANY bad evidence.
+
+    Both blocks must prove a completed, PASSING, clean-tree run with a
+    zero exit code and no failure fingerprint, and every identity field
+    must be present and equal.  There is deliberately NO warning fallback
+    (a COMPLETED run whose compiler outcome FAILED is not calibration
+    material).  Returns an empty warning list for callers that print it.
+    """
     errors: list[str] = []
-    warnings: list[str] = []
-    for name, m in (("cold", cold), ("warm", warm)):
+    runs = (("cold", cold), ("warm", warm))
+
+    for name, m in runs:
         status = m.get("STATUS", "UNKNOWN")
         if status != "COMPLETED":
             errors.append(f"{name} block STATUS={status}, want COMPLETED")
-        if m.get("RUN_OUTCOME", "UNKNOWN") == "FAIL":
-            warnings.append(
-                f"{name} block reports RUN_OUTCOME=FAIL (the VM summary exists but"
-                " the log's selfcheck did not pass); budget numbers are still"
-                " VM-completion measurements"
+        outcome = m.get("RUN_OUTCOME", "UNKNOWN")
+        if outcome != "PASS":
+            errors.append(f"{name} block RUN_OUTCOME={outcome}, want PASS")
+        selfcheck = m.get("SELFCHECK_RESULT", "UNKNOWN")
+        if selfcheck != "PASS":
+            errors.append(f"{name} block SELFCHECK_RESULT={selfcheck}, want PASS")
+        run_exit = m.get("RUN_EXIT", "UNKNOWN")
+        if not re.fullmatch(r"\d+", run_exit) or int(run_exit) != 0:
+            errors.append(f"{name} block RUN_EXIT={run_exit}, want exactly 0")
+        ff = m.get("FAILURE_FINGERPRINT", "")
+        if not ff:
+            legacy = m.get("FIRST_FAILURE_FINGERPRINT", "")
+            ff = "NONE" if legacy == "none" else legacy
+        if ff != "NONE":
+            errors.append(f"{name} block FAILURE_FINGERPRINT={ff or 'missing'}, want NONE")
+        tree_clean = m.get("RUN_TREE_CLEAN", "UNKNOWN")
+        if tree_clean != "1":
+            errors.append(
+                f"{name} block RUN_TREE_CLEAN={tree_clean}, want 1 (a dirty tree"
+                " is not calibration material)"
             )
+        kind = m.get("LOG_KIND", "UNKNOWN")
+        if kind not in ("standalone", "aggregate"):
+            errors.append(f"{name} block LOG_KIND={kind}, want standalone|aggregate")
+        for key in IDENTITY_EQUAL_FIELDS:
+            val = m.get(key, "UNKNOWN")
+            if val in UNKNOWN_TOKENS:
+                errors.append(f"{name} block {key}={val or 'missing'}, want a known value")
 
-    shas = {}
-    for name, m in (("cold", cold), ("warm", warm)):
-        sha = m.get("RUN_SHA", "UNKNOWN")
-        if sha not in ("", "UNKNOWN"):
-            shas[name] = sha
-    if opts["sha"]:
-        shas["cli"] = opts["sha"]
-    if len(set(shas.values())) > 1:
-        errors.append(f"RUN_SHA mismatch: {shas}")
-    elif not shas:
-        warnings.append(
-            "RUN_SHA absent from both blocks (and no --sha given): same-tree"
-            " identity is NOT verified beyond this warning"
-        )
-
-    targets = {}
-    for name, m in (("cold", cold), ("warm", warm)):
-        tgt = m.get("RUN_TARGET", "UNKNOWN")
-        if tgt not in ("", "UNKNOWN"):
-            targets[name] = tgt
-    if opts["target"]:
-        targets["cli"] = opts["target"]
-    if len(set(targets.values())) > 1:
-        errors.append(f"RUN_TARGET mismatch: {targets}")
-    elif not targets:
-        warnings.append(
-            "RUN_TARGET absent from both blocks (and no --target given): the"
-            " same target triple is NOT verified beyond this warning"
-        )
-
-    fps = {
-        name: m.get("CLOSURE_FINGERPRINT", "UNKNOWN")
-        for name, m in (("cold", cold), ("warm", warm))
-        if m.get("CLOSURE_FINGERPRINT", "UNKNOWN") not in ("", "UNKNOWN")
-    }
-    if len(fps) == 2 and len(set(fps.values())) > 1:
+    # Cross-run equality (every field is present above, so this is exact).
+    for key in IDENTITY_EQUAL_FIELDS:
+        values = {cold.get(key, "UNKNOWN"), warm.get(key, "UNKNOWN")}
+        if len(values) > 1:
+            errors.append(f"{key} mismatch between cold and warm: {sorted(values)}")
+    if cold.get("LOG_KIND") != warm.get("LOG_KIND"):
         errors.append(
-            "CLOSURE_FINGERPRINT mismatch (the two logs are not the same"
-            f" closure): {fps}"
+            f"LOG_KIND mismatch: cold={cold.get('LOG_KIND')} warm={warm.get('LOG_KIND')}"
         )
-    elif len(fps) == 1:
-        warnings.append(
-            "CLOSURE_FINGERPRINT present in only one block; same-closure"
-            " identity is not cross-checked"
-        )
+
+    # Optional CLI cross-checks stay (they can only tighten the gate).
+    if opts["sha"]:
+        if opts["sha"] not in (cold.get("RUN_SHA"), warm.get("RUN_SHA")):
+            errors.append(f"--sha {opts['sha']} does not match the measured RUN_SHA")
+    if opts["target"]:
+        if opts["target"] not in (cold.get("RUN_TARGET"), warm.get("RUN_TARGET")):
+            errors.append(f"--target {opts['target']} does not match the measured RUN_TARGET")
 
     if errors:
         for e in errors:
             print(f"repin_bootstrap_limits: VALIDATION FAIL: {e}", file=sys.stderr)
         sys.exit(2)
-    return warnings
+    return []
+
+
+def collect_ints(metrics: tuple[dict[str, str], ...], keys: tuple[str, ...]) -> list[int]:
+    """Non-UNKNOWN positive integers for `keys` across all metric blocks."""
+    vals: list[int] = []
+    for m in metrics:
+        for key in keys:
+            v = as_int(m, key)
+            if v is not None and v > 0:
+                vals.append(v)
+    return vals
+
+
+def collect_floats(
+    metrics: tuple[dict[str, str], ...], keys: tuple[str, ...]
+) -> list[float]:
+    vals: list[float] = []
+    for m in metrics:
+        for key in keys:
+            v = as_float(m, key)
+            if v is not None and v > 0:
+                vals.append(v)
+    return vals
 
 
 def build_proposals(cold: dict[str, str], warm: dict[str, str]) -> dict:
     proposals: dict[str, int | None] = {}
     formulas: list[str] = []
+    notes: list[str] = []
+    kind = cold.get("LOG_KIND", "standalone")
+    metrics = (cold, warm)
 
-    steps_c = as_int(cold, "FINAL_STEPS")
-    steps_w = as_int(warm, "FINAL_STEPS")
-    if steps_c is None or steps_w is None:
-        proposals["steps"] = None
-        formulas.append(
-            "steps_limit    = SKIPPED: FINAL_STEPS UNKNOWN in "
-            + ("cold " if steps_c is None else "")
-            + ("warm" if steps_w is None else "")
-        )
-    else:
-        m = max(steps_c, steps_w)
+    # ── steps: aggregate prefers max(VM A, VM B) across cold+warm ─────
+    vm_steps = (
+        collect_ints(metrics, ("VM_A_FINAL_STEPS", "VM_B_FINAL_STEPS"))
+        if kind == "aggregate"
+        else []
+    )
+    if vm_steps:
+        m = max(vm_steps)
         proposals["steps"] = ceil15(m)
         formulas.append(
-            f"steps_limit    = ceil(max({steps_c}, {steps_w}) * 1.15)"
-            f" = ceil({m * 1.15:.1f}) = {proposals['steps']}"
+            "steps_limit    = ceil(max(VM_A/VM_B FINAL_STEPS over cold+warm) * 1.15)"
+            f" = ceil({m} * 1.15) = {proposals['steps']}"
         )
-
-    host_c = as_int(cold, "HOST_CALLS")
-    host_w = as_int(warm, "HOST_CALLS")
-    if host_c is None or host_w is None:
-        proposals["host_calls"] = None
-        formulas.append("host_calls     = SKIPPED: HOST_CALLS UNKNOWN")
     else:
-        m = max(host_c, host_w)
+        if kind == "aggregate":
+            notes.append(
+                "aggregate per-VM step counters absent; falling back to the"
+                " standalone FINAL_STEPS summary fields"
+            )
+        steps_c = as_int(cold, "FINAL_STEPS")
+        steps_w = as_int(warm, "FINAL_STEPS")
+        if steps_c is None or steps_w is None:
+            proposals["steps"] = None
+            formulas.append(
+                "steps_limit    = SKIPPED: FINAL_STEPS UNKNOWN in "
+                + ("cold " if steps_c is None else "")
+                + ("warm" if steps_w is None else "")
+            )
+        else:
+            m = max(steps_c, steps_w)
+            proposals["steps"] = ceil15(m)
+            formulas.append(
+                f"steps_limit    = ceil(max({steps_c}, {steps_w}) * 1.15)"
+                f" = ceil({m * 1.15:.1f}) = {proposals['steps']}"
+            )
+
+    # ── host calls ───────────────────────────────────────────────────
+    vm_host = (
+        collect_ints(metrics, ("VM_A_HOST_CALLS", "VM_B_HOST_CALLS"))
+        if kind == "aggregate"
+        else []
+    )
+    if vm_host:
+        m = max(vm_host)
         proposals["host_calls"] = ceil15(m)
         formulas.append(
-            f"host_calls     = ceil(max({host_c}, {host_w}) * 1.15)"
-            f" = ceil({m * 1.15:.1f}) = {proposals['host_calls']}"
-        )
-
-    alloc_c = as_int(cold, "ALLOC_BYTES")
-    alloc_w = as_int(warm, "ALLOC_BYTES")
-    if alloc_c is None or alloc_w is None:
-        proposals["alloc_bytes"] = None
-        formulas.append(
-            "alloc_bytes    = SKIPPED: ALLOC_BYTES UNKNOWN (the logs do not"
-            " print a byte counter; existing pin left unchanged)"
+            "host_calls     = ceil(max(VM_A/VM_B HOST_CALLS over cold+warm) * 1.15)"
+            f" = ceil({m} * 1.15) = {proposals['host_calls']}"
         )
     else:
-        m = max(alloc_c, alloc_w)
+        if kind == "aggregate":
+            notes.append(
+                "aggregate per-VM host-call counters absent; falling back to"
+                " the standalone HOST_CALLS summary fields"
+            )
+        host_c = as_int(cold, "HOST_CALLS")
+        host_w = as_int(warm, "HOST_CALLS")
+        if host_c is None or host_w is None:
+            proposals["host_calls"] = None
+            formulas.append("host_calls     = SKIPPED: HOST_CALLS UNKNOWN")
+        else:
+            m = max(host_c, host_w)
+            proposals["host_calls"] = ceil15(m)
+            formulas.append(
+                f"host_calls     = ceil(max({host_c}, {host_w}) * 1.15)"
+                f" = ceil({m * 1.15:.1f}) = {proposals['host_calls']}"
+            )
+
+    # ── allocation ───────────────────────────────────────────────────
+    vm_alloc = (
+        collect_ints(metrics, ("VM_A_ALLOC_BYTES", "VM_B_ALLOC_BYTES"))
+        if kind == "aggregate"
+        else []
+    )
+    if vm_alloc:
+        m = max(vm_alloc)
         proposals["alloc_bytes"] = ceil15(m)
         formulas.append(
-            f"alloc_bytes    = ceil(max({alloc_c}, {alloc_w}) * 1.15)"
-            f" = ceil({m * 1.15:.1f}) = {proposals['alloc_bytes']}"
+            "alloc_bytes    = ceil(max(VM_A/VM_B ALLOC_BYTES over cold+warm) * 1.15)"
+            f" = ceil({m} * 1.15) = {proposals['alloc_bytes']}"
         )
-
-    rss_c = as_int(cold, "PEAK_RSS_MIB")
-    rss_w = as_int(warm, "PEAK_RSS_MIB")
-    if rss_c is None or rss_w is None:
-        proposals["rss_mib"] = None
-        formulas.append("rss_mib        = SKIPPED: PEAK_RSS_MIB UNKNOWN")
     else:
-        peak = max(rss_c, rss_w)
-        variance = abs(rss_c - rss_w)
+        if kind == "aggregate":
+            notes.append(
+                "aggregate per-VM alloc counters absent; falling back to the"
+                " standalone ALLOC_BYTES summary fields"
+            )
+        alloc_c = as_int(cold, "ALLOC_BYTES")
+        alloc_w = as_int(warm, "ALLOC_BYTES")
+        if alloc_c is None or alloc_w is None:
+            proposals["alloc_bytes"] = None
+            formulas.append(
+                "alloc_bytes    = SKIPPED: ALLOC_BYTES UNKNOWN (the logs do not"
+                " print a byte counter; existing pin left unchanged)"
+            )
+        else:
+            m = max(alloc_c, alloc_w)
+            proposals["alloc_bytes"] = ceil15(m)
+            formulas.append(
+                f"alloc_bytes    = ceil(max({alloc_c}, {alloc_w}) * 1.15)"
+                f" = ceil({m * 1.15:.1f}) = {proposals['alloc_bytes']}"
+            )
+
+    # ── RSS: aggregate peaks across VM A/VM B; variance = spread ─────
+    vm_rss = (
+        collect_ints(metrics, ("VM_A_PEAK_RSS_MIB", "VM_B_PEAK_RSS_MIB"))
+        if kind == "aggregate"
+        else []
+    )
+    if vm_rss:
+        peak = max(vm_rss)
+        variance = peak - min(vm_rss)
         margin = max(1024, ceil10pct(peak))
         proposals["rss_mib"] = peak + variance + margin
         formulas.append(
-            f"rss_mib        = max({rss_c}, {rss_w}) + |{rss_c} - {rss_w}|"
-            f" + max(1024, ceil(10% * {peak}))"
-        )
-        formulas.append(
-            f"               = {peak} + {variance} + {margin}"
+            "rss_mib        = max(VM_A/VM_B peak RSS over cold+warm)"
+            f" ({peak}) + spread ({variance}) + max(1024, ceil(10% * {peak})) ({margin})"
             f" = {proposals['rss_mib']}"
         )
+    else:
+        if kind == "aggregate":
+            notes.append(
+                "aggregate per-VM RSS peaks absent; falling back to the"
+                " standalone PEAK_RSS_MIB fields"
+            )
+        rss_c = as_int(cold, "PEAK_RSS_MIB")
+        rss_w = as_int(warm, "PEAK_RSS_MIB")
+        if rss_c is None or rss_w is None:
+            proposals["rss_mib"] = None
+            formulas.append("rss_mib        = SKIPPED: PEAK_RSS_MIB UNKNOWN")
+        else:
+            peak = max(rss_c, rss_w)
+            variance = abs(rss_c - rss_w)
+            margin = max(1024, ceil10pct(peak))
+            proposals["rss_mib"] = peak + variance + margin
+            formulas.append(
+                f"rss_mib        = max({rss_c}, {rss_w}) + |{rss_c} - {rss_w}|"
+                f" + max(1024, ceil(10% * {peak}))"
+            )
+            formulas.append(
+                f"               = {peak} + {variance} + {margin}"
+                f" = {proposals['rss_mib']}"
+            )
 
+    # ── wall timeout: aggregate AGGREGATE_WALL_S, else phase sum ─────
+    agg_walls = (
+        collect_floats(metrics, ("AGGREGATE_WALL_S",))
+        if kind == "aggregate"
+        else []
+    )
     wall_c = as_float(cold, "WALL_PHASE_SUM_S")
     wall_w = as_float(warm, "WALL_PHASE_SUM_S")
-    if wall_c is None or wall_w is None:
+    if kind == "aggregate" and len(agg_walls) == 2:
+        m = max(agg_walls)
+        proposals["wall_timeout_s"] = int(math.ceil(m * 1.5 / 60.0) * 60)
+        formulas.append(
+            f"GATE_TIMEOUT_S = ceil(max(AGGREGATE_WALL_S {agg_walls[0]:g},"
+            f" {agg_walls[1]:g}) * 1.5 / 60) * 60"
+            f" = ceil({m * 1.5 / 60.0:.2f}) * 60 = {proposals['wall_timeout_s']}"
+        )
+        notes.append(
+            "GATE_TIMEOUT_S is derived from the whole-gate wall clock"
+            " (AGGREGATE_WALL_S), not from summed per-phase strings"
+        )
+    elif wall_c is not None and wall_w is not None:
+        if kind == "aggregate":
+            notes.append(
+                "AGGREGATE_WALL_S missing in one/both blocks; falling back to"
+                " WALL_PHASE_SUM_S for the wall timeout"
+            )
+        m = max(wall_c, wall_w)
+        proposals["wall_timeout_s"] = int(math.ceil(m * 1.5 / 60.0) * 60)
+        formulas.append(
+            f"wall_timeout_s = ceil(max({wall_c:g}, {wall_w:g}) * 1.5 / 60) * 60"
+            f" = ceil({m * 1.5 / 60.0:.2f}) * 60 = {proposals['wall_timeout_s']}"
+        )
+    else:
         proposals["wall_timeout_s"] = None
         missing = [
             name
@@ -310,14 +478,7 @@ def build_proposals(cold: dict[str, str], warm: dict[str, str]) -> dict:
             + ", ".join(missing)
             + " (existing outer timeout left unchanged)"
         )
-    else:
-        m = max(wall_c, wall_w)
-        proposals["wall_timeout_s"] = int(math.ceil(m * 1.5 / 60.0) * 60)
-        formulas.append(
-            f"wall_timeout_s = ceil(max({wall_c:g}, {wall_w:g}) * 1.5 / 60) * 60"
-            f" = ceil({m * 1.5 / 60.0:.2f}) * 60 = {proposals['wall_timeout_s']}"
-        )
-    return {"values": proposals, "formulas": formulas}
+    return {"values": proposals, "formulas": formulas, "notes": notes}
 
 
 def read_current(path: Path, pins: dict[str, str]) -> dict[str, int]:
@@ -388,14 +549,34 @@ def main(argv: list[str]) -> int:
     print("REPIN PROPOSAL -- bootstrap limits (measurement-only, no authorization)")
     for name, m in (("cold", cold), ("warm", warm)):
         print(
-            f"  {name}: label={m.get('RUN_LABEL', '?')} status={m.get('STATUS', '?')}"
+            f"  {name}: label={m.get('RUN_LABEL', '?')} kind={m.get('LOG_KIND', '?')}"
+            f" status={m.get('STATUS', '?')} outcome={m.get('RUN_OUTCOME', '?')}"
             f" steps={m.get('FINAL_STEPS', '?')} host_calls={m.get('HOST_CALLS', '?')}"
             f" peak_rss_mib={m.get('PEAK_RSS_MIB', '?')}"
             f" alloc_bytes={m.get('ALLOC_BYTES', '?')}"
             f" sha={m.get('RUN_SHA', '?')} target={m.get('RUN_TARGET', '?')}"
         )
+        if m.get("LOG_KIND") == "aggregate":
+            print(
+                f"    {name} VM_A: steps={m.get('VM_A_FINAL_STEPS', '?')}"
+                f" host_calls={m.get('VM_A_HOST_CALLS', '?')}"
+                f" alloc_bytes={m.get('VM_A_ALLOC_BYTES', '?')}"
+                f" peak_rss_mib={m.get('VM_A_PEAK_RSS_MIB', '?')}"
+                f" wall_s={m.get('VM_A_WALL_S', '?')}"
+            )
+            print(
+                f"    {name} VM_B: steps={m.get('VM_B_FINAL_STEPS', '?')}"
+                f" host_calls={m.get('VM_B_HOST_CALLS', '?')}"
+                f" alloc_bytes={m.get('VM_B_ALLOC_BYTES', '?')}"
+                f" peak_rss_mib={m.get('VM_B_PEAK_RSS_MIB', '?')}"
+                f" wall_s={m.get('VM_B_WALL_S', '?')}"
+                f" preflight_wall_s={m.get('VM_B_PREFLIGHT_WALL_S', '?')}"
+            )
+            print(f"    {name} AGGREGATE_WALL_S={m.get('AGGREGATE_WALL_S', '?')}")
     for w in warnings:
         print(f"  WARN: {w}")
+    for n in plan.get("notes", []):
+        print(f"  NOTE: {n}")
     print("")
     print("formulas (implemented):")
     for f in plan["formulas"]:
