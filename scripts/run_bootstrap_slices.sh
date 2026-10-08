@@ -29,7 +29,7 @@ SLICE_SIZES="${SLICE_SIZES:-10 20 30 40 45}"
 STAGE0="stage0_ocaml/_build/default/bin/tg_stage0.exe"
 TARGET="aarch64-apple-darwin"
 OUT_DIR="build/slices"
-SLICE_TIMEOUT=900
+SLICE_TIMEOUT="${SLICE_TIMEOUT_S:-3600}"
 
 mkdir -p "$OUT_DIR"
 
