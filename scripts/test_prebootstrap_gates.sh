@@ -453,6 +453,9 @@ check_pin "authorization pins the VM step budget" scripts/check_ocaml_bootstrap_
 check_pin "authorization pins the VM host-call budget" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS=1000000000'
 check_pin "authorization pins the VM alloc budget" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_ALLOC=8589934592'
 check_pin "authorization pins the outer gate timeout" scripts/check_ocaml_bootstrap_complete.sh   'GATE_TIMEOUT_S=4140'
+check_pin "authorization pins the GC policy" scripts/check_ocaml_bootstrap_complete.sh   'OCAMLRUNPARAM=o=40'
+check_pin "authorization rejects the ambient timeout command" scripts/check_ocaml_bootstrap_complete.sh   'unset TG_TIMEOUT_CMD'
+check_pin "the env gate rejects TG_TIMEOUT_CMD" scripts/prebootstrap_env_gate.sh   'TG_TIMEOUT_CMD'
 check_pin "the profile entry point is explicitly non-authorizing" scripts/profile_ocaml_bootstrap.sh   'NON-AUTHORIZING'
 if grep -q 'BOOTSTRAP COMPLETE: PASS' "$ROOT/scripts/profile_ocaml_bootstrap.sh"; then
   bad "the profile entry point can emit an authorization sentinel"

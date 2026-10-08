@@ -27,9 +27,19 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 # The shared bootstrap validation library: the timeout facility is the single
-# authority (GNU timeout / Homebrew gtimeout / TG_TIMEOUT_CMD override).
+# authority (GNU timeout / Homebrew gtimeout).  Authorization mode REJECTS
+# the TG_TIMEOUT_CMD ambient override: final evidence must use the verified
+# platform timeout, not an operator-supplied command (which could silently
+# skip or alter enforcement).  A pre-resolved BH_TIMEOUT_CMD_RESOLVED is
+# cleared so resolution re-runs under the pinned policy.
 # shellcheck source=scripts/bootstrap_helpers.sh
 source "$ROOT/scripts/bootstrap_helpers.sh"
+unset TG_TIMEOUT_CMD
+unset BH_TIMEOUT_CMD_RESOLVED
+# Authorization pins the measurement GC policy: profiling calibrated with
+# o=40 (RSS ~1.2x live) and the pinned RSS ceiling assumes the same policy;
+# inheriting a different OCAMLRUNPARAM would invalidate the calibration.
+export OCAMLRUNPARAM=o=40
 
 if [ -f scripts/check_ocaml_toolchain.sh ]; then
   scripts/check_ocaml_toolchain.sh

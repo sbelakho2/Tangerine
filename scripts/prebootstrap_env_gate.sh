@@ -40,6 +40,8 @@ check_forbidden TG_ALLOW_UNBOUNDED_FINAL \
   "it removes the mandatory RSS ceiling from the final authorization (degraded safety evidence)"
 check_forbidden TG_FINAL_RSS_MEASUREMENT \
   "it enables the measurement-only RSS override on the authorization route"
+check_forbidden TG_TIMEOUT_CMD \
+  "it replaces the verified platform timeout command on the authorization route"
 
 if [ "$fail" -ne 0 ]; then
   echo "[prebootstrap-env:error] unset/zero the variable(s) above for a full, non-degraded run" >&2

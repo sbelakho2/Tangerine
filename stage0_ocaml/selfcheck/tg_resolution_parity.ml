@@ -26,6 +26,24 @@
    resolution error (unresolved name/type, ambiguity, macro-expansion
    error) fails the lane. *)
 
+(* Single-process heap sizing for this closure workload: the seed front
+   end (parse -> resolve -> typecheck fixpoint -> mono) and the kernel VM
+   (which re-parses and resolves the whole manifest closure) are both
+   allocation-heavy.  The default OCaml minor heap triggers constant minor
+   collections, and the default major space_overhead collects a multi-GB
+   live set far too often; a 64M-word minor heap plus a generous major
+   space_overhead removes the collection-dominated stalls (measured ~2x
+   wall-time on this lane).  This is pure performance configuration: no
+   gate, evidence row, or verdict changes. *)
+let () =
+  let ctrl = Gc.get () in
+  Gc.set
+    {
+      ctrl with
+      Gc.minor_heap_size = 64 * 1024 * 1024;
+      Gc.space_overhead = 300;
+    }
+
 let fail fmt =
   Printf.ksprintf
     (fun s ->
