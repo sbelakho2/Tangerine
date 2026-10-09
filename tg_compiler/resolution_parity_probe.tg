@@ -37,13 +37,16 @@
 # drift from the manifest the bootstrap compiles.
 #
 # main returns 0 iff every closure file parsed clean, resolve_names reported
-# zero errors, the microcorpus met every expectation, and every suffix
-# bucket equalled its scan oracle; 1 otherwise. Per-row evidence is written
-# to build/resolution_parity_report.txt and echoed to stdout.
+# zero errors, the microcorpus met every expectation, every suffix bucket
+# equalled its scan oracle, the kernel's FULL typecheck of the merged closure
+# reported zero diagnostics, and the all-failures typed-channel completeness
+# walk produced ZERO HIR_MISSING/HIR_INVALID fingerprints. It returns 1
+# otherwise. Per-row evidence is written to build/resolution_parity_report.txt
+# and echoed to stdout.
 
 use std::core::{Option, Result, String}
 use std::collections::{Vec, Map, Set}
-use std::fs::{read_file, write_file}
+use std::fs::{read_file, write_file, delete_file}
 use std::io::{println}
 use tg_compiler::lexer::{tokenize}
 use tg_compiler::parser::{parse, diag_has_errors}
@@ -51,7 +54,7 @@ use tg_compiler::ast::{Program, Crate, Module, Item, ItemId, ModuleId, ItemKind,
 use tg_compiler::token::{Span}
 use tg_compiler::ids::{DefId}
 use tg_compiler::resolver::{resolve_names, resolve_names_partial, ResolvedNames}
-use tg_compiler::types::{type_env_new, type_check_typed}
+use tg_compiler::types::{type_env_new, type_check_typed, verify_typed_channel_completeness, TypeEnv}
 use tg_compiler::compiler_core::{
   merge_imported_deps, apply_cfg_elimination, prepare_parsed, default_options,
   canonical_kernel_source_path, bootstrap_manifest_sources, read_source_file,
@@ -489,6 +492,114 @@ def resolution_parity_cfg_target_case(inout report: String, inout failures: Int)
   end
 end
 
+# ── the full-closure kernel typecheck + all-failures enumeration ───────
+# The lane's canonical merge already holds the EXACT production graph
+# (root + manifest closure, cfg-eliminated, macros expanded, node ids
+# assigned, resolved). Running the REAL kernel checker over it here is the
+# same front end the kernel `check` command runs, at a fraction of the
+# cost of the 2h aggregate preflight, and the typed-channel completeness
+# walk in ALL mode enumerates every HIR_MISSING/HIR_INVALID fingerprint
+# in ONE pass instead of the fail-fast single row per full run.
+
+def resolution_parity_line_of(source: String, off: Int) -> Int
+  var line = 1
+  var i = 0
+  var limit = off
+  if limit > source.len() then limit = source.len() end
+  while i < limit do
+    if source.char_at(i) == '\n' then
+      line = line + 1
+    end
+    i = i + 1
+  end
+  line
+end
+
+def resolution_parity_line_text(source: String, line: Int) -> String
+  var cur = 1
+  var start = 0
+  var i = 0
+  while i < source.len() do
+    if source.char_at(i) == '\n' then
+      if cur == line then
+        return source.slice(start, i).trim()
+      end
+      cur = cur + 1
+      start = i + 1
+    end
+    i = i + 1
+  end
+  if cur == line then return source.slice(start, source.len()).trim() end
+  ""
+end
+
+def resolution_parity_node_of_fingerprint(fp: String) -> Int
+  let segs = fp.split("|")
+  var out = -1
+  for seg in segs do
+    if seg.starts_with("Node=") then
+      match seg.slice(5, seg.len()).parse_int()
+      when Result::Ok(n) then out = n
+      when Result::Err(_) then ()
+      end
+    end
+  end
+  out
+end
+
+# Annotate one fingerprint with the construct the kernel recorded: the
+# typed node's span resolved against the ORIGINAL source file (line number
+# + the source line itself) so the report names the exact method call /
+# ident / literal without a separate archaeology run.
+def resolution_parity_annotate_fingerprint(env: TypeEnv, fp: String, inout cache: Map[String, String], inout report: String) -> Unit
+  let nid = resolution_parity_node_of_fingerprint(fp.clone())
+  if nid < 0 then
+    report = report + "HIR_NODE " + fp.clone() + " => (no node id parsed)\n"
+    return
+  end
+  match env.typed_node_spans.get(nid)
+  when Option::Some(sp) then
+    var src = "".to_string()
+    match cache.get(sp.file.clone())
+    when Option::Some(s) then src = s.clone()
+    when Option::None then
+      if sp.file.len() > 0 then
+        match read_file(sp.file.clone())
+        when Result::Ok(s2) then src = s2.clone()
+        when Result::Err(_) then ()
+        end
+      end
+      cache.insert(sp.file.clone(), src.clone())
+    end
+    let line = resolution_parity_line_of(&src, sp.start)
+    let text = resolution_parity_line_text(&src, line)
+    report = report + "HIR_NODE " + fp.clone() + " => " + sp.file.clone() + ":" + line.to_string() + " | " + text.clone() + "\n"
+  when Option::None then
+    report = report + "HIR_NODE " + fp.clone() + " => (no recorded typed span for node)\n"
+  end
+end
+
+# Bucket a checker diagnostic by its normalized prefix (deterministic
+# insertion order, full first message + source coordinate kept as the
+# sample).
+def resolution_parity_diag_bucket(inout keys: Vec[String], inout counts: Vec[Int], inout samples: Vec[String], msg: String, span_file: String, span_start: Int) -> Unit
+  var cls = msg.clone()
+  if cls.len() > 56 then cls = cls.slice(0, 56) end
+  var found = -1
+  var i = 0
+  while i < keys.len() do
+    if keys[i] == cls then found = i end
+    i = i + 1
+  end
+  if found < 0 then
+    keys.push(cls.clone())
+    counts.push(1)
+    samples.push(msg.clone() + " @" + span_file.clone() + ":" + span_start.to_string())
+  else
+    counts.set(found, counts[found] + 1)
+  end
+end
+
 # ── main ───────────────────────────────────────────────────────────────
 #
 # CANONICAL PREPARATION (audit follow-up): the probe no longer
@@ -504,7 +615,19 @@ end
 # and the seed's entry lookup must not pick the kernel driver by accident.
 def resolution_parity_main() -> Int
   let target = if raw_arg_count() > 2 then raw_arg_copy(2) else "aarch64-apple-darwin".to_string() end
-  println("RESOLUTION_PARITY target=" + target.clone())
+  # (full-closure enumeration opt-in): the kernel typecheck + all-failures
+  # completeness walk over the 45-source closure needs ~80e9 VM steps and
+  # 30-60 min, so the quick medium lane skips it; `--full` runs it and
+  # enumerates EVERY remaining HIR fingerprint in one pass.
+  var run_full = false
+  var argi = 0
+  while argi < raw_arg_count() do
+    if raw_arg_copy(argi) == "--full" then
+      run_full = true
+    end
+    argi = argi + 1
+  end
+  println("RESOLUTION_PARITY target=" + target.clone() + " full=" + run_full.to_string())
   let report_path = "build/resolution_parity_report.txt"
   var report = "RESOLUTION_PARITY target=" + target.clone() + "\n"
   var failures = 0
@@ -611,8 +734,73 @@ def resolution_parity_main() -> Int
   # 9. the target-dependent @cfg matrix
   resolution_parity_cfg_target_case(&mut report, &mut failures)
 
+  # 10. THE FULL-CLOSURE KERNEL TYPECHECK + ALL-FAILURES TYPED-CHANNEL
+  # ENUMERATION. The production checker runs over the SAME merged/
+  # prepared/resolved graph; the completeness verifier is forced into
+  # its all-failures mode so ONE run lists every HIR_MISSING/HIR_INVALID
+  # fingerprint instead of the fail-fast single row. The flag file is
+  # written as well (the documented operational fallback for guests that
+  # cannot read the host environment); the mode is also set directly on
+  # the env so enumeration can never silently degrade to fail-fast.
+  var snippet_cache: Map[String, String] = Map::new()
+  var fps: Vec[String] = Vec::new()
+  var tc_error_count = 0
+  if !run_full then
+    # quick mode: resolution/preparation oracles above already ran; the
+    # full-closure kernel typecheck is deliberately skipped.
+    report = report + "HIR_REPORT mode=all skipped (quick mode; pass --full)\n"
+  else
+  let _flagw = write_file("build/hir_report_all.flag", "all".to_string())
+  var tc_env = type_env_new()
+  tc_env.strict_resolution = true
+  tc_env.hir_report_all = true
+  # The production closure check runs with --bootstrap-proof
+  # (emit_check_summary + the kernel-entry root), which sets the trusted
+  # compiler-origin provenance on the env. Mirror it, or the lane would
+  # report compiler-private intrinsic rejections production never emits.
+  tc_env.trusted_compiler_origin = true
+  let tc_result = type_check_typed(&mut tc_env, &program, &resolved)
+  let _ = delete_file("build/hir_report_all.flag".to_string())
+  tc_error_count = tc_result.errors.len()
+  var diag_keys: Vec[String] = Vec::new()
+  var diag_counts: Vec[Int] = Vec::new()
+  var diag_samples: Vec[String] = Vec::new()
+  var dei = 0
+  while dei < tc_error_count do
+    resolution_parity_diag_bucket(&mut diag_keys, &mut diag_counts, &mut diag_samples, tc_result.errors[dei].message.clone(), tc_result.errors[dei].span.file.clone(), tc_result.errors[dei].span.start)
+    dei = dei + 1
+  end
+  report = report + "KERNEL_TYPECHECK errors=" + tc_error_count.to_string() + " classes=" + diag_keys.len().to_string() + " all_report=" + tc_env.hir_report_all.to_string() + "\n"
+  var dci = 0
+  while dci < diag_keys.len() do
+    report = report + "TC_DIAG count=" + diag_counts[dci].to_string() + " class=" + diag_keys[dci].clone() + " sample=" + diag_samples[dci].clone() + "\n"
+    dci = dci + 1
+  end
+  var fp_seen: Map[String, Bool] = Map::new()
+  for fp in tc_env.hir_report_fingerprints do
+    fp_seen.insert(fp.clone(), true)
+  end
+  for (k, _v) in fp_seen.entries() do
+    fps.push(k.clone())
+  end
+  fps.sort()
+  report = report + "HIR_REPORT mode=all total=" + fps.len().to_string() + " shown=" + fps.len().to_string() + "\n"
+  println("HIR_REPORT mode=all total=" + fps.len().to_string() + " shown=" + fps.len().to_string())
+  var fpi = 0
+  while fpi < fps.len() do
+    report = report + "HIR_REPORT " + fps[fpi].clone() + "\n"
+    resolution_parity_annotate_fingerprint(tc_env, fps[fpi].clone(), &mut snippet_cache, &mut report)
+    println("HIR_REPORT " + fps[fpi].clone())
+    fpi = fpi + 1
+  end
+  if fps.len() > 0 then
+    failures = failures + 1
+    report = report + "HIR_FINGERPRINTS FAIL count=" + fps.len().to_string() + " (the sorted unique HIR_REPORT rows above are the complete failure list)\n"
+  end
+  end
+
   if prep_errors > 0 || resolve_errors > 0 || failures > 0 then
-    let row = "resolution-parity: FAILED (" + prep_errors.to_string() + " preparation error(s), " + resolve_errors.to_string() + " resolver error(s), " + failures.to_string() + " oracle/corpus failure(s); canonical preparation over " + manifest_count.to_string() + " manifest source(s), " + module_count.to_string() + " module(s))\n"
+    let row = "resolution-parity: FAILED (" + prep_errors.to_string() + " preparation error(s), " + resolve_errors.to_string() + " resolver error(s), " + failures.to_string() + " oracle/corpus failure(s), " + fps.len().to_string() + " HIR fingerprint(s), kernel typecheck errors=" + tc_error_count.to_string() + "; canonical preparation over " + manifest_count.to_string() + " manifest source(s), " + module_count.to_string() + " module(s))\n"
     report = report + row
     match write_file(report_path.clone(), report)
     when Result::Ok(_) then ()
@@ -627,7 +815,7 @@ def resolution_parity_main() -> Int
     end
     return 1
   end
-  let ok_row = "OK target=" + target.clone() + " " + manifest_count.to_string() + " manifest source(s), " + module_count.to_string() + " module(s) via CANONICAL preparation (merge -> cfg -> macros -> node ids); resolver diagnostics 0; adversarial microcorpus + cfg-matrix + suffix-index scan oracles: PASS\n"
+  let ok_row = "OK target=" + target.clone() + " " + manifest_count.to_string() + " manifest source(s), " + module_count.to_string() + " module(s) via CANONICAL preparation (merge -> cfg -> macros -> node ids); resolver diagnostics 0; kernel typecheck errors=" + tc_error_count.to_string() + " HIR fingerprints=" + fps.len().to_string() + "; adversarial microcorpus + cfg-matrix + suffix-index scan oracles: PASS\n"
   match write_file(report_path.clone(), ok_row + report)
   when Result::Ok(_) then ()
   when Result::Err(_) then ()

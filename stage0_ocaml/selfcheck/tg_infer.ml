@@ -256,6 +256,14 @@ let () =
                Type::Var/Type::Error before readiness. *)
             fail
               "the pending-inference battery failed (expected `PENDING_INFERENCE_BATTERY fails=0`; see the report above)"
+          else if not (contains report "OPTION_EXPECT_BATTERY fails=0") then
+            (* the Option/Result expect(msg) builtin surface + its
+               Unwrap intrinsic route (the resolver module_table_for
+               HIR_INVALID fingerprint class): the expect calls must
+               type Error/Var-free with completeness true and be
+               classified as the Unwrap intrinsic for the MIR route. *)
+            fail
+              "the Option/Result expect surface battery failed (expected `OPTION_EXPECT_BATTERY fails=0`; see the report above)"
           else if not (contains report "HIR_COMPLETE_BATTERY fails=0") then
             (* the mandatory typed-channel completeness verifier: the
                positive leg asserts the constructor/later-use/argument

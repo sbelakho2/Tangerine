@@ -150,7 +150,28 @@ let () =
     Driver.run_bootstrap_closure ~repo_root
       ~manifest_path:"bootstrap/resolution_parity_mini.manifest" ~target
       ~entry:(Some "resolution_parity_main")
-      ~kernel_args:[ "resolution-parity"; target_str ]
+      ~kernel_args:
+        (let full =
+           List.mem "--full" (Array.to_list Sys.argv)
+           || Sys.getenv_opt "TG_PARITY_FULL" = Some "1"
+         in
+         if full then begin
+           (* the full-closure kernel typecheck + all-failures enumeration
+              needs ~80e9 VM steps; give it the profiling-class budget and
+              the same GC policy the profile wrapper pins. *)
+           if Sys.getenv_opt "TANGERINE_BOOTSTRAP_VM_MAX_STEPS" = None then
+             Unix.putenv "TANGERINE_BOOTSTRAP_VM_MAX_STEPS" "150000000000";
+           if Sys.getenv_opt "TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB" = None then
+             Unix.putenv "TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB" "16384";
+           if Sys.getenv_opt "TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS" = None then
+             Unix.putenv "TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS" "5000000000";
+           if Sys.getenv_opt "TANGERINE_BOOTSTRAP_VM_MAX_ALLOC" = None then
+             Unix.putenv "TANGERINE_BOOTSTRAP_VM_MAX_ALLOC" "34359738368";
+           if Sys.getenv_opt "OCAMLRUNPARAM" = None then
+             Unix.putenv "OCAMLRUNPARAM" "o=40"
+         end;
+         if full then [ "resolution-parity"; target_str; "--full" ]
+         else [ "resolution-parity"; target_str ])
   with
   | Error m -> fail "closure pipeline: %s" m
   | Ok stages -> (
