@@ -19916,6 +19916,44 @@ def try_head_unify(inout env: TypeEnv, t1: Type, t2: Type) -> Bool
   ok
 end
 
+# (batch 5 — the seed's `[T]` IS the heap vector): the kernel's
+# source-spelled `[T]` resolves to the std-declared SAFE Slice struct
+# (the `UnsafeSlice` builtin is the separate raw view — `lang_items.slice`
+# names THAT id, so the source-spelled form is recognized by its
+# registered bare name), while the seed's b_array one-id model makes `[T]`
+# the heap vector. A static-path callee declared with a Slice parameter
+# (`impl[T: Copy] Array[T] { def from(items: [T]) -> Array[T] }` — the
+# std's only Slice-param surface reached by static path) must still accept
+# the Array payload the MIR lowers specially (`Vec::from([..])` / the vec!
+# expansion). Retry the unification as the element-wise payload match.
+# Speculative (the caller restores on overall failure); never turns a
+# mismatch into an error.
+def is_source_slice_param(env: TypeEnv, param_ty: Type) -> Bool
+  match param_ty
+  when Type::Adt(ptid, pargs) then
+    if pargs.len() != 1 then return false end
+    if ptid.id == env.lang_items.slice then return true end
+    type_bare_name_of(env, param_ty.clone()) == "Slice"
+  when _ then false
+  end
+end
+
+def try_head_unify_slice_param_array_arg(inout env: TypeEnv, arg_ty: Type, param_ty: Type) -> Bool
+  if !is_source_slice_param(env, param_ty.clone()) then return false end
+  match param_ty
+  when Type::Adt(_ptid, pargs) then
+    match arg_ty
+    when Type::Adt(atid, aargs) then
+      if atid.id == env.lang_items.array && aargs.len() == 1 then
+        return try_head_unify(env, aargs[0].clone(), pargs[0].clone())
+      end
+    when _ then ()
+    end
+    false
+  when _ then false
+  end
+end
+
 # (the seed's DISCARDED arm-reconcile): reconcile two branch/join types
 # SPECULATIVELY — a successful unify JOURNALS its variable bindings (so a
 # discarded if/elsif arm's constructor variables still reach the
@@ -22918,6 +22956,15 @@ def decimal_magnitude_cmp(a: String, b: String) -> Int
   end
 end
 
+# (batch 5 — the seed's Int_literal 128-bit sanity bound): an unsuffixed
+# literal beyond the host Int is accepted as the arbitrary-precision
+# Int_literal through the u128 bound (the seed's `fits_unsigned p U128`
+# gate); the CONCRETE adoption — a cast target, an expected integer type —
+# makes the exact range decision. Beyond u128 stays fail-closed.
+def integer_literal_magnitude_fits_u128(p: ParsedIntegerLiteral) -> Bool
+  decimal_magnitude_cmp(strip_leading_zeros(parsed_int_decimal(p)), "340282366920938463463374607431768211455") <= 0
+end
+
 # Signed decimal string comparison (-1 / 0 / 1).
 def signed_decimal_cmp(a: String, b: String) -> Int
   let a_neg = a.len() > 0 && a.char_at(0) == '-'
@@ -23297,9 +23344,35 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
       if parsed_int_fits_host(&p) then
         env.pending_literal_ranges.insert(expr.node_id, PendingLiteralRange { lit: p, target_ty: Type::Int, span: expr.span, neg_count: 0 })
         Type::IntLiteral(parsed_int_to_host(&p))
+      elsif integer_literal_magnitude_fits_u128(&p) then
+        # (batch 5 — the seed's Int_literal rule): a magnitude beyond the
+        # host Int is NOT the overflow by itself. The seed records the
+        # arbitrary-precision Int_literal (through the 128-bit sanity
+        # bound) and only a CONCRETE adoption decides the range — the FNV
+        # offset bases (`0xcbf29ce484222325 as i64`, `var hi: UInt =
+        # 0xcbf29ce484222325`) are legal, and `1 as u32`/`(x >> 32) as u32`
+        # chains type. With an expected CONCRETE integer type the exact
+        # signed range is checked here (the same range authority the
+        # pending pass uses) and the RECORDED type is the concrete kind —
+        # exactly what the seed's Int k arm records. Without one the
+        # inference-only Int_literal view is returned (the cast/enclosing
+        # context adopts it); no pending default-Int record is made, since
+        # the seed applies no range decision to the bare Int_literal.
+        match expected
+        when Option::Some(exp_ty) then
+          if is_integer_type(&exp_ty) then
+            if check_integer_literal_range(env, &p, false, &exp_ty, expr.span) then
+              exp_ty
+            else
+              Type::Error
+            end
+          else
+            Type::IntLiteral(parsed_int_to_host(&p))
+          end
+        when Option::None then Type::IntLiteral(parsed_int_to_host(&p))
+        end
       else
-        # the inferred-Int range decision: a magnitude beyond the host
-        # range is the overflow — fail-closed, never a silent wrap.
+        # beyond the 128-bit sanity bound: fail-closed, never a silent wrap.
         type_add_error(env, "integer literal out of range for type `Int`", expr.span)
         Type::Error
       end
@@ -24247,7 +24320,16 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
     # (the index's span is read in every arm below).
     let recv_expr = *recv.get()
     let index_expr = *index.get()
-    let recv_type = check_expr(env, &recv_expr)
+    # (batch 5 — the stale call-result receiver): a local/parameter whose
+    # recorded type is a call's result variable (the call arm hands the
+    # fresh variable back UNCHASED) must be PRUNED before the container
+    # match. Without the chase `sections[i]` (link linker), `rows[0]`
+    # (budget/verifier lanes), `cal_ev[slot]` (mir effect rows) and
+    # `ev[slot]` (semantic_slice) fell into the `when _` arm and yielded a
+    # fresh unbound element — every downstream method call recorded
+    # Type::Error (the linker/mir/slice/budget HIR_INVALID family). The
+    # field-access arm already chases; indexing must too.
+    let recv_type = resolve_type_var(env, check_expr(env, &recv_expr))
     let index_type = check_expr(env, &index_expr)
     # Indexing is an inherently SHARED read that returns the element by
     # value; extracting a resource element this way would create a second
@@ -25231,6 +25313,46 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
   adopted
 end
 
+# (batch 5 — the module-qualified free-function call): the parser produces
+# an ExprEnumVariant for EVERY `a::b::c(...)` path, including calls to
+# top-level functions in a MODULE namespace (`std::env::get_env(...)`).
+# The resolver's record_path_call_target already resolved those to a
+# Function DefId (recorded in call_targets keyed by the call node); the
+# variant/impl/ctor surfaces cover OWNER TYPES only, so without this the
+# call fell through to the fresh-variable image and every use of its
+# result failed (`os_override.unwrap_or(...)`, `w.contains(...)` — the
+# asm host_target / codegen detect_host_target HIR_INVALID family).
+# Recover the declaration's registered FnPtr from the DefId: the resolver
+# suffix index for the path's last segment yields the module-qualified
+# key, and module_callable_types holds the registered callable type under
+# it. Option::None when the node has no recorded Function target (the
+# fail-closed guard: a variant path is never resolved here) or the key has
+# no registered type.
+def module_qualified_free_fn_type(env: TypeEnv, node_id: Int, name: String) -> Option[(Type, DefId)]
+  match env.resolutions
+  when Option::Some(res) then
+    match res.call_targets.get(node_id)
+    when Option::Some(did) then
+      let want_num = def_id_numeric(&did)
+      let bucket = match res.symbol_suffix_index.get(&name)
+      when Option::Some(v) then v
+      when Option::None then Vec::new()
+      end
+      for (key, kdid) in bucket do
+        if def_id_numeric(&kdid) == want_num then
+          match env.module_callable_types.get(key.clone())
+          when Option::Some(ty) then return Option::Some((ty.clone(), did.clone()))
+          when Option::None then ()
+          end
+        end
+      end
+      Option::None
+    when Option::None then Option::None
+    end
+  when Option::None then Option::None
+  end
+end
+
 # The enum-variant construction / static-path call check — the
 # ExprEnumVariant arm's body, extracted into a helper so the operation-
 # call surface (std::effects::perform(EFFECT.op, ...) — which parses as
@@ -25522,7 +25644,15 @@ def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, 
                           if sai < sp_inst_params.len() then
                             let sp_snap = subst_snapshot(env)
                             let sp_errs = env.errors.len()
-                            let sp_uok = try_head_unify(env, arg_tys[sai].clone(), sp_inst_params[sai].ty.clone())
+                            var sp_uok = try_head_unify(env, arg_tys[sai].clone(), sp_inst_params[sai].ty.clone())
+                            if !sp_uok then
+                              # (batch 5): the Slice-declared param takes
+                              # the Array payload (the seed's `[T]` IS the
+                              # heap vector) — Vec::from([..]) resolves
+                              # here instead of falling through to the
+                              # fresh-variable image.
+                              sp_uok = try_head_unify_slice_param_array_arg(env, arg_tys[sai].clone(), sp_inst_params[sai].ty.clone())
+                            end
                             if sp_uok then
                               # (the per-argument effect record): a
                               # RESOLVED static-path associated call
@@ -25753,6 +25883,94 @@ def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, 
                 end
                 static_ret = Option::Some(resolve_type_var(env, a_ret))
               end
+            when _ then ()
+            end
+          when Option::None then ()
+          end
+        end
+        # (batch 5 — the module-qualified free-function call): a path whose
+        # last segment names a top-level function in a MODULE namespace
+        # (`std::env::get_env(...)`) — no owner type, no builtin
+        # constructor, no mangled alias. The resolver recorded the Function
+        # DefId for this call node; instantiate its registered signature and
+        # unify the arguments exactly like the call arm (the access-marker
+        # reconciliation for `&place` args, the variadic-extras subset
+        # allowance), record the target + solved instance, and return the
+        # solved return type. The guard (a recorded Function target) keeps
+        # the variant surface authoritative for every path the resolver did
+        # not classify.
+        if static_ret.is_none() then
+          match module_qualified_free_fn_type(env, expr.node_id, variant_name.clone())
+          when Option::Some(qf_pair) then
+            let qf_ty = qf_pair.0.clone()
+            let qf_did = qf_pair.1.clone()
+            match qf_ty
+            when Type::FnPtr(qf_params, qf_ret0, _) then
+              env.typed_call_targets.insert(expr.node_id, qf_did.clone())
+              record_effect_call(env, Option::Some(qf_did))
+              let qf_decl = callee_decl_generic_params(env, expr.node_id, qf_ty.clone())
+              var qf_names: Vec[GenericParamId] = Vec::new()
+              var qf_vars: Vec[Type] = Vec::new()
+              var qf_i = 0
+              while qf_i < qf_decl.len() do
+                qf_names.push(qf_decl[qf_i].clone())
+                qf_vars.push(fresh_type_var(env))
+                qf_i = qf_i + 1
+              end
+              var qf_params_inst: Vec[ParamType] = Vec::new()
+              var qf_pi = 0
+              while qf_pi < qf_params.len() do
+                qf_params_inst.push(ParamType { ty: subst_type_args(qf_params[qf_pi].ty.clone(), qf_names.clone(), qf_vars.clone()), convention: qf_params[qf_pi].convention })
+                qf_pi = qf_pi + 1
+              end
+              let qf_ret = subst_type_args(qf_ret0.clone(), qf_names.clone(), qf_vars.clone())
+              let qf_varargs = env.variadic_extern_dids.contains(def_id_numeric(&qf_did))
+              if qf_varargs then
+                if args.len() < qf_params_inst.len() then
+                  type_add_error(env, "wrong number of arguments: variadic extern expects at least " + qf_params_inst.len().to_string() + ", found " + args.len().to_string(), expr.span)
+                end
+              else
+                if args.len() != qf_params_inst.len() then
+                  type_add_error(env, "wrong number of arguments: expected " + qf_params_inst.len().to_string() + ", found " + args.len().to_string(), expr.span)
+                end
+              end
+              var qf_ai = 0
+              while qf_ai < args.len() && qf_ai < qf_params_inst.len() do
+                match args[qf_ai].kind
+                when ExprKind::ExprAccess(_) then
+                  unify_call_arg_with_access_marker(env, arg_tys[qf_ai].clone(), qf_params_inst[qf_ai].ty.clone(), args[qf_ai].span.clone())
+                when _ then
+                  unify(env, arg_tys[qf_ai].clone(), qf_params_inst[qf_ai].ty.clone(), args[qf_ai].span)
+                end
+                record_arg_effect(env, &args[qf_ai], qf_params_inst[qf_ai].convention)
+                qf_ai = qf_ai + 1
+              end
+              match expected
+              when Option::Some(exp) then
+                let _qf_adopt = expected_adopt(env, qf_ret.clone(), exp)
+              when Option::None then ()
+              end
+              var qf_all_solved = true
+              var qf_solved: Vec[Type] = Vec::new()
+              var qf_si = 0
+              while qf_si < qf_vars.len() do
+                let qf_rv = resolve_type_var(env, qf_vars[qf_si].clone())
+                if type_has_unresolved_var(env, qf_rv.clone()) then
+                  qf_all_solved = false
+                else
+                  qf_solved.push(qf_rv)
+                end
+                qf_si = qf_si + 1
+              end
+              if qf_all_solved then
+                let qf_typed = typed_args_of_solved(env, qf_names.clone(), qf_solved, expr.span)
+                env.typed_call_instances.insert(expr.node_id, qf_typed)
+                env.pending_call_instances.remove(&expr.node_id)
+              elsif qf_names.len() > 0 then
+                env.pending_call_instances.insert(expr.node_id, (qf_names.clone(), qf_vars, expr.span))
+              end
+              validate_type_const_args(env, qf_ret.clone(), expr.span)
+              static_ret = Option::Some(resolve_type_var(env, qf_ret))
             when _ then ()
             end
           when Option::None then ()

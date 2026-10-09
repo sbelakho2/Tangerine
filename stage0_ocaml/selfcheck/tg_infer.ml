@@ -310,6 +310,15 @@ let () =
                cases file, reports a nonzero row here). *)
             fail
               "the kernel runtime-parity battery failed (expected `RUNTIME_PARITY_BATTERY fails=0`; see the report above)"
+          else if not (contains report "CLOSURE_FAMILY_BATTERY fails=0") then
+            (* batch 5: the full-closure HIR divergence families at small
+               scale — >host integer literals adopted by cast/expected
+               integer types, indexing a call-result local, Vec::from
+               over the std Array impl, and module-qualified free calls.
+               Every leg asserts errors=0 plus Error/Var-free typed
+               channels and readiness. *)
+            fail
+              "the closure-divergence family battery failed (expected `CLOSURE_FAMILY_BATTERY fails=0`; see the report above)"
           else if not (contains report "TOTALS errors=") then
             fail "the probe produced no TOTALS row"
           else if merged && not (contains report "IMPLCONF=0") then
