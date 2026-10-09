@@ -319,6 +319,15 @@ let () =
                channels and readiness. *)
             fail
               "the closure-divergence family battery failed (expected `CLOSURE_FAMILY_BATTERY fails=0`; see the report above)"
+          else if not (contains report "KERNEL_PARITY_BATTERY fails=0") then
+            (* batch 6: the remaining kernel-checker semantic divergences
+               at small scale (classes 1-4 + the small families): the
+               shared-container resource extraction false positive plus
+               its canary gates, the cross-module size_of type-query, the
+               statement/block value-discard shape, and the
+               `case`-prefixed enum variants. *)
+            fail
+              "the kernel-parity battery failed (expected `KERNEL_PARITY_BATTERY fails=0`; see the report above)"
           else if not (contains report "TOTALS errors=") then
             fail "the probe produced no TOTALS row"
           else if merged && not (contains report "IMPLCONF=0") then

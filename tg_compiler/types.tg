@@ -2468,14 +2468,18 @@ def effect_expr_has_control_flow(expr: Expr) -> Bool
   end  end
 end
 
-# Whether the function under a def-key is a std module function — the
-# trusted implementation base exempt from the compare diagnostics (its
-# declared effects are the API contract for USER callers; its internal
-# calls are the implementation of those declared effects).
-def fn_effect_is_std(env: TypeEnv, key: String) -> Bool
+# Whether the function under a def-key is part of the TRUSTED BASE — the
+# std module (the trusted implementation base: its declared effects are
+# the API contract for USER callers; its internal calls implement those
+# declared effects) or the compiler kernel itself (tg_compiler: the
+# self-hosted tool, whose ICE panics and diagnostic I/O are the tool's
+# own implementation, not a user-visible effect contract). Both are
+# exempt from the compare diagnostics; USER modules keep the full
+# transitive declaration discipline.
+def fn_effect_is_trusted_base(env: TypeEnv, key: String) -> Bool
   match env.fn_effect_modules.get(key)
   when Option::Some(mpath) then
-    mpath.len() > 0 && mpath[0] == "std"
+    mpath.len() > 0 && (mpath[0] == "std" || mpath[0] == "tg_compiler")
   when Option::None then false
   end  end
 end
@@ -3179,6 +3183,18 @@ end
 #                         capability elements, Option/Result containing
 #                         capabilities (the checker's capability-exit
 #                         machinery consumes this axis).
+#   contains_resource   — the value (or any substituted field/element/
+#                         payload) is or contains a DECLARED resource or
+#                         capability kind (TypeKind::Resource/Capability).
+#                         This is the shared-extraction rule's axis: a
+#                         type that is merely linear through a Box child
+#                         (the compiler's own AST/IR enums) contains no
+#                         resource; only a declared resource/capability
+#                         payload makes a by-value extraction duplicate
+#                         ownership. The viral is_linear axis stays the
+#                         MOVE-MODEL answer for the MIR (a Box child is
+#                         still move-only); the extraction diagnostics use
+#                         THIS axis, never is_linear.
 # is_trivially_copyable — raw bit-copy is valid, no retain/clone (—
 #                         THE copy authority; the MIR Copy verifier
 #                         queries THIS axis, never the DeinitPlan).
@@ -3219,6 +3235,7 @@ struct TypeProperties
   is_linear: Bool
   is_capability: Bool
   contains_capability: Bool
+  contains_resource: Bool = false
   is_trivially_copyable: Bool
   is_deferred: Bool
   # (audit order item 8) THE COMPILER-OWNED VECTOR/SIMD TYPE PROPERTY: TRUE
@@ -3766,6 +3783,13 @@ struct TypeEnv
   # body) is an ordinary push_scope/pop_scope, which is what makes an
   # out-of-block use an unknown symbol.
   scoped_access_stack: Vec[ScopedAccessBinding] = Vec::new()
+  # The MUTABLE local ids (inout/set parameters and `var`/`let mut`
+  # bindings): the seed's deref rule treats `*p` on a mutable local/param
+  # as the direct access place ("access through the parameter is direct"),
+  # never the strict non-pointer deref diagnostic. Populated at parameter
+  # binding (check_function) and at mutable pattern binding (check_pattern
+  # / the let statement's mut flag).
+  mutable_locals: Set[Int] = Set::new()
   resolutions: Option[ResolvedNames]
   typed_call_targets: Map[Int, DefId]
   # (audit P1-13/§26 — C variadic externs): def_id_numeric(DefId) of
@@ -4143,6 +4167,7 @@ impl Clone for TypeEnv
       local_id_counter: self.local_id_counter.clone(),
       local_ids: self.local_ids.clone(),
       scoped_access_stack: self.scoped_access_stack.clone(),
+      mutable_locals: self.mutable_locals.clone(),
       resolutions: self.resolutions.clone(),
       typed_call_targets: self.typed_call_targets.clone(),
       variadic_extern_dids: self.variadic_extern_dids.clone(),
@@ -7875,14 +7900,19 @@ end
 # owns_state alone is not duplication — the by-value read of an owning
 # element is a MOVE at the MIR level and the verifier's no-copy-of-non-
 # Copy rule is the authority for the unsound copies. What the diagnostics
-# reject is the genuinely NON-DUPLICABLE payload: the linear move-only
-# values (resource/capability kinds, Box/UniquePtr) whose extraction
-# would manufacture a second owner of a unique value. The canary
-# negatives (Array[File] indexing, Map[String, File].get, Set[File].iter,
-# Rc[Probe]) stay rejected through the linear answer.
+# reject is the genuinely NON-DUPLICABLE payload: the declared
+# resource/capability kinds (and aggregates/containers that CONTAIN one)
+# whose extraction would manufacture a second owner of a unique value.
+# The Box-linear compiler enums (the AST/IR types) are move-only but
+# contain no resource — extracting `elems[i].clone()`/`m.get(k)` from
+# their containers is the seed-accepted closure shape, so the axis must
+# never be the viral is_linear bit (a Box child is not a resource). The
+# canary negatives (Array[File] indexing, Map[String, File].get,
+# Set[File].iter, Rc[Probe]) stay rejected through the declared-kind
+# containment answer.
 def type_has_concrete_resource_kind(inout env: TypeEnv, ty: Type) -> Bool
   let p = type_properties_of(env, ty)
-  !p.is_deferred && (p.is_linear || p.is_capability)
+  !p.is_deferred && p.contains_resource
 end
 
 pub def type_kinds_contain_resource(kinds: Map[Int, TypeKind], ty: Type) -> Bool
@@ -8538,7 +8568,17 @@ def resolve_bare_callable(inout env: TypeEnv, name: String, span: Span, fallback
         ty
       when Option::None then
         if foreign_distinct >= 2 then
-          type_add_error(env, "ambiguous name `" + name + "`: defined in multiple modules; qualify the path", span)
+          # The type-query special form (size_of/align_of) is never a
+          # resolved value: the seed's parser mints it as a type-query
+          # and the caller is answered by the query channel (the call
+          # arm's type_query_kind_of_callee record), so a bare query
+          # name must not be an ambiguity error even when several
+          # modules declare a same-named function (std/alloc's extern
+          # and tg_compiler/layout_engine's def). Every other name
+          # keeps the ambiguity diagnostic.
+          if name != "size_of" && name != "align_of" then
+            type_add_error(env, "ambiguous name `" + name + "`: defined in multiple modules; qualify the path", span)
+          end
           match env.callable_first_wins.get(name.clone())
           when Option::Some(ty) then ty.clone()
           when Option::None then fallback
@@ -12375,7 +12415,7 @@ def check_effect_sets(inout env: TypeEnv) -> Unit
   var ci = 0
   while ci < comp_entries.len() do
     let (key, comp) = comp_entries[ci]
-    if !fn_effect_is_std(env, &key) then
+    if !fn_effect_is_trusted_base(env, &key) then
       match env.fn_declared_effects.get(key.clone())
       when Option::Some(decl) then
         for e in comp do
@@ -12399,7 +12439,7 @@ def check_effect_sets(inout env: TypeEnv) -> Unit
   var di = 0
   while di < decl_entries.len() do
     let (key, decl) = decl_entries[di]
-    if !fn_effect_is_std(env, &key) then
+    if !fn_effect_is_trusted_base(env, &key) then
       var comp2 = Vec::new()
       match env.fn_computed_effects.get(key.clone())
       when Option::Some(c) then comp2 = c.clone()
@@ -14015,6 +14055,11 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
     end
     bind_var(env, p.name, ty)
     param_local_ids.push(env.local_id_counter - 1)
+    # The seed's parameter mutability: inout/set parameters are mutable
+    # bindings (the deref-of-a-mutable-param rule reads this set).
+    if p.convention == AccessConvention::Inout || p.convention == AccessConvention::Set then
+      env.mutable_locals.insert(env.local_id_counter - 1)
+    end
     fn_param_types.push(ParamType { ty: ty, convention: p.convention })
     i = i + 1
   end
@@ -15310,6 +15355,37 @@ def check_block(inout env: TypeEnv, block: Block, is_value: Bool) -> FlowResult
   check_block_expected(env, block, is_value, Option::None)
 end
 
+# The tail-statement entry (seed parity): every block tail is checked with
+# the seed's DISCARDED use — its join nodes (if/match) reconcile tolerantly
+# (a Unit path never fails the join; the non-Unit branch type wins) while
+# the expression's own type still flows into the block's normal. The old
+# value-position-if/match reconciliation against Unit rejected the
+# closure's statement-shaped tails (`if at(p, End) then advance(p) else
+# diag_error(...) end` — Token vs Unit) that the seed accepts.
+def check_tail_stmt_expected(inout env: TypeEnv, stmt: Stmt, expected: Option[Type], is_value: Bool) -> FlowResult
+  if !is_value then
+    check_stmt_expected(env, &stmt, expected, false)
+  else
+    match stmt.kind
+    when StmtKind::StmtExpr(expr) then check_tail_expr(env, &expr, expected)
+    when StmtKind::StmtIf(if_stmt) then check_if_stmt_expected(env, &if_stmt, false, expected, true)
+    when StmtKind::StmtMatch(m) then check_match_expected(env, &m, false, expected, true)
+    when _ then check_stmt_expected(env, &stmt, expected, true)
+    end
+  end
+end
+
+def check_tail_expr(inout env: TypeEnv, expr: Expr, expected: Option[Type]) -> FlowResult
+  match expr.kind
+  when ExprKind::ExprIf(if_stmt) then check_if_stmt_expected(env, &if_stmt, false, expected, true)
+  when ExprKind::ExprMatch(m) then check_match_expected(env, &m, false, expected, true)
+  when ExprKind::ExprBlock(block) then check_block_expected(env, &block, true, expected)
+  when ExprKind::ExprUnsafe(_, block) then check_block_expected(env, &block, true, expected)
+  when ExprKind::ExprAsync(block) then check_block_expected(env, &block, true, expected)
+  when _ then flow_normal(check_expr_expected(env, &expr, expected))
+  end
+end
+
 # The expected-type block entry: the block's TAIL statement (the one whose
 # flow becomes the block's value) carries the enclosing expected type — the
 # seed's check_block expected threading. Every other statement is
@@ -15335,8 +15411,11 @@ def check_block_expected(inout env: TypeEnv, block: Block, is_value: Bool, expec
   while i < block.stmts.len() do
     let stmt = block.stmts[i]
     let is_tail = i + 1 == block.stmts.len()
-    let stmt_expected = if is_tail then expected.clone() else Option::None end
-    let flow = check_stmt_expected(env, &stmt, stmt_expected, is_tail && is_value)
+    let flow = if is_tail then
+      check_tail_stmt_expected(env, &stmt, expected.clone(), is_value)
+    else
+      check_stmt_expected(env, &stmt, Option::None, false)
+    end
     if !unreachable then
       normal = flow.normal
       if flow.may_return then may_return = true end
@@ -15852,6 +15931,8 @@ def check_stmt_expected(inout env: TypeEnv, stmt: Stmt, expected: Option[Type], 
     # source places (the Consume bindings over non-plain sources) — the
     # frame's per-field state for the drop sites.
     record_place_moves(env, &pattern)
+    # `var`/`let mut` bindings are mutable locals (the deref rule).
+    if is_mut then mark_pattern_bindings_mutable(env, &pattern) end
     flow_normal(Type::Unit)
   when StmtKind::StmtAssign(target, value) then
     let target_type = check_expr(env, &target)
@@ -15886,7 +15967,7 @@ def check_stmt_expected(inout env: TypeEnv, stmt: Stmt, expected: Option[Type], 
     record_projected_consume(env, &value)
     flow_normal(Type::Unit)
   when StmtKind::StmtIf(if_stmt) then
-    check_if_stmt_expected(env, &if_stmt, !value_position, expected.clone())
+    check_if_stmt_expected(env, &if_stmt, !value_position, expected.clone(), false)
   when StmtKind::StmtWhile(cond, body) then
     let cond_type = check_expr(env, &cond)
     unify(env, cond_type, Type::Bool, cond.span)
@@ -15929,7 +16010,11 @@ def check_stmt_expected(inout env: TypeEnv, stmt: Stmt, expected: Option[Type], 
     # Unconstrained Var/Param receivers are kept fresh — their element type
     # is a genuine pending equation resolved when the receiver's type lands.
     let elem_type = match for_stmt.iter.kind
-    when ExprKind::ExprRange(_, _, _) then Type::Int
+    when ExprKind::ExprRange(_, _, _) then
+      # The range's own checked type (the ExprRange arm unified the bounds
+      # and adopted a literal bound's kind): `for _ in 0..n` with n: UInt
+      # iterates UInt, not Int.
+      iter_type
     when _ then
       match iter_type
       when Type::String then Type::Char
@@ -16020,7 +16105,7 @@ def check_stmt_expected(inout env: TypeEnv, stmt: Stmt, expected: Option[Type], 
   when StmtKind::StmtExpr(expr) then
     flow_normal(check_expr_expected(env, &expr, expected.clone()))
   when StmtKind::StmtMatch(m) then
-    check_match_expected(env, &m, !value_position, expected.clone())
+    check_match_expected(env, &m, !value_position, expected.clone(), false)
   when StmtKind::StmtUnsafe(_, body) then
     check_block_expected(env, &body, true, expected.clone())
   when StmtKind::StmtDefer(body) then
@@ -16524,7 +16609,7 @@ def check_stmt_expected(inout env: TypeEnv, stmt: Stmt, expected: Option[Type], 
 end
 
 def check_if_stmt(inout env: TypeEnv, if_stmt: IfStmt, is_stmt: Bool) -> FlowResult
-  check_if_stmt_expected(env, if_stmt, is_stmt, Option::None)
+  check_if_stmt_expected(env, if_stmt, is_stmt, Option::None, false)
 end
 
 # The value-position if/elsif/else branch-kind JOIN: an unsuffixed
@@ -16646,7 +16731,7 @@ end
 # The expected-type if entry: a value-position if forwards its expected
 # type into every branch block (the seed's check_if expected threading), so
 # a branch tail is solved from the enclosing context.
-def check_if_stmt_expected(inout env: TypeEnv, if_stmt: IfStmt, is_stmt: Bool, expected: Option[Type]) -> FlowResult
+def check_if_stmt_expected(inout env: TypeEnv, if_stmt: IfStmt, is_stmt: Bool, expected: Option[Type], discarded: Bool) -> FlowResult
   let cond_type = check_expr(env, &if_stmt.cond)
   unify(env, cond_type, Type::Bool, if_stmt.cond.span)
   
@@ -16688,8 +16773,19 @@ def check_if_stmt_expected(inout env: TypeEnv, if_stmt: IfStmt, is_stmt: Bool, e
     # if/elsif/else chain's own constructor variables (the kernel's
     # if/elsif/else Result/Option arm chains).
     if !is_stmt then
-      unify(env, result_type, eb_flow.normal, ebody.span)
-      result_type = if_join_adopt_literal_kind(env, result_type, eb_flow.normal.clone())
+      # (discarded join tolerance — the seed's Discarded reconcile): a
+      # dropped-value context (a block tail / statement expression) never
+      # fails the join over a Unit path; the non-Unit branch type wins.
+      # A genuine value position keeps the strict join.
+      if discarded && (is_unit_type(&result_type) || is_unit_type(&eb_flow.normal)) then
+        if is_unit_type(&result_type) && !is_unit_type(&eb_flow.normal) then
+          result_type = eb_flow.normal.clone()
+        end
+        speculative_unify(env, result_type.clone(), eb_flow.normal.clone())
+      else
+        unify(env, result_type, eb_flow.normal, ebody.span)
+        result_type = if_join_adopt_literal_kind(env, result_type, eb_flow.normal.clone())
+      end
     elsif is_never_type(&result_type) && !is_never_type(&eb_flow.normal) then
       # Statement-if completion value: keep the first completing branch's
       # type, but a branch that completes replaces an all-diverge prefix.
@@ -16710,8 +16806,15 @@ def check_if_stmt_expected(inout env: TypeEnv, if_stmt: IfStmt, is_stmt: Bool, e
     if else_flow.may_continue then may_continue = true end
     if else_flow.may_throw then may_throw = true end
     if !is_stmt then
-      unify(env, result_type, else_flow.normal, else_block.span)
-      result_type = if_join_adopt_literal_kind(env, result_type, else_flow.normal.clone())
+      if discarded && (is_unit_type(&result_type) || is_unit_type(&else_flow.normal)) then
+        if is_unit_type(&result_type) && !is_unit_type(&else_flow.normal) then
+          result_type = else_flow.normal.clone()
+        end
+        speculative_unify(env, result_type.clone(), else_flow.normal.clone())
+      else
+        unify(env, result_type, else_flow.normal, else_block.span)
+        result_type = if_join_adopt_literal_kind(env, result_type, else_flow.normal.clone())
+      end
     elsif is_never_type(&result_type) && !is_never_type(&else_flow.normal) then
       result_type = else_flow.normal
     elsif !is_never_type(&result_type) && !is_never_type(&else_flow.normal) &&
@@ -16723,14 +16826,12 @@ def check_if_stmt_expected(inout env: TypeEnv, if_stmt: IfStmt, is_stmt: Bool, e
       speculative_unify(env, result_type, else_flow.normal)
     end
   when Option::None then
-    # An `if` without `else` used as a statement does not force its branch type
-    # to Unit — forcing it rejects valid code like `if c then fetch_and_add() end`
-    # whose branch returns a value that is discarded.
- # (e): an `if` USED AS A VALUE without an else contributes Unit on
-    # the false path — every reachable branch must have compatible values.
-    if !is_stmt then
-      unify(env, result_type, Type::Unit, if_stmt.span)
-    end
+    # An `if` WITHOUT `else` yields Unit and DISCARDS its branch values
+    # in EVERY position (the seed's no-else arm: te_type = Unit regardless
+    # of the branch type). The old value-position unify against Unit
+    # rejected the closure's tails (`if at(p, End) then advance(p) end`
+    # with advance -> Token) the seed accepts.
+    result_type = Type::Unit
     falls_through = true
   end
   
@@ -16873,14 +16974,54 @@ def exhaustiveness_debug_dump(scrutinee_tid: Int, covered_list: Vec[VariantId], 
 end
 
 def check_match(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool) -> FlowResult
-  check_match_expected(env, m, is_stmt, Option::None)
+  check_match_expected(env, m, is_stmt, Option::None, false)
 end
 
 # The expected-type match entry: the match's result type IS the expected
 # type when the enclosing context knows it (the seed's check_match
 # threading), so every arm body is checked with it and its tail is solved
 # from the match's declared result.
-def check_match_expected(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool, expected: Option[Type]) -> FlowResult
+# Cover ONE or-pattern alternative (recursively flattening nested Or
+# nodes): returns true when the alternative is a catch-all (a wildcard or
+# an ordinary binding) — the caller sets its wildcard flag.
+def cover_pattern_alternative(
+  inout env: TypeEnv, pat: Pattern, scrutinee_enum: Option[TypeDef],
+  inout covered_variants: Set[VariantId], inout covered_list: Vec[VariantId]
+) -> Bool
+  match pat.kind
+  when PatternKind::Wildcard then true
+  when PatternKind::Ident(_, _) then
+    match env.pattern_variant_resolutions.get(pat.node_id)
+    when Option::Some(_) then
+      cover_pattern_variant(env, &pat, scrutinee_enum, &mut covered_variants, &mut covered_list)
+      false
+    when Option::None then true
+    end
+  when PatternKind::Variant(_, _) then
+    cover_pattern_variant(env, &pat, scrutinee_enum, &mut covered_variants, &mut covered_list)
+    false
+  when PatternKind::Struct(_, _) then
+    # A struct-style enum-variant pattern (Enum::Variant {.. }) carries
+    # its variant resolution record too — it covers the variant by
+    # identity; a plain struct destructure whose name is not a variant of
+    # the scrutinee enum contributes nothing.
+    cover_pattern_variant(env, &pat, scrutinee_enum, &mut covered_variants, &mut covered_list)
+    false
+  when PatternKind::Or(inner_alts) then
+    var j = 0
+    var w = false
+    while j < inner_alts.len() do
+      if cover_pattern_alternative(env, &inner_alts[j], scrutinee_enum, &mut covered_variants, &mut covered_list) then
+        w = true
+      end
+      j = j + 1
+    end
+    w
+  when _ then false
+  end
+end
+
+def check_match_expected(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool, expected: Option[Type], discarded: Bool) -> FlowResult
   let scrutinee_type = check_expr(env, &m.scrutinee)
   # The scrutinee's enum definition (when the scrutinee is a closed enum) —
   # the KNOWN owner handed to the coverage fallback. A pattern record that
@@ -16959,9 +17100,16 @@ def check_match_expected(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool, expect
       when PatternKind::Wildcard then
         has_wildcard = true
       when PatternKind::Ident(_, _) then
-        # An identifier pattern is a catch-all: it matches ANY value, so it
-        # exhaustively covers a closed enum.
-        has_wildcard = true
+        # A bare-name pattern resolved as a nullary variant of the
+        # subject enum covers that variant; an ordinary binding is a
+        # catch-all (it matches ANY value, so it exhaustively covers a
+        # closed enum).
+        match env.pattern_variant_resolutions.get(arm.pattern.node_id)
+        when Option::Some(_) then
+          cover_pattern_variant(env, &arm.pattern, scrutinee_enum, &mut covered_variants, &mut covered_list)
+        when Option::None then
+          has_wildcard = true
+        end
       when PatternKind::Variant(_, _) then
         # The covered variant is the pattern's RESOLVED identity — the
         # (owner TypeId, variant index) record — with the name/qualified-path
@@ -16970,23 +17118,8 @@ def check_match_expected(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool, expect
       when PatternKind::Or(alts) then
         var j = 0
         while j < alts.len() do
-          match alts[j].kind
-          when PatternKind::Wildcard then
+          if cover_pattern_alternative(env, &alts[j], scrutinee_enum, &mut covered_variants, &mut covered_list) then
             has_wildcard = true
-          when PatternKind::Ident(_, _) then
-            has_wildcard = true
-          when PatternKind::Variant(_, _) then
-            cover_pattern_variant(env, &alts[j], scrutinee_enum, &mut covered_variants, &mut covered_list)
-          when PatternKind::Struct(_, _) then
-            # A struct-style enum-variant pattern (Enum::Variant {.. })
-            # carries its variant resolution record too — it covers the
-            # variant by identity; a plain struct destructure whose name is
-            # not a variant of the scrutinee enum contributes nothing.
-            cover_pattern_variant(env, &alts[j], scrutinee_enum, &mut covered_variants, &mut covered_list)
-          when PatternKind::Literal(_) then ()
-          when PatternKind::Tuple(_) then ()
-          when PatternKind::Array(_) then ()
-          when PatternKind::Range(_, _, _) then ()
           end
           j = j + 1
         end
@@ -17002,7 +17135,11 @@ def check_match_expected(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool, expect
       end
     end
     
-    let arm_flow = check_block_expected(env, &arm.body, true, Option::Some(result_type.clone()))
+    # A discarded (statement/tail) match does not thread the enclosing
+    # expected into its arm bodies (the seed's Discarded expected'=None);
+    # a value match keeps the expected-driven arm inference.
+    let arm_expected = if discarded then Option::None else Option::Some(result_type.clone()) end
+    let arm_flow = check_block_expected(env, &arm.body, true, arm_expected)
     if !is_never_type(&arm_flow.normal) then falls_through = true end
     if arm_flow.may_return then may_return = true end
     if arm_flow.may_break then may_break = true end
@@ -17012,20 +17149,31 @@ def check_match_expected(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool, expect
     # types (e.g. an arm ending in `set.insert(...)` returning Bool next to a
     # Unit arm) are not errors. Value-position matches still unify strictly.
     if !is_stmt then
-      unify(env, result_type, arm_flow.normal, arm.span)
-      # (match-arm join — the Never-argument adoption, the match port of
-      # if_join_adopt_never_adt_arg): a join that is an Adt whose argument
-      # resolved to the Never bottom (e.g. a `None` arm) must not pin the
-      # join when this arm determines the argument concretely — adopt the
-      # arm's concrete argument under the helper's guards (concrete arm
-      # argument only, both-way speculative unify with substitution and
-      # diagnostic rollback). The join type is resolved first: with no
-      # expected type the join starts as a fresh variable bound by this
-      # arm's unify, so the rule must read the bound type (the if join's
-      # `current` is the then arm's normal and needs no resolve). The
-      # literal-kind adoption is NOT applied here — the Never-argument rule
-      # is the match join's only addition.
-      result_type = if_join_adopt_never_adt_arg(env, resolve_type_var(env, result_type), arm_flow.normal.clone())
+      # (discarded join tolerance — the seed's Discarded arm reconcile): a
+      # dropped-value context never fails the join over a Unit path and
+      # the non-Unit arm type wins. A genuine value position keeps the
+      # strict join.
+      if discarded && (is_unit_type(&result_type) || is_unit_type(&arm_flow.normal)) then
+        if is_unit_type(&result_type) && !is_unit_type(&arm_flow.normal) then
+          result_type = arm_flow.normal.clone()
+        end
+        speculative_unify(env, result_type.clone(), arm_flow.normal.clone())
+      else
+        unify(env, result_type, arm_flow.normal, arm.span)
+        # (match-arm join — the Never-argument adoption, the match port of
+        # if_join_adopt_never_adt_arg): a join that is an Adt whose argument
+        # resolved to the Never bottom (e.g. a `None` arm) must not pin the
+        # join when this arm determines the argument concretely — adopt the
+        # arm's concrete argument under the helper's guards (concrete arm
+        # argument only, both-way speculative unify with substitution and
+        # diagnostic rollback). The join type is resolved first: with no
+        # expected type the join starts as a fresh variable bound by this
+        # arm's unify, so the rule must read the bound type (the if join's
+        # `current` is the then arm's normal and needs no resolve). The
+        # literal-kind adoption is NOT applied here — the Never-argument rule
+        # is the match join's only addition.
+        result_type = if_join_adopt_never_adt_arg(env, resolve_type_var(env, result_type), arm_flow.normal.clone())
+      end
     end
     pop_scope(env)
     i = i + 1
@@ -17276,6 +17424,83 @@ end
 # that enum — and the last-resort global scan for context-less bare
 # variants — consult the source spelling, and they live HERE, never in
 # check_pattern.
+# The seed's nullary_variant_of_subject: when the subject type is a
+# KNOWN enum and `name` is one of its variants with NO payload, the bare
+# identifier pattern is a variant pattern (tag dispatch); record the
+# (owner TypeId, variant index) identity for the coverage junction. A
+# name that is not a nullary variant stays an ordinary binding.
+def resolve_bare_nullary_variant_node(inout env: TypeEnv, pat: Pattern, name: String, expected_base: Type) -> Unit
+  if pat.node_id == 0 then return end
+  match env.pattern_variant_resolutions.get(pat.node_id)
+  when Option::Some(_) then return
+  when Option::None then ()
+  end
+  match expected_base
+  when Type::Adt(tid, _) then
+    match get_type_by_id_ref(env, &tid)
+    when Option::Some(td) then
+      match td.def_kind
+      when TypeDefKind::Enum(variants) then
+        var i = 0
+        while i < variants.len() do
+          if variants[i].name == name && variants[i].fields.is_empty() then
+            env.pattern_variant_resolutions.insert(pat.node_id, (tid.id, i))
+            return
+          end
+          i = i + 1
+        end
+      when _ then ()
+      end
+    when Option::None then ()
+    end
+  when _ then ()
+  end
+end
+
+# Mark every local bound by a mutable pattern as mutable (the seed's
+# scope.locals mut flag): the deref rule reads the set so `*p = v` on a
+# `var`/`let mut` binding is the direct place access.
+def mark_pattern_bindings_mutable(inout env: TypeEnv, pat: Pattern) -> Unit
+  match pat.kind
+  when PatternKind::Ident(_, _) then
+    match env.pattern_binding_resolutions.get(pat.node_id)
+    when Option::Some(lid) then env.mutable_locals.insert(lid)
+    when Option::None then ()
+    end
+  when PatternKind::Tuple(pats) then
+    var i = 0
+    while i < pats.len() do
+      mark_pattern_bindings_mutable(env, &pats[i])
+      i = i + 1
+    end
+  when PatternKind::Array(pats) then
+    var i = 0
+    while i < pats.len() do
+      mark_pattern_bindings_mutable(env, &pats[i])
+      i = i + 1
+    end
+  when PatternKind::Variant(_, pats) then
+    var i = 0
+    while i < pats.len() do
+      mark_pattern_bindings_mutable(env, &pats[i])
+      i = i + 1
+    end
+  when PatternKind::Struct(_, field_pats) then
+    var i = 0
+    while i < field_pats.len() do
+      mark_pattern_bindings_mutable(env, &field_pats[i].1)
+      i = i + 1
+    end
+  when PatternKind::Or(alts) then
+    var i = 0
+    while i < alts.len() do
+      mark_pattern_bindings_mutable(env, &alts[i])
+      i = i + 1
+    end
+  when _ then ()
+  end
+end
+
 def resolve_pattern_variants(inout env: TypeEnv, pat: Pattern, expected: Type) -> Unit
   # Patterns match through BORROWS only; a Box scrutinee keeps its own
   # nominal identity (a `Box { ptr }` pattern descends the Box's own
@@ -17286,7 +17511,15 @@ def resolve_pattern_variants(inout env: TypeEnv, pat: Pattern, expected: Type) -
   end
   match pat.kind
   when PatternKind::Wildcard then ()
-  when PatternKind::Ident(_, _) then ()
+  when PatternKind::Ident(name, _) then
+    # The seed's nullary-variant rule (nullary_variant_of_subject): a
+    # bare name that is a NULLARY variant of the subject enum dispatches
+    # on the tag — it is NOT a binding. Without this, an or-pattern
+    # `A | B` of nullary variants collected different binding names and
+    # failed the or-pattern interface check, and a partial match
+    # `when A then` was treated as a catch-all binding (hiding a real
+    # non-exhaustive).
+    resolve_bare_nullary_variant_node(env, pat, &name, &expected_base)
   when PatternKind::Literal(_) then ()
   when PatternKind::Tuple(pats) then
     match expected_base
@@ -17430,14 +17663,43 @@ def resolve_pattern_variant_node(inout env: TypeEnv, pat: Pattern, path: AstPath
   end
   var chosen: Option[TypeDef] = Option::None
   var named_chosen = false
-  match named_owner
+  # The seed's qualified-pattern rule (resolve_variant, typecheck.ml): a
+  # qualified variant pattern (`Arch::AArch64`) MUST belong to the
+  # SUBJECT enum — the qualifier is spelling that may name a same-named
+  # declaration from another module (the closure's asm::Arch vs
+  # target_desc::Arch import collision), while the semantic VariantId
+  # must come from the enum the checker is matching on. Prefer the
+  # context owner when it is an enum carrying the variant name; the
+  # path-resolved owner is the fallback.
+  var context_matches = false
+  match context_owner
   when Option::Some(td) then
-    chosen = Option::Some(td)
-    named_chosen = true
-  when Option::None then
+    match td.def_kind
+    when TypeDefKind::Enum(variants) then
+      var cvi = 0
+      while cvi < variants.len() do
+        if variants[cvi].name == variant_name then context_matches = true end
+        cvi = cvi + 1
+      end
+    when _ then ()
+    end
+  when Option::None then ()
+  end
+  if context_matches then
     match context_owner
     when Option::Some(td) then chosen = Option::Some(td)
     when Option::None then ()
+    end
+  else
+    match named_owner
+    when Option::Some(td) then
+      chosen = Option::Some(td)
+      named_chosen = true
+    when Option::None then
+      match context_owner
+      when Option::Some(td) then chosen = Option::Some(td)
+      when Option::None then ()
+      end
     end
   end
   var resolved: Option[(Int, Int)] = Option::None
@@ -17579,28 +17841,37 @@ def check_pattern(inout env: TypeEnv, pat: Pattern, expected: Type, source_place
   when PatternKind::Wildcard then
     ()
   when PatternKind::Ident(name, is_mut) then
-    let before = env.local_id_counter
-    bind_var_typed(env, name, expected_base, expected)
-    if env.local_id_counter > before then
-      env.pattern_binding_resolutions.insert(pat.node_id, before)
+    # A name resolved as a NULLARY VARIANT of the subject enum (the
+    # seed's nullary_variant_of_subject rule, recorded by
+    # resolve_pattern_variants) dispatches on the tag — no binding is
+    # introduced. Any other identifier binds.
+    match env.pattern_variant_resolutions.get(pat.node_id)
+    when Option::Some(_) then ()
+    when Option::None then
+      let before = env.local_id_counter
+      bind_var_typed(env, name, expected_base, expected)
+      if env.local_id_counter > before then
+        env.pattern_binding_resolutions.insert(pat.node_id, before)
+        if is_mut then env.mutable_locals.insert(before) end
  # record the binding action — a plain binding READS its source;
-      # a binding of an owning type MOVES the value out of the source place
-      # (the resource checker's projected-move rules consume this data).
-      # Binding through a BORROW is a READ — no ownership transfers out
-      # of the source. An owned Box bound by value is an OWNING wrapper,
-      # not a borrow: its binding is a MOVE (Consume) exactly like any
-      # other owned resource.
-      let bind_is_ref = match expected
-      when Type::RefInternal(_, _) then true
-      when _ then false
+        # a binding of an owning type MOVES the value out of the source place
+        # (the resource checker's projected-move rules consume this data).
+        # Binding through a BORROW is a READ — no ownership transfers out
+        # of the source. An owned Box bound by value is an OWNING wrapper,
+        # not a borrow: its binding is a MOVE (Consume) exactly like any
+        # other owned resource.
+        let bind_is_ref = match expected
+        when Type::RefInternal(_, _) then true
+        when _ then false
+        end
+        let action = if !bind_is_ref && type_has_resource_kind(env, &expected_base) then AccessEffect::Consume else AccessEffect::Read end
+        var plans = match env.binding_plans.get(pat.node_id)
+        when Option::Some(p) then p.clone()
+        when Option::None then Vec::new()
+        end
+        plans.push(BindingPlan { local: before, source_place: source_place.clone(), action: action })
+        env.binding_plans.insert(pat.node_id, plans)
       end
-      let action = if !bind_is_ref && type_has_resource_kind(env, &expected_base) then AccessEffect::Consume else AccessEffect::Read end
-      var plans = match env.binding_plans.get(pat.node_id)
-      when Option::Some(p) then p.clone()
-      when Option::None then Vec::new()
-      end
-      plans.push(BindingPlan { local: before, source_place: source_place.clone(), action: action })
-      env.binding_plans.insert(pat.node_id, plans)
     end
   when PatternKind::Literal(expr) then
     let lit_type = check_expr(env, &expr)
@@ -17641,6 +17912,11 @@ def check_pattern(inout env: TypeEnv, pat: Pattern, expected: Type, source_place
       end
       unify(env, expected_base, Type::Tuple(types), pat.span)
       ()
+    when Type::Unit then
+      # The seed's unit-pattern rule: `()` against Unit is the empty
+      # tuple pattern (Result::Ok(()) with T = Unit). A non-empty tuple
+      # pattern still requires a tuple type.
+      if pats.len() == 0 then () else type_add_error(env, "expected tuple type", pat.span) end
     when _ then
       type_add_error(env, "expected tuple type", pat.span)
     end
@@ -21298,6 +21574,7 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
       if fp.requires_drop_glue then props.requires_drop_glue = true end
       if fp.is_linear then props.is_linear = true end
       if fp.contains_capability then props.contains_capability = true end
+      if fp.contains_resource then props.contains_resource = true end
       if fp.is_deferred then props.is_deferred = true end
       i = i + 1
     end
@@ -21314,6 +21591,7 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
     if fp.requires_drop_glue then props.requires_drop_glue = true end
     if fp.is_linear then props.is_linear = true end
     if fp.contains_capability then props.contains_capability = true end
+    if fp.contains_resource then props.contains_resource = true end
     if fp.is_deferred then props.is_deferred = true end
   # Closures/functions with environments and dyn/effect forms carry
   # checker-managed state: nothing here owns or copies.
@@ -21328,6 +21606,7 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
     if cp.requires_drop_glue then props.requires_drop_glue = true end
     if cp.is_linear then props.is_linear = true end
     if cp.contains_capability then props.contains_capability = true end
+    if cp.contains_resource then props.contains_resource = true end
     if cp.is_deferred then props.is_deferred = true end
   when Type::Dyn(_) then ()
   when Type::Effect(_, _) then ()
@@ -21379,6 +21658,7 @@ def type_props_walk(inout env: TypeEnv, ty: Type, inout visiting: Map[String, Ty
     if sp.requires_drop_glue then props.requires_drop_glue = true end
     if sp.is_linear then props.is_linear = true end
     if sp.contains_capability then props.contains_capability = true end
+    if sp.contains_resource then props.contains_resource = true end
     if sp.is_deferred then props.is_deferred = true end
   when Type::Error then ()
   end
@@ -21531,8 +21811,11 @@ def type_named_props(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout vis
     if td.kind == TypeKind::Resource || td.kind == TypeKind::Capability then
       # Resources/capabilities are linear by kind; is_capability is the
       # TypeKind::Capability marker, and a capability type contains a
-      # capability (itself).
+      # capability (itself). contains_resource is the declared-kind axis
+      # the shared-extraction rule reads (a Box-linear compiler enum is
+      # NOT a resource).
       props.is_linear = true
+      props.contains_resource = true
       if td.kind == TypeKind::Capability then
         props.is_capability = true
         props.contains_capability = true
@@ -21583,6 +21866,7 @@ def type_named_props(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout vis
         let ap = type_props_walk(env, &args[i], visiting, true)
         if ap.is_linear then props.is_linear = true end
         if ap.contains_capability then props.contains_capability = true end
+        if ap.contains_resource then props.contains_resource = true end
         if ap.is_deferred then props.is_deferred = true end
         i = i + 1
       end
@@ -21595,6 +21879,7 @@ def type_named_props(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout vis
         if ap.requires_drop_glue then props.requires_drop_glue = true end
         if ap.is_linear then props.is_linear = true end
         if ap.contains_capability then props.contains_capability = true end
+        if ap.contains_resource then props.contains_resource = true end
         if ap.is_deferred then props.is_deferred = true end
       end
     elsif tid.id == env.lang_items.result then
@@ -21606,6 +21891,7 @@ def type_named_props(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout vis
         if tp.requires_drop_glue || ep.requires_drop_glue then props.requires_drop_glue = true end
         if tp.is_linear || ep.is_linear then props.is_linear = true end
         if tp.contains_capability || ep.contains_capability then props.contains_capability = true end
+        if tp.contains_resource || ep.contains_resource then props.contains_resource = true end
         if tp.is_deferred || ep.is_deferred then props.is_deferred = true end
       end
     elsif tid.id == env.lang_items.slice then
@@ -21660,6 +21946,7 @@ def type_named_props(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout vis
           # capability FIELD contains a capability (the substituted field
           # walk above is the propagation).
           if fp.contains_capability then props.contains_capability = true end
+          if fp.contains_resource then props.contains_resource = true end
           if fp.is_deferred then props.is_deferred = true end
           i = i + 1
         end
@@ -21674,6 +21961,7 @@ def type_named_props(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout vis
             if vp.requires_drop_glue then props.requires_drop_glue = true end
             if vp.is_linear then props.is_linear = true end
             if vp.contains_capability then props.contains_capability = true end
+            if vp.contains_resource then props.contains_resource = true end
             if vp.is_deferred then props.is_deferred = true end
             fi = fi + 1
           end
@@ -21687,6 +21975,7 @@ def type_named_props(inout env: TypeEnv, tid: TypeId, args: Vec[Type], inout vis
         if ip.is_linear then props.is_linear = true end
         if ip.is_capability then props.is_capability = true end
         if ip.contains_capability then props.contains_capability = true end
+        if ip.contains_resource then props.contains_resource = true end
         if ip.is_deferred then props.is_deferred = true end
       when _ then ()
       end
@@ -23386,11 +23675,25 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
     when Option::Some(sfx) then
       if sfx == "f32" then
         if check_float_literal_range(env, &p, true, expr.span) then Type::F32 else Type::Error end
+      elsif sfx == "f64" then
+        if check_float_literal_range(env, &p, false, expr.span) then Type::F64 else Type::Error end
       else
         if check_float_literal_range(env, &p, false, expr.span) then Type::Float else Type::Error end
       end
     when Option::None then
-      if check_float_literal_range(env, &p, false, expr.span) then Type::Float else Type::Error end
+      # (the seed's FloatLit arm): an F32 expectation makes the literal
+      # F32; an F64 expectation makes it F64; otherwise the default
+      # (Float — the kernel's f64 view). This is what lets `f(1.5)` at
+      # an f64 parameter and `let x: f64 = 1.5` resolve without the
+      # raw unify(F64, Float) exact-match mismatch.
+      match expected
+      when Option::Some(Type::F32) then
+        if check_float_literal_range(env, &p, true, expr.span) then Type::F32 else Type::Error end
+      when Option::Some(Type::F64) then
+        if check_float_literal_range(env, &p, false, expr.span) then Type::F64 else Type::Error end
+      when _ then
+        if check_float_literal_range(env, &p, false, expr.span) then Type::Float else Type::Error end
+      end
     end
   when ExprKind::ExprStringLit(_) then Type::String
   when ExprKind::ExprCharLit(_) then Type::Char
@@ -24414,8 +24717,21 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
     let inner_expr = *inner.get()
     let inner_type = check_expr(env, &inner_expr)
     match inner_expr.kind
-    when ExprKind::ExprIdent(_) then raw_deref_pointee(env, inner_type, true, expr.span)
-    when ExprKind::ExprSelfRef then raw_deref_pointee(env, inner_type, true, expr.span)
+    when ExprKind::ExprIdent(_) then
+      # The seed's mutable-binding deref rule: `*p` with p a mutable
+      # local/param is the direct place access ("access through the
+      # parameter is direct") — never the strict non-pointer diagnostic.
+      if expr_is_mutable_deref_target(env, &inner_expr) then
+        inner_type
+      else
+        raw_deref_pointee(env, inner_type, true, expr.span)
+      end
+    when ExprKind::ExprSelfRef then
+      if expr_is_mutable_deref_target(env, &inner_expr) then
+        inner_type
+      else
+        raw_deref_pointee(env, inner_type, true, expr.span)
+      end
     when _ then raw_deref_pointee(env, inner_type, false, expr.span)
     end
   when ExprKind::ExprArrayLit(elems) then
@@ -24980,12 +25296,12 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
   when ExprKind::ExprIf(if_stmt) then
  # an if used as a value contributes its flow's normal type (with
     # the Unit false-path rule for a missing else enforced inside).
-    check_if_stmt_expected(env, &if_stmt, false, expected.clone()).normal
+    check_if_stmt_expected(env, &if_stmt, false, expected.clone(), false).normal
   when ExprKind::ExprMatch(m) then
  # a value-producing match contributes its flow's normal type.
  # (FIX 3): non-exhaustive matches over closed enums are errors in
     # statement position too (see check_match).
-    check_match_expected(env, &m, false, expected.clone()).normal
+    check_match_expected(env, &m, false, expected.clone(), false).normal
   when ExprKind::ExprBlock(block) then
     check_block_expected(env, &block, true, expected.clone()).normal
   when ExprKind::ExprUnsafe(_, block) then
@@ -25068,26 +25384,57 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
     check_expr(env, *left.get())
     check_expr(env, *right.get())
   when ExprKind::ExprRange(start, end_, _) then
-    # The range expression (the `for i in lo..hi` iterable and value-range
-    # positions): an Int-typed value; the bounds are checked and unified
-    # with Int. The MIR lowers ranges structurally (the for-loop
+    # The seed's range rule (its Ast.Range arm): the BOUNDS are unified
+    # with EACH OTHER — never each with Int — and a bare literal bound
+    # ADOPTS the other bound's concrete integer kind. `for _ in 0..n`
+    # with n: UInt is a UInt range (std/bench pow10); the old Int-pinning
+    # reported "UInt vs Int" and the lowered counter disagreed with the
+    # bound's kind. The MIR lowers ranges structurally (the for-loop
     # desugaring reads the bounds directly), and the resource checker's
     # IterationPlan classifies the range form (source kind 3).
+    mut range_ty = Type::Int
+    var range_start_expr: Option[Expr] = Option::None
+    var range_start_ty: Option[Type] = Option::None
     match start
     when Option::Some(s) then
       let s_expr = *s.get()
       let st = check_expr(env, &s_expr)
-      unify(env, st, Type::Int, s_expr.span)
+      range_start_expr = Option::Some(s_expr)
+      range_start_ty = Option::Some(st)
     when Option::None then ()
     end
     match end_
     when Option::Some(e) then
       let e_expr = *e.get()
       let et = check_expr(env, &e_expr)
-      unify(env, et, Type::Int, e_expr.span)
-    when Option::None then ()
+      match range_start_ty
+      when Option::Some(st) then
+        if is_int_literal_type(&st) && is_integer_type(&et) then
+          # A bare literal start adopts the end's concrete kind — the
+          # lowering reads the literal's recorded node type.
+          match range_start_expr
+          when Option::Some(sx) then
+            if sx.node_id != 0 then env.typed_expr_types.insert(sx.node_id, et.clone()) end
+          when Option::None then ()
+          end
+          range_ty = et
+        elsif is_int_literal_type(&et) && is_integer_type(&st) then
+          if e_expr.node_id != 0 then env.typed_expr_types.insert(e_expr.node_id, st.clone()) end
+          range_ty = st
+        else
+          unify(env, st, et, e_expr.span)
+          range_ty = resolve_type_var(env, st)
+        end
+      when Option::None then
+        range_ty = et
+      end
+    when Option::None then
+      match range_start_ty
+      when Option::Some(st) then range_ty = st
+      when Option::None then ()
+      end
     end
-    Type::Int
+    range_ty
   when ExprKind::ExprMapLit(entries) then
     # Map literal — REJECTED at check time with an explicit diagnostic:
     # the MIR has no map-literal lowering, so an accepted literal would
@@ -25187,6 +25534,34 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
         # the first-owner name-matching scan apply as the bare fallback
         # (the pre-existing behavior for context-free variant paths).
         var variant_owner: Option[TypeDef] = Option::None
+        # The seed's constructor_via_expected rule (check_name's FIRST
+        # lookup): when the EXPECTED type is a non-generic enum carrying
+        # the variant name, the variant belongs to THAT enum — even when
+        # the qualifier resolves through the import chain to a same-named
+        # declaration in another module (asm::Arch vs target_desc::Arch;
+        # the closure's `d.arch != Arch::AArch64`). The path-resolved
+        # owner below is the fallback.
+        match expected
+        when Option::Some(Type::Adt(exp_tid, _)) then
+          match get_type_by_id_ref(env, &exp_tid)
+          when Option::Some(exp_td) then
+            match exp_td.def_kind
+            when TypeDefKind::Enum(_) then
+              if exp_td.generic_params.len() == 0 then
+                match find_enum_variant_in_owner(exp_td.clone(), variant_name.clone())
+                when Option::Some(_) then variant_owner = Option::Some(exp_td)
+                when Option::None then ()
+                end
+              end
+            when _ then ()
+            end
+          when Option::None then ()
+          end
+        when _ then ()
+        end
+        match variant_owner
+        when Option::Some(_) then ()
+        when Option::None then
         match get_type_id_by_qualified_name(env, enum_name.clone(), &env.current_module_path)
         when Option::Some(owner_tid) then
           match get_type_by_id_ref(env, &owner_tid)
@@ -25198,6 +25573,7 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
           when Option::None then ()
           end
         when Option::None then ()
+        end
         end
         match variant_owner
         when Option::None then
@@ -25367,27 +25743,57 @@ end
 def check_enum_variant_construct(inout env: TypeEnv, expr: Expr, path: AstPath, path_type_args: Vec[TypeExpr], args: Vec[Expr], expected: Option[Type]) -> Type
     let variant_name = if path.segments.len() > 0 then path.segments[path.segments.len() - 1] else "" end
     let enum_name = if path.segments.len() >= 2 then path.segments[path.segments.len() - 2] else "" end
+    # The seed's constructor_via_expected rule: when the EXPECTED type is
+    # a non-generic enum carrying the variant name, the constructor
+    # belongs to THAT enum's identity — even when the path qualifier
+    # resolves through the import chain to a same-named declaration in
+    # another module (asm::Arch vs target_desc::Arch; the closure's
+    # `ctx.desc.arch != Arch::AArch64`). The expected enum wins; the
+    # qualified-path owner below is the fallback.
+    var resolved_variant: Option[(TypeDef, VariantInfo)] = Option::None
+    match expected
+    when Option::Some(Type::Adt(exp_tid, _)) then
+      match get_type_by_id_ref(env, &exp_tid)
+      when Option::Some(exp_td) then
+        match exp_td.def_kind
+        when TypeDefKind::Enum(_) then
+          if exp_td.generic_params.len() == 0 then
+            match find_enum_variant_in_owner(exp_td.clone(), variant_name.clone())
+            when Option::Some(exp_variant) then
+              resolved_variant = Option::Some((exp_td, exp_variant))
+            when Option::None then ()
+            end
+          end
+        when _ then ()
+        end
+      when Option::None then ()
+      end
+    when _ then ()
+    end
     # Variant identity by OWNER first (the qualified path's owner segment
     # resolved through the module-qualified identity tables — the same
     # resolution the pattern junction uses), then the unambiguous global
     # scan as the bare-name fallback. The bare scan alone resolved
     # `IOError::Other(..)` to the FIRST enum declaring `Other`
     # (SmallErrorCode — 0 fields), ignoring the owner in the path.
-    var resolved_variant: Option[(TypeDef, VariantInfo)] = Option::None
-    if enum_name != "" then
-      match get_type_id_by_qualified_name(env, enum_name.clone(), &env.current_module_path)
-      when Option::Some(owner_tid) then
-        match get_type_by_id_ref(env, &owner_tid)
-        when Option::Some(owner_td) then
-          let owner_variant_opt: Option[VariantInfo] = find_enum_variant_in_owner(owner_td.clone(), variant_name.clone())
-          match owner_variant_opt
-          when Option::Some(owner_variant) then
-            resolved_variant = Option::Some((owner_td, owner_variant))
+    match resolved_variant
+    when Option::Some(_) then ()
+    when Option::None then
+      if enum_name != "" then
+        match get_type_id_by_qualified_name(env, enum_name.clone(), &env.current_module_path)
+        when Option::Some(owner_tid) then
+          match get_type_by_id_ref(env, &owner_tid)
+          when Option::Some(owner_td) then
+            let owner_variant_opt: Option[VariantInfo] = find_enum_variant_in_owner(owner_td.clone(), variant_name.clone())
+            match owner_variant_opt
+            when Option::Some(owner_variant) then
+              resolved_variant = Option::Some((owner_td, owner_variant))
+            when Option::None then ()
+            end
           when Option::None then ()
           end
         when Option::None then ()
         end
-      when Option::None then ()
       end
     end
     match resolved_variant
@@ -28744,6 +29150,17 @@ end
 # removed" diagnostic; the value-expression form (strict=false) passes the
 # operand through (the seed's native-parity arm: `*(p as Int)` is the raw
 # address-deref spelling and the cast is value-level).
+# Whether a deref operand expression denotes a MUTABLE local/parameter
+# (the seed's scope.locals mut flag): the deref of a mutable binding is
+# the direct access place, never the strict non-pointer diagnostic.
+def expr_is_mutable_deref_target(env: TypeEnv, expr: Expr) -> Bool
+  if expr.node_id == 0 then return false end
+  match env.typed_ident_resolutions.get(expr.node_id)
+  when Option::Some(lid) then env.mutable_locals.contains(&lid)
+  when Option::None then false
+  end
+end
+
 def raw_deref_pointee(inout env: TypeEnv, inner_type: Type, strict: Bool, span: Span) -> Type
   match inner_type.clone()
   when Type::Ptr(t) then t
@@ -28821,17 +29238,55 @@ def unify_access_marker_vs_ptr(inout env: TypeEnv, arg_ty: Type, param_ty: Type,
 end
 
 def check_binary_op(inout env: TypeEnv, op: BinOp, left: Expr, right: Expr, span: Span) -> Type
-  let left_type = deref_borrow_type(check_expr(env, left))
-  let right_type = deref_borrow_type(check_expr(env, right))
-
+  # The seed's binary check order (check_expr Ast.Binary): the LEFT
+  # operand is checked with no expected, the RIGHT operand with the
+  # left's type as expected — an enum-path operand whose qualifier is an
+  # import-chain spelling of a same-named declaration in another module
+  # resolves through the expected enum (constructor_via_expected), so
+  # `ctx.desc.arch != Arch::AArch64` types target_desc::Arch on both
+  # sides instead of comparing asm::Arch with target_desc::Arch.
+  var left_type = deref_borrow_type(check_expr(env, left))
   # Propagate errors without crashing
   match left_type
   when Type::Error then return Type::Error
   when _ then ()
   end
+  var right_type = deref_borrow_type(check_expr_expected(env, right, Option::Some(left_type.clone())))
   match right_type
   when Type::Error then return Type::Error
   when _ then ()
+  end
+  # (unsuffixed float literal adoption — the seed's FloatLit expected
+  # arm): an operand that is the inference-only Float view adopts the
+  # concrete peer's kind in arithmetic/comparison (`s + 1.5` with s: f64
+  # is f64). The raw unify(F64, Float) stays the exact-match policy
+  # mismatch the UNIFY_BATTERY pins; this adoption is the expression-level
+  # counterpart of the seed's literal arm (the literal is F64 there).
+  match left_type
+  when Type::Float then
+    match right_type
+    when Type::F32 then
+      left_type = Type::F32
+      if left.node_id != 0 then env.typed_expr_types.insert(left.node_id, Type::F32) end
+    when Type::F64 then
+      left_type = Type::F64
+      if left.node_id != 0 then env.typed_expr_types.insert(left.node_id, Type::F64) end
+    when _ then ()
+    end
+  when _ then
+    match right_type
+    when Type::Float then
+      match left_type
+      when Type::F32 then
+        right_type = Type::F32
+        if right.node_id != 0 then env.typed_expr_types.insert(right.node_id, Type::F32) end
+      when Type::F64 then
+        right_type = Type::F64
+        if right.node_id != 0 then env.typed_expr_types.insert(right.node_id, Type::F64) end
+      when _ then ()
+      end
+    when _ then ()
+    end
   end
   
   match op
@@ -33706,6 +34161,7 @@ def type_display(env: TypeEnv, ty: Type) -> String
   when Type::Float then "Float"
   when Type::Char then "Char"
   when Type::String then "String"
+  when Type::StaticStrPtr then "StaticStrPtr"
   when Type::I8 then "i8"
   when Type::I16 then "i16"
   when Type::I32 then "i32"
