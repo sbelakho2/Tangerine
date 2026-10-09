@@ -156,19 +156,31 @@ let () =
            || Sys.getenv_opt "TG_PARITY_FULL" = Some "1"
          in
          if full then begin
-           (* the full-closure kernel typecheck + all-failures enumeration
-              needs ~80e9 VM steps; give it the profiling-class budget and
-              the same GC policy the profile wrapper pins. *)
-           if Sys.getenv_opt "TANGERINE_BOOTSTRAP_VM_MAX_STEPS" = None then
-             Unix.putenv "TANGERINE_BOOTSTRAP_VM_MAX_STEPS" "150000000000";
-           if Sys.getenv_opt "TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB" = None then
-             Unix.putenv "TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB" "16384";
-           if Sys.getenv_opt "TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS" = None then
-             Unix.putenv "TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS" "5000000000";
-           if Sys.getenv_opt "TANGERINE_BOOTSTRAP_VM_MAX_ALLOC" = None then
-             Unix.putenv "TANGERINE_BOOTSTRAP_VM_MAX_ALLOC" "34359738368";
-           if Sys.getenv_opt "OCAMLRUNPARAM" = None then
-             Unix.putenv "OCAMLRUNPARAM" "o=40"
+           (* The full-closure kernel typecheck runs the VM IN THIS SAME
+              process AFTER the seed pipeline (whose multi-GB heap is
+              still reachable), so it needs the profiling-class budgets
+              EXPORTED BY THE CALLER: the driver reads TANGERINE_* at
+              module init, before this code runs — an in-process putenv
+              is inert.  Fail fast with the required export list instead
+              of silently trapping at the default caps. *)
+           let need name min_v =
+             match Sys.getenv_opt name with
+             | Some v -> (
+                 match int_of_string_opt (String.trim v) with
+                 | Some n when n >= min_v -> ()
+                 | _ ->
+                     fail
+                       "--full requires %s >= %d (export it before invoking; the driver reads it at startup)"
+                       name min_v)
+             | None ->
+                 fail
+                   "--full requires %s >= %d (export it before invoking; the driver reads it at startup)"
+                   name min_v
+           in
+           need "TANGERINE_BOOTSTRAP_VM_MAX_STEPS" 120_000_000_000;
+           need "TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB" 20_480;
+           need "TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS" 5_000_000_000;
+           need "TANGERINE_BOOTSTRAP_VM_MAX_ALLOC" 34_359_738_368
          end;
          if full then [ "resolution-parity"; target_str; "--full" ]
          else [ "resolution-parity"; target_str ])
