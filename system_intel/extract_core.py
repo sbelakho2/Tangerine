@@ -4,7 +4,26 @@ The core is deliberately language-neutral: every adapter emits the same
 universal entity/relation/fact vocabulary (see schema.sql).  Adapters are
 pluggable; the default registry understands common manifest files, SQL,
 configuration, deployment files, a generic code adapter for many
-languages, and an exact adapter for Tangerine (`.tg`) sources.
+languages, and a fallback adapter for Tangerine (`.tg`) sources.
+
+v2 semantics (INTERFACES.md §0/§4):
+
+* Every entity carries a namespace-qualified ``stable_id``:
+  ``file:<path>``, ``module:<path>``, ``sym:<lang>:<path>::<name>``,
+  ``test:<path>::<name>``, ``pkg:<path>``, ``schema:<path>::<table>``,
+  ``config:<path>::<KEY>``, ``repo:.``.
+* Every entity/fact carries ``epistemic_state`` / ``analysis_depth`` /
+  ``completeness`` / ``provider``.  Generic source symbols are
+  ``observed`` / depth 1 / ``partial``; manifests are ``declared``.
+* Relations carry typed endpoint keys (``src_key``/``dst_key`` plus the
+  optional endpoint kinds) so the resolver matches exactly.
+* The generic test extractor MUST NOT emit ``tests(rel, rel)``: a file-level
+  test emits ``test:<rel>::<name>`` -> the exercised file when it can derive
+  one, else an unresolved raw target.  The `.tg` adapter emits a typed
+  ``tests`` relation for `@test` functions to their module.
+
+This adapter is the zero-install FALLBACK only; entities are marked
+``provider='generic-static'`` so authoritative providers can supersede it.
 
 Nothing here mutates the scanned repository, and nothing crashes on
 malformed input: unreadable/binary/large files degrade to a Tier 0 File
@@ -17,6 +36,9 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+EXTRACTOR_PROVIDER_ID = "generic-static"
+EXTRACTOR_PROVIDER_VERSION = "2.0"
 
 SKIP_DIRS = {
     ".git",
@@ -37,6 +59,52 @@ SKIP_DIRS = {
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
 
+# ── stable ids (§4) ──────────────────────────────────────────────────────
+
+REPO_STABLE_ID = "repo:."
+
+_LANGUAGE_BY_SUFFIX = {
+    ".rs": "rust", ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".tsx": "typescript", ".jsx": "javascript", ".mjs": "javascript",
+    ".c": "c", ".h": "c", ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp",
+    ".hpp": "cpp", ".go": "go", ".java": "java", ".kt": "kotlin",
+    ".cs": "csharp", ".rb": "ruby", ".php": "php", ".swift": "swift",
+    ".sh": "shell", ".tg": "tg",
+}
+
+
+def language_for_suffix(suffix: str) -> str:
+    return _LANGUAGE_BY_SUFFIX.get(suffix, (suffix or "").lstrip(".") or "unknown")
+
+
+def stable_id_file(rel: str) -> str:
+    return f"file:{rel}"
+
+
+def stable_id_module(rel: str) -> str:
+    return f"module:{rel}"
+
+
+def stable_id_symbol(lang: str, rel: str, name: str) -> str:
+    return f"sym:{lang}:{rel}::{name}"
+
+
+def stable_id_test(rel: str, name: str) -> str:
+    return f"test:{rel}::{name}"
+
+
+def stable_id_package(rel: str) -> str:
+    return f"pkg:{rel}"
+
+
+def stable_id_schema(rel: str, table: str) -> str:
+    return f"schema:{rel}::{table}"
+
+
+def stable_id_config(rel: str, key: str) -> str:
+    return f"config:{rel}::{key}"
+
+
 # ── records ──────────────────────────────────────────────────────────────
 
 
@@ -52,6 +120,12 @@ class Entity:
     confidence: float = 1.0
     derived_from: tuple[str, ...] = ()
     attrs: dict | None = None
+    stable_id: str = ""
+    epistemic_state: str = "observed"
+    analysis_depth: int = 1
+    completeness: str = "partial"
+    provider: str = EXTRACTOR_PROVIDER_ID
+    provider_revision: str = EXTRACTOR_PROVIDER_VERSION
 
     def key(self) -> tuple[str, str]:
         return (self.kind, self.qualified_name)
@@ -59,14 +133,19 @@ class Entity:
 
 @dataclass
 class Relation:
-    src_qn: str
-    dst_qn: str
+    src_key: str
+    dst_key: str
     kind: str
+    src_kind: str | None = None
+    dst_kind: str | None = None
     tier: int = 1
     provenance: str = "inferred"
     confidence: float = 1.0
     derived_from: tuple[str, ...] = ()
     attrs: dict | None = None
+    epistemic_state: str = "inferred"
+    analysis_depth: int = 1
+    completeness: str = "partial"
 
 
 @dataclass
@@ -79,6 +158,12 @@ class Fact:
     confidence: float = 1.0
     derived_from: tuple[str, ...] = ()
     uncertainty: str | None = None
+    epistemic_state: str = "observed"
+    analysis_depth: int = 1
+    completeness: str = "partial"
+    provider: str = EXTRACTOR_PROVIDER_ID
+    provider_revision: str = EXTRACTOR_PROVIDER_VERSION
+    stable_subject: str = ""
 
 
 @dataclass
@@ -259,6 +344,21 @@ def _stem_module(rel: str) -> str:
     return p.replace("/", ".")
 
 
+def _test_target_hint(rel: str) -> str | None:
+    """The sibling file a test path likely exercises, if derivable."""
+    p = Path(rel)
+    stem = p.stem
+    suffix = p.suffix
+    name = p.name
+    if name.startswith("test_") and len(name) > 5:
+        candidate = name[5:]
+    elif stem.endswith("_test") and len(stem) > 5:
+        candidate = stem[:-5] + suffix
+    else:
+        return None
+    return (p.parent / candidate).as_posix() if str(p.parent) != "." else candidate
+
+
 def _resolve_relative(rel_file: str, target: str, ctx: ExtractContext) -> str | None:
     base = Path(rel_file).parent
     joined = (base / target).as_posix()
@@ -288,7 +388,9 @@ class GenericCodeAdapter(Adapter):
         out = Extraction()
         rel = ctx.rel(path)
         module = _stem_module(rel)
+        lang = language_for_suffix(path.suffix)
         derived = (f"generic-adapter:{path.suffix}",)
+        file_id = stable_id_file(rel)
         seen: set[str] = set()
         for line_no, line in enumerate(text.splitlines(), start=1):
             for kind, rx in _GENERIC_DEFS.get(path.suffix, []):
@@ -301,6 +403,7 @@ class GenericCodeAdapter(Adapter):
                     if qn in seen:
                         continue
                     seen.add(qn)
+                    sym_id = stable_id_symbol(lang, rel, name)
                     out.add_entity(
                         Entity(
                             kind=kind,
@@ -311,16 +414,26 @@ class GenericCodeAdapter(Adapter):
                             tier=1,
                             provenance="observed",
                             derived_from=derived,
+                            stable_id=sym_id,
+                            epistemic_state="observed",
+                            analysis_depth=1,
+                            completeness="partial",
+                            provider=EXTRACTOR_PROVIDER_ID,
+                            provider_revision=EXTRACTOR_PROVIDER_VERSION,
                         )
                     )
                     out.add_relation(
                         Relation(
-                            src_qn=rel,
-                            dst_qn=qn,
+                            src_key=file_id,
+                            dst_key=sym_id,
                             kind="contains",
+                            src_kind="File",
+                            dst_kind=kind,
                             tier=1,
                             provenance="observed",
                             derived_from=derived,
+                            epistemic_state="observed",
+                            analysis_depth=1,
                         )
                     )
             for rx in _IMPORT_RES.get(path.suffix, []):
@@ -330,35 +443,42 @@ class GenericCodeAdapter(Adapter):
                 target = m.group(1).strip()
                 if not target:
                     continue
+                resolved = None
                 if target.startswith("."):
                     resolved = _resolve_relative(rel, target, ctx)
-                    dst = resolved or target
                 elif path.suffix == ".rs" and target.startswith("crate::"):
                     inner = target.split("::")
                     if len(inner) >= 2:
                         candidate = "src/" + "/".join(inner[1:])
-                        dst = ctx.find_file(
+                        resolved = ctx.find_file(
                             [candidate + ".rs", candidate + "/mod.rs", candidate.split("/")[0] + ".rs"]
-                        ) or target
-                    else:
-                        dst = target
-                elif path.suffix in (".py",) and target.startswith("."):
-                    dst = _resolve_relative(rel, target, ctx) or target
+                        )
+                if resolved:
+                    dst_key = stable_id_file(resolved)
+                    dst_kind = "File"
+                    confidence = 0.9
                 else:
-                    dst = target
+                    dst_key = target
+                    dst_kind = None
+                    confidence = 0.5
                 out.add_relation(
                     Relation(
-                        src_qn=rel,
-                        dst_qn=dst,
+                        src_key=file_id,
+                        dst_key=dst_key,
                         kind="imports",
+                        src_kind="File",
+                        dst_kind=dst_kind,
                         tier=1,
                         provenance="inferred",
-                        confidence=0.9 if dst != target else 0.5,
+                        confidence=confidence,
                         derived_from=derived,
                         attrs={"raw": target},
+                        epistemic_state="inferred",
+                        analysis_depth=1,
                     )
                 )
         if _TEST_FILE_RE.search(rel):
+            test_id = stable_id_test(rel, path.name)
             out.add_entity(
                 Entity(
                     kind="Test",
@@ -368,22 +488,50 @@ class GenericCodeAdapter(Adapter):
                     tier=1,
                     provenance="observed",
                     derived_from=("generic-adapter:test-path",),
+                    stable_id=test_id,
+                    epistemic_state="observed",
+                    analysis_depth=1,
+                    completeness="partial",
+                    provider=EXTRACTOR_PROVIDER_ID,
+                    provider_revision=EXTRACTOR_PROVIDER_VERSION,
                 )
             )
+            # Typed tests relation: never tests(rel, rel).  The exercised
+            # target is derived from the test filename; when it cannot be
+            # resolved it stays a raw (unresolved) target with candidates.
+            hint = _test_target_hint(rel)
+            raw_hint = hint if hint is not None else _stem_module(rel)
+            if hint is not None and hint in ctx.files:
+                dst_key = stable_id_file(hint)
+                dst_kind = "File"
+                confidence = 0.8
+                candidates: tuple[str, ...] = ()
+            else:
+                dst_key = raw_hint
+                dst_kind = None
+                confidence = 0.3
+                candidates = (stable_id_file(hint),) if hint is not None else ()
             out.add_relation(
                 Relation(
-                    src_qn=rel,
-                    dst_qn=rel,
+                    src_key=test_id,
+                    dst_key=dst_key,
                     kind="tests",
+                    src_kind="Test",
+                    dst_kind=dst_kind,
                     tier=1,
-                    provenance="observed",
+                    provenance="observed" if dst_kind else "inferred",
+                    confidence=confidence,
                     derived_from=("generic-adapter:test-path",),
+                    attrs={"candidates": list(candidates)} if candidates else None,
+                    epistemic_state="observed" if dst_kind else "uncertain",
+                    analysis_depth=1,
+                    completeness="partial" if dst_kind else "unknown",
                 )
             )
         return out
 
 
-# ── Tangerine adapter ────────────────────────────────────────────────────
+# ── Tangerine fallback adapter ───────────────────────────────────────────
 
 _TG_MODULE_RE = re.compile(r"^\s*(?:pub\s+)?module\s+([A-Za-z_]\w*)")
 _TG_USE_RE = re.compile(r"^\s*(?:pub\s+)?use\s+([A-Za-z0-9_:]+)(?:::\{([^}]*)\})?\s*$")
@@ -399,6 +547,8 @@ _TG_DEFS = [
 
 
 class TangerineAdapter(Adapter):
+    """Regex fallback for `.tg` sources; NOT authoritative (native provider is)."""
+
     name = "tangerine"
 
     def detect(self, path: Path) -> bool:
@@ -408,6 +558,7 @@ class TangerineAdapter(Adapter):
         out = Extraction()
         rel = ctx.rel(path)
         derived = ("tangerine-adapter",)
+        file_id = stable_id_file(rel)
         module_segments: list[str] = []
         lines = text.splitlines()
         for line in lines:
@@ -428,14 +579,19 @@ class TangerineAdapter(Adapter):
                 names = m.group(2)
                 out.add_relation(
                     Relation(
-                        src_qn=rel,
-                        dst_qn=target,
+                        src_key=file_id,
+                        dst_key=target,
                         kind="imports",
+                        src_kind="File",
+                        dst_kind=None,
                         tier=2,
                         provenance="declared",
                         confidence=0.8,
                         derived_from=derived,
                         attrs={"names": names.strip() if names else None},
+                        epistemic_state="declared",
+                        analysis_depth=2,
+                        completeness="partial",
                     )
                 )
                 continue
@@ -444,6 +600,7 @@ class TangerineAdapter(Adapter):
                 if m:
                     name = m.group(1)
                     qn = f"{base}::{name}"
+                    sym_id = stable_id_symbol("tg", rel, name)
                     out.add_entity(
                         Entity(
                             kind=kind,
@@ -454,19 +611,31 @@ class TangerineAdapter(Adapter):
                             tier=2,
                             provenance="declared",
                             derived_from=derived,
+                            stable_id=sym_id,
+                            epistemic_state="declared",
+                            analysis_depth=2,
+                            completeness="partial",
+                            provider=EXTRACTOR_PROVIDER_ID,
+                            provider_revision=EXTRACTOR_PROVIDER_VERSION,
+                            attrs={"adapter": "tangerine-fallback"},
                         )
                     )
                     out.add_relation(
                         Relation(
-                            src_qn=rel,
-                            dst_qn=qn,
+                            src_key=file_id,
+                            dst_key=sym_id,
                             kind="contains",
+                            src_kind="File",
+                            dst_kind=kind,
                             tier=2,
                             provenance="declared",
                             derived_from=derived,
+                            epistemic_state="declared",
+                            analysis_depth=2,
                         )
                     )
                     if pending_test and rx is _TG_DEFS[0][1]:
+                        test_id = stable_id_test(rel, name)
                         out.add_entity(
                             Entity(
                                 kind="Test",
@@ -477,6 +646,36 @@ class TangerineAdapter(Adapter):
                                 tier=2,
                                 provenance="declared",
                                 derived_from=("tangerine-adapter:@test",),
+                                stable_id=test_id,
+                                epistemic_state="declared",
+                                analysis_depth=2,
+                                completeness="partial",
+                                provider=EXTRACTOR_PROVIDER_ID,
+                                provider_revision=EXTRACTOR_PROVIDER_VERSION,
+                                attrs={"adapter": "tangerine-fallback"},
+                            )
+                        )
+                        parent_dir = Path(rel).parent.as_posix()
+                        if parent_dir not in (".", ""):
+                            dst_key = stable_id_module(parent_dir)
+                            dst_kind = "Module"
+                        else:
+                            dst_key = file_id
+                            dst_kind = "File"
+                        out.add_relation(
+                            Relation(
+                                src_key=test_id,
+                                dst_key=dst_key,
+                                kind="tests",
+                                src_kind="Test",
+                                dst_kind=dst_kind,
+                                tier=2,
+                                provenance="declared",
+                                confidence=0.6,
+                                derived_from=("tangerine-adapter:@test",),
+                                epistemic_state="declared",
+                                analysis_depth=2,
+                                completeness="partial",
                             )
                         )
                     pending_test = False
@@ -515,6 +714,7 @@ class ManifestAdapter(Adapter):
         rel = ctx.rel(path)
         kind = _MANIFEST_KINDS[path.name]
         derived = (f"manifest:{path.name}",)
+        pkg_id = stable_id_package(rel)
         package_name = None
         version = None
         uncertain = None
@@ -564,6 +764,12 @@ class ManifestAdapter(Adapter):
                 confidence=1.0 if package_name else 0.3,
                 derived_from=derived,
                 attrs={"manifest": kind, "version": version},
+                stable_id=pkg_id,
+                epistemic_state="declared",
+                analysis_depth=1,
+                completeness="partial",
+                provider=EXTRACTOR_PROVIDER_ID,
+                provider_revision=EXTRACTOR_PROVIDER_VERSION,
             )
         )
         if uncertain:
@@ -577,6 +783,9 @@ class ManifestAdapter(Adapter):
                     confidence=0.3,
                     derived_from=derived,
                     uncertainty=uncertain,
+                    stable_subject=pkg_id,
+                    epistemic_state="declared",
+                    analysis_depth=1,
                 )
             )
         if package_name:
@@ -588,21 +797,29 @@ class ManifestAdapter(Adapter):
                     tier=1,
                     provenance="declared",
                     derived_from=derived,
+                    stable_subject=pkg_id,
+                    epistemic_state="declared",
+                    analysis_depth=1,
                 )
             )
         parent = path.parent.relative_to(ctx.root).as_posix()
         if parent in ("", "."):
             out.add_relation(
                 Relation(
-                    src_qn=".",
-                    dst_qn=rel,
+                    src_key=REPO_STABLE_ID,
+                    dst_key=pkg_id,
                     kind="contains",
+                    src_kind="Repository",
+                    dst_kind="Package",
                     tier=1,
                     provenance="declared",
                     derived_from=derived,
+                    epistemic_state="declared",
+                    analysis_depth=1,
                 )
             )
         else:
+            project_id = f"project:{parent}"
             out.add_entity(
                 Entity(
                     kind="Project",
@@ -611,26 +828,40 @@ class ManifestAdapter(Adapter):
                     tier=1,
                     provenance="declared",
                     derived_from=derived,
+                    stable_id=project_id,
+                    epistemic_state="declared",
+                    analysis_depth=1,
+                    completeness="partial",
+                    provider=EXTRACTOR_PROVIDER_ID,
+                    provider_revision=EXTRACTOR_PROVIDER_VERSION,
                 )
             )
             out.add_relation(
                 Relation(
-                    src_qn=".",
-                    dst_qn=parent,
+                    src_key=REPO_STABLE_ID,
+                    dst_key=project_id,
                     kind="contains",
+                    src_kind="Repository",
+                    dst_kind="Project",
                     tier=1,
                     provenance="declared",
                     derived_from=derived,
+                    epistemic_state="declared",
+                    analysis_depth=1,
                 )
             )
             out.add_relation(
                 Relation(
-                    src_qn=parent,
-                    dst_qn=rel,
+                    src_key=project_id,
+                    dst_key=pkg_id,
                     kind="contains",
+                    src_kind="Project",
+                    dst_kind="Package",
                     tier=1,
                     provenance="declared",
                     derived_from=derived,
+                    epistemic_state="declared",
+                    analysis_depth=1,
                 )
             )
         return out
@@ -659,6 +890,7 @@ class SqlAdapter(Adapter):
         for m in _SQL_TABLE_RE.finditer(text):
             table, body = m.group(1), m.group(2)
             qn = f"{rel}::{table}"
+            schema_id = stable_id_schema(rel, table)
             out.add_entity(
                 Entity(
                     kind="Schema",
@@ -668,6 +900,12 @@ class SqlAdapter(Adapter):
                     tier=1,
                     provenance="observed",
                     derived_from=derived,
+                    stable_id=schema_id,
+                    epistemic_state="observed",
+                    analysis_depth=1,
+                    completeness="partial",
+                    provider=EXTRACTOR_PROVIDER_ID,
+                    provider_revision=EXTRACTOR_PROVIDER_VERSION,
                 )
             )
             for line in body.splitlines():
@@ -685,19 +923,26 @@ class SqlAdapter(Adapter):
                             tier=1,
                             provenance="observed",
                             derived_from=derived,
+                            stable_subject=schema_id,
+                            epistemic_state="observed",
+                            analysis_depth=1,
                         )
                     )
                 fk = _SQL_FK_RE.search(line)
                 if fk:
                     out.add_relation(
                         Relation(
-                            src_qn=qn,
-                            dst_qn=fk.group(1),
+                            src_key=schema_id,
+                            dst_key=stable_id_schema(rel, fk.group(1)),
                             kind="depends_on",
+                            src_kind="Schema",
+                            dst_kind="Schema",
                             tier=1,
                             provenance="observed",
                             confidence=0.9,
                             derived_from=derived,
+                            epistemic_state="observed",
+                            analysis_depth=1,
                         )
                     )
         return out
@@ -718,6 +963,7 @@ class ConfigAdapter(Adapter):
         out = Extraction()
         rel = ctx.rel(path)
         derived = ("config-adapter",)
+        file_id = stable_id_file(rel)
         seen: set[str] = set()
         for line in text.splitlines():
             stripped = line.strip()
@@ -731,6 +977,7 @@ class ConfigAdapter(Adapter):
                 continue
             seen.add(key)
             qn = f"{rel}::{key}"
+            cfg_id = stable_id_config(rel, key)
             out.add_entity(
                 Entity(
                     kind="Configuration",
@@ -741,6 +988,12 @@ class ConfigAdapter(Adapter):
                     provenance="observed",
                     derived_from=derived,
                     attrs={"value_recorded": False},
+                    stable_id=cfg_id,
+                    epistemic_state="observed",
+                    analysis_depth=1,
+                    completeness="partial",
+                    provider=EXTRACTOR_PROVIDER_ID,
+                    provider_revision=EXTRACTOR_PROVIDER_VERSION,
                 )
             )
             out.add_fact(
@@ -751,6 +1004,9 @@ class ConfigAdapter(Adapter):
                     tier=1,
                     provenance="observed",
                     derived_from=derived,
+                    stable_subject=file_id,
+                    epistemic_state="observed",
+                    analysis_depth=1,
                 )
             )
         return out
@@ -769,6 +1025,7 @@ class DeploymentAdapter(Adapter):
         out = Extraction()
         rel = ctx.rel(path)
         derived = ("deployment-adapter",)
+        deployment_id = f"deployment:{rel}"
         out.add_entity(
             Entity(
                 kind="Deployment",
@@ -778,6 +1035,12 @@ class DeploymentAdapter(Adapter):
                 tier=1,
                 provenance="declared",
                 derived_from=derived,
+                stable_id=deployment_id,
+                epistemic_state="declared",
+                analysis_depth=1,
+                completeness="partial",
+                provider=EXTRACTOR_PROVIDER_ID,
+                provider_revision=EXTRACTOR_PROVIDER_VERSION,
             )
         )
         if path.name.startswith("docker-compose"):
@@ -791,6 +1054,7 @@ class DeploymentAdapter(Adapter):
                     if m:
                         svc = m.group(1)
                         qn = f"{rel}::{svc}"
+                        svc_id = f"service:{rel}::{svc}"
                         out.add_entity(
                             Entity(
                                 kind="Service",
@@ -800,16 +1064,26 @@ class DeploymentAdapter(Adapter):
                                 tier=1,
                                 provenance="declared",
                                 derived_from=derived,
+                                stable_id=svc_id,
+                                epistemic_state="declared",
+                                analysis_depth=1,
+                                completeness="partial",
+                                provider=EXTRACTOR_PROVIDER_ID,
+                                provider_revision=EXTRACTOR_PROVIDER_VERSION,
                             )
                         )
                         out.add_relation(
                             Relation(
-                                src_qn=rel,
-                                dst_qn=qn,
+                                src_key=deployment_id,
+                                dst_key=svc_id,
                                 kind="deploys_with",
+                                src_kind="Deployment",
+                                dst_kind="Service",
                                 tier=1,
                                 provenance="declared",
                                 derived_from=derived,
+                                epistemic_state="declared",
+                                analysis_depth=1,
                             )
                         )
                     elif re.match(r"^[A-Za-z]", line):
@@ -825,6 +1099,9 @@ class DeploymentAdapter(Adapter):
                         tier=1,
                         provenance="declared",
                         derived_from=derived,
+                        stable_subject=deployment_id,
+                        epistemic_state="declared",
+                        analysis_depth=1,
                     )
                 )
         return out
@@ -844,7 +1121,9 @@ def default_registry() -> AdapterRegistry:
     return registry
 
 
-def _iter_files(root: Path):
+def iter_files(root):
+    """Yield every scanned source path (deterministic directory order)."""
+    root = Path(root)
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
         for fname in sorted(filenames):
@@ -861,7 +1140,7 @@ def extract(
     registry = registry or default_registry()
     result = Extraction()
     ctx = ExtractContext(root=root, commit_sha=commit_sha)
-    files = list(_iter_files(root))
+    files = list(iter_files(root))
     ctx.files = {p.relative_to(root).as_posix() for p in files}
 
     repo_name = root.name or "."
@@ -875,6 +1154,12 @@ def extract(
             provenance="observed",
             derived_from=("filesystem",),
             attrs={"root": str(root), "commit_sha": commit_sha},
+            stable_id=REPO_STABLE_ID,
+            epistemic_state="observed",
+            analysis_depth=0,
+            completeness="partial",
+            provider=EXTRACTOR_PROVIDER_ID,
+            provider_revision=EXTRACTOR_PROVIDER_VERSION,
         )
     )
 
@@ -882,7 +1167,9 @@ def extract(
     dirs_with_files = sorted({str(p.parent.relative_to(root)) for p in files})
     dirs_with_files = [d for d in dirs_with_files if d not in (".", "")]
     for d in dirs_with_files:
-        result.add_entity(
+        out = Extraction()
+        module_id = stable_id_module(d)
+        out.add_entity(
             Entity(
                 kind="Module",
                 name=Path(d).name,
@@ -890,21 +1177,33 @@ def extract(
                 tier=0,
                 provenance="observed",
                 derived_from=("filesystem",),
+                stable_id=module_id,
+                epistemic_state="observed",
+                analysis_depth=0,
+                completeness="partial",
+                provider=EXTRACTOR_PROVIDER_ID,
+                provider_revision=EXTRACTOR_PROVIDER_VERSION,
             )
         )
-        result.add_relation(
+        out.add_relation(
             Relation(
-                src_qn=".",
-                dst_qn=d,
+                src_key=REPO_STABLE_ID,
+                dst_key=module_id,
                 kind="contains",
+                src_kind="Repository",
+                dst_kind="Module",
                 tier=0,
                 provenance="observed",
                 derived_from=("filesystem",),
+                epistemic_state="observed",
+                analysis_depth=0,
             )
         )
+        result.merge(out)
 
     for path in files:
         rel = ctx.rel(path)
+        file_id = stable_id_file(rel)
         try:
             size = path.stat().st_size
         except OSError:
@@ -918,18 +1217,28 @@ def extract(
                 tier=0,
                 provenance="observed",
                 derived_from=("filesystem",),
+                stable_id=file_id,
+                epistemic_state="observed",
+                analysis_depth=0,
+                completeness="partial",
+                provider=EXTRACTOR_PROVIDER_ID,
+                provider_revision=EXTRACTOR_PROVIDER_VERSION,
             )
         )
         parent = path.parent.relative_to(root).as_posix()
         if parent not in (".", ""):
             result.add_relation(
                 Relation(
-                    src_qn=parent,
-                    dst_qn=rel,
+                    src_key=stable_id_module(parent),
+                    dst_key=file_id,
                     kind="contains",
+                    src_kind="Module",
+                    dst_kind="File",
                     tier=0,
                     provenance="observed",
                     derived_from=("filesystem",),
+                    epistemic_state="observed",
+                    analysis_depth=0,
                 )
             )
         if size > MAX_FILE_BYTES:
@@ -940,7 +1249,10 @@ def extract(
                     object="skipped",
                     tier=0,
                     provenance="observed",
+                    stable_subject=file_id,
                     uncertainty=f"file exceeds the {MAX_FILE_BYTES}-byte extraction cap",
+                    epistemic_state="observed",
+                    analysis_depth=0,
                 )
             )
             continue
@@ -954,7 +1266,10 @@ def extract(
                     object="unreadable",
                     tier=0,
                     provenance="observed",
+                    stable_subject=file_id,
                     uncertainty=str(exc),
+                    epistemic_state="observed",
+                    analysis_depth=0,
                 )
             )
             continue
@@ -966,7 +1281,10 @@ def extract(
                     object="binary",
                     tier=0,
                     provenance="observed",
+                    stable_subject=file_id,
                     uncertainty="binary content; no structural facts extracted",
+                    epistemic_state="observed",
+                    analysis_depth=0,
                 )
             )
             continue
@@ -981,7 +1299,10 @@ def extract(
                     object="non-utf8",
                     tier=0,
                     provenance="observed",
+                    stable_subject=file_id,
                     uncertainty="decoded with replacement characters",
+                    epistemic_state="observed",
+                    analysis_depth=0,
                 )
             )
         for adapter in registry.for_path(path):
@@ -996,7 +1317,10 @@ def extract(
                         object="adapter-failed",
                         tier=0,
                         provenance="observed",
+                        stable_subject=file_id,
                         uncertainty=f"{adapter.name}: {exc.__class__.__name__}",
+                        epistemic_state="observed",
+                        analysis_depth=0,
                     )
                 )
             if piece:

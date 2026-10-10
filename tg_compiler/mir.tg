@@ -2213,6 +2213,12 @@ struct MirBuilder
   # bindings (owner key -> semantic ids in order): the semantic identities of
   # the locals MIR creates, used to populate semantic_to_mir.
   pattern_binding_resolutions: Map[Int, Int]
+  # Typed pattern VARIANT identities (pat node id -> (owner TypeId, variant
+  # index)): the checker's recorded resolution — the AUTHORITY for a match
+  # pattern's enum identity (a same-named enum subject cannot confuse it);
+  # the name-based typed_variant_id lookup is the synthesized-pattern
+  # fallback only.
+  pattern_variant_resolutions: Map[Int, (Int, Int)]
   param_binding_resolutions: Map[String, Vec[Int]]
   field_targets: Map[Int, FieldId]
   expr_types: Map[Int, Type]
@@ -2496,6 +2502,7 @@ def builder_new() -> MirBuilder
     return_edge_blocks: Set::new(),
     semantic_to_mir: Map::new(),
     pattern_binding_resolutions: Map::new(),
+    pattern_variant_resolutions: Map::new(),
     param_binding_resolutions: Map::new(),
     field_targets: Map::new(),
     expr_types: Map::new(),
@@ -6109,6 +6116,7 @@ def lower_program(program: Program, analyzed: AnalyzedProgram, hir_view: HirNode
   b.typed_effect_handlers = analyzed.typed.typed_effect_handlers.clone()
   b.handler_captures = analyzed.typed.handler_captures.clone()
   b.pattern_binding_resolutions = analyzed.typed.pattern_binding_resolutions.clone()
+  b.pattern_variant_resolutions = analyzed.typed.pattern_variant_resolutions.clone()
   b.param_binding_resolutions = analyzed.typed.param_binding_resolutions.clone()
  # the typed program's Program and resolver
   # snapshot — the crate module table (Program.crate.modules) and the
@@ -9923,9 +9931,18 @@ def bind_match_arm_pattern_locals(inout b: MirBuilder, scrut_local: MirLocalId, 
   let scrut_ty = lookup_local_type(b, &scrut_local)
   match pat.kind
   when PatternKind::Ident(name, is_mut) then
-    let local = add_local(b, name.clone(), scrut_ty, is_mut, span)
-    record_semantic_pattern_local(b, pat, local, "match binding")
-    push_assign(b, place_local(local), move_rvalue(operand_copy_local(scrut_local)), span)
+    # A bare-name pattern RESOLVED AS A NULLARY VARIANT (the checker's
+    # pattern_variant_resolutions record — `when KpL16 | KpL32 then` with
+    # bare variant names) is a TEST, not a binding: the arm-entry switch
+    # already dispatches it; binding it would also fail closed on the
+    # missing binding resolution (KP13).
+    match b.pattern_variant_resolutions.get(pat.node_id)
+    when Option::Some(_) then ()
+    when Option::None then
+      let local = add_local(b, name.clone(), scrut_ty, is_mut, span)
+      record_semantic_pattern_local(b, pat, local, "match binding")
+      push_assign(b, place_local(local), move_rvalue(operand_copy_local(scrut_local)), span)
+    end
   when PatternKind::Variant(path, sub_pats) then
     # A const-call pattern (`when DT_DIR() then` — types.tg's const-call
     # fallback) binds no variables and has no enum identity: it is a VALUE
@@ -9945,20 +9962,34 @@ def bind_match_arm_pattern_locals(inout b: MirBuilder, scrut_local: MirLocalId, 
     # tables cannot resolve is an internal error (fail-closed); the
     # name/discriminant fallback (ProjDowncast) is are not part of the model. The payload
     # fields are Field(FieldId) with the scrutinee enum's TypeId.
-    let scrut_tid = mir_enum_owner_tid(b, &scrut_ty)
+    var scrut_tid = mir_enum_owner_tid(b, &scrut_ty)
     let path_enum_name = if path.segments.len() >= 2 then path.segments[path.segments.len() - 2].clone() else "" end
     var variant_proj = Projection::Variant(VariantId { owner: TypeId { id: -1 }, index: 0 })
+    # The checker's RECORDED pattern identity is the AUTHORITY (KP18: the
+    # same-named variant of a same-named enum subject resolves to the
+    # scrutinee's REAL owner — the name-based lookup below picks the wrong
+    # module); typed_variant_id is the synthesized-pattern fallback only.
+    var variant_resolved = false
+    match b.pattern_variant_resolutions.get(pat.node_id)
+    when Option::Some((tid_rec, vidx_rec)) then
+      scrut_tid = Option::Some(TypeId { id: tid_rec })
+      variant_proj = Projection::Variant(VariantId { owner: TypeId { id: tid_rec }, index: vidx_rec as UInt })
+      variant_resolved = true
+    when Option::None then ()
+    end
     match scrut_tid
     when Option::Some(stid) then
-      match typed_variant_id(b, &path_enum_name, &variant_name)
-      when Option::Some(vid) then
-        if vid.owner.id == stid.id then
-          variant_proj = Projection::Variant(vid)
-        else
-          b.errors.push("internal error: variant '" + variant_name.clone() + "' owner does not match the scrutinee's enum TypeId during MIR lowering")
+      if !variant_resolved then
+        match typed_variant_id(b, &path_enum_name, &variant_name)
+        when Option::Some(vid) then
+          if vid.owner.id == stid.id then
+            variant_proj = Projection::Variant(vid)
+          else
+            b.errors.push("internal error: variant '" + variant_name.clone() + "' owner does not match the scrutinee's enum TypeId during MIR lowering")
+          end
+        when Option::None then
+          b.errors.push("internal error: missing typed variant identity for pattern variant '" + variant_name.clone() + "' during MIR lowering")
         end
-      when Option::None then
-        b.errors.push("internal error: missing typed variant identity for pattern variant '" + variant_name.clone() + "' during MIR lowering")
       end
     when Option::None then
       let scrut_name = match lookup_local_id(b, &scrut_local)
@@ -12858,6 +12889,23 @@ def mir_adopt_literal_kind(op: MirOperand, sibling_ty: Type) -> MirOperand
       when Type::ISize then mir_int_constant_of(n, Type::ISize)
       when _ then op
       end
+    when MirConstantKind::MirFloat(f) then
+      # the unsuffixed FLOAT literal (the checker's adoption records the
+      # concrete F32/F64 on the peer's kind; the constant starts life as
+      # the inference-only Float view) — `s + 1.5` with s: f64 reads the
+      # literal as f64, exactly the seed's FloatLit expected arm.
+      let unsuffixed_f = match cst.ty
+      when Type::Float then true
+      when _ then false
+      end
+      if !unsuffixed_f then
+        return op
+      end
+      match sibling_ty
+      when Type::F32 then mir_float_constant_of(f, Type::F32)
+      when Type::F64 then mir_float_constant_of(f, Type::F64)
+      when _ then op
+      end
     when _ then op
     end
   when _ then op
@@ -12868,6 +12916,16 @@ def mir_int_constant_of(value: Int, ty: Type) -> MirOperand
   MirOperand {
     kind: MirOperandKind::MirConstant(MirConstant {
       kind: MirConstantKind::MirInt(value),
+      ty: ty,
+      instance: Option::None
+    })
+  }
+end
+
+def mir_float_constant_of(value: Float, ty: Type) -> MirOperand
+  MirOperand {
+    kind: MirOperandKind::MirConstant(MirConstant {
+      kind: MirConstantKind::MirFloat(value),
       ty: ty,
       instance: Option::None
     })
@@ -14975,7 +15033,18 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
     
   elsif kind_name == "ExprFloatLit" then
     match expr.kind
-    when ExprKind::ExprFloatLit(f) then return Result::Ok(move_rvalue(operand_float(parsed_float_to_host(&f))))
+    when ExprKind::ExprFloatLit(f) then
+      # the site expectation is applied HERE at the rvalue arm (the
+      # builder's live state), so an unsuffixed float literal in an
+      # f64/f32 slot is that kind — `s + 1.5` with s: f64 emits an f64
+      # constant (the checker's adoption recorded F64; the raw operand
+      # starts as the inference-only Float view).
+      var fl_op = operand_float(parsed_float_to_host(&f))
+      match b.pending_literal_expect.clone()
+      when Option::Some(exp) then fl_op = mir_adopt_literal_kind(fl_op, exp)
+      when Option::None then ()
+      end
+      return Result::Ok(move_rvalue(fl_op))
     when _ then
       return Result::Err("internal error: expr_kind_name/ExprKind mismatch during MIR lowering")
     end
@@ -19647,35 +19716,30 @@ def lower_for(inout b: MirBuilder, pat: Pattern, iter: Expr, body: Block, span: 
     when _ then "_for_var"
     end
 
-    # The range counter's type is the BOUND's typed type — `for _ in 0..n`
-    # with n: UInt counts in UInt (a hardcoded Int made the verified MIR
-    # reject the uint bound: KP9). The typed expression channel is the
-    # authority; unrecorded bounds keep Int (the numeric default).
-    var range_counter_ty = Type::Int
-    match hi_box
-    when Option::Some(hi_te) then
-      match b.expr_types.get(hi_te.node_id)
-      when Option::Some(t) then range_counter_ty = t.clone()
-      when Option::None then ()
-      end
-    when Option::None then
-      match lo_box
-      when Option::Some(lo_te) then
-        match b.expr_types.get(lo_te.node_id)
-        when Option::Some(t) then range_counter_ty = t.clone()
-        when Option::None then ()
-        end
-      when Option::None then ()
-      end
-    end
-
-    var lo_op = mir_typed_int_operand(0, range_counter_ty.clone())
+    # The range counter's type is the START bound's LOWERED type — the
+    # seed's rule (fresh_local start_ty; int_constant_of start_ty for the
+    # increment): `0..n` with n: UInt counts in UInt, and a hardcoded Int
+    # made the verified MIR reject the uint bound (KP9). An open range
+    # (`..hi`) keeps Int (the numeric default).
+    var lo_op = operand_int(0)
+    var lo_is_bound = false
     match lo_box
     when Option::Some(lo_e) then
       # READ-ONLY (the lowering AST ownership contract): the range bound
       # stays owned by the borrowed tree.
       lo_op = lower_expr(b, *lo_e.get(), span)
+      lo_is_bound = true
     when Option::None then ()
+    end
+    var range_counter_ty = Type::Int
+    if lo_is_bound then
+      match lo_op.kind
+      when MirOperandKind::MirConstant(c) then range_counter_ty = c.ty.clone()
+      when MirOperandKind::MirCopy(p) then range_counter_ty = mir_place_type(&p, b)
+      when MirOperandKind::MirMovePlace(p) then range_counter_ty = mir_place_type(&p, b)
+      when MirOperandKind::MirRead(p) then range_counter_ty = mir_place_type(&p, b)
+      when MirOperandKind::MirConsume(p) then range_counter_ty = mir_place_type(&p, b)
+      end
     end
     var hi_op = mir_typed_int_operand(0, range_counter_ty.clone())
     match hi_box

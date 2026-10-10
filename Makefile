@@ -15,6 +15,10 @@
 #                     aggregates through the Woodpecker step graph instead)
 #   stub-scan         forbidden stub markers in the production std modules
 #   abi-layout-check  ABI module check (`std/backend_abi.tg`)
+#   system-intel-test system_intel unittest suite + CLI smoke (pure python3,
+#                     no `TG`/compiler toolchain required)
+#   system-intel-gate the system_intel release gate
+#                     (scripts/check_system_intel_gate.sh)
 #
 # The former `test-gfx-ui` recipe also ran `scripts/conformance_gates.tg`;
 # that runner no longer exists in the tree — its conformance assertions are
@@ -30,7 +34,7 @@ TG ?= build/tg
 
 .DEFAULT_GOAL := help
 
-.PHONY: help gfx-ui-build test-gfx-ui gfx-ui-test gfx-ui-visual gfx-ui-gate stub-scan abi-layout-check
+.PHONY: help gfx-ui-build test-gfx-ui gfx-ui-test gfx-ui-visual gfx-ui-gate stub-scan abi-layout-check system-intel-test system-intel-gate
 
 # The GFX/UI production modules (the former test-gfx-ui check set).
 GFX_UI_MODULES := \
@@ -46,6 +50,10 @@ help:
 	@echo "  gfx-ui-gate      aggregate over all GFX/UI checks"
 	@echo "  stub-scan        forbidden stub markers in production std modules"
 	@echo "  abi-layout-check ABI layout check (std/backend_abi.tg)"
+	@echo ""
+	@echo "system_intel targets:"
+	@echo "  system-intel-test system_intel unittest suite + CLI smoke"
+	@echo "  system-intel-gate full system_intel gate (scripts/check_system_intel_gate.sh)"
 	@echo ""
 	@echo "TG=$(TG) (override with make TG=/path/to/tg)"
 
@@ -138,3 +146,20 @@ abi-layout-check:
 	@echo "==> Checking ABI struct layout consistency..."
 	$(TG) check std/backend_abi.tg
 	@echo "==> ABI layout check passed."
+
+# ————————————————————————————————————————————
+# system_intel (P0-10)
+# ————————————————————————————————————————————
+# Pure python3 subsystem checks — no `TG`/stage3 artifact is involved, so
+# these targets run in any checkout (INTERFACES.md §7/§8).
+
+system-intel-test:
+	@echo "==> Running system_intel unittest suite..."
+	python3 -m unittest discover -s system_intel/tests -v
+	@echo "==> system_intel CLI --help smoke..."
+	bash system_intel/tools/system_intel.sh --help >/dev/null
+	@echo "==> system_intel suites OK."
+
+system-intel-gate:
+	@echo "==> Running the system_intel release gate..."
+	bash scripts/check_system_intel_gate.sh

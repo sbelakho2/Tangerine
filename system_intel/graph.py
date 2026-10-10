@@ -1,32 +1,56 @@
 """Core knowledge graph for the Tangerine System Intelligence platform.
 
-Stdlib-only (sqlite3 / json / pathlib / datetime).  The SQLite schema is
-loaded verbatim from ``schema.sql`` next to this module; that file is the
-authoritative source for table and column names.
+Stdlib-only (sqlite3 / json / pathlib / datetime / hashlib).  The SQLite
+schema is loaded verbatim from ``schema.sql`` next to this module; that file
+is the authoritative source for table and column names.
 
 The graph stores what is *known* about a repository: entities, relations,
-facts, invariants, contracts and historical records (incidents, changes).
-Every row carries provenance, confidence and (where the schema has the
-column) a tier, so derived knowledge is never confused with observed or
-declared knowledge.  Snapshots bind rows to (repo_root, commit_sha).
+facts, invariants, contracts, historical records (incidents, changes),
+unresolved edges, support/evidence and provider capability records.  Every
+row is bound to a snapshot; a snapshot is identified by the revision tuple
+from INTERFACES.md §1 and is either a mutable ``draft`` or an immutable
+``finalized`` record.
 
-Staleness semantics
--------------------
-An entity that is not re-upserted in a later extraction becomes stale via
-``stale_sweep``.  A caller may only sweep a kind when the extraction for
-that run enumerated that kind *fully*: passing a partial ``seen_by_kind``
-set silently marks real entities stale, so extraction code must omit a
-kind from ``seen_by_kind`` unless it enumerated every entity of it.
+Snapshot semantics (v2 / P0-1, P0-4, P0-5, P0-6)
+-------------------------------------------------
+* One revision tuple -> at most one snapshot.  A scan either reuses the
+  finalized snapshot for that tuple or writes a new draft and finalizes it
+  inside one transaction.
+* Finalized snapshots are immutable, enforced by BEFORE triggers in
+  ``schema.sql``: nothing inside becomes "stale".  Removed content is
+  represented by a newer snapshot and reported by :meth:`diff_snapshots`.
+* Reads (:meth:`export_json`, :meth:`stats`, :meth:`completeness`, ...)
+  resolve exactly ONE snapshot -- the latest finalized one by default, by
+  ``ORDER BY id DESC LIMIT 1`` -- and never union rows across snapshots.
+  When there is no finalized snapshot they raise :class:`SnapshotError`.
+* Relations resolve endpoints by typed ``(kind, stable_id)`` exact match.
+  Unresolved targets keep a first-class ``unresolved_edge`` row AND a
+  relation row with ``resolved=0``; cross-snapshot relations are impossible
+  through the composite foreign keys.
+* ``batch()`` commits only on success and rolls back on exception;
+  ``close()`` never commits a dirty transaction -- it rolls back.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+EPISTEMIC_STATES = (
+    "observed", "declared", "inferred", "historically_supported",
+    "uncertain", "contradicted",
+)
+
+PROVENANCE_KINDS = (
+    "source_scan", "compiler", "runtime_trace", "history", "caller",
+)
+
+COMPLETENESS_VERDICTS = ("complete", "partial", "unavailable", "unknown")
 
 ENTITY_KINDS = (
     "Repository", "Project", "Package", "Module", "File", "Symbol", "Service",
@@ -48,18 +72,42 @@ IMPACT_EDGE_KINDS = (
     "publishes", "subscribes", "flows_to",
 )
 
+# The only entity kind allowed to source a `tests` edge (P0-6).
+TEST_SOURCE_KIND = "Test"
+
+_VERDICT_RANK = {"complete": 3, "partial": 2, "unknown": 1, "unavailable": 0}
+
 _ENTITY_COLUMNS = (
     "id", "snapshot_id", "kind", "name", "qualified_name", "file", "line",
     "tier", "provenance", "confidence", "derived_from", "last_verified",
-    "uncertainty", "stale", "attrs",
+    "uncertainty", "stale", "attrs", "stable_id", "epistemic_state",
+    "analysis_depth", "completeness", "provider", "provider_revision",
 )
 _RELATION_COLUMNS = (
     "id", "snapshot_id", "src_id", "dst_id", "kind", "tier", "provenance",
     "confidence", "derived_from", "last_verified", "uncertainty", "stale",
-    "attrs",
+    "attrs", "src_key", "dst_key", "resolved", "epistemic_state",
+    "analysis_depth", "completeness", "provider",
 )
 
 _IN_CHUNK = 500
+
+_KIND_STABLE_PREFIX = {
+    "Repository": "repo",
+    "File": "file",
+    "Module": "module",
+    "Package": "pkg",
+    "Schema": "schema",
+    "Configuration": "config",
+    "Test": "test",
+    "Project": "project",
+    "Deployment": "deployment",
+    "Service": "service",
+}
+
+
+class SnapshotError(RuntimeError, ValueError):
+    """Raised when a snapshot is missing, ambiguous or immutable."""
 
 
 def _dumps(value):
@@ -76,6 +124,66 @@ def _loads(raw, default):
     except (TypeError, ValueError):
         return default
     return value if isinstance(value, type(default)) else default
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def identity_revision_digest(identity: dict) -> str:
+    """sha256 over the canonical join of the five identity fields (§1)."""
+    fields = (
+        str(identity.get("repo_identity", "")),
+        str(identity.get("source_revision", "")),
+        str(identity.get("tree_digest", "")),
+        str(identity.get("semantic_configuration", "{}") or "{}"),
+        str(identity.get("provider_set_digest", "") or ""),
+    )
+    return hashlib.sha256("\x1f".join(fields).encode("utf-8")).hexdigest()
+
+
+def derive_stable_id(kind: str, qualified_name: str | None) -> str:
+    """Deterministic stable id fallback when a caller omits one.
+
+    Extraction/provider code should always supply the §4 spelling; this is
+    the last-resort derivation (kind + qualified name) so the schema's
+    NOT NULL stable_id is always populated.
+    """
+    qn = str(qualified_name if qualified_name is not None else "")
+    if kind == "Repository":
+        return "repo:."
+    prefix = _KIND_STABLE_PREFIX.get(str(kind), str(kind).lower() or "entity")
+    return f"{prefix}:{qn}"
+
+
+def _derive_epistemics(provenance, epistemic_state, analysis_depth):
+    """Map `provenance` to (epistemic_state, analysis_depth) per §0.
+
+    ``runtime`` provenance maps to observed / analysis_depth 4 -- never to
+    ``inferred``.  Explicit caller values win.
+    """
+    state = epistemic_state
+    depth = analysis_depth
+    if provenance == "runtime":
+        if state is None:
+            state = "observed"
+        if depth is None:
+            depth = 4
+    if state is None:
+        state = provenance if provenance in EPISTEMIC_STATES else "observed"
+    if depth is None:
+        depth = 0
+    return str(state), int(depth)
+
+
+def _worst_verdict(*verdicts):
+    best = None
+    for verdict in verdicts:
+        if verdict not in _VERDICT_RANK:
+            verdict = "unknown"
+        if best is None or _VERDICT_RANK[verdict] < _VERDICT_RANK[best]:
+            best = verdict
+    return best or "unknown"
 
 
 def _rows_to_entities(rows, prefix="e"):
@@ -99,6 +207,7 @@ def _parse_relation(raw):
     rel["derived_from"] = _loads(rel.get("derived_from"), [])
     rel["attrs"] = _loads(rel.get("attrs"), {})
     rel["stale"] = bool(rel.get("stale", 0))
+    rel["resolved"] = int(rel.get("resolved", 1))
     return rel
 
 
@@ -125,10 +234,6 @@ def _chunks(seq, size=_IN_CHUNK):
         yield seq[start:start + size]
 
 
-def _utc_now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
 def _prefix_match(component_qn, qualified_names):
     """True when component_qn is a prefix of (or equal to) any name."""
     return any(qn == component_qn or qn.startswith(component_qn)
@@ -143,6 +248,7 @@ class Graph:
         self.path = path
         self._snapshot_id = None
         self._batch_depth = 0
+        self._batch_failed = False
 
     # ------------------------------------------------------------------ open
 
@@ -169,50 +275,33 @@ class Graph:
             if found is None:
                 conn.close()
                 raise RuntimeError(f"not a system_intel database: {target}")
+        version_row = conn.execute("SELECT MIN(version) AS v, MAX(version) AS v2 FROM schema_version").fetchone()
+        version = int(version_row["v2"] or 0) if version_row else 0
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(snapshot)")}
+        if "repo_identity" not in columns or version != SCHEMA_VERSION:
+            conn.close()
+            raise RuntimeError(
+                f"database {target!r} uses schema v{version} (expected v{SCHEMA_VERSION}); "
+                "system_intel v2 requires a fresh database path -- rescan into a new file"
+            )
         return cls(conn, target)
-
-    def batch(self):
-        """Defer commits until the outermost batch exits.
-
-        With `with graph.batch(): ...` every upsert defers its commit and
-        the outermost exit commits once.  Used by `persist.scan` so a
-        large repository upserts at bulk speed without changing any
-        public call signature.
-        """
-        from contextlib import contextmanager
-
-        @contextmanager
-        def _batch():
-            self._batch_depth += 1
-            try:
-                yield self
-            finally:
-                self._batch_depth -= 1
-                if self._batch_depth == 0:
-                    self._conn.commit()
-
-        return _batch()
-
-    def _maybe_commit(self):
-        if self._batch_depth == 0:
-            self._conn.commit()
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
         if self._conn is not None:
-            if exc_type is None:
-                self._conn.commit()
-            else:
+            if self._conn.in_transaction:
                 self._conn.rollback()
             self._conn.close()
             self._conn = None
         return False
 
     def close(self):
+        """Close the connection; a dirty transaction is rolled back, never committed."""
         if self._conn is not None:
-            self._conn.commit()
+            if self._conn.in_transaction:
+                self._conn.rollback()
             self._conn.close()
             self._conn = None
 
@@ -221,134 +310,373 @@ class Graph:
             raise RuntimeError("graph is closed")
         return self._conn
 
+    # ------------------------------------------------------------ transaction
+
+    def batch(self):
+        """Run a block as one all-or-nothing transaction (P0-4).
+
+        Commits ONLY when the block exits without an exception; on any
+        exception the transaction is rolled back and the exception is
+        re-raised.  There is deliberately no commit in a ``finally`` block.
+        """
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _batch():
+            self._batch_depth += 1
+            try:
+                yield self
+            except BaseException:
+                self._batch_depth -= 1
+                self._batch_failed = True
+                if self._batch_depth == 0:
+                    self._batch_failed = False
+                    self._conn.rollback()
+                raise
+            else:
+                self._batch_depth -= 1
+                if self._batch_depth == 0:
+                    if self._batch_failed:
+                        self._batch_failed = False
+                        self._conn.rollback()
+                    else:
+                        self._conn.commit()
+
+        return _batch()
+
+    def _maybe_commit(self):
+        if self._batch_depth == 0:
+            self._conn.commit()
+
     # ------------------------------------------------------------- snapshots
 
-    def ensure_snapshot(self, repo_root, commit_sha):
-        conn = self._require_conn()
-        root = str(Path(repo_root).resolve())
-        commit = str(commit_sha)
-        conn.execute(
-            "INSERT OR IGNORE INTO snapshot (repo_root, commit_sha, created_utc, schema_version)"
-            " VALUES (?, ?, ?, ?)",
-            (root, commit, _utc_now(), SCHEMA_VERSION),
-        )
-        row = conn.execute(
-            "SELECT id FROM snapshot WHERE repo_root=? AND commit_sha=?", (root, commit)
-        ).fetchone()
-        conn.commit()
-        self._snapshot_id = int(row["id"])
-        return self._snapshot_id
+    @staticmethod
+    def _snapshot_dict(row):
+        data = {k: row[k] for k in row.keys()}
+        data["commit_sha"] = data.get("source_revision")
+        return data
 
-    def _resolve_snapshot(self, snapshot_id=None):
-        if snapshot_id is not None:
-            return int(snapshot_id)
-        if self._snapshot_id is not None:
-            return self._snapshot_id
+    def latest_finalized_snapshot(self):
+        """The single deterministic latest finalized snapshot, or None."""
         row = self._require_conn().execute(
-            "SELECT id FROM snapshot ORDER BY id DESC LIMIT 1"
+            "SELECT * FROM snapshot WHERE state='finalized' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return self._snapshot_dict(row) if row is not None else None
+
+    def snapshot_by_revision(self, revision_digest):
+        row = self._require_conn().execute(
+            "SELECT * FROM snapshot WHERE revision_digest=? ORDER BY id DESC LIMIT 1",
+            (str(revision_digest),),
+        ).fetchone()
+        return self._snapshot_dict(row) if row is not None else None
+
+    def snapshot_for(self, identity: dict):
+        """The snapshot for an identity tuple (any state), or None."""
+        row = self._require_conn().execute(
+            "SELECT * FROM snapshot WHERE repo_identity=? AND source_revision=? "
+            "AND tree_digest=? AND semantic_configuration=? AND provider_set_digest=? "
+            "ORDER BY id DESC LIMIT 1",
+            (
+                str(identity.get("repo_identity", "")),
+                str(identity.get("source_revision", "")),
+                str(identity.get("tree_digest", "")),
+                str(identity.get("semantic_configuration", "{}") or "{}"),
+                str(identity.get("provider_set_digest", "") or ""),
+            ),
+        ).fetchone()
+        return self._snapshot_dict(row) if row is not None else None
+
+    def begin_draft(self, identity: dict) -> int:
+        """Insert a draft snapshot for an identity tuple; return its id.
+
+        Idempotent for an existing draft with the same tuple; raises
+        :class:`SnapshotError` when the tuple is already finalized.
+        """
+        conn = self._require_conn()
+        existing = self.snapshot_for(identity)
+        if existing is not None:
+            if existing["state"] == "draft":
+                self._snapshot_id = int(existing["id"])
+                return self._snapshot_id
+            raise SnapshotError(
+                f"revision {existing['revision_digest']} is already finalized; "
+                "one revision tuple maps to at most one snapshot"
+            )
+        revision_digest = identity.get("revision_digest") or identity_revision_digest(identity)
+        cur = conn.execute(
+            """
+            INSERT INTO snapshot (repo_root, repo_identity, source_revision, tree_digest,
+                                  semantic_configuration, provider_set_digest,
+                                  revision_digest, state, created_utc, finalized_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, NULL)
+            """,
+            (
+                identity.get("repo_root"),
+                str(identity.get("repo_identity", "")),
+                str(identity.get("source_revision", "")),
+                str(identity.get("tree_digest", "")),
+                str(identity.get("semantic_configuration", "{}") or "{}"),
+                str(identity.get("provider_set_digest", "") or ""),
+                str(revision_digest),
+                _utc_now(),
+            ),
+        )
+        snap = int(cur.lastrowid)
+        self._snapshot_id = snap
+        self._maybe_commit()
+        return snap
+
+    def finalize_snapshot(self, snapshot_id) -> None:
+        conn = self._require_conn()
+        row = conn.execute("SELECT state FROM snapshot WHERE id=?", (int(snapshot_id),)).fetchone()
+        if row is None:
+            raise SnapshotError(f"snapshot {snapshot_id} not found")
+        if row["state"] == "finalized":
+            raise SnapshotError(f"snapshot {snapshot_id} is already finalized")
+        conn.execute(
+            "UPDATE snapshot SET state='finalized', finalized_utc=? WHERE id=? AND state='draft'",
+            (_utc_now(), int(snapshot_id)),
+        )
+        self._maybe_commit()
+
+    def abort_draft(self, snapshot_id) -> None:
+        """Delete every row of a draft snapshot in one transaction."""
+        conn = self._require_conn()
+        row = conn.execute("SELECT state FROM snapshot WHERE id=?", (int(snapshot_id),)).fetchone()
+        if row is None:
+            return
+        if row["state"] == "finalized":
+            raise SnapshotError(f"snapshot {snapshot_id} is finalized and cannot be aborted")
+        snap = int(snapshot_id)
+        for table in (
+            "support", "unresolved_edge", "relation", "evidence", "fact",
+            "provider_record", "invariant", "contract", "incident", "change",
+            "entity",
+        ):
+            conn.execute(f"DELETE FROM {table} WHERE snapshot_id=?", (snap,))
+        conn.execute("DELETE FROM snapshot WHERE id=?", (snap,))
+        if self._snapshot_id == snap:
+            self._snapshot_id = None
+        self._maybe_commit()
+
+    def ensure_snapshot(self, repo_root, commit_sha):
+        """Legacy helper: create/reuse a DRAFT snapshot for (repo_root, commit_sha).
+
+        Kept for interface compatibility (protocol projection tests and older
+        callers).  New code should use :meth:`begin_draft` with a full
+        identity and :meth:`finalize_snapshot`.
+        """
+        root = str(Path(repo_root).resolve())
+        repo_identity = hashlib.sha256(f"legacy-root:{root}".encode("utf-8")).hexdigest()
+        identity = {
+            "repo_identity": repo_identity,
+            "source_revision": str(commit_sha),
+            "tree_digest": hashlib.sha256(f"legacy:{root}:{commit_sha}".encode("utf-8")).hexdigest(),
+            "semantic_configuration": "{}",
+            "provider_set_digest": "",
+            "repo_root": root,
+        }
+        existing = self.snapshot_for(identity)
+        if existing is not None:
+            if existing["state"] == "finalized":
+                raise SnapshotError(
+                    f"legacy snapshot for {root}@{commit_sha} already finalized"
+                )
+            snap = int(existing["id"])
+        else:
+            snap = self.begin_draft(identity)
+        self._snapshot_id = snap
+        return snap
+
+    def _snapshot_row(self, snapshot_id):
+        row = self._require_conn().execute(
+            "SELECT * FROM snapshot WHERE id=?", (int(snapshot_id),)
         ).fetchone()
         if row is None:
-            raise RuntimeError("no snapshot: call ensure_snapshot(repo_root, commit_sha) first")
-        self._snapshot_id = int(row["id"])
-        return self._snapshot_id
+            raise SnapshotError(f"snapshot {snapshot_id} not found")
+        return self._snapshot_dict(row)
+
+    def _resolve_read_snapshot(self, snapshot_id=None):
+        """Resolve exactly one snapshot for reads: explicit id or latest finalized."""
+        if snapshot_id is not None:
+            return self._snapshot_row(snapshot_id)
+        row = self.latest_finalized_snapshot()
+        if row is None:
+            raise SnapshotError(
+                "no finalized snapshot in this database; run scan first"
+            )
+        return row
+
+    def _resolve_snapshot(self, snapshot_id=None):
+        """Resolve a snapshot id for writes (explicit, pinned legacy, or latest finalized)."""
+        if snapshot_id is not None:
+            return int(self._snapshot_row(snapshot_id)["id"])
+        if self._snapshot_id is not None:
+            return int(self._snapshot_id)
+        row = self.latest_finalized_snapshot()
+        if row is None:
+            raise SnapshotError("no snapshot: begin a draft or scan first")
+        return int(row["id"])
 
     def _optional_snapshot(self, snapshot_id=None):
         if snapshot_id is not None:
             return int(snapshot_id)
         if self._snapshot_id is not None:
-            return self._snapshot_id
-        row = self._require_conn().execute(
-            "SELECT id FROM snapshot ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+            return int(self._snapshot_id)
+        row = self.latest_finalized_snapshot()
         return int(row["id"]) if row else None
 
     # -------------------------------------------------------------- upserts
 
-    def upsert_entity(self, kind, name, qualified_name, *, snapshot_id=None,
-                      file=None, line=None, tier=0, provenance="observed",
-                      confidence=1.0, derived_from=(), last_verified=None,
-                      uncertainty=None, attrs=None):
+    def upsert_entity(self, kind, name, stable_id=None, *, qualified_name=None,
+                      snapshot_id=None, file=None, line=None, tier=0,
+                      provenance="observed", confidence=1.0, derived_from=(),
+                      last_verified=None, uncertainty=None, attrs=None,
+                      epistemic_state=None, analysis_depth=None,
+                      completeness=None, provider=None, provider_revision=None):
         conn = self._require_conn()
         snap = self._resolve_snapshot(snapshot_id)
+        if stable_id in (None, ""):
+            if qualified_name is None:
+                qualified_name = name
+            stable_id = derive_stable_id(kind, qualified_name)
+        if qualified_name is None:
+            qualified_name = stable_id
+        state, depth = _derive_epistemics(provenance, epistemic_state, analysis_depth)
         conn.execute(
             """
             INSERT INTO entity (snapshot_id, kind, name, qualified_name, file, line,
                                 tier, provenance, confidence, derived_from,
-                                last_verified, uncertainty, stale, attrs)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-            ON CONFLICT (snapshot_id, kind, qualified_name) DO UPDATE SET
-                name=excluded.name, file=excluded.file, line=excluded.line,
-                tier=excluded.tier, provenance=excluded.provenance,
-                confidence=excluded.confidence, derived_from=excluded.derived_from,
-                last_verified=excluded.last_verified,
-                uncertainty=excluded.uncertainty, attrs=excluded.attrs, stale=0
+                                last_verified, uncertainty, stale, attrs, stable_id,
+                                epistemic_state, analysis_depth, completeness,
+                                provider, provider_revision)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (snapshot_id, stable_id) DO UPDATE SET
+                kind=excluded.kind, name=excluded.name,
+                qualified_name=excluded.qualified_name, file=excluded.file,
+                line=excluded.line, tier=excluded.tier,
+                provenance=excluded.provenance, confidence=excluded.confidence,
+                derived_from=excluded.derived_from, last_verified=excluded.last_verified,
+                uncertainty=excluded.uncertainty, attrs=excluded.attrs, stale=0,
+                epistemic_state=excluded.epistemic_state,
+                analysis_depth=excluded.analysis_depth,
+                completeness=excluded.completeness, provider=excluded.provider,
+                provider_revision=excluded.provider_revision
             """,
-            (snap, kind, name, qualified_name, file, line, int(tier),
+            (snap, str(kind), str(name), str(qualified_name), file, line, int(tier),
              str(provenance), float(confidence), _dumps(list(derived_from)),
-             last_verified, uncertainty, _dumps(dict(attrs or {}))),
+             last_verified, uncertainty, _dumps(dict(attrs or {})), str(stable_id),
+             state, depth, str(completeness or "partial"), str(provider or ""),
+             str(provider_revision or "")),
         )
         row = conn.execute(
-            "SELECT id FROM entity WHERE snapshot_id=? AND kind=? AND qualified_name=?",
-            (snap, kind, qualified_name),
+            "SELECT id FROM entity WHERE snapshot_id=? AND stable_id=?",
+            (snap, str(stable_id)),
         ).fetchone()
         self._maybe_commit()
         return int(row["id"])
 
     def upsert_relation(self, src_id, dst_id, kind, *, snapshot_id=None, tier=0,
                         provenance="inferred", confidence=1.0, derived_from=(),
-                        last_verified=None, uncertainty=None, attrs=None):
+                        last_verified=None, uncertainty=None, attrs=None,
+                        src_key=None, dst_key=None, resolved=None,
+                        epistemic_state=None, analysis_depth=None,
+                        completeness=None, provider=None):
         conn = self._require_conn()
-        if snapshot_id is not None:
-            snap = int(snapshot_id)
+        src = conn.execute(
+            "SELECT snapshot_id, stable_id FROM entity WHERE id=?", (int(src_id),)
+        ).fetchone()
+        if src is None:
+            raise KeyError(f"entity {src_id} not found")
+        snap = int(snapshot_id) if snapshot_id is not None else int(src["snapshot_id"])
+        if src_key in (None, ""):
+            src_key = src["stable_id"]
+        if dst_id is None:
+            resolved = 0
+            dst_id = None
+            d_key = str(dst_key or "")
+        else:
+            dst = conn.execute(
+                "SELECT stable_id FROM entity WHERE id=?", (int(dst_id),)
+            ).fetchone()
+            if dst is None:
+                raise KeyError(f"entity {dst_id} not found")
+            resolved = 1
+            d_key = str(dst_key or dst["stable_id"])
+        state, depth = _derive_epistemics(provenance, epistemic_state, analysis_depth)
+        if dst_id is None:
+            row = conn.execute(
+                "SELECT id FROM relation WHERE snapshot_id=? AND src_id=? AND dst_id IS NULL "
+                "AND src_key=? AND dst_key=? AND kind=?",
+                (snap, int(src_id), str(src_key), d_key, str(kind)),
+            ).fetchone()
         else:
             row = conn.execute(
-                "SELECT snapshot_id FROM entity WHERE id=?", (int(src_id),)
+                "SELECT id FROM relation WHERE snapshot_id=? AND src_id=? AND dst_id=? AND kind=?",
+                (snap, int(src_id), int(dst_id), str(kind)),
             ).fetchone()
-            if row is None:
-                raise KeyError(f"entity {src_id} not found")
-            snap = int(row["snapshot_id"])
-        conn.execute(
-            """
-            INSERT INTO relation (snapshot_id, src_id, dst_id, kind, tier, provenance,
-                                  confidence, derived_from, last_verified,
-                                  uncertainty, stale, attrs)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-            ON CONFLICT (snapshot_id, src_id, dst_id, kind) DO UPDATE SET
-                tier=excluded.tier, provenance=excluded.provenance,
-                confidence=excluded.confidence, derived_from=excluded.derived_from,
-                last_verified=excluded.last_verified,
-                uncertainty=excluded.uncertainty, attrs=excluded.attrs, stale=0
-            """,
-            (snap, int(src_id), int(dst_id), kind, int(tier), str(provenance),
-             float(confidence), _dumps(list(derived_from)), last_verified,
-             uncertainty, _dumps(dict(attrs or {}))),
-        )
-        row = conn.execute(
-            "SELECT id FROM relation WHERE snapshot_id=? AND src_id=? AND dst_id=? AND kind=?",
-            (snap, int(src_id), int(dst_id), kind),
-        ).fetchone()
+        if row is not None:
+            conn.execute(
+                """UPDATE relation SET tier=?, provenance=?, confidence=?, derived_from=?,
+                   last_verified=?, uncertainty=?, attrs=?, stale=0, resolved=?,
+                   epistemic_state=?, analysis_depth=?, completeness=?, provider=?
+                   WHERE id=?""",
+                (int(tier), str(provenance), float(confidence),
+                 _dumps(list(derived_from)), last_verified, uncertainty,
+                 _dumps(dict(attrs or {})), int(resolved), state, depth,
+                 str(completeness or "partial"), str(provider or ""), int(row["id"])),
+            )
+            rel_id = int(row["id"])
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO relation (snapshot_id, src_id, dst_id, kind, tier, provenance,
+                                      confidence, derived_from, last_verified, uncertainty,
+                                      stale, attrs, src_key, dst_key, resolved,
+                                      epistemic_state, analysis_depth, completeness, provider)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (snap, int(src_id), dst_id, str(kind), int(tier), str(provenance),
+                 float(confidence), _dumps(list(derived_from)), last_verified,
+                 uncertainty, _dumps(dict(attrs or {})), str(src_key), d_key,
+                 int(resolved), state, depth, str(completeness or "partial"),
+                 str(provider or "")),
+            )
+            rel_id = int(cur.lastrowid)
         self._maybe_commit()
-        return int(row["id"])
+        return rel_id
 
     def upsert_fact(self, subject, predicate, object, *, snapshot_id=None, tier=0,
                     provenance="observed", confidence=1.0, derived_from=(),
-                    last_verified=None, uncertainty=None):
+                    last_verified=None, uncertainty=None, epistemic_state=None,
+                    analysis_depth=None, completeness=None, provider=None,
+                    provider_revision=None, stable_subject=None):
         conn = self._require_conn()
         snap = self._resolve_snapshot(snapshot_id)
+        state, depth = _derive_epistemics(provenance, epistemic_state, analysis_depth)
         conn.execute(
             """
             INSERT INTO fact (snapshot_id, subject, predicate, object, tier, provenance,
-                              confidence, derived_from, last_verified, uncertainty, stale)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                              confidence, derived_from, last_verified, uncertainty, stale,
+                              epistemic_state, analysis_depth, completeness, provider,
+                              provider_revision, stable_subject)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (snapshot_id, subject, predicate, object) DO UPDATE SET
                 tier=excluded.tier, provenance=excluded.provenance,
                 confidence=excluded.confidence, derived_from=excluded.derived_from,
-                last_verified=excluded.last_verified,
-                uncertainty=excluded.uncertainty, stale=0
+                last_verified=excluded.last_verified, uncertainty=excluded.uncertainty,
+                stale=0, epistemic_state=excluded.epistemic_state,
+                analysis_depth=excluded.analysis_depth,
+                completeness=excluded.completeness, provider=excluded.provider,
+                provider_revision=excluded.provider_revision,
+                stable_subject=excluded.stable_subject
             """,
             (snap, str(subject), str(predicate), str(object), int(tier),
              str(provenance), float(confidence), _dumps(list(derived_from)),
-             last_verified, uncertainty),
+             last_verified, uncertainty, state, depth,
+             str(completeness or "partial"), str(provider or ""),
+             str(provider_revision or ""),
+             str(stable_subject if stable_subject is not None else subject)),
         )
         row = conn.execute(
             "SELECT id FROM fact WHERE snapshot_id=? AND subject=? AND predicate=? AND object=?",
@@ -357,13 +685,128 @@ class Graph:
         self._maybe_commit()
         return int(row["id"])
 
+    # ------------------------------------------- unresolved / support / provider
+
+    def add_unresolved_edge(self, snapshot_id, src_key, dst_raw, kind, *,
+                            provider, provider_revision="", candidates=(),
+                            confidence=0.3, completeness="unknown",
+                            evidence=()) -> int:
+        conn = self._require_conn()
+        snap = self._resolve_snapshot(snapshot_id)
+        cur = conn.execute(
+            """
+            INSERT INTO unresolved_edge (snapshot_id, src_key, dst_raw, kind, provider,
+                                         provider_revision, candidates, confidence,
+                                         completeness, evidence, created_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (snap, str(src_key), str(dst_raw), str(kind), str(provider),
+             str(provider_revision or ""), _dumps(list(candidates)),
+             float(confidence), str(completeness), _dumps(list(evidence)), _utc_now()),
+        )
+        self._maybe_commit()
+        return int(cur.lastrowid)
+
+    def unresolved_edges(self, snapshot_id=None, kind=None):
+        conn = self._require_conn()
+        snap = self._resolve_snapshot(snapshot_id)
+        sql = "SELECT * FROM unresolved_edge WHERE snapshot_id=?"
+        params = [snap]
+        if kind is not None:
+            sql += " AND kind=?"
+            params.append(str(kind))
+        sql += " ORDER BY id"
+        out = []
+        for row in conn.execute(sql, params).fetchall():
+            item = {k: row[k] for k in row.keys()}
+            item["candidates"] = _loads(item.get("candidates"), [])
+            item["evidence"] = _loads(item.get("evidence"), [])
+            out.append(item)
+        return out
+
+    def accumulate_support(self, snapshot_id, subject_table, subject_id, *,
+                           provider, provider_revision="", confidence=1.0,
+                           evidence_id=None, detail=None) -> int:
+        conn = self._require_conn()
+        snap = self._resolve_snapshot(snapshot_id)
+        if evidence_id is None:
+            row = conn.execute(
+                "SELECT id FROM support WHERE snapshot_id=? AND subject_table=? "
+                "AND subject_id=? AND provider=? AND evidence_id IS NULL",
+                (snap, str(subject_table), int(subject_id), str(provider)),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM support WHERE snapshot_id=? AND subject_table=? "
+                "AND subject_id=? AND provider=? AND evidence_id=?",
+                (snap, str(subject_table), int(subject_id), str(provider), int(evidence_id)),
+            ).fetchone()
+        if row is not None:
+            conn.execute(
+                "UPDATE support SET provider_revision=?, confidence=?, evidence_id=?, "
+                "detail=?, observed_utc=? WHERE id=?",
+                (str(provider_revision or ""), float(confidence),
+                 int(evidence_id) if evidence_id is not None else None,
+                 detail, _utc_now(), int(row["id"])),
+            )
+            sup_id = int(row["id"])
+        else:
+            cur = conn.execute(
+                """INSERT INTO support (snapshot_id, subject_table, subject_id, provider,
+                   provider_revision, confidence, evidence_id, detail, observed_utc)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (snap, str(subject_table), int(subject_id), str(provider),
+                 str(provider_revision or ""), float(confidence),
+                 int(evidence_id) if evidence_id is not None else None,
+                 detail, _utc_now()),
+            )
+            sup_id = int(cur.lastrowid)
+        self._maybe_commit()
+        return sup_id
+
+    def record_provider(self, snapshot_id, provider, provider_version,
+                        capabilities: dict, invoked=True) -> int:
+        conn = self._require_conn()
+        snap = self._resolve_snapshot(snapshot_id)
+        caps = capabilities if isinstance(capabilities, dict) else {}
+        conn.execute(
+            """INSERT INTO provider_record (snapshot_id, provider, provider_version,
+               capabilities, invoked)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (snapshot_id, provider) DO UPDATE SET
+                   provider_version=excluded.provider_version,
+                   capabilities=excluded.capabilities, invoked=excluded.invoked""",
+            (snap, str(provider), str(provider_version), _dumps(dict(caps)),
+             1 if invoked else 0),
+        )
+        row = conn.execute(
+            "SELECT id FROM provider_record WHERE snapshot_id=? AND provider=?",
+            (snap, str(provider)),
+        ).fetchone()
+        self._maybe_commit()
+        return int(row["id"])
+
+    def add_evidence(self, snapshot_id, kind, ref, *, digest=None, summary="",
+                     payload=None, provider="") -> int:
+        conn = self._require_conn()
+        snap = self._resolve_snapshot(snapshot_id)
+        cur = conn.execute(
+            """INSERT INTO evidence (snapshot_id, kind, ref, digest, summary, payload,
+               provider, created_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (snap, str(kind), str(ref), digest, str(summary),
+             _dumps(payload) if payload is not None else None,
+             str(provider or ""), _utc_now()),
+        )
+        self._maybe_commit()
+        return int(cur.lastrowid)
+
+    # ------------------------------------------------- documents (v1 helpers)
+
     def add_invariant(self, statement, component_qn=None, *, snapshot_id=None, tier=0,
                       provenance="declared", confidence=1.0, derived_from=(),
                       last_verified=None, uncertainty=None):
         conn = self._require_conn()
         snap = self._resolve_snapshot(snapshot_id)
-        # SQLite treats NULLs as distinct in UNIQUE, so dedupe manually when
-        # component_qn is absent.
         if component_qn is None:
             row = conn.execute(
                 "SELECT id FROM invariant WHERE snapshot_id=? AND statement=? AND component_qn IS NULL",
@@ -391,7 +834,7 @@ class Graph:
                  float(confidence), _dumps(list(derived_from)), last_verified, uncertainty),
             )
             inv_id = int(cur.lastrowid)
-        conn.commit()
+        self._maybe_commit()
         return inv_id
 
     def add_contract(self, kind, name, component_qn=None, format=None, *,
@@ -421,7 +864,7 @@ class Graph:
             "SELECT id FROM contract WHERE snapshot_id=? AND kind=? AND name=?",
             (snap, kind, name),
         ).fetchone()
-        conn.commit()
+        self._maybe_commit()
         return int(row["id"])
 
     def add_incident(self, summary, component_qn=None, occurred_utc=None,
@@ -429,8 +872,6 @@ class Graph:
                      provenance="historically_supported", confidence=1.0,
                      derived_from=(), last_verified=None, uncertainty=None,
                      attrs=None):
-        # NOTE: schema v1 `incident` has no tier/last_verified columns; those
-        # arguments are accepted for interface symmetry and not persisted.
         conn = self._require_conn()
         snap = self._resolve_snapshot(snapshot_id)
         cur = conn.execute(
@@ -441,14 +882,13 @@ class Graph:
              float(confidence), _dumps(list(derived_from)), uncertainty,
              _dumps(dict(attrs or {}))),
         )
-        conn.commit()
+        self._maybe_commit()
         return int(cur.lastrowid)
 
     def add_change(self, commit_sha, summary, files=(), outcome=None, *,
                    snapshot_id=None, tier=0, provenance="historically_supported",
                    confidence=1.0, derived_from=(), last_verified=None,
                    uncertainty=None, attrs=None):
-        # NOTE: schema v1 `change` has no tier/last_verified columns.
         conn = self._require_conn()
         snap = self._resolve_snapshot(snapshot_id)
         cur = conn.execute(
@@ -459,41 +899,47 @@ class Graph:
              str(provenance), float(confidence), _dumps(list(derived_from)),
              uncertainty, _dumps(dict(attrs or {}))),
         )
-        conn.commit()
+        self._maybe_commit()
         return int(cur.lastrowid)
 
-    # ------------------------------------------------------------- staleness
+    # ------------------------------------------------- legacy staleness (draft)
 
     def mark_entity_stale(self, entity_id):
+        """Deprecated: v2 has no in-place staleness.  Draft snapshots only."""
         conn = self._require_conn()
         cur = conn.execute("UPDATE entity SET stale=1 WHERE id=?", (int(entity_id),))
         if cur.rowcount == 0:
             raise KeyError(f"entity {entity_id} not found")
-        conn.commit()
+        self._maybe_commit()
 
     def mark_entity_fresh(self, entity_id):
+        """Deprecated: v2 has no in-place staleness.  Draft snapshots only."""
         conn = self._require_conn()
         cur = conn.execute("UPDATE entity SET stale=0 WHERE id=?", (int(entity_id),))
         if cur.rowcount == 0:
             raise KeyError(f"entity {entity_id} not found")
-        conn.commit()
+        self._maybe_commit()
 
     def stale_sweep(self, snapshot_id, seen_by_kind):
-        """Mark unseen entities of each given kind stale; return stale count.
+        """DEPRECATED: draft-only compatibility helper.
 
-        Only pass a kind when the extraction enumerated *all* entities of that
-        kind for the snapshot; a partial set will mark live entities stale.
+        Finalized snapshots are immutable and never go stale; removal is
+        represented by a newer snapshot and reported by
+        :meth:`diff_snapshots`.  This helper exists purely so legacy callers
+        can mark draft rows and raises :class:`SnapshotError` for finalized
+        snapshots.  Do not use it in the operating model.
         """
         conn = self._require_conn()
         snap = int(snapshot_id)
+        row = conn.execute("SELECT state FROM snapshot WHERE id=?", (snap,)).fetchone()
+        if row is None:
+            raise SnapshotError(f"snapshot {snap} not found")
+        if row["state"] != "draft":
+            raise SnapshotError("stale_sweep is draft-only; finalized snapshots are immutable")
         before = conn.execute(
             "SELECT COUNT(*) AS n FROM entity WHERE snapshot_id=? AND stale=1", (snap,)
         ).fetchone()["n"]
         for kind, seen in dict(seen_by_kind).items():
-            # Mark-then-unmark so chunking cannot turn `NOT IN (chunk)` into
-            # a per-chunk sweep of the other chunks' entities: every row of
-            # the kind is marked stale first, then every SEEN qualified name
-            # is restored fresh (chunked IN-clause).
             conn.execute(
                 "UPDATE entity SET stale=1 WHERE snapshot_id=? AND kind=? AND stale=0",
                 (snap, kind),
@@ -509,7 +955,7 @@ class Graph:
         after = conn.execute(
             "SELECT COUNT(*) AS n FROM entity WHERE snapshot_id=? AND stale=1", (snap,)
         ).fetchone()["n"]
-        conn.commit()
+        self._maybe_commit()
         return int(after) - int(before)
 
     # --------------------------------------------------------------- lookups
@@ -549,25 +995,47 @@ class Graph:
             return None
         return _parse_entity({k: rows[0][k] for k in rows[0].keys()})
 
-    def resolve_qn(self, qualified_name, include_stale=True, snapshot_id=None):
-        """Exact qualified-name match first; otherwise the UNIQUE entity whose
-        qualified name ends with ``::<qualified_name>`` (a bare symbol or a
-        relative import target).  An ambiguous suffix resolves to None; the
-        caller counts it as unresolved rather than guessing."""
-        hit = self.find_entity_by_qn(qualified_name, include_stale, snapshot_id)
-        if hit is not None:
-            return hit
+    def resolve_qn(self, qualified_name, include_stale=True, snapshot_id=None,
+                   kind=None, stable_id=None):
+        """Typed resolution helper used by CLI/protocol callers.
+
+        With ``stable_id`` the typed (kind, stable_id) key is matched exactly;
+        otherwise exact qualified-name match first, then the UNIQUE entity
+        whose qualified name ends with ``::<qualified_name>``.  Ambiguity
+        resolves to None rather than guessing.
+        """
+        conn = self._require_conn()
         snap = self._optional_snapshot(snapshot_id)
         if snap is None:
             return None
+        if stable_id is not None:
+            if kind is not None:
+                row = conn.execute(
+                    "SELECT * FROM entity WHERE snapshot_id=? AND kind=? AND stable_id=?",
+                    (snap, kind, stable_id),
+                ).fetchone()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM entity WHERE snapshot_id=? AND stable_id=? ORDER BY id",
+                    (snap, stable_id),
+                ).fetchall()
+                row = rows[0] if len(rows) == 1 else None
+            return _parse_entity({k: row[k] for k in row.keys()}) if row is not None else None
+        hit = self.find_entity_by_qn(qualified_name, include_stale, snapshot_id)
+        if hit is not None and (kind is None or hit["kind"] == kind):
+            return hit
         clause = "" if include_stale else " AND stale=0"
+        kind_clause = " AND kind=?" if kind is not None else ""
         escaped = (
             qualified_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         )
-        rows = self._require_conn().execute(
+        params = [snap, qualified_name, "%::" + escaped]
+        if kind is not None:
+            params.append(kind)
+        rows = conn.execute(
             f"SELECT * FROM entity WHERE snapshot_id=?{clause} "
-            "AND (qualified_name=? OR qualified_name LIKE ? ESCAPE '\\') ORDER BY id",
-            (snap, qualified_name, "%::" + escaped),
+            f"AND (qualified_name=? OR qualified_name LIKE ? ESCAPE '\\'){kind_clause} ORDER BY id",
+            params,
         ).fetchall()
         if len(rows) != 1:
             return None
@@ -630,23 +1098,25 @@ class Graph:
                 out.append(rel)
         return out
 
-    def edges_by_type(self, kind, include_stale=False):
+    def edges_by_type(self, kind, include_stale=False, snapshot_id=None):
         conn = self._require_conn()
-        snap = self._resolve_snapshot(None)
+        snap = self._resolve_snapshot(snapshot_id)
         sql = (
             f"SELECT {_select('r', _RELATION_COLUMNS)}, {_select('s', _ENTITY_COLUMNS)}, "
             f"{_select('d', _ENTITY_COLUMNS)} "
-            f"FROM relation r JOIN entity s ON s.id=r.src_id JOIN entity d ON d.id=r.dst_id "
+            f"FROM relation r JOIN entity s ON s.id=r.src_id "
+            f"LEFT JOIN entity d ON d.id=r.dst_id "
             f"WHERE r.snapshot_id=? AND r.kind=?"
         )
         if not include_stale:
-            sql += " AND r.stale=0 AND s.stale=0 AND d.stale=0"
+            sql += " AND r.stale=0 AND s.stale=0"
         sql += " ORDER BY r.id"
         out = []
         for row in conn.execute(sql, (snap, kind)).fetchall():
             rel = _parse_relation({c: row[f"r_{c}"] for c in _RELATION_COLUMNS})
             rel["src"] = _parse_entity({c: row[f"s_{c}"] for c in _ENTITY_COLUMNS})
-            rel["dst"] = _parse_entity({c: row[f"d_{c}"] for c in _ENTITY_COLUMNS})
+            rel["dst"] = (_parse_entity({c: row[f"d_{c}"] for c in _ENTITY_COLUMNS})
+                          if row["d_id"] is not None else None)
             out.append(rel)
         return out
 
@@ -686,7 +1156,8 @@ class Graph:
         snap = self._resolve_snapshot(None)
         allowed = set(kinds) if kinds else None
         rows = conn.execute(
-            "SELECT src_id, dst_id, kind FROM relation WHERE snapshot_id=? AND stale=0",
+            "SELECT src_id, dst_id, kind FROM relation WHERE snapshot_id=? AND stale=0 "
+            "AND dst_id IS NOT NULL",
             (snap,),
         ).fetchall()
         adjacency = {}
@@ -728,7 +1199,7 @@ class Graph:
         placeholders = ",".join("?" for _ in IMPACT_EDGE_KINDS)
         rows = conn.execute(
             f"SELECT src_id, dst_id FROM relation WHERE snapshot_id=? AND stale=0 "
-            f"AND kind IN ({placeholders})",
+            f"AND dst_id IS NOT NULL AND kind IN ({placeholders})",
             (snap, *IMPACT_EDGE_KINDS),
         ).fetchall()
         adjacency = {}
@@ -785,10 +1256,13 @@ class Graph:
         test_by_id = {e["id"]: e for e in impacted if e["kind"] == "Test"}
         for chunk in _chunks(ids):
             placeholders = ",".join("?" for _ in chunk)
+            # P0-6: ONLY entities whose kind is Test may source a `tests` edge.
             tests_rows = conn.execute(
-                f"SELECT DISTINCT src_id FROM relation WHERE snapshot_id=? AND kind='tests' "
-                f"AND stale=0 AND dst_id IN ({placeholders})",
-                (snap, *chunk),
+                f"SELECT DISTINCT r.src_id FROM relation r "
+                f"JOIN entity s ON s.id=r.src_id AND s.snapshot_id=r.snapshot_id "
+                f"WHERE r.snapshot_id=? AND r.kind='tests' AND r.stale=0 "
+                f"AND s.kind=? AND r.dst_id IN ({placeholders})",
+                (snap, TEST_SOURCE_KIND, *chunk),
             ).fetchall()
             for row in tests_rows:
                 if row["src_id"] not in test_by_id:
@@ -806,6 +1280,7 @@ class Graph:
             "invariants": invariants,
             "tests": tests,
             "incidents": incidents,
+            "completeness": self.completeness(snap),
         }
 
     def impact(self, entity_id, *, max_depth=6):
@@ -885,51 +1360,305 @@ class Graph:
             "tests": sorted(tests.values(), key=lambda t: t["qualified_name"]),
             "incidents": sorted(incidents.values(), key=lambda i: i["id"]),
             "likely_regression_surfaces": likely,
+            "completeness": self.completeness(snap),
         }
+
+    # ---------------------------------------------------------- completeness
+
+    def completeness(self, snapshot_id=None, family=None):
+        """Completeness verdicts for exactly one snapshot (§0/§3).
+
+        Families come from provider capability records, augmented by data
+        actually stored; unresolved edges cap the ``relations`` verdict at
+        ``partial`` and are always surfaced explicitly.
+        """
+        conn = self._require_conn()
+        row = self._resolve_read_snapshot(snapshot_id)
+        snap = int(row["id"])
+
+        providers = {}
+        families = {}
+        for prow in conn.execute(
+            "SELECT provider, capabilities FROM provider_record WHERE snapshot_id=? ORDER BY provider",
+            (snap,),
+        ).fetchall():
+            caps = _loads(prow["capabilities"], {})
+            providers[prow["provider"]] = caps
+            for fam, verdict in caps.items():
+                families[fam] = _worst_verdict(families.get(fam, "complete"), verdict)
+
+        def _count(sql, params=()):
+            return int(conn.execute(sql, params).fetchone()["n"])
+
+        entities = _count("SELECT COUNT(*) AS n FROM entity WHERE snapshot_id=?", (snap,))
+        relations_resolved = _count(
+            "SELECT COUNT(*) AS n FROM relation WHERE snapshot_id=? AND dst_id IS NOT NULL", (snap,)
+        )
+        relations_unresolved = _count(
+            "SELECT COUNT(*) AS n FROM relation WHERE snapshot_id=? AND dst_id IS NULL", (snap,)
+        )
+        unresolved_edges = _count(
+            "SELECT COUNT(*) AS n FROM unresolved_edge WHERE snapshot_id=?", (snap,)
+        )
+        facts = _count("SELECT COUNT(*) AS n FROM fact WHERE snapshot_id=?", (snap,))
+        tests = _count("SELECT COUNT(*) AS n FROM entity WHERE snapshot_id=? AND kind='Test'", (snap,))
+
+        if "entities" not in families:
+            families["entities"] = "complete" if entities else "unknown"
+        if "relations" not in families:
+            if relations_unresolved or unresolved_edges:
+                families["relations"] = "partial"
+            else:
+                families["relations"] = "complete" if relations_resolved else "unknown"
+        if "facts" not in families:
+            families["facts"] = "complete" if facts else "unknown"
+        if "tests" not in families and tests:
+            families["tests"] = "partial"
+        if relations_unresolved or unresolved_edges:
+            families["relations"] = _worst_verdict(families.get("relations", "unknown"), "partial")
+
+        sample = [
+            {"src_key": u["src_key"], "dst_raw": u["dst_raw"], "kind": u["kind"]}
+            for u in conn.execute(
+                "SELECT src_key, dst_raw, kind FROM unresolved_edge WHERE snapshot_id=? ORDER BY id LIMIT 10",
+                (snap,),
+            ).fetchall()
+        ]
+        filtered = ({family: families.get(family, "unknown")} if family is not None
+                    else dict(sorted(families.items())))
+        return {
+            "snapshot": row["revision_digest"],
+            "snapshot_id": snap,
+            "state": row["state"],
+            "families": filtered,
+            "providers": providers,
+            "unresolved": {
+                "count": unresolved_edges,
+                "relation_rows": relations_unresolved,
+                "sample": sample,
+            },
+            "counts": {
+                "entities": entities,
+                "relations": relations_resolved,
+                "unresolved_relations": relations_unresolved,
+                "unresolved_edges": unresolved_edges,
+                "facts": facts,
+                "tests": tests,
+            },
+        }
+
+    # ---------------------------------------------------------------- diff
+
+    def _entity_map(self, snapshot_id):
+        conn = self._require_conn()
+        out = {}
+        for row in conn.execute(
+            "SELECT * FROM entity WHERE snapshot_id=? ORDER BY id", (int(snapshot_id),)
+        ).fetchall():
+            ent = _parse_entity({k: row[k] for k in row.keys()})
+            signature = _dumps({
+                k: ent.get(k) for k in (
+                    "kind", "name", "qualified_name", "file", "line", "tier",
+                    "provenance", "confidence", "derived_from", "attrs",
+                    "epistemic_state", "analysis_depth", "completeness",
+                    "provider", "provider_revision",
+                )
+            })
+            out[ent["stable_id"]] = signature
+        return out
+
+    def _relation_map(self, snapshot_id):
+        conn = self._require_conn()
+        out = {}
+        rows = conn.execute(
+            f"""SELECT r.*, s.stable_id AS src_stable, d.stable_id AS dst_stable
+                FROM relation r
+                JOIN entity s ON s.id=r.src_id AND s.snapshot_id=r.snapshot_id
+                LEFT JOIN entity d ON d.id=r.dst_id
+                WHERE r.snapshot_id=? ORDER BY r.id""",
+            (int(snapshot_id),),
+        ).fetchall()
+        for row in rows:
+            rel = _parse_relation({c: row[c] for c in _RELATION_COLUMNS})
+            src_key = rel["src_key"] or row["src_stable"] or ""
+            dst_key = rel["dst_key"] or (row["dst_stable"] or "")
+            key = f"{src_key}|{dst_key}|{rel['kind']}"
+            out[key] = _dumps({
+                k: rel.get(k) for k in (
+                    "resolved", "tier", "provenance", "confidence", "derived_from",
+                    "attrs", "epistemic_state", "analysis_depth", "completeness",
+                    "provider",
+                )
+            })
+        return out
+
+    def _fact_map(self, snapshot_id):
+        conn = self._require_conn()
+        out = {}
+        for row in conn.execute(
+            """SELECT * FROM fact WHERE snapshot_id=? ORDER BY id""", (int(snapshot_id),)
+        ).fetchall():
+            item = _parse_common({k: row[k] for k in row.keys()})
+            key = f"{item['subject']}|{item['predicate']}|{item['object']}"
+            out[key] = _dumps({
+                k: item.get(k) for k in (
+                    "tier", "provenance", "confidence", "derived_from", "uncertainty",
+                    "epistemic_state", "analysis_depth", "completeness", "provider",
+                    "provider_revision", "stable_subject",
+                )
+            })
+        return out
+
+    def _unresolved_map(self, snapshot_id):
+        conn = self._require_conn()
+        out = {}
+        for row in conn.execute(
+            "SELECT * FROM unresolved_edge WHERE snapshot_id=? ORDER BY id", (int(snapshot_id),)
+        ).fetchall():
+            key = f"{row['src_key']}|{row['dst_raw']}|{row['kind']}"
+            out[key] = _dumps({
+                "candidates": _loads(row["candidates"], []),
+                "confidence": row["confidence"],
+                "completeness": row["completeness"],
+                "provider": row["provider"],
+            })
+        return out
+
+    @staticmethod
+    def _diff_maps(old_map, new_map):
+        added = sorted(set(new_map) - set(old_map))
+        removed = sorted(set(old_map) - set(new_map))
+        changed = sorted(k for k in set(old_map) & set(new_map) if old_map[k] != new_map[k])
+        return added, removed, changed
+
+    def diff_snapshots(self, old_id, new_id) -> dict:
+        """Structural delta between two snapshots (no mutation of either)."""
+        old = self._snapshot_row(old_id)
+        new = self._snapshot_row(new_id)
+        e_add, e_rm, e_ch = self._diff_maps(self._entity_map(old["id"]), self._entity_map(new["id"]))
+        r_add, r_rm, r_ch = self._diff_maps(self._relation_map(old["id"]), self._relation_map(new["id"]))
+        f_add, f_rm, f_ch = self._diff_maps(self._fact_map(old["id"]), self._fact_map(new["id"]))
+        u_add, u_rm, u_ch = self._diff_maps(self._unresolved_map(old["id"]), self._unresolved_map(new["id"]))
+
+        old_comp = self.completeness(old["id"])["families"]
+        new_comp = self.completeness(new["id"])["families"]
+        delta = {}
+        for fam in sorted(set(old_comp) | set(new_comp)):
+            o = old_comp.get(fam)
+            n = new_comp.get(fam)
+            delta[fam] = {"old": o, "new": n, "changed": o != n}
+
+        def _unpack(keys):
+            out = []
+            for key in keys:
+                parts = key.split("|")
+                if len(parts) == 3:
+                    out.append({"src": parts[0], "dst": parts[1], "kind": parts[2]})
+                else:
+                    out.append({"key": key})
+            return out
+
+        return {
+            "old_snapshot_id": int(old["id"]),
+            "new_snapshot_id": int(new["id"]),
+            "old_revision_digest": old["revision_digest"],
+            "new_revision_digest": new["revision_digest"],
+            "added": e_add,
+            "removed": e_rm,
+            "changed": e_ch,
+            "relations_added": _unpack(r_add),
+            "relations_removed": _unpack(r_rm),
+            "relations_changed": _unpack(r_ch),
+            "facts_added": f_add,
+            "facts_removed": f_rm,
+            "facts_changed": f_ch,
+            "unresolved_added": _unpack(u_add),
+            "unresolved_removed": _unpack(u_rm),
+            "unresolved_changed": _unpack(u_ch),
+            "completeness_delta": delta,
+        }
+
+    # ------------------------------------------------------------ integrity
+
+    def integrity_report(self, snapshot_id) -> dict:
+        """Structural checks: no orphans, same-snapshot FKs, unresolved accounting."""
+        conn = self._require_conn()
+        snap = int(snapshot_id)
+        orphan_src = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM relation r LEFT JOIN entity s "
+            "ON s.id=r.src_id AND s.snapshot_id=r.snapshot_id "
+            "WHERE r.snapshot_id=? AND s.id IS NULL", (snap,)
+        ).fetchone()["n"])
+        orphan_dst = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM relation r LEFT JOIN entity d "
+            "ON d.id=r.dst_id AND d.snapshot_id=r.snapshot_id "
+            "WHERE r.snapshot_id=? AND r.dst_id IS NOT NULL AND d.id IS NULL", (snap,)
+        ).fetchone()["n"])
+        unresolved_rows = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM relation WHERE snapshot_id=? AND dst_id IS NULL", (snap,)
+        ).fetchone()["n"])
+        unaccounted = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM relation r WHERE r.snapshot_id=? AND r.dst_id IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM unresolved_edge u WHERE u.snapshot_id=r.snapshot_id "
+            "AND u.src_key=r.src_key AND u.dst_raw=r.dst_key AND u.kind=r.kind)", (snap,)
+        ).fetchone()["n"])
+        report = {
+            "snapshot_id": snap,
+            "orphan_src_relations": orphan_src,
+            "orphan_dst_relations": orphan_dst,
+            "unresolved_relation_rows": unresolved_rows,
+            "unaccounted_unresolved_relations": unaccounted,
+            "ok": orphan_src == 0 and orphan_dst == 0 and unaccounted == 0,
+        }
+        if not report["ok"]:
+            raise SnapshotError(f"integrity check failed for snapshot {snap}: {report}")
+        return report
 
     # ------------------------------------------------------------------ stats
 
     def stats(self, snapshot_id=None):
         conn = self._require_conn()
-        snap = snapshot_id if snapshot_id is not None else self._snapshot_id
-
-        def where(alias=""):
-            return (" WHERE " + alias + "snapshot_id=?") if snap is not None else ""
-
-        def args():
-            return (int(snap),) if snap is not None else ()
+        row = self._resolve_read_snapshot(snapshot_id)
+        snap = int(row["id"])
 
         def count(table, extra=""):
-            if snap is None:
-                sql = f"SELECT COUNT(*) AS n FROM {table}"
-                if extra:
-                    sql += " WHERE 1=1" + extra
-                return int(conn.execute(sql).fetchone()["n"])
             return int(conn.execute(
-                f"SELECT COUNT(*) AS n FROM {table} WHERE snapshot_id=?{extra}", (int(snap),)
+                f"SELECT COUNT(*) AS n FROM {table} WHERE snapshot_id=?{extra}", (snap,)
             ).fetchone()["n"])
 
         by_kind = {}
-        for row in conn.execute(
-            f"SELECT kind, COUNT(*) AS n FROM entity{where()} GROUP BY kind ORDER BY kind", args()
+        for r in conn.execute(
+            "SELECT kind, COUNT(*) AS n FROM entity WHERE snapshot_id=? GROUP BY kind ORDER BY kind",
+            (snap,),
         ).fetchall():
-            by_kind[row["kind"]] = int(row["n"])
+            by_kind[r["kind"]] = int(r["n"])
         relations_by_kind = {}
-        for row in conn.execute(
-            f"SELECT kind, COUNT(*) AS n FROM relation{where()} GROUP BY kind ORDER BY kind", args()
+        for r in conn.execute(
+            "SELECT kind, COUNT(*) AS n FROM relation WHERE snapshot_id=? GROUP BY kind ORDER BY kind",
+            (snap,),
         ).fetchall():
-            relations_by_kind[row["kind"]] = int(row["n"])
-        version_row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
+            relations_by_kind[r["kind"]] = int(r["n"])
+        relations_resolved = count("relation", " AND dst_id IS NOT NULL")
+        relations_unresolved = count("relation", " AND dst_id IS NULL")
         return {
-            "schema_version": int(version_row["v"]) if version_row and version_row["v"] is not None else SCHEMA_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "snapshot_id": snap,
+            "revision_digest": row["revision_digest"],
+            "state": row["state"],
             "snapshots": int(conn.execute("SELECT COUNT(*) AS n FROM snapshot").fetchone()["n"]),
             "entities_by_kind": by_kind,
             "relations_by_kind": relations_by_kind,
+            "relations_resolved": relations_resolved,
+            "relations_unresolved": relations_unresolved,
             "facts": count("fact"),
             "invariants": count("invariant"),
             "contracts": count("contract"),
             "incidents": count("incident"),
             "changes": count("change"),
+            "unresolved_edges": count("unresolved_edge"),
+            "support": count("support"),
+            "evidence": count("evidence"),
+            "providers": count("provider_record"),
             "stale_entities": count("entity", " AND stale=1"),
             "stale_relations": count("relation", " AND stale=1"),
         }
@@ -937,31 +1666,53 @@ class Graph:
     # --------------------------------------------------------------- export
 
     def export_json(self, snapshot_id=None):
-        conn = self._require_conn()
-        snap = snapshot_id if snapshot_id is not None else self._snapshot_id
+        """Export exactly ONE snapshot (latest finalized by default).
 
-        def query(sql, parse=None, bind=True):
-            params = (int(snap),) if (bind and snap is not None) else ()
-            rows = conn.execute(sql, params).fetchall()
+        Never unions rows across snapshots (P0-1); raises SnapshotError when
+        no finalized snapshot exists.
+        """
+        conn = self._require_conn()
+        row = self._resolve_read_snapshot(snapshot_id)
+        snap = int(row["id"])
+
+        def query(table, parse=None):
+            rows = conn.execute(
+                f"SELECT * FROM {table} WHERE snapshot_id=? ORDER BY id", (snap,)
+            ).fetchall()
             out = []
-            for row in rows:
-                item = {k: row[k] for k in row.keys()}
+            for r in rows:
+                item = {k: r[k] for k in r.keys()}
                 if parse is not None:
                     item = parse(item)
                 out.append(item)
             return out
 
-        suffix = " WHERE snapshot_id=?" if snap is not None else ""
-        version_row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
+        def _parse_unresolved(item):
+            item = dict(item)
+            item["candidates"] = _loads(item.get("candidates"), [])
+            item["evidence"] = _loads(item.get("evidence"), [])
+            return item
+
+        def _parse_provider(item):
+            item = dict(item)
+            item["capabilities"] = _loads(item.get("capabilities"), {})
+            item["invoked"] = bool(item.get("invoked", 1))
+            return item
+
+        snapshot_meta = dict(row)
         return {
-            "schema_version": int(version_row["v"]) if version_row and version_row["v"] is not None else SCHEMA_VERSION,
-            "snapshots": query("SELECT * FROM snapshot ORDER BY id", bind=False),
-            "entities": query(f"SELECT * FROM entity{suffix} ORDER BY id", _parse_entity),
-            "relations": query(f"SELECT * FROM relation{suffix} ORDER BY id", _parse_relation),
-            "facts": query(f"SELECT * FROM fact{suffix} ORDER BY id", _parse_common),
-            "invariants": query(f"SELECT * FROM invariant{suffix} ORDER BY id", _parse_common),
-            "contracts": query(f"SELECT * FROM contract{suffix} ORDER BY id", _parse_common),
-            "incidents": query(f"SELECT * FROM incident{suffix} ORDER BY id", _parse_common),
-            "changes": query(f"SELECT * FROM change{suffix} ORDER BY id",
-                             lambda d: _parse_common(d, list_fields=("derived_from", "files"))),
+            "schema_version": SCHEMA_VERSION,
+            "snapshot": snapshot_meta,
+            "snapshots": [snapshot_meta],
+            "entities": query("entity", _parse_entity),
+            "relations": query("relation", _parse_relation),
+            "facts": query("fact", _parse_common),
+            "invariants": query("invariant", _parse_common),
+            "contracts": query("contract", _parse_common),
+            "incidents": query("incident", _parse_common),
+            "changes": query("change", lambda d: _parse_common(d, list_fields=("derived_from", "files"))),
+            "unresolved_edges": query("unresolved_edge", _parse_unresolved),
+            "support": query("support", _parse_common,),
+            "evidence": query("evidence", lambda d: _parse_common(d, list_fields=("derived_from",), dict_fields=("attrs",))),
+            "provider_records": query("provider_record", _parse_provider),
         }
