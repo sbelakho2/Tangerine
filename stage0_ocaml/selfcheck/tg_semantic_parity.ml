@@ -297,15 +297,20 @@ end
         Some
           "pending Vec constructor inference needs Vec::new(), which the standalone seed closure does not resolve (no std prelude); the kernel builtin channel accepts it";
     };
-    (* imported/aliased defaults: NOT expressible with the current
-       single-file harness — documented as a global NOT-COMPARABLE
-       imported_aliased_defaults row at the end.  A `use a::{X}` case is
-       deliberately NOT put in the kernel battery: it makes the in-VM
-       kernel resolver trap inside its own Option::expect path before any
-       checker verdict (observed: host call __intrinsic_option_expect:
-       Option::expect: module not found in add_item_to_symbols), and the
-       standalone seed closure has no multi-module import graph.  No case
-       is faked for the dimension. *)
+    (* imported/aliased defaults: not expressible with THIS single-file
+       harness (a multi-module import graph needs separate file modules /
+       an inline-module closure the corpus format does not assemble) —
+       documented as a global NOT-COMPARABLE imported_aliased_defaults
+       row at the end.  The former blocker (the in-VM kernel resolver
+       trapping inside its own Option::expect path) is FIXED: a missing
+       inline-module chain and an unknown import now record ordinary
+       resolver diagnostics (resolver.tg add_item_to_symbols /
+       resolve_import_path), and tg_resolution_parity's microcorpus
+       carries a missing-module-import-diagnostic case.  The dimension is
+       verified END-TO-END (verdict + executed value + import identity)
+       by tg_kernel_runtime_parity's imported_aliased_default case over a
+       real multi-file closure (`use ...::{X}` AND `use ...::X as Y`,
+       seed VM value 77 vs kernel token gbconst:77). *)
     (* methods *)
     {
       label = "method_inherent";
@@ -1187,7 +1192,7 @@ let () =
   Printf.printf
     "NOT-COMPARABLE container_constructors: the standalone seed closure has no std prelude (Vec::new/Map::new/Set::new unresolved) while the kernel's builtin registrations accept them; container construction and the pending Vec/Map constructor-inference cases are excluded from the compared corpus\n";
   Printf.printf
-    "NOT-COMPARABLE imported_aliased_defaults: a `use a::{X}` default needs a multi-module import graph; in the single-file harness the in-VM kernel resolver traps inside its own Option::expect path (observed: host call __intrinsic_option_expect: Option::expect: module not found in add_item_to_symbols) before producing a checker verdict, and the standalone seed closure has no such graph — the dimension is documented, never faked\n";
+    "NOT-COMPARABLE imported_aliased_defaults: a `use a::{X}` default needs a multi-module import graph this single-file corpus cannot assemble; the former kernel resolver Option::expect trap is FIXED (missing modules/imports are ordinary resolver diagnostics — see tg_resolution_parity's missing-module-import-diagnostic case), and the dimension is verified end-to-end by tg_kernel_runtime_parity's imported_aliased_default case (`use ...::{X}` + `use ...::X as Y`, seed value 77 vs kernel token gbconst:77)\n";
   Printf.printf
     "NOT-COMPARABLE reject_diagnostic_text: the two checkers' full message texts are not identical; the coarse class comparison above is applied where both sides produce a recognized class\n";
 

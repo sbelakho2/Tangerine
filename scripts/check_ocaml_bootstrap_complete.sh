@@ -26,6 +26,22 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Final authorization binds to a FROZEN, CLEAN tree: the calibration
+# identity (RUN_SHA / SEED_SHA256) names the tested SHA, so a dirty
+# worktree can never be authorization material.  This check is
+# independent of prebootstrap_quick.sh --final (which refuses
+# --allow-dirty): neither path can authorize an unreproducible tree.
+if ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "check_ocaml_bootstrap_complete: FAIL — not a git worktree; final authorization requires a clean, identified tree" >&2
+  exit 1
+fi
+DIRTY="$(git -C "$ROOT" status --porcelain=v1 2>/dev/null)"
+if [ -n "$DIRTY" ]; then
+  echo "check_ocaml_bootstrap_complete: FAIL — dirty worktree; final authorization requires a frozen clean tree (the calibration identity binds to the tested SHA)" >&2
+  printf '%s\n' "$DIRTY" | head -20 >&2
+  exit 1
+fi
+
 # The shared bootstrap validation library: the timeout facility is the single
 # authority (GNU timeout / Homebrew gtimeout).  Authorization mode REJECTS
 # the TG_TIMEOUT_CMD ambient override: final evidence must use the verified

@@ -54,6 +54,18 @@ type typed_signature = {
   ts_param_names : string array;
   ts_return : Type_repr.t;
   ts_where : (Type_repr.t * (string * Type_repr.t array) list) list;
+  (* the impl's COPY bounds (the ownership authority): the Copy-only
+     subset of the impl's declared type-parameter bounds, resolved in the
+     impl's parameter scope.  A method registered from
+     `impl[T: Copy] Array[T]` is applicable to a receiver ONLY when the
+     receiver's element satisfies Copy — a Vec[String].slice() /
+     Map[String, Owning].entries() call must not resolve the candidate.
+     Unlike ts_where (whose predicate list keeps the historical
+     name-keyed acceptance for algorithmic bounds), this gate is a hard
+     applicability filter; on failure the lookup falls through to the
+     builtin method surface (get/keys/values keep their historical
+     surfaces), and only then rejects with the bound diagnostic. *)
+  ts_copy_gate : (Type_repr.t * (string * Type_repr.t array) list) list;
   (* re-audit (the anonymous-signature-binder class): the declared
      binders minted for the signature's anonymous `_` / `impl Trait`
      slots, with the trait bounds the impl-trait slots declared — the
@@ -390,6 +402,16 @@ type state = {
      registry (the same query-sig channel as the compiler-builtin
      methods and the type queries). *)
   mutable derived_sigs : (Ids.Callable_id.t * typed_signature) list;
+  (* the compiler-registered builtin method surface, retained from
+     initial_env INDEPENDENT of env.methods: source impls registered at
+     the same (owner, method) key REPLACE the builtin entry there, and
+     the Copy gate's fallback (a registered impl whose `T: Copy` bound
+     the receiver cannot discharge) must still reach the builtin
+     signature the compilation has always answered with (Map::get on an
+     owning value — the kernel's builtin Map surface).  The retained
+     table is exactly the builtin_methods result, keyed by
+     (owner, method). *)
+  mutable builtin_method_sigs : ((string * string) * typed_signature) list;
   mutable o_handoff_fallback : int;
   (* once-only declaration identities: the first allocation of an item's
      generic-parameter ids is recorded and reused by every later
@@ -1536,6 +1558,7 @@ let mk_sig (st : state) ~(name : string) ~(params_decl : (string * Ids.Generic_p
     ts_param_names = Array.of_list (List.map (fun (n, _, _) -> n) params);
     ts_return = ret;
     ts_where = where;
+    ts_copy_gate = [];
     ts_anon_bounds = [];
     ts_callable = fresh_callable_id st;
     ts_span = Span.synthetic;
@@ -2143,6 +2166,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None)
       const_fns = Hashtbl.create 64;
       query_sigs = [];
       derived_sigs = [];
+      builtin_method_sigs = [];
       o_handoff_fallback = 0;
       sig_param_ids = Hashtbl.create 256;
       anon_sig_ids = Hashtbl.create 64;
@@ -2583,6 +2607,8 @@ let initial_env ?(resolved : Resolver.resolved_program option = None)
       nom_defaults = []
     }
   in
+  let builtin_method_sigs = builtin_methods st vec_p opt_p res_p res_e_p map_k_p map_v_p set_p in
+  st.builtin_method_sigs <- builtin_method_sigs;
   {
     types;
     type_ids;
@@ -2603,7 +2629,7 @@ let initial_env ?(resolved : Resolver.resolved_program option = None)
               let key = (owner, mname) in
               (key, sig_) :: List.remove_assoc key m
           | _ -> m)
-        (builtin_methods st vec_p opt_p res_p res_e_p map_k_p map_v_p set_p)
+        builtin_method_sigs
         ptr_builtins;
     impls;
     current_self = None;
@@ -3390,6 +3416,7 @@ let resolve_signature (env : env) (scope : scope) (sig_ : Ast.function_sig)
         Array.of_list (List.map (fun (p : Ast.param) -> p.Ast.p_name) sig_.Ast.sig_params);
       ts_return = ret;
       ts_where = where;
+      ts_copy_gate = [];
       ts_anon_bounds = List.rev !anon_bounds;
       ts_callable = fresh_callable_id env.state;
       ts_span = sig_.Ast.sig_span;
@@ -4073,6 +4100,89 @@ let derived_clone_obligations (env : env) (ty : Type_repr.t) :
            (List.map
               (fun pid -> (Type_repr.Type_param pid, [ ("Clone", [||]) ]))
               !needed))
+
+(* ── the method-selection COPY authority ─────────────────────────────
+   The impl's declared Copy bounds (ts_copy_gate, attached by
+   register_impl) are a hard APPLICABILITY gate on the registered
+   method: try_owners must not select a method whose `impl[T: Copy]`
+   bound the receiver's element cannot discharge.  The probe binds the
+   signature's self parameter against the receiver with a THROWAWAY
+   substitution (never the caller's journal) and solves the Copy
+   obligations in the current generic context (env.impls.param_bounds) —
+   a `Renderer[T]`/Vec[T] receiver inside a `[T: Copy]` caller proves
+   Copy(T); an unconstrained T proves nothing. *)
+let copy_gate_holds (env : env) (ts : typed_signature) (receiver_ty : Type_repr.t) : bool =
+  (* an element type that is not YET decided (an inference variable or a
+     not-yet-solved literal) must not block the candidate: the gate
+     decides only what the receiver's type already says — deferring
+     matches the unify-failure branch below *)
+  let rec undecided (ty : Type_repr.t) : bool =
+    match ty with
+    | Type_repr.Infer_var _ | Type_repr.Int_literal _ -> true
+    | Type_repr.Named (_, args) -> Array.exists undecided args
+    | Type_repr.Tuple elems -> Array.exists undecided elems
+    | Type_repr.Fixed_array (t, _) -> undecided t
+    | Type_repr.Ref_internal (_, t) | Type_repr.Raw_ptr (_, t) -> undecided t
+    | Type_repr.Function (ps, r) ->
+        Array.exists (fun (p : Type_repr.param_type) -> undecided p.Type_repr.pt_type) ps
+        || undecided r
+    | _ -> false
+  in
+  match ts.ts_copy_gate with
+  | [] -> true
+  | gate -> (
+      if Array.length ts.ts_params = 0 then false
+      else
+        match
+          Trait_solver.unify_target [] ts.ts_params.(0).Type_repr.pt_type receiver_ty
+        with
+        | None ->
+            (* the receiver does not unify with this candidate's self: not
+               this gate's business — the selection path reports the
+               receiver mismatch *)
+            true
+        | Some subst ->
+            List.for_all
+              (fun (wt, bs) ->
+                let wt' = Type_repr.substitute subst wt in
+                undecided wt'
+                || List.for_all
+                     (fun (b, bargs) ->
+                       if b <> "Copy" then true
+                       else
+                         match
+                           Trait_solver.solve env.impls
+                             {
+                               Trait_solver.trait_name = b;
+                               self_ty = wt';
+                               type_args = bargs;
+                             }
+                         with
+                         | Ok _ -> true
+                      | Error _ -> false)
+                  bs)
+              gate)
+
+(* The compiler-registered builtin method for (owner alias, name): the
+   fallback surface a Copy-gate-blocked registered impl falls through to
+   (the kernel's builtin Map/Vec/smart-pointer surface — Map::get on an
+   owning value, the raw pointer methods).  None when the surface never
+   registered such a method: the Copy-gated slice/extend/entries are NOT
+   builtin and must be rejected. *)
+let builtin_method_for (env : env) (owners : string list) (mname : string) :
+    (string * typed_signature) option =
+  let rec go = function
+    | [] -> None
+    | o :: rest -> (
+        match
+          List.find_opt
+            (fun ((o', m'), _) -> o' = o && m' = mname)
+            env.state.builtin_method_sigs
+        with
+        | Some ((o', _), ts) -> Some (o', ts)
+        | None -> go rest)
+  in
+  go owners
 
 let rec check_pattern (env : env) (scope : scope) (ty : Type_repr.t) (p : Ast.pattern) :
     (Typed_pattern.t * (string * Type_repr.t * bool) list, string) result =
@@ -5847,6 +5957,25 @@ and add_binds (scope : scope) (binds : (string * Type_repr.t * bool) list) : sco
 
 and check_block (env : env) (scope : scope) (expected : Type_repr.t option) (b : Ast.block_body)
     (_span : Span.span) : (flow_result, string) result =
+  (* re-audit P0 (the observable-tail join): a block tail carries an
+     OBSERVABLE value exactly when the enclosing context expects a
+     non-Unit type.  The tail's join must then be STRICT — every
+     reachable normal exit (a value-carrying arm of type T, a
+     no-value-carrying Unit arm, and the divergent None-flow) has to
+     agree with the declared type; a Unit arm may never silently drop
+     out of the join.  Only when nothing observes the tail value
+     (expected None, or expected Unit) is the DISCARDED use correct:
+     statement-position match/if arms may then diverge over Unit and the
+     non-Unit arm type is dropped. *)
+  let tail_use =
+    match expected with
+    | Some t
+      when not
+             (t = Type_repr.Unit
+              || match t with Type_repr.Tuple a -> Array.length a = 0 | _ -> false) ->
+        Value
+    | _ -> Discarded
+  in
   let rec go_stmts (scope : scope) (acc : flow_result) = function
     | [] -> (
         (* the tail: when a prior statement made the normal continuation
@@ -5864,16 +5993,17 @@ and check_block (env : env) (scope : scope) (expected : Type_repr.t option) (b :
                 fr_may_continue = acc.fr_may_continue;
               }
         | Some e -> (
-            (* re-audit P0 fix (the A-family tail root): the block tail
-               is checked with the DISCARDED use — a function body whose
-               last form is a statement-position match/if (`match ...
-               when Some(x) then side_effect() when None then () end`)
-               must get the statement-position arm reconcile (Unit
-               divergence allowed), not a value-context "expected
-               Option, found ()".  The tail still contributes its
-               te_type to the block's normal when it has one; the
-               Discarded use only relaxes the branch reconciliation. *)
-            match check_expr_use env scope Discarded expected e with
+            (* re-audit P0 fix (the A-family tail root): a non-observable
+               tail (expected None/Unit) is checked with the DISCARDED use —
+               a function body whose last form is a statement-position
+               match/if (`match ... when Some(x) then side_effect() when
+               None then () end`) must get the statement-position arm
+               reconcile (Unit divergence allowed), not a value-context
+               "expected Option, found ()".  An OBSERVABLE tail (expected
+               non-Unit) is checked with the VALUE use: its join is the
+               function's return value, so a Unit normal exit is a type
+               error (the discarded-tail P0). *)
+            match check_expr_use env scope tail_use expected e with
             | Ok te ->
                 (* re-audit P0 (tail-position divergence): the tail's
                    OWN flow is consumed — a `return`/diverging tail
@@ -8175,11 +8305,21 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
         t :: List.filter (fun o -> o <> t) base_owners
     | _ -> base_owners
   in
+  let blocked_copy : (string * typed_signature) option ref = ref None in
   let rec try_owners = function
     | [] -> None
     | o :: rest -> (
         match method_of_key env o mname with
-        | Some sig_ -> Some (o, sig_)
+        | Some sig_ ->
+            if copy_gate_holds env sig_ owner_ty then Some (o, sig_)
+            else begin
+              (* the registered impl's Copy authority rejects this
+                 receiver: not an applicable method.  Remember the FIRST
+                 blocked candidate for the bound diagnostic and keep
+                 searching the remaining owners. *)
+              if !blocked_copy = None then blocked_copy := Some (o, sig_);
+              try_owners rest
+            end
         | None -> try_owners rest)
   in
   (* the nominal owner name (used by receiver unification below) *)
@@ -8307,22 +8447,36 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
   let resolved_owner, resolved_sig =
     match try_owners candidate_owners with
     | Some (o, s) -> (Some o, Some s)
-    | None ->
-        let found = ref None in
-        let try_mint (m : typed_signature option) : unit =
-          if !found = None then
-            match m with
-            | Some s -> found := Some s
-            | None -> ()
-        in
-        try_mint (derived_clone ());
-        (match !clone_obligation_error with
-         | Some _ -> ()
-         | None ->
-             try_mint (derived_eq ());
-             try_mint (derived_to_string ());
-             try_mint (derived_scalar_hash ()));
-        (None, !found)
+    | None -> (
+        (* the Copy-gate fallback: a registered impl whose Copy authority
+           rejects the receiver falls through to the compiler-registered
+           BUILTIN method surface (Map::get on an owning value keeps the
+           builtin Option[V] answer, exactly like the kernel's builtin Map
+           arm).  The surface never carries a Copy bound of its own. *)
+        match builtin_method_for env candidate_owners mname with
+        | Some (o, s) ->
+            (* the builtin surface is the historical name-keyed answer: its
+               own algorithmic bounds (Map::get's K: Hash + Eq) are the
+               kernel builtin arm's semantics, not a call-site contract —
+               the registered impl's ts_where (explicit where clauses)
+               already enforced what the source declaration promised *)
+            (Some o, Some { s with ts_where = [] })
+        | None ->
+            let found = ref None in
+            let try_mint (m : typed_signature option) : unit =
+              if !found = None then
+                match m with
+                | Some s -> found := Some s
+                | None -> ()
+            in
+            try_mint (derived_clone ());
+            (match !clone_obligation_error with
+             | Some _ -> ()
+             | None ->
+                 try_mint (derived_eq ());
+                 try_mint (derived_to_string ());
+                 try_mint (derived_scalar_hash ()));
+            (None, !found))
   in
   match resolved_sig with
   | None -> (
@@ -8333,6 +8487,32 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
       | Some m ->
           env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
           Error (err span m)
+      | None -> (
+      (* the COPY authority's diagnostic: every candidate was blocked by
+         the impl's declared Copy bound and no builtin surface answers the
+         name — report the unsatisfied bound anchored at the call span. *)
+      match !blocked_copy with
+      | Some (_, ts) -> (
+          env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
+          let subst =
+            match
+              Trait_solver.unify_target [] ts.ts_params.(0).Type_repr.pt_type owner_ty
+            with
+            | Some s -> s
+            | None -> []
+          in
+          let wps =
+            List.map
+              (fun (wt, bs) -> (Type_repr.substitute subst wt, bs))
+              ts.ts_copy_gate
+          in
+          match check_where_obligations env span ("method `" ^ mname ^ "`") wps with
+          | Ok () ->
+              Error
+                (err span
+                   (Printf.sprintf "type %s has no method `%s`"
+                      (type_to_string owner_ty) mname))
+          | Error m -> Error m)
       | None -> (
       (* a field of function type called on the receiver: `self.func(x)`
          where the struct's field `func` is itself a function value *)
@@ -8385,7 +8565,7 @@ and check_method_call (env : env) (scope : scope) (expected : Type_repr.t option
           env.state.oracle.o_unresolved_calls <- env.state.oracle.o_unresolved_calls + 1;
           Error
             (err span
-               (Printf.sprintf "type %s has no method `%s`" (type_to_string owner_ty) mname))))
+               (Printf.sprintf "type %s has no method `%s`" (type_to_string owner_ty) mname)))))
       | Some sig_ -> (
           if Array.length sig_.ts_params = 0 then
             Error (err span "internal: method signature without a receiver")
@@ -9497,7 +9677,7 @@ and resolve_where (env : env) (scope : scope) (wps : Ast.where_predicate list) :
   in
   go [] wps
 
-and register_methods ?(mp : string list = []) (env : env) (owner : string)
+and register_methods ?(mp : string list = []) ?(copy_gates = []) (env : env) (owner : string)
     (methods : Ast.function_decl list)
     (extra_params : (string * Ids.Generic_param_id.t) list)
     (where_extra : (Type_repr.t * (string * Type_repr.t array) list) list)
@@ -9592,7 +9772,11 @@ and register_methods ?(mp : string list = []) (env : env) (owner : string)
                           sig_)
                   | None -> sig_
                 in
-                let sig_ = { sig_ with ts_where = where_extra @ sig_.ts_where } in
+                let sig_ =
+                  { sig_ with
+                    ts_where = where_extra @ sig_.ts_where;
+                    ts_copy_gate = copy_gates }
+                in
                 let key = (owner, sig_.ts_name) in
                 let key_q = (okey, sig_.ts_name) in
                 (* idempotent registration (audit Fix 3): re-registration
@@ -9693,6 +9877,9 @@ and register_impl ?(mp : string list = []) (env : env) (d : Ast.impl_decl) : (en
     in
     go [] d.i_associated_types
   in
+  let tp_bounds =
+    List.map (fun (tp : Ast.type_param) -> (tp.tp_name, tp.tp_bounds)) d.i_type_params
+  in
   let from_tp =
     List.concat_map
       (fun (tp : Ast.type_param) ->
@@ -9705,6 +9892,23 @@ and register_impl ?(mp : string list = []) (env : env) (d : Ast.impl_decl) : (en
             })
           tp.tp_bounds)
       d.i_type_params
+  in
+  (* the impl's declared COPY bounds are a hard applicability gate on
+     every method it registers: try_owners must not select a method whose
+     `impl[T: Copy]` bound the receiver's element cannot discharge — a
+     Vec[String].slice() / Map[String, Owning].entries() call must not
+     resolve the Copy-gated candidate.  The Copy-only subset is resolved
+     in the impl's parameter scope and attached as ts_copy_gate (the
+     algorithmic bounds keep the checked program's historical name-keyed
+     acceptance, exactly like the kernel's impl-bound fallback). *)
+  let copy_gates =
+    solver_param_bounds env' scope impl_params tp_bounds impl_where
+    |> List.filter_map (fun (pid, bs) ->
+           let copy_bs =
+             List.filter (fun (b, _) -> b = "Copy") bs
+           in
+           if copy_bs = [] then None
+           else Some (Type_repr.Type_param pid, copy_bs))
   in
   let from_where =
     List.concat_map
@@ -9764,7 +9968,8 @@ and register_impl ?(mp : string list = []) (env : env) (d : Ast.impl_decl) : (en
                 (err d.i_span
                    (Printf.sprintf "impl of trait `%s` declares methods not in the trait contract" t))))
   in
-  register_methods ~mp env2 d.i_target_type d.i_methods impl_params impl_where
+  register_methods ~mp ~copy_gates env2 d.i_target_type d.i_methods impl_params
+    impl_where
 
 and register_item (env : env) (item : Ast.item) : (env, string) result =
   match item.Ast.kind with
@@ -10195,6 +10400,11 @@ let run_oracle (env : env) (_item_name : string) : string list =
     @ List.map (fun (_, s) -> s.ts_callable) env.constructors
     @ List.map (fun (_, s) -> s.ts_callable) st.query_sigs
     @ List.map (fun (_, s, _) -> s.ts_callable) st.nested_functions
+    (* the retained builtin method surface: a Copy-gate fallback call
+       (Map::get on an owning value) records the builtin signature's
+       callable identity, which is a known compiler registration even
+       when the source impl replaced it in env.methods *)
+    @ List.map (fun (_, s) -> s.ts_callable) st.builtin_method_sigs
   in
   let is_known c =
     List.exists (fun k -> Ids.Callable_id.compare k c = 0) known_callables
@@ -10467,6 +10677,12 @@ let finalize_inference (env : env) : env =
                 ( chase_assert ctx ty,
                   List.map (fun (n, args) -> (n, Array.map (chase_assert ctx) args)) bounds ))
               ts.ts_where;
+          ts_copy_gate =
+            List.map
+              (fun (ty, bounds) ->
+                ( chase_assert ctx ty,
+                  List.map (fun (n, args) -> (n, Array.map (chase_assert ctx) args)) bounds ))
+              ts.ts_copy_gate;
           ts_anon_bounds =
             List.map
               (fun (pid, bounds) ->
@@ -10906,6 +11122,22 @@ let verify_typed_channel_completeness (env : env) (program : Ast.program) :
               check_fn_body m.Ast.fn_body
             end)
           d.Ast.i_methods
+    | Ast.TraitDef d ->
+        (* audit P0 trait-default coverage: the seed type-checks trait
+           default bodies (check_trait runs check_function_body for each
+           method with a body), so the completeness gate must assert the
+           SAME typed-HIR contract for them — an expr/effect/call record
+           missing inside a trait default would otherwise reach the
+           access/resource analysis silently.  The checked_fn_spans gate
+           keeps only successfully checked bodies (a body whose check
+           failed never lowers and cannot satisfy the channel). *)
+        List.iter
+          (fun (m : Ast.function_decl) ->
+            if Hashtbl.mem env.state.checked_fn_spans (fn_decl_key m.Ast.fn_span) then begin
+              item_label := d.Ast.t_name ^ "::" ^ m.Ast.fn_sig.Ast.sig_name;
+              check_fn_body m.Ast.fn_body
+            end)
+          d.Ast.t_methods
     | Ast.ExternBlock ex -> List.iter check_item ex.Ast.ex_items
     | Ast.ModuleDef m -> (
         match m.Ast.m_items with Some items -> List.iter check_item items | None -> ())

@@ -18,6 +18,11 @@
 #            RUN_GC_POLICY / SEED_SHA256 / MANIFEST_SHA256
 #   reject:  mixed LOG_KIND (standalone vs aggregate)
 #   reject:  aggregate pair with RUN_OUTCOME=FAIL
+#   reject:  --apply with an incomplete proposal set (missing FINAL_STEPS
+#            or missing aggregate VM_A/VM_B observations) — even though
+#            the same evidence is accepted in dry-run mode
+#   accept:  --apply with a complete proposal set rewrites the pins of a
+#            TEMP gate copy only (the real gate is never touched)
 #
 # Every case runs the repinner in DRY-RUN mode (no files written) and
 # asserts the expected accept/reject exit status.  Prints one PASS/FAIL
@@ -257,6 +262,58 @@ set_kv "$TMP/warm_legacy" RUN_OUTCOME UNKNOWN
 set_kv "$TMP/warm_legacy" PROFILE_SCHEMA UNKNOWN
 set_kv "$TMP/warm_legacy" RUN_EXIT UNKNOWN
 run_case "legacy-style block without schema-2 evidence" reject "$TMP/cold" "$TMP/warm_legacy"
+
+# ── --apply atomicity: incomplete proposal sets are refused ──────────
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+run_apply_refuse_case() { # <label> <cold> <warm>
+  local label="$1" cold="$2" warm="$3" rc=0 out="$TMP/apply_out.txt"
+  local gatescript="$TMP/gate_copy.sh" before after
+  cp "$GATE" "$gatescript"
+  before="$(hash_file "$gatescript")"
+  python3 "$REPIN" --apply --gate-script "$gatescript" "$cold" "$warm" >"$out" 2>&1 || rc=$?
+  after="$(hash_file "$gatescript")"
+  if [ "$rc" -eq 0 ]; then
+    bad "${label}: expected refusal, got accept"
+  elif ! grep -q 'REFUSING --apply' "$out"; then
+    bad "${label}: refused without a REFUSING --apply reason"
+    sed -n '1,6p' "$out" >&2
+  elif [ "$before" != "$after" ]; then
+    bad "${label}: gate script was modified despite the refusal"
+  else
+    pass "${label}: refused, gate untouched"
+  fi
+}
+
+cp "$TMP/warm" "$TMP/warm_steps_missing"
+set_kv "$TMP/warm_steps_missing" FINAL_STEPS UNKNOWN
+run_apply_refuse_case "apply refuses missing steps proposal" "$TMP/cold" "$TMP/warm_steps_missing"
+
+cp "$TMP/awarm" "$TMP/awarm_vmb_missing"
+set_kv "$TMP/awarm_vmb_missing" VM_B_FINAL_STEPS UNKNOWN
+run_apply_refuse_case "apply refuses aggregate missing VM_B observation" "$TMP/acold" "$TMP/awarm_vmb_missing"
+
+# ── --apply happy path on a TEMP gate copy (never the real gate) ─────
+gate_copy="$TMP/gate_copy.sh"
+cp "$GATE" "$gate_copy"
+rc=0
+python3 "$REPIN" --apply --gate-script "$gate_copy" "$TMP/cold" "$TMP/warm" >"$TMP/apply_ok.txt" 2>&1 || rc=$?
+if [ "$rc" -ne 0 ]; then
+  bad "apply complete proposal set: expected accept, got rc=${rc}"
+  sed -n '1,6p' "$TMP/apply_ok.txt" >&2
+elif ! grep -q '^export TANGERINE_BOOTSTRAP_VM_MAX_STEPS=2300000$' "$gate_copy"; then
+  bad "apply complete proposal set: steps pin not rewritten"
+elif ! grep -q '^GATE_TIMEOUT_S=180$' "$gate_copy"; then
+  bad "apply complete proposal set: wall pin not rewritten"
+else
+  pass "apply complete proposal set: pins rewritten on the temp copy"
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "test_repin_evidence: FAIL"

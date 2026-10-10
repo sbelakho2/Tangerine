@@ -341,6 +341,30 @@ for _utv in F32 F64 StaticStrPtr; do
 done
 check_pin "snapshot structural-reject probe exists" stage0_ocaml/selfcheck/linkprobe.tg   'linkprobe_expect_snapshot_reject'
 
+# ── P0 Copy authority (impl bounds gate method selection) ────────────
+# The seed's method selection must carry the impl's declared Copy bounds
+# as an APPLICABILITY gate (ts_copy_gate), fall through to the retained
+# builtin surface for the historical name-keyed methods, and the kernel
+# must NOT answer slice/extend/entries from a builtin name match.
+# Correctness gates for those six verdicts: tg_copy_authority (seed +
+# kernel lanes), plus the KP full-oracle helper (no absence-style greens).
+check_pin "seed copy authority: applicability gate" stage0_ocaml/src/typecheck.ml   'copy_gate_holds'
+check_pin "seed copy authority: registered Copy bounds" stage0_ocaml/src/typecheck.ml   'ts_copy_gate'
+check_pin "seed copy authority: retained builtin surface" stage0_ocaml/src/typecheck.ml   'builtin_method_sigs'
+check_pin "kernel copy authority: battery exists" tg_compiler/infer_probe.tg   'COPY_AUTHORITY_BATTERY fails='
+check_pin "kernel copy authority: full positive oracle" tg_compiler/infer_probe.tg   'def infer_probe_full_oracle_check'
+check_pin "copy authority selfcheck is wired" scripts/prebootstrap_quick.sh   'tg_copy_authority'
+if grep -q 'infer_probe_kp_absent_leg' "$ROOT/tg_compiler/infer_probe.tg"; then
+  bad "contract pin: the absence-style KP acceptance oracle is back"
+else
+  pass "contract pin: no absence-style KP acceptance oracle"
+fi
+if grep -qE 'if method == "slice" then return Type::Adt|method == "entries" then' "$ROOT/tg_compiler/types.tg"; then
+  bad "contract pin: kernel builtin eligibility-by-spelling (slice/extend/entries) is back"
+else
+  pass "contract pin: kernel slice/extend/entries builtin arms removed"
+fi
+
 # ── P0 host-device capability authority ──────────────────────────────
 # /dev/* facilities are OPEN/STAT/LSTAT/READLINK capabilities only.
 # Every mutating resolver call site must use the non-dev default; a

@@ -74,6 +74,11 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+if [ "$MODE" = "final" ] && [ "$ALLOW_DIRTY" = "1" ]; then
+  echo "prebootstrap_quick: FAIL — --final --allow-dirty is illegal: final authorization requires a frozen, clean tree (the calibration identity binds to the tested SHA)" >&2
+  exit 2
+fi
+
 FAILURES=0
 CHECKS=0
 fail() {
@@ -111,6 +116,8 @@ readonly FAST_SELFCHECKS=(
   tg_type_props
   tg_identity_collision
   tg_hir_complete
+  tg_trait_default
+  tg_copy_authority
   tg_semantic_parity
   tg_kernel_runtime_parity
 )
@@ -297,14 +304,19 @@ for name in "${FAST_SELFCHECKS[@]}"; do
   [ "$FAILURES" -eq 0 ] || break
   CHECKS=$((CHECKS + 1))
   out="/tmp/prebootstrap_quick_${name}.out"
-  # tg_semantic_parity compiles + runs the REAL kernel closure in the seed
-  # VM (the same workload class as tg_infer, whose component-lane cap is
-  # 900 s in check_ocaml_seed_health.sh); the generic 420 s bound is too
-  # tight for it under load.
+  # Calibration (2026-10-10, measured standalone on this host, x1.5 rounded
+  # up to 60 s — the repo's cap convention):
+  #   tg_copy_authority          774 s -> 1200
+  #   tg_semantic_parity        1176 s -> 1800
+  #   tg_kernel_runtime_parity  1205 s -> 1860
+  # All three compile the REAL kernel closure in the seed VM; the generic
+  # 420 s bound cannot fit them, and the former 900 s bound failed under
+  # load even though each lane is green.
   check_timeout=420
   case "$name" in
-    tg_semantic_parity) check_timeout=900 ;;
-    tg_kernel_runtime_parity) check_timeout=900 ;;
+    tg_copy_authority) check_timeout=1200 ;;
+    tg_semantic_parity) check_timeout=1800 ;;
+    tg_kernel_runtime_parity) check_timeout=1860 ;;
   esac
   if ! (cd stage0_ocaml && bh_run_with_timeout "$check_timeout" "_build/default/selfcheck/${name}.exe") >"$out" 2>&1; then
     fail "selfcheck ${name} exited non-zero (see ${out})"

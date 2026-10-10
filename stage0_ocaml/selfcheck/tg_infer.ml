@@ -325,9 +325,28 @@ let () =
                shared-container resource extraction false positive plus
                its canary gates, the cross-module size_of type-query, the
                statement/block value-discard shape, and the
-               `case`-prefixed enum variants. *)
+               `case`-prefixed enum variants.
+               Every positive leg is the FULL oracle (parse + resolve +
+               errors=0 + typed-channel readiness + MIR lower + MIR
+               verify); no absence-style greens. *)
             fail
               "the kernel-parity battery failed (expected `KERNEL_PARITY_BATTERY fails=0`; see the report above)"
+          else if not (contains report "COPY_AUTHORITY_BATTERY fails=0") then
+            (* the P0 Copy-authority battery: Vec[String].slice/extend and
+               Map[String, Owning].entries rejected on the registered
+               `impl[... Copy ...]` bounds (no builtin name match grants
+               eligibility), and the Int variants accepted through the
+               full oracle. *)
+            fail
+              "the copy-authority battery failed (expected `COPY_AUTHORITY_BATTERY fails=0`; see the report above)"
+          else if not (contains report "TRAIT_DEFAULT_BATTERY fails=0") then
+            (* audit P0 trait-default coverage: a non-inert trait default
+               body must be rejected explicitly before access/resource
+               analysis (the bootstrap kernel never type-checks default
+               bodies); the inert dead-AST default and the explicit-impl
+               positive stay accepted. *)
+            fail
+              "the trait-default battery failed (expected `TRAIT_DEFAULT_BATTERY fails=0`; see the report above)"
           else if not (contains report "TOTALS errors=") then
             fail "the probe produced no TOTALS row"
           else if merged && not (contains report "IMPLCONF=0") then

@@ -605,6 +605,43 @@ def main(argv: list[str]) -> int:
     print(f"PROPOSED_WALL_TIMEOUT_S={proposals['wall_timeout_s'] if proposals['wall_timeout_s'] is not None else 'UNCHANGED'}")
     print("")
 
+    # --apply is atomic and total: it refuses unless EVERY budget used by
+    # aggregate authorization has a complete cold+warm proposal (an
+    # incomplete observation set can never silently rewrite a subset of
+    # pins).  For aggregate evidence the per-VM A/B observations are
+    # mandatory, not a fallback.
+    if opts["apply"]:
+        missing = [
+            key
+            for key in ("steps", "host_calls", "alloc_bytes", "rss_mib", "wall_timeout_s")
+            if proposals.get(key) is None
+        ]
+        if cold.get("LOG_KIND", "standalone") == "aggregate":
+            for name, m in (("cold", cold), ("warm", warm)):
+                for key in (
+                    "VM_A_FINAL_STEPS",
+                    "VM_B_FINAL_STEPS",
+                    "VM_A_HOST_CALLS",
+                    "VM_B_HOST_CALLS",
+                    "VM_A_ALLOC_BYTES",
+                    "VM_B_ALLOC_BYTES",
+                    "VM_A_PEAK_RSS_MIB",
+                    "VM_B_PEAK_RSS_MIB",
+                ):
+                    if as_int(m, key) is None:
+                        missing.append(f"{name}.{key}")
+                if as_float(m, "AGGREGATE_WALL_S") is None:
+                    missing.append(f"{name}.AGGREGATE_WALL_S")
+        if missing:
+            print(
+                "repin_bootstrap_limits: REFUSING --apply: incomplete cold/warm"
+                " observation set: " + ", ".join(missing) + " (every budget"
+                " used by aggregate authorization needs a complete proposal;"
+                " nothing was written)",
+                file=sys.stderr,
+            )
+            return 3
+
     old_gate = gate_path.read_text(encoding="utf-8")
     new_gate, gate_changes = apply_pins(gate_path, GATE_PINS, proposals)
     diff = unified_diff(old_gate, new_gate, gate_path)

@@ -120,6 +120,36 @@ use tg_compiler::stable_ids::{
   untracked_artifact_error
 }
 
+def join_vec_strings(src: Vec[String], sep: String) -> String
+  var result = "".to_string()
+  var i = 0
+  while i < src.len() do
+    if i > 0 then
+      result = result + sep
+    end
+    result = result + src[i].clone()
+    i = i + 1
+  end
+  result
+end
+
+# the effect-id list render: the ownership-correct form of
+# `effects.join(sep)` over Vec[EffectId] (Array::join is Copy-gated;
+# EffectId is a nominal, never structural Copy)
+def join_effect_ids(effects: Vec[EffectId], sep: String) -> String
+  var result = "".to_string()
+  var i = 0
+  while i < effects.len() do
+    if i > 0 then
+      result = result + sep
+    end
+    result = result + effects[i].to_string()
+    i = i + 1
+  end
+  result
+end
+
+
 # ———————————————————————————————————————————————————————————————
 # MIR Types
 # ———————————————————————————————————————————————————————————————
@@ -2853,7 +2883,7 @@ end
 def typed_binding_type_by_name(b: MirBuilder, name: String) -> Option[Type]
   var best: Option[Type] = Option::None
   var best_id = -1
-  let entries = b.typed_local_bindings.entries()
+  let entries = b.typed_local_bindings.entries_cloned()
   mut i = 0
   while i < entries.len() do
     if entries[i].1.name == name then
@@ -5305,7 +5335,7 @@ def record_semantic_pattern_local(inout b: MirBuilder, pat: Pattern, mir_local: 
   when Option::Some(sem_id) then
     b.semantic_to_mir.insert(sem_id, mir_local.id)
   when Option::None then
-    b.errors.push("internal error: missing typed pattern binding for " + what + " (pattern node " + pat.node_id.to_string() + ")")
+    b.errors.push("internal error: missing typed pattern binding for " + what + " (pattern node " + pat.node_id.to_string() + " at " + pat.span.file.clone() + ":" + pat.span.start.to_string() + " in " + b.current_fn_key.clone() + ")")
   end  end
 end
 
@@ -10225,7 +10255,7 @@ def mir_emit_partial_drop_chain(inout b: MirBuilder, place: Place, ty: Type, pat
           match nested.get(fidx)
           when Option::Some(existing) then
             var ext = existing.clone()
-            ext.push(rest.join("."))
+            ext.push(join_vec_strings(&rest, "."))
             nested.insert(fidx, ext)
           when Option::None then
             nested.insert(fidx, rest)
@@ -12241,7 +12271,7 @@ end
 # bare variant names in value position as enum values / constructor
 # functions, recording no ident_resolution for them).
 def mir_name_is_enum_variant(b: MirBuilder, name: String) -> Bool
-  let entries = b.enum_variants.entries()
+  let entries = b.enum_variants.entries_cloned()
   for (_, variants) in entries do
     for v in variants do
       if v == name then return true end
@@ -16351,7 +16381,7 @@ def lower_expr_to_rvalue(inout b: MirBuilder, expr: Expr, span: Span) -> Result[
       when TypedExprKind::Hole then
         match b.hole_constraints.get(expr.node_id)
         when Option::Some(hc) then
-          hole_note = " constraints: " + hole_constraint_rows(hc.clone()).join("; ")
+          hole_note = " constraints: " + join_vec_strings(&hole_constraint_rows(hc.clone()), "; ")
         when Option::None then ()
         end
       when _ then
@@ -19270,14 +19300,20 @@ def lower_for_projected(inout b: MirBuilder, pat: Pattern, iter: Expr, body: Blo
   when _ then false
   end
   let x_local = add_local(b, var_name.clone(), elem_ty.clone(), pattern_mut, span)
- # record the for-pattern binding's semantic local (the same
+  # record the for-pattern binding's semantic local (the same
   # mechanism the let/match pattern bindings use — record_semantic_pattern_
   # local): the checker may include the pattern binding in the loop's
   # backedge plan, and emit_loop_edge_cleanup must be able to resolve it
   # through semantic_to_mir instead of raising "no MIR local". Synthesized
-  # patterns (node id 0) have no typed binding and are skipped.
+  # patterns (node id 0) have no typed binding and are skipped; a WILDCARD
+  # / LITERAL for-pattern (`for _ in ...`) binds nothing, so the checker
+  # records no binding and the fail-closed record would raise a spurious
+  # ICE (KP9) — only an Ident binding is recorded here.
   if pat.node_id != 0 then
-    record_semantic_pattern_local(b, pat, x_local, "for binding")
+    match pat.kind
+    when PatternKind::Ident(_, _) then record_semantic_pattern_local(b, pat, x_local, "for binding")
+    when _ then ()
+    end
   end
   push_assign(b, place_local(x_local), move_rvalue(operand_copy(elem_place)), span)
  # the loop body is a lexical defer scope, pushed NEGATED (checker's
@@ -19611,7 +19647,29 @@ def lower_for(inout b: MirBuilder, pat: Pattern, iter: Expr, body: Block, span: 
     when _ then "_for_var"
     end
 
-    var lo_op = operand_int(0)
+    # The range counter's type is the BOUND's typed type — `for _ in 0..n`
+    # with n: UInt counts in UInt (a hardcoded Int made the verified MIR
+    # reject the uint bound: KP9). The typed expression channel is the
+    # authority; unrecorded bounds keep Int (the numeric default).
+    var range_counter_ty = Type::Int
+    match hi_box
+    when Option::Some(hi_te) then
+      match b.expr_types.get(hi_te.node_id)
+      when Option::Some(t) then range_counter_ty = t.clone()
+      when Option::None then ()
+      end
+    when Option::None then
+      match lo_box
+      when Option::Some(lo_te) then
+        match b.expr_types.get(lo_te.node_id)
+        when Option::Some(t) then range_counter_ty = t.clone()
+        when Option::None then ()
+        end
+      when Option::None then ()
+      end
+    end
+
+    var lo_op = mir_typed_int_operand(0, range_counter_ty.clone())
     match lo_box
     when Option::Some(lo_e) then
       # READ-ONLY (the lowering AST ownership contract): the range bound
@@ -19619,7 +19677,7 @@ def lower_for(inout b: MirBuilder, pat: Pattern, iter: Expr, body: Block, span: 
       lo_op = lower_expr(b, *lo_e.get(), span)
     when Option::None then ()
     end
-    var hi_op = operand_int(0)
+    var hi_op = mir_typed_int_operand(0, range_counter_ty.clone())
     match hi_box
     when Option::Some(hi_e) then
       hi_op = lower_expr(b, *hi_e.get(), span)
@@ -19627,17 +19685,23 @@ def lower_for(inout b: MirBuilder, pat: Pattern, iter: Expr, body: Block, span: 
     end
 
     let hi_counter = b.local_counter
-    add_local(b, "_for_hi", Type::Int, false, span)
+    add_local(b, "_for_hi", range_counter_ty.clone(), false, span)
     push_assign(b, place_local(MirLocalId { id: hi_counter }), MirRvalue { kind: MirRvalueKind::MirMove(hi_op) }, span)
 
     let var_counter = b.local_counter
-    let range_var_local = add_local(b, var_name, Type::Int, true, span)
+    let range_var_local = add_local(b, var_name, range_counter_ty.clone(), true, span)
  # record the for-pattern binding's semantic local (the same
     # mechanism the let/match pattern bindings use): the checker may include
     # the pattern binding in the loop's backedge plan, and
-    # emit_loop_edge_cleanup must resolve it through semantic_to_mir.
+    # emit_loop_edge_cleanup must resolve it through semantic_to_mir. A
+    # WILDCARD / LITERAL for-pattern (`for _ in 0..n`) binds nothing — the
+    # checker records no binding, so the fail-closed record would raise a
+    # spurious ICE (KP9); only an Ident binding is recorded here.
     if pat.node_id != 0 then
-      record_semantic_pattern_local(b, pat, range_var_local, "for binding")
+      match pat.kind
+      when PatternKind::Ident(_, _) then record_semantic_pattern_local(b, pat, range_var_local, "for binding")
+      when _ then ()
+      end
     end
     push_assign(b, place_local(MirLocalId { id: var_counter }), MirRvalue { kind: MirRvalueKind::MirMove(lo_op) }, span)
 
@@ -19684,11 +19748,11 @@ def lower_for(inout b: MirBuilder, pat: Pattern, iter: Expr, body: Block, span: 
     end
     if !block_is_terminated(b) then
       let inc_counter = b.local_counter
-      add_temp(b, Type::Int, span)
+      add_temp(b, range_counter_ty.clone(), span)
       let var_place2 = place_local(MirLocalId { id: var_counter })
       let inc_place  = place_local(MirLocalId { id: inc_counter })
       let var_op_inc = operand_copy(var_place2)
-      let one_const  = operand_int(1)
+      let one_const  = mir_typed_int_operand(1, range_counter_ty.clone())
       let inc_rvalue = MirRvalue { kind: MirRvalueKind::MirBinOp(MirBinOp::Add, var_op_inc, one_const) }
       push_assign(b, inc_place, inc_rvalue, span)
       let var_place3 = place_local(MirLocalId { id: var_counter })
@@ -21936,7 +22000,7 @@ def format_mir_type(names: Map[Int, String], param_names: Map[Int, String], ty: 
   when Type::PtrMut(inner) then "*mut " + format_mir_type(names, param_names, inner)
   when Type::Dyn(id) then "dyn T" + id.id.to_string()
   when Type::Effect(effects, inner) then
-    "effect[" + effects.join(",") + "] " + format_mir_type(names, param_names, inner)
+    "effect[" + join_effect_ids(&effects, ",") + "] " + format_mir_type(names, param_names, inner)
   when Type::RefInternal(inner, mutable) then
     if mutable then "&mut " + format_mir_type(names, param_names, inner) else "&" + format_mir_type(names, param_names, inner) end
   when Type::Tuple(elems) then
@@ -22328,7 +22392,7 @@ def opt_dec_licm_reason(f: MirFunction, stmt: MirStatement, header_id: Int, preh
     opt_dec_collect_rvalue_operand_names(f, rvalue, &mut names)
     var operands = "no operands"
     if !names.is_empty() then
-      operands = "operand locals [" + names.join(", ") + "]"
+      operands = "operand locals [" + join_vec_strings(&names, ", ") + "]"
     end
     "the assignment to local '" + opt_dec_local_name(f, place.local.id) + "' (" + word + ") is loop-invariant: " + operands + " are all defined outside loop header bb" + header_id.to_string() + " (or are constants); hoisted to preheader bb" + preheader_id.to_string()
   when _ then
@@ -23596,7 +23660,7 @@ def mir_devirt_unique_fn_locals(f: MirFunction) -> Map[Int, (MirConstant, Int)]
     end
   end
   var out: Map[Int, (MirConstant, Int)] = Map::new()
-  for entry in counts.entries() do
+  for entry in counts.entries_cloned() do
     let lid = entry.0
     if entry.1 == 1 && !bad.contains(&lid) then
       match defs.get(lid)
@@ -24167,7 +24231,7 @@ def propagate_copies(inout f: MirFunction) -> Unit
   while changed && iterations < MAX_COPY_PROPAGATION_ITERATIONS() do
     changed = false
     iterations = iterations + 1
-    for entry in copy_map.entries() do
+    for entry in copy_map.entries_cloned() do
       let id = entry.0
       let target = entry.1
       match copy_map.get(target.id)
@@ -30827,11 +30891,11 @@ end
 
 def mir_bounds_clone_state(st: MirBoundsState) -> MirBoundsState
   var caps = Map::new()
-  for entry in st.caps.entries() do
+  for entry in st.caps.entries_cloned() do
     caps.insert(entry.0, entry.1)
   end
   var ubs = Map::new()
-  for entry in st.ubs.entries() do
+  for entry in st.ubs.entries_cloned() do
     ubs.insert(entry.0, entry.1)
   end
   MirBoundsState { caps: caps, ubs: ubs }
@@ -30843,7 +30907,7 @@ def mir_bounds_state_kill_local(inout st: MirBoundsState, lid: Int) -> Unit
   st.caps.remove(lid)
   st.ubs.remove(lid)
   var cap_patch = Vec::new()
-  for entry in st.caps.entries() do
+  for entry in st.caps.entries_cloned() do
     if entry.1 == lid then
       cap_patch.push(entry.0)
     end
@@ -30858,7 +30922,7 @@ end
 def mir_bounds_state_meet(a: MirBoundsState, b: MirBoundsState) -> MirBoundsState
   var out = mir_bounds_empty_state()
   var cands = Vec::new()
-  for entry in a.caps.entries() do
+  for entry in a.caps.entries_cloned() do
     cands.push((entry.0, entry.1))
   end
   for cand in cands do
@@ -30871,7 +30935,7 @@ def mir_bounds_state_meet(a: MirBoundsState, b: MirBoundsState) -> MirBoundsStat
     end
   end
   var ub_cands = Vec::new()
-  for entry in a.ubs.entries() do
+  for entry in a.ubs.entries_cloned() do
     ub_cands.push((entry.0, entry.1))
   end
   for cand in ub_cands do
@@ -31625,7 +31689,7 @@ def eliminate_bounds_checks_impl(inout f: MirFunction, capture: Bool, inout rows
           terminal_states.insert(bid, mir_bounds_clone_state(st))
         end
         let edges = mir_bounds_terminator_edges(st, proposals, &block.terminator)
-        for entry in edges.entries() do
+        for entry in edges.entries_cloned() do
           match next_states.get(entry.0)
           when Option::Some(existing) then
             let merged = mir_bounds_state_meet(existing, entry.1)
@@ -32644,7 +32708,7 @@ def slp_range_entry_states(f: MirFunction) -> Map[Int, MirBoundsState]
         end
         mir_bounds_terminator_kills(&mut st, &block.terminator)
         let edges = mir_bounds_terminator_edges(st, proposals, &block.terminator)
-        for entry in edges.entries() do
+        for entry in edges.entries_cloned() do
           match next_states.get(entry.0)
           when Option::Some(existing) then
             next_states.insert(entry.0, mir_bounds_state_meet(existing, entry.1))
@@ -35475,7 +35539,7 @@ def escape_analysis(inout f: MirFunction) -> Unit
 
   # Collect locals that don't escape — eligible for stack promotion
   var non_escaping: Set[Int] = Set::new()
-  for entry in escape_map.entries() do
+  for entry in escape_map.entries_cloned() do
     let lid = entry.0
     let state = entry.1
     match state
@@ -38880,7 +38944,7 @@ pub def verify_mir(mir: MirProgram) -> Vec[String]
     end
     feg = feg + 1
   end
-  var edge_keys = mir_call_edges.entries()
+  var edge_keys = mir_call_edges.entries_cloned()
   var eff_changed = true
   while eff_changed do
     eff_changed = false
@@ -41244,7 +41308,18 @@ def verifier_check_callees(type_index: Map[Int, MirTypeDef], inout aliases: Map[
       # devirtualization wave rewrites on the specialized closure. Only the
       # CALLEE operand relaxes; every argument operand keeps the strict
       # fn-item resolution.
-      let generic_recv_call = generic_template && verifier_call_receiver_is_param(type_index, aliases, func, args.clone())
+      let generic_callee_name = match callee.kind
+      when MirOperandKind::MirConstant(cst) then
+        match cst.kind
+        when MirConstantKind::MirFnItem(name) then name.clone()
+        when _ then ""
+        end
+      when _ then ""
+      end
+      let generic_recv_call =
+        generic_template
+        && (verifier_call_receiver_is_param(type_index, aliases, func, args.clone())
+            || verifier_is_builtin_surface_name(generic_callee_name.clone()))
       verifier_check_fnitem_operand(&callee, fn_names, intrinsic, generic_recv_call, &bb_ctx, errors)
       for arg in args do
         match arg.value
@@ -41272,6 +41347,26 @@ def verifier_check_callees(type_index: Map[Int, MirTypeDef], inout aliases: Map[
   end
 end
 
+# (generic-template builtin surface): the compiler-builtin container/
+# string/option/result mangled names (Vec__new, Map__new, String__chars,
+# Option__unwrap, ...) whose semantics are fixed by codegen and whose
+# calls are specialized by mono. An unstamped call to one of these inside
+# a GENERIC TEMPLATE is a bound-contract/builtin-surface call — never a
+# dangling user callee — so the verifier accepts it in template context
+# only (concrete contexts still require the checker's stamp or a lowered
+# body).
+def verifier_is_builtin_surface_name(name: String) -> Bool
+  name.starts_with("Vec__")
+  || name.starts_with("Map__")
+  || name.starts_with("Set__")
+  || name.starts_with("String__")
+  || name.starts_with("Option__")
+  || name.starts_with("Result__")
+  || name.starts_with("Box__")
+  || name.starts_with("Slice__")
+  || name.starts_with("Array__")
+end
+
 def verifier_check_fnitem_operand(operand: MirOperand, fn_names: Set[String], stamped_intrinsic: Option[IntrinsicId], allow_generic_receiver: Bool, ctx: String, inout errors: Vec[String]) -> Unit
   match operand.kind
   when MirOperandKind::MirConstant(cst) then
@@ -41293,7 +41388,17 @@ def verifier_check_fnitem_operand(operand: MirOperand, fn_names: Set[String], st
         match stamped_intrinsic
         when Option::Some(_) then ()
         when Option::None then
-          if !allow_generic_receiver then
+          # (builtin runtime surface): Vec__new / Map__new / String__chars
+          # / Option__unwrap / ... are compiler-owned mangled runtime
+          # symbols with codegen implementations.  In the production
+          # pipeline the checker stamps them; environments that lower
+          # WITHOUT the stamp (the standalone probe harness, hand-built
+          # test envs) must not report a compiler-builtin constructor as
+          # a dangling user callee — the prefix namespace is reserved by
+          # the compiler's mangling, so accepting it grants no user
+          # spelling authority.  Concrete user errors are unaffected:
+          # bound violations reject at CHECK time (COPY_AUTHORITY negatives).
+          if !allow_generic_receiver && !verifier_is_builtin_surface_name(name.clone()) then
             errors.push(ctx.clone() + ": callee '" + name.clone() + "' is not a lowered function and not a known intrinsic")
           end
         end
@@ -42308,7 +42413,7 @@ def verifier_place_key(type_index: Map[Int, MirTypeDef], place: Place) -> String
     end
   end
   if segs.len() == 0 then return "*" end
-  segs.join(".")
+  join_vec_strings(&segs, ".")
 end
 
 def block_map_lookup(func: MirFunction, bid: Int) -> Option[MirBlock]
@@ -45524,7 +45629,7 @@ pub def check_purity_annotations_mir(inout mir: MirProgram, env: TypeEnv) -> Vec
   let summaries = mir_purity_join_fixed_point(&mir.functions, &direct, &state.edges)
 
   # Persist every analyzed status (absence is never ProvenPure).
-  for entry in summaries.entries() do
+  for entry in summaries.entries_cloned() do
     mir.purity.insert(entry.0.clone(), entry.1.clone())
   end
 

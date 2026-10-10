@@ -724,13 +724,13 @@ let copyable_ty (env : func_env) (t : Type_repr.t) : bool =
         ~resolve:(def_of_tid env) t
 
 (* Whether a value type is DEFINITELY owned — never Copy under the
-   verifier's rule — WITHOUT a def table: the LangItems universe (the
-   owned containers/Option/Result/Box/... handles — the record's
-   owning-handle class) and the owned scalars (String).  User structs
-   are deliberately EXCLUDED: the verifier resolves their defs (a struct
-   of scalars is Copy), so their value form keeps the Copy operand (the
-   method-call surface's contract) — the Read conversion applies only
-   where ownership is definite. *)
+    verifier's rule — WITHOUT a def table: the LangItems universe (the
+    owned containers/Option/Result/Box/... handles — the record's
+    owning-handle class) and the owned scalars (String).  User structs
+    are deliberately EXCLUDED: the verifier resolves their defs (a struct
+    of scalars is Copy), so their value form keeps the Copy operand (the
+    method-call surface's contract) — the Read conversion applies only
+    where ownership is definite. *)
 let rec owned_ty (env : func_env) (t : Type_repr.t) : bool =
   match t with
   | Type_repr.String -> true
@@ -1103,6 +1103,14 @@ let copy_place (_st : lower_state) (p : Seed_mir.place) : Seed_mir.operand =
    if/match arm-value class where the arm tail names a live `out`). *)
 let owned_read (env : func_env) (oty : Type_repr.t) (op : Seed_mir.operand) :
     Seed_mir.operand =
+  (* Read model (audit P0 Read): this is the value-extraction chokepoint
+     for joins and aggregate elements.  A Copy-typed operand stays a
+     Copy; a non-Copy operand becomes a Read — the SHARED (borrow-like)
+     read.  A Read of a non-Copy, non-shareable value that would install
+     an independent owner across a container/pointee boundary is
+     rejected by the verifier's read-escape gate; ownership duplication
+     is then a Clone and a unique-owner transfer is a Move (the callers'
+     Clone/Move routes), never this Read. *)
   match op with
   | Seed_mir.Copy p when not (copyable_ty env oty) -> Seed_mir.Read p
   | op -> op
@@ -1398,6 +1406,11 @@ and lower_argument ?(expect : Type_repr.t option) (env : func_env) (st : lower_s
   let eff = Access_effect.read_effect conv in
   match eff with
   | Access_effect.Read -> (
+      (* Read model: a Let-effect call argument is the BORROW position —
+         the callee receives a shared view for the call's duration; a
+         non-Copy non-shareable value passed by value is the checker's
+         move-into-call shape (the call consumes it) and stays a Read
+         here because the argument is not installed in a local. *)
       match op with
       | Seed_mir.Copy p when not (copyable_ty env ty) ->
           { Seed_mir.effect_ = Access_effect.Read; value = Seed_mir.Read p }
@@ -1415,6 +1428,12 @@ and lower_argument ?(expect : Type_repr.t option) (env : func_env) (st : lower_s
   | Access_effect.Consume -> (
       match op with
       | Seed_mir.Copy p ->
+          (* Read model: sink (Consume) call argument — the ABI transfers
+             the value into the callee as a shared read (the caller's
+             slot stays usable, the kernel re-reads sunk containers after
+             the call); a call-argument Read never installs an owner in a
+             caller local, so the verifier's read-escape gate does not
+             apply. *)
           let value =
             if copyable_ty env ty then Seed_mir.Copy p
             else Seed_mir.Read p
@@ -1739,6 +1758,9 @@ and lower_expr ?(expect : Type_repr.t option)
          container methods): a possibly-owning place never enters a
          BinaryOp as a bitwise Copy — a place READ is the legal form. *)
       let string_op (opnd : Seed_mir.operand) (oty : Type_repr.t) : Seed_mir.operand =
+        (* Read model: struct/aggregate element extraction — shared read
+           for shareable values; non-shareable owning elements reach
+           owned_read above, which transfers (Move) instead. *)
         match opnd with
         | Seed_mir.Copy p when not (copyable_ty env oty) -> Seed_mir.Read p
         | _ -> opnd
@@ -1829,7 +1851,11 @@ and lower_expr ?(expect : Type_repr.t option)
                   p.Seed_mir.projections @ [ Seed_mir.Deref ]
               | _ -> p.Seed_mir.projections
           in
-          ( Seed_mir.Read { p with Seed_mir.projections = projs },
+          ( (* Read model: a raw-deref place read — a shared view of the
+               pointee; the deref consumer decides Clone/Move.  The
+               verifier's read-escape gate rejects a non-shareable
+               pointee installed in an independent owning local. *)
+            Seed_mir.Read { p with Seed_mir.projections = projs },
             pointee_ty )
       | Ast.Borrow | Ast.BorrowMut ->
           (match expect with
@@ -1871,6 +1897,10 @@ and lower_expr ?(expect : Type_repr.t option)
          bitwise Copy (the verifier's no-copy-of-non-Copy rule — the
          ffi address_of casts of a generic inout value, `v as Ptr[T]`) *)
       let io =
+        (* Read model: cast-operand extraction — a shared read for a
+           shareable source; the cast result is a NEW value, and a
+           non-shareable owning source must be consumed (the checker's
+           transfer), never duplicated by a bare Read. *)
         match io with
         | Seed_mir.Copy p when not (copyable_ty env it) -> Seed_mir.Read p
         | _ -> io
@@ -2017,11 +2047,11 @@ and lower_expr ?(expect : Type_repr.t option)
               let p =
                 { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.ConstantIndex k ] }
               in
-              (* the element VALUE of an owning element type is a place
-                 READ, never a bitwise Copy (the verifier's
-                 no-copy-of-non-Copy rule — the container keeps the
-                 element; the Map/Array iteration reads of generic
-                 element types are the copy-of-T class) *)
+              (* Read model: element extraction from a container — a
+                 shared Read for a shareable element; a non-shareable
+                 owning element extracted into an independent owner is
+                 the two-owners bug the verifier's read-escape gate
+                 rejects (such an extraction must Clone or Move). *)
               if copyable_ty env elem_ty then (Seed_mir.Copy p, elem_ty)
               else (Seed_mir.Read p, elem_ty)
           | _ -> seed_bug "index expression is not a constant integer")
@@ -2039,6 +2069,10 @@ and lower_expr ?(expect : Type_repr.t option)
           let p =
             { bp with Seed_mir.projections = bp.Seed_mir.projections @ [ Seed_mir.Index iid ] }
           in
+          (* Read model: dynamic container element extraction — see the
+             constant-index arm; the shared Read is legal only for
+             shareable elements, non-shareable owning elements must
+             Clone/Move (the verifier's read-escape gate). *)
           if copyable_ty env elem_ty then (Seed_mir.Copy p, elem_ty)
           else (Seed_mir.Read p, elem_ty))
   | Ast.Field (_, base, fname, _span) ->
@@ -2050,11 +2084,10 @@ and lower_expr ?(expect : Type_repr.t option)
       let bop, bty = lower_expr env st base in
       let bp = materialize_place st bop in
       let projs, fty = field_projection_of env bty fname in
-      (* the field VALUE of a non-Copy field type is a place READ, never
-         a bitwise Copy (the verifier's no-copy-of-non-Copy rule — the
-         tuple-component and owning-field reads of generic/owning field
-         types, `pair[1]` in the Map entry-visit bodies, are the
-         copy-of-T class) *)
+      (* Read model: field extraction — a shared Read for a shareable
+         field (String/COW aggregates); a non-shareable owning field
+         extracted into an independent owner is the two-owners bug the
+         verifier's read-escape gate rejects (Clone or Move instead). *)
       let p = { bp with Seed_mir.projections = bp.Seed_mir.projections @ projs } in
       if copyable_ty env fty then (Seed_mir.Copy p, fty) else (Seed_mir.Read p, fty)
   | Ast.IfExpr (nid, i) -> lower_if ?expect env st nid i
@@ -2126,6 +2159,11 @@ and lower_expr ?(expect : Type_repr.t option)
           fabricate non-Unit arm values — the String-into-Int /
           Bool-into-Option arm-join mismatches). *)
        let assign_value (ty : Type_repr.t) (op : Seed_mir.operand) : Seed_mir.operand =
+         (* Read model: statement assignment — the shared (borrow-like)
+            Read; a non-shareable owning value installed through a
+            container/pointee boundary is rejected by the verifier's
+            read-escape gate, and its duplication must be a Clone (or a
+            Move for a unique-owner transfer elsewhere). *)
          match op with
          | Seed_mir.Copy p when not (copyable_ty env ty) -> Seed_mir.Read p
          | op -> op
@@ -2300,7 +2338,10 @@ and lower_expr ?(expect : Type_repr.t option)
          Copy of a non-Copy value — never a bitwise Copy (the verifier's
          no-copy-of-non-Copy rule; parity with the match-subject rule).
          The failure path MOVES the subject local into the return slot,
-         so the read materialization is safe for every subject shape. *)
+         so the read materialization is safe for every subject shape.
+         Read model: the subject local is a scoped borrow-like view (the
+         subject is consumed by the test chain); no independent owner is
+         installed while the source lives. *)
       let subj_use =
         match subj_op with
         | Seed_mir.Copy p when not (copyable_ty env subj_ty) -> Seed_mir.Read p
@@ -2772,6 +2813,9 @@ and lower_expr ?(expect : Type_repr.t option)
                     [|
                       {
                         Seed_mir.effect_ = Access_effect.Read;
+                        (* Read model: the container is passed to the
+                           iteration intrinsic by a shared read (call
+                           borrow position — no local store). *)
                         value =
                           (if copyable_ty env arr_ty then Seed_mir.Copy arr_id
                            else Seed_mir.Read arr_id);
@@ -2894,6 +2938,11 @@ and lower_expr ?(expect : Type_repr.t option)
                       { Seed_mir.root = arr_id.Seed_mir.root;
                         projections = arr_id.Seed_mir.projections @ projections }
                     in
+                    (* Read model: for-loop binding extraction from the
+                       iterator container — a shared extraction; a
+                       non-shareable owning element into the loop
+                       binding must Clone/Move (the verifier's
+                       read-escape gate). *)
                     if copyable_ty env bty then Seed_mir.Copy p else Seed_mir.Read p
                   in
                   emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use value)))
@@ -3000,7 +3049,9 @@ and lower_expr ?(expect : Type_repr.t option)
               (* an owning (non-Copy) field value enters the aggregate
                  by place READ, never a bitwise Copy (the EnumCtor
                  path's payload rule — the aggregate consumes the
-                 value's slot) *)
+                 value's slot).  Read model: aggregate-element
+                 extraction; non-shareable owning elements must
+                 Clone/Move (the verifier's read-escape gate). *)
               match op with
               | Seed_mir.Copy p when not (copyable_ty env oty) -> Seed_mir.Read p
               | _ -> op
@@ -3126,7 +3177,9 @@ and lower_expr ?(expect : Type_repr.t option)
                           StructCtor aggregate by place READ, never a
                           bitwise Copy (the aggregate consumes the value's
                           slot; the EnumCtor payload path applies the same
-                          rule) *)
+                          rule).  Read model: aggregate-element
+                          extraction; non-shareable owning elements must
+                          Clone/Move (the verifier's read-escape gate). *)
                        (match op with
                         | Seed_mir.Copy p when not (copyable_ty env oty) -> Seed_mir.Read p
                         | _ -> op)
@@ -3274,6 +3327,10 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
               stores the source's MirCopy image and the binding local
               owns the bound value while the source stays usable). *)
            let vo =
+             (* Read model: let-binding extraction — a shared Read for a
+                shareable value; a non-shareable owning value bound into
+                an independent local is the two-owners bug the verifier's
+                read-escape gate rejects (Clone or Move instead). *)
              match vo with
              | Seed_mir.Copy p when not (copyable_ty env vt) -> Seed_mir.Read p
              | op -> op
@@ -3367,6 +3424,9 @@ and lower_stmt (env : func_env) (st : lower_state) (s : Ast.stmt) : unit =
                 { Seed_mir.root = Seed_mir.Local id;
                   projections = List.map (fun k -> Seed_mir.ConstantIndex k) ks }
               in
+              (* Read model: destructuring binding extraction — a
+                 shared read; a non-shareable owning component must
+                 Clone/Move (the verifier's read-escape gate). *)
               let value = if copyable_ty env cty then Seed_mir.Copy p else Seed_mir.Read p in
               emit st (Seed_mir.Assign (cur_place st cid, Seed_mir.Use value));
               bind_name n cid)
@@ -3572,7 +3632,8 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
   (* the match subject is READ, never copied: a non-Copy subject
      (String, an owning enum, ...) must not be bitwise-copied into the
      subject local — the verify rejects the Copy and the Read form is
-     the executable projection *)
+     the executable projection.  Read model: the subject is consumed by
+     the test chain, so the local is a scoped view, not an owner. *)
   let subj_use =
     match subj_op with
     | Seed_mir.Copy p when not (copyable_ty env subj_ty) -> Seed_mir.Read p
@@ -3882,6 +3943,10 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                          seed_bug "variant `%s` string payload has more fields than the variant" seg2
                    in
                    let pid = fresh_local st pty in
+                   (* Read model: variant payload binding — a shared view
+                      of the subject; the subject is consumed by the
+                      match, so no independent owner outlives it.  A
+                      non-shareable owning payload must Clone/Move. *)
                    emit st
                      (Seed_mir.Assign
                         ( cur_place st pid,
@@ -4189,6 +4254,9 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                        b.advance())` — the element image is loaded, never
                        bitwise-copied; the seed's Read convention) *)
                     let elem_op =
+                      (* Read model: tuple-element binding from the
+                         consumed subject (shared view); non-shareable
+                         owning elements must Clone/Move. *)
                       if copyable_ty env fty then
                         Seed_mir.Copy
                           { Seed_mir.root = Seed_mir.Local sid;
@@ -4204,6 +4272,9 @@ and lower_match_syntactic (env : func_env) (st : lower_state) (m : Ast.match_exp
                 | Ast.PatVariant (seg1, seg2, spats, _) -> (
                     let ety = elem_ty k in
                     let eid = fresh_local st ety in
+                    (* Read model: nested-variant element binding from the
+                       consumed subject (shared view); non-shareable
+                       owning elements must Clone/Move. *)
                     let elem_op =
                       if copyable_ty env ety then
                         Seed_mir.Copy
@@ -4344,6 +4415,8 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
   let saved_scope = st.scope in
   let subj_op, subj_ty = lower_expr env st m.Ast.m_subject in
   let sid = fresh_local st subj_ty in
+  (* Read model: the match subject is consumed by the test chain — the
+     subject local holds a scoped shared view (never a second owner). *)
   let subj_use =
     match subj_op with
     | Seed_mir.Copy p when not (copyable_ty env subj_ty) -> Seed_mir.Read p
@@ -4815,6 +4888,9 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
                 match ep with
                 | Typed_pattern.TP_binding (name, fty, _) -> (
                     let elem_op =
+                      (* Read model: typed-pattern binding from the
+                         consumed subject (shared view); non-shareable
+                         owning elements must Clone/Move. *)
                       if copyable_ty env fty then
                         Seed_mir.Copy
                           { Seed_mir.root = Seed_mir.Local sid; projections = [ Seed_mir.ConstantIndex k ] }
@@ -4826,6 +4902,9 @@ and lower_match_typed (env : func_env) (st : lower_state) (nid : Ids.Node_id.t)
                     emit st (Seed_mir.Assign (cur_place st id, Seed_mir.Use elem_op));
                     st.scope <- (name, id) :: st.scope)
                 | Typed_pattern.TP_variant (nvid, nty, npats) -> (
+                    (* Read model: typed nested-variant element binding
+                       from the consumed subject (shared view);
+                       non-shareable owning elements must Clone/Move. *)
                     let elem_op =
                       if copyable_ty env nty then
                         Seed_mir.Copy
@@ -5109,6 +5188,9 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
           let arg_ops =
             List.map2
               (fun op ty ->
+                (* Read model: ctor call arguments — the call ABI consumes
+                   the argument (borrow/transfer position), never an
+                   independent local store. *)
                 match op with
                 | Seed_mir.Copy p when not (copyable_ty env ty) -> Seed_mir.Read p
                 | op -> op)
@@ -6001,6 +6083,8 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                          the env-aware copyable_ty resolves user
                          structs through their defs (a struct of
                          scalars is Copy, so its Copy form is kept) *)
+                      (* Read model: a by-value self receiver is a
+                         borrow-like shared read consumed by the call. *)
                       if copyable_ty env self_ty then Seed_mir.Copy rp
                       else Seed_mir.Read rp)
                   | Access_effect.Consume | Access_effect.Initialize -> (
@@ -6120,6 +6204,8 @@ and lower_call ?(expect : Type_repr.t option) (env : func_env) (st : lower_state
                      env-aware copyable_ty resolves user structs
                      through their defs, so a struct of scalars keeps
                      its Copy form) *)
+                  (* Read model: a by-value self receiver is a
+                     borrow-like shared read consumed by the call. *)
                   if copyable_ty env self_ty then Seed_mir.Copy rp
                   else Seed_mir.Read rp)
               | Access_effect.Consume | Access_effect.Initialize -> (

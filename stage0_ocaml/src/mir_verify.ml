@@ -189,6 +189,13 @@ type ctx = {
      bound to this ctx's def table (program + registry), so one ctx
      never mixes two tables' answers. *)
   copy_cache : Type_properties.cache;
+  (* (audit P0 Read) the Shareable memo: shareable_read_type's answer per
+     canonical value type.  Resolving a nominal's structural def and
+     walking it is expensive (the compiler's AST enums are large), and
+     the Read-escape gate consults it per read store — the memo keeps
+     the template-mode closure pass linear in the number of DISTINCT
+     types instead of the number of read sites. *)
+  share_cache : (Type_repr.t, bool) Hashtbl.t;
   (* The P1-26 canonical drop-plan table: per concrete TypeId, the
      ordered (field/payload path, needs_drop) plan derived once from the
      program's defs (drop_plan.ml).  The drop accounting consults it
@@ -413,6 +420,99 @@ let nominal_resolver (ctx : ctx) : Type_properties.def_resolver =
 let is_copy (ctx : ctx) (ty : Type_repr.t) : bool =
   Type_properties.of_type_cached ctx.copy_cache (Some (nominal_resolver ctx)) ty
   |> fun p -> p.Type_properties.is_copy
+
+(* ── The Read-ownership model (audit P0 Read) ────────────────────────
+   Seed_mir.Read is the SHARED READ of a place: for a Copy type it is a
+   copy; for a non-Copy type it is a borrow-like value view that the VM
+   materializes as a second holder (arrays are deep-marked shared /
+   COW).  Duplicating an owner is only sound when the value's
+   REPRESENTATION supports sharing:
+
+     - String is immutable and shared safely;
+     - the COW containers (Vec/Map/Set — the array-backed nominals)
+       fork their storage on the first in-place write, and their nested
+       array cells are deep-marked, so a shared view is sound when
+       every element is itself shareable;
+     - tuples and fixed arrays inherit the property elementwise;
+     - Option/Result inherit it from their arguments;
+     - a USER struct/enum nominal answers shareable (see below);
+
+   the UNIQUE owning handles — Box/Rc/Arc/weak/UniquePtr (their
+   duplication without a refcount bump / Clone is a double-own), and the
+   LangItem containers whose element arguments reach such a handle — are
+   NOT shareable: extracting one by Read must be a Clone or a Move, and
+   a Read that installs such a value in an independent owning local is
+   rejected (check_read_escapes below).  A USER nominal (a program
+   struct/enum) answers shareable: its reads are the language's shared
+   views and the checker's resource analysis owns the consumption
+   discipline, so the compiler's own ownership-composite traversal
+   stays legal.
+
+   Deferred forms (Type_param/Infer_var) answer shareable — the concrete
+   pass re-checks the substituted instance where a handle may appear;
+   a def-less nominal answers shareable only when its arguments are
+   shareable (conservative for a native handle). *)
+let rec shareable_go (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) : bool =
+  match ty with
+  | Type_repr.String -> true
+  | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
+  | Type_repr.Float _ | Type_repr.Raw_ptr _ | Type_repr.Ref_internal _
+  | Type_repr.Never | Type_repr.Error ->
+      true
+  | Type_repr.Type_param _ | Type_repr.Infer_var _ | Type_repr.Int_literal _ -> true
+  | Type_repr.Function (params, ret) -> (
+      match ret with
+      | Type_repr.Never ->
+          (* the def_repr'd enum encoding: Function(payloads, Never) —
+             shareable iff every variant payload is shareable *)
+          Array.for_all
+            (fun p -> shareable_go ctx seen p.Type_repr.pt_type)
+            params
+      | _ -> true)
+  | Type_repr.Tuple elems -> Array.for_all (shareable_go ctx seen) elems
+  | Type_repr.Fixed_array (elem, _) -> shareable_go ctx seen elem
+  | Type_repr.Named (tid, args) ->
+      if List.mem tid seen then false
+      else (
+        let li = ctx.lang_items in
+        if
+          Lang_items.tid_eq li.Lang_items.vec tid
+          || Lang_items.tid_eq li.Lang_items.map tid
+          || Lang_items.tid_eq li.Lang_items.set tid
+        then Array.for_all (shareable_go ctx seen) args
+        else if Lang_items.is_option li tid || Lang_items.is_result li tid then
+          Array.for_all (shareable_go ctx seen) args
+        else if Lang_items.is_owning_handle li tid then
+          (* the unique handles (Box/Rc/Arc/weak/UniquePtr, a declared
+             owned-String nominal): never shareable by a bare Read *)
+          false
+        else if is_materialized_box_instance ctx tid then false
+        else
+          (* a USER nominal (a struct/enum defined by the program, NOT a
+             LangItem handle and NOT a Box instance): the language's
+             access model treats its reads as shared views, with the
+             consumption discipline owned by the checker's resource
+             analysis — the verifier's read-escape gate targets the
+             ownership-HANDLE protocol (Box/Rc/Arc/weak/UniquePtr and
+             handles nested in LangItem containers), whose duplication
+             in the VM is an unambiguous second owner.  Answering
+             shareable here keeps the gate precise and keeps the
+             compiler's own ownership-composite traversal (Pattern/Expr
+             nodes out of Vecs/Maps) legal, exactly as the seed
+             typechecks it. *)
+          let _ = (tid, seen) in
+          Array.for_all (shareable_go ctx seen) args)
+
+(* (audit P0 Read) memoized public entry: the answer per canonical value
+   type; see the ctx.share_cache comment. *)
+let shareable_read_type (ctx : ctx) (ty : Type_repr.t) : bool =
+  match Hashtbl.find_opt ctx.share_cache ty with
+  | Some b -> b
+  | None ->
+      let b = shareable_go ctx [] ty in
+      Hashtbl.replace ctx.share_cache ty b;
+      b
+
 
 (* Type compatibility.  NOMINAL-vs-NOMINAL comparisons are identity
    comparisons: Named (TypeId, args) is compatible with Named
@@ -861,6 +961,56 @@ let place_type (ctx : ctx) (fn : function_) (p : place) : Type_repr.t option =
             | None -> None
             | Some ty -> project_type ctx ty proj)
           (Some fn.locals.(lid)) p.projections
+
+(* The Read-escape gate (audit P0 Read): a Read is a shared read, never
+   an ownership duplication.  A Read of a NON-Copy, NON-shareable value
+   that is installed as a new owner — an Assign destination distinct
+   from the read place, or an operand of an aggregate that is itself
+   stored — is the two-owners bug; the extraction must be a Clone
+   (a real Clone call) or a Move (the unique owner transfer, subject to
+   the projected-move rules) instead.  Call arguments / comparisons /
+   casts consume the Read as a borrow and stay legal. *)
+let check_read_escapes (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
+    (rv : rvalue) : unit =
+  let escape (src : place) : unit =
+    (* the PROJECTED extraction class: a chain crossing a container /
+       pointee boundary (dynamic Index, ConstantIndex, or Deref) — the
+       `let x = owning_vec[0]` shape.  A whole-place Read (the join /
+       call-ABI form) keeps the existing shared-read convention. *)
+    let crosses_boundary =
+      List.exists
+        (function
+          | Seed_mir.Index _ | Seed_mir.ConstantIndex _ | Seed_mir.Deref -> true
+          | _ -> false)
+        src.projections
+    in
+    let same_place =
+      root_key src.root = root_key dest.root
+      && List.length src.projections = List.length dest.projections
+      && List.for_all2
+           (fun a b ->
+             match a, b with
+             | ConstantIndex i, ConstantIndex j -> i = j
+             | Field i, Field j -> Ids.Field_id.compare i j = 0
+             | Deref, Deref -> true
+             | Downcast _, Downcast _ -> true
+             | Index _, Index _ -> true
+             | _ -> false)
+           src.projections dest.projections
+    in
+    if crosses_boundary && not same_place then
+      match place_type ctx fn src with
+      | Some ty when not (is_copy ctx ty) && not (shareable_read_type ctx ty) ->
+          add_err ctx
+            (Printf.sprintf
+               "%s: read of non-Copy non-shareable value of type %s escapes from the container/pointee into an independent owning local _%d (a Read is a shared borrow; ownership duplication must be a Clone call and a transfer must be a Move)"
+               bb_ctx (Seed_mir.print_type ty) (root_key dest.root))
+      | _ -> ()
+  in
+  match rv with
+  | Use (Read src) -> escape src
+  | Aggregate (_, ops) -> List.iter (function Read src -> escape src | _ -> ()) ops
+  | _ -> ()
 
 (* ──────────────────────────────────────────────────────────────────
    Place keys for the moved/destroyed lattices (reference-mirroring).
@@ -3527,6 +3677,7 @@ let verify_function (ctx : ctx) (fn : function_) : unit =
                       let rv_ty =
                         check_rvalue ctx fn bb_ctx declared rv !running !moved dst_ty
                       in
+                      check_read_escapes ctx fn bb_ctx p rv;
                       match rv_ty with
                      | Some t ->
                          if not (types_compatible ctx dst_ty t) then
@@ -3766,6 +3917,7 @@ let require_valid_template ?(generic_types : Mono.generic_def array = [||])
       same_canonical_instance = (fun a b -> Ids.Type_id.compare a b = 0);
       box_instances = [];
       copy_cache = Type_properties.create_cache ();
+      share_cache = Hashtbl.create 512;
       drop_plans = Drop_plan.of_program ~lang_items prog;
     }
     prog
@@ -3789,6 +3941,7 @@ let require_valid_concrete ?(query_sigs : query_sig list = [])
       same_canonical_instance;
       box_instances;
       copy_cache = Type_properties.create_cache ();
+      share_cache = Hashtbl.create 512;
       drop_plans = Drop_plan.of_program ~lang_items ~box_instances prog;
     }
     prog

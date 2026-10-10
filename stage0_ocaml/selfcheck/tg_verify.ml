@@ -122,6 +122,128 @@ let () =
        check "m4: block-id array invariant enforced (gapped ids {0,2} rejected)"
          has_gap_err);
 
+  (* ── audit P0 Read: the Read-ownership gate ─────────────────────────
+     The negative is a hand-built MIR program INDEPENDENT of the source
+     checker: a container (Vec, langitem id 0) owns a non-Copy,
+     non-shareable element (Box[Int], langitem id 100); a projected Read
+     of the element is stored into an independent owning local while the
+     source place stays live.  The verifier must reject it.  Positives:
+     the same projected Read is legal when the element is shareable
+     (String) and when the Read is consumed as a call argument (borrow). *)
+  let vec_tid = Ids.Type_id.make 0 in
+  let box_tid = Ids.Type_id.make 100 in
+  let box_int = Type_repr.Named (box_tid, [| i64_int |]) in
+  let vec_of ty = Type_repr.Named (vec_tid, [| ty |]) in
+  let read_elem : Seed_mir.operand =
+    Seed_mir.Read { Seed_mir.root = Seed_mir.Local 1; projections = [ Seed_mir.ConstantIndex 0 ] }
+  in
+  let read_gate_li : Lang_items.t =
+    { Lang_items.seed_defaults with Lang_items.box_ = Some box_tid }
+  in
+  (* m5: container of non-Copy non-shareable element -> REJECT *)
+  let mk_gate_fn (param_ty : Type_repr.t) (elem_ty : Type_repr.t) (elem_op : Seed_mir.operand) :
+      Seed_mir.function_ =
+    {
+      Seed_mir.name = "read_gate";
+      instance = Instance_id.make ~callable:(Ids.Callable_id.make 9100) ~type_args:[||];
+      params = [| let_param param_ty |];
+      locals = [| Type_repr.Unit; param_ty; elem_ty |];
+      blocks =
+        [|
+          {
+            Seed_mir.id = 0;
+            statements =
+              [
+                Seed_mir.Assign
+                  ( { Seed_mir.root = Seed_mir.Local 2; projections = [] },
+                    Seed_mir.Use elem_op );
+              ];
+            terminator = Seed_mir.Ret;
+          };
+        |];
+      entry = 0;
+    }
+  in
+  let gate_errs (prog : Seed_mir.program) : string list =
+    match Mir_verify.require_valid_concrete ~lang_items:read_gate_li prog with
+    | Ok () -> []
+    | Error errs -> errs
+  in
+  let m5_errs = gate_errs (prog_of (mk_gate_fn (vec_of box_int) box_int read_elem)) in
+  let has_read_escape =
+    List.exists
+      (fun e -> contains_sub e "escapes from the container/pointee into an independent owning local")
+      m5_errs
+  in
+  (if has_read_escape then check "m5: projected Read of a non-shareable owning element into an independent local is rejected" true
+   else begin
+     Printf.printf "    errors:\n%s\n" (String.concat "\n    " m5_errs);
+     check "m5: projected Read of a non-shareable owning element into an independent local is rejected" false
+   end);
+
+  (* m6: the same shape with a SHAREABLE element (String) -> PASS *)
+  (match Mir_verify.require_valid_concrete ~lang_items:read_gate_li
+           (prog_of (mk_gate_fn (vec_of Type_repr.String) Type_repr.String read_elem)) with
+   | Ok () -> check "m6: projected Read of a shareable element (String) into a local passes" true
+   | Error errs ->
+       Printf.printf "    %s\n" (String.concat "\n    " errs);
+       check "m6: projected Read of a shareable element (String) into a local passes" false);
+
+  (* m7: the projected Read consumed as a call argument (a borrow) -> PASS.
+     The callee owns a Box[Int] parameter; the argument is the Read of the
+     container element, so the read is a borrow into the call, not an
+     independent owner. *)
+  let callee_inst =
+    Instance_id.make ~callable:(Ids.Callable_id.make 9101) ~type_args:[||]
+  in
+  let callee_fn : Seed_mir.function_ =
+    {
+      Seed_mir.name = "read_gate_callee";
+      instance = callee_inst;
+      params = [| let_param box_int |];
+      locals = [| Type_repr.Unit; box_int |];
+      blocks = [| { Seed_mir.id = 0; statements = []; terminator = Seed_mir.Ret } |];
+      entry = 0;
+    }
+  in
+  let caller_fn : Seed_mir.function_ =
+    {
+      Seed_mir.name = "read_gate_caller";
+      instance = Instance_id.make ~callable:(Ids.Callable_id.make 9102) ~type_args:[||];
+      params = [| let_param (vec_of box_int) |];
+      locals = [| Type_repr.Unit; vec_of box_int; Type_repr.Unit |];
+      blocks =
+        [|
+          {
+            Seed_mir.id = 0;
+            statements = [];
+            terminator =
+              Seed_mir.Call
+                ( { Seed_mir.root = Seed_mir.Local 2; projections = [] },
+                  Seed_mir.User callee_inst,
+                  [| { Seed_mir.effect_ = Access_effect.Read; value = read_elem } |],
+                  1,
+                  None );
+          };
+          { Seed_mir.id = 1; statements = []; terminator = Seed_mir.Ret };
+        |];
+      entry = 0;
+    }
+  in
+  let m7_errs =
+    gate_errs
+      { Seed_mir.functions = [| caller_fn; callee_fn |]; statics = [||]; types = [||] }
+  in
+  (if
+     List.exists
+       (fun e -> contains_sub e "escapes from the container/pointee into an independent owning local")
+       m7_errs
+   then begin
+     Printf.printf "    errors:\n%s\n" (String.concat "\n    " m7_errs);
+     check "m7: projected Read consumed as a call argument (borrow) passes" false
+   end
+   else check "m7: projected Read consumed as a call argument (borrow) passes" true);
+
   if !failures = 0 then begin
     Printf.printf "tg_verify: ALL PASS\n";
     Selfcheck_sentinel.emit_and_exit "tg_verify"

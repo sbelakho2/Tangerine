@@ -25,9 +25,14 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# The shared timeout facility (GNU timeout / Homebrew gtimeout) is the ONE
+# authority: the slice runner must not assume a bare `timeout` exists.
+# shellcheck source=scripts/bootstrap_helpers.sh
+source "$ROOT/scripts/bootstrap_helpers.sh"
+
 SLICE_SIZES="${SLICE_SIZES:-10 20 30 40 45}"
 STAGE0="stage0_ocaml/_build/default/bin/tg_stage0.exe"
-TARGET="aarch64-apple-darwin"
+TARGET="${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}"
 OUT_DIR="build/slices"
 SLICE_TIMEOUT="${SLICE_TIMEOUT_S:-3600}"
 
@@ -111,7 +116,7 @@ while IFS= read -r k; do
 
   echo "run_bootstrap_slices: RUN K=${k} modules=${modules} (hard timeout ${SLICE_TIMEOUT}s)" >&2
   rc=0
-  timeout "$SLICE_TIMEOUT" "$STAGE0" bootstrap-check \
+  bh_run_with_timeout "$SLICE_TIMEOUT" "$STAGE0" bootstrap-check \
     --manifest "$manifest" --repo-root . --target "$TARGET" >"$out" 2>&1 || rc=$?
 
   if [ "$rc" -eq 124 ]; then
