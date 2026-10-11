@@ -48,7 +48,7 @@ let () =
     s
   in
   let remove_if path = if Sys.file_exists path then Sys.remove path in
-  let run_size n =
+  let run_size ?(require_steps = true) n =
     write_file n_file (string_of_int n);
     write_file flag "1\n";
     let result =
@@ -67,13 +67,17 @@ let () =
             let steps =
               match run.Driver.bvr_vm_steps with
               | Some s -> s
-              | None -> fail "size %d: warm run exposed no VM step count" n
+              | None ->
+                  if require_steps then
+                    fail "size %d: warm run exposed no VM step count" n
+                  else -1
             in
             let expected_evals = 3 * n + 2 in
             if evals <> expected_evals then
               fail "size %d: evals=%d want exactly %d" n evals expected_evals;
-            Printf.printf "CFG_VM_SCALING n=%d steps=%d evals=%d cache_hit=%b\n%!"
-              n steps evals run.Driver.bvr_cache_hit;
+            if require_steps then
+              Printf.printf "CFG_VM_SCALING n=%d steps=%d evals=%d cache_hit=%b\n%!"
+                n steps evals run.Driver.bvr_cache_hit;
             (n, steps))
         | Some code -> fail "size %d: kernel exit %d" n code
         | None ->
@@ -81,10 +85,10 @@ let () =
               (match run.Driver.bvr_trap with Some t -> t | None -> "?"))
 
   in
-  (* warmup: populate the VM cache (cold pipeline; its steps are not
-     compared) *)
+  (* warmup: populate the VM cache (the cold pipeline run exposes no VM
+     steps; that is expected and its row is not compared) *)
   let warm_n = 64 in
-  ignore (run_size warm_n);
+  ignore (run_size ~require_steps:false warm_n);
   let sizes = [ 256; 512; 1024; 2048 ] in
   let rows = List.map run_size sizes in
   let steps_of n = List.assoc n rows in
@@ -105,7 +109,7 @@ let () =
   if !ok then begin
     Printf.printf "CFG_VM_SCALING_BATTERY fails=0 cases=%d steps_first=%d steps_last=%d\n%!"
       (List.length sizes) first last;
-    print_string "TANGERINE_SELFCHECK_PASS name=tg_cfg_scaling version=1\n%!";
+    Printf.printf "TANGERINE_SELFCHECK_PASS name=tg_cfg_scaling version=1\n%!";
     exit 0
   end
   else begin
