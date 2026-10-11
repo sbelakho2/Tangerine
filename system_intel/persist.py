@@ -313,6 +313,20 @@ def _invoke_provider(provider, root_path: Path, commit_sha):
     return snap, ""
 
 
+def _provider_scope(provider, snap) -> dict:
+    """The provider-declared semantic scope of an observation.
+
+    Preference: the snapshot's own ``scope`` (the provider knows what its
+    completeness verdicts are relative to), then the provider object's.
+    Never a bare ``{"provider": id}``: completeness without scope is
+    meaningless.
+    """
+    scope = _field(snap, "scope", None)
+    if not isinstance(scope, dict) or not scope:
+        scope = _field(provider, "scope", None)
+    return dict(scope) if isinstance(scope, dict) else {}
+
+
 def _snapshot_usable(snap) -> bool:
     if snap is None:
         return False
@@ -893,6 +907,53 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
         )
         support_rows += 1
 
+    # The CONTRACT canonicalization bridge (one canonical representation):
+    # the documented neutral convention is a fact ``predicate='contract_ref'``
+    # with ``object='contract:<kind>:<name>'`` and the holder/referenced
+    # symbol as the subject.  Federation materializes each such assertion
+    # into the dedicated contract table ONCE (stable component identity,
+    # provider and observation provenance via support); Contract entities
+    # and constrained_by relations stay DERIVED views.
+    contracts_upserted = 0
+    for fact in facts_in:
+        if str(_field(fact, "predicate", "") or "") != "contract_ref":
+            continue
+        obj = str(_field(fact, "object", "") or "")
+        if not obj.startswith("contract:"):
+            continue
+        body = obj[len("contract:"):]
+        if ":" in body:
+            contract_kind, contract_name = body.split(":", 1)
+        else:
+            contract_kind, contract_name = "unknown", body
+        if not contract_kind or not contract_name:
+            continue
+        component = str(
+            _field(fact, "stable_subject", None)
+            or _field(fact, "subject", "")
+            or ""
+        )
+        contract_provider = str(_field(fact, "provider", pid) or pid)
+        contract_revision = str(_field(fact, "provider_revision", ver) or ver)
+        contract_id = graph.add_contract(
+            contract_kind, contract_name,
+            component_qn=component or None,
+            snapshot_id=snapshot_id,
+            provenance=str(_field(fact, "provenance", "declared") or "declared"),
+            confidence=float(_field(fact, "confidence", 1.0) or 1.0),
+            derived_from=_as_list(_field(fact, "derived_from", ())),
+            uncertainty=_field(fact, "uncertainty", None),
+        )
+        contracts_upserted += 1
+        graph.accumulate_support(
+            snapshot_id, "contract", contract_id,
+            provider=contract_provider, provider_revision=contract_revision,
+            confidence=float(_field(fact, "confidence", 1.0) or 1.0),
+            detail="contract_ref",
+            observation_id=_observation_for(contract_provider),
+        )
+        support_rows += 1
+
     for ev in evidence_records:
         graph.add_evidence(
             snapshot_id,
@@ -911,6 +972,7 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
         "facts": facts_upserted,
         "unresolved_edges": unresolved_edges,
         "evidence": len(evidence_records),
+        "contracts": contracts_upserted,
         "support": support_rows,
         "counts_by_kind": counts_by_kind,
     }
@@ -962,6 +1024,7 @@ def _base_report(graph, snapshot_row, identity, db_path, started):
                 "authority": obs["authority"],
                 "enumeration_completeness": obs["enumeration_completeness"],
                 "resolution_completeness": obs["resolution_completeness"],
+                "scope": obs.get("scope") or {},
             }
             for obs in graph.observations(int(snapshot_row["id"]))
         ],
@@ -993,8 +1056,6 @@ def scan(root, db_path, *, commit_sha=None, repo_root=None, strict_clean=False,
     # behind, never a partially written snapshot (P0-4).
     graph = Graph.open(db_path)
     try:
-        provider_pairs = _provider_pairs(selected)
-
         invoked: list[tuple] = []  # (provider, snapshot|None, note)
         for candidate in selected:
             snap, note = _invoke_provider(candidate, root_path, commit_sha)
@@ -1009,9 +1070,14 @@ def scan(root, db_path, *, commit_sha=None, repo_root=None, strict_clean=False,
                     f"no provider produced a usable snapshot for {root_path}: {note}"
                 )
             usable = [(fallback, snap)]
+            invoked.append((fallback, snap, note))
             if not any(str(getattr(p, "provider_id", "")) == fallback.provider_id
                        for p in selected):
                 selected = selected + [fallback]
+
+        # the provider-set digest must describe the FINAL invoked set
+        # (including a fallback appended above), never the pre-fallback set
+        provider_pairs = _provider_pairs(selected)
 
         primary_provider, primary_snap = usable[0]
 
@@ -1035,14 +1101,23 @@ def scan(root, db_path, *, commit_sha=None, repo_root=None, strict_clean=False,
             target = ""
 
         obs_entries = []
-        for prov, snap in usable:
+        for prov, snap, _note in invoked:
+            if snap is None:
+                continue
             pid = str(getattr(prov, "provider_id", "") or "unknown-provider")
             ver = str(getattr(prov, "provider_version", "") or "")
+            # EVERY valid provider invocation is an immutable observation —
+            # including degraded/unavailable/evidence-only snapshots: a
+            # failure is knowledge ("artifact corrupt", "compiler absent")
+            # and must carry its own revision identity, not vanish.
+            scope = _provider_scope(prov, snap)
+            scope["provider"] = pid
             obs_entries.append({
                 "provider": prov,
                 "snapshot": snap,
                 "provider_id": pid,
                 "provider_version": ver,
+                "usable": _snapshot_usable(snap),
                 "observation_kind": observation_kind or _observation_kind_for(prov),
                 "observation_digest": _snapshot_digest(pid, ver, snap,
                                                        str(root_path)),
@@ -1051,7 +1126,7 @@ def scan(root, db_path, *, commit_sha=None, repo_root=None, strict_clean=False,
                                                 or _snap_family_verdict(snap, "entities")),
                 "resolution_completeness": str(_field(snap, "completeness_relations", None)
                                                or _snap_family_verdict(snap, "relations")),
-                "scope": {"provider": pid},
+                "scope": scope,
             })
         obs_digest = observation_set_digest([e["observation_digest"] for e in obs_entries])
 
@@ -1125,6 +1200,11 @@ def scan(root, db_path, *, commit_sha=None, repo_root=None, strict_clean=False,
             )
             for entry in obs_entries:
                 if entry["provider"] is primary_provider:
+                    continue
+                if not entry.get("usable", True):
+                    # degraded/unavailable observations are recorded in the
+                    # immutable observation set (their failure is knowledge)
+                    # but never projected as canonical rows
                     continue
                 _project_snapshot(
                     graph, snapshot_id, entry["snapshot"],

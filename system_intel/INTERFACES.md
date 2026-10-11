@@ -356,6 +356,29 @@ higher-authority canonical row, adds one `support` observation per provider,
 and PRESERVES any disagreement in the support detail (`conflict:<json>`)
 instead of overwriting it.
 
+EVERY valid provider invocation is an immutable ProviderObservation —
+including degraded/unavailable/evidence-only snapshots. "Usable" only decides
+which snapshot supplies canonical rows; a failure ("artifact corrupt",
+"compiler absent") is knowledge and carries its own revision identity, so a
+changed failure reason is a NEW federated revision. `scope` carries the
+provider's semantic scope (target/features, module sets, test globs,
+platform/horizon) — completeness without scope is meaningless. The
+provider-set digest is computed AFTER the final invoked set is known
+(including an appended fallback).
+
+CONTRACT BRIDGE (one canonical representation): the documented neutral
+convention is a fact `predicate='contract_ref'` with
+`object='contract:<kind>:<name>'` and the holder/referenced symbol as the
+subject. Federation materializes each such assertion into the dedicated
+`contract` table exactly once (stable component identity, provider and
+observation provenance via support); Contract entities and `constrained_by`
+relations are DERIVED views, never competing sources of truth.
+
+COMPLETENESS IS ASSERTED, NEVER INFERRED: `complete` comes only from an
+authoritative producer's capability record under its scope. Rows in storage
+prove existence and yield at most `partial`; the absence of an unresolved
+row never proves closed-world enumeration.
+
 - `providers/generic_static.py`: wraps `extract_core` (renamed semantics:
   the zero-install fallback). Capabilities: entities complete (Tier 0/1),
   relations partial, calls unavailable, runtime unknown.

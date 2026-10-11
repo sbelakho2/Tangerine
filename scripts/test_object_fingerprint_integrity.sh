@@ -465,6 +465,75 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════
+# F. REQUIRED-PHASE-SET COMPLETENESS: the same required phase missing from
+#    BOTH stages, duplicates (identical and conflicting) and unknown phases
+#    must FAIL before any digest comparison — the old walk compared only
+#    the records that existed on both sides and could prove an incomplete
+#    set when both stages omitted the exact same proof.
+# ══════════════════════════════════════════════════════════════════════
+F="$TMP/fixture-phaseset"
+mkdir -p "$F/.fingerprints"
+cp "$fpC2" "$F/.fingerprints/tg_stage2.fingerprints"
+cp "$fpC3" "$F/.fingerprints/tg_stage3.fingerprints"
+if run_equality "$F" release; then
+  pass "F+ (control): all ten exact phases compare equal in release mode"
+else
+  bad "F+ (control): ten exact phases failed equality (see $F/equality.log)"
+fi
+
+# F1: the SAME required phase (`tokens`) deleted from BOTH stages.
+mkdir -p "$F/f1/.fingerprints"
+grep -vE '^FINGERPRINT [^ ]+ tokens ' "$fpC2" > "$F/f1/.fingerprints/tg_stage2.fingerprints"
+grep -vE '^FINGERPRINT [^ ]+ tokens ' "$fpC3" > "$F/f1/.fingerprints/tg_stage3.fingerprints"
+if run_equality "$F/f1"; then
+  bad "F1: equality PASSED with the required phase tokens deleted from BOTH stages"
+else
+  expect_log "$F/f1/equality.log" "required phase 'tokens' occurs 0 time" \
+    "F1: same required phase missing from both stages is caught (unconditional)"
+fi
+
+# F2: duplicate IDENTICAL tokens record in one stage.
+mkdir -p "$F/f2/.fingerprints"
+cp "$fpC2" "$F/f2/.fingerprints/tg_stage2.fingerprints"
+awk '$1 == "FINGERPRINT" && $3 == "tokens" { print; exit }' "$fpC2" \
+  >> "$F/f2/.fingerprints/tg_stage2.fingerprints"
+cp "$fpC3" "$F/f2/.fingerprints/tg_stage3.fingerprints"
+if run_equality "$F/f2"; then
+  bad "F2: equality PASSED with a duplicate identical tokens record"
+else
+  expect_log "$F/f2/equality.log" "required phase 'tokens' occurs 2 time" \
+    "F2: duplicate identical phase record is caught"
+fi
+
+# F3: duplicate CONFLICTING tokens record in one stage (release mode).
+mkdir -p "$F/f3/.fingerprints"
+cp "$fpC2" "$F/f3/.fingerprints/tg_stage2.fingerprints"
+echo "FINGERPRINT tg_stage2 tokens 0000000000000000000000000000000000000000000000000000000000000000 probe_success=true byte_count=1" \
+  >> "$F/f3/.fingerprints/tg_stage2.fingerprints"
+cp "$fpC3" "$F/f3/.fingerprints/tg_stage3.fingerprints"
+if run_equality "$F/f3" release; then
+  bad "F3: equality PASSED with a duplicate conflicting tokens record (release)"
+else
+  expect_log "$F/f3/equality.log" "required phase 'tokens' occurs 2 time" \
+    "F3: duplicate conflicting phase record is caught in release mode"
+fi
+
+# F4: an unexpected eleventh phase in BOTH stages.
+mkdir -p "$F/f4/.fingerprints"
+cp "$fpC2" "$F/f4/.fingerprints/tg_stage2.fingerprints"
+cp "$fpC3" "$F/f4/.fingerprints/tg_stage3.fingerprints"
+echo "FINGERPRINT tg_stage2 bogus 1111111111111111111111111111111111111111111111111111111111111111 probe_success=true byte_count=1" \
+  >> "$F/f4/.fingerprints/tg_stage2.fingerprints"
+echo "FINGERPRINT tg_stage3 bogus 1111111111111111111111111111111111111111111111111111111111111111 probe_success=true byte_count=1" \
+  >> "$F/f4/.fingerprints/tg_stage3.fingerprints"
+if run_equality "$F/f4"; then
+  bad "F4: equality PASSED with an unexpected eleventh phase"
+else
+  expect_log "$F/f4/equality.log" "unknown phase 'bogus'" \
+    "F4: unknown phase is caught"
+fi
+
+# ══════════════════════════════════════════════════════════════════════
 if [ "$fail" -ne 0 ]; then
   echo "test_object_fingerprint_integrity: FAIL"
   exit 1

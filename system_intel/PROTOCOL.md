@@ -137,7 +137,10 @@ human tool) MAY return a document to a producer. Ingest:
    canonical `semantic_digest` becomes an `observation_digest` on a linked
    `Observation` (kind `verification` by default, or the declared
    `observations` records), so the federated revision that includes it can
-   never be confused with the source-only revision;
+   never be confused with the source-only revision. Creating the observation
+   is a PRECONDITION: if it fails, the ingest reports the error and writes
+   NOTHING (no provenance-less evidence or support), and every support row it
+   does write pins that exact `observation_id`;
 6. counts and skips unknown record kinds — never crashes on future records.
 
 This is how a verifier makes the system model smarter without the model

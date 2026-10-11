@@ -390,34 +390,44 @@ def _record(kind: str, obj) -> dict:
     return data
 
 
-def _content_id(prefix: str, *parts) -> str:
-    """A stable id derived ONLY from canonical content (never a row id)."""
+def _content_hash(*parts) -> str:
+    """The RAW canonical content hash (no record-kind prefix)."""
     canonical = "\x1f".join(str(part if part is not None else "") for part in parts)
-    return f"{prefix}:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _content_id(record_kind: str, *parts) -> str:
+    """``<RecordKind>:<raw content hash>`` — applied EXACTLY ONCE.
+
+    The ``stable_id`` of a record is the raw stable semantic identity; the
+    record ``id`` prefixes the record kind.  Calling this twice (or
+    prefixing an already-prefixed value) produced ids such as
+    ``Relationship:Relationship:<hash>``.
+    """
+    return f"{record_kind}:" + _content_hash(*parts)
 
 
 def evidence_stable_id(row: dict) -> str:
-    """Evidence identity = hash(kind, ref, digest, summary)."""
-    return _content_id("Evidence", row.get("kind"), row.get("ref"),
-                       row.get("digest"), row.get("summary"))
+    """Raw Evidence stable identity = hash(kind, ref, digest, summary)."""
+    return _content_hash(row.get("kind"), row.get("ref"),
+                         row.get("digest"), row.get("summary"))
 
 
 def invariant_stable_id(row: dict) -> str:
-    return _content_id("Invariant", row.get("statement"), row.get("component_qn"))
+    return _content_hash(row.get("statement"), row.get("component_qn"))
 
 
 def contract_stable_id(row: dict) -> str:
-    return _content_id("Contract", row.get("kind"), row.get("name"),
-                       row.get("component_qn"))
+    return _content_hash(row.get("kind"), row.get("name"), row.get("component_qn"))
 
 
 def incident_stable_id(row: dict) -> str:
-    return _content_id("Incident", row.get("summary"), row.get("component_qn"),
-                       row.get("occurred_utc"))
+    return _content_hash(row.get("summary"), row.get("component_qn"),
+                         row.get("occurred_utc"))
 
 
 def change_stable_id(row: dict) -> str:
-    return _content_id("Change", row.get("commit_sha"), row.get("summary"))
+    return _content_hash(row.get("commit_sha"), row.get("summary"))
 
 
 # Transport/environment fields that must never influence semantic equality.
@@ -493,7 +503,9 @@ def export_protocol(
 
     evidence_rows = data.get("evidence", [])
     # Evidence identity is content-derived; DB row ids never leak into ids.
-    evidence_ids = {int(e["id"]): evidence_stable_id(e) for e in evidence_rows}
+    evidence_ids = {
+        int(e["id"]): f"Evidence:{evidence_stable_id(e)}" for e in evidence_rows
+    }
 
     def evidence_refs_for(subject_table: str, subject_id: int) -> list[EvidenceRef]:
         out = []
@@ -719,8 +731,7 @@ def export_protocol(
                 payload = {}
         payload = payload if isinstance(payload, dict) else {}
         claim_id = payload.get("claim_id") or r.get("ref") or ""
-        stable = _content_id("Counterexample", claim_id, r.get("summary"),
-                             r.get("digest"))
+        stable = _content_hash(claim_id, r.get("summary"), r.get("digest"))
         counterexamples.append(
             _record(
                 "Counterexample",
@@ -736,8 +747,7 @@ def export_protocol(
     unresolved = []
     for r in data.get("unresolved_edges", []):
         provider = str(r.get("provider") or "")
-        stable = _content_id("UnresolvedClaim", r.get("src_key"), r.get("kind"),
-                             r.get("dst_raw"))
+        stable = _content_hash(r.get("src_key"), r.get("kind"), r.get("dst_raw"))
         unresolved.append(
             _record(
                 "UnresolvedClaim",
@@ -764,8 +774,8 @@ def export_protocol(
     for r in data.get("relations", []):
         provider, version = _provider_of(r)
         resolved = r.get("dst_id") is not None
-        stable = _content_id(
-            "Relationship", r.get("src_key"), r.get("kind"),
+        stable = _content_hash(
+            r.get("src_key"), r.get("kind"),
             r.get("dst_key") if resolved else f"unresolved:{r.get('dst_key', '')}",
         )
         relationships.append(

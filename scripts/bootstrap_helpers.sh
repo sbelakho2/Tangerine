@@ -568,6 +568,50 @@ bh_phase_equality() {
   local failures=0 compared=0 unavailable=0
   local line_a line_b parsed_a parsed_b
   local tag st phase digest_a ps_a bc_a digest_b ps_b bc_b
+  # ── REQUIRED-SET COMPLETENESS (checked BEFORE any comparison) ────────
+  # The walk below iterates over the records that EXIST; two stages that
+  # both omitted the SAME required phase would compare "equal" on the
+  # remainder and prove an incomplete set.  Every canonical phase must
+  # occur EXACTLY ONCE in EACH stage, with no unknown phase and no extra
+  # or duplicate record.  This check is unconditional (all modes).
+  local required_total=0 required_phase count_a count_b total_a total_b
+  local fp_file fp_tag fp_stage fp_phase
+  for required_phase in $BOOTSTRAP_PHASES; do
+    required_total=$((required_total + 1))
+    count_a="$(awk -v p="$required_phase" \
+      '$1 == "FINGERPRINT" && $3 == p { n++ } END { print n + 0 }' "$fa")"
+    count_b="$(awk -v p="$required_phase" \
+      '$1 == "FINGERPRINT" && $3 == p { n++ } END { print n + 0 }' "$fb")"
+    if [ "$count_a" -ne 1 ]; then
+      bh_err "phase equality: required phase '$required_phase' occurs $count_a time(s) in $stage_a (exactly once required)"
+      failures=$((failures + 1))
+    fi
+    if [ "$count_b" -ne 1 ]; then
+      bh_err "phase equality: required phase '$required_phase' occurs $count_b time(s) in $stage_b (exactly once required)"
+      failures=$((failures + 1))
+    fi
+  done
+  total_a="$(awk '$1 == "FINGERPRINT" { n++ } END { print n + 0 }' "$fa")"
+  total_b="$(awk '$1 == "FINGERPRINT" { n++ } END { print n + 0 }' "$fb")"
+  if [ "$total_a" -ne "$required_total" ]; then
+    bh_err "phase equality: $stage_a carries $total_a fingerprint record(s); exactly $required_total required (missing, duplicate or unknown phases — an incomplete set is never equal)"
+    failures=$((failures + 1))
+  fi
+  if [ "$total_b" -ne "$required_total" ]; then
+    bh_err "phase equality: $stage_b carries $total_b fingerprint record(s); exactly $required_total required (missing, duplicate or unknown phases — an incomplete set is never equal)"
+    failures=$((failures + 1))
+  fi
+  for fp_file in "$fa" "$fb"; do
+    while read -r fp_tag fp_stage fp_phase; do
+      case " $BOOTSTRAP_PHASES " in
+        *" $fp_phase "*) : ;;
+        *)
+          bh_err "phase equality: unknown phase '$fp_phase' in $fp_file (not in BOOTSTRAP_PHASES)"
+          failures=$((failures + 1))
+          ;;
+      esac
+    done < <(awk '$1 == "FINGERPRINT" { print $1, $2, $3 }' "$fp_file")
+  done
   while IFS= read -r line_a; do
     [ -n "$line_a" ] || continue
     read -r tag st phase digest_a ps_a bc_a <<< "$line_a"

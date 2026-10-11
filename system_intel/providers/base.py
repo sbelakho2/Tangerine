@@ -188,6 +188,12 @@ class ProviderSnapshot:
     provider_id: str = ""
     provider_version: str = ""
     capabilities: list[ProviderCapability] = field(default_factory=list)
+    # The SEMANTIC SCOPE this observation speaks about (what the
+    # completeness verdicts are relative to): target/features, languages,
+    # module sets, test globs, platform/horizon for runtime observations.
+    # A completeness verdict without scope is meaningless, so this travels
+    # with the snapshot into the immutable ProviderObservation.
+    scope: dict = field(default_factory=dict)
 
     def completeness(self, family: str) -> str:
         """Snapshot-level family verdict (mirrors the capability list)."""

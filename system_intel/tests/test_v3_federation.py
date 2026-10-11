@@ -84,6 +84,40 @@ class _GrowingProvider:
         }
 
 
+class _DegradedProvider:
+    """A provider whose invocation succeeds but yields NO usable static rows.
+
+    Its failure is meaningful knowledge (an unavailable/corrupt artifact),
+    so it must still become an immutable ProviderObservation with its own
+    content digest — a changed failure reason is a new federated revision.
+    """
+
+    provider_id = "degraded-native"
+    provider_version = "1.0"
+    authority = 0  # native authority, but degraded
+    capabilities = {"entities": "unavailable"}
+
+    def __init__(self, reason):
+        self.reason = reason
+
+    def snapshot(self, root, *, commit_sha=None):
+        from system_intel.providers.base import (
+            ProviderCapability, ProviderEvidence, ProviderSnapshot,
+        )
+        return ProviderSnapshot(
+            entities=[], relations=[], facts=[], unresolved=[],
+            evidence=[ProviderEvidence(kind="note", ref="artifact",
+                                       summary=self.reason)],
+            provider_id=self.provider_id,
+            provider_version=self.provider_version,
+            capabilities=[ProviderCapability(family="entities",
+                                             verdict="unavailable",
+                                             note=self.reason)],
+            scope={"target": "aarch64-apple-darwin",
+                   "module_set": "compiler-closure"},
+        )
+
+
 class _CompletenessProvider:
     provider_id = "axes-static"
     provider_version = "1.0"
@@ -586,6 +620,85 @@ class FederationV3TestCase(unittest.TestCase):
             conflict = [r for r in support if r["detail"].startswith("conflict:")]
             self.assertEqual(len(conflict), 1)
             self.assertIn("partial", conflict[0]["detail"])
+
+    # (16) ---------------------------------------------------------------
+    def test_degraded_observation_is_persistent_knowledge(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        (repo / "x.py").write_text("def f():\n    return 1\n")
+
+        first = scan(repo, self.db, provider=_DegradedProvider("artifact header corrupt"))
+        providers = {o["provider"] for o in first["observations"]}
+        # the degraded provider AND the generic fallback are BOTH observations
+        self.assertIn("degraded-native", providers)
+        self.assertIn("generic-static", providers)
+        degraded = [o for o in first["observations"]
+                    if o["provider"] == "degraded-native"][0]
+        self.assertTrue(degraded["observation_digest"])
+        self.assertEqual(degraded["authority"], "native")
+        # the provider-declared semantic scope travels with the observation
+        self.assertEqual(
+            degraded["scope"].get("module_set"), "compiler-closure"
+        )
+
+        # the provider-set digest describes the FINAL invoked set (native +
+        # the appended generic fallback), not the pre-fallback selection
+        from system_intel.persist import _provider_pairs, _provider_set_digest
+        self.assertEqual(
+            first["identity"]["provider_set_digest"],
+            _provider_set_digest([
+                ("degraded-native", "1.0"), ("generic-static", "2.0"),
+            ]),
+        )
+        with Graph.open(self.db, create=False) as g:
+            snap = g.latest_finalized_snapshot()
+            records = {
+                r["provider"]: r for r in g._require_conn().execute(
+                    "SELECT * FROM provider_record WHERE snapshot_id=?",
+                    (int(snap["id"]),),
+                ).fetchall()
+            }
+            self.assertEqual(records["degraded-native"]["invoked"], 1)
+            # a DIFFERENT failure reason is a NEW observation → new revision
+            second = scan(repo, self.db,
+                          provider=_DegradedProvider("artifact format version 9"))
+            self.assertFalse(second["reused"])
+            self.assertNotEqual(
+                first["identity"]["observation_set_digest"],
+                second["identity"]["observation_set_digest"],
+            )
+
+    # (17) ---------------------------------------------------------------
+    def test_contract_ref_facts_become_canonical_contracts(self):
+        from system_intel.persist import _project_snapshot
+        from system_intel.providers.base import ProviderFact, ProviderSnapshot
+
+        with Graph.open(self.db) as g:
+            snap = g.begin_draft(_identity("contracts"))
+            provider = ProviderSnapshot(
+                facts=[ProviderFact(
+                    subject="native:decl:1", stable_subject="native:decl:1",
+                    predicate="contract_ref", object="contract:api:orders",
+                )],
+                provider_id="tangerine-native", provider_version="1",
+            )
+            _project_snapshot(g, snap, provider, "tangerine-native", "1",
+                              canonical=True)
+            row = g._require_conn().execute(
+                "SELECT kind, name, component_qn FROM contract WHERE snapshot_id=?",
+                (snap,),
+            ).fetchone()
+            self.assertIsNotNone(row, "contract_ref must reach the canonical table")
+            self.assertEqual(
+                (row["kind"], row["name"], row["component_qn"]),
+                ("api", "orders", "native:decl:1"),
+            )
+            support = g._require_conn().execute(
+                "SELECT subject_table, detail FROM support "
+                "WHERE subject_table='contract'"
+            ).fetchone()
+            self.assertIsNotNone(support)
+            self.assertEqual(support["detail"], "contract_ref")
 
     # (10) ---------------------------------------------------------------
     def test_finalization_recomputes_the_revision_digest(self):

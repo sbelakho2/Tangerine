@@ -182,7 +182,7 @@ class ProtocolV2Tests(unittest.TestCase):
         # Evidence identity is content-derived (never "Evidence:<row id>").
         self.assertEqual(
             cxs[0]["evidence"][0]["id"],
-            evidence_stable_id({
+            "Evidence:" + evidence_stable_id({
                 "kind": "counterexample",
                 "ref": "claim:payment-idempotent",
                 "digest": None,
@@ -385,6 +385,58 @@ class ProtocolV2Tests(unittest.TestCase):
         self.assertEqual(observations[0]["provider"], "kiwi")
         self.assertEqual(observations[0]["observation_kind"], "verification")
         self.assertEqual(observations[0]["authority"], "external")
+
+    def test_ingest_support_is_bound_to_the_document_observation(self):
+        doc = {
+            "protocol_version": 2,
+            "records": {
+                "requirements": [{
+                    "record": "Requirement", "id": "req:1",
+                    "statement": "checkout is idempotent",
+                }],
+            },
+        }
+        draft = self.g.begin_draft(_identity("ingest-bind"))
+        report = ingest_protocol(self.g, doc, snapshot_id=draft, provider_id="kiwi")
+        self.assertEqual(report["errors"], [], report["errors"])
+        obs_id = report["observation_ids"][0]
+        support = self.g._require_conn().execute(
+            "SELECT provider, observation_id FROM support WHERE snapshot_id=?",
+            (draft,),
+        ).fetchall()
+        self.assertTrue(support, "a requirement claim must accumulate support")
+        self.assertEqual(
+            {int(r["observation_id"]) for r in support}, {int(obs_id)},
+            "every support row must pin the exact ProviderObservation",
+        )
+
+    def test_ingest_without_observation_identity_writes_nothing(self):
+        # An empty provider makes add_provider_observation raise: the ingest
+        # must FAIL CLOSED before writing evidence/support, never leave
+        # provenance-less claims behind.
+        doc = {
+            "protocol_version": 2,
+            "records": {
+                "observations": [{
+                    "record": "Observation", "provider": "",
+                    "observation_kind": "verification",
+                    "observation_digest": "",
+                }],
+                "requirements": [{
+                    "record": "Requirement", "id": "req:1", "statement": "x",
+                }],
+            },
+        }
+        draft = self.g.begin_draft(_identity("ingest-fail"))
+        report = ingest_protocol(self.g, doc, snapshot_id=draft, provider_id="")
+        self.assertTrue(report["errors"], "observation failure must be reported")
+        conn = self.g._require_conn()
+        for table in ("evidence", "support", "fact"):
+            n = conn.execute(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE snapshot_id=?", (draft,)
+            ).fetchone()["n"]
+            self.assertEqual(n, 0,
+                             f"{table} rows must not exist without observation identity")
 
     # legacy documents (no observations) still ingest and record one
     def test_ingest_legacy_document_still_records_observation(self):

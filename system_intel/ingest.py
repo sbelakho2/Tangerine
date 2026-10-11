@@ -151,8 +151,18 @@ def ingest_protocol(graph, doc, *, snapshot_id, provider_id, provider_version=""
             )
             graph.link_snapshot_observation(snapshot_id, obs_id)
             report["observation_ids"].append(obs_id)
-    except Exception as exc:  # noqa: BLE001 - observation identity is reported, never fatal
+    except Exception as exc:  # noqa: BLE001 - observation identity is a PRECONDITION
+        # FAIL CLOSED: without the observation identity, no evidence or
+        # support may be written into the draft (provenance is the point of
+        # the ingest model); report and leave the draft untouched by this
+        # document.
         report["errors"].append(f"observation: {exc}")
+        return report
+
+    def ingest_observation_id():
+        """The exact ProviderObservation this document established."""
+        ids = report.get("observation_ids") or []
+        return int(ids[0]) if ids else None
 
     # 0. Unknown record kinds are counted and skipped (forward compatibility),
     # in every bucket — a future protocol minor version must not crash ingest.
@@ -250,6 +260,7 @@ def ingest_protocol(graph, doc, *, snapshot_id, provider_id, provider_version=""
                     confidence=confidence_value,
                     evidence_id=int(ev_ids[0]),
                     detail="protocol:entity",
+                    observation_id=ingest_observation_id(),
                 )
             except Exception as exc:  # noqa: BLE001
                 report["errors"].append(f"entity support {stable}: {exc}")
@@ -339,6 +350,7 @@ def ingest_protocol(graph, doc, *, snapshot_id, provider_id, provider_version=""
                 confidence=1.0,
                 evidence_id=ev_id,
                 detail=f"requirement status={rec.get('status') or 'unknown'}",
+                observation_id=ingest_observation_id(),
             )
         except Exception as exc:  # noqa: BLE001
             report["errors"].append(f"requirement {rec.get('id')}: {exc}")
@@ -390,6 +402,7 @@ def ingest_protocol(graph, doc, *, snapshot_id, provider_id, provider_version=""
                     else float(rec.get("confidence") or 1.0),
                     evidence_id=int(ev_ids[0]),
                     detail=f"protocol:{stable}",
+                    observation_id=ingest_observation_id(),
                 )
             except Exception as exc:  # noqa: BLE001
                 report["errors"].append(f"support {stable}: {exc}")

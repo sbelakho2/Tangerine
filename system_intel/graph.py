@@ -1774,15 +1774,26 @@ class Graph:
         facts = _count("SELECT COUNT(*) AS n FROM fact WHERE snapshot_id=?", (snap,))
         tests = _count("SELECT COUNT(*) AS n FROM entity WHERE snapshot_id=? AND kind='Test'", (snap,))
 
+        # PRESENCE PROVES EXISTENCE, NEVER COMPLETENESS.  A family verdict
+        # is only ``complete`` when an authoritative producer ASSERTED it
+        # (a provider capability record under its scope); rows in storage
+        # alone yield at most ``partial``.  Discovering 19 of 20 functions
+        # cannot be distinguished from having found them all, and the
+        # absence of an unresolved row does not prove closed-world
+        # enumeration.
         if "entities" not in families:
-            families["entities"] = "complete" if entities else "unknown"
+            families["entities"] = "partial" if entities else "unknown"
         if "relations" not in families:
-            if relations_unresolved or unresolved_edges:
-                families["relations"] = "partial"
-            else:
-                families["relations"] = "complete" if relations_resolved else "unknown"
+            # unresolved claims are observed relations the resolver could
+            # not bind: presence (resolved OR unresolved) yields at most
+            # partial, never complete
+            families["relations"] = (
+                "partial"
+                if (relations_resolved or relations_unresolved or unresolved_edges)
+                else "unknown"
+            )
         if "facts" not in families:
-            families["facts"] = "complete" if facts else "unknown"
+            families["facts"] = "partial" if facts else "unknown"
         if "tests" not in families and tests:
             families["tests"] = "partial"
         if relations_unresolved or unresolved_edges:
