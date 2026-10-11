@@ -295,11 +295,61 @@ _V3_COLUMN_ADDITIONS = (
     ("relation", "site_completeness", "TEXT NOT NULL DEFAULT 'unknown'"),
     ("relation", "target_resolution_completeness", "TEXT NOT NULL DEFAULT 'unknown'"),
     ("unresolved_edge", "resolution_completeness", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ("support", "observation_id", "INTEGER"),
     ("provider_record", "scope", "TEXT NOT NULL DEFAULT '{}'"),
     ("provider_record", "authority", "TEXT NOT NULL DEFAULT 'fallback'"),
     ("fact", "stable_id", "TEXT NOT NULL DEFAULT ''"),
     ("contract", "stable_id", "TEXT NOT NULL DEFAULT ''"),
 )
+
+
+# Snapshot-owned family dropped when an EMPTY pre-v3 database is rebuilt
+# (children before parents).  SQLite cannot add UNIQUE/composite-FK
+# constraints in place, so a data-bearing v2 database is REFUSED (rescan
+# into a fresh database) rather than silently relabeled as v3.
+_V3_FAMILY_TABLES = (
+    "snapshot_observation", "provider_observation", "source_revision",
+    "support", "unresolved_edge", "relation", "evidence", "provider_record",
+    "fact", "invariant", "contract", "incident", "change", "entity",
+    "snapshot", "schema_version",
+)
+
+
+def _ensure_v3_structure(conn):
+    """Fail closed on a data-bearing pre-v3 database; rebuild empty ones.
+
+    A pre-v3 database cannot be upgraded in place: its snapshot UNIQUE
+    constraint predates `observation_set_digest`, and the v3 support/
+    evidence composite FKs and immutability triggers do not exist.  An
+    EMPTY pre-v3 database is rebuilt from schema.sql (no data to lose); a
+    database with any snapshot row is refused with the rescan instruction.
+    """
+    marker = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    ).fetchone()
+    if marker is None:
+        return  # fresh file: schema.sql creates the v3 structure
+    version_row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+    version = int(version_row["version"]) if version_row is not None else 0
+    if version >= SCHEMA_VERSION:
+        return
+    has_snapshot = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='snapshot'"
+    ).fetchone() is not None
+    if has_snapshot:
+        rows = int(conn.execute("SELECT COUNT(*) AS n FROM snapshot").fetchone()["n"])
+        if rows > 0:
+            raise SnapshotError(
+                f"database schema version {version} contains {rows} snapshot row(s); "
+                f"schema v{SCHEMA_VERSION} adds structural constraints (three-level "
+                "observation model, composite endpoint/evidence foreign keys, frozen "
+                "snapshot metadata) that SQLite cannot add in place — rescan into a "
+                "fresh database instead"
+            )
+    conn.execute("PRAGMA foreign_keys = OFF")
+    for table in _V3_FAMILY_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    conn.execute("PRAGMA foreign_keys = ON")
 
 
 def _migrate_added_columns(conn):
@@ -342,6 +392,7 @@ class Graph:
         conn.execute("PRAGMA foreign_keys = ON")
         schema_file = Path(__file__).with_name("schema.sql")
         if create:
+            _ensure_v3_structure(conn)
             conn.executescript(schema_file.read_text(encoding="utf-8"))
             _migrate_added_columns(conn)
             conn.commit()
@@ -995,20 +1046,37 @@ class Graph:
 
     def accumulate_support(self, snapshot_id, subject_table, subject_id, *,
                            provider, provider_revision="", confidence=1.0,
-                           evidence_id=None, detail=None) -> int:
+                           evidence_id=None, detail=None,
+                           observation_id=None) -> int:
+        """Accumulate ONE provider observation's support for a canonical row.
+
+        ``observation_id`` (level-2 provider_observation) pins WHICH
+        observation supplied the claim; it must be linked to the same
+        snapshot (enforced by a trigger).  Two distinct observations by the
+        same provider therefore stay distinguishable.
+        """
         conn = self._require_conn()
         snap = self._resolve_snapshot(snapshot_id)
         if evidence_id is None:
             row = conn.execute(
                 "SELECT id FROM support WHERE snapshot_id=? AND subject_table=? "
-                "AND subject_id=? AND provider=? AND evidence_id IS NULL",
+                "AND subject_id=? AND provider=? AND observation_id IS NULL "
+                "AND evidence_id IS NULL",
                 (snap, str(subject_table), int(subject_id), str(provider)),
             ).fetchone()
         else:
             row = conn.execute(
                 "SELECT id FROM support WHERE snapshot_id=? AND subject_table=? "
-                "AND subject_id=? AND provider=? AND evidence_id=?",
+                "AND subject_id=? AND provider=? AND observation_id IS NULL "
+                "AND evidence_id=?",
                 (snap, str(subject_table), int(subject_id), str(provider), int(evidence_id)),
+            ).fetchone()
+        if observation_id is not None:
+            row = conn.execute(
+                "SELECT id FROM support WHERE snapshot_id=? AND subject_table=? "
+                "AND subject_id=? AND provider=? AND observation_id=?",
+                (snap, str(subject_table), int(subject_id), str(provider),
+                 int(observation_id)),
             ).fetchone()
         if row is not None:
             conn.execute(
@@ -1022,11 +1090,13 @@ class Graph:
         else:
             cur = conn.execute(
                 """INSERT INTO support (snapshot_id, subject_table, subject_id, provider,
-                   provider_revision, confidence, evidence_id, detail, observed_utc)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   provider_revision, confidence, evidence_id, observation_id, detail,
+                   observed_utc)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (snap, str(subject_table), int(subject_id), str(provider),
                  str(provider_revision or ""), float(confidence),
                  int(evidence_id) if evidence_id is not None else None,
+                 int(observation_id) if observation_id is not None else None,
                  detail, _utc_now()),
             )
             sup_id = int(cur.lastrowid)

@@ -5899,6 +5899,10 @@ type bootstrap_vm_run = {
   bvr_trap : string option;
   bvr_reachable : int;
   bvr_cache_hit : bool;
+  (* realized VM steps of the warm run (None on the cold pipeline path,
+     whose inner VM run is not exposed); the cfg scaling battery measures
+     realized work from this, not wall time *)
+  bvr_vm_steps : int option;
 }
 
 let run_prepared_vm ~(repo_root : string) ~(kernel_args : string list)
@@ -5929,6 +5933,7 @@ let run_prepared_vm ~(repo_root : string) ~(kernel_args : string list)
             ^ String.concat "; " problems);
         bvr_reachable = List.length reachable;
         bvr_cache_hit = cache_hit;
+        bvr_vm_steps = None;
       }
   | Ok _ ->
       let result =
@@ -5947,6 +5952,7 @@ let run_prepared_vm ~(repo_root : string) ~(kernel_args : string list)
           (match result with Ok _ -> None | Error e -> Some e.Vm.message);
         bvr_reachable = List.length reachable;
         bvr_cache_hit = cache_hit;
+        bvr_vm_steps = Some (Vm.last_steps ());
       }
 
 (* ── the ONE structured bootstrap closure (re-audit P0: the gate must
@@ -6230,6 +6236,7 @@ let run_bootstrap_vm ~(repo_root : string) ~(manifest_path : string)
                   bvr_trap = None;
                   bvr_reachable = 0;
                   bvr_cache_hit = false;
+                  bvr_vm_steps = None;
                 }))
   | _ -> (
       match
@@ -6245,6 +6252,7 @@ let run_bootstrap_vm ~(repo_root : string) ~(manifest_path : string)
               bvr_trap = None;
               bvr_reachable = 0;
               bvr_cache_hit = false;
+              bvr_vm_steps = None;
             })
 
 let cmd_bootstrap_check (args : string list) : int =

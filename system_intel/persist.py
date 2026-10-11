@@ -351,48 +351,114 @@ def _snapshot_capabilities(snap) -> dict:
     return _capabilities_dict(getattr(snap, "capabilities", None))
 
 
-# Keys that are transport/transient plumbing inside a provider snapshot and
-# must not participate in the observation digest (cache paths, log paths).
+# Keys that are transport/transient plumbing at a RECORD's top level and
+# must not participate in the observation digest (cache/log/stdio paths).
+# Removal is deliberately NOT recursive: a semantic attribute that happens
+# to be named like plumbing must not silently vanish.
 _TRANSIENT_OBSERVATION_KEYS = frozenset({
     "cache", "cache_path", "log_path", "tmp_path", "artifact_path",
     "server_log", "compile_log", "stderr", "stdout",
 })
 
+# Fields whose values are PATHS: only these (and only when the value is
+# inside the scan root) are normalized, so `value.replace(root, ...)` is
+# never applied to arbitrary semantic strings.
+_PATH_OBSERVATION_KEYS = frozenset({
+    "path", "file", "files", "ref", "artifact", "source", "root",
+    "repo_root", "working_dir", "cwd",
+})
 
-def _canonical_observation(value, root: str = ""):
-    """Canonical, order-independent view of EVERY observation field.
+# ProviderSnapshot collection fields whose ORDER is not semantic: the
+# observation set is a set of records, so the top level is order-insensitive.
+# Everything BELOW a record keeps its order (parameter order, ABI order,
+# trace order, contract-clause order are semantic).
+_UNORDERED_SNAPSHOT_COLLECTIONS = frozenset({
+    "entities", "relations", "facts", "unresolved", "evidence", "providers",
+    "capabilities",
+})
 
-    The whole ProviderSnapshot is hashed — confidence, completeness,
-    attributes, evidence payload/summary, derived_from, uncertainty,
-    capabilities and semantic configuration included.  Only explicitly
-    transient plumbing keys are excluded; there is no hand-picked subset.
-    Absolute paths under the scan root are rewritten to ``<root>/...`` so
-    the same content observed from two checkouts yields the same digest.
+
+def _normalize_observation_path(text: str, root: str) -> str:
+    """Rewrite a path INSIDE root to ``<root>/...``; leave anything else."""
+    if not root or not isinstance(text, str):
+        return text
+    if text == root:
+        return "<root>"
+    if text.startswith(root + os.sep) or text.startswith(root + "/"):
+        return "<root>" + text[len(root):]
+    return text
+
+
+def _canonical_observation_value(value, root: str = "", key: str = "", *,
+                                 unordered: bool = False):
+    """Schema-aware canonical view of one observation value.
+
+    * dict keys are sorted (mapping order is not semantic) and transient
+      keys are dropped ONLY at a record's top level;
+    * ``set``/``frozenset`` are sorted (unordered by type);
+    * ``list``/``tuple`` PRESERVE order (ordered semantic sequences);
+    * only KNOWN path-valued fields under the scan root are normalized.
     """
     if hasattr(value, "__dataclass_fields__") and not isinstance(value, type):
+        # A RECORD's direct fields are the only place transient keys are
+        # dropped (they are the plumbing locations); nested dicts (attrs,
+        # payloads) preserve every key.
         return {
-            name: _canonical_observation(getattr(value, name), root)
+            name: _canonical_observation_value(getattr(value, name), root, name)
             for name in value.__dataclass_fields__
+            if name not in _TRANSIENT_OBSERVATION_KEYS
         }
     if isinstance(value, dict):
         return {
-            str(key): _canonical_observation(item, root)
-            for key, item in sorted(value.items(), key=lambda kv: str(kv[0]))
-            if str(key) not in _TRANSIENT_OBSERVATION_KEYS
+            str(child_key): _canonical_observation_value(
+                child_value, root, str(child_key)
+            )
+            for child_key, child_value in sorted(value.items(), key=lambda kv: str(kv[0]))
         }
-    if isinstance(value, (list, tuple, set, frozenset)):
-        items = [_canonical_observation(item, root) for item in value]
+    if isinstance(value, (set, frozenset)):
+        items = [_canonical_observation_value(item, root, key) for item in value]
         return sorted(items, key=lambda item: _canonical(item))
+    if isinstance(value, (list, tuple)):
+        items = [_canonical_observation_value(item, root, key) for item in value]
+        if unordered:
+            return sorted(items, key=lambda item: _canonical(item))
+        return items
     if isinstance(value, str):
-        if root and root in value:
-            return value.replace(root, "<root>")
+        if key in _PATH_OBSERVATION_KEYS:
+            return _normalize_observation_path(value, root)
         return value
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     text = str(value)
-    if root and root in text:
-        text = text.replace(root, "<root>")
+    if key in _PATH_OBSERVATION_KEYS:
+        text = _normalize_observation_path(text, root)
     return text
+
+
+def _canonical_observation(value, root: str = ""):
+    """Canonical view of a COMPLETE ProviderSnapshot (top-level entry).
+
+    Only the TOP-level collection fields are order-insensitive; nested
+    values (attrs, payloads, ordered sequences) keep their order.
+    """
+    if hasattr(value, "__dataclass_fields__") and not isinstance(value, type):
+        return {
+            name: _canonical_observation_value(
+                getattr(value, name), root, name,
+                unordered=name in _UNORDERED_SNAPSHOT_COLLECTIONS,
+            )
+            for name in value.__dataclass_fields__
+        }
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_observation_value(
+                item, root, str(key),
+                unordered=str(key) in _UNORDERED_SNAPSHOT_COLLECTIONS,
+            )
+            for key, item in sorted(value.items(), key=lambda kv: str(kv[0]))
+            if str(key) not in _TRANSIENT_OBSERVATION_KEYS
+        }
+    return _canonical_observation_value(value, root)
 
 
 def _snapshot_observation_payload(pid: str, version: str, snap,
@@ -454,7 +520,7 @@ def _authority_for(provider) -> str:
 
 
 def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
-                      *, canonical: bool) -> dict:
+                      *, canonical: bool, observation_ids=None) -> dict:
     """Project one provider snapshot into the draft (claim-scoped authority).
 
     Federation is claim/family-scoped, not winner-takes-all: providers are
@@ -470,6 +536,14 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
     ``canonical`` marks the primary provider (first in authority order); it
     only affects execution order, never whether a unique claim is written.
     """
+    observation_ids = observation_ids or {}
+
+    def _observation_for(provider_id: str):
+        try:
+            return int(observation_ids[provider_id])
+        except (KeyError, TypeError, ValueError):
+            return None
+
     evidence_records: list = []
     if _field(snap, "entities", None) is None:
         result = snap  # legacy extraction result (facts/relations/entities lists)
@@ -576,6 +650,7 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
                 provider=ent_provider, provider_revision=ent_revision,
                 confidence=_field(ent, "confidence", 1.0) or 1.0,
                 detail=detail,
+                observation_id=_observation_for(ent_provider),
             )
             support_rows += 1
 
@@ -706,6 +781,7 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
                 provider=rel_provider, provider_revision=rel_revision,
                 confidence=incoming_confidence,
                 detail=("conflict:" + _canonical(mismatch)) if mismatch else "support",
+                observation_id=_observation_for(rel_provider),
             )
             support_rows += 1
             continue
@@ -747,6 +823,7 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
             provider=rel_provider, provider_revision=rel_revision,
             confidence=_field(rel, "confidence", 1.0) or 1.0,
             detail=str(_field(rel, "completeness", "") or ""),
+            observation_id=_observation_for(rel_provider),
         )
         support_rows += 1
 
@@ -785,6 +862,7 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
                 provider=fact_provider, provider_revision=fact_revision,
                 confidence=incoming_confidence,
                 detail=("conflict:" + _canonical(mismatch)) if mismatch else "support",
+                observation_id=_observation_for(fact_provider),
             )
             support_rows += 1
             continue
@@ -811,6 +889,7 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
             provider=fact_provider, provider_revision=fact_revision,
             confidence=_field(fact, "confidence", 1.0) or 1.0,
             detail=str(_field(fact, "completeness", "") or ""),
+            observation_id=_observation_for(fact_provider),
         )
         support_rows += 1
 
@@ -1026,6 +1105,10 @@ def scan(root, db_path, *, commit_sha=None, repo_root=None, strict_clean=False,
             ))
         identity["source_revision_id"] = source_revision_id
         identity["observation_ids"] = observation_ids
+        observation_by_provider = {
+            entry["provider_id"]: oid
+            for entry, oid in zip(obs_entries, observation_ids)
+        }
 
         counts = None
         snapshot_id = None
@@ -1038,7 +1121,7 @@ def scan(root, db_path, *, commit_sha=None, repo_root=None, strict_clean=False,
                 graph, snapshot_id, primary_snap,
                 str(getattr(primary_provider, "provider_id", "") or ""),
                 str(getattr(primary_provider, "provider_version", "") or ""),
-                canonical=True,
+                canonical=True, observation_ids=observation_by_provider,
             )
             for entry in obs_entries:
                 if entry["provider"] is primary_provider:
@@ -1046,7 +1129,7 @@ def scan(root, db_path, *, commit_sha=None, repo_root=None, strict_clean=False,
                 _project_snapshot(
                     graph, snapshot_id, entry["snapshot"],
                     entry["provider_id"], entry["provider_version"],
-                    canonical=False,
+                    canonical=False, observation_ids=observation_by_provider,
                 )
             # provider_record for EVERY selected provider (invoked flag
             # distinguishes a degraded/unavailable provider honestly).

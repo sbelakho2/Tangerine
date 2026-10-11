@@ -214,9 +214,11 @@ CREATE TABLE IF NOT EXISTS support (
   provider_revision TEXT NOT NULL DEFAULT '',
   confidence    REAL NOT NULL DEFAULT 1.0,
   evidence_id   INTEGER,
+  observation_id INTEGER REFERENCES provider_observation (id),
   detail        TEXT,
   observed_utc  TEXT,
-  UNIQUE (snapshot_id, subject_table, subject_id, provider, evidence_id),
+  UNIQUE (snapshot_id, subject_table, subject_id, provider, observation_id,
+          evidence_id),
   FOREIGN KEY (evidence_id, snapshot_id) REFERENCES evidence (id, snapshot_id)
 );
 
@@ -442,6 +444,27 @@ END;
 -- Evidence referenced by a support row must belong to the SAME snapshot
 -- (the composite FK covers fresh databases; these triggers also cover
 -- databases created before the composite FK existed).
+-- A support row's level-2 observation must be LINKED to the same snapshot.
+CREATE TRIGGER IF NOT EXISTS support_observation_same_snapshot_insert
+BEFORE INSERT ON support
+WHEN NEW.observation_id IS NOT NULL AND NOT EXISTS
+     (SELECT 1 FROM snapshot_observation so
+      WHERE so.snapshot_id = NEW.snapshot_id
+        AND so.observation_id = NEW.observation_id)
+BEGIN
+  SELECT RAISE(ABORT, 'support observation is not linked to the same snapshot');
+END;
+
+CREATE TRIGGER IF NOT EXISTS support_observation_same_snapshot_update
+BEFORE UPDATE ON support
+WHEN NEW.observation_id IS NOT NULL AND NOT EXISTS
+     (SELECT 1 FROM snapshot_observation so
+      WHERE so.snapshot_id = NEW.snapshot_id
+        AND so.observation_id = NEW.observation_id)
+BEGIN
+  SELECT RAISE(ABORT, 'support observation is not linked to the same snapshot');
+END;
+
 CREATE TRIGGER IF NOT EXISTS support_evidence_same_snapshot_insert
 BEFORE INSERT ON support
 WHEN NEW.evidence_id IS NOT NULL AND NOT EXISTS

@@ -144,6 +144,13 @@ class FederationV3TestCase(unittest.TestCase):
             self.assertIsNotNone(source)
             self.assertEqual(source["revision_digest"], source["revision_digest"])
             self.assertTrue(g.verify_snapshot_digest(int(snap["id"])))
+            # every support row pins the EXACT level-2 observation
+            support_obs = g._require_conn().execute(
+                "SELECT DISTINCT observation_id FROM support WHERE snapshot_id=?",
+                (int(snap["id"]),),
+            ).fetchall()
+            self.assertEqual(len(support_obs), 1)
+            self.assertEqual(int(support_obs[0]["observation_id"]), int(obs["id"]))
 
     # (2) ----------------------------------------------------------------
     def test_new_observation_makes_a_new_federated_revision(self):
@@ -212,6 +219,18 @@ class FederationV3TestCase(unittest.TestCase):
             conn.rollback()
             with self.assertRaises(sqlite3.IntegrityError):
                 g.accumulate_support(s1, "entity", 999999, provider="p")
+            conn.rollback()
+            # a support observation from ANOTHER snapshot is rejected
+            source = g.upsert_source_revision({
+                "repo_identity": "r-x", "source_revision": "s-x",
+                "tree_digest": "t-x", "semantic_configuration": "{}",
+            })
+            foreign_obs = g.add_provider_observation(
+                source, "p", observation_digest="deadbeef",
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                g.accumulate_support(s1, "entity", e1, provider="p",
+                                     observation_id=foreign_obs)
             conn.rollback()
             # a same-snapshot evidence + real subject succeeds
             ev1 = g.add_evidence(s1, "test_log", "artifact://log2", digest="cafe")
@@ -398,6 +417,140 @@ class FederationV3TestCase(unittest.TestCase):
                 "SELECT DISTINCT provider FROM support WHERE snapshot_id=?", (snap,)
             ).fetchall()}
             self.assertEqual(providers, {"tangerine-native", "generic-static"})
+
+    # (14) ---------------------------------------------------------------
+    def test_data_bearing_pre_v3_database_is_refused(self):
+        db = self.root / "legacy_v2.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+        conn.execute(
+            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "repo_identity TEXT NOT NULL, source_revision TEXT NOT NULL, "
+            "tree_digest TEXT NOT NULL, semantic_configuration TEXT NOT NULL DEFAULT '{}', "
+            "provider_set_digest TEXT NOT NULL DEFAULT '', revision_digest TEXT NOT NULL, "
+            "state TEXT NOT NULL DEFAULT 'draft')"
+        )
+        conn.execute(
+            "INSERT INTO snapshot (repo_identity, source_revision, tree_digest, "
+            "revision_digest, state) VALUES ('r', 's', 't', 'd', 'finalized')"
+        )
+        conn.commit()
+        conn.close()
+        with self.assertRaises(Exception) as ctx:
+            Graph.open(db)
+        self.assertIn("rescan into a fresh database", str(ctx.exception))
+
+    def test_empty_pre_v3_database_is_rebuilt(self):
+        db = self.root / "legacy_empty.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+        conn.execute(
+            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "repo_identity TEXT NOT NULL, source_revision TEXT NOT NULL, "
+            "tree_digest TEXT NOT NULL, semantic_configuration TEXT NOT NULL DEFAULT '{}', "
+            "provider_set_digest TEXT NOT NULL DEFAULT '', revision_digest TEXT NOT NULL, "
+            "state TEXT NOT NULL DEFAULT 'draft')"
+        )
+        conn.commit()
+        conn.close()
+        with Graph.open(db) as g:
+            self.assertEqual(g._require_conn().execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()["version"], 3)
+            snap = g.begin_draft(_identity("rebuilt"))
+            g.upsert_entity("File", "a.py", "file:a.py", qualified_name="a.py",
+                            snapshot_id=snap)
+            g.finalize_snapshot(snap)
+            self.assertEqual(g.stats(snap)["entities_by_kind"]["File"], 1)
+
+    # (15) ---------------------------------------------------------------
+    def test_observation_canonicalization_is_schema_aware(self):
+        from system_intel.persist import _snapshot_digest
+        from system_intel.providers.base import (
+            ProviderEntity, ProviderEvidence, ProviderSnapshot,
+        )
+
+        def with_entities(order):
+            entities = {
+                "a": ProviderEntity(kind="Symbol", name="a", qualified_name="m.a",
+                                    stable_id="sym:a"),
+                "b": ProviderEntity(kind="Symbol", name="b", qualified_name="m.b",
+                                    stable_id="sym:b"),
+            }
+            return ProviderSnapshot(entities=[entities[key] for key in order],
+                                    provider_id="p", provider_version="1")
+
+        # Top-level record collections are order-INSENSITIVE.
+        self.assertEqual(
+            _snapshot_digest("p", "1", with_entities("ab")),
+            _snapshot_digest("p", "1", with_entities("ba")),
+        )
+
+        # Nested lists are ORDERED semantic sequences.
+        ordered_a = ProviderSnapshot(
+            entities=[ProviderEntity(kind="Symbol", name="f", qualified_name="m.f",
+                                     stable_id="sym:f",
+                                     attrs={"params": ["Int", "String"]})],
+            provider_id="p", provider_version="1",
+        )
+        ordered_b = ProviderSnapshot(
+            entities=[ProviderEntity(kind="Symbol", name="f", qualified_name="m.f",
+                                     stable_id="sym:f",
+                                     attrs={"params": ["String", "Int"]})],
+            provider_id="p", provider_version="1",
+        )
+        self.assertNotEqual(_snapshot_digest("p", "1", ordered_a),
+                            _snapshot_digest("p", "1", ordered_b))
+
+        # Transient-key removal is NOT recursive: a semantic attribute named
+        # like plumbing must still count.
+        attr_a = ProviderSnapshot(
+            entities=[ProviderEntity(kind="Symbol", name="f", qualified_name="m.f",
+                                     stable_id="sym:f", attrs={"stdout": "a"})],
+            provider_id="p", provider_version="1",
+        )
+        attr_b = ProviderSnapshot(
+            entities=[ProviderEntity(kind="Symbol", name="f", qualified_name="m.f",
+                                     stable_id="sym:f", attrs={"stdout": "b"})],
+            provider_id="p", provider_version="1",
+        )
+        self.assertNotEqual(_snapshot_digest("p", "1", attr_a),
+                            _snapshot_digest("p", "1", attr_b))
+
+        # A TOP-LEVEL transient key is plumbing and does not count.
+        dict_a = {"entities": [], "relations": [], "facts": [],
+                  "unresolved": [], "evidence": [], "cache_path": "/tmp/a"}
+        dict_b = {"entities": [], "relations": [], "facts": [],
+                  "unresolved": [], "evidence": [], "cache_path": "/tmp/b"}
+        self.assertEqual(_snapshot_digest("p", "1", dict_a),
+                         _snapshot_digest("p", "1", dict_b))
+
+        # Path normalization applies ONLY to known path fields (`ref`), so
+        # the same content from two checkouts hashes equally.
+        def ref_snapshot(ref):
+            return ProviderSnapshot(
+                evidence=[ProviderEvidence(kind="note", ref=ref)],
+                provider_id="p", provider_version="1",
+            )
+        self.assertEqual(
+            _snapshot_digest("p", "1", ref_snapshot("/w/one/x"), "/w/one"),
+            _snapshot_digest("p", "1", ref_snapshot("/w/two/x"), "/w/two"),
+        )
+
+        # A nested non-path field that merely looks path-like is NOT
+        # normalized (semantic strings are never rewritten).
+        def note_snapshot(note):
+            return ProviderSnapshot(
+                evidence=[ProviderEvidence(kind="note", ref="ref",
+                                           payload={"note": note})],
+                provider_id="p", provider_version="1",
+            )
+        self.assertNotEqual(
+            _snapshot_digest("p", "1", note_snapshot("/w/one/x"), "/w/one"),
+            _snapshot_digest("p", "1", note_snapshot("/w/two/x"), "/w/two"),
+        )
 
     # (13) ---------------------------------------------------------------
     def test_duplicate_claim_preserves_disagreement(self):

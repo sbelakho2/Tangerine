@@ -2726,6 +2726,13 @@ let entry_exit_code (entry_frame : frame) : int =
       Int64.to_int (Int_value.to_int64 i)
   | _ -> 0
 
+(* steps of the LAST completed VM run in this process (diagnostic access
+   for selfcheck harnesses that need realized work, e.g. the cfg scaling
+   battery); VMs run sequentially, so a single ref is unambiguous. *)
+let last_run_steps = ref 0
+
+let last_steps () = !last_run_steps
+
 let print_final_telemetry (vm : t) : unit =
   if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
     Printf.eprintf
@@ -2760,7 +2767,8 @@ let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
       host.Host.invoke_guest <-
         Some (fun fv -> invoke_guest_value vm entry_frame.statics fv);
       host.Host.unwind_depth <- 0;
-      (try
+      let run_result =
+        (try
          run_frame vm entry_frame;
          print_final_telemetry vm;
          Ok (entry_exit_code entry_frame)
@@ -2771,6 +2779,9 @@ let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
       | Exit ->
           print_final_telemetry vm;
           Ok (entry_exit_code entry_frame))
+      in
+      last_run_steps := vm.steps;
+      run_result
 
 let run ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array)
     ~(host : Host.t) : (int, vm_error) result =
