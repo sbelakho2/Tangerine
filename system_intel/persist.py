@@ -8,10 +8,11 @@ v3 semantics (INTERFACES.md §1/§3, audit P0 federation items):
   level-3 federated snapshot = the immutable set of observation ids.
 * A normal ``scan`` (``provider=None``) selects providers through the
   registry automatically (native first when applicable, generic-static as
-  the zero-install fallback) and federates their snapshots: canonical rows
-  come from the highest-authority usable provider, and every provider's
-  observation is accumulated in ``support`` -- observations never overwrite
-  each other.
+  the zero-install fallback) and federates their snapshots claim-scoped:
+  every provider contributes its UNIQUE knowledge (authority is per claim,
+  not per provider), while the same typed assertion keeps the
+  higher-authority canonical row and accumulates one ``support`` observation
+  per provider -- with disagreements preserved, never overwritten.
 * Providers run BEFORE final snapshot identity: the primary snapshot's
   semantic configuration (target/features/options) and its content digest
   participate in the revision identity, so recompiling the same source under
@@ -350,32 +351,74 @@ def _snapshot_capabilities(snap) -> dict:
     return _capabilities_dict(getattr(snap, "capabilities", None))
 
 
+# Keys that are transport/transient plumbing inside a provider snapshot and
+# must not participate in the observation digest (cache paths, log paths).
+_TRANSIENT_OBSERVATION_KEYS = frozenset({
+    "cache", "cache_path", "log_path", "tmp_path", "artifact_path",
+    "server_log", "compile_log", "stderr", "stdout",
+})
+
+
+def _canonical_observation(value):
+    """Canonical, order-independent view of EVERY observation field.
+
+    The whole ProviderSnapshot is hashed — confidence, completeness,
+    attributes, evidence payload/summary, derived_from, uncertainty,
+    capabilities and semantic configuration included.  Only explicitly
+    transient plumbing keys are excluded; there is no hand-picked subset.
+    """
+    if hasattr(value, "__dataclass_fields__") and not isinstance(value, type):
+        return {
+            name: _canonical_observation(getattr(value, name))
+            for name in value.__dataclass_fields__
+        }
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_observation(item)
+            for key, item in sorted(value.items(), key=lambda kv: str(kv[0]))
+            if str(key) not in _TRANSIENT_OBSERVATION_KEYS
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = [_canonical_observation(item) for item in value]
+        return sorted(items, key=lambda item: _canonical(item))
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _snapshot_observation_payload(pid: str, version: str, snap) -> dict:
+    """The complete canonical snapshot body plus provider identity."""
+    if hasattr(snap, "__dataclass_fields__") and not isinstance(snap, type):
+        body = _canonical_observation(snap)
+    elif isinstance(snap, dict):
+        body = _canonical_observation(snap)
+    else:
+        attrs = {}
+        for name in dir(snap):
+            if name.startswith("_"):
+                continue
+            try:
+                value = getattr(snap, name)
+            except Exception:  # noqa: BLE001 - duck-typed legacy object
+                continue
+            if callable(value):
+                continue
+            attrs[name] = value
+        body = _canonical_observation(attrs)
+    if isinstance(body, dict):
+        body["provider_id"] = str(pid)
+        body["provider_version"] = str(version)
+    return body
+
+
 def _snapshot_digest(pid: str, version: str, snap) -> str:
-    """Content-derived observation digest (never a DB row id)."""
-    payload = {
-        "provider": str(pid),
-        "version": str(version),
-        "entities": sorted(
-            f"{_field(e, 'kind', '')}\x1f{_field(e, 'stable_id', '')}"
-            for e in _as_list(_field(snap, "entities", []))
-        ),
-        "relations": sorted(
-            f"{_field(r, 'src_key', '')}\x1f{_field(r, 'kind', '')}\x1f{_field(r, 'dst_key', '')}"
-            for r in _as_list(_field(snap, "relations", []))
-        ),
-        "facts": sorted(
-            f"{_field(f, 'stable_subject', '')}\x1f{_field(f, 'predicate', '')}\x1f{_field(f, 'object', '')}"
-            for f in _as_list(_field(snap, "facts", []))
-        ),
-        "unresolved": sorted(
-            f"{_field(u, 'src_key', '')}\x1f{_field(u, 'kind', '')}\x1f{_field(u, 'dst_raw', '')}"
-            for u in _as_list(_field(snap, "unresolved", []))
-        ),
-        "evidence": sorted(
-            f"{_field(e, 'kind', '')}\x1f{_field(e, 'ref', '')}\x1f{_field(e, 'digest', '') or ''}"
-            for e in _as_list(_field(snap, "evidence", []))
-        ),
-    }
+    """Content-derived observation digest (never a DB row id).
+
+    Hashes the canonical COMPLETE ProviderSnapshot, so a provider cannot
+    change confidence, completeness, attributes, evidence payload/summary
+    or any other meaningful metadata without changing the digest.
+    """
+    payload = _snapshot_observation_payload(pid, version, snap)
     return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
 
 
@@ -401,12 +444,20 @@ def _authority_for(provider) -> str:
 
 def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
                       *, canonical: bool) -> dict:
-    """Project one provider snapshot into the draft.
+    """Project one provider snapshot into the draft (claim-scoped authority).
 
-    ``canonical=True`` writes the canonical rows (primary provider);
-    ``canonical=False`` only accumulates SUPPORT for typed keys that the
-    canonical rows already contain (observations never overwrite canonical
-    truth, and a second provider never duplicates the graph).
+    Federation is claim/family-scoped, not winner-takes-all: providers are
+    projected in authority order (the primary first) and EVERY provider
+    contributes its unique knowledge.  On the same typed assertion:
+
+    * identical claim   -> the canonical row stays + one support observation
+    * conflicting claim -> the higher-authority (earlier) row stays canonical
+      and the disagreement is preserved in the support detail
+    * unique claim      -> included with its own provider authority and
+      completeness
+
+    ``canonical`` marks the primary provider (first in authority order); it
+    only affects execution order, never whether a unique claim is written.
     """
     evidence_records: list = []
     if _field(snap, "entities", None) is None:
@@ -443,14 +494,13 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
         ent_provider = str(_field(ent, "provider", pid) or pid)
         ent_revision = str(_field(ent, "provider_revision", ver) or ver)
         existing = ids_by_typed.get((kind, stable))
+        existing_row = None
         if existing is None and graph is not None:
-            row = graph._require_conn().execute(
-                "SELECT id FROM entity WHERE snapshot_id=? AND kind=? AND stable_id=?",
+            existing_row = graph._require_conn().execute(
+                "SELECT * FROM entity WHERE snapshot_id=? AND kind=? AND stable_id=?",
                 (int(snapshot_id), kind, stable),
             ).fetchone()
-            existing = int(row["id"]) if row is not None else None
-        if not canonical and existing is None:
-            continue
+            existing = int(existing_row["id"]) if existing_row is not None else None
         if existing is not None:
             entity_id = existing
         else:
@@ -480,24 +530,80 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
         stable_by_qn.setdefault(qn, stable)
         stable_by_qn.setdefault(stable, stable)
         if graph is not None:
+            detail = str(_field(ent, "completeness", "") or "support")
+            if existing_row is not None:
+                # A second provider asserts the same typed entity: keep the
+                # canonical row and PRESERVE any disagreement.
+                incoming = {
+                    "name": name,
+                    "qualified_name": qn,
+                    "file": _field(ent, "file", None),
+                    "line": _field(ent, "line", None),
+                    "provenance": str(_field(ent, "provenance", "observed") or "observed"),
+                    "confidence": float(_field(ent, "confidence", 1.0) or 1.0),
+                    "completeness": str(_field(ent, "completeness", "partial") or "partial"),
+                    "attrs": _field(ent, "attrs", None) or {},
+                }
+                stored = {
+                    "name": existing_row["name"],
+                    "qualified_name": existing_row["qualified_name"],
+                    "file": existing_row["file"],
+                    "line": existing_row["line"],
+                    "provenance": existing_row["provenance"],
+                    "confidence": existing_row["confidence"],
+                    "completeness": existing_row["completeness"],
+                    "attrs": json.loads(existing_row["attrs"] or "{}"),
+                }
+                mismatch = {
+                    key: {"canonical": stored[key], "other": value}
+                    for key, value in incoming.items()
+                    if key in stored and stored[key] != value
+                }
+                detail = ("conflict:" + _canonical(mismatch)) if mismatch else "support"
             graph.accumulate_support(
                 snapshot_id, "entity", entity_id,
                 provider=ent_provider, provider_revision=ent_revision,
                 confidence=_field(ent, "confidence", 1.0) or 1.0,
-                detail=str(_field(ent, "completeness", "") or ""),
+                detail=detail,
             )
             support_rows += 1
 
     def _resolve(key, kind):
+        """Resolve a typed endpoint key, including entities an EARLIER
+        provider projected into the same draft (claim-scoped federation)."""
         if key in (None, ""):
             return None
         key = str(key)
+        conn = graph._require_conn() if graph is not None else None
         if kind:
-            hit = ids_by_typed.get((str(kind), key))
+            typed = (str(kind), key)
+            hit = ids_by_typed.get(typed)
             if hit is not None:
                 return hit
+            if conn is not None:
+                row = conn.execute(
+                    "SELECT id FROM entity WHERE snapshot_id=? AND kind=? AND stable_id=?",
+                    (int(snapshot_id), str(kind), key),
+                ).fetchone()
+                if row is not None:
+                    entity_id = int(row["id"])
+                    ids_by_typed[typed] = entity_id
+                    ids_by_stable.setdefault(key, entity_id)
+                    return entity_id
             return None
-        return ids_by_stable.get(key)
+        hit = ids_by_stable.get(key)
+        if hit is not None:
+            return hit
+        if conn is not None:
+            row = conn.execute(
+                "SELECT id FROM entity WHERE snapshot_id=? AND stable_id=? LIMIT 1",
+                (int(snapshot_id), key),
+            ).fetchone()
+            if row is not None:
+                entity_id = int(row["id"])
+                ids_by_stable[key] = entity_id
+                return entity_id
+        return None
 
     relations_upserted = 0
     relations_unresolved = 0
@@ -545,20 +651,52 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
             unresolved_edges += 1
             continue
 
-        if not canonical:
-            # Secondary providers only strengthen an EXISTING canonical edge.
-            existing = graph._require_conn().execute(
-                "SELECT id FROM relation WHERE snapshot_id=? AND src_id=? AND dst_id=? AND kind=?",
-                (int(snapshot_id), int(src_id), int(dst_id) if dst_id is not None else None, rkind),
-            ).fetchone() if dst_id is not None else None
-            if existing is not None:
-                graph.accumulate_support(
-                    snapshot_id, "relation", int(existing["id"]),
+        # Claim-scoped federation: an edge already asserted by a
+        # higher-authority provider keeps its canonical row (disagreement is
+        # preserved in the support detail); a UNIQUE edge is written with
+        # this provider's own authority and completeness.
+        if dst_id is not None:
+            stored_edge = graph._require_conn().execute(
+                "SELECT * FROM relation WHERE snapshot_id=? AND src_id=? AND dst_id=? AND kind=?",
+                (int(snapshot_id), int(src_id), int(dst_id), rkind),
+            ).fetchone()
+        else:
+            stored_edge = graph._require_conn().execute(
+                "SELECT * FROM relation WHERE snapshot_id=? AND src_id=? AND dst_id IS NULL "
+                "AND dst_key=? AND kind=?",
+                (int(snapshot_id), int(src_id), str(dst_key or ""), rkind),
+            ).fetchone()
+        if stored_edge is not None:
+            mismatch = {}
+            incoming_completeness = str(_field(rel, "completeness", "partial") or "partial")
+            if str(stored_edge["completeness"]) != incoming_completeness:
+                mismatch["completeness"] = {
+                    "canonical": str(stored_edge["completeness"]),
+                    "other": incoming_completeness,
+                }
+            incoming_confidence = float(_field(rel, "confidence", 1.0) or 1.0)
+            if float(stored_edge["confidence"]) != incoming_confidence:
+                mismatch["confidence"] = {
+                    "canonical": float(stored_edge["confidence"]),
+                    "other": incoming_confidence,
+                }
+            if dst_id is None:
+                graph.add_unresolved_edge(
+                    snapshot_id, str(src_key or ""), str(dst_key or ""), rkind,
                     provider=rel_provider, provider_revision=rel_revision,
-                    confidence=_field(rel, "confidence", 1.0) or 1.0,
-                    detail=str(_field(rel, "completeness", "") or ""),
+                    candidates=candidates or [],
+                    confidence=_field(rel, "confidence", 0.3) or 0.3,
+                    completeness=str(_field(rel, "completeness", "unknown") or "unknown"),
                 )
-                support_rows += 1
+                unresolved_edges += 1
+                relations_unresolved += 1
+            graph.accumulate_support(
+                snapshot_id, "relation", int(stored_edge["id"]),
+                provider=rel_provider, provider_revision=rel_revision,
+                confidence=incoming_confidence,
+                detail=("conflict:" + _canonical(mismatch)) if mismatch else "support",
+            )
+            support_rows += 1
             continue
 
         common = dict(
@@ -610,11 +748,34 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
         fact_provider = str(_field(fact, "provider", pid) or pid)
         fact_revision = str(_field(fact, "provider_revision", ver) or ver)
         existing = graph._require_conn().execute(
-            "SELECT id FROM fact WHERE snapshot_id=? AND subject=? AND predicate=? AND object=?",
+            "SELECT * FROM fact WHERE snapshot_id=? AND subject=? AND predicate=? AND object=?",
             (int(snapshot_id), subject, str(_field(fact, "predicate", "") or ""),
              str(_field(fact, "object", "") or "")),
         ).fetchone()
-        if not canonical and existing is None:
+        if existing is not None:
+            # Same assertion from another provider: support the canonical
+            # row and preserve any disagreement; a unique fact is written
+            # below with its own provider/authority.
+            mismatch = {}
+            incoming_completeness = str(_field(fact, "completeness", "partial") or "partial")
+            if str(existing["completeness"]) != incoming_completeness:
+                mismatch["completeness"] = {
+                    "canonical": str(existing["completeness"]),
+                    "other": incoming_completeness,
+                }
+            incoming_confidence = float(_field(fact, "confidence", 1.0) or 1.0)
+            if float(existing["confidence"]) != incoming_confidence:
+                mismatch["confidence"] = {
+                    "canonical": float(existing["confidence"]),
+                    "other": incoming_confidence,
+                }
+            graph.accumulate_support(
+                snapshot_id, "fact", int(existing["id"]),
+                provider=fact_provider, provider_revision=fact_revision,
+                confidence=incoming_confidence,
+                detail=("conflict:" + _canonical(mismatch)) if mismatch else "support",
+            )
+            support_rows += 1
             continue
         fact_id = graph.upsert_fact(
             subject,

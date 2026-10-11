@@ -21,7 +21,7 @@ formats, agent names or workflow state appear in the protocol.
     "target": "aarch64-apple-darwin",
     "provider_set_digest": "sha256:...",
     "observation_set_digest": "sha256:...",
-    "source_revision_id": 7,
+    "source_revision_digest": "sha256:...",
     "state": "finalized"
   },
   "provider_set": [

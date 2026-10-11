@@ -304,6 +304,124 @@ class FederationV3TestCase(unittest.TestCase):
             self.assertNotEqual(rows[a], rows[b],
                                 "two facts about one subject must differ")
 
+    # (11) ---------------------------------------------------------------
+    def test_observation_digest_covers_the_complete_observation(self):
+        """Metadata-only changes must change the observation digest."""
+        from system_intel.persist import _snapshot_digest
+        from system_intel.providers.base import (
+            ProviderEntity, ProviderEvidence, ProviderSnapshot,
+        )
+
+        def snapshot(confidence=1.0, attrs=None, summary="observed"):
+            return ProviderSnapshot(
+                entities=[ProviderEntity(
+                    kind="Symbol", name="f", qualified_name="m.f",
+                    stable_id="native:decl:1", confidence=confidence,
+                    attrs=attrs or {"visibility": "public"},
+                )],
+                evidence=[ProviderEvidence(kind="trace", ref="t:1",
+                                           summary=summary, payload={"n": 1})],
+                provider_id="p", provider_version="1",
+                capabilities=[],
+            )
+
+        base = _snapshot_digest("p", "1", snapshot())
+        self.assertEqual(base, _snapshot_digest("p", "1", snapshot()))
+        self.assertNotEqual(base, _snapshot_digest("p", "1", snapshot(confidence=0.5)))
+        self.assertNotEqual(base, _snapshot_digest("p", "1", snapshot(attrs={"visibility": "private"})))
+        self.assertNotEqual(base, _snapshot_digest("p", "1", snapshot(summary="different")))
+
+    # (12) ---------------------------------------------------------------
+    def test_unique_secondary_provider_knowledge_is_included(self):
+        """Authority is claim-scoped: unique non-primary knowledge survives."""
+        from system_intel.persist import _project_snapshot
+        from system_intel.providers.base import (
+            ProviderEntity, ProviderFact, ProviderRelation, ProviderSnapshot,
+        )
+
+        with Graph.open(self.db) as g:
+            snap = g.begin_draft(_identity("federation"))
+            primary = ProviderSnapshot(
+                entities=[ProviderEntity(kind="Module", name="m",
+                                         qualified_name="module:m",
+                                         stable_id="native:decl:1")],
+                relations=[], facts=[], evidence=[],
+                provider_id="tangerine-native", provider_version="1",
+            )
+            secondary = ProviderSnapshot(
+                entities=[ProviderEntity(kind="Deployment", name="docker",
+                                         qualified_name="deployment:docker",
+                                         stable_id="deployment:docker")],
+                relations=[ProviderRelation(
+                    src_key="deployment:docker", dst_key="native:decl:1",
+                    kind="deploys_with",
+                    src_kind="Deployment", dst_kind="Module",
+                )],
+                facts=[ProviderFact(
+                    subject="deployment:docker", predicate="uses_manifest",
+                    object="Dockerfile", stable_subject="deployment:docker",
+                )],
+                evidence=[], provider_id="generic-static", provider_version="2",
+            )
+            _project_snapshot(g, snap, primary, "tangerine-native", "1", canonical=True)
+            _project_snapshot(g, snap, secondary, "generic-static", "2", canonical=False)
+            conn = g._require_conn()
+            kinds = {r["kind"] for r in conn.execute(
+                "SELECT kind FROM entity WHERE snapshot_id=?", (snap,)
+            ).fetchall()}
+            self.assertIn("Deployment", kinds,
+                          "unique secondary knowledge must not be dropped")
+            self.assertIn("Module", kinds)
+            edge = conn.execute(
+                "SELECT src_key, dst_key, provider FROM relation WHERE kind='deploys_with'"
+            ).fetchone()
+            self.assertIsNotNone(edge)
+            self.assertEqual(edge["dst_key"], "native:decl:1")
+            self.assertEqual(edge["provider"], "generic-static")
+            facts = {r["predicate"] for r in conn.execute(
+                "SELECT predicate FROM fact WHERE snapshot_id=?", (snap,)
+            ).fetchall()}
+            self.assertIn("uses_manifest", facts)
+            providers = {r["provider"] for r in conn.execute(
+                "SELECT DISTINCT provider FROM support WHERE snapshot_id=?", (snap,)
+            ).fetchall()}
+            self.assertEqual(providers, {"tangerine-native", "generic-static"})
+
+    # (13) ---------------------------------------------------------------
+    def test_duplicate_claim_preserves_disagreement(self):
+        from system_intel.persist import _project_snapshot
+        from system_intel.providers.base import ProviderEntity, ProviderSnapshot
+
+        with Graph.open(self.db) as g:
+            snap = g.begin_draft(_identity("conflict"))
+            high = ProviderSnapshot(
+                entities=[ProviderEntity(kind="Symbol", name="f",
+                                         qualified_name="m.f",
+                                         stable_id="sym:f", completeness="complete")],
+                provider_id="high-authority", provider_version="1",
+            )
+            low = ProviderSnapshot(
+                entities=[ProviderEntity(kind="Symbol", name="f",
+                                         qualified_name="m.f",
+                                         stable_id="sym:f", completeness="partial")],
+                provider_id="low-authority", provider_version="1",
+            )
+            _project_snapshot(g, snap, high, "high-authority", "1", canonical=True)
+            _project_snapshot(g, snap, low, "low-authority", "1", canonical=False)
+            conn = g._require_conn()
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) AS n FROM entity").fetchone()["n"], 1,
+                "the same typed claim must not duplicate the canonical row",
+            )
+            support = conn.execute(
+                "SELECT provider, detail FROM support WHERE subject_table='entity' "
+                "ORDER BY provider"
+            ).fetchall()
+            self.assertEqual(len(support), 2)
+            conflict = [r for r in support if r["detail"].startswith("conflict:")]
+            self.assertEqual(len(conflict), 1)
+            self.assertIn("partial", conflict[0]["detail"])
+
     # (10) ---------------------------------------------------------------
     def test_finalization_recomputes_the_revision_digest(self):
         with Graph.open(self.db) as g:

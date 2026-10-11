@@ -214,9 +214,12 @@ Identity has **three levels** (v3):
 - The NORMAL `scan()` uses the provider registry automatically (native first
   when applicable, generic-static as the zero-install fallback), runs the
   providers BEFORE final identity selection (their semantic configuration and
-  content digest participate in the revision), and accumulates every
-  provider's observation in `support` — observations never overwrite each
-  other.
+  content digest participate in the revision), and federates claim-scoped:
+  every provider contributes its UNIQUE knowledge (e.g. generic-static's
+  Docker/SQL/config view survives even when native is primary), while the
+  same typed assertion keeps the higher-authority canonical row and
+  accumulates one `support` observation per provider, preserving any
+  disagreement instead of overwriting it.
 - `scan()` builds a DRAFT snapshot in ONE transaction, runs extraction,
   resolution, completeness accounting and integrity checks, and finalizes
   only on success. A failure rolls back — no partial truth is ever visible.

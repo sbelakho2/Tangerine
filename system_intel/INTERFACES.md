@@ -15,6 +15,12 @@ immutability, structural support/evidence integrity, a provider registry that
 the NORMAL scan path always uses, and a completeness algebra that separates
 scope/authority/enumeration/resolution.
 
+TERMINOLOGY: "v3" names the System Intelligence FEDERATION/SCHEMA model
+(schema_version=3). The wire protocol is still `protocol_version = 2`: the
+changes are additive record kinds/optional fields within its major version
+(Entity, Observation, source_revision_digest), exactly as PROTOCOL.md's
+versioning policy allows. There is no "protocol v3".
+
 ## 0. Enumerations (single source of truth)
 
 ```text
@@ -340,6 +346,15 @@ class SemanticProvider(Protocol):
     def delta(self, old_snapshot, new_snapshot) -> dict: ...
     def completeness(self, family: str) -> str: ...
 ```
+
+FEDERATION POLICY (claim-scoped, never winner-takes-all): providers are
+projected in authority order (primary first), and authority is per CLAIM, not
+per provider. Every provider contributes its UNIQUE knowledge with its own
+authority/completeness (generic-static's Docker/SQL/config entities survive
+even when tangerine-native is primary). The same typed assertion keeps the
+higher-authority canonical row, adds one `support` observation per provider,
+and PRESERVES any disagreement in the support detail (`conflict:<json>`)
+instead of overwriting it.
 
 - `providers/generic_static.py`: wraps `extract_core` (renamed semantics:
   the zero-install fallback). Capabilities: entities complete (Tier 0/1),

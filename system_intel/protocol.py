@@ -115,7 +115,8 @@ class Observation:
     scope: dict = field(default_factory=dict)
     enumeration_completeness: str = "unknown"
     resolution_completeness: str = "unknown"
-    source_revision_id: int | None = None
+    # The level-1 CONTENT digest, never the SQLite source_revision row id.
+    source_revision_digest: str = ""
 
 
 @dataclass
@@ -343,11 +344,17 @@ def entity_records(data: dict) -> list[dict]:
     return out
 
 
-def observation_records(data: dict) -> list[dict]:
-    """Project the immutable provider-observation set as protocol records."""
+def observation_records(data: dict, source_digests: dict | None = None) -> list[dict]:
+    """Project the immutable provider-observation set as protocol records.
+
+    ``source_revision_id`` is a STORAGE row id and never becomes protocol
+    identity: it is resolved to the level-1 content digest here.
+    """
+    source_digests = source_digests or {}
     out = []
     for o in data.get("observations", []):
         digest = str(o.get("observation_digest") or "")
+        source_revision_id = o.get("source_revision_id")
         out.append(
             _record(
                 "Observation",
@@ -368,7 +375,9 @@ def observation_records(data: dict) -> list[dict]:
                     resolution_completeness=str(
                         o.get("resolution_completeness") or "unknown"
                     ),
-                    source_revision_id=o.get("source_revision_id"),
+                    source_revision_digest=str(
+                        source_digests.get(source_revision_id, "") or ""
+                    ),
                 ),
             )
         )
@@ -417,15 +426,29 @@ _SEMANTIC_TRANSPORT_KEYS = (
 )
 
 
+# Storage row ids that must NEVER influence semantic equality (the protocol
+# exposes content digests instead).
+_SEMANTIC_ROW_ID_KEYS = frozenset({"source_revision_id", "row_ref", "row_id"})
+
+
+def _strip_row_identity(value):
+    if isinstance(value, dict):
+        return {
+            key: _strip_row_identity(item)
+            for key, item in value.items()
+            if key not in _SEMANTIC_TRANSPORT_KEYS and key not in _SEMANTIC_ROW_ID_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_row_identity(item) for item in value]
+    return value
+
+
 def _semantic_view(doc: dict) -> dict:
     view = json.loads(json.dumps(doc, sort_keys=True, default=str))
-    for key in _SEMANTIC_TRANSPORT_KEYS:
-        view.pop(key, None)
+    view = _strip_row_identity(view)
     snapshot = view.get("snapshot")
     if isinstance(snapshot, dict):
-        for key in _SEMANTIC_TRANSPORT_KEYS:
-            snapshot.pop(key, None)
-        snapshot.pop("id", None)  # DB row id, not semantics
+        snapshot.pop("id", None)  # the snapshot DB row id, not semantics
     return view
 
 
@@ -492,7 +515,7 @@ def export_protocol(
         _record(
             "Provider",
             ProviderRecord(
-                id=f"Provider:{p['provider']}",
+                id=_content_id("Provider", p["provider"], p.get("provider_version", "")),
                 provider=p["provider"],
                 version=p.get("provider_version", ""),
                 capabilities=p.get("capabilities") or {},
@@ -766,6 +789,24 @@ def export_protocol(
     target = ""
     if isinstance(semantic_config, dict):
         target = str(semantic_config.get("target") or "")
+    # Level-1 identity is the source revision's CONTENT digest; storage row
+    # ids never appear in the protocol document.
+    source_digests: dict = {}
+    for observation in data.get("observations", []):
+        source_id = observation.get("source_revision_id")
+        if source_id is None or source_id in source_digests:
+            continue
+        row = graph.source_revision_row(source_id)
+        source_digests[source_id] = (
+            str(row.get("revision_digest") or "") if row is not None else ""
+        )
+    snapshot_source_digest = source_digests.get(snap.get("source_revision_id"))
+    if snapshot_source_digest is None:
+        snapshot_source_digest = ""
+        if snap.get("source_revision_id") is not None:
+            source_row = graph.source_revision_row(snap.get("source_revision_id"))
+            if source_row is not None:
+                snapshot_source_digest = str(source_row.get("revision_digest") or "")
     doc = {
         "protocol_version": PROTOCOL_VERSION,
         "generated_utc": datetime.now(timezone.utc).isoformat(),
@@ -779,7 +820,7 @@ def export_protocol(
             "target": target,
             "provider_set_digest": snap.get("provider_set_digest"),
             "observation_set_digest": snap.get("observation_set_digest"),
-            "source_revision_id": snap.get("source_revision_id"),
+            "source_revision_digest": snapshot_source_digest,
             "state": snap.get("state"),
             "repo_root": snap.get("repo_root"),
             "created_utc": snap.get("created_utc"),
@@ -795,7 +836,7 @@ def export_protocol(
         "records": {
             "requirements": [_record("Requirement", r) for r in (requirements or [])],
             "entities": entity_records(data),
-            "observations": observation_records(data),
+            "observations": observation_records(data, source_digests),
             "facts": facts,
             "claims": claims,
             "invariants": invariants,

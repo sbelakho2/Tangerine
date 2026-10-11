@@ -299,11 +299,26 @@ class ProtocolV2Tests(unittest.TestCase):
             self.assertTrue(fact["id"].startswith("Fact:fact:"), fact["id"])
 
     def test_two_independent_databases_have_identical_semantic_digest(self):
-        def build(tag):
+        def build(tag, decoys=0):
             graph = Graph.open(":memory:")
-            # SAME logical revision in both databases; only row ids and the
-            # transport timestamp differ.
-            snap = graph.begin_draft(_identity("same"))
+            # decoys shift the auto-increment ids so the storage row ids
+            # differ between databases while the CONTENT is identical.
+            for index in range(decoys):
+                graph.upsert_source_revision({
+                    "repo_identity": f"decoy-{index}",
+                    "source_revision": f"decoy-rev-{index}",
+                    "tree_digest": f"decoy-tree-{index}",
+                    "semantic_configuration": "{}",
+                })
+            ident = _identity("same")
+            source_id = graph.upsert_source_revision({
+                "repo_identity": ident["repo_identity"],
+                "source_revision": ident["source_revision"],
+                "tree_digest": ident["tree_digest"],
+                "semantic_configuration": "{}",
+            })
+            ident["source_revision_id"] = source_id
+            snap = graph.begin_draft(ident)
             graph.upsert_entity("File", "a.py", "file:a.py", qualified_name="a.py",
                                 snapshot_id=snap)
             graph.upsert_fact("svc", "publishes", "OrderCreated", snapshot_id=snap,
@@ -315,7 +330,7 @@ class ProtocolV2Tests(unittest.TestCase):
             return doc
 
         doc_a = build("a")
-        doc_b = build("b")
+        doc_b = build("b", decoys=3)
         # Transport timestamps and DB row ids may differ...
         doc_b["generated_utc"] = "2000-01-01T00:00:00+00:00"
         # ...but the semantic digest (and the record identities) are equal.
@@ -324,6 +339,12 @@ class ProtocolV2Tests(unittest.TestCase):
         ids_b = {r["id"] for r in doc_b["records"]["facts"]}
         self.assertEqual(ids_a, ids_b)
         self.assertNotEqual(doc_a["generated_utc"], doc_b["generated_utc"])
+        # No storage row id leaks into the document anywhere.
+        import json as _json
+        blob = _json.dumps(doc_a)
+        self.assertNotIn("source_revision_id", blob)
+        self.assertNotIn("row_ref", blob)
+        self.assertTrue(doc_a["snapshot"]["source_revision_digest"])
 
     def test_ingest_entities_and_records_an_observation(self):
         doc = {
