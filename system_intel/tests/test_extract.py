@@ -243,7 +243,10 @@ class ScanTests(unittest.TestCase):
                 {"src": "module:data", "dst": "file:data/binary.bin", "kind": "contains"},
                 diff["relations_removed"],
             )
-            self.assertIn("data/binary.bin|extraction|binary", diff["facts_removed"])
+            self.assertTrue(any(f.get("subject") == "data/binary.bin"
+                            and f.get("predicate") == "extraction"
+                            and f.get("object") == "binary"
+                            for f in diff["facts_removed"]))
             # the old snapshot is untouched history
             old = graph.stats(first["snapshot_id"])
             self.assertIn("File", old["entities_by_kind"])

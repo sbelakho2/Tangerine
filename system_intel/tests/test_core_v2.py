@@ -311,7 +311,10 @@ class CoreV2TestCase(unittest.TestCase):
                 diff["relations_removed"],
             )
             self.assertGreater(len(diff["facts_removed"]), 0)
-            self.assertIn("data/binary.bin|extraction|binary", diff["facts_removed"])
+            self.assertTrue(any(f.get("subject") == "data/binary.bin"
+                            and f.get("predicate") == "extraction"
+                            and f.get("object") == "binary"
+                            for f in diff["facts_removed"]))
             # no in-place staleness: the old snapshot still has the file
             self.assertIn("File", g.stats(first["snapshot_id"])["entities_by_kind"])
             old_export = g.export_json(first["snapshot_id"])

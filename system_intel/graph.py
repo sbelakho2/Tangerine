@@ -278,6 +278,16 @@ def _chunks(seq, size=_IN_CHUNK):
         yield seq[start:start + size]
 
 
+def _structured_key(*parts) -> str:
+    """A collision-free map key from semantic identity parts.
+
+    JSON array (not separator-joined): qualified names / contract keys may
+    legitimately contain `|`, so splitting a joined key is unsound.
+    """
+    return json.dumps([str(part if part is not None else "") for part in parts],
+                      separators=(",", ":"))
+
+
 def _prefix_match(component_qn, qualified_names):
     """True when component_qn equals, or is a NAMESPACE-SEGMENT prefix of,
     a qualified name.
@@ -1925,12 +1935,13 @@ class Graph:
             rel = _parse_relation({c: row[c] for c in _RELATION_COLUMNS})
             src_key = rel["src_key"] or row["src_stable"] or ""
             dst_key = rel["dst_key"] or (row["dst_stable"] or "")
-            key = f"{src_key}|{dst_key}|{rel['kind']}"
+            key = _structured_key(src_key, dst_key, rel["kind"])
             out[key] = _dumps({
                 k: rel.get(k) for k in (
                     "resolved", "tier", "provenance", "confidence", "derived_from",
                     "attrs", "epistemic_state", "analysis_depth", "completeness",
-                    "provider",
+                    "site_completeness", "target_resolution_completeness",
+                    "provider", "provider_revision",
                 )
             })
         return out
@@ -1942,7 +1953,7 @@ class Graph:
             """SELECT * FROM fact WHERE snapshot_id=? ORDER BY id""", (int(snapshot_id),)
         ).fetchall():
             item = _parse_common({k: row[k] for k in row.keys()})
-            key = f"{item['subject']}|{item['predicate']}|{item['object']}"
+            key = _structured_key(item["subject"], item["predicate"], item["object"])
             out[key] = _dumps({
                 k: item.get(k) for k in (
                     "tier", "provenance", "confidence", "derived_from", "uncertainty",
@@ -1958,12 +1969,13 @@ class Graph:
         for row in conn.execute(
             "SELECT * FROM unresolved_edge WHERE snapshot_id=? ORDER BY id", (int(snapshot_id),)
         ).fetchall():
-            key = f"{row['src_key']}|{row['dst_raw']}|{row['kind']}"
+            key = _structured_key(row["src_key"], row["dst_raw"], row["kind"])
             out[key] = _dumps({
                 "candidates": _loads(row["candidates"], []),
                 "confidence": row["confidence"],
                 "completeness": row["completeness"],
                 "provider": row["provider"],
+                "provider_revision": row["provider_revision"],
             })
         return out
 
@@ -1992,11 +2004,30 @@ class Graph:
             delta[fam] = {"old": o, "new": n, "changed": o != n}
 
         def _unpack(keys):
+            # signatures are canonical JSON tuples: semantic identifiers may
+            # themselves contain any separator, so no string splitting
             out = []
             for key in keys:
-                parts = key.split("|")
-                if len(parts) == 3:
+                try:
+                    parts = json.loads(key)
+                except (TypeError, ValueError):
+                    parts = None
+                if isinstance(parts, list) and len(parts) == 3:
                     out.append({"src": parts[0], "dst": parts[1], "kind": parts[2]})
+                else:
+                    out.append({"key": key})
+            return out
+
+        def _unpack_facts(keys):
+            out = []
+            for key in keys:
+                try:
+                    parts = json.loads(key)
+                except (TypeError, ValueError):
+                    parts = None
+                if isinstance(parts, list) and len(parts) == 3:
+                    out.append({"subject": parts[0], "predicate": parts[1],
+                                "object": parts[2]})
                 else:
                     out.append({"key": key})
             return out
@@ -2012,9 +2043,9 @@ class Graph:
             "relations_added": _unpack(r_add),
             "relations_removed": _unpack(r_rm),
             "relations_changed": _unpack(r_ch),
-            "facts_added": f_add,
-            "facts_removed": f_rm,
-            "facts_changed": f_ch,
+            "facts_added": _unpack_facts(f_add),
+            "facts_removed": _unpack_facts(f_rm),
+            "facts_changed": _unpack_facts(f_ch),
             "unresolved_added": _unpack(u_add),
             "unresolved_removed": _unpack(u_rm),
             "unresolved_changed": _unpack(u_ch),

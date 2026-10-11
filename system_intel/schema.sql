@@ -174,7 +174,9 @@ CREATE TABLE IF NOT EXISTS relation (
   provider_revision TEXT NOT NULL DEFAULT '',
   FOREIGN KEY (src_id, snapshot_id) REFERENCES entity (id, snapshot_id),
   FOREIGN KEY (dst_id, snapshot_id) REFERENCES entity (id, snapshot_id),
-  CHECK (dst_id IS NOT NULL OR resolved = 0)
+  -- exact biconditional: resolved=1 <=> the endpoint is bound
+  CHECK ((dst_id IS NOT NULL AND resolved = 1)
+         OR (dst_id IS NULL AND resolved = 0))
 );
 CREATE INDEX IF NOT EXISTS relation_src_idx ON relation (snapshot_id, src_id, kind);
 CREATE INDEX IF NOT EXISTS relation_dst_idx ON relation (snapshot_id, dst_id, kind);

@@ -429,8 +429,12 @@ class GraphV2TestCase(unittest.TestCase):
         self.assertEqual(diff["changed"], ["module:b"])
         self.assertEqual(diff["relations_removed"],
                          [{"src": "module:a", "dst": "module:b", "kind": "depends_on"}])
-        self.assertIn("a|uses|b", diff["facts_removed"])
-        self.assertIn("b|uses|c", diff["facts_added"])
+        self.assertTrue(any(f.get("subject") == "a" and f.get("predicate") == "uses"
+                            and f.get("object") == "b"
+                            for f in diff["facts_removed"]))
+        self.assertTrue(any(f.get("subject") == "b" and f.get("predicate") == "uses"
+                            and f.get("object") == "c"
+                            for f in diff["facts_added"]))
         self.assertIn("relations", diff["completeness_delta"])
 
     # ------------------------------------------------------- deprecated sweep
