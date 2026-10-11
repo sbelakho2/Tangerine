@@ -1993,16 +1993,6 @@ def cfg_attribute_holds(target: AsmTarget, attr: Attribute) -> Bool
   end
 end
 
-def span_equal(a: Span, b: Span) -> Bool
-  a.file == b.file && a.start == b.start && a.end_pos == b.end_pos
-end
-
-# The elimination pass itself: filter the merged program's items, dropping
-# the items carrying a contradicting @cfg attribute, and rebuild the
-# crate's module item lists (the surviving ItemIds are remapped to their
-# new flat indices — the same module-table rebuild the macro-filtering
-# pass performs).
-#
 # STRICT SEMANTICS (no resurrection): an item whose @cfg contradicts the
 # target DOES NOT EXIST for that target — the elimination is final and NO
 # reference from a kept item can bring an eliminated item back. A kept
@@ -2025,20 +2015,31 @@ pub def cfg_item_contradicts(target: AsmTarget, item: Item) -> Bool
   eliminate
 end
 
-# Partition the item list: the kept items (inline-module children filtered
-# recursively) go to `kept_out` in order, the gated items go to the
-# eliminated pool, and every kept span is recorded (the span is the flat
-# item identity at this stage — node ids are assigned later).
-def cfg_partition_items(items: Vec[Item], target: AsmTarget, inout kept_out: Vec[Item], inout eliminated: Vec[Item], inout kept_spans: Vec[Span]) -> Unit
+# (@cfg elimination — ONE structural pass)
+#
+# The pass filters the merged program's items ONCE: cfg_partition_items
+# produces the final filtered item tree directly (inline modules included),
+# the eliminated count, and nothing else.  There is NO second
+# reconstruction pass and NO retained-span vector: the previous
+# implementation threw the filtered tree away and rebuilt it by scanning a
+# Vec of every retained span per item — O(items x retained) span_equal
+# comparisons, recursing into inline modules with the full span list — and
+# that dominated the self-host preflight's step cost.  The partitioner
+# preserves original order, so the k-th KEPT top-level item is new index k;
+# the old->new map is built by re-testing the cheap per-item @cfg predicate,
+# never by span membership.  An eliminated item NEVER returns (a kept item
+# that referenced it fails the resolver's unresolved-name error), and an
+# item is classified exactly once per traversal.
+def cfg_partition_items(items: Vec[Item], target: AsmTarget, inout kept_out: Vec[Item], inout eliminated_count: Int, inout predicate_evals: Int) -> Unit
   for item in items do
+    predicate_evals = predicate_evals + 1
     if cfg_item_contradicts(target, &item) then
-      eliminated.push(item.clone())
+      eliminated_count = eliminated_count + 1
     else
-      kept_spans.push(item.span)
       match item.kind
       when ItemKind::ItemModule(md) then
         var nested_kept = Vec::new()
-        cfg_partition_items(md.items, target, &mut nested_kept, eliminated, kept_spans)
+        cfg_partition_items(md.items, target, &mut nested_kept, eliminated_count, predicate_evals)
         kept_out.push(Item {
           kind: ItemKind::ItemModule(ModuleDecl {
             vis: md.vis,
@@ -2059,82 +2060,39 @@ def cfg_partition_items(items: Vec[Item], target: AsmTarget, inout kept_out: Vec
   end
 end
 
-# Rebuild an item list from the ORIGINAL items: keep the spans in the
-# kept set (an eliminated item never returns — no reference can resurrect
-# it), recursing into inline modules.
-def cfg_rebuild_items(items: Vec[Item], kept_spans: Vec[Span], inout out: Vec[Item]) -> Unit
-  for item in items do
-    var is_kept = false
-    for k in kept_spans do
-      if span_equal(&k, &item.span) then
-        is_kept = true
-      end
-    end
-    if is_kept then
-      match item.kind
-      when ItemKind::ItemModule(md) then
-        var nested = Vec::new()
-        cfg_rebuild_items(md.items, kept_spans, &mut nested)
-        out.push(Item {
-          kind: ItemKind::ItemModule(ModuleDecl {
-            vis: md.vis,
-            name: md.name.clone(),
-            items: nested,
-            is_inline: md.is_inline,
-            span: md.span
-          }),
-          attrs: item.attrs.clone(),
-          span: item.span,
-          is_pub: item.is_pub,
-          owner_module: item.owner_module
-        })
-      when _ then
-        out.push(item.clone())
-      end
-    end
-  end
-end
-
-pub def apply_cfg_elimination(inout program: Program, opts: CompilerOptions) -> Unit
+# The counted form: the scaling regression battery measures the number of
+# @cfg predicate evaluations per item list size.  The one-pass design
+# evaluates the cheap predicate at most TWICE per top-level item (once in
+# the partitioner, once in the old->new index loop) and once per nested
+# item; a quadratic membership scan over retained spans cannot stay within
+# that bound.
+pub def apply_cfg_elimination_counted(inout program: Program, opts: CompilerOptions, inout predicate_evals: Int) -> Unit
   let target = resolve_codegen_target(opts)
 
   var kept_items = Vec::new()
-  var kept_spans = Vec::new()
-  var eliminated_items = Vec::new()
-  cfg_partition_items(program.items, target, &mut kept_items, &mut eliminated_items, &mut kept_spans)
+  var eliminated_count = 0
+  cfg_partition_items(program.items, target, &mut kept_items, &mut eliminated_count, predicate_evals)
 
-  if eliminated_items.len() == 0 then
+  if eliminated_count == 0 then
     return
   end
 
-  # NO retention fixpoint: the eliminated items stay eliminated — an item
-  # contradicting the target does not exist for this target, and a kept
-  # item that references an eliminated name fails the resolver's standard
-  # unresolved-name error. Rebuild the program in the ORIGINAL order: the
-  # span-based identity test (one item per span) restores the kept items
-  # at their original positions, and the crate's module item lists are
-  # remapped to the new flat indices (the same module-table rebuild the
-  # macro-filtering pass performs).
-  var kept = Vec::new()
+  # Old top-level index -> new top-level index. The partitioner keeps items
+  # in original order, so the k-th non-contradicting top-level item is new
+  # index k; this re-tests the cheap @cfg predicate and never scans spans.
   var old_to_new: Map[Int, Int] = Map::new()
   var new_idx = 0
-  cfg_rebuild_items(program.items, kept_spans, &mut kept)
   var ri = 0
   while ri < program.items.len() do
     let item = program.items[ri].clone()
-    var is_kept = false
-    for k in kept_spans do
-      if span_equal(&k, &item.span) then
-        is_kept = true
-      end
-    end
-    if is_kept then
+    predicate_evals = predicate_evals + 1
+    if !cfg_item_contradicts(target, &item) then
       old_to_new.insert(ri, new_idx)
       new_idx = new_idx + 1
     end
     ri = ri + 1
   end
-  program.items = kept
+  program.items = kept_items
   var filtered_modules = Map::new()
   let module_entries = program.crate.modules.entries_cloned()
   for (mid, info) in module_entries do
@@ -2154,6 +2112,12 @@ pub def apply_cfg_elimination(inout program: Program, opts: CompilerOptions) -> 
   end
   program.crate.modules = filtered_modules
 end
+
+pub def apply_cfg_elimination(inout program: Program, opts: CompilerOptions) -> Unit
+  var predicate_evals = 0
+  apply_cfg_elimination_counted(&mut program, opts, &mut predicate_evals)
+end
+
 
 pub def analyze_parsed(inout env: TypeEnv, inout program: Program, opts: CompilerOptions) -> Result[AnalyzedProgram, Vec[Diagnostic]]
  # (@cfg — the target-conditioned elimination pass): EARLY in the

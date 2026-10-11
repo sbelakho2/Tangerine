@@ -23,7 +23,12 @@
 #               [11/11] marker is VM A (the artifact-corpus compile);
 #               everything after [11/11] until `SELF-HOST PREFLIGHT:` is
 #               VM B (the strict self-host preflight).  Fields absent in
-#               a section are UNKNOWN, never guessed.
+#               a section are UNKNOWN, never guessed.  The churn counters
+#               (VM_*_COPIES/PUSHES/PUSH_COPIES/SET_COPIES/MAP_SCANS/
+#               SET_SCANS/MARK_*) are per-VM DELTAS: the VM captures the
+#               process-global prof_* values at construction and the
+#               beacon prints counter-minus-baseline, so VM B's numbers
+#               can never include VM A's work.
 #
 # SUCCESS RECOGNITION (never a loose grep PASS; error descriptions
 # legitimately contain "PASS"):
@@ -218,8 +223,7 @@ BEGIN { section = "B" }  # standalone logs hold only the preflight VM (VM B)
       b_host = v
       if (section == "A") a_host = v
       else if (section == "B") sb_host = v
-    } else if (k == "dt") { sub(/[^0-9.].*$/, "", v); b_dt = v }
-    else if (k == "live_mb") {
+    } else if (k == "dt") { sub(/[^0-9.].*$/, "", v); b_dt = v } else if (k == "live_mb") {
       b_live = v
       if (num(v) > peak_live) peak_live = num(v)
       if (section == "A" && num(v) > a_peak_live) a_peak_live = num(v)
@@ -229,21 +233,52 @@ BEGIN { section = "B" }  # standalone logs hold only the preflight VM (VM B)
       if (num(v) > peak_rss) peak_rss = num(v)
       if (section == "A" && num(v) > a_peak_rss) a_peak_rss = num(v)
       else if (section == "B" && num(v) > sb_peak_rss) sb_peak_rss = num(v)
-    } else if (k == "mark_calls") b_mark_calls = v
-    else if (k == "mark_nodes") b_mark_nodes = v
-    else if (k == "regions") b_regions = v
+    } else if (k == "mark_calls") {
+      b_mark_calls = v
+      if (section == "A") a_mark_calls = v
+      else if (section == "B") sb_mark_calls = v
+    } else if (k == "mark_nodes") {
+      b_mark_nodes = v
+      if (section == "A") a_mark_nodes = v
+      else if (section == "B") sb_mark_nodes = v
+    } else if (k == "mark_cleared") {
+      b_mark_cleared = v
+      if (section == "A") a_mark_cleared = v
+      else if (section == "B") sb_mark_cleared = v
+    } else if (k == "copies") {
+      b_copies = v
+      if (section == "A") a_copies = v
+      else if (section == "B") sb_copies = v
+    } else if (k == "pushes") {
+      b_pushes = v
+      if (section == "A") a_pushes = v
+      else if (section == "B") sb_pushes = v
+    } else if (k == "push_copies") {
+      b_push_copies = v
+      if (section == "A") a_push_copies = v
+      else if (section == "B") sb_push_copies = v
+    } else if (k == "set_copies") {
+      b_set_copies = v
+      if (section == "A") a_set_copies = v
+      else if (section == "B") sb_set_copies = v
+    } else if (k == "map_scans") {
+      b_map_scans = v
+      if (section == "A") a_map_scans = v
+      else if (section == "B") sb_map_scans = v
+    } else if (k == "set_scans") {
+      b_set_scans = v
+      if (section == "A") a_set_scans = v
+      else if (section == "B") sb_set_scans = v
+    } else if (k == "regions") b_regions = v
     else if (k == "alloc_bytes") {
       b_alloc = v; b_alloc_key = "alloc_bytes"
-      if (section == "A") { a_alloc = v; a_alloc_key = "last_beacon:alloc_bytes" }
-      else if (section == "B") { sb_alloc = v; sb_alloc_key = "last_beacon:alloc_bytes" }
+      if (section == "A") { a_alloc = v; a_alloc_key = "last_beacon:alloc_bytes" } else if (section == "B") { sb_alloc = v; sb_alloc_key = "last_beacon:alloc_bytes" }
     } else if (k == "alloc" && b_alloc_key == "") {
       b_alloc = v; b_alloc_key = "alloc"
-      if (section == "A" && a_alloc_key == "") { a_alloc = v; a_alloc_key = "last_beacon:alloc" }
-      else if (section == "B" && sb_alloc_key == "") { sb_alloc = v; sb_alloc_key = "last_beacon:alloc" }
+      if (section == "A" && a_alloc_key == "") { a_alloc = v; a_alloc_key = "last_beacon:alloc" } else if (section == "B" && sb_alloc_key == "") { sb_alloc = v; sb_alloc_key = "last_beacon:alloc" }
     } else if (k == "vm_alloc_bytes" && b_alloc_key == "") {
       b_alloc = v; b_alloc_key = "vm_alloc_bytes"
-      if (section == "A" && a_alloc_key == "") { a_alloc = v; a_alloc_key = "last_beacon:vm_alloc_bytes" }
-      else if (section == "B" && sb_alloc_key == "") { sb_alloc = v; sb_alloc_key = "last_beacon:vm_alloc_bytes" }
+      if (section == "A" && a_alloc_key == "") { a_alloc = v; a_alloc_key = "last_beacon:vm_alloc_bytes" } else if (section == "B" && sb_alloc_key == "") { sb_alloc = v; sb_alloc_key = "last_beacon:vm_alloc_bytes" }
     }
   }
   next
@@ -412,8 +447,7 @@ END {
     else if (ends_nl == 0 && (vm_steps_line == log_lines || b_line > vm_steps_line))
       status = "INCOMPLETE"
     else status = "COMPLETED"
-  }
-  else if (beacons > 0) status = "INCOMPLETE"
+  } else if (beacons > 0) status = "INCOMPLETE"
   else if (run_exit_seen || exit_seen || selfcheck_line != "") status = "FAILED_NO_VM"
   else status = "INCOMPLETE"
 
@@ -457,16 +491,14 @@ END {
     outcome = "PASS"
   else outcome = "FAIL"
 
-  if (vm_steps != "") { final_steps = vm_steps; final_steps_source = "vm_summary" }
-  else if (b_steps != "") { final_steps = b_steps; final_steps_source = "last_beacon" }
+  if (vm_steps != "") { final_steps = vm_steps; final_steps_source = "vm_summary" } else if (b_steps != "") { final_steps = b_steps; final_steps_source = "last_beacon" }
   else { final_steps = "UNKNOWN"; final_steps_source = "none" }
 
   if (host_calls != "") host_source = "vm_summary"
   else if (b_host != "") { host_calls = b_host; host_source = "last_beacon" }
   else host_source = "none"
 
-  if (b_alloc != "") { alloc_bytes = b_alloc; alloc_source = "last_beacon:" b_alloc_key }
-  else if (sites_last != "") { alloc_bytes = sites_last; alloc_source = "vm_alloc_sites" }
+  if (b_alloc != "") { alloc_bytes = b_alloc; alloc_source = "last_beacon:" b_alloc_key } else if (sites_last != "") { alloc_bytes = sites_last; alloc_source = "vm_alloc_sites" }
   else { alloc_bytes = "UNKNOWN"; alloc_source = "none" }
 
   sum = 0
@@ -556,6 +588,15 @@ END {
   print "VM_A_ALLOC_BYTES_SOURCE=" vmA_alloc_src
   print "VM_A_PEAK_RSS_MIB=" vmA_rss
   print "VM_A_PEAK_LIVE_MB=" vmA_live
+  print "VM_A_COPIES=" put(a_beacons > 0, put(a_copies != "", a_copies, "UNKNOWN"), "UNKNOWN")
+  print "VM_A_PUSHES=" put(a_beacons > 0, put(a_pushes != "", a_pushes, "UNKNOWN"), "UNKNOWN")
+  print "VM_A_PUSH_COPIES=" put(a_beacons > 0, put(a_push_copies != "", a_push_copies, "UNKNOWN"), "UNKNOWN")
+  print "VM_A_SET_COPIES=" put(a_beacons > 0, put(a_set_copies != "", a_set_copies, "UNKNOWN"), "UNKNOWN")
+  print "VM_A_MAP_SCANS=" put(a_beacons > 0, put(a_map_scans != "", a_map_scans, "UNKNOWN"), "UNKNOWN")
+  print "VM_A_SET_SCANS=" put(a_beacons > 0, put(a_set_scans != "", a_set_scans, "UNKNOWN"), "UNKNOWN")
+  print "VM_A_MARK_CALLS=" put(a_beacons > 0, put(a_mark_calls != "", a_mark_calls, "UNKNOWN"), "UNKNOWN")
+  print "VM_A_MARK_NODES=" put(a_beacons > 0, put(a_mark_nodes != "", a_mark_nodes, "UNKNOWN"), "UNKNOWN")
+  print "VM_A_MARK_CLEARED=" put(a_beacons > 0, put(a_mark_cleared != "", a_mark_cleared, "UNKNOWN"), "UNKNOWN")
   print "VM_A_WALL_S=" put(vmA_wall != "", vmA_wall, "UNKNOWN")
   print "VM_A_WALL_SOURCE=" put(vmA_wall != "", "driver_phase", "none")
   print "VM_B_BEACONS=" put(b_seen, b_beacons + 0, "UNKNOWN")
@@ -569,6 +610,15 @@ END {
   print "VM_B_ALLOC_BYTES_SOURCE=" vmB_alloc_src
   print "VM_B_PEAK_RSS_MIB=" vmB_rss
   print "VM_B_PEAK_LIVE_MB=" vmB_live
+  print "VM_B_COPIES=" put(b_beacons > 0, put(sb_copies != "", sb_copies, "UNKNOWN"), "UNKNOWN")
+  print "VM_B_PUSHES=" put(b_beacons > 0, put(sb_pushes != "", sb_pushes, "UNKNOWN"), "UNKNOWN")
+  print "VM_B_PUSH_COPIES=" put(b_beacons > 0, put(sb_push_copies != "", sb_push_copies, "UNKNOWN"), "UNKNOWN")
+  print "VM_B_SET_COPIES=" put(b_beacons > 0, put(sb_set_copies != "", sb_set_copies, "UNKNOWN"), "UNKNOWN")
+  print "VM_B_MAP_SCANS=" put(b_beacons > 0, put(sb_map_scans != "", sb_map_scans, "UNKNOWN"), "UNKNOWN")
+  print "VM_B_SET_SCANS=" put(b_beacons > 0, put(sb_set_scans != "", sb_set_scans, "UNKNOWN"), "UNKNOWN")
+  print "VM_B_MARK_CALLS=" put(b_beacons > 0, put(sb_mark_calls != "", sb_mark_calls, "UNKNOWN"), "UNKNOWN")
+  print "VM_B_MARK_NODES=" put(b_beacons > 0, put(sb_mark_nodes != "", sb_mark_nodes, "UNKNOWN"), "UNKNOWN")
+  print "VM_B_MARK_CLEARED=" put(b_beacons > 0, put(sb_mark_cleared != "", sb_mark_cleared, "UNKNOWN"), "UNKNOWN")
   print "VM_B_WALL_S=" put(vmB_wall != "", vmB_wall, "UNKNOWN")
   print "VM_B_WALL_SOURCE=" put(vmB_wall != "", vmB_wall_src, "none")
   print "VM_B_PREFLIGHT_WALL_S=" put(vm_b_preflight_wall != "", vm_b_preflight_wall, "UNKNOWN")

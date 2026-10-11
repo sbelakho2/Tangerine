@@ -179,6 +179,20 @@ type t = {
   baseline_regions_live : int;
   baseline_region_bytes : int;
   baseline_captured_live : int;
+  (* churn-counter baselines: prof_* are process-global refs shared by
+     every VM in the process (the aggregate gate runs VM A then VM B in
+     one process), so a raw beacon print attributes VM A's work to VM B.
+     Capture the starting values at construction and report per-VM
+     DELTAS — the same rule the memory baselines above already follow. *)
+  baseline_pushes : int;
+  baseline_push_copies : int;
+  baseline_set_copies : int;
+  baseline_map_scans : int;
+  baseline_set_scans : int;
+  baseline_copies : int;
+  baseline_mark_calls : int;
+  baseline_mark_nodes : int;
+  baseline_mark_cleared : int;
 }
 
 let find_fn (vm : t) (inst : Instance_id.t) : int option =
@@ -293,17 +307,23 @@ let step_limit (vm : t) : unit =
       | f :: _ when f.fn >= 0 && f.fn < Array.length vm.step_hist ->
           vm.step_hist.(f.fn) <- vm.step_hist.(f.fn) + 1
       | _ -> ());
-     if vm.steps mod 100_000_000 = 0 then
+     if vm.steps mod 100_000_000 = 0 then begin
        let st = Gc.quick_stat () in
        let now = Unix.gettimeofday () in
        let dt = now -. !beacon_prev in
        beacon_prev := now;
        Printf.eprintf
-         "VM BEACON steps=%d host=%d pushes=%d push_copies=%d set_copies=%d map_scans=%d set_scans=%d mark_calls=%d mark_nodes=%d mark_cleared=%d dt=%.1fs regions=%d live_mb=%.0f rss_mb=%.0f reg_live=%d reg_bytes=%.1fMB pool_mb=%.1f cap_live=%d frames=%d\n%!"
-         vm.steps vm.host_calls !Vm_value.prof_pushes !Vm_value.prof_push_copies
-         !Vm_value.prof_set_copies !Vm_value.prof_map_scans !Vm_value.prof_set_scans
-         !Vm_value.prof_mark_calls !Vm_value.prof_mark_nodes
-         !Vm_value.prof_mark_cleared dt
+         "VM BEACON steps=%d host=%d copies=%d pushes=%d push_copies=%d set_copies=%d map_scans=%d set_scans=%d mark_calls=%d mark_nodes=%d mark_cleared=%d dt=%.1fs regions=%d live_mb=%.0f rss_mb=%.0f reg_live=%d reg_bytes=%.1fMB pool_mb=%.1f cap_live=%d frames=%d\n%!"
+         vm.steps vm.host_calls
+         (!Vm_value.prof_copies - vm.baseline_copies)
+         (!Vm_value.prof_pushes - vm.baseline_pushes)
+         (!Vm_value.prof_push_copies - vm.baseline_push_copies)
+         (!Vm_value.prof_set_copies - vm.baseline_set_copies)
+         (!Vm_value.prof_map_scans - vm.baseline_map_scans)
+         (!Vm_value.prof_set_scans - vm.baseline_set_scans)
+         (!Vm_value.prof_mark_calls - vm.baseline_mark_calls)
+         (!Vm_value.prof_mark_nodes - vm.baseline_mark_nodes)
+         (!Vm_value.prof_mark_cleared - vm.baseline_mark_cleared) dt
          !Vm_memory.prof_regions
          (float_of_int st.Gc.live_words *. 8. /. 1048576.)
          (float_of_int (current_rss_bytes ()) /. 1048576.)
@@ -317,6 +337,36 @@ let step_limit (vm : t) : unit =
          (List.length vm.frames);
        Printf.eprintf "VM ALLOC SITES frees=%d %s\n%!" !Vm_memory.prof_frees
          (Vm_memory.prof_alloc_sites_summary ())
+     end;
+     if vm.steps mod 1_000_000_000 = 0 then begin
+       (* periodic hot-function sample: the full top-15 histogram report
+          is produced only when the step CEILING trips, so a run that
+          dies by wall time (or that must be localized early) would
+          otherwise have no in-flight hot-spot evidence *)
+       let top = Array.make 5 (-1, 0) in
+       Array.iteri
+         (fun fn count ->
+           if count > 0 then begin
+             let pos = ref (-1) in
+             for i = 0 to 4 do
+               if !pos < 0 && snd top.(i) < count then pos := i
+             done;
+             if !pos >= 0 then begin
+               for i = 4 downto !pos + 1 do
+                 top.(i) <- top.(i - 1)
+               done;
+               top.(!pos) <- (fn, count)
+             end
+           end)
+         vm.step_hist;
+       let buf = Buffer.create 128 in
+       Array.iter
+         (fun (fn, count) ->
+           if fn >= 0 then
+             Buffer.add_string buf (Printf.sprintf " fn%d=%d" fn count))
+         top;
+       Printf.eprintf "VM HOT steps=%d top5:%s\n%!" vm.steps (Buffer.contents buf)
+     end
    end);
   (* Optional hard RSS ceiling (Linux /proc or macOS Mach — whichever
      current_rss_bytes can measure): fail with a diagnostic instead of
@@ -2596,9 +2646,18 @@ let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
              depth = 0;
              trace = [];
              baseline_regions_live =
-               !Vm_memory.prof_regions - !Vm_memory.prof_frees;
-             baseline_region_bytes = !Vm_memory.prof_live_bytes;
-             baseline_captured_live = !Vm_value.prof_captured_live;
+                !Vm_memory.prof_regions - !Vm_memory.prof_frees;
+              baseline_region_bytes = !Vm_memory.prof_live_bytes;
+              baseline_captured_live = !Vm_value.prof_captured_live;
+              baseline_pushes = !Vm_value.prof_pushes;
+              baseline_push_copies = !Vm_value.prof_push_copies;
+              baseline_set_copies = !Vm_value.prof_set_copies;
+              baseline_map_scans = !Vm_value.prof_map_scans;
+              baseline_set_scans = !Vm_value.prof_set_scans;
+              baseline_copies = !Vm_value.prof_copies;
+              baseline_mark_calls = !Vm_value.prof_mark_calls;
+              baseline_mark_nodes = !Vm_value.prof_mark_nodes;
+              baseline_mark_cleared = !Vm_value.prof_mark_cleared;
              step_hist =
                (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
                   Array.make (Array.length program.Seed_mir.functions) 0
@@ -2687,8 +2746,10 @@ let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
              Printf.eprintf
                "VM STEPS: %d (limit %d), host calls: %d (limit %d), push copies: %d (%d pushes), map replace scans: %d, set replace scans: %d\n"
                vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls
-               !Vm_value.prof_copies !Vm_value.prof_pushes !Vm_value.prof_map_scans
-               !Vm_value.prof_set_scans);
+               (!Vm_value.prof_copies - vm.baseline_copies)
+               (!Vm_value.prof_pushes - vm.baseline_pushes)
+               (!Vm_value.prof_map_scans - vm.baseline_map_scans)
+               (!Vm_value.prof_set_scans - vm.baseline_set_scans));
           Error { kind = Trap msg; message = msg; trace = List.rev vm.trace }
       | Exit ->
           (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then

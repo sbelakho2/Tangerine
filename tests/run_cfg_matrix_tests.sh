@@ -28,6 +28,15 @@
 #       -> MUST BE REJECTED with "unresolved name: cfg_windows_marker"
 #       (an un-gated reference to an unavailable symbol fails on EVERY
 #       non-windows target; the deleted resurrection cannot make it legal)
+#   (n+) tests/cfg_matrix/canary_pos_cfg_nested_host.tg
+#       --target <host triple>      -> MUST CHECK CLEAN (the windows-gated
+#                                      member INSIDE the nested inline
+#                                      module is eliminated; the un-gated
+#                                      sibling resolves)
+#   (n-) tests/cfg_matrix/canary_neg_cfg_nested_linux_on_macos.tg
+#       --target aarch64-apple-darwin -> MUST BE REJECTED with
+#                                      "unresolved name: cfg_linux_nested"
+#                                      (nested elimination is final)
 #   host tests/cfg_matrix/canary_pos_cfg_host_family.tg
 #       --target <host triple>      -> MUST COMPILE AND RUN, exit code 0
 #       (the target-kept member of the mutually exclusive family resolves;
@@ -111,6 +120,12 @@ expect_check "tests/cfg_matrix/canary_neg_cfg_linux_symbol_on_macos.tg" "$DARWIN
 # non-windows target.
 expect_check "tests/cfg_matrix/canary_neg_cfg_ungated_windows_ref.tg" "$DARWIN_TRIPLE" "unresolved name: cfg_windows_marker" || true
 expect_check "tests/cfg_matrix/canary_neg_cfg_ungated_windows_ref.tg" "$LINUX_TRIPLE" "unresolved name: cfg_windows_marker" || true
+
+# (n+) / (n-): NESTED inline-module member elimination (the one-pass
+# apply_cfg_elimination regression): the nested host member resolves while
+# the nested foreign member is eliminated and its reference fails.
+expect_check "tests/cfg_matrix/canary_pos_cfg_nested_host.tg" "$HOST_TRIPLE" "" || true
+expect_check "tests/cfg_matrix/canary_neg_cfg_nested_linux_on_macos.tg" "$DARWIN_TRIPLE" "unresolved name: cfg_linux_nested" || true
 
 # host: the host-agnostic family canary compiles AND runs (exit code 0).
 total=$((total + 1))
