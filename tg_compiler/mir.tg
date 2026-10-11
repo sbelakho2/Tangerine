@@ -12932,6 +12932,69 @@ def mir_float_constant_of(value: Float, ty: Type) -> MirOperand
   }
 end
 
+# The concrete integer kind of a checker-resolved type, or None when the
+# type is not a concrete integer (IntLiteral/Var/Float/aggregate). The
+# for-range counter typing reads the CHECKER's resolved bound kind through
+# this (the seed's fresh_local start_ty): an unsuffixed literal bound is
+# already unified to the sibling's kind in the typed channel, so `0..n`
+# with n: UInt yields UInt here.
+def mir_concrete_int_kind(ty: Type) -> Option[Type]
+  match ty
+  when Type::Int then Option::Some(Type::Int)
+  when Type::UInt then Option::Some(Type::UInt)
+  when Type::I8 then Option::Some(Type::I8)
+  when Type::I16 then Option::Some(Type::I16)
+  when Type::I32 then Option::Some(Type::I32)
+  when Type::I64 then Option::Some(Type::I64)
+  when Type::U8 then Option::Some(Type::U8)
+  when Type::U16 then Option::Some(Type::U16)
+  when Type::U32 then Option::Some(Type::U32)
+  when Type::U64 then Option::Some(Type::U64)
+  when Type::USize then Option::Some(Type::USize)
+  when Type::ISize then Option::Some(Type::ISize)
+  when _ then Option::None
+  end  end
+end
+
+# The INFORMATIVE concrete integer kind of a lowered range bound: the
+# kind of a place read (the checker-resolved local/param type) or of a
+# SUFFIXED literal; Option::None for an unsuffixed integer literal (its
+# constant starts life as the default Int view) and non-integer operands.
+# The for-range counter typing uses this so `0..n` with n: UInt counts in
+# UInt (the literal bound is adopted to the sibling kind).
+def mir_operand_informative_int_kind(b: MirBuilder, op: MirOperand) -> Option[Type]
+  match op.kind
+  when MirOperandKind::MirConstant(c) then
+    match c.kind
+    when MirConstantKind::MirInt(_) then
+      match c.ty
+      when Type::Int then Option::None
+      when Type::IntLiteral(_) then Option::None
+      when Type::Var(_) then Option::None
+      when _ then mir_concrete_int_kind(c.ty.clone())
+      end
+    when _ then Option::None
+    end
+  when MirOperandKind::MirCopy(p) then mir_concrete_int_kind(mir_place_type(&p, b))
+  when MirOperandKind::MirRead(p) then mir_concrete_int_kind(mir_place_type(&p, b))
+  when MirOperandKind::MirMovePlace(p) then mir_concrete_int_kind(mir_place_type(&p, b))
+  when MirOperandKind::MirConsume(p) then mir_concrete_int_kind(mir_place_type(&p, b))
+  end  end
+end
+
+# The raw concrete integer kind of a lowered operand (including an
+# unsuffixed Int-typed literal constant); Option::None for non-integer
+# operands. The for-range fallback when no INFORMATIVE bound exists.
+def mir_operand_integer_kind(b: MirBuilder, op: MirOperand) -> Option[Type]
+  match op.kind
+  when MirOperandKind::MirConstant(c) then mir_concrete_int_kind(c.ty.clone())
+  when MirOperandKind::MirCopy(p) then mir_concrete_int_kind(mir_place_type(&p, b))
+  when MirOperandKind::MirRead(p) then mir_concrete_int_kind(mir_place_type(&p, b))
+  when MirOperandKind::MirMovePlace(p) then mir_concrete_int_kind(mir_place_type(&p, b))
+  when MirOperandKind::MirConsume(p) then mir_concrete_int_kind(mir_place_type(&p, b))
+  end  end
+end
+
 def lr_binary(inout b: MirBuilder, op: BinOp, left: Expr, right: Expr, span: Span, result_ty: Type) -> MirRvalue
   # the unsuffixed-literal expectation threaded into each operand's
   # lowering (the seed's `expect` for binary operands): the LEFT operand's
@@ -19716,36 +19779,111 @@ def lower_for(inout b: MirBuilder, pat: Pattern, iter: Expr, body: Block, span: 
     when _ then "_for_var"
     end
 
-    # The range counter's type is the START bound's LOWERED type — the
-    # seed's rule (fresh_local start_ty; int_constant_of start_ty for the
-    # increment): `0..n` with n: UInt counts in UInt, and a hardcoded Int
-    # made the verified MIR reject the uint bound (KP9). An open range
-    # (`..hi`) keeps Int (the numeric default).
+    # READ-ONLY (the lowering AST ownership contract): the range bounds
+    # stay owned by the borrowed tree. A LITERAL bound is emitted DIRECTLY
+    # as a constant of the counter kind (it is never lowered as an Int
+    # temp): an unsuffixed `0` in `0..n` with n: UInt must become a UInt 0,
+    # and a literal bound never SELECTS the counter kind. A NON-literal
+    # bound is lowered once and carries the checker-resolved kind.
     var lo_op = operand_int(0)
-    var lo_is_bound = false
+    var lo_is_literal = false
+    var lo_lit_value = 0
     match lo_box
     when Option::Some(lo_e) then
-      # READ-ONLY (the lowering AST ownership contract): the range bound
-      # stays owned by the borrowed tree.
-      lo_op = lower_expr(b, *lo_e.get(), span)
-      lo_is_bound = true
+      let lo_expr = *lo_e.get()
+      if expr_kind_name(&lo_expr.kind) == "ExprIntLit" then
+        lo_is_literal = true
+        match lo_expr.kind
+        when ExprKind::ExprIntLit(n) then lo_lit_value = parsed_int_to_host(&n)
+        when _ then ()
+        end
+      else
+        lo_op = lower_expr(b, lo_expr, span)
+      end
     when Option::None then ()
     end
-    var range_counter_ty = Type::Int
-    if lo_is_bound then
-      match lo_op.kind
-      when MirOperandKind::MirConstant(c) then range_counter_ty = c.ty.clone()
-      when MirOperandKind::MirCopy(p) then range_counter_ty = mir_place_type(&p, b)
-      when MirOperandKind::MirMovePlace(p) then range_counter_ty = mir_place_type(&p, b)
-      when MirOperandKind::MirRead(p) then range_counter_ty = mir_place_type(&p, b)
-      when MirOperandKind::MirConsume(p) then range_counter_ty = mir_place_type(&p, b)
-      end
-    end
-    var hi_op = mir_typed_int_operand(0, range_counter_ty.clone())
+    var hi_op = operand_int(0)
+    var hi_is_literal = false
+    var hi_lit_value = 0
     match hi_box
     when Option::Some(hi_e) then
-      hi_op = lower_expr(b, *hi_e.get(), span)
+      let hi_expr = *hi_e.get()
+      if expr_kind_name(&hi_expr.kind) == "ExprIntLit" then
+        hi_is_literal = true
+        match hi_expr.kind
+        when ExprKind::ExprIntLit(n) then hi_lit_value = parsed_int_to_host(&n)
+        when _ then ()
+        end
+      else
+        hi_op = lower_expr(b, hi_expr, span)
+      end
     when Option::None then ()
+    end
+    # The counter's type is the seed's fresh_local(start_ty): `0..n` with
+    # n: UInt counts in UInt (a hardcoded Int made the verified MIR reject
+    # the uint bound — KP9). A NON-literal bound's lowered kind is the
+    # authority (its checker-resolved kind is the sibling's unified kind);
+    # the literal bound is emitted at the counter kind below. Priority:
+    # non-literal start, non-literal end, then any informative bound, then
+    # the raw concrete kinds, then Int (`..` keeps Int).
+    var range_counter_ty = Type::Int
+    var range_counter_fixed = false
+    if !lo_is_literal then
+      match mir_operand_informative_int_kind(b, lo_op.clone())
+      when Option::Some(t) then
+        range_counter_ty = t
+        range_counter_fixed = true
+      when Option::None then ()
+      end
+    end
+    if !range_counter_fixed && !hi_is_literal then
+      match mir_operand_informative_int_kind(b, hi_op.clone())
+      when Option::Some(t) then
+        range_counter_ty = t
+        range_counter_fixed = true
+      when Option::None then ()
+      end
+    end
+    if !range_counter_fixed then
+      match mir_operand_informative_int_kind(b, lo_op.clone())
+      when Option::Some(t) then
+        range_counter_ty = t
+        range_counter_fixed = true
+      when Option::None then ()
+      end
+    end
+    if !range_counter_fixed then
+      match mir_operand_informative_int_kind(b, hi_op.clone())
+      when Option::Some(t) then
+        range_counter_ty = t
+        range_counter_fixed = true
+      when Option::None then ()
+      end
+    end
+    if !range_counter_fixed then
+      match mir_operand_integer_kind(b, lo_op.clone())
+      when Option::Some(t) then range_counter_ty = t
+      when Option::None then ()
+      end
+    end
+    if !range_counter_fixed then
+      match mir_operand_integer_kind(b, hi_op.clone())
+      when Option::Some(t) then range_counter_ty = t
+      when Option::None then ()
+      end
+    end
+    # A LITERAL bound becomes a constant OF THE COUNTER KIND (`0..n` emits
+    # a UInt 0); a non-literal bound is adopted to the counter kind when it
+    # is itself an unsuffixed literal constant (a no-op for a place read).
+    if lo_is_literal then
+      lo_op = mir_typed_int_operand(lo_lit_value, range_counter_ty.clone())
+    else
+      lo_op = mir_adopt_literal_kind(lo_op, range_counter_ty.clone())
+    end
+    if hi_is_literal then
+      hi_op = mir_typed_int_operand(hi_lit_value, range_counter_ty.clone())
+    else
+      hi_op = mir_adopt_literal_kind(hi_op, range_counter_ty.clone())
     end
 
     let hi_counter = b.local_counter
