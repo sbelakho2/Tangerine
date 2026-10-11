@@ -193,6 +193,11 @@ type t = {
   baseline_mark_calls : int;
   baseline_mark_nodes : int;
   baseline_mark_cleared : int;
+  (* function names by flat index (diagnostic hot-sample rendering) *)
+  fn_names : string array;
+  (* per-VM beacon clock (a process-global ref would attribute the
+     inter-VM gap to the next VM's first dt) *)
+  mutable beacon_prev_time : float;
 }
 
 let find_fn (vm : t) (inst : Instance_id.t) : int option =
@@ -204,10 +209,6 @@ let mk_error vm kind message =
 (* per-host-binding call counts and cumulative wall time (diagnostic;
    populated only when TANGERINE_DEBUG_STEPS is set) *)
 let host_prof : (string, int * float) Hashtbl.t = Hashtbl.create 256
-
-(* diagnostic: wall time since the previous beacon (first beacon from
-   module load) *)
-let beacon_prev = ref (Unix.gettimeofday ())
 
 (* Resident set size, three-tier measurement:
      1. Linux /proc/self/status "VmRSS: N kB" — a unit independent of
@@ -310,8 +311,8 @@ let step_limit (vm : t) : unit =
      if vm.steps mod 100_000_000 = 0 then begin
        let st = Gc.quick_stat () in
        let now = Unix.gettimeofday () in
-       let dt = now -. !beacon_prev in
-       beacon_prev := now;
+       let dt = now -. vm.beacon_prev_time in
+       vm.beacon_prev_time <- now;
        Printf.eprintf
          "VM BEACON steps=%d host=%d copies=%d pushes=%d push_copies=%d set_copies=%d map_scans=%d set_scans=%d mark_calls=%d mark_nodes=%d mark_cleared=%d dt=%.1fs regions=%d live_mb=%.0f rss_mb=%.0f reg_live=%d reg_bytes=%.1fMB pool_mb=%.1f cap_live=%d frames=%d\n%!"
          vm.steps vm.host_calls
@@ -362,8 +363,14 @@ let step_limit (vm : t) : unit =
        let buf = Buffer.create 128 in
        Array.iter
          (fun (fn, count) ->
-           if fn >= 0 then
-             Buffer.add_string buf (Printf.sprintf " fn%d=%d" fn count))
+           if fn >= 0 then begin
+             let name =
+               if fn < Array.length vm.fn_names then vm.fn_names.(fn)
+               else "?"
+             in
+             Buffer.add_string buf
+               (Printf.sprintf " %s(fn%d)=%d" name fn count)
+           end)
          top;
        Printf.eprintf "VM HOT steps=%d top5:%s\n%!" vm.steps (Buffer.contents buf)
      end
@@ -2658,12 +2665,19 @@ let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
               baseline_mark_calls = !Vm_value.prof_mark_calls;
               baseline_mark_nodes = !Vm_value.prof_mark_nodes;
               baseline_mark_cleared = !Vm_value.prof_mark_cleared;
+              fn_names =
+                Array.map (fun f -> f.Seed_mir.name) program.Seed_mir.functions;
+              beacon_prev_time = Unix.gettimeofday ();
              step_hist =
                (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
                   Array.make (Array.length program.Seed_mir.functions) 0
                 else [||]);
            }
          in
+         (* host-binding profiling is per-VM diagnostics: clear the
+            process-global table so a fresh VM's totals cannot include a
+            previous VM's host work *)
+         Hashtbl.reset host_prof;
          check_fn_shape vm fn_idx;
          vm.shape_checked.(fn_idx) <- true;
          let fn = program.Seed_mir.functions.(fn_idx) in
@@ -2712,6 +2726,21 @@ let entry_exit_code (entry_frame : frame) : int =
       Int64.to_int (Int_value.to_int64 i)
   | _ -> 0
 
+let print_final_telemetry (vm : t) : unit =
+  if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
+    Printf.eprintf
+      "VM STEPS: %d (limit %d), host calls: %d (limit %d), copies: %d, pushes: %d, push copies: %d, set copies: %d, map replace scans: %d, set replace scans: %d, mark calls: %d, mark nodes: %d, mark cleared: %d\n"
+      vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls
+      (!Vm_value.prof_copies - vm.baseline_copies)
+      (!Vm_value.prof_pushes - vm.baseline_pushes)
+      (!Vm_value.prof_push_copies - vm.baseline_push_copies)
+      (!Vm_value.prof_set_copies - vm.baseline_set_copies)
+      (!Vm_value.prof_map_scans - vm.baseline_map_scans)
+      (!Vm_value.prof_set_scans - vm.baseline_set_scans)
+      (!Vm_value.prof_mark_calls - vm.baseline_mark_calls)
+      (!Vm_value.prof_mark_nodes - vm.baseline_mark_nodes)
+      (!Vm_value.prof_mark_cleared - vm.baseline_mark_cleared)
+
 let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
     ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array)
     ~(host : Host.t) : (int, vm_error) result =
@@ -2733,28 +2762,14 @@ let run_li ~(limits : limits) ~(lang_items : Lang_items.t)
       host.Host.unwind_depth <- 0;
       (try
          run_frame vm entry_frame;
-         (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
-            Printf.eprintf
-              "VM STEPS: %d (limit %d), host calls: %d (limit %d), push copies: %d (%d pushes), map replace scans: %d, set replace scans: %d\n"
-              vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls
-              !Vm_value.prof_copies !Vm_value.prof_pushes !Vm_value.prof_map_scans
-              !Vm_value.prof_set_scans);
+         print_final_telemetry vm;
          Ok (entry_exit_code entry_frame)
        with
       | Failure msg ->
-          (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
-             Printf.eprintf
-               "VM STEPS: %d (limit %d), host calls: %d (limit %d), push copies: %d (%d pushes), map replace scans: %d, set replace scans: %d\n"
-               vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls
-               (!Vm_value.prof_copies - vm.baseline_copies)
-               (!Vm_value.prof_pushes - vm.baseline_pushes)
-               (!Vm_value.prof_map_scans - vm.baseline_map_scans)
-               (!Vm_value.prof_set_scans - vm.baseline_set_scans));
+          print_final_telemetry vm;
           Error { kind = Trap msg; message = msg; trace = List.rev vm.trace }
       | Exit ->
-          (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
-             Printf.eprintf "VM STEPS: %d (limit %d), host calls: %d (limit %d)\n"
-               vm.steps vm.limits.max_steps vm.host_calls vm.limits.max_host_calls);
+          print_final_telemetry vm;
           Ok (entry_exit_code entry_frame))
 
 let run ~(program : Seed_mir.program) ~(entry : Instance_id.t) ~(argv : string array)

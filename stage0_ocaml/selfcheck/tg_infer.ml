@@ -345,9 +345,17 @@ let () =
                analysis (the bootstrap kernel never type-checks default
                bodies); the inert dead-AST default and the explicit-impl
                positive stay accepted. *)
-            fail
-              "the trait-default battery failed (expected `TRAIT_DEFAULT_BATTERY fails=0`; see the report above)"
-          else if not (contains report "TOTALS errors=") then
+             fail
+               "the trait-default battery failed (expected `TRAIT_DEFAULT_BATTERY fails=0`; see the report above)"
+           else if not (contains report "CFG_SCALING_BATTERY fails=0") then
+             (* the one-pass @cfg elimination scaling guard: 4 synthetic
+                item-list sizes with evaluated-predicate counts that must
+                stay exactly linear (2*top + nested), plus the nested
+                inline-module accept/reject legs through the full oracle.
+                A reintroduced retained-span membership scan cannot pass. *)
+             fail
+               "the cfg-scaling battery failed (expected `CFG_SCALING_BATTERY fails=0`; see the report above)"
+           else if not (contains report "TOTALS errors=") then
             fail "the probe produced no TOTALS row"
           else if merged && not (contains report "IMPLCONF=0") then
             (* the merged mode runs the canonical preparation (macro
