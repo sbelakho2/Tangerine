@@ -39,7 +39,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 EPISTEMIC_STATES = (
     "observed", "declared", "inferred", "historically_supported",
@@ -87,7 +87,8 @@ _RELATION_COLUMNS = (
     "id", "snapshot_id", "src_id", "dst_id", "kind", "tier", "provenance",
     "confidence", "derived_from", "last_verified", "uncertainty", "stale",
     "attrs", "src_key", "dst_key", "resolved", "epistemic_state",
-    "analysis_depth", "completeness", "provider",
+    "analysis_depth", "completeness", "site_completeness",
+    "target_resolution_completeness", "provider", "provider_revision",
 )
 
 _IN_CHUNK = 500
@@ -131,15 +132,47 @@ def _utc_now():
 
 
 def identity_revision_digest(identity: dict) -> str:
-    """sha256 over the canonical join of the five identity fields (§1)."""
+    """sha256 over the canonical join of the six identity fields (v3).
+
+    Identity levels: ``repo_identity`` + ``source_revision`` + ``tree_digest``
+    + ``semantic_configuration`` describe the SOURCE revision (level 1);
+    ``provider_set_digest`` names which providers observed it;
+    ``observation_set_digest`` names the immutable federated observation set
+    (level 3).  A new runtime/verification observation therefore produces a
+    new revision digest even when the source is unchanged.
+    """
     fields = (
         str(identity.get("repo_identity", "")),
         str(identity.get("source_revision", "")),
         str(identity.get("tree_digest", "")),
         str(identity.get("semantic_configuration", "{}") or "{}"),
         str(identity.get("provider_set_digest", "") or ""),
+        str(identity.get("observation_set_digest", "") or ""),
     )
     return hashlib.sha256("\x1f".join(fields).encode("utf-8")).hexdigest()
+
+
+def source_revision_digest(repo_identity, source_revision, tree_digest, target,
+                           semantic_configuration) -> str:
+    """sha256 over the level-1 source-revision identity fields."""
+    fields = (
+        str(repo_identity),
+        str(source_revision),
+        str(tree_digest),
+        str(target or ""),
+        str(semantic_configuration or "{}"),
+    )
+    return hashlib.sha256("\x1f".join(fields).encode("utf-8")).hexdigest()
+
+
+def observation_set_digest(observation_digests) -> str:
+    """sha256 over the canonical sorted observation digests (level 3)."""
+    canonical = json.dumps(
+        sorted(str(d) for d in observation_digests),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def derive_stable_id(kind: str, qualified_name: str | None) -> str:
@@ -154,6 +187,17 @@ def derive_stable_id(kind: str, qualified_name: str | None) -> str:
         return "repo:."
     prefix = _KIND_STABLE_PREFIX.get(str(kind), str(kind).lower() or "entity")
     return f"{prefix}:{qn}"
+
+
+def fact_stable_id(stable_subject, predicate, object) -> str:
+    """Content-derived fact identity: subject ID + predicate + object.
+
+    Several different facts about the same subject must never share an
+    identity (the v2 protocol derived Fact ids from the subject alone, so
+    ``publishes X`` and ``publishes Y`` collided).
+    """
+    canonical = "\x1f".join((str(stable_subject), str(predicate), str(object)))
+    return "fact:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _derive_epistemics(provenance, epistemic_state, analysis_depth):
@@ -240,6 +284,38 @@ def _prefix_match(component_qn, qualified_names):
                for qn in qualified_names)
 
 
+# v3 column additions applied to databases created by older schema
+# versions (fresh databases already carry them in schema.sql).  SQLite
+# cannot add a UNIQUE constraint in place; the value-level integrity is
+# enforced by the revision-digest check in finalize_snapshot.
+_V3_COLUMN_ADDITIONS = (
+    ("snapshot", "observation_set_digest", "TEXT NOT NULL DEFAULT ''"),
+    ("snapshot", "source_revision_id", "INTEGER"),
+    ("relation", "provider_revision", "TEXT NOT NULL DEFAULT ''"),
+    ("relation", "site_completeness", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ("relation", "target_resolution_completeness", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ("unresolved_edge", "resolution_completeness", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ("provider_record", "scope", "TEXT NOT NULL DEFAULT '{}'"),
+    ("provider_record", "authority", "TEXT NOT NULL DEFAULT 'fallback'"),
+    ("fact", "stable_id", "TEXT NOT NULL DEFAULT ''"),
+    ("contract", "stable_id", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _migrate_added_columns(conn):
+    """Add any missing v3 columns to pre-v3 tables (idempotent)."""
+    for table, column, decl in _V3_COLUMN_ADDITIONS:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if row is None:
+            continue
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 class Graph:
     """A standalone system-intelligence graph backed by SQLite."""
 
@@ -267,6 +343,7 @@ class Graph:
         schema_file = Path(__file__).with_name("schema.sql")
         if create:
             conn.executescript(schema_file.read_text(encoding="utf-8"))
+            _migrate_added_columns(conn)
             conn.commit()
         else:
             found = conn.execute(
@@ -375,16 +452,138 @@ class Graph:
         row = self._require_conn().execute(
             "SELECT * FROM snapshot WHERE repo_identity=? AND source_revision=? "
             "AND tree_digest=? AND semantic_configuration=? AND provider_set_digest=? "
-            "ORDER BY id DESC LIMIT 1",
+            "AND observation_set_digest=? ORDER BY id DESC LIMIT 1",
             (
                 str(identity.get("repo_identity", "")),
                 str(identity.get("source_revision", "")),
                 str(identity.get("tree_digest", "")),
                 str(identity.get("semantic_configuration", "{}") or "{}"),
                 str(identity.get("provider_set_digest", "") or ""),
+                str(identity.get("observation_set_digest", "") or ""),
             ),
         ).fetchone()
         return self._snapshot_dict(row) if row is not None else None
+
+    # ------------------------------------------------- observations (v3)
+
+    def upsert_source_revision(self, identity: dict) -> int:
+        """Insert (or reuse) the level-1 source revision; return its id.
+
+        Identity is (repo_identity, source_revision, tree_digest, target,
+        semantic_configuration); the revision_digest is recomputed here so a
+        caller can never persist a digest that disagrees with the fields.
+        """
+        conn = self._require_conn()
+        repo_identity = str(identity.get("repo_identity", ""))
+        source_revision = str(identity.get("source_revision", ""))
+        tree_digest = str(identity.get("tree_digest", ""))
+        target = str(identity.get("target", "") or "")
+        semantic = str(identity.get("semantic_configuration", "{}") or "{}")
+        digest = source_revision_digest(repo_identity, source_revision, tree_digest,
+                                        target, semantic)
+        row = conn.execute(
+            "SELECT id FROM source_revision WHERE repo_identity=? AND source_revision=? "
+            "AND tree_digest=? AND target=? AND semantic_configuration=?",
+            (repo_identity, source_revision, tree_digest, target, semantic),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+        cur = conn.execute(
+            """INSERT INTO source_revision (repo_identity, source_revision, tree_digest,
+               target, semantic_configuration, revision_digest, created_utc)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (repo_identity, source_revision, tree_digest, target,
+                            semantic_configuration) DO NOTHING""",
+            (repo_identity, source_revision, tree_digest, target, semantic,
+             digest, _utc_now()),
+        )
+        if cur.lastrowid:
+            source_id = int(cur.lastrowid)
+        else:
+            row = conn.execute(
+                "SELECT id FROM source_revision WHERE revision_digest=?", (digest,)
+            ).fetchone()
+            source_id = int(row["id"])
+        self._maybe_commit()
+        return source_id
+
+    def source_revision_row(self, source_revision_id) -> dict | None:
+        row = self._require_conn().execute(
+            "SELECT * FROM source_revision WHERE id=?", (int(source_revision_id),)
+        ).fetchone()
+        return {k: row[k] for k in row.keys()} if row is not None else None
+
+    def add_provider_observation(self, source_revision_id, provider, *,
+                                 provider_version="", observation_kind="static",
+                                 observation_digest="", scope=None,
+                                 semantic_configuration="{}",
+                                 authority="fallback",
+                                 enumeration_completeness="unknown",
+                                 resolution_completeness="unknown") -> int:
+        """Append one immutable provider observation; return its id.
+
+        The observation_digest is content-derived by the caller and must be
+        non-empty (a fresh observation must never be confused with a reused
+        one).
+        """
+        conn = self._require_conn()
+        if str(provider).strip() == "":
+            raise SnapshotError("provider_observation requires a provider id")
+        if str(observation_digest).strip() == "":
+            raise SnapshotError("provider_observation requires a content digest")
+        scope_json = _dumps(scope if isinstance(scope, dict) else {})
+        params = (
+            str(provider), str(provider_version), int(source_revision_id),
+            str(observation_kind), str(observation_digest), scope_json,
+            str(semantic_configuration or "{}"), str(authority),
+            str(enumeration_completeness), str(resolution_completeness),
+            _utc_now(),
+        )
+        conn.execute(
+            """INSERT INTO provider_observation (provider, provider_version,
+               source_revision_id, observation_kind, observation_digest, scope,
+               semantic_configuration, authority, enumeration_completeness,
+               resolution_completeness, created_utc)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (provider, provider_version, source_revision_id,
+                            observation_kind, observation_digest) DO NOTHING""",
+            params,
+        )
+        row = conn.execute(
+            "SELECT id FROM provider_observation WHERE provider=? AND provider_version=? "
+            "AND source_revision_id=? AND observation_kind=? AND observation_digest=?",
+            params[:5],
+        ).fetchone()
+        self._maybe_commit()
+        return int(row["id"])
+
+    def link_snapshot_observation(self, snapshot_id, observation_id) -> None:
+        conn = self._require_conn()
+        conn.execute(
+            "INSERT OR IGNORE INTO snapshot_observation (snapshot_id, observation_id) "
+            "VALUES (?, ?)",
+            (int(snapshot_id), int(observation_id)),
+        )
+        self._maybe_commit()
+
+    def observations(self, snapshot_id=None) -> list[dict]:
+        """The immutable observation set of a snapshot, digest-ordered."""
+        conn = self._require_conn()
+        snap = self._resolve_read_snapshot(snapshot_id)
+        rows = conn.execute(
+            """SELECT o.*, so.snapshot_id AS linked_snapshot_id
+               FROM snapshot_observation so
+               JOIN provider_observation o ON o.id = so.observation_id
+               WHERE so.snapshot_id = ?
+               ORDER BY o.provider, o.observation_kind, o.observation_digest""",
+            (int(snap["id"]),),
+        ).fetchall()
+        out = []
+        for row in rows:
+            item = {k: row[k] for k in row.keys()}
+            item["scope"] = _loads(item.get("scope"), {})
+            out.append(item)
+        return out
 
     def begin_draft(self, identity: dict) -> int:
         """Insert a draft snapshot for an identity tuple; return its id.
@@ -407,8 +606,9 @@ class Graph:
             """
             INSERT INTO snapshot (repo_root, repo_identity, source_revision, tree_digest,
                                   semantic_configuration, provider_set_digest,
+                                  observation_set_digest, source_revision_id,
                                   revision_digest, state, created_utc, finalized_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, NULL)
             """,
             (
                 identity.get("repo_root"),
@@ -417,27 +617,78 @@ class Graph:
                 str(identity.get("tree_digest", "")),
                 str(identity.get("semantic_configuration", "{}") or "{}"),
                 str(identity.get("provider_set_digest", "") or ""),
+                str(identity.get("observation_set_digest", "") or ""),
+                int(identity["source_revision_id"])
+                if identity.get("source_revision_id") is not None else None,
                 str(revision_digest),
                 _utc_now(),
             ),
         )
         snap = int(cur.lastrowid)
         self._snapshot_id = snap
+        for observation_id in identity.get("observation_ids", ()) or ():
+            conn.execute(
+                "INSERT OR IGNORE INTO snapshot_observation (snapshot_id, observation_id) "
+                "VALUES (?, ?)",
+                (snap, int(observation_id)),
+            )
         self._maybe_commit()
         return snap
 
     def finalize_snapshot(self, snapshot_id) -> None:
+        """Draft -> finalized, with the identity digest RECOMPUTED first.
+
+        The federated observation-set digest is derived from the linked
+        provider observations (when any are linked) and the revision digest
+        is recomputed from the frozen identity fields, so a finalized
+        snapshot's digest is self-enforcing; the integrity gate re-verifies
+        it on read.
+        """
         conn = self._require_conn()
-        row = conn.execute("SELECT state FROM snapshot WHERE id=?", (int(snapshot_id),)).fetchone()
+        row = conn.execute("SELECT * FROM snapshot WHERE id=?", (int(snapshot_id),)).fetchone()
         if row is None:
             raise SnapshotError(f"snapshot {snapshot_id} not found")
         if row["state"] == "finalized":
             raise SnapshotError(f"snapshot {snapshot_id} is already finalized")
+        linked = conn.execute(
+            "SELECT o.observation_digest FROM snapshot_observation so "
+            "JOIN provider_observation o ON o.id = so.observation_id "
+            "WHERE so.snapshot_id=?",
+            (int(snapshot_id),),
+        ).fetchall()
+        obs_digest = str(row["observation_set_digest"] or "")
+        if linked:
+            obs_digest = observation_set_digest([r["observation_digest"] for r in linked])
+        expected = identity_revision_digest({
+            "repo_identity": row["repo_identity"],
+            "source_revision": row["source_revision"],
+            "tree_digest": row["tree_digest"],
+            "semantic_configuration": row["semantic_configuration"],
+            "provider_set_digest": row["provider_set_digest"],
+            "observation_set_digest": obs_digest,
+        })
         conn.execute(
-            "UPDATE snapshot SET state='finalized', finalized_utc=? WHERE id=? AND state='draft'",
-            (_utc_now(), int(snapshot_id)),
+            "UPDATE snapshot SET observation_set_digest=?, revision_digest=?, "
+            "state='finalized', finalized_utc=? WHERE id=? AND state='draft'",
+            (obs_digest, expected, _utc_now(), int(snapshot_id)),
         )
         self._maybe_commit()
+
+    def verify_snapshot_digest(self, snapshot_id) -> bool:
+        """True when a snapshot's stored revision digest matches its fields."""
+        conn = self._require_conn()
+        row = conn.execute("SELECT * FROM snapshot WHERE id=?", (int(snapshot_id),)).fetchone()
+        if row is None:
+            raise SnapshotError(f"snapshot {snapshot_id} not found")
+        expected = identity_revision_digest({
+            "repo_identity": row["repo_identity"],
+            "source_revision": row["source_revision"],
+            "tree_digest": row["tree_digest"],
+            "semantic_configuration": row["semantic_configuration"],
+            "provider_set_digest": row["provider_set_digest"],
+            "observation_set_digest": row["observation_set_digest"],
+        })
+        return str(row["revision_digest"]) == expected
 
     def abort_draft(self, snapshot_id) -> None:
         """Delete every row of a draft snapshot in one transaction."""
@@ -448,6 +699,7 @@ class Graph:
         if row["state"] == "finalized":
             raise SnapshotError(f"snapshot {snapshot_id} is finalized and cannot be aborted")
         snap = int(snapshot_id)
+        conn.execute("DELETE FROM snapshot_observation WHERE snapshot_id=?", (snap,))
         for table in (
             "support", "unresolved_edge", "relation", "evidence", "fact",
             "provider_record", "invariant", "contract", "incident", "change",
@@ -581,7 +833,9 @@ class Graph:
                         last_verified=None, uncertainty=None, attrs=None,
                         src_key=None, dst_key=None, resolved=None,
                         epistemic_state=None, analysis_depth=None,
-                        completeness=None, provider=None):
+                        completeness=None, site_completeness=None,
+                        target_resolution_completeness=None,
+                        provider=None, provider_revision=None):
         conn = self._require_conn()
         src = conn.execute(
             "SELECT snapshot_id, stable_id FROM entity WHERE id=?", (int(src_id),)
@@ -619,12 +873,17 @@ class Graph:
             conn.execute(
                 """UPDATE relation SET tier=?, provenance=?, confidence=?, derived_from=?,
                    last_verified=?, uncertainty=?, attrs=?, stale=0, resolved=?,
-                   epistemic_state=?, analysis_depth=?, completeness=?, provider=?
+                   epistemic_state=?, analysis_depth=?, completeness=?,
+                   site_completeness=?, target_resolution_completeness=?,
+                   provider=?, provider_revision=?
                    WHERE id=?""",
                 (int(tier), str(provenance), float(confidence),
                  _dumps(list(derived_from)), last_verified, uncertainty,
                  _dumps(dict(attrs or {})), int(resolved), state, depth,
-                 str(completeness or "partial"), str(provider or ""), int(row["id"])),
+                 str(completeness or "partial"),
+                 str(site_completeness or "unknown"),
+                 str(target_resolution_completeness or "unknown"),
+                 str(provider or ""), str(provider_revision or ""), int(row["id"])),
             )
             rel_id = int(row["id"])
         else:
@@ -633,14 +892,18 @@ class Graph:
                 INSERT INTO relation (snapshot_id, src_id, dst_id, kind, tier, provenance,
                                       confidence, derived_from, last_verified, uncertainty,
                                       stale, attrs, src_key, dst_key, resolved,
-                                      epistemic_state, analysis_depth, completeness, provider)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      epistemic_state, analysis_depth, completeness,
+                                      site_completeness, target_resolution_completeness,
+                                      provider, provider_revision)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (snap, int(src_id), dst_id, str(kind), int(tier), str(provenance),
                  float(confidence), _dumps(list(derived_from)), last_verified,
                  uncertainty, _dumps(dict(attrs or {})), str(src_key), d_key,
                  int(resolved), state, depth, str(completeness or "partial"),
-                 str(provider or "")),
+                 str(site_completeness or "unknown"),
+                 str(target_resolution_completeness or "unknown"),
+                 str(provider or ""), str(provider_revision or "")),
             )
             rel_id = int(cur.lastrowid)
         self._maybe_commit()
@@ -654,13 +917,15 @@ class Graph:
         conn = self._require_conn()
         snap = self._resolve_snapshot(snapshot_id)
         state, depth = _derive_epistemics(provenance, epistemic_state, analysis_depth)
+        stable_subject_text = str(stable_subject if stable_subject is not None else subject)
+        fact_stable = fact_stable_id(stable_subject_text, str(predicate), str(object))
         conn.execute(
             """
             INSERT INTO fact (snapshot_id, subject, predicate, object, tier, provenance,
                               confidence, derived_from, last_verified, uncertainty, stale,
                               epistemic_state, analysis_depth, completeness, provider,
-                              provider_revision, stable_subject)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                              provider_revision, stable_subject, stable_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (snapshot_id, subject, predicate, object) DO UPDATE SET
                 tier=excluded.tier, provenance=excluded.provenance,
                 confidence=excluded.confidence, derived_from=excluded.derived_from,
@@ -669,14 +934,15 @@ class Graph:
                 analysis_depth=excluded.analysis_depth,
                 completeness=excluded.completeness, provider=excluded.provider,
                 provider_revision=excluded.provider_revision,
-                stable_subject=excluded.stable_subject
+                stable_subject=excluded.stable_subject,
+                stable_id=excluded.stable_id
             """,
             (snap, str(subject), str(predicate), str(object), int(tier),
              str(provenance), float(confidence), _dumps(list(derived_from)),
              last_verified, uncertainty, state, depth,
              str(completeness or "partial"), str(provider or ""),
              str(provider_revision or ""),
-             str(stable_subject if stable_subject is not None else subject)),
+             stable_subject_text, fact_stable),
         )
         row = conn.execute(
             "SELECT id FROM fact WHERE snapshot_id=? AND subject=? AND predicate=? AND object=?",
@@ -690,19 +956,22 @@ class Graph:
     def add_unresolved_edge(self, snapshot_id, src_key, dst_raw, kind, *,
                             provider, provider_revision="", candidates=(),
                             confidence=0.3, completeness="unknown",
-                            evidence=()) -> int:
+                            resolution_completeness=None, evidence=()) -> int:
         conn = self._require_conn()
         snap = self._resolve_snapshot(snapshot_id)
         cur = conn.execute(
             """
             INSERT INTO unresolved_edge (snapshot_id, src_key, dst_raw, kind, provider,
                                          provider_revision, candidates, confidence,
-                                         completeness, evidence, created_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                         completeness, resolution_completeness,
+                                         evidence, created_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (snap, str(src_key), str(dst_raw), str(kind), str(provider),
              str(provider_revision or ""), _dumps(list(candidates)),
-             float(confidence), str(completeness), _dumps(list(evidence)), _utc_now()),
+             float(confidence), str(completeness),
+             str(resolution_completeness or completeness),
+             _dumps(list(evidence)), _utc_now()),
         )
         self._maybe_commit()
         return int(cur.lastrowid)
@@ -765,19 +1034,23 @@ class Graph:
         return sup_id
 
     def record_provider(self, snapshot_id, provider, provider_version,
-                        capabilities: dict, invoked=True) -> int:
+                        capabilities: dict, invoked=True, scope=None,
+                        authority="fallback") -> int:
         conn = self._require_conn()
         snap = self._resolve_snapshot(snapshot_id)
         caps = capabilities if isinstance(capabilities, dict) else {}
         conn.execute(
             """INSERT INTO provider_record (snapshot_id, provider, provider_version,
-               capabilities, invoked)
-               VALUES (?, ?, ?, ?, ?)
+               capabilities, invoked, scope, authority)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (snapshot_id, provider) DO UPDATE SET
                    provider_version=excluded.provider_version,
-                   capabilities=excluded.capabilities, invoked=excluded.invoked""",
+                   capabilities=excluded.capabilities, invoked=excluded.invoked,
+                   scope=excluded.scope, authority=excluded.authority""",
             (snap, str(provider), str(provider_version), _dumps(dict(caps)),
-             1 if invoked else 0),
+             1 if invoked else 0,
+             _dumps(scope if isinstance(scope, dict) else {}),
+             str(authority or "fallback")),
         )
         row = conn.execute(
             "SELECT id FROM provider_record WHERE snapshot_id=? AND provider=?",
@@ -1424,6 +1697,60 @@ class Graph:
                 (snap,),
             ).fetchall()
         ]
+
+        # Provider scope/authority and the SEPARATED enumeration vs
+        # resolution completeness axes (P1 completeness algebra): one scalar
+        # cannot combine providers whose scopes differ.
+        provider_scopes = {}
+        for orow in conn.execute(
+            """SELECT o.provider, o.provider_version, o.observation_kind,
+                      o.observation_digest, o.scope, o.authority,
+                      o.enumeration_completeness, o.resolution_completeness
+               FROM snapshot_observation so
+               JOIN provider_observation o ON o.id = so.observation_id
+               WHERE so.snapshot_id=?
+               ORDER BY o.provider, o.observation_kind""",
+            (snap,),
+        ).fetchall():
+            entry = provider_scopes.setdefault(orow["provider"], {
+                "provider_version": orow["provider_version"],
+                "observations": [],
+            })
+            entry["observations"].append({
+                "observation_kind": orow["observation_kind"],
+                "observation_digest": orow["observation_digest"],
+                "scope": _loads(orow["scope"], {}),
+                "authority": orow["authority"],
+                "enumeration_completeness": orow["enumeration_completeness"],
+                "resolution_completeness": orow["resolution_completeness"],
+            })
+
+        # Relation completeness keeps the two axes apart: all sites may be
+        # enumerated while some indirect targets stay unknown.
+        site_rows = {}
+        for rrow in conn.execute(
+            "SELECT site_completeness, COUNT(*) AS n FROM relation "
+            "WHERE snapshot_id=? GROUP BY site_completeness ORDER BY site_completeness",
+            (snap,),
+        ).fetchall():
+            site_rows[str(rrow["site_completeness"])] = int(rrow["n"])
+        target_rows = {}
+        for rrow in conn.execute(
+            "SELECT target_resolution_completeness, COUNT(*) AS n FROM relation "
+            "WHERE snapshot_id=? GROUP BY target_resolution_completeness "
+            "ORDER BY target_resolution_completeness",
+            (snap,),
+        ).fetchall():
+            target_rows[str(rrow["target_resolution_completeness"])] = int(rrow["n"])
+        site_verdict = "unknown"
+        if site_rows:
+            site_verdict = _worst_verdict(*site_rows.keys())
+        target_verdict = "unknown"
+        if target_rows:
+            target_verdict = _worst_verdict(*target_rows.keys())
+        if relations_unresolved or unresolved_edges:
+            target_verdict = _worst_verdict(target_verdict, "partial")
+
         filtered = ({family: families.get(family, "unknown")} if family is not None
                     else dict(sorted(families.items())))
         return {
@@ -1432,6 +1759,13 @@ class Graph:
             "state": row["state"],
             "families": filtered,
             "providers": providers,
+            "provider_scopes": provider_scopes,
+            "relations_completeness": {
+                "site": site_verdict,
+                "target_resolution": target_verdict,
+                "site_rows": site_rows,
+                "target_resolution_rows": target_rows,
+            },
             "unresolved": {
                 "count": unresolved_edges,
                 "relation_rows": relations_unresolved,
@@ -1602,16 +1936,36 @@ class Graph:
             "AND NOT EXISTS (SELECT 1 FROM unresolved_edge u WHERE u.snapshot_id=r.snapshot_id "
             "AND u.src_key=r.src_key AND u.dst_raw=r.dst_key AND u.kind=r.kind)", (snap,)
         ).fetchone()["n"])
+        bad_support = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM support s WHERE s.snapshot_id=? AND "
+            "(s.evidence_id IS NOT NULL AND NOT EXISTS "
+            " (SELECT 1 FROM evidence e WHERE e.id=s.evidence_id AND e.snapshot_id=s.snapshot_id))",
+            (snap,),
+        ).fetchone()["n"])
+        digest_ok = self.verify_snapshot_digest(snap)
+        reasons = []
+        if orphan_src or orphan_dst:
+            reasons.append("cross-snapshot relation endpoints")
+        if unaccounted:
+            reasons.append("unresolved relations without an unresolved_edge")
+        if bad_support:
+            reasons.append("support evidence outside the snapshot")
+        if not digest_ok:
+            reasons.append("revision digest disagrees with the identity fields")
         report = {
             "snapshot_id": snap,
             "orphan_src_relations": orphan_src,
             "orphan_dst_relations": orphan_dst,
             "unresolved_relation_rows": unresolved_rows,
             "unaccounted_unresolved_relations": unaccounted,
-            "ok": orphan_src == 0 and orphan_dst == 0 and unaccounted == 0,
+            "support_evidence_violations": bad_support,
+            "digest_verified": digest_ok,
+            "ok": not reasons,
         }
         if not report["ok"]:
-            raise SnapshotError(f"integrity check failed for snapshot {snap}: {report}")
+            raise SnapshotError(
+                f"integrity check failed for snapshot {snap}: {report} ({'; '.join(reasons)})"
+            )
         return report
 
     # ------------------------------------------------------------------ stats
@@ -1645,6 +1999,11 @@ class Graph:
             "snapshot_id": snap,
             "revision_digest": row["revision_digest"],
             "state": row["state"],
+            "source_revision_id": row["source_revision_id"],
+            "observation_set_digest": row["observation_set_digest"],
+            "observations": int(conn.execute(
+                "SELECT COUNT(*) AS n FROM snapshot_observation WHERE snapshot_id=?", (snap,)
+            ).fetchone()["n"]),
             "snapshots": int(conn.execute("SELECT COUNT(*) AS n FROM snapshot").fetchone()["n"]),
             "entities_by_kind": by_kind,
             "relations_by_kind": relations_by_kind,
@@ -1715,4 +2074,5 @@ class Graph:
             "support": query("support", _parse_common,),
             "evidence": query("evidence", lambda d: _parse_common(d, list_fields=("derived_from",), dict_fields=("attrs",))),
             "provider_records": query("provider_record", _parse_provider),
+            "observations": self.observations(snap),
         }

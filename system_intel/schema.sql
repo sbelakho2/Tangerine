@@ -1,19 +1,78 @@
--- Tangerine System Intelligence — persistent graph schema (SQLite), v2.
--- Standalone: no consumer-specific concepts live in the core.  Every row is
--- bound to a snapshot; snapshot identity is the revision tuple from
--- INTERFACES.md §1.  Finalized snapshots are IMMUTABLE: BEFORE triggers abort
--- every INSERT/UPDATE/DELETE against the seven core tables while the owning
--- snapshot state is 'finalized' ("nothing inside a finalized snapshot
--- becomes stale"; removed content is represented by newer snapshots and
--- `diff_snapshots`, never by mutating history).
+-- Tangerine System Intelligence — persistent graph schema (SQLite), v3.
+-- Standalone: no consumer-specific concepts live in the core.  Three identity
+-- levels (P0 observation model):
+--
+--   source_revision       level 1: repository identity + source tree +
+--                         target/semantic configuration inputs
+--   provider_observation  level 2: ONE provider's immutable observation over
+--                         a source revision (static/runtime/verification/
+--                         history), carrying scope, authority and the
+--                         enumeration/resolution completeness verdicts
+--   snapshot              level 3 (FederatedSnapshot): the immutable set of
+--                         provider_observation ids that answers queries
+--
+-- Every snapshot-owned row is bound to a snapshot; finalized snapshots are
+-- IMMUTABLE (BEFORE triggers abort every INSERT/UPDATE/DELETE against the
+-- snapshot-owned tables while the owning snapshot state is 'finalized';
+-- "nothing inside a finalized snapshot becomes stale" — removed content is
+-- represented by newer snapshots and `diff_snapshots`, never by mutating
+-- history).  The snapshot metadata row itself is frozen once finalized:
+-- only the draft -> finalized transition is permitted.
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 INSERT INTO schema_version (version)
-  SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+  SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+UPDATE schema_version SET version = 3 WHERE version < 3;
 
--- One row per scan revision.  repo_root is provenance metadata, never
--- identity; the identity is the UNIQUE tuple below.
+-- ── level 1: source revision ─────────────────────────────────────────────
+-- source_revision is the SOURCE + CONFIGURATION identity.  The same source
+-- commit under a different target/feature set is a DIFFERENT revision.
+-- repo_root is provenance metadata, never identity.
+CREATE TABLE IF NOT EXISTS source_revision (
+  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_identity          TEXT NOT NULL,
+  source_revision        TEXT NOT NULL,
+  tree_digest            TEXT NOT NULL,
+  target                 TEXT NOT NULL DEFAULT '',
+  semantic_configuration TEXT NOT NULL DEFAULT '{}',
+  revision_digest        TEXT NOT NULL UNIQUE,
+  created_utc            TEXT,
+  UNIQUE (repo_identity, source_revision, tree_digest, target,
+          semantic_configuration)
+);
+
+-- ── level 2: provider observation ────────────────────────────────────────
+-- ONE provider's immutable observation over a source revision.  A new
+-- runtime trace / Kiwi verification / historical record is a NEW row; the
+-- observation_digest is content-derived (never a DB row id) and the
+-- federated set digest changes, so freshness can never be masked by
+-- source-revision reuse.
+CREATE TABLE IF NOT EXISTS provider_observation (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider              TEXT NOT NULL,
+  provider_version      TEXT NOT NULL DEFAULT '',
+  source_revision_id    INTEGER NOT NULL REFERENCES source_revision(id),
+  observation_kind      TEXT NOT NULL DEFAULT 'static'
+                        CHECK (observation_kind IN
+                               ('static','runtime','verification','history')),
+  observation_digest    TEXT NOT NULL,
+  scope                 TEXT NOT NULL DEFAULT '{}',
+  semantic_configuration TEXT NOT NULL DEFAULT '{}',
+  authority             TEXT NOT NULL DEFAULT 'fallback'
+                        CHECK (authority IN
+                               ('native','compiler','fallback','external')),
+  enumeration_completeness TEXT NOT NULL DEFAULT 'unknown',
+  resolution_completeness  TEXT NOT NULL DEFAULT 'unknown',
+  created_utc           TEXT,
+  UNIQUE (provider, provider_version, source_revision_id, observation_kind,
+          observation_digest)
+);
+
+-- ── level 3: federated snapshot ──────────────────────────────────────────
+-- The immutable set of provider observations.  The identity tuple is
+-- (source revision, provider set, observation set); one tuple maps to at
+-- most one snapshot.
 CREATE TABLE IF NOT EXISTS snapshot (
   id                    INTEGER PRIMARY KEY AUTOINCREMENT,
   repo_root             TEXT,
@@ -22,12 +81,24 @@ CREATE TABLE IF NOT EXISTS snapshot (
   tree_digest           TEXT NOT NULL,
   semantic_configuration TEXT NOT NULL DEFAULT '{}',
   provider_set_digest   TEXT NOT NULL DEFAULT '',
+  observation_set_digest TEXT NOT NULL DEFAULT '',
+  source_revision_id    INTEGER REFERENCES source_revision(id),
   revision_digest       TEXT NOT NULL,
   state                 TEXT NOT NULL DEFAULT 'draft' CHECK (state IN ('draft','finalized')),
   created_utc           TEXT,
   finalized_utc         TEXT,
   UNIQUE (repo_identity, source_revision, tree_digest,
-          semantic_configuration, provider_set_digest)
+          semantic_configuration, provider_set_digest, observation_set_digest)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS snapshot_revision_digest_uniq
+  ON snapshot (revision_digest);
+
+-- The federated observation set (append-only while draft; frozen when the
+-- snapshot finalizes).
+CREATE TABLE IF NOT EXISTS snapshot_observation (
+  snapshot_id    INTEGER NOT NULL REFERENCES snapshot(id) ON DELETE CASCADE,
+  observation_id INTEGER NOT NULL REFERENCES provider_observation(id),
+  PRIMARY KEY (snapshot_id, observation_id)
 );
 
 -- Universal graph entities.  `kind` is open-ended; the documented set is
@@ -73,6 +144,10 @@ CREATE INDEX IF NOT EXISTS entity_name_idx ON entity (snapshot_id, name);
 -- unresolved target keeps a first-class unresolved_edge row plus a relation
 -- row with resolved=0 / dst_id NULL.  The composite foreign keys make a
 -- cross-snapshot relation structurally impossible.
+--
+-- `site_completeness` and `target_resolution_completeness` are SEPARATE:
+-- all call sites may be enumerated while some indirect targets stay
+-- unknown.
 CREATE TABLE IF NOT EXISTS relation (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   snapshot_id   INTEGER NOT NULL REFERENCES snapshot(id) ON DELETE CASCADE,
@@ -93,7 +168,10 @@ CREATE TABLE IF NOT EXISTS relation (
   epistemic_state TEXT NOT NULL DEFAULT 'inferred',
   analysis_depth INTEGER NOT NULL DEFAULT 0,
   completeness  TEXT NOT NULL DEFAULT 'partial',
+  site_completeness TEXT NOT NULL DEFAULT 'unknown',
+  target_resolution_completeness TEXT NOT NULL DEFAULT 'unknown',
   provider      TEXT NOT NULL DEFAULT '',
+  provider_revision TEXT NOT NULL DEFAULT '',
   FOREIGN KEY (src_id, snapshot_id) REFERENCES entity (id, snapshot_id),
   FOREIGN KEY (dst_id, snapshot_id) REFERENCES entity (id, snapshot_id),
   CHECK (dst_id IS NOT NULL OR resolved = 0)
@@ -118,12 +196,15 @@ CREATE TABLE IF NOT EXISTS unresolved_edge (
   candidates    TEXT NOT NULL DEFAULT '[]',
   confidence    REAL NOT NULL DEFAULT 0.3,
   completeness  TEXT NOT NULL DEFAULT 'unknown',
+  resolution_completeness TEXT NOT NULL DEFAULT 'unknown',
   evidence      TEXT NOT NULL DEFAULT '[]',
   created_utc   TEXT
 );
 CREATE INDEX IF NOT EXISTS unresolved_edge_snapshot_idx ON unresolved_edge (snapshot_id, kind);
 
--- Observations supporting canonical rows.
+-- Observations supporting canonical rows.  The (subject_table, subject_id)
+-- pair is structurally validated against the same snapshot (triggers
+-- below) and evidence_id must belong to the SAME snapshot (composite FK).
 CREATE TABLE IF NOT EXISTS support (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   snapshot_id   INTEGER NOT NULL REFERENCES snapshot (id),
@@ -132,10 +213,11 @@ CREATE TABLE IF NOT EXISTS support (
   provider      TEXT NOT NULL,
   provider_revision TEXT NOT NULL DEFAULT '',
   confidence    REAL NOT NULL DEFAULT 1.0,
-  evidence_id   INTEGER REFERENCES evidence (id),
+  evidence_id   INTEGER,
   detail        TEXT,
   observed_utc  TEXT,
-  UNIQUE (snapshot_id, subject_table, subject_id, provider, evidence_id)
+  UNIQUE (snapshot_id, subject_table, subject_id, provider, evidence_id),
+  FOREIGN KEY (evidence_id, snapshot_id) REFERENCES evidence (id, snapshot_id)
 );
 
 CREATE TABLE IF NOT EXISTS evidence (
@@ -147,8 +229,11 @@ CREATE TABLE IF NOT EXISTS evidence (
   summary       TEXT NOT NULL DEFAULT '',
   payload       TEXT,
   provider      TEXT NOT NULL DEFAULT '',
-  created_utc   TEXT
+  created_utc   TEXT,
+  UNIQUE (id, snapshot_id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS evidence_id_snapshot_uniq
+  ON evidence (id, snapshot_id);
 
 CREATE TABLE IF NOT EXISTS provider_record (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,6 +241,8 @@ CREATE TABLE IF NOT EXISTS provider_record (
   provider      TEXT NOT NULL,
   provider_version TEXT NOT NULL,
   capabilities  TEXT NOT NULL,
+  scope         TEXT NOT NULL DEFAULT '{}',
+  authority     TEXT NOT NULL DEFAULT 'fallback',
   invoked       INTEGER NOT NULL DEFAULT 1,
   UNIQUE (snapshot_id, provider)
 );
@@ -180,6 +267,7 @@ CREATE TABLE IF NOT EXISTS fact (
   provider      TEXT NOT NULL DEFAULT '',
   provider_revision TEXT NOT NULL DEFAULT '',
   stable_subject TEXT NOT NULL DEFAULT '',
+  stable_id     TEXT NOT NULL DEFAULT '',
   UNIQUE (snapshot_id, subject, predicate, object)
 );
 
@@ -216,6 +304,7 @@ CREATE TABLE IF NOT EXISTS contract (
   uncertainty   TEXT,
   stale         INTEGER NOT NULL DEFAULT 0,
   attrs         TEXT NOT NULL DEFAULT '{}',
+  stable_id     TEXT NOT NULL DEFAULT '',
   UNIQUE (snapshot_id, kind, name)
 );
 
@@ -250,12 +339,126 @@ CREATE TABLE IF NOT EXISTS change (
   attrs         TEXT NOT NULL DEFAULT '{}'
 );
 
--- ── immutability triggers ────────────────────────────────────────────────
--- Draft snapshots are mutable (scan() writes and finalizes inside one
--- transaction).  Once a snapshot is 'finalized', nothing inside it may be
--- inserted, updated or deleted; a scan that changes the tree produces a NEW
--- revision, and removals are answered by diff_snapshots.
+-- ── source/observation immutability (append-only, never mutated) ─────────
+CREATE TRIGGER IF NOT EXISTS source_revision_no_update
+BEFORE UPDATE ON source_revision
+BEGIN SELECT RAISE(ABORT, 'source_revision is append-only and immutable'); END;
 
+CREATE TRIGGER IF NOT EXISTS source_revision_no_delete
+BEFORE DELETE ON source_revision
+BEGIN SELECT RAISE(ABORT, 'source_revision is append-only and immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS provider_observation_no_update
+BEFORE UPDATE ON provider_observation
+BEGIN SELECT RAISE(ABORT, 'provider_observation is append-only and immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS provider_observation_no_delete
+BEFORE DELETE ON provider_observation
+BEGIN SELECT RAISE(ABORT, 'provider_observation is append-only and immutable'); END;
+
+-- ── snapshot metadata freeze ─────────────────────────────────────────────
+-- A finalized snapshot's identity fields/state are frozen: the only legal
+-- snapshot UPDATE is the draft -> finalized transition.  Deletion is
+-- reserved for explicit DB-level maintenance tooling (which must disable
+-- the trigger), never for normal operation.
+CREATE TRIGGER IF NOT EXISTS snapshot_no_update_finalized
+BEFORE UPDATE ON snapshot
+WHEN OLD.state = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: metadata is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS snapshot_no_delete_finalized
+BEFORE DELETE ON snapshot
+WHEN OLD.state = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS snapshot_observation_no_insert_finalized
+BEFORE INSERT ON snapshot_observation
+WHEN (SELECT state FROM snapshot WHERE id = NEW.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: observation set is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS snapshot_observation_no_update_finalized
+BEFORE UPDATE ON snapshot_observation
+WHEN (SELECT state FROM snapshot WHERE id = OLD.snapshot_id) = 'finalized'
+  OR (SELECT state FROM snapshot WHERE id = NEW.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: observation set is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS snapshot_observation_no_delete_finalized
+BEFORE DELETE ON snapshot_observation
+WHEN (SELECT state FROM snapshot WHERE id = OLD.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: observation set is immutable'); END;
+
+-- ── support structural integrity ─────────────────────────────────────────
+-- The polymorphic (subject_table, subject_id) pair must name a row of a
+-- known snapshot-owned table in the SAME snapshot; a bad pair can never be
+-- written through the public API.
+CREATE TRIGGER IF NOT EXISTS support_subject_valid_insert
+BEFORE INSERT ON support
+WHEN NEW.subject_table NOT IN
+       ('entity','relation','fact','unresolved_edge','invariant','contract','incident','change')
+  OR (NEW.subject_table = 'entity' AND NOT EXISTS
+        (SELECT 1 FROM entity WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'relation' AND NOT EXISTS
+        (SELECT 1 FROM relation WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'fact' AND NOT EXISTS
+        (SELECT 1 FROM fact WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'unresolved_edge' AND NOT EXISTS
+        (SELECT 1 FROM unresolved_edge WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'invariant' AND NOT EXISTS
+        (SELECT 1 FROM invariant WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'contract' AND NOT EXISTS
+        (SELECT 1 FROM contract WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'incident' AND NOT EXISTS
+        (SELECT 1 FROM incident WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'change' AND NOT EXISTS
+        (SELECT 1 FROM change WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+BEGIN
+  SELECT RAISE(ABORT, 'support subject is not a same-snapshot row of a known table');
+END;
+
+CREATE TRIGGER IF NOT EXISTS support_subject_valid_update
+BEFORE UPDATE ON support
+WHEN NEW.subject_table NOT IN
+       ('entity','relation','fact','unresolved_edge','invariant','contract','incident','change')
+  OR (NEW.subject_table = 'entity' AND NOT EXISTS
+        (SELECT 1 FROM entity WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'relation' AND NOT EXISTS
+        (SELECT 1 FROM relation WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'fact' AND NOT EXISTS
+        (SELECT 1 FROM fact WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'unresolved_edge' AND NOT EXISTS
+        (SELECT 1 FROM unresolved_edge WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'invariant' AND NOT EXISTS
+        (SELECT 1 FROM invariant WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'contract' AND NOT EXISTS
+        (SELECT 1 FROM contract WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'incident' AND NOT EXISTS
+        (SELECT 1 FROM incident WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+  OR (NEW.subject_table = 'change' AND NOT EXISTS
+        (SELECT 1 FROM change WHERE id = NEW.subject_id AND snapshot_id = NEW.snapshot_id))
+BEGIN
+  SELECT RAISE(ABORT, 'support subject is not a same-snapshot row of a known table');
+END;
+
+-- Evidence referenced by a support row must belong to the SAME snapshot
+-- (the composite FK covers fresh databases; these triggers also cover
+-- databases created before the composite FK existed).
+CREATE TRIGGER IF NOT EXISTS support_evidence_same_snapshot_insert
+BEFORE INSERT ON support
+WHEN NEW.evidence_id IS NOT NULL AND NOT EXISTS
+     (SELECT 1 FROM evidence WHERE id = NEW.evidence_id AND snapshot_id = NEW.snapshot_id)
+BEGIN
+  SELECT RAISE(ABORT, 'support evidence does not belong to the same snapshot');
+END;
+
+CREATE TRIGGER IF NOT EXISTS support_evidence_same_snapshot_update
+BEFORE UPDATE ON support
+WHEN NEW.evidence_id IS NOT NULL AND NOT EXISTS
+     (SELECT 1 FROM evidence WHERE id = NEW.evidence_id AND snapshot_id = NEW.snapshot_id)
+BEGIN
+  SELECT RAISE(ABORT, 'support evidence does not belong to the same snapshot');
+END;
+
+-- ── snapshot-owned immutability (all families) ───────────────────────────
 CREATE TRIGGER IF NOT EXISTS entity_no_insert_finalized
 BEFORE INSERT ON entity
 WHEN (SELECT state FROM snapshot WHERE id = NEW.snapshot_id) = 'finalized'
@@ -367,3 +570,67 @@ CREATE TRIGGER IF NOT EXISTS provider_record_no_delete_finalized
 BEFORE DELETE ON provider_record
 WHEN (SELECT state FROM snapshot WHERE id = OLD.snapshot_id) = 'finalized'
 BEGIN SELECT RAISE(ABORT, 'snapshot finalized: provider_record is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS invariant_no_insert_finalized
+BEFORE INSERT ON invariant
+WHEN (SELECT state FROM snapshot WHERE id = NEW.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: invariant is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS invariant_no_update_finalized
+BEFORE UPDATE ON invariant
+WHEN (SELECT state FROM snapshot WHERE id = OLD.snapshot_id) = 'finalized'
+  OR (SELECT state FROM snapshot WHERE id = NEW.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: invariant is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS invariant_no_delete_finalized
+BEFORE DELETE ON invariant
+WHEN (SELECT state FROM snapshot WHERE id = OLD.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: invariant is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS contract_no_insert_finalized
+BEFORE INSERT ON contract
+WHEN (SELECT state FROM snapshot WHERE id = NEW.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: contract is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS contract_no_update_finalized
+BEFORE UPDATE ON contract
+WHEN (SELECT state FROM snapshot WHERE id = OLD.snapshot_id) = 'finalized'
+  OR (SELECT state FROM snapshot WHERE id = NEW.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: contract is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS contract_no_delete_finalized
+BEFORE DELETE ON contract
+WHEN (SELECT state FROM snapshot WHERE id = OLD.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: contract is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS incident_no_insert_finalized
+BEFORE INSERT ON incident
+WHEN (SELECT state FROM snapshot WHERE id = NEW.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: incident is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS incident_no_update_finalized
+BEFORE UPDATE ON incident
+WHEN (SELECT state FROM snapshot WHERE id = OLD.snapshot_id) = 'finalized'
+  OR (SELECT state FROM snapshot WHERE id = NEW.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: incident is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS incident_no_delete_finalized
+BEFORE DELETE ON incident
+WHEN (SELECT state FROM snapshot WHERE id = OLD.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: incident is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS change_no_insert_finalized
+BEFORE INSERT ON change
+WHEN (SELECT state FROM snapshot WHERE id = NEW.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: change is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS change_no_update_finalized
+BEFORE UPDATE ON change
+WHEN (SELECT state FROM snapshot WHERE id = OLD.snapshot_id) = 'finalized'
+  OR (SELECT state FROM snapshot WHERE id = NEW.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: change is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS change_no_delete_finalized
+BEFORE DELETE ON change
+WHEN (SELECT state FROM snapshot WHERE id = OLD.snapshot_id) = 'finalized'
+BEGIN SELECT RAISE(ABORT, 'snapshot finalized: change is immutable'); END;

@@ -21,9 +21,12 @@ v2 changes over v1 (stop-ship review):
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+
+from system_intel.graph import fact_stable_id
 
 PROTOCOL_VERSION = 2
 
@@ -76,6 +79,43 @@ class Requirement:
     statement: str
     status: str = "unknown"  # open | met | unknown
     refs: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EntityRecord:
+    """The object a Relationship/Fact stable_id denotes.
+
+    v2 exported relationship endpoint keys without ever saying WHAT they
+    denoted; consumers had to guess.  Entities are now first-class records
+    keyed by the stable_id (never a database row id).
+    """
+
+    id: str
+    stable_id: str
+    kind: str
+    name: str
+    qualified_name: str = ""
+    file: str | None = None
+    line: int | None = None
+    epistemics: Epistemics = field(default_factory=Epistemics)
+    confidence: Confidence = field(default_factory=Confidence)
+    provenance: Provenance = field(default_factory=Provenance)
+
+
+@dataclass
+class Observation:
+    """One immutable provider observation backing the federated snapshot."""
+
+    id: str
+    provider: str
+    provider_version: str = ""
+    observation_kind: str = "static"
+    observation_digest: str = ""
+    authority: str = "fallback"
+    scope: dict = field(default_factory=dict)
+    enumeration_completeness: str = "unknown"
+    resolution_completeness: str = "unknown"
+    source_revision_id: int | None = None
 
 
 @dataclass
@@ -275,14 +315,131 @@ def _provider_of(row: dict) -> tuple[str, str]:
     )
 
 
-def _stable(row: dict, fallback: str) -> str:
-    return str(row.get("stable_id") or row.get("stable_subject") or fallback)
+def entity_records(data: dict) -> list[dict]:
+    """Project graph entities as first-class protocol records."""
+    out = []
+    for r in data.get("entities", []):
+        provider, version = _provider_of(r)
+        stable = str(r.get("stable_id") or "")
+        if not stable:
+            continue
+        out.append(
+            _record(
+                "Entity",
+                EntityRecord(
+                    id=f"Entity:{stable}",
+                    stable_id=stable,
+                    kind=str(r.get("kind") or ""),
+                    name=str(r.get("name") or ""),
+                    qualified_name=str(r.get("qualified_name") or ""),
+                    file=r.get("file"),
+                    line=r.get("line"),
+                    epistemics=_epistemics(r),
+                    confidence=_confidence(r),
+                    provenance=_provenance(r, provider, version),
+                ),
+            )
+        )
+    return out
+
+
+def observation_records(data: dict) -> list[dict]:
+    """Project the immutable provider-observation set as protocol records."""
+    out = []
+    for o in data.get("observations", []):
+        digest = str(o.get("observation_digest") or "")
+        out.append(
+            _record(
+                "Observation",
+                Observation(
+                    id=_content_id(
+                        "Observation", o.get("provider"), o.get("provider_version"),
+                        o.get("observation_kind"), digest,
+                    ),
+                    provider=str(o.get("provider") or ""),
+                    provider_version=str(o.get("provider_version") or ""),
+                    observation_kind=str(o.get("observation_kind") or "static"),
+                    observation_digest=digest,
+                    authority=str(o.get("authority") or "fallback"),
+                    scope=o.get("scope") if isinstance(o.get("scope"), dict) else {},
+                    enumeration_completeness=str(
+                        o.get("enumeration_completeness") or "unknown"
+                    ),
+                    resolution_completeness=str(
+                        o.get("resolution_completeness") or "unknown"
+                    ),
+                    source_revision_id=o.get("source_revision_id"),
+                ),
+            )
+        )
+    return out
 
 
 def _record(kind: str, obj) -> dict:
     data = asdict(obj) if hasattr(obj, "__dataclass_fields__") else dict(obj)
     data["record"] = kind
     return data
+
+
+def _content_id(prefix: str, *parts) -> str:
+    """A stable id derived ONLY from canonical content (never a row id)."""
+    canonical = "\x1f".join(str(part if part is not None else "") for part in parts)
+    return f"{prefix}:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def evidence_stable_id(row: dict) -> str:
+    """Evidence identity = hash(kind, ref, digest, summary)."""
+    return _content_id("Evidence", row.get("kind"), row.get("ref"),
+                       row.get("digest"), row.get("summary"))
+
+
+def invariant_stable_id(row: dict) -> str:
+    return _content_id("Invariant", row.get("statement"), row.get("component_qn"))
+
+
+def contract_stable_id(row: dict) -> str:
+    return _content_id("Contract", row.get("kind"), row.get("name"),
+                       row.get("component_qn"))
+
+
+def incident_stable_id(row: dict) -> str:
+    return _content_id("Incident", row.get("summary"), row.get("component_qn"),
+                       row.get("occurred_utc"))
+
+
+def change_stable_id(row: dict) -> str:
+    return _content_id("Change", row.get("commit_sha"), row.get("summary"))
+
+
+# Transport/environment fields that must never influence semantic equality.
+_SEMANTIC_TRANSPORT_KEYS = (
+    "generated_utc", "created_utc", "finalized_utc", "repo_root", "row_ref",
+)
+
+
+def _semantic_view(doc: dict) -> dict:
+    view = json.loads(json.dumps(doc, sort_keys=True, default=str))
+    for key in _SEMANTIC_TRANSPORT_KEYS:
+        view.pop(key, None)
+    snapshot = view.get("snapshot")
+    if isinstance(snapshot, dict):
+        for key in _SEMANTIC_TRANSPORT_KEYS:
+            snapshot.pop(key, None)
+        snapshot.pop("id", None)  # DB row id, not semantics
+    return view
+
+
+def semantic_digest(doc: dict) -> str:
+    """Canonical digest of a protocol document's MEANING.
+
+    Independent of `generated_utc`, DB row ids and filesystem provenance:
+    two independently created databases with the same logical content must
+    produce the same digest.
+    """
+    canonical = json.dumps(
+        _semantic_view(doc), sort_keys=True, separators=(",", ":"), default=str
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def export_protocol(
@@ -312,7 +469,8 @@ def export_protocol(
         support_index.setdefault((str(s.get("subject_table")), int(s.get("subject_id") or 0)), []).append(s)
 
     evidence_rows = data.get("evidence", [])
-    evidence_ids = {int(e["id"]): f"Evidence:{e['id']}" for e in evidence_rows}
+    # Evidence identity is content-derived; DB row ids never leak into ids.
+    evidence_ids = {int(e["id"]): evidence_stable_id(e) for e in evidence_rows}
 
     def evidence_refs_for(subject_table: str, subject_id: int) -> list[EvidenceRef]:
         out = []
@@ -351,7 +509,13 @@ def export_protocol(
     claims = []
     for r in data.get("facts", []):
         provider, version = _provider_of(r)
-        stable = _stable(r, f"fact:{r['subject']}:{r['predicate']}:{r['object']}")
+        # Fact identity = subject ID + predicate + object (several facts about
+        # one subject must never collide, P0).
+        stable = str(
+            r.get("stable_id")
+            or fact_stable_id(r.get("stable_subject") or r["subject"],
+                              r["predicate"], r["object"])
+        )
         facts.append(
             _record(
                 "Fact",
@@ -386,7 +550,7 @@ def export_protocol(
     invariants = []
     for r in data.get("invariants", []):
         provider, version = _provider_of(r)
-        stable = _stable(r, f"invariant:{r['id']}")
+        stable = str(r.get("stable_id") or invariant_stable_id(r))
         invariants.append(
             _record(
                 "Invariant",
@@ -418,7 +582,7 @@ def export_protocol(
     contracts = []
     for r in data.get("contracts", []):
         provider, version = _provider_of(r)
-        stable = _stable(r, f"contract:{r['id']}")
+        stable = str(r.get("stable_id") or contract_stable_id(r))
         contracts.append(
             _record(
                 "Contract",
@@ -439,7 +603,7 @@ def export_protocol(
     risks = []
     for r in data.get("incidents", []):
         provider, version = _provider_of(r)
-        stable = _stable(r, f"incident:{r['id']}")
+        stable = incident_stable_id(r)
         risks.append(
             _record(
                 "Risk",
@@ -461,7 +625,11 @@ def export_protocol(
             conf = 1.0
         if r.get("uncertainty") or conf < 1.0:
             provider, version = _provider_of(r)
-            stable = _stable(r, f"fact:{r['id']}")
+            stable = str(
+                r.get("stable_id")
+                or fact_stable_id(r.get("stable_subject") or r["subject"],
+                                  r["predicate"], r["object"])
+            )
             risks.append(
                 _record(
                     "Risk",
@@ -482,7 +650,7 @@ def export_protocol(
     changes = []
     for r in data.get("changes", []):
         provider, version = _provider_of(r)
-        stable = _stable(r, f"change:{r['id']}")
+        stable = change_stable_id(r)
         changes.append(
             _record(
                 "Change",
@@ -528,11 +696,13 @@ def export_protocol(
                 payload = {}
         payload = payload if isinstance(payload, dict) else {}
         claim_id = payload.get("claim_id") or r.get("ref") or ""
+        stable = _content_id("Counterexample", claim_id, r.get("summary"),
+                             r.get("digest"))
         counterexamples.append(
             _record(
                 "Counterexample",
                 Counterexample(
-                    id=f"Counterexample:{r['id']}",
+                    id=stable,
                     claim_id=str(claim_id),
                     description=r.get("summary") or "refuting evidence",
                     evidence=[EvidenceRef(id=evidence_ids[int(r["id"])], digest=r.get("digest"), ref=r.get("ref"))],
@@ -543,7 +713,8 @@ def export_protocol(
     unresolved = []
     for r in data.get("unresolved_edges", []):
         provider = str(r.get("provider") or "")
-        stable = f"unresolved:{r.get('src_key','')}:{r.get('kind','')}:{r.get('dst_raw','')}"
+        stable = _content_id("UnresolvedClaim", r.get("src_key"), r.get("kind"),
+                             r.get("dst_raw"))
         unresolved.append(
             _record(
                 "UnresolvedClaim",
@@ -570,7 +741,10 @@ def export_protocol(
     for r in data.get("relations", []):
         provider, version = _provider_of(r)
         resolved = r.get("dst_id") is not None
-        stable = f"rel:{r.get('src_key','')}:{r.get('kind','')}:{r.get('dst_key','') or r.get('src_id')}"
+        stable = _content_id(
+            "Relationship", r.get("src_key"), r.get("kind"),
+            r.get("dst_key") if resolved else f"unresolved:{r.get('dst_key', '')}",
+        )
         relationships.append(
             _record(
                 "Relationship",
@@ -589,7 +763,10 @@ def export_protocol(
         )
 
     completeness = graph.completeness(snap_id)
-    return {
+    target = ""
+    if isinstance(semantic_config, dict):
+        target = str(semantic_config.get("target") or "")
+    doc = {
         "protocol_version": PROTOCOL_VERSION,
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "snapshot": {
@@ -599,7 +776,10 @@ def export_protocol(
             "source_revision": snap.get("source_revision"),
             "tree_digest": snap.get("tree_digest"),
             "semantic_configuration": semantic_config,
+            "target": target,
             "provider_set_digest": snap.get("provider_set_digest"),
+            "observation_set_digest": snap.get("observation_set_digest"),
+            "source_revision_id": snap.get("source_revision_id"),
             "state": snap.get("state"),
             "repo_root": snap.get("repo_root"),
             "created_utc": snap.get("created_utc"),
@@ -610,8 +790,12 @@ def export_protocol(
             for p in data.get("provider_records", [])
         ],
         "completeness": completeness.get("families", {}),
+        "relations_completeness": completeness.get("relations_completeness", {}),
+        "provider_scopes": completeness.get("provider_scopes", {}),
         "records": {
             "requirements": [_record("Requirement", r) for r in (requirements or [])],
+            "entities": entity_records(data),
+            "observations": observation_records(data),
             "facts": facts,
             "claims": claims,
             "invariants": invariants,
@@ -625,6 +809,8 @@ def export_protocol(
             "providers": providers,
         },
     }
+    doc["semantic_digest"] = semantic_digest(doc)
+    return doc
 
 
 def _safe_float(value, default: float) -> float:

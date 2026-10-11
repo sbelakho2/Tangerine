@@ -855,6 +855,18 @@ else
   bad "repin evidence mutation matrix failed"
 fi
 
+# ── 13. object-fingerprint integrity (the P0 false-green) ────────────
+# The dedicated mutation test proves a FAILED otool/nm probe is recorded
+# UNAVAILABLE with probe_success=false (never sha256("")), that the release
+# fingerprint comparison fails on it, that probe_success/byte_count are
+# compared, and that successful probes (including legitimately empty
+# captures) still compare equal. Self-contained stubs; no built compiler.
+if bash "$ROOT/scripts/test_object_fingerprint_integrity.sh"; then
+  pass "object fingerprint integrity mutation tests (all cases correct)"
+else
+  bad "object fingerprint integrity mutation tests failed"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "test_prebootstrap_gates: FAIL"
   exit 1

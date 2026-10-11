@@ -1122,12 +1122,23 @@ def default_registry() -> AdapterRegistry:
 
 
 def iter_files(root):
-    """Yield every scanned source path (deterministic directory order)."""
+    """Yield every scanned source path (deterministic directory order).
+
+    Symlinked FILES are skipped: their content is never followed (it may
+    resolve outside the root).  Directory symlinks are already not followed
+    by ``os.walk``.
+    """
     root = Path(root)
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
         for fname in sorted(filenames):
-            yield Path(dirpath) / fname
+            path = Path(dirpath) / fname
+            try:
+                if path.is_symlink():
+                    continue
+            except OSError:
+                continue
+            yield path
 
 
 def extract(

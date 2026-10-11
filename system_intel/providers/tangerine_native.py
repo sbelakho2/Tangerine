@@ -21,36 +21,130 @@ documented routes (verified in ``tg_compiler/driver.tg`` and
   (semantic_server.tg:3040) and ``snapshot.get`` answers the family counts
   (semantic_query.tg:2293).
 
-Projection into the universal vocabulary (§5):
+Compiler discovery (release authority, requirement 1)
+-----------------------------------------------------
+The release compiler is ``build/tg`` — the full driver the bootstrap lane
+materializes (``run_bootstrap.sh`` "Full Toolchain Materialization Complete";
+``Makefile`` ``TG ?= build/tg``).  Discovery order is: explicit constructor
+``binary`` -> ``TANGERINE_NATIVE_COMPILER`` -> ``<root>/build/tg`` ->
+``<repo_root>/build/tg``.  ``TANGERINE_NATIVE_SNAPSHOT`` names an explicit
+artifact.  ``build/bootstrap/tg`` is NOT consulted: it is a ladder/kernel
+stage, not the release compiler.
 
-* ``symbol`` rows  -> Symbol entities (``native:sym:<key>``)
-* ``type`` rows    -> Symbol entities, type kind in attrs (``native:type:<key>``)
-* ``call`` rows    -> ``calls`` relations, analysis_depth 3
-* ``indirect`` rows-> ``unresolved`` entries, completeness ``unknown``
-  (the native model records every indirect site with an EMPTY candidate set
-  and completeness "Unknown" — semantic_snapshot.tg:7527)
-* ``effect`` / ``capability`` / ``ownership`` rows -> facts, depth 3
-* ``contract`` rows -> Contract entities, epistemic_state ``declared``
-* ``test`` rows     -> Test entities + typed ``tests`` relations (or an
-  unresolved claim when the exercised decl cannot be mapped)
-* ``dep-completeness`` rows -> the family verdicts, MIRRORED and never
-  upgraded (semantic_snapshot.tg:5892 documents the producer statuses)
+Persistent native identity (requirement 2)
+------------------------------------------
+Stable IDs use the native PERSISTENT DIGEST carried by the artifact, never
+the textual key:
+
+* declaration rows (``symbol``, ``type``) carry ``i``, the persisted
+  ``StableDefId`` digest render ``<hi>-<lo>``; the stable id is
+  ``native:decl:<hi>-<lo>``.  The textual ``key``/``name``/``module`` fields
+  become ATTRIBUTES (``key``, ``name``, ``module``); a rename keeps the
+  digest (the identity) and only moves those attributes.
+* ``test`` rows carry the persisted ``StableTestId`` digest in ``test``; the
+  stable id is ``native:test:<hi>-<lo>`` and the canonical ``tkey`` text is
+  an attribute.
+* ``contract`` rows carry the persisted ``StableContractId`` digest in
+  ``i``; the stable id is ``native:contract:<hi>-<lo>``.
+* dependency rows (``dep-*``) and member/resource rows carry canonical KEY
+  TEXTS; they are resolved to ``native:decl:<digest>`` through the artifact's
+  ``key -> digest`` table (built from the symbol/type rows).
+* A zero digest (``0-0``, the native "no identity" digest) or an artifact
+  with genuinely no persistent digest (the server-only ``symbol_search``
+  route) degrades to the deterministic textual fallback
+  ``native:sym:<key text>`` / ``native:key:<key text>``; every degraded row
+  records ``identity_degraded: True`` and an ``identity_basis`` attribute so
+  consumers can never mistake it for persistent identity.
+
+Projection into the universal vocabulary (§5)
+---------------------------------------------
+Every row family the §30 artifact exposes is projected (read from
+``tg_compiler/semantic_snapshot.tg``'s parse loop, lines 11087-11329):
+symbols/types (entity), typed members (``field``/``variant``/``signature``/
+``trait-method`` facts), calls (``calls`` relations), indirect sites
+(unresolved claims, empty candidates, completeness ``unknown`` — mirrored
+exactly, semantic_snapshot.tg:7527), effects/capabilities/ownership facts,
+contracts + ``dep-contract-ref`` (Contract entities + ``contract_ref``
+facts + ``constrained_by``/``depends_on`` relations), tests (Test entities +
+``tests`` relations), coverage (facts + tests relations), MIR summaries
+(facts), concrete types + the typed dependency families
+(``dep-type-use``/``dep-trait-impl``/``dep-trait-select``/
+``dep-generic-inst``/``dep-layout``/``dep-const-eval``/``dep-derived-body``/
+``dep-abi`` -> ``depends_on``/``implements`` relations), unsafe/drop/DMA and
+resource-summary rows (facts), ABI surfaces (``API`` entities + facts), and
+the header surface hashes (``Repository`` entity ``repo:.`` + ``native.*``
+facts).  ``dep-completeness`` rows mirror the producer verdicts and are NEVER
+upgraded.  Families the artifact does not carry (invariants, history) stay
+``unknown`` with an honest capability note.
+
+Contract canonicalization (requirement 4)
+-----------------------------------------
+The graph's canonical contract representation is the ``(kind, name)`` pair
+(``graph.add_contract``).  The provider emits, for EVERY native ``contract``
+row, a machine-readable fact ``predicate='contract_ref'`` with
+``object='contract:<kind>:<name>'`` where ``<kind>`` is the native contract
+kind word (``Pre``/``Post``/``Invariant``, the closed
+``snapshot_contract_kind_of_word`` vocabulary) and ``<name>`` is the native
+canonical contract row key ``<fn key>|<kind>|<clause>``
+(``stable_contract_row_key``, stable_ids.tg:722) when the holder key is
+known, else ``digest::<hi>-<lo>``.  A ``dep-contract-ref`` row emits the same
+shape with the REFERENCED symbol as fact subject; when the contract row join
+fails the object stays ``contract:unknown:<contract id>`` with
+``contract_kind_unresolved`` recorded — never a fabricated kind.
+
+Native semantic delta (requirement 5)
+-------------------------------------
+The artifact does not serialize a §31 delta and the §39 server's
+``snapshot.diff`` op answers ``snapshot.diff_unavailable`` on the single
+snapshot a session holds (semantic_query.tg:2891) — so no native pair delta
+rides the provider's two routes.  ``delta(old, new)`` therefore translates
+the native row identity diff computed from the two §30 artifacts the
+provider parsed: entity families with persistent digests (declarations,
+tests, contracts) plus the indirect unresolved additions, keyed by the
+typed stable ids above.  The result carries ``source: "native"`` plus a
+``note``.  When either snapshot has no cached accepted artifact (server-only
+snapshots, rejected artifacts, snapshots from another provider instance),
+``delta`` falls back to the generic ``_snapshot_delta`` with
+``source: "generic"`` and an explanatory note.  Edge-only deltas are not
+fabricated into the entity set (the federation shape has no edge channel;
+the generic diff has the same boundary).
+
+Server exchange bound (requirement 6)
+-------------------------------------
+``_talk_to_server`` runs the ENTIRE §39 exchange (spawn, request write,
+response reads, exit wait) in a worker thread covered by one wall-clock
+``server_timeout`` (default 30s).  A hung server is killed and the call
+returns degraded within the bound — never an unbounded scan.
+
+Corruption policy (requirement 7)
+---------------------------------
+* unknown FUTURE row tags are skipped and recorded in ``parse_notes``;
+* a malformed row of a KNOWN family (missing/wrong-typed field, malformed
+  digest, out-of-vocabulary word) invalidates THAT FAMILY: its capability
+  becomes ``unavailable`` (never ``complete``), ``parse_notes`` explain it,
+  and the family's projections are dropped;
+* an unparseable line, a non-object row, a row without a tag, a missing/
+  duplicate/malformed header, a wrong ``v``/``format``, or a malformed
+  ``dep-completeness`` record rejects the WHOLE artifact (degraded; no
+  entities from it).
 
 Degradation is first-class: a missing binary, a compile failure, an absent
-artifact or a protocol mismatch yields ``unavailable`` capabilities, an empty
-snapshot, a note and a recorded evidence entry — ``snapshot()`` never raises
-for these expected states and NEVER fabricates data.
+artifact or a protocol mismatch yields ``unavailable`` capabilities, an
+empty snapshot, a note and a recorded evidence entry — ``snapshot()`` never
+raises for these expected states and NEVER fabricates data.
 """
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
+import re
 import shutil
 import struct
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -69,7 +163,7 @@ from system_intel.providers.base import (
 from system_intel.providers.generic_static import _snapshot_delta
 
 PROVIDER_ID = "tangerine-native"
-PROVIDER_VERSION = "1.0"
+PROVIDER_VERSION = "1.1"
 
 NATIVE_COMPILER_ENV = "TANGERINE_NATIVE_COMPILER"
 NATIVE_SNAPSHOT_ENV = "TANGERINE_NATIVE_SNAPSHOT"
@@ -83,7 +177,10 @@ MAX_KEYS = 65536
 SERVER_TIMEOUT_S = 30.0
 COMPILE_TIMEOUT_S = 600.0
 
-DEFAULT_BINARY = "build/bootstrap/tg"
+# The release compiler: `build/tg`, the full driver the bootstrap lane
+# materializes (run_bootstrap.sh "Full Toolchain Materialization Complete").
+# `build/bootstrap/tg` is a ladder/kernel stage and is never consulted.
+DEFAULT_BINARY = "build/tg"
 
 _ENTRY_CANDIDATES = (
     "tg_compiler/bootstrap_main.tg",
@@ -98,16 +195,277 @@ _ALL_FAMILIES = (
 )
 
 _CAPABILITY_NOTES = {
-    "entities": "native symbols/types tables built from finalized type state",
-    "relations": "mirrors the native dependency-family completeness record",
-    "facts": "effect/capability/ownership rows; no native producer status published",
-    "calls": "mirrors native Call completeness; indirect rows stay 'unknown'",
-    "tests": "mirrors native TestReferences completeness",
-    "contracts": "declared contract rows; mirrors ContractReference completeness",
-    "ownership": "ownership facts; no native producer status published",
+    "entities": (
+        "native symbol/type declarations + typed member tables "
+        "(field/variant/signature/trait-method) + ABI surfaces, from "
+        "finalized type state"
+    ),
+    "relations": (
+        "native call edges + the typed dependency families (type-use, trait "
+        "impl/select, generic inst, layout, const-eval, derived-body, ABI, "
+        "contract refs); mirrors the native family verdicts"
+    ),
+    "facts": (
+        "effect/capability/ownership/MIR-summary/resource/unsafe/drop/DMA/"
+        "concrete-type/coverage facts; no per-family producer status is "
+        "published, so the verdict stays partial when rows exist"
+    ),
+    "calls": "native call edges; indirect rows stay 'unknown'",
+    "tests": "native test relationships; mirrors TestReferences",
+    "contracts": (
+        "native contract rows + ContractReference edges; mirrors "
+        "ContractReference completeness"
+    ),
+    "ownership": "ownership/drop-plan/DMA facts",
     "invariants": "no native invariant family is served",
     "runtime": "coverage-ingest rows only; the compile carries no runtime data",
     "history": "no history source in the native artifact",
+}
+
+# ── §30 row grammar (semantic_snapshot.tg parse loop, lines 11087-11329) ──
+
+_ZERO_DIGEST = "0-0"
+
+_DIGEST_RE = re.compile(r"^[0-9]+-[0-9]+$")
+_ML_RE = re.compile(r"^[^|]+\|[0-9]+$")
+
+_HEADER_FORMAT = "tg-semantic-snapshot/v1"
+_HEADER_VERSION = 1
+
+_HEADER_REQUIRED = (
+    ("compiler_version", "str"), ("features", "str"), ("options", "str"),
+    ("target", "str"), ("tarch", "str"), ("tcpu", "str"), ("tptr", "int"),
+    ("tendian", "str"), ("tabi", "str"), ("tfloat", "str"), ("tisa", "str"),
+    ("tnative", "str"), ("tident", "digest"), ("tdigest", "digest"),
+    ("revision", "digest"), ("public_api_hash", "digest"),
+    ("abi_hash", "digest"), ("unsafe_hash", "digest"),
+)
+
+_HEADER_OPTIONAL_DIGESTS = (
+    "d_concrete_types", "d_drop_plans", "d_allocation_sites",
+    "d_resource_summaries", "d_dma_ownership", "d_features",
+)
+
+_DEF_KINDS = frozenset((
+    "Function", "Method", "Static", "Constant", "EnumVariant",
+    "StructField", "Intrinsic", "TypeName", "Trait", "Other",
+))
+_TYPE_KINDS = frozenset(("Struct", "Enum", "Trait"))
+_CALL_KINDS = frozenset(("Direct", "Indirect", "Intrinsic"))
+_CAPABILITY_DIRS = frozenset(("Requires", "Provides"))
+_CONTRACT_KINDS = frozenset(("Pre", "Post", "Invariant"))
+_UNSAFE_KINDS = frozenset((
+    "unsafe-block", "unsafe-fn", "raw-deref", "raw-pointer-cast",
+    "transmute", "unchecked-index", "extern-call", "inline-asm",
+    "volatile-raw-access", "unsafe-trait-impl", "unknown-call",
+))
+_DMA_STATES = frozenset((
+    "not-pinned", "pinned-read", "pinned-write", "pinned-readwrite",
+    "returns",
+))
+_PROOF_LEVELS = frozenset((
+    "static-proof", "static-bound", "runtime-measured", "unavailable",
+))
+_ALLOC_SIZE_KINDS = frozenset(("Exact", "UpperBound", "Unbounded", "Unknown"))
+_DEP_STATUSES = frozenset(("complete", "partial", "unavailable"))
+
+# tag -> (required fields {name: kind}, optional fields {name: kind})
+# kinds: str | int | bool | digest | ml
+_ROW_SCHEMAS = {
+    "symbol": (
+        {"i": "digest", "key": "str", "kind": "str", "name": "str",
+         "module": "str", "pub": "bool", "generic": "bool"}, {},
+    ),
+    "type": (
+        {"i": "digest", "key": "str", "tkind": "str", "name": "str",
+         "module": "str", "generic_arity": "int", "pub": "bool"}, {},
+    ),
+    "call": ({"from": "digest", "to": "digest", "ekind": "str"}, {}),
+    "indirect": (
+        {"caller": "str", "site": "str", "sig": "str", "candidates": "str",
+         "completeness": "str"}, {},
+    ),
+    "effect": (
+        {"f": "digest", "flags": "int", "caps": "str", "purity": "str",
+         "pevidence": "str"}, {},
+    ),
+    "capability": ({"f": "digest", "cap": "int", "dir": "str"}, {}),
+    "ownership": ({"f": "digest", "place": "str", "conv": "int"}, {}),
+    "contract": (
+        {"i": "digest", "f": "digest", "ckind": "str", "text": "str",
+         "fp": "digest", "msg": "str"}, {},
+    ),
+    "test": (
+        {"test": "digest", "target": "digest"},
+        {"tkey": "str", "tkind": "str", "tname": "str", "tattrs": "str"},
+    ),
+    "coverage": (
+        {"f": "digest", "branch": "str", "arm": "str", "kind": "str",
+         "test": "str"}, {},
+    ),
+    "mir": (
+        {"f": "digest", "blocks": "int", "statements": "int", "locals": "int",
+         "reachable": "bool", "unsafe": "bool", "unknown": "bool",
+         "flags": "int", "caps": "str", "purity": "str", "pevidence": "str"},
+        {},
+    ),
+    "unsafe-fact": ({"i": "digest", "f": "str", "ukind": "str", "site": "str"}, {}),
+    "drop-plan": (
+        {"f": "str", "place": "str", "site": "str", "paths": "str",
+         "kind": "str"}, {},
+    ),
+    "dma": (
+        {"f": "str", "place": "str", "state": "str", "op": "str",
+         "site": "str"}, {"pid": "digest"},
+    ),
+    "concrete-type": (
+        {"i": "str", "template": "str", "args": "str", "size": "int",
+         "align": "int", "status": "str", "fields": "str"}, {},
+    ),
+    "alloc-site": ({"f": "str", "site": "str", "kind": "str", "size": "int"}, {}),
+    "alloc-summary": (
+        {"f": "str", "dynamic": "int", "arena": "int", "sites": "int",
+         "usites": "str", "blevel": "str", "alevel": "str", "slevel": "str"},
+        {},
+    ),
+    "stack-summary": (
+        {"f": "str", "frame": "int", "max": "int", "recursive": "bool",
+         "flevel": "str", "mlevel": "str"}, {},
+    ),
+    "blocking-summary": (
+        {"f": "str", "blocking": "bool", "bsites": "str", "unbounded": "bool",
+         "level": "str"}, {},
+    ),
+    "code-size-summary": (
+        {"f": "str", "bytes": "int", "exact": "bool", "level": "str"}, {},
+    ),
+    "field": (
+        {"o": "digest", "name": "str", "index": "int", "ty": "str",
+         "member": "str", "pub": "bool"}, {"ml": "ml"},
+    ),
+    "variant": (
+        {"o": "digest", "name": "str", "index": "int", "payload": "str",
+         "member": "str"}, {"ml": "ml"},
+    ),
+    "signature": (
+        {"f": "digest", "params": "str", "ret": "str", "effects": "str",
+         "variadic": "bool"}, {},
+    ),
+    "trait-method": (
+        {"o": "digest", "name": "str", "index": "int", "params": "str",
+         "ret": "str", "member": "str"}, {"ml": "ml"},
+    ),
+    "abi-surface": (
+        {"surface": "str", "symbol": "str", "kind": "str", "size": "int",
+         "align": "int", "args": "str", "ret": "str", "fields": "str",
+         "conv": "str", "extern": "str", "pclasses": "str", "plocs": "str",
+         "ownin": "str", "ownout": "str", "null": "str", "variadic": "bool",
+         "ext": "str", "platform": "str", "failure": "str", "thread": "str",
+         "taint": "str", "boundary": "str"}, {},
+    ),
+    "dep-type-use": ({"user": "str", "used": "str"}, {}),
+    "dep-trait-impl": ({"impl": "str", "trait": "str", "self": "str"}, {}),
+    "dep-trait-select": ({"fn": "str", "trait": "str", "impl": "str"}, {}),
+    "dep-generic-inst": ({"instance": "str", "template": "str"}, {}),
+    "dep-layout": ({"dependent": "str", "source": "str"}, {}),
+    "dep-const-eval": ({"dependent": "str", "const": "str"}, {}),
+    "dep-derived-body": ({"derived": "str", "source": "str"}, {}),
+    "dep-contract-ref": ({"contract": "str", "symbol": "str"}, {}),
+    "dep-abi": ({"surface": "str", "type": "str"}, {}),
+}
+
+_KNOWN_TAGS = frozenset(set(_ROW_SCHEMAS) | {"header", "dep-completeness"})
+
+_WORD_VOCAB = {
+    "symbol": {"kind": _DEF_KINDS},
+    "type": {"tkind": _TYPE_KINDS},
+    "call": {"ekind": _CALL_KINDS},
+    "capability": {"dir": _CAPABILITY_DIRS},
+    "contract": {"ckind": _CONTRACT_KINDS},
+    "unsafe-fact": {"ukind": _UNSAFE_KINDS},
+    "dma": {"state": _DMA_STATES},
+    "alloc-site": {"kind": _ALLOC_SIZE_KINDS},
+    "alloc-summary": {"blevel": _PROOF_LEVELS, "alevel": _PROOF_LEVELS,
+                      "slevel": _PROOF_LEVELS},
+    "stack-summary": {"flevel": _PROOF_LEVELS, "mlevel": _PROOF_LEVELS},
+    "blocking-summary": {"level": _PROOF_LEVELS},
+    "code-size-summary": {"level": _PROOF_LEVELS},
+}
+
+_INT_RANGE = {
+    "ownership": {"conv": (0, 3)},
+    "effect": {"flags": (0, 127)},
+    "mir": {"flags": (0, 127)},
+}
+
+# Row-tag -> capability families whose verdict the family feeds.  A malformed
+# row of the tag invalidates every listed capability.
+_TAG_CAPABILITY = {
+    "symbol": ("entities",),
+    "type": ("entities",),
+    "field": ("entities",),
+    "variant": ("entities",),
+    "signature": ("entities",),
+    "trait-method": ("entities",),
+    "abi-surface": ("entities",),
+    "call": ("calls", "relations"),
+    "indirect": ("calls",),
+    "test": ("tests",),
+    "contract": ("contracts",),
+    "dep-contract-ref": ("contracts", "relations"),
+    "effect": ("facts",),
+    "capability": ("facts",),
+    "ownership": ("facts", "ownership"),
+    "coverage": ("facts", "runtime"),
+    "mir": ("facts",),
+    "unsafe-fact": ("facts",),
+    "drop-plan": ("facts", "ownership"),
+    "dma": ("facts", "ownership"),
+    "concrete-type": ("facts",),
+    "alloc-site": ("facts",),
+    "alloc-summary": ("facts",),
+    "stack-summary": ("facts",),
+    "blocking-summary": ("facts",),
+    "code-size-summary": ("facts",),
+    "dep-type-use": ("relations",),
+    "dep-trait-impl": ("relations",),
+    "dep-trait-select": ("relations",),
+    "dep-generic-inst": ("relations",),
+    "dep-layout": ("relations",),
+    "dep-const-eval": ("relations",),
+    "dep-derived-body": ("relations",),
+    "dep-abi": ("relations",),
+}
+
+_ENTITY_TAGS = ("symbol", "type", "field", "variant", "signature",
+                "trait-method", "abi-surface")
+_CALL_TAGS = ("call", "indirect")
+_TEST_TAGS = ("test",)
+_CONTRACT_TAGS = ("contract", "dep-contract-ref")
+_FACT_TAGS = (
+    "effect", "capability", "ownership", "coverage", "mir", "unsafe-fact",
+    "drop-plan", "dma", "concrete-type", "alloc-site", "alloc-summary",
+    "stack-summary", "blocking-summary", "code-size-summary",
+)
+_OWNERSHIP_TAGS = ("ownership", "drop-plan", "dma")
+_RUNTIME_TAGS = ("coverage",)
+_RELATION_TAGS = (
+    "call", "dep-type-use", "dep-trait-impl", "dep-trait-select",
+    "dep-generic-inst", "dep-layout", "dep-const-eval", "dep-derived-body",
+    "dep-contract-ref", "dep-abi",
+)
+_MEMBER_TAGS = ("field", "variant", "signature", "trait-method")
+
+# The producer's canonical dependency-family names (semantic_snapshot.tg:5892).
+_DEP_FAMILY_BY_TAG = {
+    "dep-type-use": "TypeUse",
+    "dep-trait-impl": "TraitImpl",
+    "dep-trait-select": "TraitSelection",
+    "dep-generic-inst": "GenericInstantiation",
+    "dep-layout": "LayoutDependency",
+    "dep-const-eval": "ConstEvalDependency",
+    "dep-derived-body": "DerivedBody",
+    "dep-abi": "AbiDependency",
 }
 
 
@@ -221,9 +579,91 @@ def parse_response_body(body: bytes) -> dict:
 # ── §30 artifact ─────────────────────────────────────────────────────────
 
 
+def _is_digest(value) -> bool:
+    return isinstance(value, str) and bool(_DIGEST_RE.match(value))
+
+
+def _field_ok(value, kind: str) -> bool:
+    if kind == "str":
+        return isinstance(value, str)
+    if kind == "int":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "bool":
+        return isinstance(value, bool)
+    if kind == "digest":
+        return _is_digest(value)
+    if kind == "ml":
+        return isinstance(value, str) and (
+            value == "" or bool(_ML_RE.match(value))
+        )
+    return False
+
+
+def _header_error(row: dict) -> str:
+    """Return a rejection reason for a malformed header row, else ''."""
+    version = row.get("v")
+    if not _field_ok(version, "int") or version != _HEADER_VERSION:
+        return (
+            f"unsupported or missing snapshot version {version!r} "
+            f"(expected {_HEADER_VERSION})"
+        )
+    if row.get("format") != _HEADER_FORMAT:
+        return f"unsupported snapshot format {row.get('format')!r}"
+    for key, kind in _HEADER_REQUIRED:
+        if not _field_ok(row.get(key), kind):
+            return f"header field {key!r} missing or malformed"
+    for key in _HEADER_OPTIONAL_DIGESTS:
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        if not _is_digest(value):
+            return f"header optional digest {key!r} malformed"
+    return ""
+
+
+def _row_error(tag: str, row: dict) -> str:
+    """Return a family-invalidating reason for a known-schema row, else ''."""
+    required, optional = _ROW_SCHEMAS[tag]
+    for key, kind in required.items():
+        if key not in row:
+            return f"missing required field {key!r}"
+        if not _field_ok(row.get(key), kind):
+            return f"malformed field {key!r}"
+    for key, kind in optional.items():
+        if key in row and not _field_ok(row.get(key), kind):
+            return f"malformed optional field {key!r}"
+    for key, allowed in _WORD_VOCAB.get(tag, {}).items():
+        if row.get(key) not in allowed:
+            return f"unknown {key} word {row.get(key)!r}"
+    for key, (low, high) in _INT_RANGE.get(tag, {}).items():
+        value = row.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return f"field {key!r} is not an integer"
+        if value < low or value > high:
+            return f"field {key!r} out of range [{low}, {high}]"
+    return ""
+
+
+def _dep_completeness_error(row: dict) -> str:
+    family = row.get("family")
+    status = row.get("status")
+    if not isinstance(family, str) or not family:
+        return "family must be a non-empty string"
+    if status not in _DEP_STATUSES:
+        return f"invalid completeness status {status!r}"
+    return ""
+
+
 @dataclass
 class NativeArtifact:
-    """Parsed ``tg-semantic-snapshot/v1`` artifact (semantic_snapshot.tg)."""
+    """Parsed ``tg-semantic-snapshot/v1`` artifact (semantic_snapshot.tg).
+
+    ``rejected`` artifacts are integrity failures (bad header/version/format,
+    unparseable lines, a malformed ``dep-completeness`` record): they carry no
+    trustworthy projections at all.  ``invalid_families`` lists known row tags
+    whose rows were malformed: each tag's capability is ``unavailable`` and
+    its projections are dropped, while the rest of the artifact stays usable.
+    """
 
     path: str
     sha256: str
@@ -231,7 +671,15 @@ class NativeArtifact:
     rows: dict[str, list[dict]] = field(default_factory=dict)
     dependency_completeness: dict[str, str] = field(default_factory=dict)
     digest_to_key: dict[str, str] = field(default_factory=dict)
+    key_to_digest: dict[str, str] = field(default_factory=dict)
     parse_notes: list[str] = field(default_factory=list)
+    invalid_families: set[str] = field(default_factory=set)
+    rejected: bool = False
+    reject_reason: str = ""
+
+    @property
+    def accepted(self) -> bool:
+        return not self.rejected
 
     @property
     def revision(self) -> str:
@@ -276,10 +724,12 @@ class NativeArtifact:
 
 
 def _parse_artifact(path) -> NativeArtifact | None:
-    """Parse a §30 artifact defensively; None when absent/empty/unreadable.
+    """Parse a §30 artifact fail-closed; None when absent/empty/unreadable.
 
-    Malformed rows are recorded in ``parse_notes`` and skipped — the parser
-    never crashes on an artifact it does not fully understand.
+    Unknown FUTURE row tags are skipped (recorded in ``parse_notes``).  A
+    malformed row of a known family invalidates that family; a malformed/
+    missing header, an unparseable line, a tag-less row, or a malformed
+    ``dep-completeness`` record rejects the whole artifact.
     """
     try:
         text = Path(path).read_text(encoding="utf-8")
@@ -290,42 +740,75 @@ def _parse_artifact(path) -> NativeArtifact | None:
     artifact = NativeArtifact(
         path=str(path), sha256=hashlib.sha256(text.encode("utf-8")).hexdigest()
     )
-    for line_no, line in enumerate(text.splitlines(), start=1):
-        line = line.strip()
+
+    def reject(reason: str) -> NativeArtifact:
+        artifact.rejected = True
+        artifact.reject_reason = reason
+        artifact.parse_notes.append(reason)
+        return artifact
+
+    header_seen = False
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
         if not line:
             continue
         try:
             row = json.loads(line)
         except ValueError:
-            if len(artifact.parse_notes) < 20:
-                artifact.parse_notes.append(f"line {line_no}: unparseable row")
-            continue
+            return reject(f"line {line_no}: unparseable JSON row")
         if not isinstance(row, dict):
-            if len(artifact.parse_notes) < 20:
-                artifact.parse_notes.append(f"line {line_no}: non-object row")
-            continue
-        tag = str(row.get("s", "") or "")
-        if not tag:
-            if len(artifact.parse_notes) < 20:
-                artifact.parse_notes.append(f"line {line_no}: row without tag")
-            continue
+            return reject(f"line {line_no}: non-object row")
+        tag = row.get("s")
+        if not isinstance(tag, str) or not tag:
+            return reject(f"line {line_no}: row without a tag")
         if tag == "header":
-            if not artifact.header:
-                artifact.header = row
+            if header_seen:
+                return reject(f"line {line_no}: duplicate header row")
+            reason = _header_error(row)
+            if reason:
+                return reject(f"line {line_no}: malformed header ({reason})")
+            artifact.header = row
+            header_seen = True
+            continue
+        if not header_seen:
+            return reject(
+                f"line {line_no}: row {tag!r} appears before the header row"
+            )
+        if tag not in _KNOWN_TAGS:
+            if len(artifact.parse_notes) < 50:
+                artifact.parse_notes.append(
+                    f"line {line_no}: unknown future row tag {tag!r} skipped"
+                )
+            continue
+        if tag == "dep-completeness":
+            reason = _dep_completeness_error(row)
+            if reason:
+                return reject(
+                    f"line {line_no}: malformed dep-completeness row ({reason})"
+                )
+            artifact.dependency_completeness[str(row["family"])] = normalize_verdict(
+                row["status"], default="unknown"
+            )
+            continue
+        reason = _row_error(tag, row)
+        if reason:
+            artifact.invalid_families.add(tag)
+            if len(artifact.parse_notes) < 50:
+                artifact.parse_notes.append(
+                    f"line {line_no}: malformed {tag} row ({reason}); "
+                    "family invalidated"
+                )
             continue
         artifact.rows.setdefault(tag, []).append(row)
-        if tag == "dep-completeness":
-            family = str(row.get("family", "") or "")
-            if family:
-                artifact.dependency_completeness[family] = normalize_verdict(
-                    row.get("status"), default="unknown"
-                )
+    if not header_seen:
+        return reject("missing header row (headerless artifact)")
     for tag in ("symbol", "type"):
         for row in artifact.rows.get(tag, []):
             digest = str(row.get("i", "") or "")
             key = str(row.get("key", "") or "")
             if digest and key:
                 artifact.digest_to_key.setdefault(digest, key)
+                artifact.key_to_digest.setdefault(key, digest)
     return artifact
 
 
@@ -335,6 +818,7 @@ class _ServerSession:
     responses: dict[str, dict] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
+    timed_out: bool = False
 
     def responded(self) -> bool:
         return bool(self.responses)
@@ -367,14 +851,21 @@ class TangerineNativeProvider:
     provider_version = PROVIDER_VERSION
     authority = 0  # lower number = higher authority (native is authoritative)
 
-    def __init__(self, binary=None, artifact=None) -> None:
+    def __init__(self, binary=None, artifact=None, server_timeout=None) -> None:
         self._binary_override = str(binary) if binary else None
         self._artifact_override = str(artifact) if artifact else None
+        self._server_timeout = (
+            float(server_timeout) if server_timeout else SERVER_TIMEOUT_S
+        )
         self._completeness = {family: "unknown" for family in _ALL_FAMILIES}
+        self._invalid_families: set[str] = set()
         self._degrade_note = ""
         self._last_snapshot: ProviderSnapshot | None = None
         self._last_artifact: NativeArtifact | None = None
         self._last_server: _ServerSession | None = None
+        # Accepted artifacts parsed by THIS instance, for the native delta.
+        self._native_by_digest: dict[str, NativeArtifact] = {}
+        self._native_by_revision: dict[str, NativeArtifact] = {}
 
     # ------------------------------------------------------------ discovery
 
@@ -453,7 +944,7 @@ class TangerineNativeProvider:
         if artifact_path is None or not Path(artifact_path).is_file():
             return identity
         artifact = _parse_artifact(artifact_path)
-        if artifact is None:
+        if artifact is None or artifact.rejected:
             return identity
         config = artifact.semantic_configuration
         identity.update({
@@ -469,16 +960,29 @@ class TangerineNativeProvider:
         })
         return identity
 
+    def _capability_note(self, family: str) -> str:
+        note = _CAPABILITY_NOTES.get(family, "")
+        invalid = sorted(
+            tag for tag in self._invalid_families
+            if family in _TAG_CAPABILITY.get(tag, ())
+        )
+        if invalid:
+            note = (
+                f"{note}; corrupted native row family(ies) "
+                f"{', '.join(invalid)}: capability unavailable"
+            ).strip("; ")
+        if self._degrade_note:
+            note = f"{note}; {self._degrade_note}" if note else self._degrade_note
+        return note
+
     def capabilities(self) -> list[ProviderCapability]:
-        out = []
-        for family in _ALL_FAMILIES:
-            note = _CAPABILITY_NOTES.get(family, "")
-            if self._degrade_note:
-                note = f"{note}; {self._degrade_note}" if note else self._degrade_note
-            out.append(ProviderCapability(
-                family, self._completeness.get(family, "unknown"), note
-            ))
-        return out
+        return [
+            ProviderCapability(
+                family, self._completeness.get(family, "unknown"),
+                self._capability_note(family),
+            )
+            for family in _ALL_FAMILIES
+        ]
 
     def completeness(self, family: str) -> str:
         return normalize_verdict(self._completeness.get(str(family), "unknown"))
@@ -507,25 +1011,45 @@ class TangerineNativeProvider:
                         notes.append(
                             f"native artifact {artifact_path} is empty or unreadable"
                         )
+                    elif artifact.rejected:
+                        notes.append(
+                            f"native artifact {artifact_path} rejected: "
+                            f"{artifact.reject_reason}"
+                        )
+                    else:
+                        notes.extend(
+                            f"native artifact: {note}"
+                            for note in artifact.parse_notes
+                        )
+                        self._register_artifact(artifact)
                 else:
                     notes.append(f"native artifact {artifact_path} does not exist")
+
+            usable_artifact = artifact if (
+                artifact is not None and not artifact.rejected
+            ) else None
+            invalid_families = (
+                set(artifact.invalid_families) if usable_artifact else set()
+            )
 
             server: _ServerSession | None = None
             if binary is not None and binary.is_file():
                 server = self._talk_to_server(
                     root_path, binary,
-                    Path(artifact_path) if artifact else None,
+                    Path(artifact_path) if usable_artifact else None,
                 )
                 notes.extend(server.notes)
             elif binary is None:
+                repo_root = Path(__file__).resolve().parents[2]
                 notes.append(
-                    f"native compiler not found (env {NATIVE_COMPILER_ENV} or "
-                    f"{DEFAULT_BINARY})"
+                    f"native compiler not found (env {NATIVE_COMPILER_ENV}, "
+                    f"{root_path / DEFAULT_BINARY}, or "
+                    f"{repo_root / DEFAULT_BINARY})"
                 )
             else:
                 notes.append(f"native compiler {binary} is not a file")
 
-            if artifact is None and (server is None or not server.responded()):
+            if usable_artifact is None and (server is None or not server.responded()):
                 return self._degraded(root_path, notes, artifact=artifact,
                                       server=server)
 
@@ -533,19 +1057,23 @@ class TangerineNativeProvider:
             relations: list[ProviderRelation] = []
             facts: list[ProviderFact] = []
             unresolved: list[ProviderUnresolved] = []
-            if artifact is not None:
+            if usable_artifact is not None:
                 self._project_artifact(
-                    artifact, entities, relations, facts, unresolved, notes
+                    usable_artifact, root_path, entities, relations, facts,
+                    unresolved, notes,
                 )
             if server is not None and server.responded():
                 self._project_server(
-                    server, artifact is not None, entities, facts, notes
+                    server, usable_artifact is not None, entities, facts, notes
                 )
 
-            completeness = self._mirror_completeness(artifact, server)
+            completeness = self._mirror_completeness(usable_artifact, server)
+            self._invalid_families = invalid_families
             capabilities = [
-                ProviderCapability(family, completeness.get(family, "unknown"),
-                                   _CAPABILITY_NOTES.get(family, ""))
+                ProviderCapability(
+                    family, completeness.get(family, "unknown"),
+                    self._capability_note(family),
+                )
                 for family in _ALL_FAMILIES
             ]
             evidence: list[ProviderEvidence] = []
@@ -557,6 +1085,7 @@ class TangerineNativeProvider:
                     summary=(
                         "Tangerine §30 semantic snapshot artifact "
                         f"(revision {artifact.revision or 'unknown'})"
+                        + (" [REJECTED]" if artifact.rejected else "")
                     ),
                     payload={
                         "revision": artifact.revision,
@@ -564,6 +1093,9 @@ class TangerineNativeProvider:
                         "surface_hashes": artifact.surface_hashes,
                         "dependency_completeness": artifact.dependency_completeness,
                         "parse_notes": artifact.parse_notes,
+                        "invalid_families": sorted(artifact.invalid_families),
+                        "rejected": artifact.rejected,
+                        "reject_reason": artifact.reject_reason,
                     },
                     provider=self.provider_id,
                 ))
@@ -582,6 +1114,7 @@ class TangerineNativeProvider:
                             for op, resp in sorted(server.responses.items())
                         },
                         "counts": server.counts,
+                        "timed_out": server.timed_out,
                         "revision": next(
                             (resp["keys"][0]
                              for op, resp in server.responses.items()
@@ -616,7 +1149,8 @@ class TangerineNativeProvider:
                     "invoked": True,
                 }],
                 semantic_configuration=(
-                    artifact.semantic_configuration if artifact else {}
+                    usable_artifact.semantic_configuration
+                    if usable_artifact else {}
                 ),
                 provider_id=self.provider_id,
                 provider_version=self.provider_version,
@@ -625,7 +1159,7 @@ class TangerineNativeProvider:
             self._completeness = completeness
             self._degrade_note = ""
             self._last_snapshot = snap
-            self._last_artifact = artifact
+            self._last_artifact = usable_artifact
             self._last_server = server
             return snap
         except Exception as exc:  # noqa: BLE001 - degrade, never crash a scan
@@ -712,147 +1246,297 @@ class TangerineNativeProvider:
             "completeness": "unavailable",
         }
 
+    # ------------------------------------------------------------ delta
+
+    def _register_artifact(self, artifact: NativeArtifact) -> None:
+        if not artifact.accepted:
+            return
+        self._native_by_digest[artifact.sha256] = artifact
+        if artifact.revision:
+            self._native_by_revision[artifact.revision] = artifact
+
+    def _artifact_for_snapshot(
+        self, snapshot: ProviderSnapshot
+    ) -> NativeArtifact | None:
+        for ev in snapshot.evidence:
+            if ev.kind != "native_snapshot_artifact":
+                continue
+            if ev.digest and ev.digest in self._native_by_digest:
+                return self._native_by_digest[ev.digest]
+            payload = ev.payload if isinstance(ev.payload, dict) else {}
+            revision = str(payload.get("revision", "") or "")
+            if revision and revision in self._native_by_revision:
+                return self._native_by_revision[revision]
+        return None
+
     def delta(self, old_snapshot: ProviderSnapshot,
               new_snapshot: ProviderSnapshot) -> dict:
-        return _snapshot_delta(old_snapshot, new_snapshot)
+        """Set diff of two snapshots, preferring the NATIVE artifact delta.
+
+        The native §31 pair delta is not serialized by the artifact and the
+        §39 server answers ``snapshot.diff_unavailable`` for its single
+        snapshot, so the native translation is the identity diff over the two
+        §30 artifacts THIS provider parsed (declarations/tests/contracts by
+        persistent digest + indirect unresolved additions).  When either
+        artifact is unavailable the generic ``_snapshot_delta`` is used; the
+        returned dict records ``source`` ('native'|'generic') and a ``note``.
+        """
+        old_artifact = self._artifact_for_snapshot(old_snapshot)
+        new_artifact = self._artifact_for_snapshot(new_snapshot)
+        if old_artifact is not None and new_artifact is not None:
+            translated = _native_artifact_delta(old_artifact, new_artifact)
+            translated["source"] = "native"
+            translated["note"] = (
+                "native §30 artifact delta over persistent-digest identities "
+                "(declarations, tests, contracts) + indirect unresolved "
+                "additions"
+            )
+            return translated
+        generic = _snapshot_delta(old_snapshot, new_snapshot)
+        generic["source"] = "generic"
+        generic["note"] = (
+            "native artifact pair unavailable in this provider session "
+            "(server-only or rejected artifact, or a different provider "
+            "instance parsed the artifact); fell back to the generic "
+            "snapshot diff"
+        )
+        return generic
 
     # ------------------------------------------------------------ projection
 
     @staticmethod
-    def _digest_stable(artifact: NativeArtifact, digest: str,
-                       domain: str = "sym") -> str | None:
-        key = artifact.digest_to_key.get(str(digest))
-        if not key:
-            return None
-        return f"native:{domain}:{key}"
+    def _decl_stable(digest, key=None) -> tuple[str, bool]:
+        """Typed stable id for a persistent declaration digest.
 
-    def _project_artifact(self, artifact: NativeArtifact,
+        Returns ``(stable_id, degraded)``; a zero/absent digest degrades to
+        the deterministic textual fallback (``native:sym:<key>`` when the
+        textual key is known, else ``native:key:<digest>``).
+        """
+        text = str(digest or "")
+        if text and text != _ZERO_DIGEST:
+            return f"native:decl:{text}", False
+        if key:
+            return f"native:sym:{key}", True
+        return f"native:key:{text or 'unknown'}", True
+
+    @staticmethod
+    def _key_stable(artifact: NativeArtifact, text) -> tuple[str, bool]:
+        """Resolve a canonical key TEXT to a declaration digest stable id."""
+        value = str(text or "")
+        digest = artifact.key_to_digest.get(value)
+        if digest and digest != _ZERO_DIGEST:
+            return f"native:decl:{digest}", False
+        return f"native:key:{value or 'unknown'}", True
+
+    @staticmethod
+    def _display_key(artifact: NativeArtifact, digest) -> str:
+        text = str(digest or "")
+        return artifact.digest_to_key.get(text, text)
+
+    @staticmethod
+    def _split_list(text) -> list[str]:
+        value = str(text or "")
+        return [part for part in value.split(";;") if part]
+
+    def _project_artifact(self, artifact: NativeArtifact, root: Path,
                           entities: list[ProviderEntity],
                           relations: list[ProviderRelation],
                           facts: list[ProviderFact],
                           unresolved: list[ProviderUnresolved],
                           notes: list[str]) -> None:
+        invalid = artifact.invalid_families
+        degraded_keys = 0
+
+        def rows(tag: str) -> list[dict]:
+            if tag in invalid:
+                return []
+            return artifact.rows.get(tag, [])
+
+        def attr_state(attrs: dict, degraded: bool, basis: str) -> dict:
+            nonlocal degraded_keys
+            if degraded:
+                degraded_keys += 1
+                attrs["identity_degraded"] = True
+                attrs["identity_basis"] = basis
+            else:
+                attrs["identity_degraded"] = False
+                attrs["identity_basis"] = basis
+            return attrs
+
+        facts_completeness = (
+            "partial" if any(rows(tag) for tag in _FACT_TAGS) else "unknown"
+        )
+        member_completeness = (
+            "partial" if any(rows(tag) for tag in _MEMBER_TAGS) else "unknown"
+        )
         dep = artifact.dependency_completeness
+        calls_completeness = normalize_verdict(dep.get("Call"), default="partial")
+        tests_completeness = normalize_verdict(
+            dep.get("TestReferences"), default="partial"
+        )
+        contracts_completeness = normalize_verdict(
+            dep.get("ContractReference"), default="partial"
+        )
 
-        def dep_verdict(family: str, fallback: str) -> str:
-            if family in dep:
-                return normalize_verdict(dep[family], default=fallback)
-            return fallback
-
-        symbol_completeness = "complete"
-        call_completeness = dep_verdict("Call", "partial")
-        tests_completeness = dep_verdict("TestReferences", "partial")
-        contracts_completeness = dep_verdict("ContractReference", "partial")
-
-        for row in artifact.rows.get("symbol", []):
-            key = str(row.get("key", "") or "")
-            if not key:
-                notes.append("native symbol row without a key text")
+        # ———— header: Repository/ABI surface ————
+        surface_hashes = artifact.surface_hashes
+        entities.append(ProviderEntity(
+            kind="Repository",
+            name=(root.name or "."),
+            qualified_name=".",
+            stable_id="repo:.",
+            tier=0,
+            provenance="compiler",
+            derived_from=("tangerine-native:artifact-header",),
+            attrs={
+                "native_family": "artifact-header",
+                "revision": artifact.revision,
+                "compiler_version": artifact.compiler_version,
+                "surface_hashes": surface_hashes,
+                "semantic_configuration": artifact.semantic_configuration,
+            },
+            epistemic_state="observed",
+            analysis_depth=2,
+            completeness="complete",
+            provider=self.provider_id,
+            provider_revision=self.provider_version,
+        ))
+        if artifact.revision:
+            facts.append(ProviderFact(
+                subject="repo:.",
+                predicate="native.revision",
+                object=artifact.revision,
+                stable_subject="repo:.",
+                tier=0,
+                provenance="compiler",
+                derived_from=("tangerine-native:artifact-header",),
+                attrs={"artifact": artifact.path},
+                epistemic_state="observed",
+                analysis_depth=2,
+                completeness="complete",
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+        for hash_name in ("public_api_hash", "abi_hash", "unsafe_hash"):
+            value = surface_hashes.get(hash_name)
+            if not value:
                 continue
+            facts.append(ProviderFact(
+                subject="repo:.",
+                predicate=f"native.{hash_name}",
+                object=value,
+                stable_subject="repo:.",
+                tier=0,
+                provenance="compiler",
+                derived_from=("tangerine-native:artifact-header",),
+                attrs={"artifact": artifact.path, "surface": "repository"},
+                epistemic_state="observed",
+                analysis_depth=2,
+                completeness="complete",
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+
+        # ———— declarations ————
+        for row in rows("symbol"):
+            key = str(row.get("key", "") or "")
+            digest = str(row.get("i", "") or "")
+            stable, degraded = self._decl_stable(digest, key)
             entities.append(ProviderEntity(
                 kind="Symbol",
-                name=str(row.get("name") or key),
-                qualified_name=key,
-                stable_id=f"native:sym:{key}",
+                name=str(row.get("name") or key or digest),
+                qualified_name=key or digest,
+                stable_id=stable,
                 tier=3,
                 provenance="compiler",
                 derived_from=("tangerine-native:symbol",),
-                attrs={
+                attrs=attr_state({
                     "native_family": "symbol",
+                    "key": key,
                     "def_kind": row.get("kind"),
-                    "digest": row.get("i"),
+                    "digest": digest,
                     "module": row.get("module"),
                     "is_pub": row.get("pub"),
                     "is_generic": row.get("generic"),
                     "raw": row,
-                },
+                }, degraded,
+                   "zero-digest-textual-fallback" if degraded
+                   else "persistent-decl-digest"),
                 epistemic_state="observed",
                 analysis_depth=2,
-                completeness=symbol_completeness,
+                completeness="complete",
                 provider=self.provider_id,
                 provider_revision=self.provider_version,
             ))
 
-        for row in artifact.rows.get("type", []):
+        for row in rows("type"):
             key = str(row.get("key", "") or "")
-            if not key:
-                notes.append("native type row without a key text")
-                continue
+            digest = str(row.get("i", "") or "")
+            stable, degraded = self._decl_stable(digest, key)
             entities.append(ProviderEntity(
                 kind="Symbol",
-                name=str(row.get("name") or key),
-                qualified_name=key,
-                stable_id=f"native:type:{key}",
+                name=str(row.get("name") or key or digest),
+                qualified_name=key or digest,
+                stable_id=stable,
                 tier=3,
                 provenance="compiler",
                 derived_from=("tangerine-native:type",),
-                attrs={
+                attrs=attr_state({
                     "native_family": "type",
+                    "key": key,
                     "type_kind": row.get("tkind"),
-                    "digest": row.get("i"),
+                    "digest": digest,
                     "module": row.get("module"),
                     "is_pub": row.get("pub"),
                     "generic_arity": row.get("generic_arity"),
                     "raw": row,
-                },
+                }, degraded,
+                   "zero-digest-textual-fallback" if degraded
+                   else "persistent-decl-digest"),
                 epistemic_state="observed",
                 analysis_depth=2,
-                completeness=symbol_completeness,
+                completeness="complete",
                 provider=self.provider_id,
                 provider_revision=self.provider_version,
             ))
 
-        for row in artifact.rows.get("call", []):
-            from_digest = str(row.get("from", "") or "")
-            to_digest = str(row.get("to", "") or "")
-            src_stable = self._digest_stable(artifact, from_digest)
-            dst_stable = self._digest_stable(artifact, to_digest)
-            attrs = {
-                "ekind": row.get("ekind"),
-                "from_digest": from_digest,
-                "to_digest": to_digest,
-                "raw": row,
-            }
-            if src_stable and dst_stable:
-                relations.append(ProviderRelation(
-                    src_key=src_stable,
-                    dst_key=dst_stable,
-                    kind="calls",
-                    src_kind="Symbol",
-                    dst_kind="Symbol",
-                    tier=3,
-                    provenance="compiler",
-                    derived_from=("tangerine-native:call",),
-                    attrs=attrs,
-                    epistemic_state="observed",
-                    analysis_depth=3,
-                    completeness=call_completeness,
-                    provider=self.provider_id,
-                    provider_revision=self.provider_version,
-                ))
-            else:
-                unresolved.append(ProviderUnresolved(
-                    src_key=src_stable or f"native:def:{from_digest}",
-                    dst_raw=to_digest,
-                    kind="calls",
-                    candidates=(),
-                    confidence=0.5,
-                    completeness="unknown",
-                    attrs=dict(attrs, mapped_src=bool(src_stable),
-                               mapped_dst=bool(dst_stable)),
-                    provider=self.provider_id,
-                    provider_revision=self.provider_version,
-                ))
+        # ———— calls ————
+        for row in rows("call"):
+            src_stable, src_degraded = self._decl_stable(row.get("from"))
+            dst_stable, dst_degraded = self._decl_stable(row.get("to"))
+            relations.append(ProviderRelation(
+                src_key=src_stable,
+                dst_key=dst_stable,
+                kind="calls",
+                src_kind="Symbol",
+                dst_kind="Symbol",
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:call",),
+                attrs={
+                    "ekind": row.get("ekind"),
+                    "from_digest": row.get("from"),
+                    "to_digest": row.get("to"),
+                    "identity_degraded": bool(src_degraded or dst_degraded),
+                    "raw": row,
+                },
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=calls_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
 
-        for row in artifact.rows.get("indirect", []):
+        for row in rows("indirect"):
             # The native model emits EVERY indirect site with an EMPTY
             # candidate set and completeness "Unknown" (semantic_snapshot.tg:7527);
             # the provider mirrors that exactly — never a guess.
             caller = str(row.get("caller", "") or "")
             site = str(row.get("site", "") or "")
             signature = str(row.get("sig", "") or "")
+            src_stable, src_degraded = self._key_stable(artifact, caller)
             unresolved.append(ProviderUnresolved(
-                src_key=caller,
+                src_key=src_stable,
                 dst_raw=signature or site,
                 kind="calls",
                 candidates=(),
@@ -860,30 +1544,29 @@ class TangerineNativeProvider:
                 completeness="unknown",
                 evidence=(f"site:{site}",) if site else (),
                 attrs={
+                    "caller_key": caller,
                     "call_site": site,
                     "signature": signature,
                     "native_completeness": row.get("completeness", "Unknown"),
+                    "identity_degraded": src_degraded,
                     "raw": row,
                 },
                 provider=self.provider_id,
                 provider_revision=self.provider_version,
             ))
 
-        facts_completeness = "partial" if (
-            artifact.rows.get("effect")
-            or artifact.rows.get("capability")
-            or artifact.rows.get("ownership")
-        ) else "unknown"
-        for row in artifact.rows.get("effect", []):
+        # ———— effects / capabilities / ownership ————
+        for row in rows("effect"):
             digest = str(row.get("f", "") or "")
-            key = artifact.digest_to_key.get(digest)
+            key = self._display_key(artifact, digest)
+            stable_subject, _ = self._decl_stable(digest)
             facts.append(ProviderFact(
-                subject=key or digest,
+                subject=key,
                 predicate="effect",
                 object=(
                     f"flags={row.get('flags')};purity={row.get('purity')}"
                 ),
-                stable_subject=f"native:sym:{key}" if key else "",
+                stable_subject=stable_subject,
                 tier=3,
                 provenance="compiler",
                 derived_from=("tangerine-native:effect",),
@@ -899,14 +1582,15 @@ class TangerineNativeProvider:
                 provider=self.provider_id,
                 provider_revision=self.provider_version,
             ))
-        for row in artifact.rows.get("capability", []):
+        for row in rows("capability"):
             digest = str(row.get("f", "") or "")
-            key = artifact.digest_to_key.get(digest)
+            key = self._display_key(artifact, digest)
+            stable_subject, _ = self._decl_stable(digest)
             facts.append(ProviderFact(
-                subject=key or digest,
+                subject=key,
                 predicate="capability",
                 object=f"{row.get('dir')}:{row.get('cap')}",
-                stable_subject=f"native:sym:{key}" if key else "",
+                stable_subject=stable_subject,
                 tier=3,
                 provenance="compiler",
                 derived_from=("tangerine-native:capability",),
@@ -917,14 +1601,15 @@ class TangerineNativeProvider:
                 provider=self.provider_id,
                 provider_revision=self.provider_version,
             ))
-        for row in artifact.rows.get("ownership", []):
+        for row in rows("ownership"):
             digest = str(row.get("f", "") or "")
-            key = artifact.digest_to_key.get(digest)
+            key = self._display_key(artifact, digest)
+            stable_subject, _ = self._decl_stable(digest)
             facts.append(ProviderFact(
-                subject=key or digest,
+                subject=key,
                 predicate="ownership",
                 object=f"{row.get('place')}:convention={row.get('conv')}",
-                stable_subject=f"native:sym:{key}" if key else "",
+                stable_subject=stable_subject,
                 tier=3,
                 provenance="compiler",
                 derived_from=("tangerine-native:ownership",),
@@ -936,65 +1621,378 @@ class TangerineNativeProvider:
                 provider_revision=self.provider_version,
             ))
 
-        for row in artifact.rows.get("contract", []):
-            contract_id = str(row.get("i", "") or "")
-            function_digest = str(row.get("f", "") or "")
-            function_key = artifact.digest_to_key.get(function_digest)
-            stable = f"native:contract:{contract_id}"
-            entities.append(ProviderEntity(
-                kind="Contract",
-                name=f"{function_key or function_digest}:{row.get('ckind')}",
-                qualified_name=contract_id,
-                stable_id=stable,
+        # ———— typed members ————
+        for row in rows("field"):
+            digest = str(row.get("o", "") or "")
+            key = self._display_key(artifact, digest)
+            stable_subject, _ = self._decl_stable(digest)
+            facts.append(ProviderFact(
+                subject=key,
+                predicate="member",
+                object=f"field:{row.get('name')}:{row.get('ty')}",
+                stable_subject=stable_subject,
                 tier=3,
                 provenance="compiler",
-                derived_from=("tangerine-native:contract",),
+                derived_from=("tangerine-native:field",),
                 attrs={
-                    "contract_kind": row.get("ckind"),
-                    "expression": row.get("text"),
-                    "fingerprint": row.get("fp"),
-                    "message": row.get("msg"),
-                    "function": (
-                        f"native:sym:{function_key}" if function_key
-                        else function_digest
-                    ),
-                    "function_digest": function_digest,
+                    "member_kind": "field",
+                    "index": row.get("index"),
+                    "member": row.get("member"),
+                    "member_lineage": row.get("ml"),
+                    "is_pub": row.get("pub"),
+                    "owner_digest": digest,
                     "raw": row,
                 },
-                epistemic_state="declared",
+                epistemic_state="observed",
                 analysis_depth=3,
-                completeness=contracts_completeness,
+                completeness=member_completeness,
                 provider=self.provider_id,
                 provider_revision=self.provider_version,
             ))
-            if function_key:
-                relations.append(ProviderRelation(
-                    src_key=f"native:sym:{function_key}",
-                    dst_key=stable,
-                    kind="constrained_by",
-                    src_kind="Symbol",
-                    dst_kind="Contract",
-                    tier=3,
-                    provenance="compiler",
-                    derived_from=("tangerine-native:contract",),
-                    attrs={"raw": row},
-                    epistemic_state="declared",
-                    analysis_depth=3,
-                    completeness=contracts_completeness,
-                    provider=self.provider_id,
-                    provider_revision=self.provider_version,
-                ))
+        for row in rows("variant"):
+            digest = str(row.get("o", "") or "")
+            key = self._display_key(artifact, digest)
+            stable_subject, _ = self._decl_stable(digest)
+            facts.append(ProviderFact(
+                subject=key,
+                predicate="member",
+                object=f"variant:{row.get('name')}({row.get('payload')})",
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:variant",),
+                attrs={
+                    "member_kind": "variant",
+                    "index": row.get("index"),
+                    "member": row.get("member"),
+                    "member_lineage": row.get("ml"),
+                    "owner_digest": digest,
+                    "raw": row,
+                },
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=member_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+        for row in rows("signature"):
+            digest = str(row.get("f", "") or "")
+            key = self._display_key(artifact, digest)
+            stable_subject, _ = self._decl_stable(digest)
+            facts.append(ProviderFact(
+                subject=key,
+                predicate="signature",
+                object=f"({row.get('params')})->{row.get('ret')}",
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:signature",),
+                attrs={
+                    "declared_effects": self._split_list(row.get("effects")),
+                    "variadic": row.get("variadic"),
+                    "function_digest": digest,
+                    "raw": row,
+                },
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=member_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+        for row in rows("trait-method"):
+            digest = str(row.get("o", "") or "")
+            key = self._display_key(artifact, digest)
+            stable_subject, _ = self._decl_stable(digest)
+            facts.append(ProviderFact(
+                subject=key,
+                predicate="member",
+                object=(
+                    f"trait-method:{row.get('name')}"
+                    f"({row.get('params')})->{row.get('ret')}"
+                ),
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:trait-method",),
+                attrs={
+                    "member_kind": "trait_method",
+                    "index": row.get("index"),
+                    "member": row.get("member"),
+                    "member_lineage": row.get("ml"),
+                    "owner_digest": digest,
+                    "raw": row,
+                },
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=member_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
 
-        for row in artifact.rows.get("test", []):
-            test_key = str(row.get("tkey", "") or "")
+        # ———— MIR summaries ————
+        for row in rows("mir"):
+            digest = str(row.get("f", "") or "")
+            key = self._display_key(artifact, digest)
+            stable_subject, _ = self._decl_stable(digest)
+            facts.append(ProviderFact(
+                subject=key,
+                predicate="mir",
+                object=(
+                    f"blocks={row.get('blocks')};statements={row.get('statements')};"
+                    f"locals={row.get('locals')};reachable={row.get('reachable')};"
+                    f"unsafe={row.get('unsafe')};unknown={row.get('unknown')};"
+                    f"purity={row.get('purity')}"
+                ),
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:mir",),
+                attrs={
+                    "capabilities": row.get("caps"),
+                    "purity_evidence": row.get("pevidence"),
+                    "flags": row.get("flags"),
+                    "function_digest": digest,
+                    "raw": row,
+                },
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=facts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+
+        # ———— concrete types (layout of generic instantiations) ————
+        for row in rows("concrete-type"):
+            instance = str(row.get("i", "") or "")
+            facts.append(ProviderFact(
+                subject=instance,
+                predicate="layout",
+                object=(
+                    f"size={row.get('size')};align={row.get('align')};"
+                    f"status={row.get('status')}"
+                ),
+                stable_subject=f"native:typeinst:{instance}",
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:concrete-type",),
+                attrs={
+                    "instance_key": instance,
+                    "template": row.get("template"),
+                    "args": self._split_list(row.get("args")),
+                    "fields": self._split_list(row.get("fields")),
+                    "raw": row,
+                },
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=facts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+
+        # ———— resource rows ————
+        for row in rows("alloc-site"):
+            subject = str(row.get("f", "") or "")
+            stable_subject, degraded = self._key_stable(artifact, subject)
+            facts.append(ProviderFact(
+                subject=subject,
+                predicate="alloc_site",
+                object=f"{row.get('kind')}:{row.get('size')}",
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:alloc-site",),
+                attrs=attr_state({
+                    "site": row.get("site"),
+                    "function_key": subject,
+                    "raw": row,
+                }, degraded, "textual-key"),
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=facts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+        for row in rows("alloc-summary"):
+            subject = str(row.get("f", "") or "")
+            stable_subject, degraded = self._key_stable(artifact, subject)
+            facts.append(ProviderFact(
+                subject=subject,
+                predicate="alloc_summary",
+                object=(
+                    f"dynamic={row.get('dynamic')};arena={row.get('arena')};"
+                    f"sites={row.get('sites')};usites={row.get('usites')};"
+                    f"blevel={row.get('blevel')};alevel={row.get('alevel')};"
+                    f"slevel={row.get('slevel')}"
+                ),
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:alloc-summary",),
+                attrs=attr_state({
+                    "function_key": subject,
+                    "raw": row,
+                }, degraded, "textual-key"),
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=facts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+        for row in rows("stack-summary"):
+            subject = str(row.get("f", "") or "")
+            stable_subject, degraded = self._key_stable(artifact, subject)
+            facts.append(ProviderFact(
+                subject=subject,
+                predicate="stack",
+                object=(
+                    f"frame={row.get('frame')};max={row.get('max')};"
+                    f"recursive={row.get('recursive')};flevel={row.get('flevel')};"
+                    f"mlevel={row.get('mlevel')}"
+                ),
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:stack-summary",),
+                attrs=attr_state({
+                    "function_key": subject,
+                    "raw": row,
+                }, degraded, "textual-key"),
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=facts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+        for row in rows("blocking-summary"):
+            subject = str(row.get("f", "") or "")
+            stable_subject, degraded = self._key_stable(artifact, subject)
+            facts.append(ProviderFact(
+                subject=subject,
+                predicate="blocking",
+                object=(
+                    f"blocking={row.get('blocking')};unbounded={row.get('unbounded')};"
+                    f"bsites={row.get('bsites')};level={row.get('level')}"
+                ),
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:blocking-summary",),
+                attrs=attr_state({
+                    "function_key": subject,
+                    "raw": row,
+                }, degraded, "textual-key"),
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=facts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+        for row in rows("code-size-summary"):
+            subject = str(row.get("f", "") or "")
+            stable_subject, degraded = self._key_stable(artifact, subject)
+            facts.append(ProviderFact(
+                subject=subject,
+                predicate="code_size",
+                object=(
+                    f"bytes={row.get('bytes')};exact={row.get('exact')};"
+                    f"level={row.get('level')}"
+                ),
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:code-size-summary",),
+                attrs=attr_state({
+                    "function_key": subject,
+                    "raw": row,
+                }, degraded, "textual-key"),
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=facts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+
+        # ———— unsafe / drop / DMA ————
+        for row in rows("unsafe-fact"):
+            subject = str(row.get("f", "") or "")
+            stable_subject, degraded = self._key_stable(artifact, subject)
+            facts.append(ProviderFact(
+                subject=subject,
+                predicate="unsafe",
+                object=f"{row.get('ukind')}:{row.get('site')}",
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:unsafe-fact",),
+                attrs=attr_state({
+                    "unsafe_digest": row.get("i"),
+                    "function_key": subject,
+                    "raw": row,
+                }, degraded, "textual-key"),
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=facts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+        for row in rows("drop-plan"):
+            subject = str(row.get("f", "") or "")
+            stable_subject, degraded = self._key_stable(artifact, subject)
+            facts.append(ProviderFact(
+                subject=subject,
+                predicate="drop_plan",
+                object=(
+                    f"{row.get('place')}:{row.get('kind')}:{row.get('site')}"
+                ),
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:drop-plan",),
+                attrs=attr_state({
+                    "conditional_paths": self._split_list(row.get("paths")),
+                    "function_key": subject,
+                    "raw": row,
+                }, degraded, "textual-key"),
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=facts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+        for row in rows("dma"):
+            subject = str(row.get("f", "") or "")
+            stable_subject, degraded = self._key_stable(artifact, subject)
+            facts.append(ProviderFact(
+                subject=subject,
+                predicate="dma",
+                object=(
+                    f"{row.get('place')}:{row.get('state')}:{row.get('op')}"
+                ),
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:dma",),
+                attrs=attr_state({
+                    "place_id": row.get("pid"),
+                    "commit_site": row.get("site"),
+                    "function_key": subject,
+                    "raw": row,
+                }, degraded, "textual-key"),
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=facts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+
+        # ———— tests + coverage ————
+        test_stable_by_key: dict[str, str] = {}
+        for row in rows("test"):
             test_digest = str(row.get("test", "") or "")
-            if not test_key and not test_digest:
-                notes.append("native test row without a test key")
-                continue
-            stable = (
-                f"native:test:{test_key}" if test_key
-                else f"native:test:{test_digest}"
-            )
+            test_key = str(row.get("tkey", "") or "")
+            stable = f"native:test:{test_digest}"
+            if test_key:
+                test_stable_by_key.setdefault(test_key, stable)
             entities.append(ProviderEntity(
                 kind="Test",
                 name=str(row.get("tname") or test_key or test_digest),
@@ -1007,7 +2005,10 @@ class TangerineNativeProvider:
                     "test_kind": row.get("tkind"),
                     "test_attributes": row.get("tattrs"),
                     "test_digest": test_digest,
+                    "tkey": test_key,
                     "target_digest": row.get("target"),
+                    "identity_basis": "persistent-test-digest",
+                    "identity_degraded": False,
                     "raw": row,
                 },
                 epistemic_state="declared",
@@ -1017,8 +2018,8 @@ class TangerineNativeProvider:
                 provider_revision=self.provider_version,
             ))
             target_digest = str(row.get("target", "") or "")
-            target_stable = self._digest_stable(artifact, target_digest)
-            if target_stable:
+            target_stable, target_degraded = self._decl_stable(target_digest)
+            if not target_degraded:
                 relations.append(ProviderRelation(
                     src_key=stable,
                     dst_key=target_stable,
@@ -1028,7 +2029,7 @@ class TangerineNativeProvider:
                     tier=3,
                     provenance="compiler",
                     derived_from=("tangerine-native:test",),
-                    attrs={"raw": row},
+                    attrs={"target_digest": target_digest, "raw": row},
                     epistemic_state="declared",
                     analysis_depth=3,
                     completeness=tests_completeness,
@@ -1043,10 +2044,377 @@ class TangerineNativeProvider:
                     candidates=(),
                     confidence=0.4,
                     completeness="unknown",
-                    attrs={"target_digest": target_digest, "raw": row},
+                    attrs={
+                        "target_digest": target_digest,
+                        "identity_degraded": True,
+                        "raw": row,
+                    },
                     provider=self.provider_id,
                     provider_revision=self.provider_version,
                 ))
+
+        for row in rows("coverage"):
+            digest = str(row.get("f", "") or "")
+            key = self._display_key(artifact, digest)
+            stable_subject, _ = self._decl_stable(digest)
+            branch = str(row.get("branch", "") or "")
+            arm = str(row.get("arm", "") or "")
+            point_kind = str(row.get("kind", "") or "")
+            test_id = str(row.get("test", "") or "")
+            facts.append(ProviderFact(
+                subject=key,
+                predicate="coverage",
+                object=f"{point_kind}:{branch}" + (f"#{arm}" if arm else ""),
+                stable_subject=stable_subject,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:coverage",),
+                attrs={
+                    "branch": branch,
+                    "arm": arm,
+                    "point_kind": point_kind,
+                    "test_id": test_id,
+                    "function_digest": digest,
+                    "raw": row,
+                },
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=facts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+            if test_id:
+                test_stable = test_stable_by_key.get(test_id)
+                if test_stable:
+                    relations.append(ProviderRelation(
+                        src_key=test_stable,
+                        dst_key=stable_subject,
+                        kind="tests",
+                        src_kind="Test",
+                        dst_kind="Symbol",
+                        tier=3,
+                        provenance="compiler",
+                        derived_from=("tangerine-native:coverage",),
+                        attrs={
+                            "role": "coverage",
+                            "branch": branch,
+                            "arm": arm,
+                            "point_kind": point_kind,
+                            "raw": row,
+                        },
+                        epistemic_state="observed",
+                        analysis_depth=3,
+                        completeness=tests_completeness,
+                        provider=self.provider_id,
+                        provider_revision=self.provider_version,
+                    ))
+                else:
+                    unresolved.append(ProviderUnresolved(
+                        src_key=(
+                            test_stable or f"native:key:{test_id}"
+                        ),
+                        dst_raw=key or digest,
+                        kind="tests",
+                        candidates=(),
+                        confidence=0.4,
+                        completeness="unknown",
+                        attrs={
+                            "role": "coverage",
+                            "test_id": test_id,
+                            "branch": branch,
+                            "point_kind": point_kind,
+                            "raw": row,
+                        },
+                        provider=self.provider_id,
+                        provider_revision=self.provider_version,
+                    ))
+
+        # ———— contracts + contract references (canonical (kind, name)) ————
+        contract_by_key: dict[str, tuple[str, str, str]] = {}
+        for row in rows("contract"):
+            contract_digest = str(row.get("i", "") or "")
+            function_digest = str(row.get("f", "") or "")
+            ckind = str(row.get("ckind", "") or "")
+            text = str(row.get("text", "") or "")
+            function_key = artifact.digest_to_key.get(function_digest)
+            if function_key:
+                canonical_name = f"{function_key}|{ckind}|{text}"
+            else:
+                canonical_name = f"digest::{contract_digest}"
+            stable = f"native:contract:{contract_digest}"
+            contract_by_key[canonical_name] = (ckind, canonical_name, stable)
+            holder_stable, _ = self._decl_stable(function_digest)
+            entities.append(ProviderEntity(
+                kind="Contract",
+                name=canonical_name,
+                qualified_name=canonical_name,
+                stable_id=stable,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:contract",),
+                attrs={
+                    "native_family": "contract",
+                    "contract_kind": ckind,
+                    "contract_digest": contract_digest,
+                    "expression": text,
+                    "fingerprint": row.get("fp"),
+                    "message": row.get("msg"),
+                    "contract_key": canonical_name,
+                    "function": holder_stable,
+                    "function_digest": function_digest,
+                    "identity_basis": "persistent-contract-digest",
+                    "identity_degraded": False,
+                    "raw": row,
+                },
+                epistemic_state="declared",
+                analysis_depth=3,
+                completeness=contracts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+            facts.append(ProviderFact(
+                subject=canonical_name,
+                predicate="contract_ref",
+                object=f"contract:{ckind}:{canonical_name}",
+                stable_subject=stable,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:contract",),
+                attrs={
+                    "role": "declaration",
+                    "contract_kind": ckind,
+                    "contract_digest": contract_digest,
+                    "contract_key": canonical_name,
+                    "function": holder_stable,
+                    "expression": text,
+                    "fingerprint": row.get("fp"),
+                    "message": row.get("msg"),
+                    "raw": row,
+                },
+                epistemic_state="declared",
+                analysis_depth=3,
+                completeness=contracts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+            relations.append(ProviderRelation(
+                src_key=holder_stable,
+                dst_key=stable,
+                kind="constrained_by",
+                src_kind="Symbol",
+                dst_kind="Contract",
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:contract",),
+                attrs={"contract_kind": ckind, "raw": row},
+                epistemic_state="declared",
+                analysis_depth=3,
+                completeness=contracts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+
+        for row in rows("dep-contract-ref"):
+            contract_text = str(row.get("contract", "") or "")
+            symbol_text = str(row.get("symbol", "") or "")
+            entry = contract_by_key.get(contract_text)
+            if entry is not None:
+                ckind, canonical_name, contract_stable = entry
+                kind_resolved = True
+            else:
+                ckind, canonical_name, contract_stable = "unknown", contract_text, f"native:key:{contract_text}"
+                kind_resolved = False
+            symbol_stable, symbol_degraded = self._key_stable(artifact, symbol_text)
+            facts.append(ProviderFact(
+                subject=symbol_text or symbol_stable,
+                predicate="contract_ref",
+                object=f"contract:{ckind}:{canonical_name}",
+                stable_subject=symbol_stable,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:dep-contract-ref",),
+                attrs={
+                    "role": "reference",
+                    "contract_id": contract_text,
+                    "contract_kind": ckind,
+                    "contract_kind_unresolved": not kind_resolved,
+                    "referenced_symbol": symbol_text,
+                    "identity_degraded": symbol_degraded,
+                    "raw": row,
+                },
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=contracts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+            relations.append(ProviderRelation(
+                src_key=contract_stable,
+                dst_key=symbol_stable,
+                kind="depends_on",
+                src_kind="Contract",
+                dst_kind="Symbol",
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:dep-contract-ref",),
+                attrs={
+                    "role": "contract_reference",
+                    "contract_kind_unresolved": not kind_resolved,
+                    "identity_degraded": symbol_degraded,
+                    "raw": row,
+                },
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=contracts_completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+
+        # ———— typed dependency families ————
+        def dep_relation(row: dict, tag: str, src_text, dst_text, kind: str,
+                         derived: str, attrs: dict,
+                         src_kind: str = "Symbol",
+                         dst_kind: str = "Symbol") -> None:
+            src_stable, src_degraded = self._key_stable(artifact, src_text)
+            dst_stable, dst_degraded = self._key_stable(artifact, dst_text)
+            family = _DEP_FAMILY_BY_TAG.get(tag, "")
+            completeness = normalize_verdict(
+                dep.get(family), default="partial"
+            )
+            relations.append(ProviderRelation(
+                src_key=src_stable,
+                dst_key=dst_stable,
+                kind=kind,
+                src_kind=src_kind,
+                dst_kind=dst_kind,
+                tier=3,
+                provenance="compiler",
+                derived_from=(derived,),
+                attrs={
+                    **attrs,
+                    "native_family": family,
+                    "identity_degraded": bool(src_degraded or dst_degraded),
+                    "raw": row,
+                },
+                epistemic_state="observed",
+                analysis_depth=3,
+                completeness=completeness,
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+
+        for row in rows("dep-type-use"):
+            dep_relation(row, "dep-type-use", row.get("user"), row.get("used"),
+                         "depends_on", "tangerine-native:dep-type-use",
+                         {"role": "type_use"})
+        for row in rows("dep-trait-impl"):
+            dep_relation(row, "dep-trait-impl", row.get("impl"),
+                         row.get("trait"), "implements",
+                         "tangerine-native:dep-trait-impl",
+                         {"role": "trait_impl", "self_type": row.get("self")})
+        for row in rows("dep-trait-select"):
+            dep_relation(row, "dep-trait-select", row.get("fn"),
+                         row.get("impl"), "depends_on",
+                         "tangerine-native:dep-trait-select",
+                         {"role": "trait_selection", "trait": row.get("trait")})
+        for row in rows("dep-generic-inst"):
+            dep_relation(row, "dep-generic-inst", row.get("instance"),
+                         row.get("template"), "depends_on",
+                         "tangerine-native:dep-generic-inst",
+                         {"role": "generic_instantiation"})
+        for row in rows("dep-layout"):
+            dep_relation(row, "dep-layout", row.get("dependent"),
+                         row.get("source"), "depends_on",
+                         "tangerine-native:dep-layout",
+                         {"role": "layout_dependency"})
+        for row in rows("dep-const-eval"):
+            dep_relation(row, "dep-const-eval", row.get("dependent"),
+                         row.get("const"), "depends_on",
+                         "tangerine-native:dep-const-eval",
+                         {"role": "const_eval_dependency"})
+        for row in rows("dep-derived-body"):
+            dep_relation(row, "dep-derived-body", row.get("derived"),
+                         row.get("source"), "depends_on",
+                         "tangerine-native:dep-derived-body",
+                         {"role": "derived_body"})
+        for row in rows("dep-abi"):
+            dep_relation(row, "dep-abi", f"native:abi:{row.get('surface')}",
+                         row.get("type"), "depends_on",
+                         "tangerine-native:dep-abi",
+                         {"role": "abi_dependency"}, src_kind="API")
+
+        # ———— ABI surfaces ————
+        for row in rows("abi-surface"):
+            surface = str(row.get("surface", "") or "")
+            stable = f"native:abi:{surface}"
+            entities.append(ProviderEntity(
+                kind="API",
+                name=surface,
+                qualified_name=surface,
+                stable_id=stable,
+                tier=3,
+                provenance="compiler",
+                derived_from=("tangerine-native:abi-surface",),
+                attrs={
+                    "native_family": "abi-surface",
+                    "surface_id": surface,
+                    "symbol_key": row.get("symbol"),
+                    "surface_kind": row.get("kind"),
+                    "size": row.get("size"),
+                    "align": row.get("align"),
+                    "arg_classes": row.get("args"),
+                    "ret_class": row.get("ret"),
+                    "fields": row.get("fields"),
+                    "calling_convention": row.get("conv"),
+                    "external_symbol": row.get("extern"),
+                    "platform": row.get("platform"),
+                    "failure_convention": row.get("failure"),
+                    "thread_safety": row.get("thread"),
+                    "taint": row.get("taint"),
+                    "canonical_boundary": row.get("boundary"),
+                    "variadic": row.get("variadic"),
+                    "identity_basis": "abi-surface-key",
+                    "identity_degraded": False,
+                    "raw": row,
+                },
+                epistemic_state="observed",
+                analysis_depth=2,
+                completeness="partial",
+                provider=self.provider_id,
+                provider_revision=self.provider_version,
+            ))
+            symbol_text = str(row.get("symbol", "") or "")
+            if symbol_text:
+                symbol_stable, symbol_degraded = self._key_stable(
+                    artifact, symbol_text
+                )
+                relations.append(ProviderRelation(
+                    src_key=symbol_stable,
+                    dst_key=stable,
+                    kind="depends_on",
+                    src_kind="Symbol",
+                    dst_kind="API",
+                    tier=3,
+                    provenance="compiler",
+                    derived_from=("tangerine-native:abi-surface",),
+                    attrs={
+                        "role": "abi_surface",
+                        "identity_degraded": symbol_degraded,
+                        "raw": row,
+                    },
+                    epistemic_state="observed",
+                    analysis_depth=3,
+                    completeness="partial",
+                    provider=self.provider_id,
+                    provider_revision=self.provider_version,
+                ))
+
+        if degraded_keys:
+            notes.append(
+                f"native artifact: {degraded_keys} row(s)/endpoint(s) resolved "
+                "to the degraded textual identity (no persistent digest); "
+                "identity_degraded is recorded on each"
+            )
 
     def _project_server(self, server: _ServerSession, have_artifact: bool,
                         entities: list[ProviderEntity],
@@ -1067,6 +2435,7 @@ class TangerineNativeProvider:
                         subject="repo:.",
                         predicate="native.revision",
                         object=str(keys[0]),
+                        stable_subject="repo:.",
                         tier=0,
                         provenance="compiler",
                         derived_from=("tangerine-native:revision",),
@@ -1085,6 +2454,7 @@ class TangerineNativeProvider:
                         subject="repo:.",
                         predicate="native.snapshot",
                         object=str(row),
+                        stable_subject="repo:.",
                         tier=0,
                         provenance="compiler",
                         derived_from=("tangerine-native:snapshot.get",),
@@ -1107,7 +2477,12 @@ class TangerineNativeProvider:
                         tier=3,
                         provenance="compiler",
                         derived_from=("tangerine-native:symbol_search",),
-                        attrs={"key_text": text, "source": "symbol_search"},
+                        attrs={
+                            "key_text": text,
+                            "source": "symbol_search",
+                            "identity_basis": "textual-key",
+                            "identity_degraded": True,
+                        },
                         epistemic_state="declared",
                         analysis_depth=2,
                         completeness="partial",
@@ -1125,6 +2500,7 @@ class TangerineNativeProvider:
                         subject="repo:.",
                         predicate=f"native.{kind or op}",
                         object=str(row),
+                        stable_subject="repo:.",
                         tier=0,
                         provenance="compiler",
                         derived_from=(f"tangerine-native:{op}",),
@@ -1138,44 +2514,70 @@ class TangerineNativeProvider:
 
     def _mirror_completeness(self, artifact: NativeArtifact | None,
                              server: _ServerSession | None) -> dict[str, str]:
-        """Mirror the native producer's own completeness; never upgrade."""
+        """Mirror the native producer's own completeness; never upgrade.
+
+        A family invalidated by malformed rows reads back ``unavailable``;
+        a rejected artifact contributes nothing.
+        """
         completeness: dict[str, str] = {}
-        if artifact is not None:
+        if artifact is not None and not artifact.rejected:
+            invalid = artifact.invalid_families
             dep = artifact.dependency_completeness
-            completeness["entities"] = "complete"
-            completeness["calls"] = normalize_verdict(
-                dep.get("Call"), default="partial"
+
+            def bad(*tags: str) -> bool:
+                return any(tag in invalid for tag in tags)
+
+            def has(*tags: str) -> bool:
+                return any(artifact.rows.get(tag) for tag in tags)
+
+            completeness["entities"] = (
+                "unavailable" if bad(*_ENTITY_TAGS) else "complete"
             )
-            completeness["tests"] = normalize_verdict(
-                dep.get("TestReferences"), default="partial"
+            call_invalid = bad(*_CALL_TAGS)
+            completeness["calls"] = (
+                "unavailable" if call_invalid
+                else normalize_verdict(dep.get("Call"), default="partial")
             )
-            completeness["contracts"] = normalize_verdict(
-                dep.get("ContractReference"), default="partial"
+            completeness["tests"] = (
+                "unavailable" if bad(*_TEST_TAGS)
+                else normalize_verdict(dep.get("TestReferences"), default="partial")
             )
-            if dep:
+            completeness["contracts"] = (
+                "unavailable" if bad(*_CONTRACT_TAGS)
+                else normalize_verdict(
+                    dep.get("ContractReference"), default="partial"
+                )
+            )
+            completeness["facts"] = (
+                "unavailable" if bad(*_FACT_TAGS)
+                else ("partial" if has(*_FACT_TAGS) else "unknown")
+            )
+            completeness["ownership"] = (
+                "unavailable" if bad(*_OWNERSHIP_TAGS)
+                else ("partial" if has(*_OWNERSHIP_TAGS) else "unknown")
+            )
+            completeness["runtime"] = (
+                "unavailable" if bad(*_RUNTIME_TAGS)
+                else ("partial" if has(*_RUNTIME_TAGS) else "unknown")
+            )
+            if bad(*_RELATION_TAGS):
+                completeness["relations"] = "unavailable"
+            elif dep:
                 completeness["relations"] = worst_verdict(
-                    *[normalize_verdict(v, default="partial") for v in dep.values()]
+                    *[normalize_verdict(v, default="partial")
+                      for v in dep.values()]
                 )
             else:
                 completeness["relations"] = "partial"
-            completeness["facts"] = "partial" if (
-                artifact.rows.get("effect")
-                or artifact.rows.get("capability")
-                or artifact.rows.get("ownership")
-            ) else "unknown"
-            completeness["ownership"] = (
-                "partial" if artifact.rows.get("ownership") else "unknown"
-            )
-            completeness["runtime"] = (
-                "partial" if artifact.rows.get("coverage") else "unknown"
-            )
-            completeness["history"] = "unknown"
-            completeness["invariants"] = "unknown"
             # An explicit "Unknown" producer word can never read back stronger.
-            if any(
-                str(row.get("completeness", "")).strip().lower() == "unknown"
-                for row in artifact.rows.get("indirect", [])
-            ) and "Call" not in dep:
+            if (
+                "Call" not in dep
+                and not call_invalid
+                and any(
+                    str(row.get("completeness", "")).strip().lower() == "unknown"
+                    for row in artifact.rows.get("indirect", [])
+                )
+            ):
                 completeness["calls"] = "unknown"
         elif server is not None and server.responded():
             # Counts and (optionally) symbol keys are visible, but no native
@@ -1188,6 +2590,8 @@ class TangerineNativeProvider:
         else:
             for family in _ALL_FAMILIES:
                 completeness[family] = "unavailable"
+        for family in _ALL_FAMILIES:
+            completeness.setdefault(family, "unknown")
         return completeness
 
     # ------------------------------------------------------------ sessions
@@ -1229,6 +2633,12 @@ class TangerineNativeProvider:
 
     def _talk_to_server(self, root: Path, binary: Path,
                         artifact_path: Path | None) -> _ServerSession:
+        """Run the whole §39 exchange under ONE wall-clock bound.
+
+        The worker thread owns the blocking reads; the caller joins it with
+        ``server_timeout`` and kills the process on expiry, so a hung server
+        can never block a scan indefinitely.
+        """
         session = _ServerSession(binary=str(binary))
         args = [str(binary), "server"]
         if artifact_path is not None:
@@ -1249,6 +2659,30 @@ class TangerineNativeProvider:
                 f"native server could not start: {exc.__class__.__name__}: {exc}"
             )
             return session
+        worker = threading.Thread(
+            target=self._server_exchange,
+            args=(proc, requests, session),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(self._server_timeout)
+        if worker.is_alive():
+            session.timed_out = True
+            session.notes.append(
+                f"native server exchange exceeded the {self._server_timeout:g}s "
+                "wall-clock bound; killed and degraded (hung server)"
+            )
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            worker.join(5.0)
+        self._finalize_server_process(proc)
+        session.counts = _parse_counts(session.responses.get("snapshot.get"))
+        return session
+
+    def _server_exchange(self, proc, requests: list[tuple[str, str]],
+                         session: _ServerSession) -> None:
         try:
             payload = b"".join(
                 frame_request(PROTOCOL_VERSION, index + 1, op, arg)
@@ -1265,6 +2699,8 @@ class TangerineNativeProvider:
         except OSError:
             pass
         for index, (op, _arg) in enumerate(requests):
+            if session.timed_out:
+                break
             try:
                 body = read_frame(proc.stdout)
             except NativeProtocolError as exc:
@@ -1297,20 +2733,38 @@ class TangerineNativeProvider:
                 break
             session.responses[op] = response
         try:
-            proc.wait(timeout=SERVER_TIMEOUT_S)
+            proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            proc.kill()
             try:
-                proc.wait(timeout=5)
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 pass
-            session.notes.append("native server did not exit after stdin close; killed")
+            session.notes.append(
+                "native server did not exit after stdin close; killed"
+            )
+
+    @staticmethod
+    def _finalize_server_process(proc) -> None:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
         try:
-            proc.stdout.close()
-        except OSError:
+            proc.wait(timeout=5.0)
+        except (subprocess.TimeoutExpired, OSError):
             pass
-        session.counts = _parse_counts(session.responses.get("snapshot.get"))
-        return session
+        for stream in (proc.stdin, proc.stdout):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except OSError:
+                pass
 
     def _degraded(self, root: Path, notes: list[str],
                   artifact: NativeArtifact | None = None,
@@ -1319,10 +2773,15 @@ class TangerineNativeProvider:
             "native compiler/artifact unavailable"
         )
         self._completeness = {family: "unavailable" for family in _ALL_FAMILIES}
+        self._invalid_families = (
+            set(artifact.invalid_families)
+            if artifact is not None and not artifact.rejected else set()
+        )
         self._degrade_note = reason
         capabilities = [
-            ProviderCapability(family, "unavailable",
-                               f"{_CAPABILITY_NOTES.get(family, '')}; {reason}".strip("; "))
+            ProviderCapability(
+                family, "unavailable", self._capability_note(family)
+            )
             for family in _ALL_FAMILIES
         ]
         evidence = [ProviderEvidence(
@@ -1332,7 +2791,13 @@ class TangerineNativeProvider:
             payload={
                 "notes": notes,
                 "artifact": artifact.path if artifact else "",
+                "rejected": bool(artifact and artifact.rejected),
+                "reject_reason": artifact.reject_reason if artifact else "",
+                "invalid_families": (
+                    sorted(artifact.invalid_families) if artifact else []
+                ),
                 "server": server.binary if server else "",
+                "server_timed_out": bool(server and server.timed_out),
             },
             provider=self.provider_id,
         )]
@@ -1350,3 +2815,76 @@ class TangerineNativeProvider:
         )
         self._last_snapshot = snap
         return snap
+
+
+# ── native artifact delta (requirement 5) ────────────────────────────────
+
+
+def _canonical_row(row: dict) -> str:
+    return json.dumps(row, sort_keys=True, separators=(",", ":"))
+
+
+def _artifact_entities(artifact: NativeArtifact) -> dict[str, str]:
+    """Persistent-digest entity renders for one accepted artifact."""
+    out: dict[str, str] = {}
+    for tag in ("symbol", "type"):
+        if tag in artifact.invalid_families:
+            continue
+        for row in artifact.rows.get(tag, []):
+            digest = str(row.get("i", "") or "")
+            if not _is_digest(digest) or digest == _ZERO_DIGEST:
+                continue
+            out[f"native:decl:{digest}"] = _canonical_row(row)
+    if "test" not in artifact.invalid_families:
+        for row in artifact.rows.get("test", []):
+            digest = str(row.get("test", "") or "")
+            if not _is_digest(digest):
+                continue
+            out[f"native:test:{digest}"] = _canonical_row(row)
+    if "contract" not in artifact.invalid_families:
+        for row in artifact.rows.get("contract", []):
+            digest = str(row.get("i", "") or "")
+            if not _is_digest(digest):
+                continue
+            out[f"native:contract:{digest}"] = _canonical_row(row)
+    return out
+
+
+def _artifact_unresolved(artifact: NativeArtifact) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if "indirect" in artifact.invalid_families:
+        return out
+    for row in artifact.rows.get("indirect", []):
+        src = str(row.get("caller", "") or "")
+        dst = str(row.get("sig") or row.get("site") or "")
+        out[f"{src}\x1f{'calls'}\x1f{dst}"] = _canonical_row(row)
+    return out
+
+
+def _native_artifact_delta(old: NativeArtifact,
+                           new: NativeArtifact) -> dict:
+    """Native row-identity diff of two §30 artifacts.
+
+    Entities keyed by persistent digest (declarations, tests, contracts) and
+    indirect unresolved renders — the same channels the federation delta
+    shape exposes; edge-only changes are not fabricated into the entity set.
+
+    Note: this mirrors the native §31 entity/indirect semantics over the
+    artifact rows because neither the artifact nor the single-snapshot §39
+    server serializes a pair delta (see the module docstring).
+    """
+    old_entities = _artifact_entities(old)
+    new_entities = _artifact_entities(new)
+    old_unresolved = _artifact_unresolved(old)
+    new_unresolved = _artifact_unresolved(new)
+    return {
+        "added": sorted(set(new_entities) - set(old_entities)),
+        "removed": sorted(set(old_entities) - set(new_entities)),
+        "changed": sorted(
+            key for key in set(old_entities) & set(new_entities)
+            if old_entities[key] != new_entities[key]
+        ),
+        "unresolved_added": sorted(
+            set(new_unresolved) - set(old_unresolved)
+        ),
+    }

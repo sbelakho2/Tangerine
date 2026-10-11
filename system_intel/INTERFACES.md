@@ -1,13 +1,19 @@
-# system_intel v2 — pinned interfaces (contract for parallel workstreams)
+# system_intel v3 — pinned interfaces (contract for parallel workstreams)
 
-This file is the FROZEN contract for the v2 inversion. Do not edit it without
-coordinating; code against it exactly.
+This file is the FROZEN contract for the v3 federation inversion. Do not edit
+it without coordinating; code against it exactly.
 
 The inversion (user directive, 2026-10-10): `system_intel` is a
 language-neutral **semantic federation + persistence + history + cross-repo
 query** layer. Semantic truth comes from interchangeable **providers**.
 The native Tangerine provider is authoritative for Tangerine code; the
 stdlib-only scanner is the zero-install fallback, never the authority.
+
+v3 (2026-10-11) makes the observation model explicit and closes the
+federation/protocol integrity findings: three identity levels, full snapshot
+immutability, structural support/evidence integrity, a provider registry that
+the NORMAL scan path always uses, and a completeness algebra that separates
+scope/authority/enumeration/resolution.
 
 ## 0. Enumerations (single source of truth)
 
@@ -18,25 +24,45 @@ analysis_depth  : 0 filesystem | 1 lexical/syntax | 2 symbols/types
                   | 3 deps/calls/data-flow | 4 runtime | 5 federation
 completeness    : complete | partial | unavailable | unknown
 provenance_kind : source_scan | compiler | runtime_trace | history | caller
+observation_kind: static | runtime | verification | history      (level 2)
+authority       : native | compiler | fallback | external        (level 2)
 ```
 
 `provenance` (existing column semantics) stays the free-form derivation
 source; the above are separate columns/fields. `runtime` provenance maps to
 `epistemic_state=observed, analysis_depth=4`, never to `inferred`.
 
-## 1. Identity (P0-2/3)
+## 1. Identity — three levels (v3)
 
 ```text
+LEVEL 1  source_revision
 repo_identity            : stable identity of the repository (e.g. remote URL
                            digest or root-path digest for local-only repos)
 source_revision          : git HEAD sha, or "worktree:<base-sha>:<tree-digest>"
                            when the worktree is dirty, or
                            "content:<tree-digest>" for non-git trees
 tree_digest              : sha256 of the canonical (path,size,mode,content)
-                           manifest of extracted files
+                           manifest of extracted files (symlinks recorded by
+                           target string, never followed; scan output paths
+                           excluded)
+target                   : the codegen target triple when known ('' otherwise)
 semantic_configuration   : canonical JSON of target/features/options, default "{}"
+revision_digest          : sha256 over (repo_identity, source_revision,
+                           tree_digest, target, semantic_configuration)
+
+LEVEL 2  provider_observation
+provider + provider_version + source_revision_id + observation_kind
+(static|runtime|verification|history) + observation_digest (CONTENT-derived:
+sorted typed keys of the provider snapshot, never a DB row id) + scope +
+authority (native|compiler|fallback|external) + enumeration_completeness +
+resolution_completeness
+
+LEVEL 3  FederatedSnapshot (snapshot row)
 provider_set_digest      : sha256 over sorted (provider_id, provider_version)
-revision_digest          : sha256 over the canonical join of the five fields
+observation_set_digest   : sha256 over the sorted observation digests
+revision_digest          : sha256 over (repo_identity, source_revision,
+                           tree_digest, semantic_configuration,
+                           provider_set_digest, observation_set_digest)
 ```
 
 Rules:
@@ -45,10 +71,60 @@ Rules:
   the `worktree:<base>:<digest>` revision; a strict mode fails instead.
 - Non-git trees MUST get `content:<tree-digest>`, never a constant.
 - One revision tuple → at most one snapshot.
+- A NEW observation over the SAME source (runtime trace, verification
+  evidence, history, a different target) changes the observation-set digest
+  and therefore produces a NEW federated revision — source-level reuse can
+  never mask observation freshness.
+- `finalize_snapshot` RECOMPUTES the observation-set and revision digests from
+  the linked observations and the frozen identity fields; the integrity gate
+  re-verifies them on read.
 
-## 2. Schema v2 (schema.sql, schema_version=2)
+## 2. Schema v3 (schema.sql, schema_version=3)
 
-Changes over v1 (exact column names; v1 columns remain unless noted):
+Level-1/2 tables and federation links:
+
+```sql
+source_revision(
+  id INTEGER PRIMARY KEY,
+  repo_identity TEXT NOT NULL, source_revision TEXT NOT NULL,
+  tree_digest TEXT NOT NULL, target TEXT NOT NULL DEFAULT '',
+  semantic_configuration TEXT NOT NULL DEFAULT '{}',
+  revision_digest TEXT NOT NULL UNIQUE, created_utc TEXT,
+  UNIQUE (repo_identity, source_revision, tree_digest, target,
+          semantic_configuration)
+)  -- append-only: UPDATE/DELETE abort
+
+provider_observation(
+  id INTEGER PRIMARY KEY,
+  provider TEXT NOT NULL, provider_version TEXT NOT NULL DEFAULT '',
+  source_revision_id INTEGER NOT NULL REFERENCES source_revision(id),
+  observation_kind TEXT NOT NULL CHECK (... static|runtime|verification|history),
+  observation_digest TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT '{}',
+  semantic_configuration TEXT NOT NULL DEFAULT '{}',
+  authority TEXT NOT NULL CHECK (... native|compiler|fallback|external),
+  enumeration_completeness TEXT NOT NULL DEFAULT 'unknown',
+  resolution_completeness TEXT NOT NULL DEFAULT 'unknown',
+  created_utc TEXT,
+  UNIQUE (provider, provider_version, source_revision_id, observation_kind,
+          observation_digest)
+)  -- append-only: UPDATE/DELETE abort
+
+snapshot_observation(
+  snapshot_id INTEGER NOT NULL REFERENCES snapshot(id) ON DELETE CASCADE,
+  observation_id INTEGER NOT NULL REFERENCES provider_observation(id),
+  PRIMARY KEY (snapshot_id, observation_id)
+)
+
+snapshot( ... v2 columns ...,
+  observation_set_digest TEXT NOT NULL DEFAULT '',
+  source_revision_id INTEGER REFERENCES source_revision(id),
+  UNIQUE (repo_identity, source_revision, tree_digest,
+          semantic_configuration, provider_set_digest, observation_set_digest)
+)
+```
+
+Changes over v1/v2 (exact column names; earlier columns remain unless noted):
 
 ```sql
 snapshot(
@@ -88,11 +164,16 @@ relation(
   epistemic_state TEXT NOT NULL DEFAULT 'inferred',
   analysis_depth INTEGER NOT NULL DEFAULT 0,
   completeness TEXT NOT NULL DEFAULT 'partial',
+  site_completeness TEXT NOT NULL DEFAULT 'unknown',
+  target_resolution_completeness TEXT NOT NULL DEFAULT 'unknown',
   provider TEXT NOT NULL DEFAULT '',
+  provider_revision TEXT NOT NULL DEFAULT '',
   FOREIGN KEY (src_id, snapshot_id) REFERENCES entity (id, snapshot_id),
   FOREIGN KEY (dst_id, snapshot_id) REFERENCES entity (id, snapshot_id)
   -- dst_id NULL allowed ONLY when resolved=0; enforce with a CHECK
 )
+-- site_completeness and target_resolution_completeness are SEPARATE axes:
+-- all call sites may be enumerated while some indirect targets stay unknown.
 
 unresolved_edge(
   id INTEGER PRIMARY KEY,
@@ -117,10 +198,14 @@ support(                                -- observations supporting canonical row
   provider TEXT NOT NULL,
   provider_revision TEXT NOT NULL DEFAULT '',
   confidence REAL NOT NULL DEFAULT 1.0,
-  evidence_id INTEGER REFERENCES evidence (id),
+  evidence_id INTEGER,
   detail TEXT,
   observed_utc TEXT,
-  UNIQUE (snapshot_id, subject_table, subject_id, provider, evidence_id)
+  UNIQUE (snapshot_id, subject_table, subject_id, provider, evidence_id),
+  -- evidence must belong to the SAME snapshot; the (subject_table,
+  -- subject_id) pair must name a same-snapshot row of a known table
+  -- (triggers support_subject_valid_*/support_evidence_same_snapshot_*).
+  FOREIGN KEY (evidence_id, snapshot_id) REFERENCES evidence (id, snapshot_id)
 )
 
 evidence(
@@ -132,7 +217,8 @@ evidence(
   summary TEXT NOT NULL DEFAULT '',
   payload TEXT,                         -- JSON, provider-defined
   provider TEXT NOT NULL DEFAULT '',
-  created_utc TEXT
+  created_utc TEXT,
+  UNIQUE (id, snapshot_id)              -- enables the support composite FK
 )
 
 provider_record(
@@ -141,19 +227,28 @@ provider_record(
   provider TEXT NOT NULL,
   provider_version TEXT NOT NULL,
   capabilities TEXT NOT NULL,           -- JSON {family: 'complete'|'partial'|'unavailable'|'unknown'}
+  scope TEXT NOT NULL DEFAULT '{}',
+  authority TEXT NOT NULL DEFAULT 'fallback',
   invoked INTEGER NOT NULL DEFAULT 1,
   UNIQUE (snapshot_id, provider)
 )
 
 fact(... v1 ... + epistemic_state, analysis_depth, completeness, provider,
-     provider_revision, stable_subject TEXT NOT NULL DEFAULT '')
+     provider_revision, stable_subject TEXT NOT NULL DEFAULT '',
+     stable_id TEXT NOT NULL DEFAULT '')
+     -- stable_id = 'fact:' + sha256(stable_subject, predicate, object), so two
+     -- facts about the same subject never collide.
 ```
 
-Immutability triggers (P0-4 + staleness redesign): once `snapshot.state =
-'finalized'`, INSERT/UPDATE/DELETE on entity/relation/fact/unresolved_edge/
-support/evidence/provider_record for that snapshot_id MUST RAISE(ABORT)
-(BEFORE triggers). Draft snapshots are mutable; scan() finalizes inside ONE
-transaction. Failure → rollback; no partial truth is ever visible.
+Immutability triggers (P0-4 + staleness redesign + v3 completion): once
+`snapshot.state = 'finalized'`, INSERT/UPDATE/DELETE on
+entity/relation/fact/unresolved_edge/support/evidence/provider_record AND
+invariant/contract/incident/change for that snapshot_id MUST RAISE(ABORT)
+(BEFORE triggers). The snapshot metadata row itself is frozen the same way:
+the ONLY legal `snapshot` UPDATE is draft → finalized; deletion and identity
+mutation of a finalized snapshot abort. Draft snapshots are mutable; scan()
+finalizes inside ONE transaction. Failure → rollback; no partial truth is
+ever visible.
 
 ## 3. Core Graph API v2 additions (graph.py)
 
@@ -175,7 +270,21 @@ Graph.add_unresolved_edge(snapshot_id, src_key, dst_raw, kind, *,
     provider, provider_revision='', candidates=(), confidence=0.3,
     completeness='unknown', evidence=()) -> int
 Graph.completeness(snapshot_id=None, family=None) -> dict
-    # -> {'snapshot': revision_digest, 'families': {family: verdict}, ...}
+    # -> {'snapshot': revision_digest, 'families': {family: verdict},
+    #     'provider_scopes': {provider: {observations: [{authority, scope,
+    #         enumeration_completeness, resolution_completeness, ...}]}},
+    #     'relations_completeness': {'site': verdict,
+    #         'target_resolution': verdict, ...}, ...}
+Graph.verify_snapshot_digest(snapshot_id) -> bool     # self-enforcing digest
+Graph.upsert_source_revision(identity) -> int         # level 1, append-only
+Graph.source_revision_row(source_revision_id) -> dict | None
+Graph.add_provider_observation(source_revision_id, provider, *,
+    provider_version='', observation_kind='static', observation_digest='',
+    scope=None, semantic_configuration='{}', authority='fallback',
+    enumeration_completeness='unknown',
+    resolution_completeness='unknown') -> int         # level 2, append-only
+Graph.link_snapshot_observation(snapshot_id, observation_id) -> None
+Graph.observations(snapshot_id=None) -> list[dict]    # level 3 set
 Graph.accumulate_support(snapshot_id, subject_table, subject_id, *,
     provider, provider_revision='', confidence=1.0, evidence_id=None,
     detail=None) -> int
@@ -242,10 +351,17 @@ class SemanticProvider(Protocol):
     length prefix per frame; request fields protocol_version, request_id,
     operation, payload; response fields protocol_version, request_id, ok
     ('true'/'false'), kind, keys-count, keys..., error).
-  - The provider must discover the compiler binary via
-    `TANGERINE_NATIVE_COMPILER` env (default: `build/bootstrap/tg`), and
-    MUST degrade to `unavailable` capabilities (never fabricate) when the
-    binary/artifact is absent.
+  - The provider must discover the compiler binary through ONE discovery
+    authority: the release compiler is `build/tg` (materialized by the
+    bootstrap ladder), with the repo-root `build/tg` as the second candidate
+    and `TANGERINE_NATIVE_COMPILER` as the explicit override. It MUST degrade
+    to `unavailable` capabilities (never fabricate) when the binary/artifact
+    is absent. `build/bootstrap/tg` is NOT an authority.
+  - Native stable IDs must use the artifact's persistent declaration/lineage
+    digest (never a bare textual key); the textual key/name/module are
+    attributes. A fallback to the textual key is allowed ONLY when the
+    artifact carries no persistent digest, and must be recorded as degraded
+    identity.
   - Project: symbols→Symbol/Module, types→Symbol, calls→calls relations,
     indirect_calls→unresolved edges with completeness 'unknown',
     contracts→Contract rows, tests→Test + tests relations, effects/
@@ -283,20 +399,27 @@ class SemanticProvider(Protocol):
 - `Makefile`: `system-intel-test` (runs the unittest suite + CLI smoke) and
   `system-intel-gate` (test + protocol two-snapshot regression + provider
   conformance).
-- `.woodpecker/system-intel.yaml`: steps named `system-intel-test`,
-  `system-intel-gate`; add to `.woodpecker/gate.yaml` `depends_on` and to
+- `.woodpecker/system-intel-generic.yaml` (the compiler-free Python lane;
+  steps `system-intel-test`, `system-intel-gate`) and
+  `.woodpecker/system-intel-native.yaml` (Darwin/arm64; consumes the
+  bootstrap-materialized `build/tg`, asserts `tangerine-native` is selected
+  and a real SemanticSnapshot is consumed, and fails closed when `build/tg`
+  is missing). BOTH carry release-required steps and are listed in
+  `.woodpecker/gate.yaml` `depends_on` and
   `.woodpecker/release_required_jobs.txt` (the exact-set verifier must stay
   green: `scripts/check_ci_required_jobs.sh`).
-- The gate MUST include: multi-snapshot protocol determinism, failed-
-  transaction rollback, dirty-worktree identity, unresolved-edge
-  preservation, typed endpoint collisions, runtime provenance, cross-snapshot
-  FK rejection, zero-entity rescan, stale/removed relation+fact behavior
-  (now via `diff_snapshots`), provider conformance.
+- The gate MUST include: multi-snapshot protocol determinism (two independent
+  DBs → equal `semantic_digest`), failed-transaction rollback, dirty-worktree
+  identity, unresolved-edge preservation, typed endpoint collisions, runtime
+  provenance, cross-snapshot FK rejection, zero-entity rescan, stale/removed
+  relation+fact behavior (now via `diff_snapshots`), observation freshness,
+  full snapshot immutability, support/evidence structural integrity, symlink
+  handling, DB self-contamination exclusion, provider conformance.
 
 ## 8. Validation commands (all workstreams)
 
 ```bash
-cd /home/aaron/IdeaProjects/Tangerine
+cd "$(git rev-parse --show-toplevel)"
 python3 -m unittest discover -s system_intel/tests -v
 bash system_intel/tools/system_intel.sh --help
 bash system_intel/tools/system_intel.sh scan system_intel/tests/fixtures/mini_repo --db /tmp/intel_v2.db

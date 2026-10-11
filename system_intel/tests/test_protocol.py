@@ -6,7 +6,14 @@ import unittest
 
 from system_intel.graph import Graph, SnapshotError
 from system_intel.ingest import ingest_protocol
-from system_intel.protocol import PROTOCOL_VERSION, Requirement, export_protocol, protocol_json
+from system_intel.protocol import (
+    PROTOCOL_VERSION,
+    Requirement,
+    evidence_stable_id,
+    export_protocol,
+    protocol_json,
+    semantic_digest,
+)
 
 
 def _identity(tag, **overrides):
@@ -95,7 +102,10 @@ class ProtocolV2Tests(unittest.TestCase):
         for rec in doc["records"]["unresolved"]:
             self.assertTrue(rec["id"].startswith("UnresolvedClaim:"))
             self.assertFalse(re.fullmatch(r"UnresolvedClaim:\d+", rec["id"]))
-            self.assertIn("file:src/x.py", rec["id"])
+            # content-derived identity: the hash is deterministic and carries
+            # no row id; the raw source key lives in the record fields.
+            self.assertEqual(rec["stable_id"], rec["id"].split(":", 1)[1])
+            self.assertEqual(len(rec["stable_id"].split(":")[-1]), 64)
         self.assertEqual(doc["protocol_version"], PROTOCOL_VERSION)
 
     # (d) runtime provenance is observed/depth-4, never inferred
@@ -169,7 +179,17 @@ class ProtocolV2Tests(unittest.TestCase):
         cxs = doc["records"]["counterexamples"]
         self.assertEqual(len(cxs), 1)
         self.assertEqual(cxs[0]["claim_id"], "claim:payment-idempotent")
-        self.assertEqual(cxs[0]["evidence"][0]["id"], f"Evidence:{ev}")
+        # Evidence identity is content-derived (never "Evidence:<row id>").
+        self.assertEqual(
+            cxs[0]["evidence"][0]["id"],
+            evidence_stable_id({
+                "kind": "counterexample",
+                "ref": "claim:payment-idempotent",
+                "digest": None,
+                "summary": "double charge observed",
+            }),
+        )
+        self.assertNotEqual(cxs[0]["evidence"][0]["id"], f"Evidence:{ev}")
         self.assertEqual(cxs[0]["epistemics"]["epistemic_state"], "contradicted")
 
     # requirements are carried through the protocol
@@ -245,6 +265,113 @@ class ProtocolV2Tests(unittest.TestCase):
         report = ingest_protocol(self.g, doc, snapshot_id=draft, provider_id="kiwi")
         self.assertEqual(report["errors"], [])
         self.assertGreaterEqual(report["skipped_records"], 1)
+
+    # ── v3 protocol integrity ──────────────────────────────────────────
+
+    def test_entity_records_exported_as_first_class_subjects(self):
+        snap = self._draft("entities")
+        self.g.upsert_entity(
+            "Symbol", "Order", "sym:python:app/store.py::Order",
+            qualified_name="app.store.Order", snapshot_id=snap, file="app/store.py",
+        )
+        self.g.finalize_snapshot(snap)
+        doc = export_protocol(self.g)
+        entities = doc["records"]["entities"]
+        self.assertEqual(len(entities), 1)
+        record = entities[0]
+        self.assertEqual(record["record"], "Entity")
+        self.assertEqual(record["stable_id"], "sym:python:app/store.py::Order")
+        self.assertEqual(record["kind"], "Symbol")
+        self.assertEqual(record["provenance"]["kind"], record["provenance"]["kind"])
+        self.assertTrue(record["id"].startswith("Entity:"))
+
+    def test_fact_ids_do_not_collide_for_one_subject(self):
+        snap = self._draft("facts")
+        self.g.upsert_fact("checkout", "publishes", "OrderCreated",
+                           snapshot_id=snap, stable_subject="sym:checkout")
+        self.g.upsert_fact("checkout", "publishes", "OrderPaid",
+                           snapshot_id=snap, stable_subject="sym:checkout")
+        self.g.finalize_snapshot(snap)
+        doc = export_protocol(self.g)
+        ids = {f["id"] for f in doc["records"]["facts"]}
+        self.assertEqual(len(ids), 2, "different facts must have different ids")
+        for fact in doc["records"]["facts"]:
+            self.assertTrue(fact["id"].startswith("Fact:fact:"), fact["id"])
+
+    def test_two_independent_databases_have_identical_semantic_digest(self):
+        def build(tag):
+            graph = Graph.open(":memory:")
+            # SAME logical revision in both databases; only row ids and the
+            # transport timestamp differ.
+            snap = graph.begin_draft(_identity("same"))
+            graph.upsert_entity("File", "a.py", "file:a.py", qualified_name="a.py",
+                                snapshot_id=snap)
+            graph.upsert_fact("svc", "publishes", "OrderCreated", snapshot_id=snap,
+                              stable_subject="svc")
+            graph.add_evidence(snap, "trace", "trace:1", summary="observed publish")
+            graph.finalize_snapshot(snap)
+            doc = export_protocol(graph)
+            graph.close()
+            return doc
+
+        doc_a = build("a")
+        doc_b = build("b")
+        # Transport timestamps and DB row ids may differ...
+        doc_b["generated_utc"] = "2000-01-01T00:00:00+00:00"
+        # ...but the semantic digest (and the record identities) are equal.
+        self.assertEqual(semantic_digest(doc_a), semantic_digest(doc_b))
+        ids_a = {r["id"] for r in doc_a["records"]["facts"]}
+        ids_b = {r["id"] for r in doc_b["records"]["facts"]}
+        self.assertEqual(ids_a, ids_b)
+        self.assertNotEqual(doc_a["generated_utc"], doc_b["generated_utc"])
+
+    def test_ingest_entities_and_records_an_observation(self):
+        doc = {
+            "protocol_version": 2,
+            "snapshot": {"revision_digest": "sha256:peer"},
+            "completeness": {"entities": "partial", "relations": "unknown"},
+            "records": {
+                "entities": [{
+                    "record": "Entity",
+                    "id": "Entity:sym:peer::Thing",
+                    "stable_id": "sym:peer::Thing",
+                    "kind": "Symbol",
+                    "name": "Thing",
+                    "qualified_name": "peer.Thing",
+                    "epistemics": {"epistemic_state": "declared",
+                                   "analysis_depth": 2, "completeness": "partial"},
+                }],
+                "evidence": [{
+                    "record": "Evidence",
+                    "id": "Evidence:peer-1",
+                    "kind": "verification",
+                    "ref": "kiwi:run:1",
+                    "summary": "verified",
+                }],
+            },
+        }
+        draft = self.g.begin_draft(_identity("ingest-obs"))
+        report = ingest_protocol(
+            self.g, doc, snapshot_id=draft, provider_id="kiwi", provider_version="1.0"
+        )
+        self.assertEqual(report["errors"], [], report["errors"])
+        self.assertEqual(len(report["entity_ids"]), 1)
+        self.assertTrue(report["observation_ids"], "ingest must record an observation")
+        self.assertTrue(report["observation_digest"].startswith("sha256:"))
+        # The linked observation set is visible on the draft snapshot.
+        observations = self.g.observations(draft)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["provider"], "kiwi")
+        self.assertEqual(observations[0]["observation_kind"], "verification")
+        self.assertEqual(observations[0]["authority"], "external")
+
+    # legacy documents (no observations) still ingest and record one
+    def test_ingest_legacy_document_still_records_observation(self):
+        draft = self.g.begin_draft(_identity("legacy"))
+        doc = {"protocol_version": 2, "records": {"facts": []}}
+        report = ingest_protocol(self.g, doc, snapshot_id=draft, provider_id="kiwi")
+        self.assertEqual(report["errors"], [])
+        self.assertTrue(report["observation_ids"])
 
 
 if __name__ == "__main__":

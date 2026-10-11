@@ -18,13 +18,19 @@ formats, agent names or workflow state appear in the protocol.
     "source_revision": "git sha | worktree:<base>:<digest> | content:<digest>",
     "tree_digest": "sha256:...",
     "semantic_configuration": {"target": "aarch64-apple-darwin", "...": "..."},
+    "target": "aarch64-apple-darwin",
     "provider_set_digest": "sha256:...",
+    "observation_set_digest": "sha256:...",
+    "source_revision_id": 7,
     "state": "finalized"
   },
   "provider_set": [
     {"provider": "tangerine-native", "version": "…", "capabilities": {"calls": "complete", "runtime": "unknown"}}
   ],
   "completeness": {"entities": "complete", "relations": "partial", "calls": "unknown"},
+  "relations_completeness": {"site": "complete", "target_resolution": "partial"},
+  "provider_scopes": {"tangerine-native": {"observations": [{"authority": "native", "enumeration_completeness": "complete", "resolution_completeness": "partial", "observation_digest": "sha256:..."}]}},
+  "semantic_digest": "sha256:...",
   "records": { "...": [] }
 }
 ```
@@ -32,6 +38,19 @@ formats, agent names or workflow state appear in the protocol.
 A document describes EXACTLY ONE snapshot revision. Producers MUST NOT mix
 records from different revisions; consumers MUST reject or flag documents
 that claim otherwise.
+
+`semantic_digest` is a canonical digest of the document's MEANING: it
+excludes `generated_utc`, database row ids and filesystem provenance
+(`repo_root`, row timestamps). Two independently produced databases with the
+same logical content MUST yield the same `semantic_digest`, and a consumer
+may use it to deduplicate observations across transports.
+
+The three identity levels are explicit: the snapshot's source revision
+(level 1), the `Observation` records (level 2 — one immutable observation per
+provider, with its content-derived `observation_digest`), and the federated
+snapshot (level 3 — `observation_set_digest` over the observation set). New
+runtime/verification/history observations therefore change the revision
+digest even when the source tree is unchanged.
 
 ## Record common fields
 
@@ -55,8 +74,21 @@ Runtime observations MUST use `epistemic_state=observed`, `analysis_depth=4`
 
 - **Requirement** — `{id, statement, status: open|met|unknown, refs[]}`.
   A thing that must hold for the system.
+- **Entity** — `{stable_id, kind, name, qualified_name, file, line,
+  epistemics, confidence, provenance}`. The object a `Relationship` or
+  `Fact` stable_id DENOTES; without it consumers cannot tell what
+  `src_key`/`dst_key` name. Identity is `(kind, stable_id)`; display names
+  are attributes and are never used for resolution.
+- **Observation** — `{provider, provider_version, observation_kind:
+  static|runtime|verification|history, observation_digest, authority:
+  native|compiler|fallback|external, scope,
+  enumeration_completeness, resolution_completeness}`. One immutable
+  observation backing the federated snapshot. `observation_digest` is
+  content-derived, never a row id.
 - **Fact** — `{subject, predicate, object, ...}`. Observed/declared/inferred
-  structural truth.
+  structural truth. Fact identity is `fact:<sha256(stable_subject,
+  predicate, object)>`, so several facts about one subject never share an
+  id.
 - **Claim** — a checkable assertion re-expressing a fact or invariant.
 - **Invariant** — a condition that must remain true (`statement`, optional
   `component`).
@@ -96,10 +128,17 @@ human tool) MAY return a document to a producer. Ingest:
 1. validates `protocol_version`;
 2. targets a MUTABLE (draft) revision — finalized revisions are immutable
    truth; ingesting into a finalized revision must fail;
-3. persists `Evidence`, `UnresolvedClaim`, `Counterexample`, `Requirement`
-   records, accumulating `support` for subjects that resolve locally;
+3. persists `Entity`, `Evidence`, `UnresolvedClaim`, `Counterexample`,
+   `Requirement` records, accumulating `support` for subjects that resolve
+   locally; entities are upserted by `(kind, stable_id)`, never by display
+   name;
 4. attributes everything to `provider`/`provider_version`;
-5. counts and skips unknown record kinds — never crashes on future records.
+5. records the ingested document as an IMMUTABLE observation: the document's
+   canonical `semantic_digest` becomes an `observation_digest` on a linked
+   `Observation` (kind `verification` by default, or the declared
+   `observations` records), so the federated revision that includes it can
+   never be confused with the source-only revision;
+6. counts and skips unknown record kinds — never crashes on future records.
 
 This is how a verifier makes the system model smarter without the model
 depending on the verifier.

@@ -70,7 +70,7 @@ breaks_if_changed, flows_to.
 The documented sets are conventions, not a closed enum: `kind` is a free
 string so new ecosystems can be described without a schema migration.
 
-## Epistemics: five orthogonal axes (schema v2)
+## Epistemics: five orthogonal axes (schema v3)
 
 Do not overload one ordinal. Every row records:
 
@@ -194,32 +194,60 @@ with Graph.open(".tangerine-intel.db") as graph:
 
 ## Snapshots, identity and staleness semantics
 
-- A **snapshot** is one immutable observation, identified by the five-field
-  identity tuple. Its `revision_digest` is the content-addressed identity.
+Identity has **three levels** (v3):
+
+1. **SourceRevision** — repository identity + source tree + target/semantic
+   configuration. `repo_root` is provenance metadata, never identity.
+2. **ProviderObservation** — one provider's immutable observation over a
+   source revision (static / runtime / verification / history), with a
+   content-derived `observation_digest`, a scope, an authority and the
+   separated enumeration/resolution completeness verdicts.
+3. **FederatedSnapshot** — the immutable SET of observation ids. Its
+   `observation_set_digest` makes a new runtime trace, Kiwi evidence or
+   historical record a NEW federated revision even when the source is
+   unchanged.
+
 - A dirty git worktree is recorded as `worktree:<base-sha>:<tree-digest>`,
   never as the clean HEAD sha; non-git trees use `content:<tree-digest>`.
   `scan(..., strict_clean=True)` refuses anything that is not a clean,
   identified revision.
+- The NORMAL `scan()` uses the provider registry automatically (native first
+  when applicable, generic-static as the zero-install fallback), runs the
+  providers BEFORE final identity selection (their semantic configuration and
+  content digest participate in the revision), and accumulates every
+  provider's observation in `support` — observations never overwrite each
+  other.
 - `scan()` builds a DRAFT snapshot in ONE transaction, runs extraction,
   resolution, completeness accounting and integrity checks, and finalizes
   only on success. A failure rolls back — no partial truth is ever visible.
-- Finalized snapshots are **immutable** (enforced by triggers). Re-scanning
-  the same revision is a zero-write reuse.
+  Symlinked files are never followed; the scan's own database is excluded
+  from the repository tree digest.
+- Finalized snapshots are **immutable**: every snapshot-owned table (entity,
+  relation, fact, unresolved_edge, support, evidence, provider_record,
+  invariant, contract, incident, change) is protected by BEFORE triggers, and
+  the snapshot metadata row itself allows only draft → finalized (identity
+  mutation, reversal and deletion abort). The revision digest is RECOMPUTED
+  and re-verified at finalization/read.
+- Re-scanning the same revision tuple with the same provider observations is
+  a zero-write reuse.
 - Removed entities/relations/facts are reported by `diff_snapshots(old, new)`
   — "stale" is revision-relative, not an in-place mutation flag.
 - Unresolved edges are preserved forever as first-class claims.
+- Support rows structurally validate their polymorphic subject
+  (`subject_table`/`subject_id` must name a same-snapshot row) and their
+  evidence (`evidence_id` must belong to the same snapshot).
 
-**schema_version:** `schema.sql` seeds `schema_version.version = 2`;
+**schema_version:** `schema.sql` seeds `schema_version.version = 3`;
 `stats()`/`export_json()` report it.
 
 ## Layout
 
 ```
 system_intel/
-  INTERFACES.md     frozen v2 contract (identity, schema, API, SPI, protocol)
+  INTERFACES.md     frozen v3 contract (identity levels, schema, API, SPI, protocol)
   graph.py          core Graph API (snapshots, entities, claims, queries)
   cli.py            argparse CLI, `python3 -m system_intel.cli`
-  schema.sql        authoritative SQLite schema (v2)
+  schema.sql        authoritative SQLite schema (v3)
   protocol.py       neutral exchange protocol v2 (stable IDs, completeness)
   PROTOCOL.md       standalone protocol specification
   ingest.py         symmetric ingest (evidence/support/unresolved claims)

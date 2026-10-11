@@ -305,6 +305,33 @@ Woodpecker analogue of the former two required checks is:
 
 No admin bypass for ordinary merges remains the documented policy.
 
+The aggregate `gate` now covers the System Intelligence release proof
+transitively: `.woodpecker/system-intel-generic.yaml` (the compiler-free
+Python lane) and `.woodpecker/system-intel-native.yaml` (the Darwin/arm64
+lane consuming bootstrap's materialized `build/tg`) both carry
+release-required steps, and `scripts/check_ci_required_jobs.sh` enforces
+exact set equality between `release_required_jobs.txt` and
+`gate.yaml`'s `depends_on`.
+
+Applying the protection is a repository-admin API action, so it cannot be
+done by an unauthenticated CI checkout. The exact settings to apply:
+
+```bash
+# Requires an authenticated gh with admin rights on the repository.
+gh api -X PUT repos/sbelakho2/Tangerine/branches/main/protection \
+  -f 'required_status_checks[strict]=true' \
+  -f 'required_status_checks[contexts][]=release-gate' \
+  -f 'enforce_admins=true' \
+  -f 'required_pull_request_reviews[required_approving_review_count]=0' \
+  -f 'restrictions='
+# confirm
+gh api repos/sbelakho2/Tangerine/branches/main/protection
+```
+
+Until that call is made by an authenticated admin, this remains the one
+credential-blocked release item; it is recorded here so it is never
+mistaken for a code-complete gate.
+
 ## Known divergences and carried-over breakage
 
 * **sast**: dropped (see above).

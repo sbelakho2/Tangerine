@@ -15,9 +15,12 @@ error, never a crash.
 from __future__ import annotations
 
 from system_intel.graph import SnapshotError
+from system_intel.protocol import semantic_digest as _document_digest
 
 SUPPORTED_RECORD_KINDS = {
     "Requirement",
+    "Entity",
+    "Observation",
     "Fact",
     "Claim",
     "Invariant",
@@ -80,8 +83,76 @@ def ingest_protocol(graph, doc, *, snapshot_id, provider_id, provider_version=""
         "unresolved_ids": [],
         "counterexample_ids": [],
         "requirement_fact_ids": [],
+        "entity_ids": [],
+        "observation_ids": [],
+        "observation_digest": "",
         "errors": [],
     }
+
+    # 0b. Observation identity (symmetric ingest model): an ingested document
+    # IS an observation.  It contributes a content-derived digest and a
+    # linked provider_observation, so the federated revision that includes it
+    # is distinguishable from the source-only revision (freshness can never
+    # be masked by snapshot reuse).
+    doc_digest = _document_digest(doc)
+    report["observation_digest"] = doc_digest
+    source_revision_id = snap_row.get("source_revision_id")
+    try:
+        if source_revision_id is None:
+            source_revision_id = graph.upsert_source_revision({
+                "repo_identity": snap_row.get("repo_identity"),
+                "source_revision": snap_row.get("source_revision"),
+                "tree_digest": snap_row.get("tree_digest"),
+                "target": "",
+                "semantic_configuration": snap_row.get("semantic_configuration") or "{}",
+            })
+        explicit = [
+            rec for rec in records.get("observations", []) or []
+            if rec.get("record") == "Observation"
+        ]
+        declarations = explicit or [{
+            "provider": provider_id,
+            "provider_version": provider_version,
+            "observation_kind": "verification",
+            "observation_digest": doc_digest,
+            "authority": "external",
+            "scope": {"document": "protocol"},
+            "enumeration_completeness": doc.get("completeness", {}).get("entities", "unknown")
+            if isinstance(doc.get("completeness"), dict) else "unknown",
+            "resolution_completeness": doc.get("completeness", {}).get("relations", "unknown")
+            if isinstance(doc.get("completeness"), dict) else "unknown",
+        }]
+        for declaration in declarations:
+            kind = str(declaration.get("observation_kind") or "verification")
+            if kind not in ("static", "runtime", "verification", "history"):
+                kind = "verification"
+            authority = str(declaration.get("authority") or "external")
+            if authority not in ("native", "compiler", "fallback", "external"):
+                authority = "external"
+            obs_id = graph.add_provider_observation(
+                source_revision_id,
+                str(declaration.get("provider") or provider_id),
+                provider_version=str(
+                    declaration.get("provider_version") or provider_version
+                ),
+                observation_kind=kind,
+                observation_digest=str(
+                    declaration.get("observation_digest") or doc_digest
+                ),
+                scope=declaration.get("scope") if isinstance(declaration.get("scope"), dict) else {},
+                semantic_configuration=snap_row.get("semantic_configuration") or "{}",
+                authority=authority,
+                enumeration_completeness=str(
+                    declaration.get("enumeration_completeness") or "unknown"
+                ),
+                resolution_completeness=str(
+                    declaration.get("resolution_completeness") or "unknown"
+                ),
+            )
+            graph.link_snapshot_observation(snapshot_id, obs_id)
+            report["observation_ids"].append(obs_id)
+    except Exception as exc:  # noqa: BLE001 - observation identity is reported, never fatal
+        report["errors"].append(f"observation: {exc}")
 
     # 0. Unknown record kinds are counted and skipped (forward compatibility),
     # in every bucket — a future protocol minor version must not crash ingest.
@@ -124,6 +195,64 @@ def ingest_protocol(graph, doc, *, snapshot_id, provider_id, provider_version=""
             if mapped is not None:
                 out.append(str(mapped))
         return out
+
+    # 1b. Entities: the objects Relationship/Fact stable_ids denote. They are
+    # upserted by (kind, stable_id) — never by display name — so an ingested
+    # entity can never collide with a different local subject.
+    for rec in records.get("entities", []) or []:
+        if rec.get("record") != "Entity":
+            report["skipped_records"] += 1
+            continue
+        stable = str(rec.get("stable_id") or "")
+        kind = str(rec.get("kind") or "")
+        if not stable or not kind:
+            report["errors"].append(f"entity {rec.get('id')}: missing kind/stable_id")
+            continue
+        try:
+            provenance = rec.get("provenance")
+            provenance_kind = (
+                str(provenance.get("kind") or "declared")
+                if isinstance(provenance, dict) else "declared"
+            )
+            epistemics = rec.get("epistemics") if isinstance(rec.get("epistemics"), dict) else {}
+            confidence = rec.get("confidence")
+            confidence_value = (
+                float(confidence.get("value", 1.0))
+                if isinstance(confidence, dict) else float(confidence or 1.0)
+            )
+            ent_id = graph.upsert_entity(
+                kind,
+                str(rec.get("name") or stable),
+                stable,
+                qualified_name=str(rec.get("qualified_name") or stable),
+                snapshot_id=snapshot_id,
+                file=rec.get("file"),
+                line=rec.get("line"),
+                provenance=provenance_kind,
+                confidence=confidence_value,
+                epistemic_state=epistemics.get("epistemic_state"),
+                analysis_depth=epistemics.get("analysis_depth"),
+                completeness=epistemics.get("completeness"),
+                provider=provider_id,
+                provider_revision=provider_version,
+            )
+        except Exception as exc:  # noqa: BLE001 - ingest reports, never crashes
+            report["errors"].append(f"entity {rec.get('id')}: {exc}")
+            continue
+        report["entity_ids"].append(ent_id)
+        report["accepted_records"] += 1
+        ev_ids = map_evidence(rec.get("evidence"))
+        if ev_ids:
+            try:
+                graph.accumulate_support(
+                    snapshot_id, "entity", ent_id,
+                    provider=provider_id, provider_revision=provider_version,
+                    confidence=confidence_value,
+                    evidence_id=int(ev_ids[0]),
+                    detail="protocol:entity",
+                )
+            except Exception as exc:  # noqa: BLE001
+                report["errors"].append(f"entity support {stable}: {exc}")
 
     # 2. Unresolved claims: first-class unknown edges.
     for rec in records.get("unresolved", []) or []:

@@ -7,8 +7,9 @@
 #     every stage/test/canary invocation
 #   - per-phase fingerprints under TG_BOOTSTRAP_TRACE=1
 #     (link-image / text / sections / symbols / relocs + probed
-#     tokens / ast / hir / mir / mir-mono dumps) and the stage2==stage3
-#     phase-equality gate
+#     tokens / ast / hir / mir / mir-mono dumps), each record carrying
+#     probe_success/byte_count/digest (a failed probe is UNAVAILABLE and
+#     is NEVER hashed), and the stage2==stage3 phase-equality gate
 #   - canary suite manifest parity (positive/negative/arch suites; missing
 #     tests, unlisted tests, count drift and zero suites are all fatal)
 #   - validate_stage: hard gate that a produced stage binary is usable
@@ -41,10 +42,14 @@ bh_warn() { printf '[bootstrap:warning] %s\n' "$*" >&2; }
 # names are linked into PATH.  Resolve once, allow an explicit
 # TG_TIMEOUT_CMD override, and fail closed with an actionable message
 # instead of a late "command not found".
+# NOTE: assignment uses the :- default because authorization mode explicitly
+# UNSETS this variable before re-resolution; every READ inside this function
+# must therefore also default, or `set -u` aborts (the historical
+# authorization-gate failure).
 BH_TIMEOUT_CMD_RESOLVED="${BH_TIMEOUT_CMD_RESOLVED:-}"
 bh_timeout_cmd() {
-  if [ -n "$BH_TIMEOUT_CMD_RESOLVED" ]; then
-    printf '%s' "$BH_TIMEOUT_CMD_RESOLVED"
+  if [ -n "${BH_TIMEOUT_CMD_RESOLVED:-}" ]; then
+    printf '%s' "${BH_TIMEOUT_CMD_RESOLVED:-}"
     return 0
   fi
   if [ -n "${TG_TIMEOUT_CMD:-}" ]; then
@@ -216,37 +221,93 @@ bh_arch_of() {
 # Phase fingerprints (TG_BOOTSTRAP_TRACE=1)
 # ———————————————————————————————————————————————————————————————
 
-# Emit a stable, machine-readable phase fingerprint line for one stage.
-# Usage: bh_phase_line <stage> <phase> <hash>
+# Emit a stable, machine-readable phase fingerprint record for one stage:
+#   FINGERPRINT <stage> <phase> <digest> probe_success=<true|false> byte_count=<n>
+#
+# The record carries the probe status explicitly:
+#   - probe_success=true  -> <digest> is the sha256 of exactly <byte_count>
+#     captured bytes; a legitimately successful EMPTY capture is
+#     sha256("") with byte_count=0 and is still a success;
+#   - probe_success=false -> <digest> is UNAVAILABLE and is NEVER a hash of
+#     whatever partial output the failed probe left behind, so a failed
+#     probe can never masquerade as sha256("").
+# Inconsistent records are rejected here (a digest with probe_success=false,
+# UNAVAILABLE with probe_success=true, a malformed byte_count/digest), so no
+# caller can emit a record the equality gate would have to interpret.
+#
 # UNAVAILABLE is never a "phase has no route" gap: EVERY fingerprinted
 # semantic phase has a real dump route in the stage binaries today (the kernel
 # entry tg_compiler/bootstrap_main.tg maps --dump-tokens / --dump-ast /
 # --dump-resolved-ast / --dump-mir-lowered / --dump-mir-mono to
 # opts.dump_phase and the kernel compile entry tg_compiler/compiler_core.tg
 # writes the normalized dump and stops). UNAVAILABLE records that a probe
-# could not produce output — the probe exited nonzero / printed nothing
-# (semantic phases), or the host lacks the Mach-O inspection tools
-# (otool/nm — object phases). It never silently drops a
-# phase — it is recorded so the stage2==stage3 equality gate can distinguish
-# "not comparable" from "comparable and equal".
+# could not produce output — the probe exited nonzero (semantic phases), the
+# probe printed nothing (semantic phases require nonempty dumps), or the host
+# lacks the Mach-O inspection tools (otool/nm — object phases). It never
+# silently drops a phase — it is recorded so the stage2==stage3 equality gate
+# can distinguish "not comparable" from "comparable and equal".
+# Usage: bh_phase_line <stage> <phase> <digest|UNAVAILABLE> <true|false> <byte_count>
 bh_phase_line() {
-  printf 'FINGERPRINT %s %s %s\n' "$1" "$2" "$3"
+  local stage="$1" phase="$2" digest="$3" probe_success="$4" byte_count="$5"
+  case "$probe_success" in
+    true | false) ;;
+    *)
+      bh_err "phase line: invalid probe_success '$probe_success' for $stage $phase"
+      return 1
+      ;;
+  esac
+  case "$byte_count" in
+    '' | *[!0-9]*)
+      bh_err "phase line: invalid byte_count '$byte_count' for $stage $phase"
+      return 1
+      ;;
+  esac
+  if [ "$probe_success" = "false" ]; then
+    if [ "$digest" != "UNAVAILABLE" ]; then
+      bh_err "phase line: refusing to emit a digest for a failed probe ($stage $phase)"
+      return 1
+    fi
+  else
+    if [ "$digest" = "UNAVAILABLE" ] || [ "${#digest}" -ne 64 ]; then
+      bh_err "phase line: refusing UNAVAILABLE/malformed digest for a successful probe ($stage $phase)"
+      return 1
+    fi
+    case "$digest" in
+      *[!0-9a-f]*)
+        bh_err "phase line: digest is not lowercase hex ($stage $phase)"
+        return 1
+        ;;
+    esac
+  fi
+  printf 'FINGERPRINT %s %s %s probe_success=%s byte_count=%s\n' \
+    "$stage" "$phase" "$digest" "$probe_success" "$byte_count"
 }
 
 # Deterministically compute the sha256 of a compiler's textual output.
 # Usage: bh_dump_hash <compiler> <source> [flags...]
 # The hash utility reads stdin; flags are passed through verbatim so callers
 # can combine e.g. `--dump-mir-lowered -O0`.
+# A probe that exits nonzero is a FAILURE and produces NO digest: hashing
+# whatever partial/empty stdout the failed compile left behind would forge a
+# valid-looking fingerprint (the false-green class this helper must never
+# reintroduce). A successful compile with empty output is a legitimate
+# sha256("") digest (probe_success=true, byte_count=0).
 bh_dump_hash() {
   local compiler="$1" source_file="$2"
   shift 2
-  "$compiler" compile "$source_file" "$@" 2>/dev/null | bh_sha256_cmd
+  local out
+  if ! out="$("$compiler" compile "$source_file" "$@" 2>/dev/null)"; then
+    bh_err "dump probe failed: $compiler compile $source_file $* — no digest is emitted (record the phase UNAVAILABLE)"
+    return 1
+  fi
+  printf '%s' "$out" | bh_sha256_cmd
 }
 
 # The pipeline phases fingerprinted per stage. Every phase is recorded with a
-# sha256 and the stage2==stage3 reproducibility gate (bh_phase_equality)
-# compares ALL of them, so equality is asserted at every phase, not only at
-# the final link image.
+# probe_success/byte_count/digest record and the stage2==stage3 reproducibility
+# gate (bh_phase_equality) compares ALL of them (digest, probe status and byte
+# count), so equality is asserted at every phase, not only at the final link
+# image.
 #
 # Observable today from the stage binaries (Mach-O on the bootstrap host):
 #   link-image : sha256 of the final linked stage binary (exists)
@@ -262,19 +323,27 @@ bh_dump_hash() {
 # the kernel compile entry routes through compile_startup_entry
 # (tg_compiler/compiler_core.tg), which writes the normalized phase dump and
 # stops before further pipeline work. The harness probes each stage binary; a
-# probe that fails or produces no output is recorded as UNAVAILABLE, and the
-# RELEASE gate (bh_phase_equality with a 4th argument "release") treats
-# UNAVAILABLE as a hard failure. The release phase gate must obtain ALL FIVE
-# semantic phase hashes (tokens, ast, hir, mir, mir-mono) from these routes as
-# nonempty, deterministic output — to be proven by the first successful
-# stage2/stage3 run.
+# probe that fails or produces no output is recorded as UNAVAILABLE (with
+# probe_success=false and no digest), and the RELEASE gate (bh_phase_equality
+# with a 4th argument "release") treats UNAVAILABLE as a hard failure. The
+# release phase gate must obtain ALL FIVE semantic phase hashes (tokens, ast,
+# hir, mir, mir-mono) from these routes as nonempty, deterministic output — to
+# be proven by the first successful stage2/stage3 run.
 BOOTSTRAP_PHASES="link-image text sections symbols relocs tokens ast hir mir mir-mono"
 
 # Compute the phase fingerprints for a stage binary.
 # Usage: bh_fingerprints <stage> <compiler> <source> <outdir>
 # Always writes $outdir/.fingerprints/<stage>.fingerprints (consumed by
-# bh_phase_equality and uploaded by CI); FINGERPRINT lines are printed to
+# bh_phase_equality and uploaded by CI); FINGERPRINT records are printed to
 # stdout only under TG_BOOTSTRAP_TRACE=1.
+#
+# Every record carries probe_success and byte_count in addition to the digest
+# (see bh_phase_line): a probe that exits nonzero is recorded UNAVAILABLE with
+# probe_success=false and is NEVER hashed — an empty stdout from a FAILED
+# probe must not become sha256(""), which would make two failures compare as
+# "equal output". A probe that SUCCEEDS with empty output is probe_success=true,
+# byte_count=0, digest=sha256("") and stays comparable (equal only when both
+# stages succeeded).
 bh_fingerprints() {
   local stage="$1" compiler="$2" source_file="$3" outdir="$4"
   local fp_dir="$outdir/.fingerprints"
@@ -292,46 +361,100 @@ bh_fingerprints() {
   # files as a hard failure, never as a vacuous pass.
   : > "$fp_file"
 
-  bh_fp() {
-    local phase="$1" hash="$2"
-    bh_phase_line "$stage" "$phase" "$hash" >> "$fp_file"
+  # Append one record and echo it under trace mode. Returns nonzero (and
+  # writes nothing) when bh_phase_line rejects the record.
+  bh_fp() { # <phase> <digest|UNAVAILABLE> <probe_success> <byte_count>
+    local line
+    line="$(bh_phase_line "$stage" "$1" "$2" "$3" "$4")" || return 1
+    printf '%s\n' "$line" >> "$fp_file"
     if [ "${BOOTSTRAP_TRACE_ACTIVE}" = "1" ]; then
-      bh_phase_line "$stage" "$phase" "$hash"
+      printf '%s\n' "$line"
+    fi
+    return 0
+  }
+
+  # Record a collected probe capture. success=1 hashes EXACTLY the captured
+  # bytes (sha256 of an empty SUCCESSFUL capture is legitimate); success=0
+  # records UNAVAILABLE with probe_success=false and NEVER hashes — the
+  # byte_count of a failed probe is diagnostic only.
+  bh_fp_captured() { # <phase> <success:0|1> <captured bytes>
+    local phase="$1" ok="$2" captured="$3" bytes
+    bytes="$(printf '%s' "$captured" | wc -c | tr -d ' ')"
+    if [ "$ok" = "1" ]; then
+      bh_fp "$phase" "$(printf '%s' "$captured" | bh_sha256_cmd)" true "$bytes"
+    else
+      bh_fp "$phase" UNAVAILABLE false "$bytes"
     fi
   }
 
   # Phase 1: the final link image.
-  bh_fp link-image "$(bh_sha256_file "$binary")"
+  local link_digest link_bytes
+  link_digest="$(bh_sha256_file "$binary")" || {
+    bh_err "fingerprinting $stage: cannot hash $binary"
+    return 1
+  }
+  link_bytes="$(wc -c < "$binary" | tr -d ' ')"
+  bh_fp link-image "$link_digest" true "$link_bytes"
 
   # Phases 2-5: object/codegen phases derived from the Mach-O image. These are
   # the observable artifacts of the codegen phase (sections/symbols/relocs/
   # text). All normalization strips only the file-path header and canonicalizes
   # ordering (sort) so the hashes are stable across runs and machines.
+  # The exit status of EACH probe tool is captured directly (never masked by a
+  # pipeline tail or `|| true`): a failed probe is recorded UNAVAILABLE with
+  # probe_success=false and its partial stdout is never hashed.
   if command -v otool >/dev/null 2>&1 && command -v nm >/dev/null 2>&1; then
     local arch
     arch="$(bh_arch_of "$(bh_boot_target)")"
 
-    local text_dump
-    text_dump="$(otool -tv -arch "$arch" "$binary" 2>/dev/null | sed '1d' || true)"
-    bh_fp text "$(printf '%s' "$text_dump" | bh_sha256_cmd)"
+    local text_raw text_ok=0 text_dump=""
+    if text_raw="$(otool -tv -arch "$arch" "$binary" 2>/dev/null)"; then
+      text_ok=1
+      text_dump="$(printf '%s\n' "$text_raw" | sed '1d')" || {
+        bh_err "fingerprinting $stage: text normalization failed"
+        return 1
+      }
+    fi
+    bh_fp_captured text "$text_ok" "$text_dump"
 
-    local sec_dump
-    sec_dump="$(otool -l "$binary" 2>/dev/null | sed '1d' \
-      | grep -E '^\s+(sectname|segname|addr|size|offset|align|reloff|nreloc|flags)\s' || true)"
-    bh_fp sections "$(printf '%s' "$sec_dump" | bh_sha256_cmd)"
+    # grep exit 1 = no matching lines: a legitimately empty SUCCESSFUL
+    # sections capture, not a probe failure (only grep exit >1 is an error).
+    local sec_raw sec_ok=0 sec_dump="" sec_rc=0
+    if sec_raw="$(otool -l "$binary" 2>/dev/null)"; then
+      sec_ok=1
+      sec_dump="$(printf '%s\n' "$sec_raw" | sed '1d' \
+        | grep -E '^\s+(sectname|segname|addr|size|offset|align|reloff|nreloc|flags)\s')" || sec_rc=$?
+      if [ "$sec_rc" -gt 1 ]; then
+        bh_err "fingerprinting $stage: sections normalization failed (grep exit $sec_rc)"
+        return 1
+      fi
+    fi
+    bh_fp_captured sections "$sec_ok" "$sec_dump"
 
-    local sym_dump
-    sym_dump="$(nm "$binary" 2>/dev/null | sort || true)"
-    bh_fp symbols "$(printf '%s' "$sym_dump" | bh_sha256_cmd)"
+    local sym_raw sym_ok=0 sym_dump=""
+    if sym_raw="$(nm "$binary" 2>/dev/null)"; then
+      sym_ok=1
+      sym_dump="$(printf '%s\n' "$sym_raw" | sort)" || {
+        bh_err "fingerprinting $stage: symbols normalization failed"
+        return 1
+      }
+    fi
+    bh_fp_captured symbols "$sym_ok" "$sym_dump"
 
-    local reloc_dump
-    reloc_dump="$(otool -r "$binary" 2>/dev/null | sed '1d' || true)"
-    bh_fp relocs "$(printf '%s' "$reloc_dump" | bh_sha256_cmd)"
+    local reloc_raw reloc_ok=0 reloc_dump=""
+    if reloc_raw="$(otool -r "$binary" 2>/dev/null)"; then
+      reloc_ok=1
+      reloc_dump="$(printf '%s\n' "$reloc_raw" | sed '1d')" || {
+        bh_err "fingerprinting $stage: relocs normalization failed"
+        return 1
+      }
+    fi
+    bh_fp_captured relocs "$reloc_ok" "$reloc_dump"
   else
-    bh_fp sections UNAVAILABLE
-    bh_fp symbols UNAVAILABLE
-    bh_fp relocs UNAVAILABLE
-    bh_fp text UNAVAILABLE
+    bh_fp text UNAVAILABLE false 0
+    bh_fp sections UNAVAILABLE false 0
+    bh_fp symbols UNAVAILABLE false 0
+    bh_fp relocs UNAVAILABLE false 0
   fi
 
   # Phases 6-10: front-end phases via the kernel entry's real --dump-* routes.
@@ -339,23 +462,23 @@ bh_fingerprints() {
   # live today: bootstrap_main.tg parse_args maps each flag to opts.dump_phase
   # and the kernel compile entry (compiler_core.tg) writes the normalized dump
   # for tokens/ast/resolved-ast/mir-lowered/mir-mono and stops. A probe that
-  # exits nonzero or prints nothing records UNAVAILABLE — a probe failure, NOT
-  # a missing route. The RELEASE phase gate must obtain all five semantic phase
-  # hashes from these routes (nonempty deterministic output, to be proven by
-  # the first successful stage2/stage3 run).
+  # exits nonzero or prints nothing records UNAVAILABLE (probe_success=false,
+  # no digest) — a probe failure, NOT a missing route and NEVER sha256("").
+  # The RELEASE phase gate must obtain all five semantic phase hashes from
+  # these routes (nonempty deterministic output, to be proven by the first
+  # successful stage2/stage3 run).
   if [ "${BOOTSTRAP_TRACE_ACTIVE}" = "1" ]; then
     local dump_src="${source_file:-tg_compiler/bootstrap_main.tg}"
     bh_dump_phase() {
       local phase="$1" flag="$2"
-      local out
+      local out out_ok=0
       if out="$( "$compiler" compile "$dump_src" --strict-resolution "$flag" --target "$(bh_boot_target)" 2>/dev/null )"; then
-        if [ -n "$out" ]; then
-          bh_fp "$phase" "$(printf '%s' "$out" | bh_sha256_cmd)"
-        else
-          bh_fp "$phase" UNAVAILABLE
-        fi
+        out_ok=1
+      fi
+      if [ "$out_ok" = "1" ] && [ -n "$out" ]; then
+        bh_fp_captured "$phase" 1 "$out"
       else
-        bh_fp "$phase" UNAVAILABLE
+        bh_fp_captured "$phase" 0 "$out"
       fi
     }
     bh_dump_phase tokens     --dump-tokens
@@ -364,28 +487,71 @@ bh_fingerprints() {
     bh_dump_phase mir        --dump-mir-lowered
     bh_dump_phase mir-mono   --dump-mir-mono
   else
-    bh_fp tokens UNAVAILABLE
-    bh_fp ast UNAVAILABLE
-    bh_fp hir UNAVAILABLE
-    bh_fp mir UNAVAILABLE
-    bh_fp mir-mono UNAVAILABLE
+    bh_fp tokens UNAVAILABLE false 0
+    bh_fp ast UNAVAILABLE false 0
+    bh_fp hir UNAVAILABLE false 0
+    bh_fp mir UNAVAILABLE false 0
+    bh_fp mir-mono UNAVAILABLE false 0
   fi
 
   bh_log "fingerprints for $stage written to $fp_file"
   return 0
 }
 
+# Parse one fingerprint record into "<digest> <probe_success> <byte_count>".
+# Returns 1 for a malformed/inconsistent record (missing fields, a bad
+# probe_success/byte_count, a digest on a failed probe, UNAVAILABLE or a
+# non-hex value on a successful probe). Malformed records never compare.
+# Usage: _bh_fp_parse <record-line>
+_bh_fp_parse() {
+  local line="$1" tag st phase digest psf bcf ps bc
+  read -r tag st phase digest psf bcf <<< "$line"
+  if [ "$tag" != "FINGERPRINT" ] || [ -z "$phase" ] || [ -z "$digest" ]; then
+    return 1
+  fi
+  case "$psf" in
+    probe_success=true) ps=true ;;
+    probe_success=false) ps=false ;;
+    *) return 1 ;;
+  esac
+  case "$bcf" in
+    byte_count=*) bc="${bcf#byte_count=}" ;;
+    *) return 1 ;;
+  esac
+  case "$bc" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  if [ "$ps" = "false" ]; then
+    [ "$digest" = "UNAVAILABLE" ] || return 1
+  else
+    [ "${#digest}" -eq 64 ] || return 1
+    case "$digest" in
+      *[!0-9a-f]*) return 1 ;;
+    esac
+  fi
+  printf '%s %s %s\n' "$digest" "$ps" "$bc"
+}
+
 # Hard-gate: stage2 and stage3 must agree on EVERY fingerprinted phase, not
-# just the final link image. A phase UNAVAILABLE in both stages records a
-# probe failure and does not fail outside release mode; a phase available in
-# one stage only, or differing between the stages, fails the gate.
+# just the final link image. Each phase is compared as the FULL record
+# (digest, probe_success, byte_count):
+#   - a phase UNAVAILABLE (probe_success=false) in BOTH stages is a probe
+#     failure: fatal in release mode, and the documented "not comparable"
+#     tolerance outside release mode;
+#   - a phase available in one stage only, with a mismatched probe status, a
+#     differing digest/byte_count, or a malformed record fails the gate in
+#     EVERY mode — two failures are never "equal output";
+#   - a legitimately successful empty capture (probe_success=true,
+#     byte_count=0, digest=sha256("")) compares as a normal phase: equal only
+#     when BOTH stages report the same successful empty capture.
 #
 # RELEASE GATE (4th argument "release"): the CI/bootstrap gate (run_bootstrap
-# Step 6) treats ANY UNAVAILABLE fingerprint as a HARD FAILURE — all five
-# semantic phases (tokens, ast, hir, mir, mir-mono) have real --dump-* routes
-# in the stage binaries and must produce fingerprints from them, so a "not
-# comparable" phase is never acceptable in a release build. The UNAVAILABLE
-# tolerance remains only for non-release/debug probes (no 4th argument).
+# Step 5 in trace mode, where the semantic probes actually run) treats ANY
+# UNAVAILABLE probe record as a HARD FAILURE — all five semantic phases
+# (tokens, ast, hir, mir, mir-mono) have real --dump-* routes in the stage
+# binaries and must produce fingerprints from them, so a "not comparable"
+# phase is never acceptable in a release build. The UNAVAILABLE tolerance
+# remains only for non-release/debug probes (no 4th argument).
 # Usage: bh_phase_equality <stage-a> <stage-b> <outdir> [release]
 bh_phase_equality() {
   local stage_a="$1" stage_b="$2" outdir="$3" release_gate="${4:-}"
@@ -400,41 +566,69 @@ bh_phase_equality() {
     return 1
   fi
   local failures=0 compared=0 unavailable=0
-  local tag st phase ha hb
-  while read -r tag st phase ha; do
-    hb="$(awk -v p="$phase" '$3==p {print $4}' "$fb" | head -n1)"
-    if [ -z "$hb" ]; then
+  local line_a line_b parsed_a parsed_b
+  local tag st phase digest_a ps_a bc_a digest_b ps_b bc_b
+  while IFS= read -r line_a; do
+    [ -n "$line_a" ] || continue
+    read -r tag st phase digest_a ps_a bc_a <<< "$line_a"
+    if [ "$tag" != "FINGERPRINT" ] || [ -z "$phase" ]; then
+      bh_err "phase equality: malformed fingerprint record in $stage_a: $line_a"
+      failures=$((failures + 1))
+      continue
+    fi
+    if ! parsed_a="$(_bh_fp_parse "$line_a")"; then
+      bh_err "phase equality: malformed fingerprint record in $stage_a: $line_a"
+      failures=$((failures + 1))
+      continue
+    fi
+    read -r digest_a ps_a bc_a <<< "$parsed_a"
+
+    line_b="$(awk -v p="$phase" '$1 == "FINGERPRINT" && $3 == p { print; exit }' "$fb")"
+    if [ -z "$line_b" ]; then
       bh_err "phase equality: '$phase' present in $stage_a but missing in $stage_b"
       failures=$((failures + 1))
       continue
     fi
-    if [ "$ha" = "UNAVAILABLE" ] && [ "$hb" = "UNAVAILABLE" ]; then
-      if [ "$release_gate" = "release" ]; then
-        bh_err "phase equality (RELEASE GATE): $phase UNAVAILABLE in both stages — every semantic phase must produce a fingerprint; a UNAVAILABLE phase is a hard failure in release mode"
-        failures=$((failures + 1))
-        continue
-      fi
-      bh_log "phase equality: $phase UNAVAILABLE in both stages (probe produced no output; release mode makes this fatal)"
-      unavailable=$((unavailable + 1))
-      continue
-    fi
-    if [ "$ha" = "UNAVAILABLE" ] || [ "$hb" = "UNAVAILABLE" ]; then
-      if [ "$release_gate" = "release" ]; then
-        bh_err "phase equality (RELEASE GATE): $phase UNAVAILABLE — every semantic phase must produce a fingerprint ($stage_a=$ha $stage_b=$hb)"
-        failures=$((failures + 1))
-        continue
-      fi
-      bh_err "phase equality: $phase available in one stage only ($stage_a=$ha $stage_b=$hb)"
+    if ! parsed_b="$(_bh_fp_parse "$line_b")"; then
+      bh_err "phase equality: malformed fingerprint record in $stage_b: $line_b"
       failures=$((failures + 1))
       continue
     fi
+    read -r digest_b ps_b bc_b <<< "$parsed_b"
+
+    if [ "$ps_a" = "false" ] || [ "$ps_b" = "false" ]; then
+      if [ "$ps_a" = "false" ] && [ "$ps_b" = "false" ]; then
+        if [ "$release_gate" = "release" ]; then
+          bh_err "phase equality (RELEASE GATE): $phase UNAVAILABLE in both stages — every semantic/object phase must produce a fingerprint; a UNAVAILABLE probe record is a hard failure in release mode"
+          failures=$((failures + 1))
+          continue
+        fi
+        bh_log "phase equality: $phase UNAVAILABLE in both stages (probe failure; release mode makes this fatal)"
+        unavailable=$((unavailable + 1))
+        continue
+      fi
+      bh_err "phase equality: $phase probe status mismatch — $stage_a probe_success=$ps_a, $stage_b probe_success=$ps_b (a failed probe is never comparable to a successful one)"
+      failures=$((failures + 1))
+      continue
+    fi
+
     compared=$((compared + 1))
-    if [ "$ha" != "$hb" ]; then
-      bh_err "phase equality: $phase differs — $stage_a=$ha $stage_b=$hb"
+    if [ "$digest_a" != "$digest_b" ]; then
+      bh_err "phase equality: $phase differs — $stage_a=$digest_a $stage_b=$digest_b"
+      failures=$((failures + 1))
+    elif [ "$bc_a" != "$bc_b" ]; then
+      bh_err "phase equality: $phase digest matches but byte_count differs — $stage_a=$bc_a $stage_b=$bc_b (not a comparable capture)"
       failures=$((failures + 1))
     fi
   done < "$fa"
-  while read -r tag st phase hb; do
+  while IFS= read -r line_b; do
+    [ -n "$line_b" ] || continue
+    read -r tag st phase digest_b ps_b bc_b <<< "$line_b"
+    if [ "$tag" != "FINGERPRINT" ] || [ -z "$phase" ]; then
+      bh_err "phase equality: malformed fingerprint record in $stage_b: $line_b"
+      failures=$((failures + 1))
+      continue
+    fi
     if ! grep -qE "^FINGERPRINT [^ ]+ $phase " "$fa"; then
       bh_err "phase equality: '$phase' present in $stage_b but missing in $stage_a"
       failures=$((failures + 1))

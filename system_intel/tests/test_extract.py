@@ -204,7 +204,7 @@ class ScanTests(unittest.TestCase):
         self.assertGreater(report["entities_upserted"], 10)
         self.assertGreater(report["relations_upserted"], 5)
         self.assertGreater(report["relations_unresolved"], 0)
-        self.assertEqual(report["schema_version"], 2)
+        self.assertEqual(report["schema_version"], 3)
         self.assertEqual(report["state"], "finalized")
         self.assertFalse(report["reused"])
         self.assertGreater(report["counts_by_kind"].get("Symbol", 0), 0)

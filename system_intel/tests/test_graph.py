@@ -40,7 +40,7 @@ class GraphV2TestCase(unittest.TestCase):
 
     def test_schema_version_and_draft_identity(self):
         stats = self.graph.stats(self.snap)
-        self.assertEqual(stats["schema_version"], 2)
+        self.assertEqual(stats["schema_version"], 3)
         self.assertEqual(stats["state"], "draft")
 
     def test_begin_draft_idempotent_and_finalized_conflict(self):
@@ -272,7 +272,7 @@ class GraphV2TestCase(unittest.TestCase):
 
     def test_context_manager(self):
         with Graph.open(self.db_path, create=False) as graph:
-            self.assertEqual(graph.stats(self.snap)["schema_version"], 2)
+            self.assertEqual(graph.stats(self.snap)["schema_version"], 3)
 
     # ------------------------------------------------------- write/read gate
 

@@ -20,12 +20,26 @@ Semantics:
 * ``query(snapshot, op)``    — ``{"kind", "records"/"keys", "completeness",
                                "note"}`` over the materialized snapshot.
 * ``delta(old, new)``        — ``{"added", "removed", "changed",
-                               "unresolved_added"}`` of stable keys.
+                               "unresolved_added"}`` of stable keys.  A
+                               provider MAY add ``source`` ('native' |
+                               'generic') and ``note`` keys to record which
+                               delta engine produced the sets; consumers must
+                               treat the four key sets as the stable core.
 * ``completeness(family)``   — the verdict for one family from the last
                                snapshot; ``unknown`` before the first one.
 
 Completeness verdicts MIRROR the producing provider and are never upgraded:
 a native family marked ``Unknown`` can never read back ``complete``.
+
+Contract canonicalization convention (§5 ``Contract``): a provider that
+declares or references contracts emits provider facts with
+``predicate='contract_ref'`` and ``object='contract:<kind>:<name>'`` where
+``<kind>`` is the provider's contract-kind word (e.g. the Tangerine native
+``Pre``/``Post``/``Invariant``) and ``<name>`` is the provider's canonical,
+stable contract name (for the native provider the canonical contract row key
+``<fn key>|<kind>|<clause>``).  This is the machine-readable pair consumers
+feed to ``Graph.add_contract(kind, name, ...)``; the human ``Contract``
+entity/relation projection rides beside it.
 """
 
 from __future__ import annotations
