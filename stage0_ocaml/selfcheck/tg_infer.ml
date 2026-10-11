@@ -355,6 +355,13 @@ let () =
                 A reintroduced retained-span membership scan cannot pass. *)
              fail
                "the cfg-scaling battery failed (expected `CFG_SCALING_BATTERY fails=0`; see the report above)"
+           else if not (contains report "SHA256_VECTOR_BATTERY fails=0") then
+             (* the kernel content-address hash against published FIPS 180-4
+                vectors: the preflight's dominant cost is fingerprinting
+                through this implementation, so a mutation there must fail
+                here, not silently change every fingerprint. *)
+             fail
+               "the sha256-vector battery failed (expected `SHA256_VECTOR_BATTERY fails=0`; see the report above)"
            else if not (contains report "TOTALS errors=") then
             fail "the probe produced no TOTALS row"
           else if merged && not (contains report "IMPLCONF=0") then
