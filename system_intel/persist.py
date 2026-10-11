@@ -359,39 +359,49 @@ _TRANSIENT_OBSERVATION_KEYS = frozenset({
 })
 
 
-def _canonical_observation(value):
+def _canonical_observation(value, root: str = ""):
     """Canonical, order-independent view of EVERY observation field.
 
     The whole ProviderSnapshot is hashed — confidence, completeness,
     attributes, evidence payload/summary, derived_from, uncertainty,
     capabilities and semantic configuration included.  Only explicitly
     transient plumbing keys are excluded; there is no hand-picked subset.
+    Absolute paths under the scan root are rewritten to ``<root>/...`` so
+    the same content observed from two checkouts yields the same digest.
     """
     if hasattr(value, "__dataclass_fields__") and not isinstance(value, type):
         return {
-            name: _canonical_observation(getattr(value, name))
+            name: _canonical_observation(getattr(value, name), root)
             for name in value.__dataclass_fields__
         }
     if isinstance(value, dict):
         return {
-            str(key): _canonical_observation(item)
+            str(key): _canonical_observation(item, root)
             for key, item in sorted(value.items(), key=lambda kv: str(kv[0]))
             if str(key) not in _TRANSIENT_OBSERVATION_KEYS
         }
     if isinstance(value, (list, tuple, set, frozenset)):
-        items = [_canonical_observation(item) for item in value]
+        items = [_canonical_observation(item, root) for item in value]
         return sorted(items, key=lambda item: _canonical(item))
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, str):
+        if root and root in value:
+            return value.replace(root, "<root>")
         return value
-    return str(value)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    text = str(value)
+    if root and root in text:
+        text = text.replace(root, "<root>")
+    return text
 
 
-def _snapshot_observation_payload(pid: str, version: str, snap) -> dict:
+def _snapshot_observation_payload(pid: str, version: str, snap,
+                                  root: str = "") -> dict:
     """The complete canonical snapshot body plus provider identity."""
     if hasattr(snap, "__dataclass_fields__") and not isinstance(snap, type):
-        body = _canonical_observation(snap)
+        body = _canonical_observation(snap, root)
     elif isinstance(snap, dict):
-        body = _canonical_observation(snap)
+        body = _canonical_observation(snap, root)
     else:
         attrs = {}
         for name in dir(snap):
@@ -404,21 +414,22 @@ def _snapshot_observation_payload(pid: str, version: str, snap) -> dict:
             if callable(value):
                 continue
             attrs[name] = value
-        body = _canonical_observation(attrs)
+        body = _canonical_observation(attrs, root)
     if isinstance(body, dict):
         body["provider_id"] = str(pid)
         body["provider_version"] = str(version)
     return body
 
 
-def _snapshot_digest(pid: str, version: str, snap) -> str:
+def _snapshot_digest(pid: str, version: str, snap, root: str = "") -> str:
     """Content-derived observation digest (never a DB row id).
 
     Hashes the canonical COMPLETE ProviderSnapshot, so a provider cannot
     change confidence, completeness, attributes, evidence payload/summary
-    or any other meaningful metadata without changing the digest.
+    or any other meaningful metadata without changing the digest.  Paths
+    under ``root`` are normalized so the digest is checkout-independent.
     """
-    payload = _snapshot_observation_payload(pid, version, snap)
+    payload = _snapshot_observation_payload(pid, version, snap, root)
     return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
 
 
@@ -954,7 +965,8 @@ def scan(root, db_path, *, commit_sha=None, repo_root=None, strict_clean=False,
                 "provider_id": pid,
                 "provider_version": ver,
                 "observation_kind": observation_kind or _observation_kind_for(prov),
-                "observation_digest": _snapshot_digest(pid, ver, snap),
+                "observation_digest": _snapshot_digest(pid, ver, snap,
+                                                       str(root_path)),
                 "authority": _authority_for(prov),
                 "enumeration_completeness": str(_field(snap, "completeness_entities", None)
                                                 or _snap_family_verdict(snap, "entities")),

@@ -331,6 +331,18 @@ class FederationV3TestCase(unittest.TestCase):
         self.assertNotEqual(base, _snapshot_digest("p", "1", snapshot(attrs={"visibility": "private"})))
         self.assertNotEqual(base, _snapshot_digest("p", "1", snapshot(summary="different")))
 
+        # Checkout-independent: paths under the scan root are normalized.
+        from system_intel.providers.base import ProviderEvidence
+        def path_snapshot(path):
+            return ProviderSnapshot(
+                evidence=[ProviderEvidence(kind="note", ref=path)],
+                provider_id="p", provider_version="1",
+            )
+        self.assertEqual(
+            _snapshot_digest("p", "1", path_snapshot("/w/one/tg_semantic.jsonl"), "/w/one"),
+            _snapshot_digest("p", "1", path_snapshot("/w/two/tg_semantic.jsonl"), "/w/two"),
+        )
+
     # (12) ---------------------------------------------------------------
     def test_unique_secondary_provider_knowledge_is_included(self):
         """Authority is claim-scoped: unique non-primary knowledge survives."""
