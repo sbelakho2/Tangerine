@@ -359,12 +359,23 @@ class GraphV2TestCase(unittest.TestCase):
     # -------------------------------------------------------- change_surface
 
     def test_change_surface_exact_and_suffix(self):
-        self.graph.upsert_entity("Module", "A", "module:pkg.mod.A")
+        self.graph.upsert_entity("Module", "A", "module:pkg.mod.A",
+                                 qualified_name="pkg.mod.A")
         self.graph.upsert_entity("Symbol", "B", "sym:x:pkg.mod.B",
                                  qualified_name="pkg.mod.B")
         surface = self.graph.change_surface(["pkg.mod.A", "mod.B", "does.not.exist"])
         self.assertEqual(sorted(surface["matched"]), ["mod.B", "pkg.mod.A"])
         self.assertEqual(surface["unmatched"], ["does.not.exist"])
+        # the suffix hit is FUZZY (namespace-boundary aware), the exact one
+        # is not; a mere textual resemblance such as foo.barbaz vs bar is
+        # not a match at all.
+        self.assertEqual(surface["fuzzy"], ["mod.B"])
+        self.graph.upsert_entity("Symbol", "barbaz", "sym:x:foo.barbaz",
+                                 qualified_name="foo.barbaz")
+        no_match = self.graph.change_surface(["bar"])
+        self.assertEqual(no_match["matched"], {})
+        self.assertEqual(no_match["fuzzy"], [])
+        self.assertEqual(no_match["unmatched"], ["bar"])
         self.assertEqual(len(surface["impacted"]), 2)
         self.assertIn("completeness", surface)
 

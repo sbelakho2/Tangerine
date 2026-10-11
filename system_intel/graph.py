@@ -279,9 +279,21 @@ def _chunks(seq, size=_IN_CHUNK):
 
 
 def _prefix_match(component_qn, qualified_names):
-    """True when component_qn is a prefix of (or equal to) any name."""
-    return any(qn == component_qn or qn.startswith(component_qn)
-               for qn in qualified_names)
+    """True when component_qn equals, or is a NAMESPACE-SEGMENT prefix of,
+    a qualified name.
+
+    Raw ``startswith`` is not enough: ``foo.bar`` must not be treated as a
+    prefix of ``foo.barbaz``.  Only ``::`` (module paths) and ``.``
+    (dotted paths) segment boundaries count.
+    """
+    if not component_qn:
+        return False
+    for qn in qualified_names:
+        if qn == component_qn:
+            return True
+        if qn.startswith(component_qn + "::") or qn.startswith(component_qn + "."):
+            return True
+    return False
 
 
 # v3 column additions applied to databases created by older schema
@@ -1643,11 +1655,26 @@ class Graph:
         everything = [_parse_entity({k: r[k] for k in r.keys()}) for r in rows]
 
         matched = {}
+        fuzzy = []
         unmatched = []
         seed_ids = []
         for qn in qualified_names:
             exact = [e for e in everything if e["qualified_name"] == qn]
-            hits = exact if exact else [e for e in everything if e["qualified_name"].endswith(qn)]
+            if exact:
+                hits = exact
+            else:
+                # Namespace-boundary-aware suffix fallback.  A textual
+                # resemblance is FUZZY evidence, reported as such and never
+                # silently promoted to an exact impact seed.
+                suffix = "::" + qn
+                dotted = "." + qn
+                hits = [
+                    e for e in everything
+                    if e["qualified_name"].endswith(suffix)
+                    or e["qualified_name"].endswith(dotted)
+                ]
+                if hits:
+                    fuzzy.append(qn)
             if hits:
                 matched[qn] = hits
                 for ent in hits:
@@ -1696,6 +1723,7 @@ class Graph:
 
         return {
             "matched": matched,
+            "fuzzy": fuzzy,
             "unmatched": unmatched,
             "impacted": impacted,
             "contracts": sorted(contracts.values(), key=lambda c: c["id"]),
