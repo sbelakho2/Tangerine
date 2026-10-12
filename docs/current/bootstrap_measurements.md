@@ -96,7 +96,41 @@ reducing the guest's retained live data (macro expansion already adds
 +2.4 GB) or an incremental VM marking strategy — compiler/VM work, not a
 budget or policy change.  The outer gate timeout remains provisional.
 
-## 5. Conclusion and next lever
+## 5. Retention-reduction batch (commits 289a42d, 306f777, 8e899b7)
+
+Semantics-preserving live-set/allocation reductions in the analysis path,
+each verified by the full kernel battery (`tg_infer: PASS`,
+`KERNEL_PARITY_BATTERY fails=0 cases=21`, `CFG_SCALING_BATTERY fails=0`,
+`SHA256_VECTOR_BATTERY fails=0`, zero failure rows):
+
+- `prepare_parsed` no longer clones the whole merged AST (in-place macro
+  expansion via `expand_macros_inout`); `expand_program_pass` drains and
+  writes back items instead of rebuilding a copied Program per pass; the
+  per-expanded-item double copies are gone.
+- `AnalyzedProgram` no longer carries duplicate deep copies of the AST and
+  resolutions (they live once on `typed.ast`/`typed.resolutions`), and the
+  duplicate `plan_typed` TypedProgram (its own AST + ~30 table clones) is
+  merged away — one TypedProgram literal feeds the deinit-plan walk and is
+  then extended with the finished plan table.
+- The 11.3 MB closure snapshot is no longer deep-copied at ~13 use/lookup
+  sites (read-only observers replace per-site copies; one load per entry).
+- `type_env_release_analysis_channels` drops the 33 node-keyed check-only
+  channels right after `analyze_program`; the retained readers
+  (`env.resolutions`, `fn_class_claims`, `fn_class_names`) are untouched.
+- `resource_check_owned(sink cfg, ...)` mutates the pipeline's CFG in place
+  (no whole-program CFG copy); dead result snapshots and the duplicated
+  DMA-facts table are removed; `access_check_with_snapshot` reuses the
+  single engine snapshot instead of building a second one in the context.
+- `MonoCache`/`MirBuilder` whole-AST clones were deliberately NOT converted
+  (no reference types in the language, the O(1) store-sharing facility is
+  module-private to resolver/types, and the AST must live across both
+  lowering passes) — documented as deferred.
+
+The pinned-`o=40` preflight completion attempt then re-runs on this batch;
+its phase markers measure the new trajectory against the section-4
+baseline.
+
+## 6. Conclusion and next lever
 
 The cfg quadratic is gone (structural and realized scaling guards enforce
 it), and the remaining step cost is legitimate linear work.  The binding
