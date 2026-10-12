@@ -2761,6 +2761,36 @@ pub def bootstrap_closure_snapshot_lookup(snap: BootstrapClosureSnapshot, rel: S
   end
 end
 
+# (per-use snapshot reads): the Option-observing forms of the snapshot
+# readers. The manifest-closed callers hold the ONE loaded snapshot as a
+# local/parameter and every callee only READS it, so matching the Option
+# directly observes the payload — the former `.clone()` at each call site
+# deep-copied the full 45-source snapshot (manifest + ~11.3 MB of source
+# bytes + the index) once per use statement, several times over.
+def bootstrap_closure_snapshot_lookup_opt(snapshot: Option[BootstrapClosureSnapshot], rel: String) -> Option[String]
+  match snapshot
+  when Option::Some(snap) then bootstrap_closure_snapshot_lookup(snap, rel)
+  when Option::None then Option::None
+  end
+end
+
+# The NUMBER of manifest entries in the loaded snapshot (0 without one —
+# the same value the former Some-arm assignment produced).
+def bootstrap_closure_snapshot_entry_count(snapshot: Option[BootstrapClosureSnapshot]) -> Int
+  match snapshot
+  when Option::Some(snap) then snap.sources.len()
+  when Option::None then 0
+  end
+end
+
+# The loaded snapshot's digest ("" without one — the caller's default).
+def bootstrap_closure_fingerprint_snapshot_opt(snapshot: Option[BootstrapClosureSnapshot], root_path: String, root_source: String) -> String
+  match snapshot
+  when Option::Some(snap) then bootstrap_closure_fingerprint_snapshot(snap, root_path, root_source)
+  when Option::None then "".to_string()
+  end
+end
+
 # (P0 closure authority): membership in the loaded snapshot.  The
 # dependency graph is decided against THIS, never against the live
 # filesystem, so removing/creating a file after the snapshot cannot
@@ -2785,7 +2815,7 @@ end
 # plain path strings: prefer the full module path, else the containing
 # module, with existence decided by bootstrap_dep_path_exists.
 pub def bootstrap_dep_choose(full_path: String, parent: Option[String], snapshot: Option[BootstrapClosureSnapshot]) -> Option[String]
-  if bootstrap_dep_path_exists(full_path.clone(), snapshot.clone()) then
+  if bootstrap_dep_path_exists(full_path.clone(), snapshot) then
     Option::Some(full_path)
   else
     match parent
@@ -2851,6 +2881,69 @@ pub def emit_check_ok_summary(path: String, ast: Program, stop: String, manifest
     + " closure_sha256=" + closure_sha256)
 end
 
+# (analysis-channel release): once analyze_program returned Ok, the
+# AnalyzedProgram artifact owns the AUTHORITATIVE typed tables (the typed
+# HIR, the resolver snapshot, the finalized per-node channels the MIR
+# consumes, the ONE TypedCFG, the finished engine snapshot). From that
+# point on the env's per-node analysis channels are DEAD — the only
+# post-analyze env consumers in the pipeline are the three MIR annotation
+# checks (check_effect_class_annotations_mir / check_purity_annotations_mir
+# / check_budget_annotations_mir), which read env.resolutions,
+# env.fn_class_claims and env.fn_class_names (through fn_effect_def_key)
+# and nothing else. This releases the dead channels so the second full
+# typed-HIR copy does not stay live through lowering/codegen (the
+# pre-analysis live-set wall).
+#
+# DELIBERATELY LEFT INTACT: env.resolutions, env.fn_class_claims,
+# env.fn_class_names, the effect tables (typed_effects / effect_name_index
+# / typed_effect_handlers / handler_captures / fn_declared_effects /
+# fn_computed_effects / fn_call_graph / fn_declared_effect_names /
+# fn_declared_effect_spans / fn_effect_modules), the impl tables (impls /
+# method_lookup / impls_by_trait / impl_head_index / impl_reg_states /
+# impl_pre_registered / trait_contracts / trait_registry / param_for_type_impls),
+# lang_items, and the registered type tables (type_list / type_name_index /
+# module_type_names / ...). Every released field below is either carried by
+# the artifact (which deep-clones each table) or read only by the checking
+# phase itself.
+pub def type_env_release_analysis_channels(inout env: TypeEnv) -> Unit
+  # typed HIR node channels (the artifact carries the authoritative copies)
+  env.typed_exprs = Map::new()
+  env.typed_expr_types = Map::new()
+  env.typed_stmts = Map::new()
+  env.typed_patterns = Map::new()
+  # per-node location / identity channels (gate + analysis only)
+  env.typed_node_spans = Map::new()
+  env.typed_node_owners = Map::new()
+  env.typed_local_owners = Map::new()
+  env.typed_sig_spans = Map::new()
+  env.typed_static_spans = Map::new()
+  env.typed_ident_resolutions = Map::new()
+  env.typed_global_bindings = Map::new()
+  env.typed_local_bindings = Map::new()
+  env.param_binding_resolutions = Map::new()
+  env.pattern_binding_resolutions = Map::new()
+  env.pattern_variant_resolutions = Map::new()
+  env.typed_access_effects = Map::new()
+  env.typed_field_targets = Map::new()
+  env.typed_call_targets = Map::new()
+  env.typed_call_instances = Map::new()
+  env.typed_contract_calls = Map::new()
+  env.typed_trait_contract_methods = Map::new()
+  env.typed_trait_contract_conflicts = Set::new()
+  env.typed_type_queries = Map::new()
+  env.const_param_reads = Map::new()
+  env.place_move_states = Map::new()
+  env.typed_aggregate_ownership = Map::new()
+  env.closure_captures = Map::new()
+  # per-node checker-only channels (no post-analyze reader)
+  env.binding_plans = Map::new()
+  env.hole_constraints = Map::new()
+  env.pattern_const_calls = Map::new()
+  env.pending_literal_ranges = Map::new()
+  env.variant_pattern_id_spans = Map::new()
+  env.pending_call_instances = Map::new()
+end
+
 pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: DiagnosticEmitter) -> Result[Unit, String]
   if opts.verbose then
     println("[diag] compile_file_core entered, path=" + path.clone())
@@ -2869,22 +2962,20 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
     Option::None
   end
   if manifest_closed then
-    match bootstrap_require_closure_snapshot(closure_snapshot.clone())
+    match bootstrap_require_closure_snapshot(closure_snapshot)
     when Result::Ok(_) then ()
     when Result::Err(e) then
       return Result::Err(e)
     end
   end
   let source = if manifest_closed then
-    match closure_snapshot.clone()
-    when Option::Some(snap) then
-      match bootstrap_closure_snapshot_lookup(snap, canonical_kernel_source_path(path.clone()))
-      when Option::Some(s) then s
-      when Option::None then
-        return Result::Err("Failed to read file: " + path.clone() + ": root source is not a member of the closure snapshot")
-      end
+    # (the require above guarantees the snapshot is Some, so this is the
+    # single not-a-member failure the former matched arm produced for
+    # every reachable input).
+    match bootstrap_closure_snapshot_lookup_opt(closure_snapshot, canonical_kernel_source_path(path.clone()))
+    when Option::Some(s) then s
     when Option::None then
-      return Result::Err("Failed to read file: " + path.clone() + ": closure snapshot unavailable")
+      return Result::Err("Failed to read file: " + path.clone() + ": root source is not a member of the closure snapshot")
     end
   else
     match read_source_file(path.clone())
@@ -2996,12 +3087,11 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   end
   var manifest_entries = 0
   var closure_digest = "".to_string()
-  match closure_snapshot.clone()
-  when Option::Some(snap) then
-    manifest_entries = snap.sources.len()
-    closure_digest = bootstrap_closure_fingerprint_snapshot(snap, path.clone(), source.clone())
-  when Option::None then ()
-  end
+  # (per-use snapshot reads): both readers OBSERVE the one loaded
+  # snapshot — no per-site deep copy; the None case yields the same
+  # defaults the former match left (0 entries, "" digest).
+  manifest_entries = bootstrap_closure_snapshot_entry_count(closure_snapshot)
+  closure_digest = bootstrap_closure_fingerprint_snapshot_opt(closure_snapshot, path.clone(), source.clone())
   var ast = match merge_imported_deps_snapshot(ast_with_prelude, manifest_closed, root_dedup, closure_snapshot)
   when Result::Ok(a) then a
   when Result::Err(e) then
@@ -3084,6 +3174,13 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
     end
     return Result::Err(join_diagnostics(&diags))
   end
+
+  # (analysis-channel release): the artifact owns the authoritative typed
+  # tables; the env's dead per-node channels (a second full typed-HIR
+  # copy) are released here — before lowering, before the post-analyze
+  # MIR annotation checks (which read only env.resolutions /
+  # env.fn_class_claims / env.fn_class_names; see the release function).
+  type_env_release_analysis_channels(&mut env)
 
   phase_trace("semantic-done")
   if opts.stop_after == StopAfter::Semantic then
@@ -3622,7 +3719,7 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
     Option::None
   end
   if manifest_closed then
-    match bootstrap_require_closure_snapshot(closure_snapshot.clone())
+    match bootstrap_require_closure_snapshot(closure_snapshot)
     when Result::Ok(_) then ()
     when Result::Err(e) then
       println(e)
@@ -4054,7 +4151,7 @@ def merge_imported_deps_snapshot(program: Program, include_compiler_lib: Bool, r
     # (P0 closure authority): NO legacy fallback.  A manifest-closed walk
     # without the one loaded snapshot is an error, never a second
     # manifest read plus per-file filesystem reads.
-    match bootstrap_require_closure_snapshot(snapshot.clone())
+    match bootstrap_require_closure_snapshot(snapshot)
     when Result::Ok(_) then ()
     when Result::Err(e) then
       return Result::Err(e)
@@ -4064,7 +4161,7 @@ def merge_imported_deps_snapshot(program: Program, include_compiler_lib: Bool, r
     # snapshot and this walk can neither add nor drop a closure file.  The
     # canonical order (sorted std, then sorted compiler) is preserved, so
     # module ids and the 45-source evidence stay identical.
-    match snapshot.clone()
+    match snapshot
     when Option::Some(snap) then
       var std_files: Vec[String] = Vec::new()
       var compiler_files: Vec[String] = Vec::new()
@@ -4101,7 +4198,7 @@ def merge_imported_deps_snapshot(program: Program, include_compiler_lib: Bool, r
     prelude_files()
   end
   for prelude in preludes do
-    match collect_dep_file_snapshot(prelude, &mut merged_items, &mut loaded, &mut merged_modules, snapshot.clone())
+    match collect_dep_file_snapshot(prelude, &mut merged_items, &mut loaded, &mut merged_modules, snapshot)
     when Result::Ok(_) then ()
     when Result::Err(e) then
       return Result::Err(dep_error_message(e, prelude))
@@ -4112,7 +4209,7 @@ def merge_imported_deps_snapshot(program: Program, include_compiler_lib: Bool, r
     # the minimal self-hostable module set. The full lib.tg is reserved for
     # user embedding and pulls in non-bootstrap tooling modules. This keeps the
     # bootstrap compiler closure small (bootstrap/compiler_kernel.manifest).
-    match collect_dep_file_snapshot("tg_compiler/lib_kernel.tg", &mut merged_items, &mut loaded, &mut merged_modules, snapshot.clone())
+    match collect_dep_file_snapshot("tg_compiler/lib_kernel.tg", &mut merged_items, &mut loaded, &mut merged_modules, snapshot)
     when Result::Ok(_) then ()
     when Result::Err(e) then
       return Result::Err(dep_error_message(e, "tg_compiler/lib_kernel.tg"))
@@ -4223,9 +4320,9 @@ def collect_dep_items_snapshot(program: Program, inout out: Vec[Item], inout loa
   for item in program.items do
     match item.kind
     when ItemKind::ItemUse(u) then
-      match dep_use_to_file_snapshot(&u, snapshot.clone())
+      match dep_use_to_file_snapshot(&u, snapshot)
       when Option::Some(path) then
-        match collect_dep_file_snapshot(path, out, loaded, modules, snapshot.clone())
+        match collect_dep_file_snapshot(path, out, loaded, modules, snapshot)
         when Result::Ok(_) then ()
         when Result::Err(e) then
           return Result::Err(e)
@@ -4273,7 +4370,7 @@ pub def collect_dep_file_snapshot(path: String, inout out: Vec[Item], inout load
   # bytes come from the ONE snapshot; a path outside it fails closed and is
   # NEVER read from the filesystem (the manifest IS the closure).  The
   # non-snapshot path (user/driver builds) keeps the on-disk read.
-  let source = match snapshot.clone()
+  let source = match snapshot
   when Option::Some(snap) then
     match bootstrap_closure_snapshot_lookup(snap, path.clone())
     when Option::Some(s) then s
@@ -4607,8 +4704,17 @@ end
 # scanning: the item list of a module is per-module (Module.items), and the
 # owner lookup never walks it.
 def module_path_for_item(program: Program, item_idx: Int) -> Vec[String]
-  let owner = program.items[item_idx].owner_module
-  match program.crate.modules.get(owner)
+  module_path_for_owner(&program.crate, program.items[item_idx].owner_module)
+end
+
+# The same table read keyed by the owner ModuleId directly: the in-place
+# expansion pass has already drained the flat item vector when it resolves
+# each item's module path, so no index is left to read — the owner stamped
+# ON the item is the same ModuleId the indexed form read. Identical
+# behavior: the owner Module's path, or the root module's empty path when
+# the owner is missing from the table.
+def module_path_for_owner(crate: Crate, owner: ModuleId) -> Vec[String]
+  match crate.modules.get(owner)
   when Option::Some(info) then
     var path = Vec::new()
     for seg in info.path do
@@ -4846,11 +4952,13 @@ end
 
 # (in-place entry, semantics-preserving): prepare_parsed calls THIS form
 # directly — the former whole-program `program.clone()` argument is not
-# needed. The expansion only READS its input until the single result is
-# assigned back through `*program` at the end, and the value form above
-# delegates here so every other caller keeps the identical signature
-# (its `var current = program` binds a shared read and the inout call is
-# copy-in/copy-out — no deep clone on either path).
+# needed. The fixpoint below rebuilds the caller's item vector IN PLACE
+# through the inout parameter (see expand_program_pass), the filter step
+# moves the surviving items into the result, and that single result is
+# assigned back through `*program` at the end; the value form above
+# delegates here so every other caller keeps the identical signature (its
+# `var current = program` binds a shared read and the inout call carries
+# the place — no deep clone on either path).
 def expand_macros_inout(inout program: Program, inout diags: Vec[Diagnostic]) -> Unit
   # Phase 1: collect macro declarations, MODULE-SCOPED. Every macro registers
   # under the module path of its owning module (from Program.crate's module
@@ -4908,19 +5016,23 @@ def expand_macros_inout(inout program: Program, inout diags: Vec[Diagnostic]) ->
 
   # Phase 2: iteratively expand until fixpoint (max 64 passes).
   #
- # (macro hygiene, expansion-depth contract): 64 is the DEPTH CAP. The
+  # (macro hygiene, expansion-depth contract): 64 is the DEPTH CAP. The
   # eager re-expansion of substituted bodies (see expand_expr's macro arms)
   # normally converges in one or two passes; a macro that transitively
   # embeds itself adds one nesting level per pass, so 64 passes bounds the
   # nesting depth. If the fixpoint has not converged when the cap is hit,
   # residual ExprMacroCall nodes remain — that is the E105 failure recorded
   # below after the macro definitions are filtered out.
-  var current = *program
+  #
+  # (in-place fixpoint): each pass rebuilds the caller's OWN item vector
+  # through the inout parameter — the former `var current = *program`
+  # snapshot plus `expand_program_pass(env, current)` returned a whole new
+  # Program (and cloned the crate) per pass. The final state is identical:
+  # the last pass's rebuilt items ARE the expansion result.
   var pass = 0
   while pass < 64 do
-    let expanded_result = expand_program_pass(&env, current)
-    current = expanded_result.program
-    if !expanded_result.did_expand then break end
+    let did_expand = expand_program_pass(&env, &mut program)
+    if !did_expand then break end
     pass = pass + 1
   end
 
@@ -4931,14 +5043,7 @@ def expand_macros_inout(inout program: Program, inout diags: Vec[Diagnostic]) ->
   end
 
   # Phase 3: remove macro declarations from the output AST
-  let current_span = current.span.clone()
-  var filtered_items = Vec::new()
-  for item in current.items do
-    match item.kind
-    when ItemKind::ItemMacro(_) then ()  # Drop macro defs
-    when _ then filtered_items.push(item.clone())
-    end
-  end
+  let current_span = program.span.clone()
  # (module table): the modules map indexes the filtered items, so it is
   # rebuilt here — per module, its OWN item list (Module.items) is walked,
   # macro declarations are dropped, and every surviving ItemId is remapped
@@ -4947,15 +5052,17 @@ def expand_macros_inout(inout program: Program, inout diags: Vec[Diagnostic]) ->
   # per-module registration tables (module_tables, keyed by path join)
   # consume, keeping the per-module first-wins foundation valid past macro
   # filtering. The filtered items keep their owner ModuleId (they are
-  # cloned with it), and the module ids are carried unchanged.
+  # moved with it), and the module ids are carried unchanged. This table
+  # rebuild runs BEFORE the item drain below — its remap reads the
+  # pre-filter flat item KINDS by index.
   var filtered_modules = Map::new()
   var removed_global = 0
-  let module_entries = current.crate.modules.entries_cloned()
+  let module_entries = program.crate.modules.entries_cloned()
   for (mid, info) in module_entries do
     var removed_in_module = 0
     var new_items = Vec::new()
     for it_id in info.items do
-      match current.items[it_id.id].kind
+      match program.items[it_id.id].kind
       when ItemKind::ItemMacro(_) then removed_in_module = removed_in_module + 1
       when _ then
         new_items.push(ItemId { id: it_id.id - removed_global - removed_in_module })
@@ -4969,9 +5076,33 @@ def expand_macros_inout(inout program: Program, inout diags: Vec[Diagnostic]) ->
     })
     removed_global = removed_global + removed_in_module
   end
+  # (move-based filter): drain the expanded item vector (ownership
+  # transfer), then move each surviving item into the filtered list in the
+  # ORIGINAL order — the former per-item `filtered_items.push(item.clone())`
+  # duplicated the whole expanded AST once more just to drop macro
+  # declarations. The drain→pop double-buffer restores forward order
+  # without any element copy.
+  var pending_items: Vec[Item] = Vec::new()
+  while !program.items.is_empty() do
+    match program.items.pop()
+    when Option::Some(it) then pending_items.push(it)
+    when Option::None then break
+    end
+  end
+  var filtered_items = Vec::new()
+  while !pending_items.is_empty() do
+    let item = match pending_items.pop()
+    when Option::Some(it) then it
+    when Option::None then break
+    end
+    match item.kind
+    when ItemKind::ItemMacro(_) then ()  # Drop macro defs
+    when _ then filtered_items.push(item)
+    end
+  end
   let filtered_program = Program {
     items: filtered_items,
-    crate: Crate { root: current.crate.root, modules: filtered_modules },
+    crate: Crate { root: program.crate.root, modules: filtered_modules },
     span: current_span
   }
 
@@ -5214,30 +5345,49 @@ def residual_macro_calls_in_item(item: Item, inout out: Vec[Expr]) -> Unit
   end  end
 end
 
-pub def expand_program_pass(env: MacroEnv, program: Program) -> ExpandedProgram
-  let program_span = program.span.clone()
+# (in-place pass, semantics-preserving): rebuilds the caller's OWN item
+# vector through the inout parameter and returns whether anything
+# expanded. The pass DRAINS the vector first (pop transfers ownership —
+# no per-item clone for the items the expansion moves through unchanged),
+# expands in the ORIGINAL order (each item's macro resolution is anchored
+# by env.current_module set immediately before it, and the recorded
+# lookup diagnostics keep their call-site order), and writes the rebuilt
+# vector back. The crate and span are carried UNCHANGED: items map 1:1
+# through expansion (no insertion/deletion), so the existing module table
+# still indexes the rebuilt items — the former per-pass
+# `program.crate.clone()` + whole-Program rebuild is gone. The former
+# `program.items[i].clone()` deep-copied EVERY item on EVERY pass out of
+# an observed input.
+pub def expand_program_pass(env: MacroEnv, inout program: Program) -> Bool
+  var pending: Vec[Item] = Vec::new()
+  while !program.items.is_empty() do
+    match program.items.pop()
+    when Option::Some(it) then pending.push(it)
+    when Option::None then break
+    end
+  end
   var new_items = Vec::new()
   var did_expand = false
-  var i = 0
-  while i < program.items.len() do
+  while !pending.is_empty() do
+    let item = match pending.pop()
+    when Option::Some(it) then it
+    when Option::None then break
+    end
  # (macro identity): anchor the resolution of this item's macro calls
     # in its OWNING module (the item's owner ModuleId read through the crate
-    # table — module_path_for_item; no range scan). A bare macro
+    # table — module_path_for_owner; no range scan). A bare macro
     # name resolves in this module; a qualified path resolves relative to it
     # (then absolutely, then through import aliases).
-    env.current_module = module_path_for_item(&program, i)
-    let expanded_item = expand_item(env, program.items[i].clone())
+    env.current_module = module_path_for_owner(&program.crate, item.owner_module)
+    let expanded_item = expand_item(env, item)
     # (fresh value, moved): expanded_item is a local used ONCE — the
     # former `.item.clone()` deep-copied every expanded item (the whole
     # program, per pass) just to hand a fresh value to push.
     new_items.push(expanded_item.item)
     if expanded_item.did_expand then did_expand = true end
-    i = i + 1
   end
- # items map 1:1 through expansion (no insertion/deletion), so the
-  # Crate is carried through unchanged and still indexes the new flat items
-  # vector.
-  ExpandedProgram { program: Program { items: new_items, crate: program.crate.clone(), span: program_span }, did_expand }
+  program.items = new_items
+  did_expand
 end
 
 pub def expand_item(env: MacroEnv, item: Item) -> ExpandedItem
@@ -5419,7 +5569,7 @@ pub def expand_block(env: MacroEnv, block: Block, ctx_stack: Vec[Int]) -> Expand
   var i = 0
   while i < block.stmts.len() do
     let expanded_stmt = expand_stmt(env, &block.stmts[i], ctx_stack)
-    new_stmts.push(expanded_stmt.stmt.clone())
+    new_stmts.push(expanded_stmt.stmt)
     if expanded_stmt.did_expand then did_expand = true end
     i = i + 1
   end
@@ -5513,7 +5663,7 @@ pub def expand_exprs(env: MacroEnv, args: Vec[Expr], ctx_stack: Vec[Int]) -> Exp
   var i = 0
   while i < args.len() do
     let expanded_arg = expand_expr(env, &args[i], ctx_stack)
-    new_args.push(expanded_arg.expr.clone())
+    new_args.push(expanded_arg.expr)
     if expanded_arg.did_expand then did_expand = true end
     i = i + 1
   end
@@ -6499,7 +6649,7 @@ pub def compile_multiple_files(opts: CompilerOptions, files: Vec[String], output
     Option::None
   end
   if manifest_closed then
-    match bootstrap_require_closure_snapshot(closure_snapshot.clone())
+    match bootstrap_require_closure_snapshot(closure_snapshot)
     when Result::Ok(_) then ()
     when Result::Err(e) then
       println(e)
