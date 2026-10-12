@@ -195,10 +195,40 @@ type t = {
   baseline_mark_cleared : int;
   (* function names by flat index (diagnostic hot-sample rendering) *)
   fn_names : string array;
+  (* targeted caller attribution (TANGERINE_DEBUG_CALLEE_FN=<flat index>):
+     caller flat index -> call count; -1 disables *)
+  debug_callee_fn : int;
+  callee_edges : (int, int) Hashtbl.t;
   (* per-VM beacon clock (a process-global ref would attribute the
      inter-VM gap to the next VM's first dt) *)
   mutable beacon_prev_time : float;
 }
+
+(* targeted caller attribution flush: the top caller edges for the
+   TANGERINE_DEBUG_CALLEE_FN target, with the caller's name.  The counters
+   reset after each flush so successive flushes are per-interval. *)
+let flush_callee_edges (vm : t) : unit =
+  if vm.debug_callee_fn >= 0 then begin
+    let edges = Hashtbl.fold (fun k v acc -> (k, v) :: acc) vm.callee_edges [] in
+    let edges = List.sort (fun (_, a) (_, b) -> compare b a) edges in
+    let rec take n = function
+      | [] -> []
+      | _ when n <= 0 -> []
+      | x :: rest -> x :: take (n - 1) rest
+    in
+    List.iter
+      (fun (caller, count) ->
+        let cname =
+          if caller >= 0 && caller < Array.length vm.program.Seed_mir.functions
+          then vm.program.Seed_mir.functions.(caller).Seed_mir.name
+          else "?"
+        in
+        Printf.eprintf "VM HOTEDGE callee=%d caller=%d count=%d caller_name=%s\n%!"
+          vm.debug_callee_fn caller count cname)
+      (take 10 edges);
+    Hashtbl.reset vm.callee_edges
+  end
+
 
 let find_fn (vm : t) (inst : Instance_id.t) : int option =
   Hashtbl.find_opt vm.fn_index inst
@@ -372,7 +402,8 @@ let step_limit (vm : t) : unit =
                (Printf.sprintf " %s(fn%d)=%d" name fn count)
            end)
          top;
-       Printf.eprintf "VM HOT steps=%d top5:%s\n%!" vm.steps (Buffer.contents buf)
+       Printf.eprintf "VM HOT steps=%d top5:%s\n%!" vm.steps (Buffer.contents buf);
+       flush_callee_edges vm
      end
    end);
   (* Optional hard RSS ceiling (Linux /proc or macOS Mach — whichever
@@ -1966,6 +1997,16 @@ let rec exec_terminator (vm : t) (frame : frame) (term : Seed_mir.terminator) : 
                    (Printf.sprintf "call to unknown instance %s (in %s)"
                       (Seed_mir.print_instance inst) caller_name)
            in
+           (* targeted caller attribution: count caller -> callee edges
+              when this callee is the debug target *)
+           if vm.debug_callee_fn >= 0 && fn_idx = vm.debug_callee_fn then begin
+             let prev =
+               match Hashtbl.find_opt vm.callee_edges frame.fn with
+               | Some n -> n
+               | None -> 0
+             in
+             Hashtbl.replace vm.callee_edges frame.fn (prev + 1)
+           end;
            vm.frames <- frame :: vm.frames;
            vm.depth <- vm.depth + 1;
            if vm.depth > vm.limits.max_depth then
@@ -2667,6 +2708,11 @@ let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
               baseline_mark_cleared = !Vm_value.prof_mark_cleared;
               fn_names =
                 Array.map (fun f -> f.Seed_mir.name) program.Seed_mir.functions;
+              debug_callee_fn =
+                (match Sys.getenv_opt "TANGERINE_DEBUG_CALLEE_FN" with
+                | Some s -> (try int_of_string s with _ -> -1)
+                | None -> -1);
+              callee_edges = Hashtbl.create 64;
               beacon_prev_time = Unix.gettimeofday ();
              step_hist =
                (if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
@@ -2680,8 +2726,11 @@ let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
          (match Sys.getenv_opt "TANGERINE_DEBUG_STEPS" with
          | Some _ ->
              Array.iteri
-               (fun i name -> Printf.eprintf "VM FN %d %s\n" i name)
-               vm.fn_names
+               (fun i (f : Seed_mir.function_) ->
+                 Printf.eprintf "VM FN %d name=%s instance=%s\n" i
+                   f.Seed_mir.name
+                   (Seed_mir.print_instance f.Seed_mir.instance))
+               program.Seed_mir.functions
          | None -> ());
          (* host-binding profiling is per-VM diagnostics: clear the
             process-global table so a fresh VM's totals cannot include a
@@ -2743,6 +2792,7 @@ let last_run_steps = ref 0
 let last_steps () = !last_run_steps
 
 let print_final_telemetry (vm : t) : unit =
+  flush_callee_edges vm;
   if Sys.getenv_opt "TANGERINE_DEBUG_STEPS" <> None then
     Printf.eprintf
       "VM STEPS: %d (limit %d), host calls: %d (limit %d), copies: %d, pushes: %d, push copies: %d, set copies: %d, map replace scans: %d, set replace scans: %d, mark calls: %d, mark nodes: %d, mark cleared: %d\n"
