@@ -178,7 +178,34 @@ run was stopped once the map was captured; its frontier matched the
 previous run.  `cfg-done` being unchanged confirms the
 dep-walk snapshot copies were not on the manifest-closed preflight path.
 
-## 7. Conclusion and next lever
+## 7. Typed-HIR arena conversion (56c442e) and the pre-arena endpoint
+
+The audit identified the structural cause of the ~4.7 GB typecheck live set:
+typed expressions, statements and patterns were each stored once in the
+flat maps AND recursively embedded (owned copies) inside every ancestor
+record, so a leaf was retained once per ancestor (O(depth^2) live).  Three
+verified stages now reference children by NodeId instead — every typed
+node exists exactly once in `typed_exprs` / `typed_stmts` /
+`typed_patterns`; readers resolve ids (`typed_expr_at`, `typed_stmt_at`,
+`typed_pattern_at`; missing record = ICE finding); all flat maps stay in
+place; behavior is byte-identical (battery twice, plus a baseline-vs-final
+guest-report diff showing only the accessors' added definitions).
+
+Pre-arena endpoint measured by the progress trace (post-owner-interning,
+before the arena): at item 8064/8334 the checker had recorded
+`typed_exprs=507293 typed_stmts=73789 typed_patterns=65927
+expr_types=581082 call_targets=74387`, live 4657 MB / 6.23M regions at
+48.0e9 steps with dt=4.1s — i.e. the typecheck nearly completed before the
+mark-bound cliff; the arena stages remove the per-ancestor duplication of
+exactly those volumes.
+
+The decisive post-arena pinned-`o=40` run (with the progress trace, the
+`VM FN` instance map and targeted `HOTEDGE` attribution available) is the
+next measurement: if `typecheck-bodies-done` is reached, the staged
+sequence continues into materialize/deinit/oracle/snapshot submarkers, then
+MIR/mono, then authenticated cold/warm and repin.
+
+## 8. Conclusion and next lever
 
 The cfg quadratic is gone (structural and realized scaling guards enforce
 it), and the remaining step cost is legitimate linear work.  The binding
