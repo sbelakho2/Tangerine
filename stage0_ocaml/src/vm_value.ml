@@ -321,9 +321,51 @@ and mark_agg (a : agg) : unit =
     Array.iter mark_value_shared a.agg_elems
   end
 
+(* Slow deep-share marking watchdog (TANGERINE_DEBUG_SLOW_MARK=1): times
+   each top-level mark and reports operations >= 500 ms with the wall time,
+   the number of nodes marked and the root value kind.  A deep-share mark
+   is a HOST-side traversal, so it does not advance VM steps — a freeze in
+   the beacon is exactly what this names. *)
+let slow_mark_enabled =
+  lazy
+    (match Sys.getenv_opt "TANGERINE_DEBUG_SLOW_MARK" with
+    | Some "1" -> true
+    | _ -> false)
+
+let slow_mark_kind (v : t) : string =
+  match v with
+  | Array _ -> "array"
+  | Tuple _ -> "tuple"
+  | Struct _ -> "struct"
+  | Enum _ -> "enum"
+  | Closure _ -> "closure"
+  | Set _ -> "set"
+  | Map _ -> "map"
+  | Unit -> "unit"
+  | Bool _ -> "bool"
+  | Int _ -> "int"
+  | Float32 _ -> "f32"
+  | Float64 _ -> "f64"
+  | Char _ -> "char"
+  | String _ -> "string"
+  | Function _ -> "function"
+  | RawPtr _ -> "rawptr"
+  | Ref _ -> "ref"
+  | Null -> "null"
+  | MovedOut -> "moved"
+
 let arr_mark_shared_value (v : t) : unit =
   incr prof_mark_calls;
-  mark_value_shared v
+  if Lazy.force slow_mark_enabled then begin
+    let nodes_before = !prof_mark_nodes in
+    let t0 = Unix.gettimeofday () in
+    mark_value_shared v;
+    let dt = Unix.gettimeofday () -. t0 in
+    if dt >= 0.5 then
+      Printf.eprintf "VM SLOW MARK wall=%.3fs nodes=%d root_kind=%s\n%!" dt
+        (!prof_mark_nodes - nodes_before) (slow_mark_kind v)
+  end
+  else mark_value_shared v
 
 (* Capture a computed-value snapshot: mark the captured value shared (its
    array cells can no longer be written in place through any holder — a
