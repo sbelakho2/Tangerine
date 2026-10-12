@@ -172,9 +172,27 @@ and t = {
   mutable in_fork_child : bool;
 }
 
-(* Output helpers (the VM's printf/intrinsic path — audit §45). *)
-let emit_stdout (t : t) (s : string) : unit = Buffer.add_string t.stdout s
-let emit_stderr (t : t) (s : string) : unit = Buffer.add_string t.stderr s
+(* Output helpers (the VM's printf/intrinsic path — audit §45).
+
+   TANGERINE_DEBUG_GUEST_STREAMS=1 additionally TEES the guest streams to
+   the process stderr: the driver captures guest stdout/stderr into
+   buffers (bvr_stdout/bvr_stderr), so diagnostic guest printfs — e.g. the
+   kernel PHASE markers used for live-set attribution — are otherwise
+   invisible until a failure dump.  Diagnostic-only; it never changes
+   guest semantics or captured buffers. *)
+let debug_guest_streams =
+  lazy
+    (match Sys.getenv_opt "TANGERINE_DEBUG_GUEST_STREAMS" with
+    | Some "1" -> true
+    | _ -> false)
+
+let emit_stdout (t : t) (s : string) : unit =
+  Buffer.add_string t.stdout s;
+  if Lazy.force debug_guest_streams then prerr_string s
+
+let emit_stderr (t : t) (s : string) : unit =
+  Buffer.add_string t.stderr s;
+  if Lazy.force debug_guest_streams then prerr_string s
 let stdout_contents (t : t) : string = Buffer.contents t.stdout
 let stderr_contents (t : t) : string = Buffer.contents t.stderr
 
