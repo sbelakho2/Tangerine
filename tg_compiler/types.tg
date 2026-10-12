@@ -3896,8 +3896,31 @@ struct TypeEnv
   # renders owner + name/id instead of a line — the best available without
   # that widening.
   typed_node_spans: Map[Int, Span] = Map::new()
+  # (owner-label interning — live-set reduction): the per-node/per-local owner
+  # channels. The OBSERVABLE maps typed_node_owners / typed_local_owners keep
+  # their Map[Int, String] shape: compiler_core's release path assigns them
+  # `Map::new()`, and the out-of-file probe readers (infer_probe's NR/NL dumps,
+  # span_probe's CTX rows) match an `Option[String]` arm against a
+  # `"".to_string()` arm, so their value type is pinned by external call sites
+  # to String (a Map[Int, Int] value makes those match arms fail the arm
+  # unification — verified against the real closure check). The hot recording
+  # path therefore writes the interned owner INDEX into the parallel _idx
+  # channels instead: one Int per node/local instead of a deep String clone per
+  # node/local (the label is interned ONCE per item/method in owner_table).
+  # The observable maps are materialized from the _idx channels once at the
+  # END of the typed check (materialize_owner_label_maps), so every reader —
+  # in-file and out-of-file — observes byte-identical values, while the
+  # per-node String copies no longer exist during whole-closure body checking
+  # (the live-set wall).
   typed_node_owners: Map[Int, String] = Map::new()
   typed_local_owners: Map[Int, String] = Map::new()
+  typed_node_owners_idx: Map[Int, Int] = Map::new()
+  typed_local_owners_idx: Map[Int, Int] = Map::new()
+  # The intern table: owner_table is the index -> label authority (deep-cloned
+  # with the env); owner_intern is its reverse lookup (kept consistent with the
+  # Vec by construction — every insert happens in intern_owner_label).
+  owner_table: Vec[String] = Vec::new()
+  owner_intern: Map[String, Int] = Map::new()
   # typed_fn_signatures / typed_static_types key -> the declaration span
   # (the gate's located rendering for those channels).
   typed_sig_spans: Map[String, Span] = Map::new()
@@ -3907,6 +3930,10 @@ struct TypeEnv
   # recorded with every typed node and local. Saved/restored around each
   # body check (nesting-safe).
   current_item_label: String = ""
+  # The current item's interned owner index (see owner_table): the value the
+  # per-node/per-local recording actually stores. -1 = no item in progress.
+  # Saved/restored in lockstep with current_item_label.
+  current_item_owner: Int = -1
   typed_ident_resolutions: Map[Int, Int]
   # (semantic field defaults): expr node id -> the checker's resolved
   # GLOBAL binding for that identifier (GlobalBinding — a static, an enum
@@ -4210,9 +4237,14 @@ impl Clone for TypeEnv
       typed_node_spans: self.typed_node_spans.clone(),
       typed_node_owners: self.typed_node_owners.clone(),
       typed_local_owners: self.typed_local_owners.clone(),
+      typed_node_owners_idx: self.typed_node_owners_idx.clone(),
+      typed_local_owners_idx: self.typed_local_owners_idx.clone(),
+      owner_table: self.owner_table.clone(),
+      owner_intern: self.owner_intern.clone(),
       typed_sig_spans: self.typed_sig_spans.clone(),
       typed_static_spans: self.typed_static_spans.clone(),
       current_item_label: self.current_item_label.clone(),
+      current_item_owner: self.current_item_owner.clone(),
       typed_ident_resolutions: self.typed_ident_resolutions.clone(),
       typed_global_bindings: self.typed_global_bindings.clone(),
       param_binding_resolutions: self.param_binding_resolutions.clone(),
@@ -8993,6 +9025,52 @@ end
 # Scope Management
 # ———————————————————————————————————————————————————————————————
 
+# The owner-label intern table (see the TypeEnv field note): returns the
+# existing index for an equal label or appends a new entry. Called ONCE per
+# item/method at the current_item_label assignment points (never per node),
+# so the same label is materialized exactly once per compilation.
+pub def intern_owner_label(inout env: TypeEnv, label: String) -> Int
+  match env.owner_intern.get(&label)
+  when Option::Some(owner_index) then owner_index
+  when Option::None then
+    let owner_index = env.owner_table.len()
+    env.owner_table.push(label.clone())
+    env.owner_intern.insert(label, owner_index)
+    owner_index
+  end
+end
+
+# The index -> label resolution (clone for the caller). The intern is
+# injective by construction, so the returned String is byte-identical to the
+# label the index was interned from; an out-of-range index (no owner
+# recorded) renders the empty label exactly like the old absent-map case.
+pub def owner_label_of(env: TypeEnv, owner_index: Int) -> String
+  if owner_index >= 0 && owner_index < env.owner_table.len() then
+    env.owner_table[owner_index].clone()
+  else
+    "".to_string()
+  end
+end
+
+# Materialize the OBSERVABLE String owner maps from the interned _idx
+# channels (called once at the very end of the typed check — after every
+# in-file reader has resolved through the intern table, and before any
+# out-of-file reader can observe the env). Every inserted String is
+# owner_label_of(index), so the observable map content is byte-identical to
+# what the per-node String recording produced before. The interned channels
+# are released here: nothing reads them afterwards, and compiler_core's
+# channel release only clears the observable maps.
+def materialize_owner_label_maps(inout env: TypeEnv) -> Unit
+  for (node_id, owner_index) in env.typed_node_owners_idx do
+    env.typed_node_owners.insert(node_id, owner_label_of(env, owner_index))
+  end
+  for (local_id, owner_index) in env.typed_local_owners_idx do
+    env.typed_local_owners.insert(local_id, owner_label_of(env, owner_index))
+  end
+  env.typed_node_owners_idx.clear()
+  env.typed_local_owners_idx.clear()
+end
+
 def push_scope(inout env: TypeEnv) -> Unit
   let m: Map[String, Type] = Map::new()
   env.scopes.push(m)
@@ -9019,8 +9097,10 @@ def bind_var_typed(inout env: TypeEnv, name: String, scope_ty: Type, binding_ty:
     # (gate diagnostics): the binding's owning item rides a parallel map
     # (the LocalBinding record and its channel stay unchanged — see the
     # TypeEnv field note); the gate renders owner + name/id for a local
-    # whose type is unresolved.
-    env.typed_local_owners.insert(env.local_id_counter, env.current_item_label.clone())
+    # whose type is unresolved. The hot path stores the interned owner
+    # INDEX; the observable String channel is materialized once at the end
+    # of the check (materialize_owner_label_maps).
+    env.typed_local_owners_idx.insert(env.local_id_counter, env.current_item_owner)
     env.local_id_counter = env.local_id_counter + 1
   end
 end
@@ -10955,7 +11035,9 @@ def check_declared_field_defaults(inout env: TypeEnv, program: Program) -> Unit
           match get_type_by_id_ref(env, tid.clone())
           when Option::Some(td) then
             let prev_label = env.current_item_label.clone()
+            let prev_owner = env.current_item_owner
             env.current_item_label = "field defaults of struct " + s.name.clone()
+            env.current_item_owner = intern_owner_label(env, env.current_item_label.clone())
             push_scope(env)
             bind_generic_params(env, &s.generic_params, &td.generic_params)
             push_unit_const_param_scope(env, td.generic_params.clone())
@@ -10994,6 +11076,7 @@ def check_declared_field_defaults(inout env: TypeEnv, program: Program) -> Unit
             pop_unit_const_param_scope(env)
             pop_scope(env)
             env.current_item_label = prev_label
+            env.current_item_owner = prev_owner
           when Option::None then ()
           end
         when Option::None then ()
@@ -11356,6 +11439,12 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
   i = 0
   env.check_ctx = "pass4-check"
   module_ptr = 0
+  # (body-check progress trace — diagnostic only): with
+  # build/phase_trace.flag present, every 128 top-level items processed
+  # append one line to this buffer and rewrite build/typecheck_progress.txt
+  # so the file always carries the full history. No flag -> the only added
+  # cost is the file_exists check below (once per 128 items).
+  var typecheck_progress: Vec[String] = Vec::new()
   while i < program.items.len() do
     let item = program.items[i]
     let (owner_path, next_module_ptr) = module_path_of_item(program, module_ptr, i)
@@ -11368,6 +11457,16 @@ def type_check_program_env(inout env: TypeEnv, program: Program) -> Unit
     env.current_module_path = owner_path.clone()
     check_item(env, program, item, i)
     i = i + 1
+    if i % 128 == 0 then
+      if std::fs::file_exists("build/phase_trace.flag".to_string()) then
+        typecheck_progress.push("items=" + i.to_string() + " typed_exprs=" + env.typed_exprs.len().to_string() + " typed_stmts=" + env.typed_stmts.len().to_string() + " typed_patterns=" + env.typed_patterns.len().to_string() + " expr_types=" + env.typed_expr_types.len().to_string() + " call_targets=" + env.typed_call_targets.len().to_string())
+        var progress_text = "".to_string()
+        for progress_line in typecheck_progress do
+          progress_text = progress_text + progress_line.clone() + "\n"
+        end
+        let _ = std::fs::write_file("build/typecheck_progress.txt", progress_text)
+      end
+    end
   end
   
  # (effect discipline): after every function body is checked, close
@@ -12296,7 +12395,9 @@ def check_item(inout env: TypeEnv, program: Program, item: Item, item_idx: Int) 
     env.check_ctx = "const:" + c.name
     # (gate diagnostics): the initializer's owning-item label.
     let prev_item_label = env.current_item_label.clone()
+    let prev_item_owner = env.current_item_owner
     env.current_item_label = "const " + c.name
+    env.current_item_owner = intern_owner_label(env, env.current_item_label.clone())
     push_scope(env)
     let const_ty = match c.ty
     when Option::Some(ty_expr) then resolve_type_expr(env, &ty_expr)
@@ -12315,12 +12416,15 @@ def check_item(inout env: TypeEnv, program: Program, item: Item, item_idx: Int) 
     unify(env, value_ty, const_ty, c.span)
     pop_scope(env)
     env.current_item_label = prev_item_label
+    env.current_item_owner = prev_item_owner
   when ItemKind::ItemStatic(s) then
     # Check static variable initializer (already registered in pass 3)
     env.check_ctx = "static:" + s.name
     # (gate diagnostics): the initializer's owning-item label.
     let prev_item_label = env.current_item_label.clone()
+    let prev_item_owner = env.current_item_owner
     env.current_item_label = "static " + s.name
+    env.current_item_owner = intern_owner_label(env, env.current_item_label.clone())
     push_scope(env)
     let static_ty = resolve_type_expr(env, &s.ty)
  # (channel b): a static whose type is (or contains) the RAW Slice
@@ -12335,6 +12439,7 @@ def check_item(inout env: TypeEnv, program: Program, item: Item, item_idx: Int) 
     unify(env, value_ty, static_ty, s.span)
     pop_scope(env)
     env.current_item_label = prev_item_label
+    env.current_item_owner = prev_item_owner
   when ItemKind::ItemEffectDecl(e) then
     # The algebraic-effects typed registration (pass 4 — every referenced
     # type resolves here): intern the semantic EffectId (idempotent — the
@@ -14116,7 +14221,9 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   # nested checks (impl methods, const/static initializers) can never leak
   # a stale label into a later body.
   let prev_item_label = env.current_item_label.clone()
+  let prev_item_owner = env.current_item_owner
   env.current_item_label = f.name.clone()
+  env.current_item_owner = intern_owner_label(env, env.current_item_label.clone())
   
   # Register generic type parameters in scope. the ids were
   # interned in pass 3 under f_owner (item_owner_def — the item's DefId or
@@ -14254,6 +14361,7 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   env.current_fn_key = ""
   env.expected_return = Option::None
   env.current_item_label = prev_item_label
+  env.current_item_owner = prev_item_owner
   
   pop_unit_const_param_scope(env)
   pop_scope(env)
@@ -15308,7 +15416,9 @@ def check_impl_bodies(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String],
     # type + method name the gate renders with every typed node/local of
     # this body; saved/restored per method.
     let prev_item_label = env.current_item_label.clone()
+    let prev_item_owner = env.current_item_owner
     env.current_item_label = type_display(env, &st.self_type) + "::" + m.name.clone()
+    env.current_item_owner = intern_owner_label(env, env.current_item_label.clone())
 
  # Register method-level generic type parameters in scope. the
     # ids were interned in the signature pass under the same owner
@@ -15436,6 +15546,7 @@ def check_impl_bodies(inout env: TypeEnv, i: ImplDecl, method_keys: Vec[String],
     env.current_fn_key = ""
     env.expected_return = Option::None
     env.current_item_label = prev_item_label
+    env.current_item_owner = prev_item_owner
 
     pop_unit_const_param_scope(env)
     pop_scope(env)
@@ -16709,9 +16820,11 @@ def check_stmt_expected(inout env: TypeEnv, stmt: Stmt, expected: Option[Type], 
   if stmt.node_id != 0 then
     env.typed_expr_types.insert(stmt.node_id, result.normal.clone())
     # (gate diagnostics): the statement node's own span + owning item — the
-    # located origin the readiness gate renders for this node.
+    # located origin the readiness gate renders for this node. The owner is
+    # the interned index (see the TypeEnv owner-channel note); the
+    # observable String map is materialized once at the end of the check.
     env.typed_node_spans.insert(stmt.node_id, stmt.span.clone())
-    env.typed_node_owners.insert(stmt.node_id, env.current_item_label.clone())
+    env.typed_node_owners_idx.insert(stmt.node_id, env.current_item_owner)
  # (phase 2): the typed statement record — assembled from the
     # recorded children (the composite expression kinds of the tree carry
     # their blocks' TypedStmt children). A missing child (the
@@ -25800,8 +25913,10 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
     # (gate diagnostics): the node's own span + owning item — recorded in
     # lockstep with the typed channels; the readiness gate renders the true
     # file:line from this span (and the item when only the owner is known).
+    # The owner is the interned index (see the TypeEnv owner-channel note);
+    # the observable String map is materialized once at the end of the check.
     env.typed_node_spans.insert(expr.node_id, expr.span.clone())
-    env.typed_node_owners.insert(expr.node_id, env.current_item_label.clone())
+    env.typed_node_owners_idx.insert(expr.node_id, env.current_item_owner)
   end
   adopted
 end
@@ -31625,10 +31740,12 @@ def gate_span_is_knock_on(located: Vec[Span], span: Span) -> Bool
 end
 
 # The owning-item label recorded for a typed node ("") — the message
-# annotation of a located gate row.
+# annotation of a located gate row. Resolved through the intern table
+# (owner_label_of clones the label, byte-identical to the per-node String
+# the channel carried before the interning); no reader observes a difference.
 def gate_node_owner(env: TypeEnv, node_id: Int) -> String
-  match env.typed_node_owners.get(node_id)
-  when Option::Some(label) then label
+  match env.typed_node_owners_idx.get(node_id)
+  when Option::Some(owner_index) then owner_label_of(env, owner_index)
   when Option::None then "".to_string()
   end
 end
@@ -31753,9 +31870,10 @@ def verify_codegen_readiness(inout env: TypeEnv) -> Unit
       # located span. Its same-item signal is the owning label: suppress only
       # when the local's item already carries a located root cause; otherwise
       # ANNOTATE the row with the local name + owner (def name + binding id)
-      # so it stays traceable. It never fabricates a location.
-      let owner = match env.typed_local_owners.get(lid)
-      when Option::Some(label) then label
+      # so it stays traceable. It never fabricates a location. Resolved
+      # through the intern table (byte-identical owner text).
+      let owner = match env.typed_local_owners_idx.get(lid)
+      when Option::Some(owner_index) then owner_label_of(env, owner_index)
       when Option::None then "".to_string()
       end
       let owner_located = owner.len() > 0 && located_owners.contains(&owner)
@@ -33297,9 +33415,14 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
   env.typed_node_spans.clear()
   env.typed_node_owners.clear()
   env.typed_local_owners.clear()
+  env.typed_node_owners_idx.clear()
+  env.typed_local_owners_idx.clear()
+  env.owner_table.clear()
+  env.owner_intern.clear()
   env.typed_sig_spans.clear()
   env.typed_static_spans.clear()
   env.current_item_label = ""
+  env.current_item_owner = -1
   env.typed_ident_resolutions.clear()
   env.typed_global_bindings.clear()
   env.param_binding_resolutions.clear()
@@ -33730,6 +33853,13 @@ def type_check_typed_mode(inout env: TypeEnv, program: Program, resolutions: Res
     resource_errors: Vec::new()
   }
   phase_trace("engine-snapshot-done")
+  # (owner-label interning — final step): materialize the observable String
+  # owner maps from the interned channels. This runs after every in-file
+  # reader (the readiness gate resolves through the intern table) and after
+  # the TypedProgram snapshot is assembled, so the per-node String copies
+  # never exist during whole-closure body checking (the live-set wall) —
+  # while every out-of-file reader still observes byte-identical maps.
+  materialize_owner_label_maps(env)
   TypeCheckResult {
     errors: env.errors.clone(),
     program: placeholder_artifact
