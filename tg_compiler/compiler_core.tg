@@ -1753,8 +1753,11 @@ end
 # the caller checks diag_has_errors on it and returns the failed state before
 # any lowering happens.
 pub def prepare_parsed(inout program: Program, inout diags: Vec[Diagnostic]) -> Unit
-  let expanded = expand_macros(program.clone(), diags)
-  *program = expanded
+  # (in-place expansion): the inout entry reads the caller's place and
+  # assigns the ONE result back through it — the former transient
+  # whole-program `program.clone()` argument is eliminated. The result is
+  # identical (same AST; assign_node_ids below numbers the same tree).
+  expand_macros_inout(&mut program, &mut diags)
   assign_node_ids(program)
 end
 
@@ -2210,11 +2213,10 @@ pub def analyze_parsed(inout env: TypeEnv, inout program: Program, opts: Compile
     # (lower_program takes it) — resource_check is never re-run during
     # lowering.
     Result::Ok(AnalyzedProgram {
+      # the program / resolver snapshots live ONLY on the typed HIR
+      # (typed.ast / typed.resolutions); the artifact no longer carries
+      # parallel deep copies of either.
       typed: typed,
-      # the library API (lib.tg / lib_kernel.tg) reads ast / resolutions
-      # directly off the analyze result (compile/check).
-      ast: typed.ast.clone(),
-      resolutions: typed.resolutions.clone(),
       cfg: res_result.cfg,
       finalize_plan: res_result.finalize_plan,
       # (fourth-audit P0-17) the emitted typed drop-plan facts ride the
@@ -3210,7 +3212,7 @@ pub def compile_file_core(path: String, opts: CompilerOptions, inout emitter: Di
   # CallableLineageView and the mono_cache_new_persistent cache); this
   # module is inside the bootstrap kernel closure and must never import
   # that full-library entry (see the module doc of finalize.tg).
-  when Option::Some(tp) then mono_cache_new_ephemeral(&ast, &tp.resolutions)
+  when Option::Some(tp) then mono_cache_new_ephemeral(&ast, &tp.typed.resolutions)
   when Option::None then return Result::Err("monomorphization requires a typed program")
   end
   match monomorphize_program(&mut mir, &mut mono_cache)
@@ -3781,7 +3783,7 @@ pub def compile_startup_entry(opts: CompilerOptions, path: String, output_path: 
     println("  Monomorphizing generics...")
   end
   var mono_cache = match typed_program
-  when Option::Some(tp) then mono_cache_new_ephemeral(&ast, &tp.resolutions)
+  when Option::Some(tp) then mono_cache_new_ephemeral(&ast, &tp.typed.resolutions)
   when Option::None then return 1
   end
   match monomorphize_program(&mut mir, &mut mono_cache)
@@ -4837,6 +4839,19 @@ end
 # skip-semantic-checks paths) checks diag_has_errors on the bag and returns
 # the failed state before lowering.
 pub def expand_macros(program: Program, inout diags: Vec[Diagnostic]) -> Program
+  var current = program
+  expand_macros_inout(&mut current, diags)
+  current
+end
+
+# (in-place entry, semantics-preserving): prepare_parsed calls THIS form
+# directly — the former whole-program `program.clone()` argument is not
+# needed. The expansion only READS its input until the single result is
+# assigned back through `*program` at the end, and the value form above
+# delegates here so every other caller keeps the identical signature
+# (its `var current = program` binds a shared read and the inout call is
+# copy-in/copy-out — no deep clone on either path).
+def expand_macros_inout(inout program: Program, inout diags: Vec[Diagnostic]) -> Unit
   # Phase 1: collect macro declarations, MODULE-SCOPED. Every macro registers
   # under the module path of its owning module (from Program.crate's module
   # table, read via the item's OWNER ModuleId — module_path_for_item is a
@@ -4888,7 +4903,7 @@ pub def expand_macros(program: Program, inout diags: Vec[Diagnostic]) -> Program
   # pending when this early return is taken; the single drain below covers
   # every recorded macro diagnostic).
   if env.macros.is_empty() then
-    return program
+    return
   end
 
   # Phase 2: iteratively expand until fixpoint (max 64 passes).
@@ -4900,7 +4915,7 @@ pub def expand_macros(program: Program, inout diags: Vec[Diagnostic]) -> Program
   # nesting depth. If the fixpoint has not converged when the cap is hit,
   # residual ExprMacroCall nodes remain — that is the E105 failure recorded
   # below after the macro definitions are filtered out.
-  var current = program
+  var current = *program
   var pass = 0
   while pass < 64 do
     let expanded_result = expand_program_pass(&env, current)
@@ -4975,7 +4990,7 @@ pub def expand_macros(program: Program, inout diags: Vec[Diagnostic]) -> Program
     diag_macro_expansion_depth_exceeded(diags, residual_calls[0].span.clone())
   end
 
-  filtered_program
+  *program = filtered_program
 end
 
 # ───────────────────────────────────────────────────────────────────────
@@ -5212,7 +5227,10 @@ pub def expand_program_pass(env: MacroEnv, program: Program) -> ExpandedProgram
     # (then absolutely, then through import aliases).
     env.current_module = module_path_for_item(&program, i)
     let expanded_item = expand_item(env, program.items[i].clone())
-    new_items.push(expanded_item.item.clone())
+    # (fresh value, moved): expanded_item is a local used ONCE — the
+    # former `.item.clone()` deep-copied every expanded item (the whole
+    # program, per pass) just to hand a fresh value to push.
+    new_items.push(expanded_item.item)
     if expanded_item.did_expand then did_expand = true end
     i = i + 1
   end
@@ -5263,7 +5281,8 @@ pub def expand_item(env: MacroEnv, item: Item) -> ExpandedItem
     var did_expand = false
     for method in impl_block.methods do
       let expanded_method = expand_function_decl(env, &method)
-      new_methods.push(expanded_method.func.clone())
+      # (fresh value, moved): single-use local — no duplicate deep copy.
+      new_methods.push(expanded_method.func)
       if expanded_method.did_expand then did_expand = true end
     end
     let new_impl = ImplDecl {
@@ -5293,7 +5312,8 @@ pub def expand_item(env: MacroEnv, item: Item) -> ExpandedItem
     var did_expand = false
     for ti in trait_decl.methods do
       let expanded = expand_trait_method(env, ti)
-      new_methods.push(expanded.method.clone())
+      # (fresh value, moved): single-use local — no duplicate deep copy.
+      new_methods.push(expanded.method)
       if expanded.did_expand then did_expand = true end
     end
     let new_trait = TraitDecl {
@@ -6602,7 +6622,7 @@ pub def compile_multiple_files(opts: CompilerOptions, files: Vec[String], output
     println("  Monomorphizing generics...")
   end
   var mono_cache = match typed_program
-  when Option::Some(tp) then mono_cache_new_ephemeral(&ast, &tp.resolutions)
+  when Option::Some(tp) then mono_cache_new_ephemeral(&ast, &tp.typed.resolutions)
   when Option::None then return 1
   end
   match monomorphize_program(&mut mir, &mut mono_cache)
