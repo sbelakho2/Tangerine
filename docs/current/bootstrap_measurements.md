@@ -130,7 +130,41 @@ The pinned-`o=40` preflight completion attempt then re-runs on this batch;
 its phase markers measure the new trajectory against the section-4
 baseline.
 
-## 6. Conclusion and next lever
+## 6. Post-reduction staircase and the current frontier (428265b)
+
+Re-run of the pinned-`o=40` standalone preflight on the retention batch
+(with phase markers and the typechecker submarkers):
+
+| Marker | pre-batch steps / live | post-batch steps / live |
+|---|---:|---:|
+| cfg-done | 26.2e9 / 1533 MB | 26.2e9 / 1533 MB |
+| macro-done | 32.0e9 / 3962 MB | **29.1e9 / 2833 MB** |
+| resolve-done | ~33e9 / ~4000 MB | **30.7e9 / 2909 MB** |
+| typecheck-begin | ~33e9 | **30.7e9 / 2909 MB** |
+| typecheck-bodies-done | not reached | not reached |
+
+The macro-expansion reduction is measured: -2.9e9 steps and -1.13 GB live
+at macro-done, and the typecheck now starts ~1.1 GB lower.  Throughput past
+the old collapse point is stable (47.9e9 steps at dt=4.7s/100M where the
+pre-batch run had collapsed to 20+s and then stalled), and live regions in
+the typecheck are ~6.2M (was ~10.4M).
+
+The frontier has nevertheless NOT moved past the typecheck: the run enters
+the mark-bound stall at ~47.9e9 steps with live 4714 MB / 6.22M regions,
+still before `typecheck-bodies-done` — i.e. inside the whole-closure body
+checking itself.  The VM profile at the stall names `clone` (fn502,
+1.9e9+ steps and growing) as the active hot function; `TANGERINE_DEBUG_STEPS`
+now also dumps the flat `VM FN <index> <name>` map so that instance can be
+identified exactly in the next run (several methods share the name
+`clone`).
+
+Next lever (staged process): identify fn502 from the next run's `VM FN`
+map and attack that specific checker structure's clone/live cost — or
+reduce the checker's accumulated per-node channel representation — before
+any further measurement or repin.  `cfg-done` being unchanged confirms the
+dep-walk snapshot copies were not on the manifest-closed preflight path.
+
+## 7. Conclusion and next lever
 
 The cfg quadratic is gone (structural and realized scaling guards enforce
 it), and the remaining step cost is legitimate linear work.  The binding
