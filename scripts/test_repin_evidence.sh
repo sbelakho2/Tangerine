@@ -89,6 +89,8 @@ HOST_CALLS_LIMIT=1000000
 HOST_CALLS_SOURCE=vm_summary
 ALLOC_BYTES=700000000
 WALL_PHASE_SUM_S=100.0
+RUN_CACHE_MODE=UNSPECIFIED
+VM_B_CACHE_HIT=UNKNOWN
 EOF
   if [ "$kind" = "aggregate" ]; then
     cat >>"$path" <<EOF
@@ -155,16 +157,22 @@ set_kv "$TMP/cold" RUN_LABEL cold
 set_kv "$TMP/warm" RUN_LABEL warm
 set_kv "$TMP/cold" FINAL_STEPS 1000000
 set_kv "$TMP/warm" FINAL_STEPS 2000000
-run_case "standalone COMPLETED+PASS" accept "$TMP/cold" "$TMP/warm"
+# calibration provenance: a genuine --cold run (cache rebuilt) followed by
+# a genuine --warm run (prepared-VM cache HIT)
+set_kv "$TMP/cold" RUN_CACHE_MODE COLD
+set_kv "$TMP/cold" VM_B_CACHE_HIT 0
+set_kv "$TMP/warm" RUN_CACHE_MODE WARM
+set_kv "$TMP/warm" VM_B_CACHE_HIT 1
+run_case "standalone COLD+WARM COMPLETED+PASS" accept "$TMP/cold" "$TMP/warm"
 if grep -q '^PROPOSED_STEPS_LIMIT=2300000$' "$TMP/out.txt"; then
   pass "standalone margin formula: steps = ceil(2000000*1.15) = 2300000"
 else
   bad "standalone margin formula: expected PROPOSED_STEPS_LIMIT=2300000"
 fi
-if grep -q '^PROPOSED_WALL_TIMEOUT_S=180$' "$TMP/out.txt"; then
-  pass "standalone wall margin: ceil(100*1.5/60)*60 = 180"
+if grep -q '^PROPOSED_WALL_TIMEOUT_S=UNCHANGED$' "$TMP/out.txt"; then
+  pass "standalone wall timeout SKIPPED (outer gate timeout stays provisional)"
 else
-  bad "standalone wall margin: expected PROPOSED_WALL_TIMEOUT_S=180"
+  bad "standalone wall timeout: expected PROPOSED_WALL_TIMEOUT_S=UNCHANGED"
 fi
 
 # ── COMPLETED + FAIL ─────────────────────────────────────────────────
@@ -309,11 +317,52 @@ if [ "$rc" -ne 0 ]; then
   sed -n '1,6p' "$TMP/apply_ok.txt" >&2
 elif ! grep -q '^export TANGERINE_BOOTSTRAP_VM_MAX_STEPS=2300000$' "$gate_copy"; then
   bad "apply complete proposal set: steps pin not rewritten"
-elif ! grep -q '^GATE_TIMEOUT_S=180$' "$gate_copy"; then
-  bad "apply complete proposal set: wall pin not rewritten"
+elif ! grep -q '^GATE_TIMEOUT_S=4140$' "$gate_copy"; then
+  bad "apply complete proposal set: standalone apply must NOT rewrite the outer gate timeout"
 else
-  pass "apply complete proposal set: pins rewritten on the temp copy"
+  pass "apply complete proposal set: VM pins rewritten, outer timeout left provisional"
 fi
+
+# ── GC-POLICY BINDING: a repin measured under another host-GC policy must
+#    never authorize the o=40 gate; --adopt-gc-policy is the deliberate
+#    atomic alternative ─────────────────────────────────────────────────
+cp "$TMP/cold" "$TMP/cold80"
+cp "$TMP/warm" "$TMP/warm80"
+set_kv "$TMP/cold80" RUN_GC_POLICY o=80
+set_kv "$TMP/warm80" RUN_GC_POLICY o=80
+cp "$GATE" "$TMP/gate_policy.sh"
+rc=0
+python3 "$REPIN" --apply --gate-script "$TMP/gate_policy.sh" "$TMP/cold80" "$TMP/warm80" >"$TMP/apply_policy.txt" 2>&1 || rc=$?
+if [ "$rc" -ne 0 ] && grep -q "does not match the authorization policy" "$TMP/apply_policy.txt"; then
+  if grep -q '^export OCAMLRUNPARAM=o=40$' "$TMP/gate_policy.sh"; then
+    pass "GC-policy binding: apply refuses o=80 metrics against the o=40 gate (gate untouched)"
+  else
+    bad "GC-policy binding: gate policy changed despite refusal"
+  fi
+else
+  bad "GC-policy binding: expected a refusal citing the authorization policy (rc=${rc})"
+  sed -n '1,6p' "$TMP/apply_policy.txt" >&2
+fi
+
+cp "$GATE" "$TMP/gate_adopt.sh"
+rc=0
+python3 "$REPIN" --apply --adopt-gc-policy o=80 --gate-script "$TMP/gate_adopt.sh" "$TMP/cold80" "$TMP/warm80" >"$TMP/apply_adopt.txt" 2>&1 || rc=$?
+if [ "$rc" -eq 0 ] && grep -q '^export OCAMLRUNPARAM=o=80$' "$TMP/gate_adopt.sh"; then
+  pass "GC-policy adoption: o=80 metrics + --adopt-gc-policy rewrite the gate policy atomically"
+else
+  bad "GC-policy adoption: expected rc=0 and the gate pin rewritten to o=80 (rc=${rc})"
+  sed -n '1,8p' "$TMP/apply_adopt.txt" >&2
+fi
+
+cp "$TMP/cold" "$TMP/cold_badcache"
+cp "$TMP/warm" "$TMP/warm_badcache"
+set_kv "$TMP/cold_badcache" RUN_CACHE_MODE WARM
+set_kv "$TMP/cold_badcache" VM_B_CACHE_HIT 1
+run_case "cache provenance: warm/warm masquerade" reject "$TMP/cold_badcache" "$TMP/warm"
+
+cp "$TMP/warm" "$TMP/warm_missed"
+set_kv "$TMP/warm_missed" VM_B_CACHE_HIT 0
+run_case "cache provenance: warm run that missed the prepared cache" reject "$TMP/cold" "$TMP/warm_missed"
 
 if [ "$fail" -ne 0 ]; then
   echo "test_repin_evidence: FAIL"

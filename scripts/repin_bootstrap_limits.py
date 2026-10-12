@@ -96,8 +96,8 @@ def usage(msg: str | None = None) -> "NoReturn":  # noqa: F821
         print(f"repin_bootstrap_limits: {msg}", file=sys.stderr)
     print(
         "usage: scripts/repin_bootstrap_limits.py [--apply] [--driver-defaults]\n"
-        "           [--gate-script PATH] [--driver-path PATH] [--sha SHA]\n"
-        "           [--target TRIPLE] COLD_METRICS WARM_METRICS",
+        "           [--adopt-gc-policy o=N] [--gate-script PATH] [--driver-path PATH]\n"
+        "           [--sha SHA] [--target TRIPLE] COLD_METRICS WARM_METRICS",
         file=sys.stderr,
     )
     sys.exit(2)
@@ -111,6 +111,13 @@ def parse_args(argv: list[str]) -> dict:
         "driver_path": DEFAULT_DRIVER,
         "sha": None,
         "target": None,
+        # --apply binds the measured RUN_GC_POLICY to the authorization
+        # gate's hard-pinned OCAMLRUNPARAM.  Changing the host-GC policy is
+        # a DELIBERATE, atomic operation: --adopt-gc-policy o=N requires the
+        # cold/warm runs to share exactly that policy AND rewrites the gate
+        # pin together with the budgets.
+        "adopt_gc_policy": None,
+        "gate_gc_policy": None,
     }
     positional: list[str] = []
     i = 0
@@ -120,6 +127,11 @@ def parse_args(argv: list[str]) -> dict:
             opts["apply"] = True
         elif a == "--driver-defaults":
             opts["driver_defaults"] = True
+        elif a == "--adopt-gc-policy":
+            if i + 1 >= len(argv):
+                usage("--adopt-gc-policy needs a value (e.g. o=80)")
+            opts["adopt_gc_policy"] = argv[i + 1].strip()
+            i += 1
         elif a in ("--gate-script", "--driver-path", "--sha", "--target"):
             if i + 1 >= len(argv):
                 usage(f"{a} needs a value")
@@ -252,6 +264,53 @@ def validate(cold: dict[str, str], warm: dict[str, str], opts: dict) -> list[str
     if opts["target"]:
         if opts["target"] not in (cold.get("RUN_TARGET"), warm.get("RUN_TARGET")):
             errors.append(f"--target {opts['target']} does not match the measured RUN_TARGET")
+
+    # ── calibration provenance: a repin pair must be a genuinely COLD run
+    #    followed by a genuinely WARM one (standalone logs carry both the
+    #    mode and the selfcheck prepared-VM cache verdict) ────────────────
+    if cold.get("LOG_KIND") == "standalone":
+        c_mode = cold.get("RUN_CACHE_MODE", "UNKNOWN")
+        w_mode = warm.get("RUN_CACHE_MODE", "UNKNOWN")
+        c_hit = cold.get("VM_B_CACHE_HIT", "UNKNOWN")
+        w_hit = warm.get("VM_B_CACHE_HIT", "UNKNOWN")
+        if c_mode != "COLD" or c_hit != "0":
+            errors.append(
+                f"cold block RUN_CACHE_MODE={c_mode} VM_B_CACHE_HIT={c_hit},"
+                " want COLD/0 (run scripts/profile_ocaml_bootstrap.sh --cold)"
+            )
+        if w_mode != "WARM" or w_hit != "1":
+            errors.append(
+                f"warm block RUN_CACHE_MODE={w_mode} VM_B_CACHE_HIT={w_hit},"
+                " want WARM/1 (run --warm after --cold; a warm run that missed"
+                " the prepared-VM cache is not warm)"
+            )
+
+    # ── GC-policy binding: resource limits measured under one host-GC
+    #    policy must never silently authorize another ────────────────────
+    policy = cold.get("RUN_GC_POLICY", "UNKNOWN")
+    gate_policy = opts.get("gate_gc_policy")
+    if opts.get("apply"):
+        target_policy = opts.get("adopt_gc_policy") or gate_policy
+        if target_policy is None:
+            errors.append(
+                "cannot read the authorization gate GC policy"
+                " (export OCAMLRUNPARAM=...) from --gate-script"
+            )
+        elif policy != target_policy:
+            errors.append(
+                f"measured RUN_GC_POLICY={policy} does not match the"
+                f" authorization policy {target_policy}; a repin measured"
+                " under a different host-GC policy must not authorize it"
+                " (use --adopt-gc-policy DELIBERATELY to change both)"
+            )
+    elif gate_policy and policy != gate_policy:
+        print(
+            "repin_bootstrap_limits: WARNING: measured RUN_GC_POLICY=" + policy
+            + " differs from the authorization gate policy " + gate_policy
+            + "; --apply would refuse (use --adopt-gc-policy only for a"
+            " deliberate policy change)",
+            file=sys.stderr,
+        )
 
     if errors:
         for e in errors:
@@ -454,6 +513,17 @@ def build_proposals(cold: dict[str, str], warm: dict[str, str]) -> dict:
             "GATE_TIMEOUT_S is derived from the whole-gate wall clock"
             " (AGGREGATE_WALL_S), not from summed per-phase strings"
         )
+    elif kind == "standalone" and wall_c is not None and wall_w is not None:
+        # Standalone calibration is VM B only: its wall time can NOT bound
+        # the aggregate gate (VM A exists there).  The outer timeout stays
+        # provisional and fail-closed until a completed aggregate run
+        # provides AGGREGATE_WALL_S.
+        proposals["wall_timeout_s"] = None
+        formulas.append(
+            f"wall_timeout_s = SKIPPED: standalone calibration (cold={wall_c:g}s,"
+            f" warm={wall_w:g}s) does not repin the outer gate timeout; the"
+            " pinned value stays provisional until a completed aggregate run"
+        )
     elif wall_c is not None and wall_w is not None:
         if kind == "aggregate":
             notes.append(
@@ -540,6 +610,15 @@ def unified_diff(old_text: str, new_text: str, path: Path) -> str:
 
 def main(argv: list[str]) -> int:
     opts = parse_args(argv)
+    gate_probe = Path(opts["gate_script"])
+    if gate_probe.is_file():
+        m_gc = re.search(
+            r"^export OCAMLRUNPARAM=(.+)$",
+            gate_probe.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        if m_gc:
+            opts["gate_gc_policy"] = m_gc.group(1).strip()
     cold = read_metrics(opts["cold"])
     warm = read_metrics(opts["warm"])
     warnings = validate(cold, warm, opts)
@@ -611,10 +690,14 @@ def main(argv: list[str]) -> int:
     # pins).  For aggregate evidence the per-VM A/B observations are
     # mandatory, not a fallback.
     if opts["apply"]:
+        # Standalone calibration deliberately SKIPS the outer gate timeout
+        # (VM B wall time cannot bound an aggregate gate that also runs
+        # VM A); an aggregate pair must still propose it.
+        required_keys = ("steps", "host_calls", "alloc_bytes", "rss_mib")
+        if cold.get("LOG_KIND", "standalone") == "aggregate":
+            required_keys = required_keys + ("wall_timeout_s",)
         missing = [
-            key
-            for key in ("steps", "host_calls", "alloc_bytes", "rss_mib", "wall_timeout_s")
-            if proposals.get(key) is None
+            key for key in required_keys if proposals.get(key) is None
         ]
         if cold.get("LOG_KIND", "standalone") == "aggregate":
             for name, m in (("cold", cold), ("warm", warm)):
@@ -644,6 +727,29 @@ def main(argv: list[str]) -> int:
 
     old_gate = gate_path.read_text(encoding="utf-8")
     new_gate, gate_changes = apply_pins(gate_path, GATE_PINS, proposals)
+    # --adopt-gc-policy is atomic with the budgets: the same operation that
+    # installs the measured limits also installs the policy they were
+    # measured under.
+    gc_change: tuple[str, str] | None = None
+    if opts["adopt_gc_policy"]:
+        adopted = opts["adopt_gc_policy"]
+        matches = re.findall(r"^export OCAMLRUNPARAM=(.+)$", new_gate, re.MULTILINE)
+        if len(matches) != 1:
+            print(
+                "repin_bootstrap_limits: ERROR: expected exactly one"
+                " `export OCAMLRUNPARAM=` line in the gate script",
+                file=sys.stderr,
+            )
+            return 3
+        if matches[0].strip() != adopted:
+            new_gate = re.sub(
+                r"^export OCAMLRUNPARAM=.*$",
+                f"export OCAMLRUNPARAM={adopted}",
+                new_gate,
+                count=1,
+                flags=re.MULTILINE,
+            )
+            gc_change = (matches[0].strip(), adopted)
     diff = unified_diff(old_gate, new_gate, gate_path)
     if diff:
         print(f"gate diff ({'apply' if opts['apply'] else 'dry-run'}):")
@@ -674,13 +780,20 @@ def main(argv: list[str]) -> int:
         print("DRY RUN: no files written. Re-run with --apply to rewrite the pins.")
         return 0
 
-    if gate_changes:
+    if gate_changes or gc_change is not None:
         mode = stat.S_IMODE(gate_path.stat().st_mode)
         tmp = gate_path.with_name(gate_path.name + ".repin.tmp")
         tmp.write_text(new_gate, encoding="utf-8")
         os.chmod(tmp, mode)
         os.replace(tmp, gate_path)
-        print(f"applied {len(gate_changes)} gate pin(s) to {gate_path}")
+        if gate_changes:
+            print(f"applied {len(gate_changes)} gate pin(s) to {gate_path}")
+        if gc_change is not None:
+            print(
+                "applied GC-policy adoption to "
+                f"{gate_path}: OCAMLRUNPARAM {gc_change[0]} -> {gc_change[1]}"
+                " (deliberate policy change, recorded with the budgets)"
+            )
     else:
         print(f"gate {gate_path}: already at proposed values")
 

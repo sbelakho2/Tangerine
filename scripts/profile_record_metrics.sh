@@ -195,6 +195,11 @@ BEGIN { section = "B" }  # standalone logs hold only the preflight VM (VM B)
   if (ocaml_version == "" && index(t, "OCAML_VERSION=") == 1) ocaml_version = substr(t, 15)
   if (dune_version == "" && index(t, "DUNE_VERSION=") == 1) dune_version = substr(t, 14)
   if (gc_policy == "" && index(t, "GC_POLICY=") == 1) gc_policy = substr(t, 11)
+  if (cache_mode == "" && index(t, "RUN_CACHE_MODE=") == 1) cache_mode = substr(t, 16)
+  # the selfcheck prepared-VM cache verdict: a WARM calibration run must
+  # report true; the repinner requires exactly one COLD-0 and one WARM-1
+  if (index(t, "cache_hit=true") > 0) cache_hit_v = 1
+  else if (index(t, "cache_hit=false") > 0) cache_hit_v = 0
   if (max_steps == "" && index(t, "PROFILE_MAX_STEPS=") == 1) max_steps = substr(t, 19)
   if (max_rss == "" && index(t, "PROFILE_MAX_RSS_MIB=") == 1) max_rss = substr(t, 21)
   if (max_host == "" && index(t, "PROFILE_MAX_HOST_CALLS=") == 1) max_host = substr(t, 24)
@@ -571,6 +576,8 @@ END {
   print "SEED_SHA256=" put(seed_sha256 != "", seed_sha256, "UNKNOWN")
   print "MANIFEST_SHA256=" put(manifest_sha256 != "", manifest_sha256, "UNKNOWN")
   print "RUN_GC_POLICY=" put(gc_policy != "", gc_policy, "UNKNOWN")
+  print "RUN_CACHE_MODE=" put(cache_mode != "", cache_mode, "UNKNOWN")
+  print "VM_B_CACHE_HIT=" put(cache_hit_v != "", sprintf("%d", cache_hit_v), "UNKNOWN")
   print "OCAML_VERSION=" put(ocaml_version != "", ocaml_version, "UNKNOWN")
   print "DUNE_VERSION=" put(dune_version != "", dune_version, "UNKNOWN")
   print "PROFILE_MAX_STEPS=" put(max_steps != "", max_steps, "UNKNOWN")

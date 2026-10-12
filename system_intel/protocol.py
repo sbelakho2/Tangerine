@@ -736,7 +736,7 @@ def export_protocol(
             _record(
                 "Counterexample",
                 Counterexample(
-                    id=stable,
+                    id=f"Counterexample:{stable}",
                     claim_id=str(claim_id),
                     description=r.get("summary") or "refuting evidence",
                     evidence=[EvidenceRef(id=evidence_ids[int(r["id"])], digest=r.get("digest"), ref=r.get("ref"))],

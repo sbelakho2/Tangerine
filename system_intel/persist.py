@@ -331,7 +331,16 @@ def _snapshot_usable(snap) -> bool:
     if snap is None:
         return False
     if isinstance(snap, dict):
-        return any(key in snap for key in ("entities", "relations", "facts", "unresolved"))
+        # a legacy dict snapshot is usable only with ACTUAL rows or an
+        # explicit complete/partial capability verdict for entities — an
+        # empty dict carrying the four collection keys must not suppress
+        # the generic fallback
+        for key in ("entities", "relations", "facts", "unresolved"):
+            if list(snap.get(key) or ()):
+                return True
+        caps = _snapshot_capabilities(snap)
+        verdict = str(caps.get("entities", "unknown"))
+        return verdict in ("complete", "partial")
     entities = list(getattr(snap, "entities", ()) or ())
     if entities:
         return True
@@ -909,33 +918,57 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
 
     # The CONTRACT canonicalization bridge (one canonical representation):
     # the documented neutral convention is a fact ``predicate='contract_ref'``
-    # with ``object='contract:<kind>:<name>'`` and the holder/referenced
-    # symbol as the subject.  Federation materializes each such assertion
-    # into the dedicated contract table ONCE (stable component identity,
-    # provider and observation provenance via support); Contract entities
-    # and constrained_by relations stay DERIVED views.
-    contracts_upserted = 0
-    for fact in facts_in:
-        if str(_field(fact, "predicate", "") or "") != "contract_ref":
-            continue
+    # with ``object='contract:<kind>:<name>'`` and a ``role`` attribute.
+    # DECLARATIONS establish the canonical contract and its owner exactly
+    # once (authority order; ownership is never rewritten); REFERENCES
+    # establish dependency/support only and never move the owner, and a
+    # reference-only contract is never fabricated.  Contract entities and
+    # constrained_by relations stay DERIVED views.
+    def _contract_parts(fact):
         obj = str(_field(fact, "object", "") or "")
         if not obj.startswith("contract:"):
-            continue
+            return None
         body = obj[len("contract:"):]
         if ":" in body:
             contract_kind, contract_name = body.split(":", 1)
         else:
             contract_kind, contract_name = "unknown", body
         if not contract_kind or not contract_name:
+            return None
+        return contract_kind, contract_name
+
+    declarations = []
+    references = []
+    for fact in facts_in:
+        if str(_field(fact, "predicate", "") or "") != "contract_ref":
             continue
-        component = str(
-            _field(fact, "stable_subject", None)
-            or _field(fact, "subject", "")
-            or ""
-        )
+        fact_attrs = _field(fact, "attrs", None) or {}
+        role = str(fact_attrs.get("role", "")) if isinstance(fact_attrs, dict) else ""
+        if role == "reference":
+            references.append(fact)
+        else:
+            declarations.append(fact)
+
+    contracts_upserted = 0
+    for fact in declarations:
+        parts = _contract_parts(fact)
+        if parts is None:
+            continue
+        contract_kind, contract_name = parts
+        fact_attrs = _field(fact, "attrs", None) or {}
+        # the DECLARATION's holder is the owner; a referenced symbol never is
+        component = ""
+        if isinstance(fact_attrs, dict):
+            component = str(fact_attrs.get("function", "") or "")
+        if not component:
+            component = str(
+                _field(fact, "stable_subject", None)
+                or _field(fact, "subject", "")
+                or ""
+            )
         contract_provider = str(_field(fact, "provider", pid) or pid)
         contract_revision = str(_field(fact, "provider_revision", ver) or ver)
-        contract_id = graph.add_contract(
+        contract_id = graph.upsert_contract_owner(
             contract_kind, contract_name,
             component_qn=component or None,
             snapshot_id=snapshot_id,
@@ -949,8 +982,42 @@ def _project_snapshot(graph: Graph, snapshot_id: int, snap, pid: str, ver: str,
             snapshot_id, "contract", contract_id,
             provider=contract_provider, provider_revision=contract_revision,
             confidence=float(_field(fact, "confidence", 1.0) or 1.0),
-            detail="contract_ref",
+            detail="contract_declaration",
             observation_id=_observation_for(contract_provider),
+        )
+        support_rows += 1
+
+    for fact in references:
+        parts = _contract_parts(fact)
+        if parts is None:
+            continue
+        contract_kind, contract_name = parts
+        row = graph._require_conn().execute(
+            "SELECT id FROM contract WHERE snapshot_id=? AND kind=? AND name=?",
+            (int(snapshot_id), contract_kind, contract_name),
+        ).fetchone()
+        if row is None:
+            # reference-only: never fabricate a contract or an owner; the
+            # depends_on relation still carries the reference
+            continue
+        ref_provider = str(_field(fact, "provider", pid) or pid)
+        ref_revision = str(_field(fact, "provider_revision", ver) or ver)
+        # one support row per provider for a canonical row: a REFERENCE
+        # never downgrades an existing declaration support (the reference
+        # dependency itself is carried by the depends_on relation)
+        existing_support = graph._require_conn().execute(
+            "SELECT detail FROM support WHERE snapshot_id=? AND subject_table='contract' "
+            "AND subject_id=? AND provider=? AND observation_id IS NULL",
+            (int(snapshot_id), int(row["id"]), ref_provider),
+        ).fetchone()
+        if existing_support is not None and str(existing_support["detail"]) == "contract_declaration":
+            continue
+        graph.accumulate_support(
+            snapshot_id, "contract", int(row["id"]),
+            provider=ref_provider, provider_revision=ref_revision,
+            confidence=float(_field(fact, "confidence", 1.0) or 1.0),
+            detail="contract_reference",
+            observation_id=_observation_for(ref_provider),
         )
         support_rows += 1
 

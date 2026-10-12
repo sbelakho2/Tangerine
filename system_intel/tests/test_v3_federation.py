@@ -668,6 +668,54 @@ class FederationV3TestCase(unittest.TestCase):
                 second["identity"]["observation_set_digest"],
             )
 
+    # (18) ---------------------------------------------------------------
+    def test_contract_owner_survives_references_and_ordering(self):
+        """A contract REFERENCE must never rewrite the declared owner."""
+        from system_intel.persist import _project_snapshot
+        from system_intel.providers.base import ProviderFact, ProviderSnapshot
+
+        declaration = ProviderFact(
+            subject="native:contract:1", stable_subject="native:contract:1",
+            predicate="contract_ref", object="contract:api:orders",
+            attrs={"role": "declaration", "function": "native:decl:1"},
+        )
+        ref_a = ProviderFact(
+            subject="native:decl:2", stable_subject="native:decl:2",
+            predicate="contract_ref", object="contract:api:orders",
+            attrs={"role": "reference", "referenced_symbol": "sym:a"},
+        )
+        ref_b = ProviderFact(
+            subject="native:decl:3", stable_subject="native:decl:3",
+            predicate="contract_ref", object="contract:api:orders",
+            attrs={"role": "reference", "referenced_symbol": "sym:b"},
+        )
+
+        for label, facts in (
+            ("decl-first", [declaration, ref_a, ref_b]),
+            ("refs-first", [ref_a, ref_b, declaration]),
+            ("permuted", [ref_b, declaration, ref_a]),
+        ):
+            with Graph.open(":memory:") as g:
+                snap = g.begin_draft(_identity(label))
+                provider = ProviderSnapshot(
+                    facts=facts, provider_id="tangerine-native",
+                    provider_version="1",
+                )
+                _project_snapshot(g, snap, provider, "tangerine-native", "1",
+                                  canonical=True)
+                row = g._require_conn().execute(
+                    "SELECT component_qn FROM contract WHERE kind='api' AND name='orders'"
+                ).fetchone()
+                self.assertIsNotNone(row, label)
+                self.assertEqual(row["component_qn"], "native:decl:1",
+                                 f"{label}: the declaration owns the contract")
+                details = {
+                    r["detail"] for r in g._require_conn().execute(
+                        "SELECT detail FROM support WHERE subject_table='contract'"
+                    ).fetchall()
+                }
+                self.assertEqual(details, {"contract_declaration"}, label)
+
     # (17) ---------------------------------------------------------------
     def test_contract_ref_facts_become_canonical_contracts(self):
         from system_intel.persist import _project_snapshot
@@ -698,7 +746,7 @@ class FederationV3TestCase(unittest.TestCase):
                 "WHERE subject_table='contract'"
             ).fetchone()
             self.assertIsNotNone(support)
-            self.assertEqual(support["detail"], "contract_ref")
+            self.assertEqual(support["detail"], "contract_declaration")
 
     # (10) ---------------------------------------------------------------
     def test_finalization_recomputes_the_revision_digest(self):

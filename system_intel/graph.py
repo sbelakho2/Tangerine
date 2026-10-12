@@ -1202,6 +1202,47 @@ class Graph:
         self._maybe_commit()
         return inv_id
 
+    def upsert_contract_owner(self, kind, name, component_qn=None, format=None, *,
+                              snapshot_id=None, tier=0, provenance="declared",
+                              confidence=1.0, derived_from=(), last_verified=None,
+                              uncertainty=None, attrs=None):
+        """Upsert a contract WITHOUT ever rewriting its owner.
+
+        The contract table is unique on (snapshot_id, kind, name) and holds
+        one component_qn: a REFERENCE to a contract must never move its
+        owner.  Ownership is set by the FIRST declaration that materializes
+        the row (providers are processed in authority order) and preserved
+        thereafter; later declarations/references only enrich metadata.
+        """
+        conn = self._require_conn()
+        snap = self._resolve_snapshot(snapshot_id)
+        conn.execute(
+            """
+            INSERT INTO contract (snapshot_id, kind, name, component_qn, format, tier,
+                                  provenance, confidence, derived_from, last_verified,
+                                  uncertainty, stale, attrs)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            ON CONFLICT (snapshot_id, kind, name) DO UPDATE SET
+                component_qn=COALESCE(contract.component_qn, excluded.component_qn),
+                format=COALESCE(contract.format, excluded.format),
+                tier=MAX(contract.tier, excluded.tier),
+                provenance=contract.provenance,
+                confidence=MAX(contract.confidence, excluded.confidence),
+                derived_from=excluded.derived_from,
+                last_verified=excluded.last_verified,
+                uncertainty=excluded.uncertainty, attrs=excluded.attrs, stale=0
+            """,
+            (snap, kind, name, component_qn, format, int(tier), str(provenance),
+             float(confidence), _dumps(list(derived_from)), last_verified,
+             uncertainty, _dumps(dict(attrs or {}))),
+        )
+        row = conn.execute(
+            "SELECT id FROM contract WHERE snapshot_id=? AND kind=? AND name=?",
+            (snap, kind, name),
+        ).fetchone()
+        self._maybe_commit()
+        return int(row["id"])
+
     def add_contract(self, kind, name, component_qn=None, format=None, *,
                      snapshot_id=None, tier=0, provenance="declared",
                      confidence=1.0, derived_from=(), last_verified=None,

@@ -28,13 +28,37 @@
 #      evidence log always ends with it).
 #
 # Usage:
-#   scripts/profile_ocaml_bootstrap.sh [steps] [rss_mib] [host_calls] [alloc_bytes]
+#   scripts/profile_ocaml_bootstrap.sh [--cold|--warm] [steps] [rss_mib] [host_calls] [alloc_bytes]
 # Defaults: the plan's profiling class — 120e9 steps, 16 GiB RSS,
 # 5e9 host calls, 32 GiB allocation (deliberately generous but HARD for
 # this run).  Nothing here writes an authorization PASS; the final gate
 # pins its own measured limits and rejects ambient overrides.
+#
+# CACHE AUTHENTICATION (calibration provenance): a repin pair must be a
+# genuinely COLD run followed by a genuinely WARM one.
+#   --cold  removes the prepared-VM cache first, so the run rebuilds it.
+#   --warm  REQUIRES the cache and FAILS unless the run reports
+#           cache_hit=true (a warm run that missed the cache is not warm).
+# The mode is recorded as RUN_CACHE_MODE= and the selfcheck's own
+# cache_hit is recorded as VM_B_CACHE_HIT=; the repinner requires exactly
+# one COLD(cache_hit=0) and one WARM(cache_hit=1).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+CACHE_MODE="UNSPECIFIED"
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --cold) CACHE_MODE="COLD" ;;
+    --warm) CACHE_MODE="WARM" ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
+done
+if [ "${#POSITIONAL[@]}" -gt 0 ]; then
+  set -- "${POSITIONAL[@]}"
+else
+  set --
+fi
 
 STEPS="${1:-120000000000}"
 RSS_MIB="${2:-16384}"
@@ -84,8 +108,25 @@ DUNE_VERSION="$(dune --version 2>/dev/null | head -1 || echo UNKNOWN)"
 OCAMLRUNPARAM="${OCAMLRUNPARAM:-o=40}"
 export OCAMLRUNPARAM
 
+# ── cache mode enforcement (BEFORE the header) ───────────────────────
+VM_CACHE="$ROOT/build/bootstrap_selfcheck.vmcache"
+case "$CACHE_MODE" in
+  COLD)
+    rm -f "$VM_CACHE" "$VM_CACHE.tmp"
+    echo "profile_ocaml_bootstrap: --cold: removed the prepared-VM cache so the run rebuilds it" >&2
+    ;;
+  WARM)
+    if [ ! -f "$VM_CACHE" ]; then
+      echo "profile_ocaml_bootstrap: --warm requires a prepared-VM cache at $VM_CACHE (run --cold first)" >&2
+      exit 2
+    fi
+    ;;
+  *) : ;;
+esac
+
 # ── machine-readable header (BEFORE the child) ───────────────────────
-echo "profile_ocaml_bootstrap: steps=${STEPS} rss=${RSS_MIB}MiB host_calls=${HOST_CALLS} alloc=${ALLOC_BYTES} gc=${OCAMLRUNPARAM} (NON-AUTHORIZING)"
+echo "profile_ocaml_bootstrap: steps=${STEPS} rss=${RSS_MIB}MiB host_calls=${HOST_CALLS} alloc=${ALLOC_BYTES} gc=${OCAMLRUNPARAM} cache_mode=${CACHE_MODE} (NON-AUTHORIZING)"
+echo "RUN_CACHE_MODE=${CACHE_MODE}"
 echo "PROFILE_SCHEMA=2"
 echo "RUN_SHA=${RUN_SHA:-UNKNOWN}"
 echo "RUN_TREE_CLEAN=${RUN_TREE_CLEAN}"
@@ -126,4 +167,15 @@ if [ -z "$CLOSURE_FP" ]; then
   CLOSURE_FP="$(grep -oE 'fingerprint: [0-9a-fA-F]{64}' "$CHILD_LOG" 2>/dev/null | tail -1 | sed 's/.*fingerprint: //' || true)"
 fi
 echo "CLOSURE_FINGERPRINT=${CLOSURE_FP:-UNKNOWN}"
+
+# ── warm-run cache authentication (a warm run that missed the cache is
+#    not warm; calibration provenance requires the real thing) ─────────
+if [ "$CACHE_MODE" = "WARM" ]; then
+  HIT="$(grep -oE 'cache_hit=(true|false)' "$CHILD_LOG" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+  if [ "$HIT" != "true" ]; then
+    echo "profile_ocaml_bootstrap: --warm FAILED: the run reported cache_hit=${HIT:-<none>} (a warm calibration run must execute from the prepared-VM cache)" >&2
+    echo "RUN_EXIT=${CHILD_EXIT}"
+    exit 3
+  fi
+fi
 echo "RUN_EXIT=${CHILD_EXIT}"
