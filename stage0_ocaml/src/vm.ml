@@ -2674,6 +2674,15 @@ let entry_frame_of_li ~(limits : limits) ~(lang_items : Lang_items.t)
                 else [||]);
            }
          in
+         (* debug: dump the flat function-index -> name map once so VM HOT
+            samples (which print fn<index>) can be resolved to a name even
+            when several methods share a name (e.g. many `clone`s) *)
+         (match Sys.getenv_opt "TANGERINE_DEBUG_STEPS" with
+         | Some _ ->
+             Array.iteri
+               (fun i name -> Printf.eprintf "VM FN %d %s\n" i name)
+               vm.fn_names
+         | None -> ());
          (* host-binding profiling is per-VM diagnostics: clear the
             process-global table so a fresh VM's totals cannot include a
             previous VM's host work *)
