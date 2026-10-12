@@ -680,52 +680,19 @@ struct ResourceCheckResult
   # context's edge->owner map) with the exact-place mask rows. The snapshot
   # builder persists them; the §31 delta diffs them.
   drop_plan_facts: Vec[ResourceDropPlanFact] = Vec::new()
- # the TYPED iteration plans, keyed by the for-statement's node id
-  # (the same node id the MIR's loop_id uses). Produced in check_for;
-  # consumed by the MIR (lower_for) for the projected-vs-consuming decision
-  # — see IterationPlan below.
-  iteration_plans: Map[Int, IterationPlan]
- # (phase 2): the TYPED iteration records (TypedIteration { plan })
-  # — the typed-HIR serialization of the plans above, produced at the same
-  # check_for site; consumed by the MIR (lower_for / typed_iteration_of)
-  # through the typed statement record's join key (TypedStmtKind::
-  # For.iteration = the for-stmt node id).
-  typed_iterations: Map[Int, TypedIteration]
- # the authoritative per-flow-block frame states — (entry, exit)
-  # per CfgBlock id (the lexical records' first-statement semantic node id
-  # — the same id attach_block_cfg_record gives the CfgBlock record; the
-  # synthetic join/split records' ALLOCATED negative id — the id the
-  # structural pass allocated and the state walk read back through
-  # cfg_join_record_id, so every frame key equals a CfgBlock record's id
-  # and the uniqueness invariant (validate_cfg_blocks) guards the whole
-  # key domain). Entry is
-  # the frame entering the block — at a join, the merged predecessor-exit
-  # frames; exit is the frame after the block's statements — the
-  # scope-exit frontier the block's originating edges' obligations derive
-  # from. Populated by run_cfg_block at the block transitions;
-  # self-contained per run (reset/snapshot, the iteration_plans
-  # convention).
- # the block frames are the GROUNDING of the edge model's drop
-  # obligations: the drop-local actions of a block-originating edge derive
-  # from its SOURCE block's exit frame (the locals live at the exit the
-  # edge exits, per the edge kind's scope-exit frontier — Normal exits the
-  # block's own scope, Return exits every scope, Break/Continue exit the
-  # loop's scope with the loop-entry exclude). The block-grounded
-  # derivation (block_grounded_drop_ids) is THE AUTHORITY; the statement-
-  # level recording produces the same sets and remains the byte-identical
-  # emission path, and validate_cfg_edges checks every block-originating
-  # edge's drop actions against these frames (a drop of a local not live at
-  # the source block's exit is an inconsistency).
- # the block frames are the PRIMARY computation of the flow
-  # analysis (run_cfg_block's per-block execution under the block
-  # fixed-point worklist). The recording sites READ them — the Normal
-  # edge's derivation looks the recorded frames up (record_block_exit_plan
-  # / block_frames_get), the terminator recording sites derive through the
-  # same block_grounded_drop_ids from the exit frame (the terminator-point
-  # frame IS the block exit frame), and verify_terminator_edge_grounding
-  # reconciles every block-originating Return/Break/Continue edge against
-  # these recorded frames.
-  block_frames: Map[Int, (ResFrame, ResFrame)]
+  # (result-field reduction): the iteration plans, the typed iteration
+  # records and the per-block frame states are NOT duplicated onto this
+  # result. Their single copies live in the AnalysisContext the caller
+  # threads through the pass (context.iteration_plans /
+  # context.typed_iterations / context.block_frames — the MIR's
+  # lower_program reads analyzed.context.typed_iterations; the block
+  # frames are consumed by this run's own validate_cfg_edges through
+  # ctx.block_frames and by the block_frames_get recording sites). The
+  # former `iteration_plans` / `typed_iterations` / `block_frames` result
+  # fields were never read by any consumer (grep across tg_compiler: the
+  # only readers of the context copies are in this file and mir.tg's
+  # analyzed.context access), so filling them cloned three whole tables
+  # per run for nothing.
   # (audit item 16, next tier) The emitted DMA-ownership facts: one row per
   # committed canonical DMA op of every checked function body (the owner
   # key + place + post-state word + op word + site). The snapshot builder
@@ -860,14 +827,6 @@ struct AnalysisContext
   dma_callees: Map[Int, String]
   current_owner_key: String
   dma_facts: Vec[ResourceDmaFact]
-  # (access-check copy channel — the seed's per-access `copy` bit): the
-  # engine snapshot the access checker's Consume-of-Copy downgrade queries
-  # (access_check.tg's access_expr_is_copy), built LAZILY on the first
-  # Consume access and reused for the rest of the run.
-  # access_copy_env_ready marks whether the snapshot has been built; the
-  # field is the empty env until then.
-  access_copy_env: TypeEnv
-  access_copy_env_ready: Bool
   # (the projected-iteration escape context): the stack of the enclosing
   # projected for-loop escape frames (LoopEscapeFrame). Pushed/popped
   # lexically by check_loop_body around the loop-body walk, so it is empty
@@ -907,8 +866,6 @@ pub def analysis_context_new() -> AnalysisContext
     dma_callees: Map::new(),
     current_owner_key: "",
     dma_facts: Vec::new(),
-    access_copy_env: engine_env_empty(),
-    access_copy_env_ready: false,
     loop_escape_stack: Vec::new(),
     loop_body_scan: Option::None
   }
@@ -919,10 +876,12 @@ end
 # compilation — the single result of analyze_parsed and the ONLY input the
 # MIR lowering consumes. It carries the typed HIR (the TypedProgram), the
 # ONE TypedCFG (with the CleanupEdge table serialized into cfg.cleanup —
-# cleanup_edges_serialize's output), the semantic finalize plan, the whole
-# AnalysisContext (the iteration plans, the typed iterations, the block
-# frames, the slice-view registry, the CfgEdgeId-keyed access registry),
-# the engine snapshot TypeEnv the resource checker ran on, and the two
+# cleanup_edges_serialize's output), the semantic finalize plan, the
+# AnalysisContext (the iteration plans, the typed iterations, the
+# slice-view registry, the CfgEdgeId-keyed access registry — the block
+# frames and the DMA working rows are run scratch and are released by
+# resource_check_owned at the end of the pass), the engine snapshot TypeEnv
+# the resource checker ran on, and the two
 # checkers' error lists (empty on the Ok path). The MIR's lowering
 # (lower_program, mir.tg) consumes THIS artifact — resource_check is never
 # re-run during lowering, and no analysis result is recovered by a second
@@ -963,10 +922,6 @@ def record_iteration_plan(inout ctx: AnalysisContext, for_node_id: Int, plan: It
   ctx.iteration_plans.insert(for_node_id, plan)
 end
 
-def iteration_plans_snapshot(ctx: AnalysisContext) -> Map[Int, IterationPlan]
-  ctx.iteration_plans.clone()
-end
-
 # (phase 2): the TYPED iteration records (TypedIteration) live in the
 # context with the plans (context.typed_iterations — the ITERATION_PLANS
 # convention; no reset protocol).
@@ -974,22 +929,16 @@ def record_typed_iteration(inout ctx: AnalysisContext, for_node_id: Int, plan: I
   ctx.typed_iterations.insert(for_node_id, TypedIteration { plan: plan })
 end
 
-def typed_iterations_snapshot(ctx: AnalysisContext) -> Map[Int, TypedIteration]
-  ctx.typed_iterations.clone()
-end
-
 # the block-level frame accumulator is AnalysisContext state
 # (context.block_frames — the authoritative (entry, exit) per-block states
 # of the flow analysis, keyed by CfgBlock id — the lexical first-statement
 # ids and the synthetic join/split ids, the exact ids the CfgBlock records
 # carry; the ITERATION_PLANS
-# convention — no reset protocol).
+# convention — no reset protocol). The accumulator is run scratch: the
+# finished run releases it (resource_check_owned), so the artifact never
+# carries the frame lattice past the resource pass.
 def record_block_frame(inout ctx: AnalysisContext, block_id: Int, entry: ResFrame, exit: ResFrame) -> Unit
   ctx.block_frames.insert(block_id, (entry, exit))
-end
-
-def block_frames_snapshot(ctx: AnalysisContext) -> Map[Int, (ResFrame, ResFrame)]
-  ctx.block_frames.clone()
 end
 
 # a block's RECORDED (entry, exit) frames — the primary computation
@@ -1456,22 +1405,46 @@ def resource_dma_facts_dedup(inout facts: Vec[ResourceDmaFact]) -> Unit
   end
 end
 
+# (legacy entry — the CLONING wrapper): keeps the historical signature.
+# The caller's TypedCFG is deep-copied into a private working copy (exactly
+# the pre-existing behavior, INCLUDING the defaulted-empty edge_owners of
+# that literal), then the owned entry runs over the copy and returns it in
+# the result. Only legacy callers pay the copy; the pipeline calls
+# resource_check_owned directly with the ONE TypedCFG instance it already
+# built (build_typed_cfg) and never reads again.
 pub def resource_check(program: Program, typed: TypedProgram, cfg_in: TypedCFG, inout ctx: AnalysisContext, inout env_snapshot: TypeEnv) -> ResourceCheckResult
- # the accumulators (iteration plans, typed iterations, block
+  # the accumulators (iteration plans, typed iterations, block
   # frames, slice views, the access registry) live in the AnalysisContext —
   # fresh per compilation, so NO reset protocol exists here.
+  var cfg = TypedCFG { edges: cfg_in.edges.clone(), blocks: cfg_in.blocks.clone(), cleanup: Vec::new() }
+  resource_check_owned(cfg, program, typed, ctx, env_snapshot)
+end
+
+# (the OWNED entry — the pipeline's no-copy form): the caller hands the ONE
+# TypedCFG instance over by value (sink); this run mutates it in place and
+# returns it in the result (no clone anywhere). The caller must not use its
+# binding again — the pipeline takes the result's cfg into the
+# AnalyzedProgram. Why `sink` and not `inout`: the result must OWN the cfg
+# (ResourceCheckResult.cfg is a value), and moving fields out of an inout
+# parameter is rejected by the resource checker's own permission rule
+# ("inout parameter may be modified but not consumed" — apply_consume /
+# apply_projected_consume; the canary
+# tests/canary_neg/canary_neg_resource_inout_param_consume.tg pins it), a
+# rule that applies to this file when the compiler compiles itself. A sink
+# parameter is owned caller storage, so the fields move into the result
+# freely.
+pub def resource_check_owned(sink cfg: TypedCFG, program: Program, typed: TypedProgram, inout ctx: AnalysisContext, inout env_snapshot: TypeEnv) -> ResourceCheckResult
  # (ONE TypedCFG): the CFG arrives from the PIPELINE — the ONE
   # instance built by compiler_core's analyze_parsed (build_typed_cfg is
   # never called here) and already consumed by the access checker. The
   # state computation below (check_item -> check_function -> check_fn_body
   # -> run_cfg_block, the block frames) WALKS THE BLOCKS and attaches the
-  # cleanup actions to the pre-built edges; the working copy keeps the
-  # pipeline's pristine instance untouched. The access checker consumed the
-  # same TypedCFG earlier in the pipeline and populated the shared
-  # context.access_registry (keyed by CfgEdgeId — the edge's index in this
-  # very edge list), whose EndAccess obligations are prepended at the
-  # recording sites.
-  var cfg = TypedCFG { edges: cfg_in.edges.clone(), blocks: cfg_in.blocks.clone(), cleanup: Vec::new() }
+  # cleanup actions to the pre-built edges IN PLACE (the caller's instance
+  # IS the working copy now — the caller never reads it again). The access
+  # checker consumed the same TypedCFG earlier in the pipeline and populated
+  # the shared context.access_registry (keyed by CfgEdgeId — the edge's
+  # index in this very edge list), whose EndAccess obligations are prepended
+  # at the recording sites.
  # the engine snapshot TypeEnv is built ONCE by the pipeline
   # (compiler_core's analyze_parsed — engine_snapshot_env) and consumed
   # here through env_snapshot; the finished snapshot is carried into the
@@ -1512,34 +1485,47 @@ pub def resource_check(program: Program, typed: TypedProgram, cfg_in: TypedCFG, 
   # unique, so the lookup by block id is unambiguous program-wide). Runs
   # ONCE per program over the whole CFG (the per-function edge lists the
   # validation used to receive are gone — the CFG is global now).
-  let body_block_frames = block_frames_snapshot(ctx)
+  # The validation READS the context's recorded frames through the borrow
+  # (validate_cfg_edges observes its block_frames argument — no snapshot
+  # clone is taken).
   # the block-id UNIQUENESS INVARIANT — the number of CfgBlock records
   # must equal the number of unique CfgBlock ids (the P0 duplicate
   # detection; the allocator keeps the synthetic join domain disjoint
   # from the statement-id domain by construction, and this assertion
   # machine-checks it on every run).
   validate_cfg_blocks(&cfg.blocks, &cfg.edges, &mut errors)
-  validate_cfg_edges(ctx, typed, &finalize_plan, &cfg.edges, &cfg.blocks, &body_block_frames, &mut errors)
+  validate_cfg_edges(ctx, typed, &finalize_plan, &cfg.edges, &cfg.blocks, &ctx.block_frames, &mut errors)
  # serialize the edges' actions into the parallel CleanupEdge table
   # (cleanup[i] is edge i's CleanupEdge; the edge's index IS its CfgEdgeId).
   let cleanup_edges = cleanup_edges_serialize(&cfg.edges)
   # (fourth-audit P0-17) Emit the typed drop-plan facts from the REAL
-  # cleanup edges + the pre-built parallel owner vector, in canonical order.
+  # cleanup edges + the parallel owner vector, in canonical order.
   var drop_facts = resource_drop_plan_facts(&typed, &cfg.edges, &cfg.edge_owners)
   resource_drop_plan_facts_sort(&mut drop_facts)
   # (audit item 16, next tier) The committed DMA-ownership facts: the
   # worklist may revisit blocks, so sort under the canonical row order and
   # drop identical rows — the emitted table is visit-order independent.
+  # The canonicalization runs IN PLACE on the context's accumulator and the
+  # result carries the single copy; the context's working rows are released
+  # right after (nothing reads context.dma_facts after the run — the
+  # artifact's consumers read res_result.dma_facts / analyzed.dma_facts).
+  resource_dma_facts_sort(&mut ctx.dma_facts)
+  resource_dma_facts_dedup(&mut ctx.dma_facts)
   var dma_facts = ctx.dma_facts.clone()
-  resource_dma_facts_sort(&mut dma_facts)
-  resource_dma_facts_dedup(&mut dma_facts)
+  ctx.dma_facts = Vec::new()
+  # (context release): the per-block (entry, exit) frame lattice is the
+  # run's scratch state — every read of it happens above (the state
+  # computation and validate_cfg_edges). Nothing outside this file reads
+  # context.block_frames (grep across tg_compiler: block_frames_get /
+  # validate_cfg_edges are the only readers, both in this file), so the
+  # finished context releases the lattice instead of carrying it through
+  # the rest of the compilation in the artifact. The artifact's consumers
+  # read the iteration/typed-iteration records, which stay on the context.
+  ctx.block_frames = Map::new()
   ResourceCheckResult {
     errors: errors,
     finalize_plan: finalize_plan,
     cfg: TypedCFG { edges: cfg.edges, blocks: cfg.blocks, cleanup: cleanup_edges, edge_owners: cfg.edge_owners },
-    iteration_plans: iteration_plans_snapshot(ctx),
-    typed_iterations: typed_iterations_snapshot(ctx),
-    block_frames: body_block_frames,
     drop_plan_facts: drop_facts,
     dma_facts: dma_facts
   }
@@ -6909,7 +6895,8 @@ def check_for(program: Program, typed: TypedProgram, inout env: TypeEnv, inout c
  # produce the TYPED iteration plan for this for-stmt — the
   # projected-vs-consuming decision that used to live in the MIR's own
   # name-use scan — and record it keyed by the for-stmt's node id. The MIR
-  # consumes it via ResourceCheckResult.iteration_plans; unclassifiable
+  # consumes it through the carried AnalysisContext
+  # (analyzed.context.typed_iterations); unclassifiable
   # iterables get no plan and the MIR's legacy heuristic remains the
   # documented fallback.
  # the PROJECTED-MUTATION rule — under projected iteration the
