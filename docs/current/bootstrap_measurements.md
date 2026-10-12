@@ -161,7 +161,21 @@ identified exactly in the next run (several methods share the name
 Next lever (staged process): identify fn502 from the next run's `VM FN`
 map and attack that specific checker structure's clone/live cost — or
 reduce the checker's accumulated per-node channel representation — before
-any further measurement or repin.  `cfg-done` being unchanged confirms the
+any further measurement or repin.
+
+`VM FN 502 clone` resolved: the dump shows fn502 is an unqualified small
+`clone` in the derived-id/type-registration neighborhood
+(`derived::TypeId::clone` 498/501, `ClosureId` 500, `TypeVarId` 503,
+`GenericParamId` 504/505; layout helpers 508-510).  A small-id clone
+consuming 1.9e9+ steps therefore runs on the order of 10^8 times — it is
+transient garbage, not retained live: the wall persists because the
+STALL's live set (~4.7 GB / 6.2M regions) is the checker's accumulated
+whole-program typed channels, which the clone wave keeps feeding while the
+major GC marks them.  Two levers remain, in order: (1) a caller-attributed
+profile of fn502's call sites to remove the per-operation clone, and
+(2) reducing the checker's accumulated per-node channel live.  The FN-map
+run was stopped once the map was captured; its frontier matched the
+previous run.  `cfg-done` being unchanged confirms the
 dep-walk snapshot copies were not on the manifest-closed preflight path.
 
 ## 7. Conclusion and next lever
