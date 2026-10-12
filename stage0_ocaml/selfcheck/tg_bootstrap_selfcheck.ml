@@ -140,8 +140,9 @@ let () =
       (Sys.getenv_opt "TANGERINE_PREFLIGHT_DIAGNOSTIC",
        Sys.getenv_opt "TANGERINE_PREFLIGHT_STOP")
     with
-    | Some "1", Some phase
-      when phase = "semantic" || phase = "mir" || phase = "mono" ->
+    (* the kernel check CLI accepts exactly mir|mono; the typecheck-only
+       split is not addressable from the CLI *)
+    | Some "1", Some phase when phase = "mir" || phase = "mono" ->
         (phase <> "mono", phase)
     | _ -> (false, "mono")
   in
