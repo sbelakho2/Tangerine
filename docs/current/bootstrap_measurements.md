@@ -199,11 +199,20 @@ expr_types=581082 call_targets=74387`, live 4657 MB / 6.23M regions at
 mark-bound cliff; the arena stages remove the per-ancestor duplication of
 exactly those volumes.
 
-The decisive post-arena pinned-`o=40` run (with the progress trace, the
-`VM FN` instance map and targeted `HOTEDGE` attribution available) is the
-next measurement: if `typecheck-bodies-done` is reached, the staged
-sequence continues into materialize/deinit/oracle/snapshot submarkers, then
-MIR/mono, then authenticated cold/warm and repin.
+The decisive post-arena pinned-`o=40` run measured: at item 8064/8334
+(identical channel counts: 507070 exprs / 73780 stmts / 65927 patterns /
+580843 expr_types), live 4108 MB vs 4657 MB pre-arena (-549 MB, -12%) and
+5.98M regions vs 6.23M — the arena removes the per-ancestor duplication
+but the whole-closure live set is dominated by the flat per-node channels
+themselves.  The run then enters the SAME step-level freeze at ~47.9e9
+steps (last typecheck items are the compiler's largest modules): CPU
+advances for 25+ minutes with ZERO 100M-step beacon progress, in every
+o=40 run regardless of the batch.  The remaining levers are now
+(a) per-node channel allocation in the giant-function tail (the flat
+map write and the typed record both clone the same values per expression —
+migrating consumers to the typed node removes the duplicate writes) and
+(b) seed-VM major-GC/mark behaviour on the ~6M-region live set; neither is
+a budget or policy change.
 
 ## 8. Conclusion and next lever
 
