@@ -55,7 +55,33 @@ the remainder is the checker itself across the closure.
   steps, host calls, closure fingerprint, semantic outcome) with only
   wall time and peak RSS differing.
 
-## 4. Conclusion and next lever
+## 4. Phase attribution (instrumented runs, file-gated PHASE markers)
+
+With `build/phase_trace.flag` present and
+`TANGERINE_DEBUG_GUEST_STREAMS=1`, the check emits PHASE markers that
+interleave with the VM beacons, attributing live-set growth to stages
+(deterministic run; aarch64-apple-darwin, o=40):
+
+| Marker | Steps | Live |
+|---|---:|---:|
+| `cfg-done` (guest parse + manifest merge + closure fingerprint + @cfg elimination all complete) | 26.2e9 | 1.57 GB |
+| `macro-done` (macro expansion over the merged closure) | 32.0e9 | 3.96 GB |
+| `resolve-done` | ~33e9 | ~4 GB |
+| `typecheck-begin` → (wall) | 33e9 → 46e9+ | 4–5 GB |
+
+Conclusions: the pre-analysis pipeline (guest parse + merge + the ~10e9-step
+closure fingerprint + cfg) already costs 26.2e9 steps; macro expansion
+alone adds ~5.8e9 steps and +2.4 GB of live data; and the TYPE CHECK is the
+long pole (12e9+ steps and climbing at the wall) with the live set at
+~5 GB, where major-GC marking consumes nearly all wall time.  The wall is
+therefore inside the checker itself, not MIR/mono.
+
+Since total GC mark work scales approximately as total allocation divided
+by the heap space overhead, the completion attempt uses
+`OCAMLRUNPARAM=o=200` (5x less mark work than o=40) with a larger RSS cap;
+the outer gate timeout stays provisional.
+
+## 5. Conclusion and next lever
 
 The cfg quadratic is gone (structural and realized scaling guards enforce
 it), and the remaining step cost is legitimate linear work.  The binding
