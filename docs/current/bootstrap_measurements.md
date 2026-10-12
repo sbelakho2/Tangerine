@@ -33,7 +33,29 @@ Phase breakdown (hot functions, cumulative steps): `tg_sha256_hex` ~9.97e9,
 `tg_fingerprint_compose` ~6.07e9, `clone` ~2.3e9, `tokenize/lex` ~2.2e9;
 the remainder is the checker itself across the closure.
 
-## 3. Conclusion and next lever
+## 3. Calibration provenance guarantees (recently tightened)
+
+- **GC-policy binding**: `repin_bootstrap_limits.py --apply` requires the
+  measured `RUN_GC_POLICY` (cold == warm) to equal the authorization
+  gate's hard-pinned `OCAMLRUNPARAM`; a repin measured under another
+  host-GC policy is refused.  Adopting a new policy is the deliberate,
+  atomic `--adopt-gc-policy o=N` path (gate policy + budgets together).
+- **Genuine cold/warm**: `profile_ocaml_bootstrap.sh --cold` removes the
+  prepared-VM cache so the run rebuilds it; `--warm` requires the cache
+  and FAILS unless the run reports `cache_hit=true`.  The metric blocks
+  carry `RUN_CACHE_MODE=` and `VM_B_CACHE_HIT=`, and the repinner demands
+  exactly one COLD/0 and one WARM/1 (warm/warm can no longer masquerade
+  as cold+warm).
+- **Outer timeout stays provisional**: standalone calibration (VM B only)
+  does not repin `GATE_TIMEOUT_S`; only a completed aggregate run with
+  `AGGREGATE_WALL_S` does, because the aggregate gate also runs VM A.
+- **Conditioning the A/B**: for identical SHA/seed/manifest/target/closure
+  fingerprint the host-GC policy must not change the guest instruction
+  stream, so an A/B is only comparable once both runs COMPLETE (final
+  steps, host calls, closure fingerprint, semantic outcome) with only
+  wall time and peak RSS differing.
+
+## 4. Conclusion and next lever
 
 The cfg quadratic is gone (structural and realized scaling guards enforce
 it), and the remaining step cost is legitimate linear work.  The binding
