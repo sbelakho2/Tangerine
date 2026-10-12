@@ -76,10 +76,25 @@ long pole (12e9+ steps and climbing at the wall) with the live set at
 ~5 GB, where major-GC marking consumes nearly all wall time.  The wall is
 therefore inside the checker itself, not MIR/mono.
 
-Since total GC mark work scales approximately as total allocation divided
-by the heap space overhead, the completion attempt uses
-`OCAMLRUNPARAM=o=200` (5x less mark work than o=40) with a larger RSS cap;
-the outer gate timeout stays provisional.
+The completion attempt used `OCAMLRUNPARAM=o=200` (a 5x larger heap space
+overhead) with a large RSS cap.  Result: the guest-trACKED live set grows to
+17.7 GB (deferred collection) and the same mark-bound wall arrives at
+46.9e9 steps — o=200 is WORSE than o=40 for this VM (a larger live set
+makes every major cycle more expensive).  The GC-policy sweep is therefore
+conclusive:
+
+| Policy | wall reached at | peak guest live | peak RSS |
+|---|---:|---:|---:|
+| o=40 | 50.8e9 steps | 5.7 GB | 6.7 GiB |
+| o=120 | 36.8e9 steps | 8.0 GB | 6.3 GiB |
+| o=200 | 46.9e9 steps | 17.7 GB | 6.6 GiB |
+
+No host-GC policy completes this preflight on a 16 GB machine: the wall is
+the whole-closure live set (~5 GB at o=40) hitting a mark-bound regime
+where GC marking consumes nearly all wall time.  Completion requires
+reducing the guest's retained live data (macro expansion already adds
++2.4 GB) or an incremental VM marking strategy — compiler/VM work, not a
+budget or policy change.  The outer gate timeout remains provisional.
 
 ## 5. Conclusion and next lever
 
