@@ -104,6 +104,7 @@ mark
 cat >"$TMP/exit_path.log" <<'EOF'
 TG SELF-HOST PREFLIGHT (kernel in the seed VM checks tg_compiler/bootstrap_main.tg)
 VM STEPS: 4000000000 (limit 30000000000), host calls: 9 (limit 5000000000), copies: 91, pushes: 92, push copies: 93, set copies: 94, map replace scans: 95, set replace scans: 96, mark calls: 97, mark nodes: 98, mark cleared: 99
+TG_SELFHOST_PREFLIGHT stop=mono diagnostic=0 cache_hit=true
 TANGERINE_SELFCHECK_PASS name=tg_bootstrap_selfcheck version=1
 RUN_EXIT=0
 EOF
@@ -120,6 +121,7 @@ mark
 cat >"$TMP/zero_beacon.log" <<'EOF'
 TG SELF-HOST PREFLIGHT (kernel in the seed VM checks tg_compiler/bootstrap_main.tg)
 VM STEPS: 7777 (limit 30000000000), host calls: 1 (limit 5000000000), copies: 7, pushes: 8, push copies: 9, set copies: 10, map replace scans: 11, set replace scans: 12, mark calls: 13, mark nodes: 14, mark cleared: 15
+TG_SELFHOST_PREFLIGHT stop=mono diagnostic=0 cache_hit=true
 TANGERINE_SELFCHECK_PASS name=tg_bootstrap_selfcheck version=1
 RUN_EXIT=0
 EOF
@@ -146,6 +148,7 @@ cat >"$TMP/double_sentinel.log" <<'EOF'
 TG SELF-HOST PREFLIGHT (kernel in the seed VM checks tg_compiler/bootstrap_main.tg)
 VM STEPS: 100 (limit 30000000000), host calls: 1 (limit 5000000000), copies: 1, pushes: 1, push copies: 1, set copies: 1, map replace scans: 1, set replace scans: 1, mark calls: 1, mark nodes: 1, mark cleared: 1
 TANGERINE_SELFCHECK_PASS name=tg_bootstrap_selfcheck version=1
+TG_SELFHOST_PREFLIGHT stop=mono diagnostic=0 cache_hit=true
 TANGERINE_SELFCHECK_PASS name=tg_bootstrap_selfcheck version=1
 RUN_EXIT=0
 EOF
@@ -201,6 +204,36 @@ mark
 # 10. The recorder NEVER prints an authorization sentinel.
 # ─────────────────────────────────────────────────────────────────────────
 expect_no_match "no-authorization-sentinel" bleed "BOOTSTRAP COMPLETE: PASS"
+mark
+
+# ─────────────────────────────────────────────────────────────────────────
+# 11. DIAGNOSTIC early-stop (mir) must NEVER be a standalone PASS — even
+#     with a clean exit 0 and no failure evidence.
+# ─────────────────────────────────────────────────────────────────────────
+cat >"$TMP/diag_mir.log" <<'EOF'
+TG SELF-HOST PREFLIGHT (kernel in the seed VM checks tg_compiler/bootstrap_main.tg)
+VM STEPS: 500000000 (limit 120000000000), host calls: 1 (limit 5000000000), copies: 1, pushes: 1, push copies: 1, set copies: 1, map replace scans: 1, set replace scans: 1, mark calls: 1, mark nodes: 1, mark cleared: 1
+TG_SELFHOST_PREFLIGHT stop=mir diagnostic=1 cache_hit=false
+TANGERINE_SELFCHECK_DIAGNOSTIC_PASS name=tg_bootstrap_selfcheck version=1 stop=mir
+RUN_EXIT=0
+EOF
+expect_line "diagnostic-mir-not-a-pass" diag_mir "SELFCHECK_RESULT=FAIL"
+expect_line "diagnostic-mir-not-a-pass" diag_mir "RUN_STOP_AFTER=mir"
+expect_line "diagnostic-mir-not-a-pass" diag_mir "RUN_DIAGNOSTIC=1"
+mark
+
+# ─────────────────────────────────────────────────────────────────────────
+# 12. An ordinary sentinel WITHOUT the stop/mode line is refused (fail
+#     closed: absent producer evidence is not mono).
+# ─────────────────────────────────────────────────────────────────────────
+cat >"$TMP/no_stop_line.log" <<'EOF'
+TG SELF-HOST PREFLIGHT (kernel in the seed VM checks tg_compiler/bootstrap_main.tg)
+VM STEPS: 100 (limit 30000000000), host calls: 1 (limit 5000000000), copies: 1, pushes: 1, push copies: 1, set copies: 1, map replace scans: 1, set replace scans: 1, mark calls: 1, mark nodes: 1, mark cleared: 1
+TANGERINE_SELFCHECK_PASS name=tg_bootstrap_selfcheck version=1
+RUN_EXIT=0
+EOF
+expect_line "missing-stop-line-refused" no_stop_line "SELFCHECK_RESULT=FAIL"
+expect_line "missing-stop-line-refused" no_stop_line "RUN_STOP_AFTER=UNKNOWN"
 mark
 
 echo ""

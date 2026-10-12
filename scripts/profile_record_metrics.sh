@@ -141,6 +141,13 @@ function num(s) { return s + 0 }
 function put(cond, val, noval) { return (cond ? val : noval) }
 
 BEGIN { section = "B" }  # standalone logs hold only the preflight VM (VM B)
+BEGIN {
+  # fail-closed defaults: an absent TG_SELFHOST_PREFLIGHT line never yields
+  # a standalone PASS (RUN_STOP_AFTER/RUN_DIAGNOSTIC stay UNKNOWN)
+  run_stop_after = "UNKNOWN"
+  run_diagnostic = "UNKNOWN"
+  diagnostic_sentinel_count = 0
+}
 
 { log_lines = NR
   s = strip_ansi($0)
@@ -154,6 +161,13 @@ BEGIN { section = "B" }  # standalone logs hold only the preflight VM (VM B)
   # The exact standalone selfcheck sentinel (the ONLY success signal of
   # the standalone path; never a loose PASS grep).
   if (t == "TANGERINE_SELFCHECK_PASS name=tg_bootstrap_selfcheck version=1") sentinel_count++
+  # the preflight stop/mode line (producer: tg_bootstrap_selfcheck).  A
+  # DIAGNOSTIC sentinel is deliberately NOT the ordinary one.
+  if (index(t, "TG_SELFHOST_PREFLIGHT stop=") == 1) {
+    s2 = t; sub(/.* stop=/, "", s2); sub(/ .*/, "", s2); run_stop_after = s2
+    s3 = t; sub(/.* diagnostic=/, "", s3); sub(/ .*/, "", s3); run_diagnostic = s3
+  }
+  if (index(t, "TANGERINE_SELFCHECK_DIAGNOSTIC_PASS") == 1) diagnostic_sentinel_count++
 
   # Aggregate log detection (gate banner or wrapper-appended wall field).
   if (index(t, "BOOTSTRAP COMPLETENESS GATE (tg_bootstrap_gate)") > 0) {
@@ -510,11 +524,17 @@ END {
       if (reason == "") reason = "aggregate PASS facts incomplete"
     }
   } else {
-    if (sentinel_count == 1 && failure_evidence == 0) selfcheck = "PASS"
+    if (sentinel_count == 1 && failure_evidence == 0 && diagnostic_sentinel_count == 0 \
+        && run_stop_after == "mono" && run_diagnostic == "0")
+      selfcheck = "PASS"
     else {
       selfcheck = "FAIL"
-      if (sentinel_count == 0) reason = "no TANGERINE_SELFCHECK_PASS name=tg_bootstrap_selfcheck version=1 line"
-      else if (sentinel_count > 1) reason = sentinel_count " sentinel lines (want exactly 1)"
+      if (sentinel_count == 0) reason = reason "no TANGERINE_SELFCHECK_PASS name=tg_bootstrap_selfcheck version=1 line; "
+      else if (sentinel_count > 1) reason = reason sentinel_count " sentinel lines (want exactly 1); "
+      if (diagnostic_sentinel_count > 0) reason = reason "diagnostic (non-authorization) sentinel present; "
+      if (run_stop_after != "mono") reason = reason "RUN_STOP_AFTER=" run_stop_after " (want mono); "
+      if (run_diagnostic != "0") reason = reason "RUN_DIAGNOSTIC=" run_diagnostic " (want 0); "
+      if (reason == "") reason = "standalone PASS facts incomplete"
     }
   }
   if (failure_evidence > 0) {
@@ -577,6 +597,8 @@ END {
   print "MANIFEST_SHA256=" put(manifest_sha256 != "", manifest_sha256, "UNKNOWN")
   print "RUN_GC_POLICY=" put(gc_policy != "", gc_policy, "UNKNOWN")
   print "RUN_CACHE_MODE=" put(cache_mode != "", cache_mode, "UNKNOWN")
+  print "RUN_STOP_AFTER=" run_stop_after
+  print "RUN_DIAGNOSTIC=" run_diagnostic
   print "VM_B_CACHE_HIT=" put(cache_hit_v != "", sprintf("%d", cache_hit_v), "UNKNOWN")
   print "OCAML_VERSION=" put(ocaml_version != "", ocaml_version, "UNKNOWN")
   print "DUNE_VERSION=" put(dune_version != "", dune_version, "UNKNOWN")

@@ -60,6 +60,10 @@ else
   set --
 fi
 
+# CALIBRATION PROVENANCE: an ambient diagnostic override must never leak
+# into what looks like an ordinary cold/warm measurement.
+unset TANGERINE_PREFLIGHT_DIAGNOSTIC TANGERINE_PREFLIGHT_STOP
+
 STEPS="${1:-120000000000}"
 RSS_MIB="${2:-16384}"
 HOST_CALLS="${3:-5000000000}"

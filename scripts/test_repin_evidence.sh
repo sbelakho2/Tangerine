@@ -70,6 +70,8 @@ RUN_TARGET=aarch64-apple-darwin
 SEED_SHA256=2222222222222222222222222222222222222222222222222222222222222222
 MANIFEST_SHA256=3333333333333333333333333333333333333333333333333333333333333333
 RUN_GC_POLICY=o=40
+RUN_STOP_AFTER=mono
+RUN_DIAGNOSTIC=0
 CLOSURE_FINGERPRINT=4444444444444444444444444444444444444444444444444444444444444444
 RUN_EXIT=0
 STATUS=COMPLETED
@@ -363,6 +365,20 @@ run_case "cache provenance: warm/warm masquerade" reject "$TMP/cold_badcache" "$
 cp "$TMP/warm" "$TMP/warm_missed"
 set_kv "$TMP/warm_missed" VM_B_CACHE_HIT 0
 run_case "cache provenance: warm run that missed the prepared cache" reject "$TMP/cold" "$TMP/warm_missed"
+
+# ── DIAGNOSTIC early-stop material is refused even when every other
+#    identity field is clean and the recorder would have signed it ───────
+cp "$TMP/cold" "$TMP/cold_mir"
+cp "$TMP/warm" "$TMP/warm_mir"
+set_kv "$TMP/cold_mir" RUN_STOP_AFTER mir
+set_kv "$TMP/warm_mir" RUN_STOP_AFTER mir
+run_case "diagnostic stop=mir pair refused" reject "$TMP/cold_mir" "$TMP/warm_mir"
+
+cp "$TMP/cold" "$TMP/cold_diag"
+cp "$TMP/warm" "$TMP/warm_diag"
+set_kv "$TMP/cold_diag" RUN_DIAGNOSTIC 1
+set_kv "$TMP/warm_diag" RUN_DIAGNOSTIC 1
+run_case "diagnostic=1 pair refused" reject "$TMP/cold_diag" "$TMP/warm_diag"
 
 if [ "$fail" -ne 0 ]; then
   echo "test_repin_evidence: FAIL"

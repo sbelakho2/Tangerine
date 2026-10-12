@@ -269,6 +269,23 @@ def validate(cold: dict[str, str], warm: dict[str, str], opts: dict) -> list[str
     #    followed by a genuinely WARM one (standalone logs carry both the
     #    mode and the selfcheck prepared-VM cache verdict) ────────────────
     if cold.get("LOG_KIND") == "standalone":
+        # an early-stop DIAGNOSTIC run (stop=mir) must never become
+        # calibration material: the recorder only emits the ordinary
+        # sentinel for stop=mono/diagnostic=0, and the repinner re-checks
+        # the fields so a hand-crafted block cannot pass either.
+        for blk_name, blk in (("cold", cold), ("warm", warm)):
+            stop_after = blk.get("RUN_STOP_AFTER", "UNKNOWN")
+            diag = blk.get("RUN_DIAGNOSTIC", "UNKNOWN")
+            if stop_after != "mono":
+                errors.append(
+                    f"{blk_name} block RUN_STOP_AFTER={stop_after}, want mono"
+                    " (a diagnostic early-stop run is not calibration material)"
+                )
+            if diag != "0":
+                errors.append(
+                    f"{blk_name} block RUN_DIAGNOSTIC={diag}, want 0"
+                    " (diagnostic overrides must be disabled for calibration)"
+                )
         c_mode = cold.get("RUN_CACHE_MODE", "UNKNOWN")
         w_mode = warm.get("RUN_CACHE_MODE", "UNKNOWN")
         c_hit = cold.get("VM_B_CACHE_HIT", "UNKNOWN")

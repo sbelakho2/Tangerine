@@ -247,9 +247,24 @@ let () =
                     manifest_fingerprint fingerprint_after manifest_count count_after);
               Printf.printf
                 "tg_bootstrap_selfcheck: OK — kernel check exit 0 over the exact %d-source \
-                 manifest closure (strict resolution; resolver 0, type 0; stop after MONO; \
+                 manifest closure (strict resolution; resolver 0, type 0; stop after %s; \
                  closure fingerprint stable across the run; cache_hit=%b)\n"
-                manifest_count run.Driver.bvr_cache_hit;
+                manifest_count (String.uppercase_ascii stop_after)
+                run.Driver.bvr_cache_hit;
+              (* the machine-readable stop/mode line: the metric recorder reads
+                 RUN_STOP_AFTER/RUN_DIAGNOSTIC from it and refuses standalone
+                 PASS for anything but stop=mono with diagnostic=0 *)
+              Printf.printf "TG_SELFHOST_PREFLIGHT stop=%s diagnostic=%d cache_hit=%b\n%!"
+                stop_after (if diagnostic then 1 else 0) run.Driver.bvr_cache_hit;
+              if diagnostic then begin
+                (* a DIAGNOSTIC success is NEVER the ordinary selfcheck
+                   sentinel: an early-stop (mir) run must not be usable as
+                   cold/warm calibration or authorization evidence *)
+                Printf.printf
+                  "TANGERINE_SELFCHECK_DIAGNOSTIC_PASS name=tg_bootstrap_selfcheck version=1 stop=%s\n%!"
+                  stop_after;
+                exit 0
+              end;
               Selfcheck_sentinel.emit_and_exit "tg_bootstrap_selfcheck")
           | [] ->
               fail
