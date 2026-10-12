@@ -214,6 +214,32 @@ migrating consumers to the typed node removes the duplicate writes) and
 (b) seed-VM major-GC/mark behaviour on the ~6M-region live set; neither is
 a budget or policy change.
 
+### Dense NodeTable conversion REVERTED (measured 5000x regression)
+
+A conversion of the node-dense channels (typed_expr_types then
+typed_exprs/stmts/patterns/spans/owner-idx/call-target/instance) from the
+persistent Map to a dense `Vec[Option[T]]` NodeTable passed every
+correctness battery byte-identically but is CATASTROPHICALLY slower in the
+seed VM: measured `set_copies` 8.0e9 (was ~1.5e6), `push_copies` 1.6e9,
+`mark_nodes` 1.07e10, `dt` 139 s per 100M steps, and only 128 of 8334
+items after 30 minutes (normal: ~100 items/minute).  Cause: a READ
+argument marks the table value shared in the seed VM, after which every
+subsequent indexed `data[id] = ...` write hits the `arr_set` full-array
+copy-on-write path — the exact failure mode previously fixed in the
+SHA-256 schedule.  The persistent Map avoids this through store-level
+(not array-level) sharing; that is precisely why the kernel uses Maps for
+write-heavy channels.  A dense representation would require a VM-level
+update path that never COWs on write-after-read (or strictly append-only
+push writes), which is a VM/representation change, not a checker change.
+Both conversion commits were reverted (07e43d8, 69b02af); the arena and
+owner-interning changes are retained.
+
+CORRECTED NEXT LEVER: reduce the number and size of per-node WRITES and
+the retained per-node VALUES in the tail channels (e.g. stop writing
+purely-diagnostic channels unless diagnostics are requested, or compact
+repeated value payloads), or improve seed-VM mark/COW behaviour — do NOT
+retry dense arrays before the COW-on-read marking is addressed.
+
 ## 8. Conclusion and next lever
 
 The cfg quadratic is gone (structural and realized scaling guards enforce
