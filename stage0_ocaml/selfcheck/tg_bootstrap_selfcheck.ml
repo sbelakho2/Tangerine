@@ -129,9 +129,30 @@ let () =
   Printf.printf "  manifest closure: %d source(s) [pinned]\n%!" manifest_count;
   let cache_path = Filename.concat repo_root "build/bootstrap_selfcheck.vmcache" in
   let vm_cache = if no_cache then None else Some cache_path in
+  (* DIAGNOSTIC phase bisection (live-set attribution): with BOTH
+     TANGERINE_PREFLIGHT_DIAGNOSTIC=1 and TANGERINE_PREFLIGHT_STOP=<phase>
+     set, the preflight stops at that phase instead of mono.  This is
+     never authorization: the default is mono, the banner is loud, and a
+     non-mono summary cannot satisfy the authorization stop check below
+     (which requires the REQUESTED stop to be mono). *)
+  let diagnostic, stop_after =
+    match
+      (Sys.getenv_opt "TANGERINE_PREFLIGHT_DIAGNOSTIC",
+       Sys.getenv_opt "TANGERINE_PREFLIGHT_STOP")
+    with
+    | Some "1", Some phase
+      when phase = "semantic" || phase = "mir" || phase = "mono" ->
+        (phase <> "mono", phase)
+    | _ -> (false, "mono")
+  in
+  if diagnostic then
+    Printf.eprintf
+      "tg_bootstrap_selfcheck: DIAGNOSTIC STOP OVERRIDE to `%s` — NOT authorization evidence\n%!"
+      stop_after;
   let kernel_args =
-    [ "check"; "--strict-resolution"; "--bootstrap-proof"; "--stop-after=mono";
-      "tg_compiler/bootstrap_main.tg"; "--target"; target_str ]
+    [ "check"; "--strict-resolution"; "--bootstrap-proof";
+      "--stop-after=" ^ stop_after; "tg_compiler/bootstrap_main.tg";
+      "--target"; target_str ]
   in
   match
     Driver.run_bootstrap_vm ~repo_root
@@ -169,11 +190,11 @@ let () =
           (match rows with
           | [ row ] -> (
               (match summary_field row "stop" with
-              | Some v when v = "mono" -> ()
+              | Some v when v = stop_after -> ()
               | Some v ->
                   fail
-                    "kernel preflight stopped at `%s`, the final authorization requires the                      mono stop (--stop-after=mono)"
-                    v
+                    "kernel preflight stopped at `%s`, this run required the `%s` stop"
+                    v stop_after
               | None -> fail "kernel summary has no stop= field: %s" row);
               (match summary_field row "file" with
               | Some f when f = "tg_compiler/bootstrap_main.tg" -> ()
