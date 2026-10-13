@@ -318,3 +318,89 @@ checker — after which completed cold+warm runs can repin the budgets
 (`scripts/repin_bootstrap_limits.py`), the aggregate gate can print
 `BOOTSTRAP COMPLETE: PASS`, and the stage1 -> stage2 -> stage3 ladder can
 run.
+
+## 9. The 48e9 freeze is GONE; the tail now reaches MONO (028e7e7, o=40)
+
+Re-ran the pinned preflight (`scripts/profile_ocaml_bootstrap.sh --cold`
+with the plan's hard caps, `OCAMLRUNPARAM=o=40`) on `028e7e7` (arena stage 4
++ freeze-fix + type-authority stage A) WITHOUT ambient diagnostic overrides,
+with `build/phase_trace.flag` present and `TANGERINE_DEBUG_GUEST_STREAMS=1`
+(host-stream tee only; inert for step accounting).  The instruction stream
+tracks the pre-fix baseline (`9EUmW3`) through 26e9 steps (regions /
+`reg_live` / `mark_calls` match to <0.6%), then diverges as arena stage 4
+changes HIR construction.
+
+Crossing the old wall:
+
+| step | dt | regions | `reg_live` | live_mb |
+|---:|---:|---:|---:|---:|
+| 30.0e9 | 4.4 s | 5.98e6 | 2.71e6 | 2,803 |
+| 43.9e9 | 13.8 s | 5.98e6 | 2.71e6 | 3,845 |
+| **48.7e9** | **2.8 s** | 6.05e6 | 2.75e6 | 4,867 |
+
+The baseline froze at 48.0e9 for 178.5 s in a single
+`__intrinsic_map_visit_value` (`9a350c3`); the same step now passes in a
+2.8 s beacon.  The largest stalls seen are two ~60-70 s major-GC beacons at
+46.4-46.5e9 (no `SLOW MARK` / `MAPPAIRS` firing) — ordinary GC against the
+~5-6 GB live set, not the O(N^2) map-visit.
+
+The run then completed the ENTIRE tail.  With the plan's 60e9 cap it
+trapped inside the post-MONO semantic-completeness oracle
+(`run_semantic_completeness_oracle` -> `oracle_check_expr_type_equality` ->
+`type_identity_key_resolved` -> `type_canon_render`, added in `028e7e7`).
+Re-run with a 150e9 cap it reached EVERY phase marker and only then failed
+on the closure's own semantics, not on time or memory:
+
+```
+PHASE cfg-done / macro-done / resolve-begin / resolve-done / typecheck-begin
+PHASE typecheck-bodies-done
+PHASE typed-materialize-begin / typed-materialize-done
+PHASE deinit-plans-done
+PHASE semantic-oracle-done
+PHASE engine-snapshot-done
+PHASE typecheck-done
+mono: build OK — pre 8392 template function(s) -> post 4648 specialized instance(s)
+mono: materialized 350 concrete type instance def(s); final types table 1191 entries
+MONO_MIR_STRUCTURAL_GATE = PASS (4648 functions) [canonical-type-instances=345]
+```
+
+So `typecheck-bodies-done`, the materialization, the deinit plans, the
+semantic oracle, the engine snapshot and MONO all run.  The remaining
+failure is **typecheck debt**, not performance:
+
+- 165 distinct `--strict-resolution` diagnostics across 138 sites (mir.tg
+  158 rows, types.tg 90, lir.tg / bootstrap_main.tg / resource_check.tg /
+  lexer.tg 16/16/12/12, …): type mismatches (Option vs Tuple, Bool vs Unit,
+  …), 16 effect-declaration errors (`function calls an effectful function
+  but declares no effect: File/Io`), and
+- exactly ONE `error[ICE]: HIR_MISSING|tg_compiler::layout_engine|
+  container_repr_for_name|Node=368374|if` (a typed HIR record missing for an
+  `if` node) — the `verify_hir_fail` completeness fingerprint, not a MIR
+  lowering failure.
+
+The `028e7e7` expression-type equality oracle reported ZERO `DIVERGENT`
+rows, i.e. the single-write-path refactor held across the full merged
+closure.  RSS peaked at 7.4 GB of the 16 GiB cap and `live_mb` at 8.6 GB:
+the 60e9 trap was a step-budget wall, not an RSS wall.  The pinned gate
+budget (`TANGERINE_BOOTSTRAP_VM_MAX_STEPS=30e9`) is now well below the
+completed preflight and must be repinned; the completion needs >60e9 steps
+(cold).
+
+Dominant growing cost at the tail: `clone(fn503)` (1.42e9 -> 2.15e9 steps
+from 41e9 -> 60e9) and `build_deinit_plan(fn1318)` — the small-ID clone
+neighborhood the plan flagged; the arena-stage-4 id-only references did not
+remove it.
+
+### The `TANGERINE_DEBUG_SLOW_MARK` watchdog was itself a freeze
+
+The first diagnostic run ran WITH `TANGERINE_DEBUG_SLOW_MARK=1` and
+manufactured 88 s / 724.5 s / 57.2 s / 903.4 s beacon stalls at 11.6-13.0e9
+where the clean run is a flat ~2 s — a ~9x wall regression.  Cause: the
+watchdog timed EVERY top-level `arr_mark_shared_value` with two
+`Unix.gettimeofday` calls (plus the float boxing they allocate).  At ~1e9
+marks by 13e9 steps that is ~2e9 extra host operations driving the major GC
+— a measurement artifact LARGER than the freeze it sought.  Fixed: the
+clock is now read once per 65536 marked nodes inside the traversal (a
+single long mark is still caught; ~1.5e4 reads per 1e9 marks), armed by a
+plain ref store at the top-level call (`stage0_ocaml/src/vm_value.ml`).
+The clean runs above confirm the stalls vanish without the flag.

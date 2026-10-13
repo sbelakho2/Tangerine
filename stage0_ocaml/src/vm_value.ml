@@ -294,8 +294,47 @@ let agg_singleton (a : agg) : t option =
    (Ref (Place _) / Ref (Region _)), RawPtr and Function are not part
    of the value tree (a reference names a place or an owned region
    image — it does not own a nested value), so the walk stops there. *)
+(* Slow deep-share marking watchdog (TANGERINE_DEBUG_SLOW_MARK=1): names a
+   mark that spends >= 500 ms of WALL time (the host-side traversal does not
+   advance VM steps, so a beacon freeze is exactly what this names).
+
+   PER-CALL TIMING IS ITSELF A FREEZE.  Timing every top-level mark with two
+   Unix.gettimeofday calls (plus the float boxing they allocate) added ~1e9
+   extra host operations to a 13e9-step preflight and drove the major GC so
+   hard that it manufactured 57-903 s stalls and a ~9x wall regression — a
+   measurement artifact LARGER than the freeze it sought.  The clock is now
+   read only once per 65536 marked nodes (inside the traversal, so a single
+   long mark is still caught), i.e. ~1.5e4 calls per 1e9 marks.  The
+   reported wall is the slow 65536-node window; the root kind is the current
+   top-level mark's kind (a plain ref store, no syscall per mark). *)
+let slow_mark_enabled =
+  lazy
+    (match Sys.getenv_opt "TANGERINE_DEBUG_SLOW_MARK" with
+    | Some "1" -> true
+    | _ -> false)
+
+let slow_mark_active = ref false
+let slow_mark_root = ref ""
+let slow_mark_last_check = ref 0.0
+let slow_mark_reported = ref false
+
 let rec mark_value_shared (v : t) : unit =
   incr prof_mark_nodes;
+  (* periodic wall-clock watchdog (see below): one gettimeofday per 65536
+     nodes; a >=500 ms window names the current top-level mark's root kind *)
+  if !slow_mark_active && !prof_mark_nodes land 0xFFFF = 0 then begin
+    let now = Unix.gettimeofday () in
+    if !slow_mark_last_check > 0.0 && not !slow_mark_reported then begin
+      let dt = now -. !slow_mark_last_check in
+      if dt >= 0.5 then begin
+        slow_mark_reported := true;
+        Printf.eprintf
+          "VM SLOW MARK wall>=%.3fs nodes_per_window=65536 root_kind=%s\n%!"
+          dt !slow_mark_root
+      end
+    end;
+    slow_mark_last_check := now
+  end;
   match v with
   | Array a ->
       if a.cell.owned then begin
@@ -338,17 +377,8 @@ and mark_agg (a : agg) : unit =
     Array.iter mark_value_shared a.agg_elems
   end
 
-(* Slow deep-share marking watchdog (TANGERINE_DEBUG_SLOW_MARK=1): times
-   each top-level mark and reports operations >= 500 ms with the wall time,
-   the number of nodes marked and the root value kind.  A deep-share mark
-   is a HOST-side traversal, so it does not advance VM steps — a freeze in
-   the beacon is exactly what this names. *)
-let slow_mark_enabled =
-  lazy
-    (match Sys.getenv_opt "TANGERINE_DEBUG_SLOW_MARK" with
-    | Some "1" -> true
-    | _ -> false)
-
+(* the root-kind classifier for the slow-mark watchdog (see the preamble
+   immediately above mark_value_shared) *)
 let slow_mark_kind (v : t) : string =
   match v with
   | Array _ -> "array"
@@ -374,13 +404,13 @@ let slow_mark_kind (v : t) : string =
 let arr_mark_shared_value (v : t) : unit =
   incr prof_mark_calls;
   if Lazy.force slow_mark_enabled then begin
-    let nodes_before = !prof_mark_nodes in
-    let t0 = Unix.gettimeofday () in
+    (* arm the periodic watchdog for this top-level mark; no syscall here *)
+    slow_mark_root := slow_mark_kind v;
+    slow_mark_last_check := 0.0;
+    slow_mark_reported := false;
+    slow_mark_active := true;
     mark_value_shared v;
-    let dt = Unix.gettimeofday () -. t0 in
-    if dt >= 0.5 then
-      Printf.eprintf "VM SLOW MARK wall=%.3fs nodes=%d root_kind=%s\n%!" dt
-        (!prof_mark_nodes - nodes_before) (slow_mark_kind v)
+    slow_mark_active := false
   end
   else mark_value_shared v
 
