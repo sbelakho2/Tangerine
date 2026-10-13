@@ -234,6 +234,29 @@ push writes), which is a VM/representation change, not a checker change.
 Both conversion commits were reverted (07e43d8, 69b02af); the arena and
 owner-interning changes are retained.
 
+### Freeze classification instrumentation (b33fb24 + arena stage 4)
+
+The 47.9e9 "freeze" is NOT yet proven to be OCaml-GC; three different
+marking systems appear in the beacons (OCaml `Gc.live_words` as live_mb;
+the seed VM's cumulative simulated-region allocation as `regions`; and the
+VM's own deep value-sharing mark counters mark_calls/mark_nodes/
+mark_cleared).  A host-side operation does not advance the VM step
+counter, so a beacon freeze can be any of them.  Instrumentation added:
+- `TANGERINE_DEBUG_SLOW_MARK=1` times every `arr_mark_shared_value` and
+  prints `VM SLOW MARK wall=… nodes=… root_kind=…` for ops >= 500 ms.
+- the typecheck trace now emits per-item and per-function BEGIN/END rows
+  (`TYPECHECK ITEM BEGIN/END index=… …`, `TYPECHECK FN BEGIN/END name=…`)
+  over the last 350 top-level items, flag-gated, so the freeze names the
+  exact giant function instead of "somewhere in the tail".
+- arena stage 4: construction sites that only needed a child NodeId now use
+  `typed_expr_id_of`/`typed_stmt_id_of`/`typed_pattern_id_of`
+  (`contains_key` + `node_id`) instead of fetching the whole record through
+  `Map::get` — every such fetch deep-copies the record and runs the
+  value-sharing mark traversal on it.
+- the next run also takes a native `sample` of the frozen process and
+  classifies the top frames as caml_gc_* / mark_value_shared / Array.copy /
+  Vm.exec.
+
 CORRECTED NEXT LEVER: reduce the number and size of per-node WRITES and
 the retained per-node VALUES in the tail channels (e.g. stop writing
 purely-diagnostic channels unless diagnostics are requested, or compact
