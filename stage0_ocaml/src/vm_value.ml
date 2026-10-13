@@ -830,7 +830,26 @@ let map_remove (m : map_store) (key : t) : (t * t) option * map_store =
 
 let map_len (m : map_store) : int = m.map_count
 
-let map_pairs (m : map_store) : (t * t) list = map_seq m
+(* slow host-operation watchdogs (TANGERINE_DEBUG_SLOW_MARK=1): host
+   operations do not advance VM steps, so a beacon freeze can be one of
+   these running for minutes; report ops >= 200 ms with their size *)
+let slow_host_enabled =
+  lazy
+    (match Sys.getenv_opt "TANGERINE_DEBUG_SLOW_MARK" with
+    | Some "1" -> true
+    | _ -> false)
+
+let map_pairs (m : map_store) : (t * t) list =
+  if Lazy.force slow_host_enabled then begin
+    let n = map_len m in
+    let t0 = Unix.gettimeofday () in
+    let r = map_seq m in
+    let dt = Unix.gettimeofday () -. t0 in
+    if dt >= 0.2 then
+      Printf.eprintf "VM SLOW MAPPAIRS wall=%.3fs entries=%d\n%!" dt n;
+    r
+  end
+  else map_seq m
 
 let map_of_pairs (pairs : (t * t) list) : t =
   List.fold_left
@@ -1218,7 +1237,15 @@ let rec drop_glue (m : Vm_memory.t) (v : t) : unit =
   | Array elems -> arr_iter (drop_glue m) elems
   | Set store -> List.iter (drop_glue m) (set_elems store)
   | Map store ->
-      List.iter (fun (k, v) -> drop_glue m k; drop_glue m v) (map_pairs store)
+      if Lazy.force slow_host_enabled && map_len store >= 50000 then begin
+        let n = map_len store in
+        let t0 = Unix.gettimeofday () in
+        List.iter (fun (k, v) -> drop_glue m k; drop_glue m v) (map_pairs store);
+        let dt = Unix.gettimeofday () -. t0 in
+        if dt >= 0.2 then
+          Printf.eprintf "VM SLOW DROP map entries=%d wall=%.3fs\n%!" n dt
+      end
+      else List.iter (fun (k, v) -> drop_glue m k; drop_glue m v) (map_pairs store)
   | Enum (_, payload) -> agg_iter (drop_glue m) payload
   | Ref (Region rr) ->
       if not rr.rlive then

@@ -257,6 +257,28 @@ counter, so a beacon freeze can be any of them.  Instrumentation added:
   classifies the top frames as caml_gc_* / mark_value_shared / Array.copy /
   Vm.exec.
 
+### Freeze CLASSIFIED by native sample (instr run 78280aa)
+
+The frozen process (48.0e9 steps, item 8194 in progress — the first
+`semantic_*`/`lir` tail item) was sampled with macOS `sample` for 15 s:
+the main thread is inside an OCaml `List.rev_append` allocation loop
+(8815/11048 samples), of which 8814 are `caml_call_gc` ->
+`caml_do_pending_actions_res` -> `caml_poll_gc_work`:
+`caml_major_collection_slice` 6947 samples (mark `do_some_marking` 5087,
+sweep `pool_sweep` ~1828) and `caml_empty_minor_heaps_once` 1865 samples.
+`VM SLOW MARK` fired ZERO times.
+
+Classification: the freeze is OCaml-runtime GC bound, driven by host-side
+list allocation (`List.rev_append` from `Vm_value.map_pairs`, used by
+`Map::entries`/map iteration and by `drop_glue`'s Map arm) over large
+stores; a host operation does not advance the VM step counter, which is
+why the beacon freezes while CPU advances.  It is NOT the Tangerine
+deep-sharing mark (no slow-mark rows).  Watchdogs added (same flag):
+`VM SLOW MAPPAIRS wall=… entries=…` and `VM SLOW DROP map entries=…
+wall=…` (>= 200 ms / >= 50k entries) will name the exact store size and
+operation; likely mitigations: iterator-based host traversal instead of
+materializing pair lists for large maps, and drop-in-place for glue.
+
 CORRECTED NEXT LEVER: reduce the number and size of per-node WRITES and
 the retained per-node VALUES in the tail channels (e.g. stop writing
 purely-diagnostic channels unless diagnostics are requested, or compact
