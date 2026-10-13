@@ -6017,7 +6017,11 @@ def typed_pattern_for(inout env: TypeEnv, pat: Pattern) -> Option[TypedPattern]
           # recorded here under the pattern's node id — the arena invariant
           # requires every reference stored in a kind to resolve through
           # typed_exprs. (Stage-1 note: the record is scanned by the
-          # readiness/oracle walks like any other.)
+          # readiness/oracle walks like any other.) The flat type row is
+          # written in LOCKSTEP with the record (this fabricated node is an
+          # expression-arena node; the migration equality oracle checks
+          # every record against its flat row).
+          env.typed_expr_types.insert(pat.node_id, call_ty.clone())
           env.typed_exprs.insert(pat.node_id, TypedExpr { id: pat.node_id, ty: call_ty.clone(), kind: TypedExprKind::Global(const_name) })
           kind = Option::Some(TypedPatternKind::Literal(pat.node_id))
         when Option::None then ()
@@ -6574,6 +6578,26 @@ def typed_place_of(env: TypeEnv, expr: Expr) -> Option[TypedPlace]
   when ExprKind::ExprTry(inner) then typed_place_of(env, *inner.get())
   when _ then Option::None
   end  end
+end
+
+# (migration stage A — THE one expression-type write path): every write of
+# an expression node's recorded type goes through here — the construction
+# site (check_expr_expected's tail) and every later REFINEMENT (the
+# range-bound literal adoption and the unsuffixed-float operand adoption).
+# The flat typed_expr_types entry and the arena record's `ty` are written in
+# lockstep: at the construction site the record does not exist yet, so only
+# the flat row is written (record_typed_hir then records the SAME value);
+# once the record exists, a refinement updates BOTH channels. The semantic
+# completeness oracle (oracle_check_expr_type_equality) asserts the
+# invariant for every typed program.
+pub def record_expr_type(inout env: TypeEnv, node_id: Int, ty: Type) -> Unit
+  if node_id == 0 then return end
+  env.typed_expr_types.insert(node_id, ty.clone())
+  match env.typed_exprs.get(node_id)
+  when Option::Some(te) then
+    env.typed_exprs.insert(node_id, TypedExpr { id: te.id, ty: ty.clone(), kind: te.kind })
+  when Option::None then ()
+  end
 end
 
 # The recording site (check_expr's tail): after the expression's type is
@@ -25789,12 +25813,12 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
           # lowering reads the literal's recorded node type.
           match range_start_expr
           when Option::Some(sx) then
-            if sx.node_id != 0 then env.typed_expr_types.insert(sx.node_id, et.clone()) end
+            if sx.node_id != 0 then record_expr_type(env, sx.node_id, et.clone()) end
           when Option::None then ()
           end
           range_ty = et
         elsif is_int_literal_type(&et) && is_integer_type(&st) then
-          if e_expr.node_id != 0 then env.typed_expr_types.insert(e_expr.node_id, st.clone()) end
+          if e_expr.node_id != 0 then record_expr_type(env, e_expr.node_id, st.clone()) end
           range_ty = st
         else
           unify(env, st, et, e_expr.span)
@@ -26053,7 +26077,7 @@ def check_expr_expected(inout env: TypeEnv, expr: Expr, expected: Option[Type]) 
   when Option::None then ()
   end
   if expr.node_id != 0 then
-    env.typed_expr_types.insert(expr.node_id, adopted.clone())
+    record_expr_type(env, expr.node_id, adopted.clone())
     record_typed_hir(env, expr, &adopted)
     # (gate diagnostics): the node's own span + owning item — recorded in
     # lockstep with the typed channels; the readiness gate renders the true
@@ -29634,10 +29658,10 @@ def check_binary_op(inout env: TypeEnv, op: BinOp, left: Expr, right: Expr, span
     match right_type
     when Type::F32 then
       left_type = Type::F32
-      if left.node_id != 0 then env.typed_expr_types.insert(left.node_id, Type::F32) end
+      record_expr_type(env, left.node_id, Type::F32)
     when Type::F64 then
       left_type = Type::F64
-      if left.node_id != 0 then env.typed_expr_types.insert(left.node_id, Type::F64) end
+      record_expr_type(env, left.node_id, Type::F64)
     when _ then ()
     end
   when _ then
@@ -29646,10 +29670,10 @@ def check_binary_op(inout env: TypeEnv, op: BinOp, left: Expr, right: Expr, span
       match left_type
       when Type::F32 then
         right_type = Type::F32
-        if right.node_id != 0 then env.typed_expr_types.insert(right.node_id, Type::F32) end
+        record_expr_type(env, right.node_id, Type::F32)
       when Type::F64 then
         right_type = Type::F64
-        if right.node_id != 0 then env.typed_expr_types.insert(right.node_id, Type::F64) end
+        record_expr_type(env, right.node_id, Type::F64)
       when _ then ()
       end
     when _ then ()
@@ -32879,6 +32903,32 @@ end
 #      terminators, unresolved callees) are the MIR verifier's checks that
 #      run at the MIR boundary; the typecheck side is (2)-(6) above.
 
+# (migration stage A — the expression-type EQUALITY ORACLE): for every
+# expression node that has an arena record, the flat typed_expr_types row
+# must exist and carry the SAME type — every expression-type write goes
+# through record_expr_type, so the two channels can never diverge. The
+# comparison is the frontend's canonical type-identity key
+# (type_identity_key_resolved — the relation the trait solver and the
+# instance keys use), never a display form. This walk runs inside the
+# semantic completeness oracle for EVERY battery run (not flag-gated): the
+# battery proves the invariant before stage B makes the arena record the
+# sole authority for expression nodes and shrinks the flat map to its
+# residual (statement/synthetic) rows.
+def oracle_check_expr_type_equality(inout env: TypeEnv, inout findings: Vec[String]) -> Unit
+  for (eq_nid, eq_te) in env.typed_exprs do
+    match env.typed_expr_types.get(eq_nid)
+    when Option::Some(eq_flat) then
+      let eq_flat_key = type_identity_key_resolved(env, eq_flat.clone())
+      let eq_rec_key = type_identity_key_resolved(env, eq_te.ty.clone())
+      if eq_flat_key != eq_rec_key then
+        findings.push("internal error: expression node " + eq_nid.to_string() + " has DIVERGENT recorded types — flat typed_expr_types=" + eq_flat_key.clone() + " arena TypedExpr.ty=" + eq_rec_key.clone() + " (every expression-type write must go through record_expr_type)")
+      end
+    when Option::None then
+      findings.push("internal error: expression node " + eq_nid.to_string() + " has an arena TypedExpr record but NO flat typed_expr_types row (the two channels must be written in lockstep)")
+    end
+  end
+end
+
 def run_semantic_completeness_oracle(inout env: TypeEnv, typed: TypedProgram) -> Unit
   var findings: Vec[String] = Vec::new()
   # (2) the DefId registry — the numeric flattening of every resolver-
@@ -32930,6 +32980,9 @@ def run_semantic_completeness_oracle(inout env: TypeEnv, typed: TypedProgram) ->
   for (_, te) in env.typed_exprs do
     oracle_walk_typed_expr(env, typed, te, &mut findings)
   end
+  # (migration stage A) the expression-type EQUALITY ORACLE: every arena
+  # record must agree with its flat typed_expr_types row.
+  oracle_check_expr_type_equality(env, &mut findings)
   for (_, tp) in env.typed_patterns do
     oracle_walk_typed_pattern(env, typed, tp, &mut findings)
   end

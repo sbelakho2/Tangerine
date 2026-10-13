@@ -279,6 +279,23 @@ wall=…` (>= 200 ms / >= 50k entries) will name the exact store size and
 operation; likely mitigations: iterator-based host traversal instead of
 materializing pair lists for large maps, and drop-in-place for glue.
 
+### The freeze FIXED: O(1) memoized map-visit handles (9a350c3)
+
+The watchdogs named the operation exactly: `HOST SLOW 178.5s
+__intrinsic_map_visit_value args=[#0:Map,#1:Int]` with `VM SLOW MAPPAIRS
+wall=178.504s entries=594475` — the guest's map-visit protocol rebuilt the
+entire 594k-entry pair list and linearly scanned it on EVERY step (O(N)
+per step, O(N^2) per iteration), and the pair allocation drove major-GC
+slices while the VM step counter did not advance.
+
+Fix: `map_store` memoizes the pair sequence and a physical-keyed suffix
+table (stores are immutable, so memos are always valid; all five
+construction/insert/replace/remove/drain literals reset them), answered
+per step in O(1) by `map_visit_next_key_memo`/`map_visit_value_memo`;
+the linear scan remains the small-store (<64) and physical-miss fallback.
+Host-only change; verified by the battery (KERNEL_PARITY fails=0 cases=21,
+CFG_SCALING fails=0, SHA256_VECTOR fails=0, zero FAIL rows).
+
 CORRECTED NEXT LEVER: reduce the number and size of per-node WRITES and
 the retained per-node VALUES in the tail channels (e.g. stop writing
 purely-diagnostic channels unless diagnostics are requested, or compact

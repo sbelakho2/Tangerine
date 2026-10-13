@@ -92,6 +92,21 @@ let contains (haystack : string) (needle : string) =
   in
   go 0
 
+(* LINE-START containment: a battery verdict must START a whole line
+   (battery rows carry suffixes like `cases=0`), so
+   `RUNTIME_PARITY_BATTERY fails=0` can never satisfy a
+   `PARITY_BATTERY fails=0` assertion (the Stage-B regression where
+   PARITY_BATTERY fails=2 still exited PASS). *)
+let contains_line (haystack : string) (needle : string) =
+  let n = String.length needle in
+  haystack
+  |> String.split_on_char '\n'
+  |> List.exists (fun line ->
+         let line = String.trim line in
+         String.length line >= n
+         && String.sub line 0 n = needle
+         && (String.length line = n || line.[n] = ' '))
+
 let () =
   let repo_root, merged, lower, lower_merged =
     match Array.to_list Sys.argv with
@@ -238,7 +253,7 @@ let () =
                consumes the node record before any name lookup). *)
             fail
               "the kernel semantic-default battery failed (expected `SEMANTIC_DEFAULT_BATTERY fails=0`; see the report above)"
-          else if not (contains report "PARITY_BATTERY fails=0") then
+          else if not (contains_line report "PARITY_BATTERY fails=0") then
             (* the seed-vs-kernel parity battery + the no-fallback mutation
                witnesses: the kernel checker's verdict rows for the parity
                cases (consumed by tg_semantic_parity) plus the two deleted-
