@@ -3313,25 +3313,38 @@ let binding_manifest : binding list =
          (fun _ args ->
            match args with
            | [| Vm_value.Map store; handle |] -> (
-               match map_visit_pair (Vm_value.map_pairs store) handle with
-               | Some (_, (k, _) :: _) ->
+               (* O(1) memoized suffix lookup for large stores; the linear
+                  pair-scan remains the small-store / physical-miss path *)
+               match Vm_value.map_visit_next_key_memo store handle with
+               | Some k ->
                    Vm_value.arr_mark_shared_value k;
                    Ok (vm_option_some k)
-               | Some (_, []) | None -> Ok vm_option_none)
+               | None -> (
+                   match map_visit_pair (Vm_value.map_pairs store) handle with
+                   | Some (_, (k, _) :: _) ->
+                       Vm_value.arr_mark_shared_value k;
+                       Ok (vm_option_some k)
+                   | Some (_, []) | None -> Ok vm_option_none))
            | _ -> arg_mismatch "(Map, key)"));
     intrinsic_binding "__intrinsic_map_visit_value"
       (adapter_raw (lets [ map_of p0 p1; p0 ]) (ref_ p1)
          (fun _ args ->
            match args with
            | [| Vm_value.Map store; handle |] -> (
-               match map_visit_pair (Vm_value.map_pairs store) handle with
-               | Some ((_, v), _) ->
+               (* O(1) memoized suffix lookup for large stores *)
+               match Vm_value.map_visit_value_memo store handle with
+               | Some v ->
                    Vm_value.arr_mark_shared_value v;
                    Ok v
-               | None ->
-                   Error
-                     "stale record-visit handle: the entry is no longer in the \
-                      map (the traversal never fabricates a successor)")
+               | None -> (
+                   match map_visit_pair (Vm_value.map_pairs store) handle with
+                   | Some ((_, v), _) ->
+                       Vm_value.arr_mark_shared_value v;
+                       Ok v
+                   | None ->
+                       Error
+                         "stale record-visit handle: the entry is no longer in the \
+                          map (the traversal never fabricates a successor)"))
            | _ -> arg_mismatch "(Map, key)"));
     intrinsic_binding "__intrinsic_set_visit_begin"
       (adapter_raw (lets [ set_of p0 ]) (option_of (ref_ p0))

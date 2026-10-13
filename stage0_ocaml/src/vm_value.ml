@@ -11,6 +11,16 @@
    trees stay freely shareable. *)
 module Int_map = Map.Make (Int)
 
+(* Physical-identity keyed table (visit-handle memos): `==` equality with a
+   structural hash (physically equal values hash alike; collisions are
+   resolved by the physical comparison). *)
+module Obj_tbl = Hashtbl.Make (struct
+  type t = Obj.t
+
+  let equal (a : Obj.t) (b : Obj.t) = a == b
+  let hash = Hashtbl.hash
+end)
+
 (* ── Byte-copy instrumentation (diagnostic; TANGERINE_DEBUG_STEPS) ──
    Counts the element copies the growable-array and store-rewrite paths
    perform, so a profile can name the quadratic copy volume.  The
@@ -133,6 +143,13 @@ and map_store = {
      marks only the new members and stays marked; an insert/remove on an
      unmarked store keeps the result unmarked. *)
   mutable map_marked : bool;
+  (* MEMOIZED visit order (the store is immutable, so a memo on the store
+     object is always valid): the canonical pair sequence, and a physical-
+     keyed suffix table so visit_next/visit_value are O(1) per step
+     instead of rebuilding the whole pair list and linearly scanning it
+     (measured: 178 s for ONE visit_value on a 594k-entry store). *)
+  mutable map_seq_memo : (t * t) list option;
+  mutable map_suffix_memo : (t * t) list Obj_tbl.t option;
   (* The incremental PURITY flag for the compiler-internal persistent
      snapshot (map_snapshot): TRUE only while no stored key/value carries
      an owned region ref, so sharing the store can never double-drop.
@@ -728,7 +745,8 @@ let map_snapshot (m : map_store) : (map_store, string) result =
 (* ── The store surface (see the store note at the type) ────────────── *)
 
 let map_empty : t =
-  Map { map_front = []; map_back = []; map_index = Int_map.empty; map_count = 0; map_marked = true; map_pure = true }
+  Map { map_front = []; map_back = []; map_index = Int_map.empty; map_count = 0; map_marked = true; map_pure = true;
+           map_seq_memo = None; map_suffix_memo = None }
 
 let set_empty : t =
   Set { set_front = []; set_back = []; set_index = Int_map.empty; set_count = 0; set_marked = true }
@@ -740,7 +758,47 @@ let bucket_mem_key (bucket : (t * t) list) (key : t) : (t * t) option =
    order (front @ reversed back).  The queue split keeps insertion O(1)
    while the iteration, visit and drain interfaces keep the original
    list's order EXACTLY (entries() and drain both walk oldest-first). *)
-let map_seq (m : map_store) : (t * t) list = m.map_front @ List.rev m.map_back
+let map_seq (m : map_store) : (t * t) list =
+  match m.map_seq_memo with
+  | Some s -> s
+  | None ->
+      let s = m.map_front @ List.rev m.map_back in
+      m.map_seq_memo <- Some s;
+      s
+
+(* O(1)-per-step visit handles: a physical-keyed suffix table built once
+   per store.  The suffix node is the pair-list tail starting at the
+   entry, so `next` is its second element's key and `value` its head's
+   value — exactly the map_visit_pair semantics without the O(N) rebuild
+   and scan per step. *)
+let map_visit_suffix_table (m : map_store) : (t * t) list Obj_tbl.t =
+  match m.map_suffix_memo with
+  | Some t -> t
+  | None ->
+      let t = Obj_tbl.create (max 16 m.map_count) in
+      let rec build = function
+        | [] -> ()
+        | ((k, _) as node) :: rest ->
+            Obj_tbl.replace t (Obj.repr k) (node :: rest);
+            build rest
+      in
+      build (map_seq m);
+      m.map_suffix_memo <- Some t;
+      t
+
+let map_visit_value_memo (m : map_store) (handle : t) : t option =
+  if m.map_count < 64 then None
+  else
+    match Obj_tbl.find_opt (map_visit_suffix_table m) (Obj.repr handle) with
+    | Some ((_, v) :: _) -> Some v
+    | _ -> None
+
+let map_visit_next_key_memo (m : map_store) (handle : t) : t option =
+  if m.map_count < 64 then None
+  else
+    match Obj_tbl.find_opt (map_visit_suffix_table m) (Obj.repr handle) with
+    | Some (_ :: (k2, _) :: _) -> Some k2
+    | _ -> None
 let set_seq (s : set_store) : t list = s.set_front @ List.rev s.set_back
 
 (* insert with the container contract: an existing lookup_eq-equal key
@@ -777,6 +835,7 @@ let map_insert_entry (m : map_store) (key : t) (value : t) : t option * map_stor
           map_marked = m.map_marked;
           map_pure =
             m.map_pure && (not (has_owned_ref key)) && not (has_owned_ref value);
+          map_seq_memo = None; map_suffix_memo = None;
         } )
   | None ->
       let new_pair = (key, value) in
@@ -789,6 +848,7 @@ let map_insert_entry (m : map_store) (key : t) (value : t) : t option * map_stor
           map_marked = m.map_marked;
           map_pure =
             m.map_pure && (not (has_owned_ref key)) && not (has_owned_ref value);
+          map_seq_memo = None; map_suffix_memo = None;
         } )
 
 let map_insert (m : map_store) (key : t) (value : t) : map_store =
@@ -826,6 +886,7 @@ let map_remove (m : map_store) (key : t) : (t * t) option * map_store =
           map_count = m.map_count - 1;
           map_marked = m.map_marked;
           map_pure = m.map_pure;
+          map_seq_memo = None; map_suffix_memo = None;
         } )
 
 let map_len (m : map_store) : int = m.map_count
@@ -884,7 +945,8 @@ let map_drain_one (m : map_store) : (t * t) option * map_store =
       (Some (k, v),
        { map_front = rest; map_back = back; map_index = index';
          map_count = m.map_count - 1; map_marked = m.map_marked;
-         map_pure = m.map_pure })
+         map_pure = m.map_pure;
+         map_seq_memo = None; map_suffix_memo = None })
 
 (* insert with the std replacement contract: an existing element is
    REPLACED by the incoming item (the caller's moved value becomes the
