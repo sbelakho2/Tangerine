@@ -2509,7 +2509,22 @@ end
 def fn_effect_is_trusted_base(env: TypeEnv, key: String) -> Bool
   match env.fn_effect_modules.get(key)
   when Option::Some(mpath) then
-    mpath.len() > 0 && (mpath[0] == "std" || mpath[0] == "tg_compiler")
+    if mpath.len() > 0 then
+      mpath[0] == "std" || mpath[0] == "tg_compiler"
+    else
+      # (root-module exemption — seed parity): the compiled program's own
+      # file IS the root module and carries an EMPTY path
+      # (item_source_module_path returns Vec::new() for the root file), while
+      # the seed's root (bootstrap_main.tg) carries tg_compiler::bootstrap_main.
+      # In the bootstrap-proof lane the root IS the compiler-kernel entry, so
+      # its functions are trusted base exactly as the seed's root is — their
+      # effect declarations are the API contract, not a self-usage claim.
+      # Gated on trusted_compiler_origin so a USER program's root (never the
+      # kernel) is not exempt. Without this, every root function that calls an
+      # Io effectful function reported "declares no effect: Io" (8 rows in the
+      # closure, all in tg_compiler/bootstrap_main.tg).
+      env.trusted_compiler_origin
+    end
   when Option::None then false
   end  end
 end
@@ -6626,6 +6641,23 @@ def record_typed_hir(inout env: TypeEnv, expr: Expr, result: Type) -> Unit
   end  end
 end
 
+# The lockstep node recording used at EVERY expression entry point: the flat
+# type row, the typed-HIR arena record, the node span and the owning item.
+# check_expr_expected inlined this block; the TAIL entry points (check_tail_expr)
+# must use it too — a value-position if/match reached as a block tail was
+# checked but never recorded, so the HIR-completeness walk (verify_hir_node)
+# reported HIR_MISSING on every nested `else if` ExprIf node (79 in the
+# closure: codegen::bare_intrinsic_name, codegen::canonical_fn_ref,
+# layout_engine::container_repr_for_name).
+def record_expr_node(inout env: TypeEnv, expr: Expr, ty: Type) -> Unit
+  if expr.node_id != 0 then
+    record_expr_type(env, expr.node_id, ty.clone())
+    record_typed_hir(env, expr, &ty)
+    env.typed_node_spans.insert(expr.node_id, expr.span.clone())
+    env.typed_node_owners_idx.insert(expr.node_id, env.current_item_owner)
+  end
+end
+
 # Build the typed kind of an expression node from its shape and the
 # recorded semantic metadata (the per-variant typed children are looked up
 # from the recorded tree — children are recorded before their parents).
@@ -7970,6 +8002,14 @@ def type_def_name_is(env: TypeEnv, tid: TypeId, name: String) -> Bool
   match env.type_id_index.get(tid.id)
   when Option::Some(idx) then env.type_list[idx].name == name
   when Option::None then false
+  end  end
+end
+
+# The declared NAME of a TypeId (diagnostic — the named-id divergence probe).
+def type_name_of_id(env: TypeEnv, tid: TypeId) -> String
+  match env.type_id_index.get(tid.id)
+  when Option::Some(idx) then env.type_list[idx].name.clone()
+  when Option::None then "<unknown>"
   end  end
 end
 
@@ -10458,6 +10498,13 @@ def unify(inout env: TypeEnv, t1: Type, t2: Type, span: Span) -> Bool
         match b
         when Type::Adt(id2, args2) then
           if id1.id != id2.id then
+            # (named-id divergence probe): a same-NAME Adt pair with different
+            # TypeIds is the seed/kernel nominal-identity divergence — report
+            # the id pair so the duplicate registration can be found.
+            let n1 = type_name_of_id(env, &id1)
+            if n1 == type_name_of_id(env, &id2) then
+              println("NAMED_ID_DIVERGENCE name=" + n1 + " id_a=" + id1.id.to_string() + " id_b=" + id2.id.to_string() + " a=" + type_tag(env, &a) + " b=" + type_tag(env, &b))
+            end
             type_mismatch_error(env, &a, &b, span)
             false
           elsif args1.len() != args2.len() then
@@ -12486,7 +12533,11 @@ def check_item(inout env: TypeEnv, program: Program, item: Item, item_idx: Int, 
       fn_trace_exprs0 = env.typed_exprs.len()
       trace_progress.push("TYPECHECK FN BEGIN name=" + fn_trace_name.clone())
     end
-    check_function(env, f, owner_key, &f_owner, &effect_claims)
+    let fn_is_intrinsic = match attribute_named(item.attrs.clone(), "intrinsic".to_string())
+    when Option::Some(_) then true
+    when Option::None then false
+    end
+    check_function(env, f, owner_key, &f_owner, &effect_claims, fn_is_intrinsic)
     if trace_tail then
       trace_progress.push("TYPECHECK FN END name=" + fn_trace_name.clone() + " delta_exprs=" + (env.typed_exprs.len() - fn_trace_exprs0).to_string() + " wall_hint=none")
     end
@@ -14373,7 +14424,7 @@ def wcet_cost_expr(env: TypeEnv, e: Expr) -> Int
   end  end
 end
 
-def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_owner: DefId, effect_claims: Vec[EffectClassClaim]) -> Unit
+def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_owner: DefId, effect_claims: Vec[EffectClassClaim], skip_body: Bool) -> Unit
   push_scope(env)
   env.check_ctx = "fn:" + f.name
   # (gate diagnostics): every typed node/local recorded while this body is
@@ -14496,6 +14547,13 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
   # (§20 slice 3): the body is the function's LOWERING UNIT — its own
   # const generic parameters are the only ones substitutable per instance.
   push_unit_const_param_scope(env, &fn_param_ids)
+  if skip_body then
+    # (@intrinsic via an ITEM attribute / bodyless): the declared signature is
+    # the WHOLE contract — there is no body to check and nothing to unify with
+    # the return type. (A bare in-body `@intrinsic(...)` is handled in the
+    # PARSER: the body is represented as FnNone.)
+    ()
+  else
   match f.body
   when FnBody::FnBlock(block) then
     # (expected-type body tail): the declared return type is threaded into
@@ -14517,6 +14575,7 @@ def check_function(inout env: TypeEnv, f: FunctionDecl, owner_key: String, f_own
     # transfer_consume mirror at the FnExpr body check).
     record_projected_consume(env, &expr)
   when _ then ()
+  end
   end
   env.current_fn_key = ""
   env.expected_return = Option::None
@@ -15773,9 +15832,17 @@ end
 def check_tail_expr(inout env: TypeEnv, expr: Expr, expected: Option[Type]) -> FlowResult
   match expr.kind
   when ExprKind::ExprIf(if_stmt) then
-    check_if_stmt_expected(env, &if_stmt, false, expected.clone(), tail_join_discarded(expected.clone()))
+    # (tail if/match HIR recording): record the node in lockstep — a
+    # value-position if reached as a block tail (the nested `else if`
+    # chain) must carry a typed HIR record or the completeness walk reports
+    # HIR_MISSING. The flow's normal is the node's value type.
+    let flow = check_if_stmt_expected(env, &if_stmt, false, expected.clone(), tail_join_discarded(expected.clone()))
+    record_expr_node(env, expr, flow.normal.clone())
+    flow
   when ExprKind::ExprMatch(m) then
-    check_match_expected(env, &m, false, expected.clone(), tail_join_discarded(expected.clone()))
+    let flow = check_match_expected(env, &m, false, expected.clone(), tail_join_discarded(expected.clone()))
+    record_expr_node(env, expr, flow.normal.clone())
+    flow
   when ExprKind::ExprBlock(block) then check_block_expected(env, &block, true, expected)
   when ExprKind::ExprUnsafe(_, block) then check_block_expected(env, &block, true, expected)
   when ExprKind::ExprAsync(block) then check_block_expected(env, &block, true, expected)
@@ -17176,7 +17243,11 @@ def check_if_stmt_expected(inout env: TypeEnv, if_stmt: IfStmt, is_stmt: Bool, e
       # dropped-value context (a block tail / statement expression) never
       # fails the join over a Unit path; the non-Unit branch type wins.
       # A genuine value position keeps the strict join.
-      if discarded && (is_unit_type(&result_type) || is_unit_type(&eb_flow.normal)) then
+      if discarded then
+        # (discarded join — see the match port): a dropped-value context
+        # never fails the join over a Unit path; adopt the first non-Unit
+        # branch type but NEVER strictly unify branches — two heterogeneous
+        # non-Unit branches are both discarded values, not a conflict.
         if is_unit_type(&result_type) && !is_unit_type(&eb_flow.normal) then
           result_type = eb_flow.normal.clone()
         end
@@ -17205,7 +17276,7 @@ def check_if_stmt_expected(inout env: TypeEnv, if_stmt: IfStmt, is_stmt: Bool, e
     if else_flow.may_continue then may_continue = true end
     if else_flow.may_throw then may_throw = true end
     if !is_stmt then
-      if discarded && (is_unit_type(&result_type) || is_unit_type(&else_flow.normal)) then
+      if discarded then
         if is_unit_type(&result_type) && !is_unit_type(&else_flow.normal) then
           result_type = else_flow.normal.clone()
         end
@@ -17538,7 +17609,15 @@ def check_match_expected(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool, expect
     # expected into its arm bodies (the seed's Discarded expected'=None);
     # a value match keeps the expected-driven arm inference.
     let arm_expected = if discarded then Option::None else Option::Some(result_type.clone()) end
-    let arm_flow = check_block_expected(env, &arm.body, true, arm_expected)
+    # (statement-discard parity — mirror check_if_stmt_expected): a
+    # STATEMENT-position match's arm bodies are statement blocks, so a nested
+    # tail match/if inside an arm is itself a discarded position. Hardcoding
+    # the value form made an inner tail match take a STRICT join (its expected
+    # was the outer match's fresh result variable), so `Option` arms versus a
+    # `()` arm (which types as Type::Tuple([]), not Type::Unit) errored —
+    # the resolver.tg:3017 / lexer.tg:4332 "Option vs Tuple" class.
+    let arms_are_values = !is_stmt
+    let arm_flow = check_block_expected(env, &arm.body, arms_are_values, arm_expected)
     if !is_never_type(&arm_flow.normal) then falls_through = true end
     if arm_flow.may_return then may_return = true end
     if arm_flow.may_break then may_break = true end
@@ -17552,10 +17631,24 @@ def check_match_expected(inout env: TypeEnv, m: MatchExpr, is_stmt: Bool, expect
       # dropped-value context never fails the join over a Unit path and
       # the non-Unit arm type wins. A genuine value position keeps the
       # strict join.
-      if discarded && (is_unit_type(&result_type) || is_unit_type(&arm_flow.normal)) then
+      if discarded then
+        # (discarded join — a tail whose value is unobservable, expected
+        # None or Unit): every arm's value is DROPPED, so the join never
+        # fails. Adopt the first non-Unit arm type as the running join type
+        # (the seed's "non-Unit branch wins") but NEVER unify arms against
+        # each other: two heterogeneous non-Unit arms (Option vs Bool) are
+        # both discarded values, not a type conflict. The previous condition
+        # additionally required a Unit side, so a SECOND non-Unit arm fell
+        # into the strict branch and produced a spurious mismatch (the
+        # resolver.tg record_item_def class: 58+ "Option vs Tuple" rows).
         if is_unit_type(&result_type) && !is_unit_type(&arm_flow.normal) then
           result_type = arm_flow.normal.clone()
         end
+        # (speculative, NOT dropped): binds a fresh result variable to the arm
+        # type so a discarded value's type is still KNOWN (`let source = match
+        # ... end`), while a conflicting second arm rolls back silently — a
+        # dropped value is never a type conflict. Removing this left the fresh
+        # variable unbound ("no method len on ?T" cascade in compile_file_core).
         speculative_unify(env, result_type.clone(), arm_flow.normal.clone())
       else
         unify(env, result_type, arm_flow.normal, arm.span)
