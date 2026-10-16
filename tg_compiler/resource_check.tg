@@ -865,6 +865,14 @@ struct AnalysisContext
   # executed in place, so its terminators are not scanned (the pre-existing
   # behavior — run_cfg_block gets scan=None there).
   loop_body_scan: Option[LoopBodyScan]
+  # (step cost) the find_edge_index memo — the (kind, source) of an
+  # attach-kind edge -> its FIRST index in the edge vector, plus the number
+  # of edges already folded into the memo.  find_edge_index advances the
+  # cursor lazily, so every edge is visited ONCE across the whole run
+  # (amortized O(edges)) instead of rescanning the vector per attach
+  # (O(statements x edges) — the resource phase's step-limit wall).
+  edge_find_memo: Map[String, Int]
+  edge_find_cursor: Int
 end
 
 # one fresh context per compilation — the pipeline (analyze_parsed,
@@ -883,7 +891,9 @@ pub def analysis_context_new() -> AnalysisContext
     current_owner_key: "",
     dma_facts: Vec::new(),
     loop_escape_stack: Vec::new(),
-    loop_body_scan: Option::None
+    loop_body_scan: Option::None,
+    edge_find_memo: Map::new(),
+    edge_find_cursor: 0
   }
 end
 
@@ -2566,15 +2576,56 @@ end
 # identity, or -1. The structural CFG pass records every transfer the
 # state computation attaches to, so a miss at an attach site is an
 # internal error (reported by attach_edge_actions).
-pub def find_edge_index(edges: Vec[CfgEdge], kind: CfgEdgeKind, source: Int) -> Int
-  mut i = 0
-  while i < edges.len() do
-    if edges[i].kind == kind && edges[i].source == source then
-      return i
-    end
-    i = i + 1
+# the memo key tag of an attach-kind edge (the other kinds are never looked
+# up; an unlisted kind takes the linear fallback and is never memoized).
+def cfg_edge_find_key(kind: CfgEdgeKind, source: Int) -> String
+  let k = match kind
+  when CfgEdgeKind::Normal then "N"
+  when CfgEdgeKind::Return then "R"
+  when CfgEdgeKind::Break then "B"
+  when CfgEdgeKind::Continue then "C"
+  when CfgEdgeKind::GuardElse then "G"
+  when _ then "?"
   end
-  -1
+  k + ":" + source.to_string()
+end
+
+pub def find_edge_index(inout ctx: AnalysisContext, edges: Vec[CfgEdge], kind: CfgEdgeKind, source: Int) -> Int
+  # (step cost): the (kind, source) -> FIRST index memo, advanced by a cursor.
+  # The edge vector only GROWS, so folding each new edge exactly once
+  # (first-wins) keeps the memo valid while every edge is visited ONCE across
+  # the whole run.  Previously each attach rescanned the vector
+  # (O(statements x edges) — the resource phase's step-limit wall).
+  let can_memo = match kind
+  when CfgEdgeKind::Normal then true
+  when CfgEdgeKind::Return then true
+  when CfgEdgeKind::Break then true
+  when CfgEdgeKind::Continue then true
+  when CfgEdgeKind::GuardElse then true
+  when _ then false
+  end
+  if !can_memo then
+    mut i = 0
+    while i < edges.len() do
+      if edges[i].kind == kind && edges[i].source == source then
+        return i
+      end
+      i = i + 1
+    end
+    return -1
+  end
+  while ctx.edge_find_cursor < edges.len() do
+    let ci = ctx.edge_find_cursor
+    let ck = cfg_edge_find_key(edges[ci].kind, edges[ci].source)
+    if !ctx.edge_find_memo.contains_key(&ck) then
+      ctx.edge_find_memo.insert(ck, ci)
+    end
+    ctx.edge_find_cursor = ctx.edge_find_cursor + 1
+  end
+  match ctx.edge_find_memo.get(&cfg_edge_find_key(kind, source))
+  when Option::Some(i) then i.clone()
+  when Option::None then -1
+  end
 end
 
 # / attach a cleanup obligation to a PRE-BUILT edge (by its
@@ -2586,8 +2637,8 @@ end
 # PREPENDED in reverse registration order (borrows end LIFO — before any
 # deferred code runs or memory is freed), then the recording site's actions
 # (RunDefer LIFO, then Drop in reverse drop order).
-pub def attach_edge_actions(ctx: AnalysisContext, inout edges: Vec[CfgEdge], kind: CfgEdgeKind, source: Int, actions: Vec[CleanupAction], inout errors: Vec[ResourceError]) -> Unit
-  let idx = find_edge_index(edges, kind, source)
+pub def attach_edge_actions(inout ctx: AnalysisContext, inout edges: Vec[CfgEdge], kind: CfgEdgeKind, source: Int, actions: Vec[CleanupAction], inout errors: Vec[ResourceError]) -> Unit
+  let idx = find_edge_index(&mut ctx, edges, kind, source)
   if idx >= 0 then
     var full_actions = Vec::new()
     let access_ids = access_registry_for_edge(ctx, idx)
@@ -3795,7 +3846,7 @@ def run_fn_block_worklist(program: Program, typed: TypedProgram, inout env: Type
     let final_block = Block { stmts: last_slice, span: block.span }
     let block_actions = record_block_exit_plan(ctx, typed, frame, &entry_names, &final_block, finalize_plan)
     if blk_key != 0 then
-      attach_edge_actions(ctx, edges, CfgEdgeKind::Normal, last_key, block_actions, errors)
+      attach_edge_actions(&mut ctx, edges, CfgEdgeKind::Normal, last_key, block_actions, errors)
     end
   end
   if blk_key != 0 then
@@ -4638,7 +4689,7 @@ def check_block(program: Program, typed: TypedProgram, inout env: TypeEnv, inout
     # Empty blocks (key 0) have no statements, hence no
     # cleanup-bearing fallthrough edge.
     if blk_key != 0 then
-      attach_edge_actions(ctx, edges, CfgEdgeKind::Normal, blk_key, block_actions, errors)
+      attach_edge_actions(&mut ctx, edges, CfgEdgeKind::Normal, blk_key, block_actions, errors)
     end
   end
  # the block records were built by the structural pass (the state
@@ -5021,12 +5072,12 @@ def check_terminator_stmt(program: Program, typed: TypedProgram, inout env: Type
     # computed by check_return_stmt is ATTACHED to it (the "return::<stmt
     # id>" string-key serialization is are not part of the model).
     let ret_actions = check_return_stmt(program, typed, env, ctx, val_opt, loop_outer, frame, errors, finalize_plan, edges, blocks, stmt.node_id, defer_chain)
-    attach_edge_actions(ctx, edges, CfgEdgeKind::Return, stmt.node_id, ret_actions, errors)
+    attach_edge_actions(&mut ctx, edges, CfgEdgeKind::Return, stmt.node_id, ret_actions, errors)
   when StmtKind::StmtBreak(val_opt) then
  # / BREAK edge — the pre-built CfgEdge { kind: Break,
     # source: <stmt id>, destination: <innermost loop body key> }.
     let brk_actions = check_break_stmt(program, typed, env, ctx, val_opt, loop_outer, frame, errors, finalize_plan, edges, blocks, stmt.node_id, current_loop_entry, defer_chain)
-    attach_edge_actions(ctx, edges, CfgEdgeKind::Break, stmt.node_id, brk_actions, errors)
+    attach_edge_actions(&mut ctx, edges, CfgEdgeKind::Break, stmt.node_id, brk_actions, errors)
   when StmtKind::StmtContinue then
  # / CONTINUE edge — the pre-built CfgEdge { kind:
     # Continue, source: <stmt id>, destination: <innermost loop body key> }.
@@ -5035,7 +5086,7 @@ def check_terminator_stmt(program: Program, typed: TypedProgram, inout env: Type
     # were live before this iteration and must survive into the next one.
  # the scopes nested inside the loop run their defers on this edge.
     let cont_actions = record_exit_edge_plan(typed, frame, current_loop_entry, finalize_plan, defer_chain, true)
-    attach_edge_actions(ctx, edges, CfgEdgeKind::Continue, stmt.node_id, cont_actions, errors)
+    attach_edge_actions(&mut ctx, edges, CfgEdgeKind::Continue, stmt.node_id, cont_actions, errors)
   when _ then ()
   end  end
 end
@@ -5203,12 +5254,12 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     # computed by check_return_stmt is ATTACHED to it (the "return::<stmt
     # id>" string-key serialization is are not part of the model).
     let ret_actions = check_return_stmt(program, typed, env, ctx, val_opt, loop_outer, frame, errors, finalize_plan, edges, blocks, stmt.node_id, defer_chain)
-    attach_edge_actions(ctx, edges, CfgEdgeKind::Return, stmt.node_id, ret_actions, errors)
+    attach_edge_actions(&mut ctx, edges, CfgEdgeKind::Return, stmt.node_id, ret_actions, errors)
   when StmtKind::StmtBreak(val_opt) then
  # / BREAK edge — the pre-built CfgEdge { kind: Break,
     # source: <stmt id>, destination: <innermost loop body key> }.
     let brk_actions = check_break_stmt(program, typed, env, ctx, val_opt, loop_outer, frame, errors, finalize_plan, edges, blocks, stmt.node_id, current_loop_entry, defer_chain)
-    attach_edge_actions(ctx, edges, CfgEdgeKind::Break, stmt.node_id, brk_actions, errors)
+    attach_edge_actions(&mut ctx, edges, CfgEdgeKind::Break, stmt.node_id, brk_actions, errors)
   when StmtKind::StmtContinue then
  # / CONTINUE edge — the pre-built CfgEdge { kind:
     # Continue, source: <stmt id>, destination: <innermost loop body key> }.
@@ -5217,7 +5268,7 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     # were live before this iteration and must survive into the next one.
  # the scopes nested inside the loop run their defers on this edge.
     let cont_actions = record_exit_edge_plan(typed, frame, current_loop_entry, finalize_plan, defer_chain, true)
-    attach_edge_actions(ctx, edges, CfgEdgeKind::Continue, stmt.node_id, cont_actions, errors)
+    attach_edge_actions(&mut ctx, edges, CfgEdgeKind::Continue, stmt.node_id, cont_actions, errors)
   when StmtKind::StmtExpr(e) then
     check_expr(program, typed, env, ctx, &e, loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
     if value_position then
@@ -5326,7 +5377,7 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
       end
       let g_val = val_opt.clone()
       let g_actions = check_return_stmt(program, typed, env, ctx, val_opt, loop_outer, &mut gframe, errors, finalize_plan, edges, blocks, stmt.node_id, defer_chain)
-      attach_edge_actions(ctx, edges, CfgEdgeKind::GuardElse, stmt.node_id, g_actions, errors)
+      attach_edge_actions(&mut ctx, edges, CfgEdgeKind::GuardElse, stmt.node_id, g_actions, errors)
       check_iter_binding_escape_at(typed, ctx, &gframe, true, g_val, g_span, &g_sanctioned, errors)
     when GuardElse::Panic(_) then ()
     when GuardElse::Break(val_opt) then
@@ -5339,12 +5390,12 @@ def check_stmt(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
       end
       let gb_val = val_opt.clone()
       let g_actions = check_break_stmt(program, typed, env, ctx, val_opt, loop_outer, &mut gframe2, errors, finalize_plan, edges, blocks, stmt.node_id, current_loop_entry, defer_chain)
-      attach_edge_actions(ctx, edges, CfgEdgeKind::GuardElse, stmt.node_id, g_actions, errors)
+      attach_edge_actions(&mut ctx, edges, CfgEdgeKind::GuardElse, stmt.node_id, g_actions, errors)
       check_iter_binding_escape_at(typed, ctx, &gframe2, false, gb_val, gb_span, &gb_sanctioned, errors)
     when GuardElse::Continue then
  # / GUARD-ELSE edge (else-continue).
       let g_actions = record_exit_edge_plan(typed, frame, current_loop_entry, finalize_plan, defer_chain, true)
-      attach_edge_actions(ctx, edges, CfgEdgeKind::GuardElse, stmt.node_id, g_actions, errors)
+      attach_edge_actions(&mut ctx, edges, CfgEdgeKind::GuardElse, stmt.node_id, g_actions, errors)
     end
     # (item 2): the else path has diverged — restore the path-scoped marks
     # the snapshot captured so only the else path's own scan (above) ever
@@ -7365,9 +7416,9 @@ def check_loop_created(inout ctx: AnalysisContext, entry: ResFrame, entry_names:
     if single_shot && exit_source >= 0 then
  # the backedge is unreachable — the loop-created cleanup runs
       # on the loop's EXIT edge (the condition's False edge) instead.
-      attach_edge_actions(ctx, edges, CfgEdgeKind::False, exit_source, backedge_actions, errors)
+      attach_edge_actions(&mut ctx, edges, CfgEdgeKind::False, exit_source, backedge_actions, errors)
     else
-      attach_edge_actions(ctx, edges, CfgEdgeKind::Backedge, loop_stmt_id, backedge_actions, errors)
+      attach_edge_actions(&mut ctx, edges, CfgEdgeKind::Backedge, loop_stmt_id, backedge_actions, errors)
     end
   end
   to_forget
@@ -8743,7 +8794,7 @@ def check_expr(program: Program, typed: TypedProgram, inout env: TypeEnv, inout 
     # keep compiling.
     var prop_exclude = Vec::new()
     let prop_actions = record_exit_edge_plan(typed, frame, &prop_exclude, finalize_plan, defer_chain, false)
-    attach_edge_actions(ctx, edges, CfgEdgeKind::Propagate, expr.node_id, prop_actions, errors)
+    attach_edge_actions(&mut ctx, edges, CfgEdgeKind::Propagate, expr.node_id, prop_actions, errors)
   when ExprKind::ExprRange(start, end_, _) then
     match start
     when Option::Some(s) then check_expr(program, typed, env, ctx, *s.get(), loop_outer, frame, errors, finalize_plan, edges, blocks, current_loop_entry, defer_chain)
