@@ -3876,19 +3876,20 @@ def validate_cfg_blocks(blocks: Vec[CfgBlock], edges: Vec[CfgEdge], inout errors
   # branch fallthroughs and the loop's exit edge target the synthetic
   # join ids; the continuation edges and the break/continue/backedge
   # edges target the block keys / loop-body keys.
+  # (step cost): the target block-ids are a Set built ONCE — the per-edge
+  # scan of all blocks is O(edges x blocks) and this validation runs once
+  # over the program-wide CFG.
+  var block_id_set: Set[Int] = Set::new()
+  var bidx = 0
+  while bidx < blocks.len() do
+    block_id_set.insert(blocks[bidx].id)
+    bidx = bidx + 1
+  end
   var ei = 0
   while ei < edges.len() do
     let dest = edges[ei].destination
     if dest != 0 then
-      var named = false
-      var ri = 0
-      while ri < blocks.len() do
-        if blocks[ri].id == dest then
-          named = true
-        end
-        ri = ri + 1
-      end
-      if !named then
+      if !block_id_set.contains(&dest) then
         errors.push(ResourceError {
           message: "internal error: resource-check CFG edge targets block id " + dest.to_string() + " that no CfgBlock record carries",
           span: Span { file: "", start: 0, end_pos: 0 }
@@ -3977,19 +3978,23 @@ def validate_cfg_edges(ctx: AnalysisContext, typed: TypedProgram, finalize_plan:
     i = i + 1
   end
   mut j = 0
+  # (step cost): the duplicate-Normal-successor check is a Set membership
+  # test, not a nested scan.  This runs ONCE per resource_check over the
+  # PROGRAM-WIDE edge vector, so the nested form is O(edges^2) — the
+  # resource phase's step-limit wall.  The error count and order are
+  # identical to the nested form: the first Normal edge of a source is
+  # recorded, each later one reports.
+  var normal_sources: Set[Int] = Set::new()
   while j < edges.len() do
     if edges[j].kind == CfgEdgeKind::Normal then
       let nsrc = edges[j].source
-      mut k = j + 1
-      while k < edges.len() do
-        if edges[k].kind == CfgEdgeKind::Normal && edges[k].source == nsrc then
-          errors.push(ResourceError {
-            message: "internal error: a block has more than one Normal CFG successor",
-            span: Span { file: "", start: 0, end_pos: 0 }
-          })
-          break
-        end
-        k = k + 1
+      if normal_sources.contains(&nsrc) then
+        errors.push(ResourceError {
+          message: "internal error: a block has more than one Normal CFG successor",
+          span: Span { file: "", start: 0, end_pos: 0 }
+        })
+      else
+        normal_sources.insert(nsrc)
       end
     end
     j = j + 1
@@ -4089,6 +4094,23 @@ def validate_cfg_edges(ctx: AnalysisContext, typed: TypedProgram, finalize_plan:
   # they drop when the deferred code RUNS, outside the exiting block's
   # frame.
   var no_exclude = Vec::new()
+  # (step cost): edge index -> owning block index, built ONCE.  The per-edge
+  # edge_source_block_index scan is O(blocks + block-edges) each, so the
+  # per-edge form below is O(edges x (blocks + edges)) over the
+  # program-wide CFG.  FIRST hit wins, exactly like the scan.
+  var edge_owner_block: Map[Int, Int] = Map::new()
+  var ob = 0
+  while ob < blocks.len() do
+    var oe = 0
+    while oe < blocks[ob].edges.len() do
+      let eidx = blocks[ob].edges[oe]
+      if !edge_owner_block.contains_key(&eidx) then
+        edge_owner_block.insert(eidx, ob)
+      end
+      oe = oe + 1
+    end
+    ob = ob + 1
+  end
   var gi = 0
   while gi < edges.len() do
     let e = edges[gi]
@@ -4107,7 +4129,12 @@ def validate_cfg_edges(ctx: AnalysisContext, typed: TypedProgram, finalize_plan:
     when _ then ()
     end
     if grounded then
-      let src_block = edge_source_block_index(blocks, gi)
+      # the once-built owner map (FIRST hit wins, as edge_source_block_index
+      # did); a miss is the documented -1 (no lexical block record).
+      let src_block = match edge_owner_block.get(&gi)
+      when Option::Some(bi) then bi.clone()
+      when Option::None then -1
+      end
       if src_block >= 0 then
         let bid = blocks[src_block].id
         match block_frames.get(&bid)
@@ -4427,10 +4454,18 @@ struct LoopEscapePathMarks
 end
 
 def run_cfg_block(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, stmts: Vec[Stmt], loop_outer: Vec[Int], frame_in: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int], block_key: Int, scan: Option[LoopBodyScan], value_block: Bool) -> (ResFrame, Option[LoopBodyScan])
-   mut bf = res_frame_clone(frame_in)
-   mut dead = false
-   mut carried_scan = scan
-   mut ni = 0
+    mut bf = res_frame_clone(frame_in)
+    mut dead = false
+    mut carried_scan = scan
+    mut ni = 0
+    # (step-cost bound): every edge this block contributes is APPENDED during
+    # this call (terminators and nested blocks append inside it), so the
+    # block's edges are the suffix [edge_start, edges.len()).  The grounding
+    # verifier below acts only on edges whose SOURCE is one of this block's
+    # statement node ids — all in that suffix — so it starts the scan at
+    # edge_start instead of rescanning the whole program-wide accumulator per
+    # block (O(blocks x edges); the resource phase's step-limit wall).
+    let edge_start = edges.len()
    # (item 1 — the sanctioned-sink snapshot): the pre-terminator
    # provenance of every enclosing projected loop's bindings. Taken BEFORE
    # the terminator executes so a consume committed by the terminator's OWN
@@ -4531,7 +4566,7 @@ def run_cfg_block(program: Program, typed: TypedProgram, inout env: TypeEnv, ino
     end
     ni = ni + 1
   end
-  verify_terminator_edge_grounding(typed, finalize_plan, edges, &orig_ids, frame_in, &bf, current_loop_entry, errors)
+  verify_terminator_edge_grounding(typed, finalize_plan, edges, &orig_ids, frame_in, &bf, current_loop_entry, errors, edge_start)
   (bf, carried_scan)
 end
 
@@ -4716,8 +4751,9 @@ end
 # body executes through the same run_cfg_block machinery (check_loop_body),
 # its (entry, exit) frames ARE recorded under the body's block record id,
 # and this reconciliation covers them like every other block.
-def verify_terminator_edge_grounding(typed: TypedProgram, finalize_plan: FunctionCleanupTable, edges: Vec[CfgEdge], orig_ids: Vec[Int], entry: ResFrame, exit: ResFrame, current_loop_entry: Vec[Int], inout errors: Vec[ResourceError]) -> Unit
-  mut e = 0
+def verify_terminator_edge_grounding(typed: TypedProgram, finalize_plan: FunctionCleanupTable, edges: Vec[CfgEdge], orig_ids: Vec[Int], entry: ResFrame, exit: ResFrame, current_loop_entry: Vec[Int], inout errors: Vec[ResourceError], edge_from: Int) -> Unit
+  # edge_from bounds the scan to THIS block's edge suffix — see run_cfg_block.
+  mut e = edge_from
   while e < edges.len() do
     let ed = edges[e]
     var grounded_kind = false
