@@ -878,6 +878,11 @@ struct AnalysisContext
   # per-if/match/loop lookup stops scanning every block.
   block_origin_memo: Map[Int, Int]
   block_origin_cursor: Int
+  # (step cost) the block id -> index memo (first-wins, cursor-advanced) — the
+  # worklist's successor join looked the processed block up by scanning every
+  # block record.
+  block_id_memo: Map[Int, Int]
+  block_id_cursor: Int
 end
 
 # one fresh context per compilation — the pipeline (analyze_parsed,
@@ -900,7 +905,9 @@ pub def analysis_context_new() -> AnalysisContext
     edge_find_memo: Map::new(),
     edge_find_cursor: 0,
     block_origin_memo: Map::new(),
-    block_origin_cursor: 0
+    block_origin_cursor: 0,
+    block_id_memo: Map::new(),
+    block_id_cursor: 0
   }
 end
 
@@ -3735,6 +3742,23 @@ end
 # carry only id + origin + edge indices; the function-level driver holds only the
 # body's statements) — that is the integration point that would need the
 # structural pass to expose per-record statements.
+# (step cost): block id -> index memo, advanced by a cursor over the
+# grow-only block vector (first-wins).  Used by the worklist's successor join,
+# which otherwise scanned every block record per processed item.
+def cfg_block_index_by_id(inout ctx: AnalysisContext, blocks: Vec[CfgBlock], id: Int) -> Int
+  while ctx.block_id_cursor < blocks.len() do
+    let ci = ctx.block_id_cursor
+    if !ctx.block_id_memo.contains_key(&blocks[ci].id) then
+      ctx.block_id_memo.insert(blocks[ci].id, ci)
+    end
+    ctx.block_id_cursor = ctx.block_id_cursor + 1
+  end
+  match ctx.block_id_memo.get(&id)
+  when Option::Some(bi) then bi.clone()
+  when Option::None then -1
+  end
+end
+
 def run_fn_block_worklist(program: Program, typed: TypedProgram, inout env: TypeEnv, inout ctx: AnalysisContext, block: Block, loop_outer: Vec[Int], inout frame: ResFrame, inout errors: Vec[ResourceError], inout finalize_plan: FunctionCleanupTable, inout edges: Vec[CfgEdge], inout blocks: Vec[CfgBlock], inout current_loop_entry: Vec[Int], inout defer_chain: Vec[Int], value_body: Bool) -> Unit
   # The top-level basic-block driver: the function body's statements are
   # partitioned into top-level blocks at the control-flow statements (the
@@ -3765,19 +3789,29 @@ def run_fn_block_worklist(program: Program, typed: TypedProgram, inout env: Type
   let first_key = block.stmts[starts[0]].node_id
   entry_states.insert(first_key, res_frame_clone(frame))
   pending.push(first_key)
+  # (step cost): the worklist's own indexes.  The per-item scans of `starts`
+  # (worklist key -> block index, and the successor "in universe" test) made
+  # the worklist O(items^2); both are built ONCE here (the statement ranges
+  # are stable for the function).
+  var start_index: Map[Int, Int] = Map::new()
+  var universe: Set[Int] = Set::new()
+  var sbi = 0
+  while sbi < starts.len() do
+    let sk = block.stmts[starts[sbi]].node_id
+    if !start_index.contains_key(&sk) then
+      start_index.insert(sk, sbi)
+    end
+    universe.insert(sk)
+    sbi = sbi + 1
+  end
   while pending.len() > 0 do
     match pending.pop()
     when Option::Some(key) then
-      var bi = 0
-      var found = false
-      while bi < starts.len() do
-        if block.stmts[starts[bi]].node_id == key then
-          found = true
-          break
-        end
-        bi = bi + 1
+      let bi = match start_index.get(&key)
+      when Option::Some(b) then b.clone()
+      when Option::None then -1
       end
-      if found then
+      if bi >= 0 then
         match entry_states.get(key)
         when Option::Some(entry_f) then
           frame_assign(frame, &entry_f)
@@ -3797,24 +3831,15 @@ def run_fn_block_worklist(program: Program, typed: TypedProgram, inout env: Type
           # linear continuation edges the structural pass recorded). The
           # nested records' entries are the statement recursion's domain.
           let exit_state = res_frame_clone(frame)
-          var ri = 0
-          while ri < blocks.len() do
-            if blocks[ri].id == key then
+          let ri = cfg_block_index_by_id(&mut ctx, blocks, key)
+          if ri >= 0 then
               var ei = 0
               while ei < blocks[ri].edges.len() do
                 let eidx = blocks[ri].edges[ei]
                 if eidx < edges.len() then
                   let dest = edges[eidx].destination
                   if dest != 0 then
-                    var in_universe = false
-                    var ui = 0
-                    while ui < starts.len() do
-                      if block.stmts[starts[ui]].node_id == dest then
-                        in_universe = true
-                      end
-                      ui = ui + 1
-                    end
-                    if in_universe then
+                    if universe.contains(&dest) then
                       match entry_states.get(dest)
                       when Option::Some(cur) then
                         var two = Vec::new()
@@ -3835,8 +3860,6 @@ def run_fn_block_worklist(program: Program, typed: TypedProgram, inout env: Type
                 ei = ei + 1
               end
             end
-            ri = ri + 1
-          end
         when Option::None then ()
         end
       end
