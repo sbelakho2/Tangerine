@@ -3751,7 +3751,9 @@ let env_budget name default =
   | None -> default
 
 let bootstrap_vm_max_steps =
-  env_budget "TANGERINE_BOOTSTRAP_VM_MAX_STEPS" 30_000_000_000
+  (* Repinned from the completed aggregate self-host preflight: 30e9
+     trapped inside resolve-import binding; 150e9 completes the run. *)
+  env_budget "TANGERINE_BOOTSTRAP_VM_MAX_STEPS" 150_000_000_000
 
 let bootstrap_vm_max_host_calls =
   env_budget "TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS" 1_000_000_000

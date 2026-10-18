@@ -40916,6 +40916,161 @@ def verifier_check_operand_ownership(inout engine_env: TypeEnv, type_index: Map[
   end  end
 end
 
+# ── The Read-escape gate (audit P0 Read parity) ─────────────────────
+# MirRead is a shared read, never an ownership duplication.  The seed's
+# check_read_escapes rejects a Read of a NON-Copy, NON-shareable value
+# that CROSSES a container/pointee boundary (dynamic index, constant
+# index, or deref) and is installed somewhere other than the same place.
+# A whole-place Read keeps the shared-read convention (calls, joins and
+# same-storage reads are legal).  This is the verifier half the resource
+# checker delegates to when it stops consuming plain lets/assignments and
+# aggregate operands.
+def verifier_types_all_shareable_read(inout env: TypeEnv, types: Vec[Type]) -> Bool
+  var i = 0
+  while i < types.len() do
+    if !verifier_type_shareable_read(env, types[i].clone()) then
+      return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+def verifier_type_shareable_read(inout env: TypeEnv, ty: Type) -> Bool
+  match ty
+  when Type::String then true
+  when Type::Unit then true
+  when Type::Bool then true
+  when Type::Char then true
+  when Type::Int then true
+  when Type::UInt then true
+  when Type::Float then true
+  when Type::StaticStrPtr then true
+  when Type::Never then true
+  when Type::I8 then true
+  when Type::I16 then true
+  when Type::I32 then true
+  when Type::I64 then true
+  when Type::I128 then true
+  when Type::U8 then true
+  when Type::U16 then true
+  when Type::U32 then true
+  when Type::U64 then true
+  when Type::U128 then true
+  when Type::ISize then true
+  when Type::USize then true
+  when Type::F32 then true
+  when Type::F64 then true
+  when Type::IntLiteral(_) then true
+  when Type::Const(_) then true
+  when Type::ConstParam(_) then true
+  when Type::ConstSym(_) then true
+  when Type::Param(_) then true
+  when Type::Var(_) then true
+  when Type::Error then true
+  when Type::FnPtr(_, _, _) then true
+  when Type::Closure(_, _, _, _, _) then true
+  when Type::RefInternal(_, _) then true
+  when Type::Ptr(_) then true
+  when Type::PtrMut(_) then true
+  when Type::Dyn(_) then true
+  when Type::Effect(_, inner) then verifier_type_shareable_read(env, inner)
+  when Type::Tuple(elems) then verifier_types_all_shareable_read(env, elems)
+  when Type::FixedArray(elem, _) then verifier_type_shareable_read(env, elem)
+  when Type::FixedArraySym(elem, _) then verifier_type_shareable_read(env, elem)
+  when Type::Adt(tid, args) then
+    let li = env.lang_items
+    # COW/immutable containers and Option/Result inherit shareability
+    # element-wise (the seed shareable_go's Named arm).
+    if tid.id == li.vec || tid.id == li.map || tid.id == li.set ||
+       tid.id == li.option || tid.id == li.result then
+      verifier_types_all_shareable_read(env, args)
+    elsif tid.id == li.box_ || tid.id == li.rc || tid.id == li.arc_strong ||
+          tid.id == li.weak_rc || tid.id == li.weak_arc || tid.id == li.unique_ptr then
+      # the unique/shared HANDLES: a bare Read never bumps the count and
+      # would install a second owner — never shareable.
+      false
+    else
+      # a USER nominal (incl. resource/value declarations): the checker's
+      # resource analysis owns the consumption discipline; the verifier's
+      # gate targets the handle protocol only (seed parity).
+      verifier_types_all_shareable_read(env, args)
+    end
+  end  end
+end
+
+def verifier_read_crosses_boundary(place: Place) -> Bool
+  var i = 0
+  while i < place.projections.len() do
+    match place.projections[i]
+    when Projection::ProjDeref then return true
+    when Projection::ProjIndex(_) then return true
+    when Projection::ProjConstantIndex(_) then return true
+    when _ then ()
+    end
+    i = i + 1
+  end
+  false
+end
+
+def verifier_read_same_place(a: Place, b: Place) -> Bool
+  if a.local.id != b.local.id then return false end
+  if a.projections.len() != b.projections.len() then return false end
+  var i = 0
+  while i < a.projections.len() do
+    match (a.projections[i], b.projections[i])
+    when (Projection::ProjDeref, Projection::ProjDeref) then ()
+    when (Projection::ProjIndex(_), Projection::ProjIndex(_)) then ()
+    when (Projection::ProjConstantIndex(x), Projection::ProjConstantIndex(y)) then
+      if x != y then return false end
+    when (Projection::Field(x), Projection::Field(y)) then
+      if x.owner.id != y.owner.id || x.index != y.index then return false end
+    when (Projection::Variant(x), Projection::Variant(y)) then
+      if x.owner.id != y.owner.id || x.index != y.index then return false end
+    when (Projection::TupleIndex(x), Projection::TupleIndex(y)) then
+      if x != y then return false end
+    when _ then return false
+    end
+    i = i + 1
+  end
+  true
+end
+
+def verifier_check_read_escape(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], inout aliases: Map[Int, GenericParamId], func: MirFunction, dest: Place, src: Place, ctx: String, inout errors: Vec[String]) -> Unit
+  if !verifier_read_crosses_boundary(src) then return end
+  if verifier_read_same_place(src, dest) then return end
+  match verifier_place_result_type_opt(type_index, aliases, func, &src)
+  when Option::Some(ty) then
+    if !verifier_type_trivially_copyable(engine_env, ty.clone()) &&
+       !verifier_type_shareable_read(engine_env, ty.clone()) then
+      errors.push(ctx.clone() + ": read of non-Copy non-shareable value of type " + verifier_type_key(type_index, &ty) + " escapes from the container/pointee into an independent owning local _" + dest.local.id.to_string() + " (a Read is a shared borrow; ownership duplication must be a Clone call and a transfer must be a Move)")
+    end
+  when Option::None then ()
+  end  end
+end
+
+def verifier_check_rvalue_read_escapes(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], inout aliases: Map[Int, GenericParamId], func: MirFunction, dest: Place, rvalue: MirRvalue, ctx: String, inout errors: Vec[String]) -> Unit
+  match rvalue.kind
+  when MirRvalueKind::MirMove(op) then
+    match op.kind
+    when MirOperandKind::MirRead(src) then
+      verifier_check_read_escape(engine_env, type_index, aliases, func, dest, src, ctx, errors)
+    when _ then ()
+    end
+  when MirRvalueKind::MirAggregate(_, ops) then
+    var i = 0
+    while i < ops.len() do
+      match ops[i].kind
+      when MirOperandKind::MirRead(src) then
+        verifier_check_read_escape(engine_env, type_index, aliases, func, dest.clone(), src, ctx, errors)
+      when _ then ()
+      end
+      i = i + 1
+    end
+  when _ then ()
+  end  end
+end
+
 # MirCallArg.effect must agree with the operand form.
 #   - Modify/Initialize args must be places (MirCallValue::Place or a
 #     value operand carrying a place) — an inout/initialize slot, never a
@@ -43445,6 +43600,9 @@ def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, M
       # "assign to ... storage is not live" violation is reported by the
       # destination check itself (StorageDead'd storage).
       verifier_check_dest_place(type_index, aliases, func, &place, &live, ctx, errors)
+      # (the Read-escape gate): a boundary-crossing shared READ may not
+      # install a second owner (the seed's check_read_escapes parity).
+      verifier_check_rvalue_read_escapes(engine_env, type_index, aliases, func, place.clone(), rvalue.clone(), ctx, errors)
       match verifier_place_result_type_opt(type_index, aliases, func, &place)
       when Option::Some(dst_ty) then
         let rv_ty = verifier_rvalue_type(engine_env, type_index, func, aliases, param_names, scope, &rvalue, &running, &mut moved, Option::Some(dst_ty.clone()), ctx, errors)

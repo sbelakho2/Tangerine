@@ -282,6 +282,8 @@ t G6.1 "exactly one verifier_place_result_type_opt definition (mir.tg)" \
   'test "$(grep -c "^def verifier_place_result_type_opt" tg_compiler/mir.tg)" -eq 1'
 t G6.2 "verifier projection tests exist (tests/verifier_projection_tests.tg)" \
   'test -s tests/verifier_projection_tests.tg && grep -q "def " tests/verifier_projection_tests.tg'
+t G6.2b "verifier Read-escape tests exist (tests/verifier_read_escape_tests.tg)" \
+  'test -s tests/verifier_read_escape_tests.tg && grep -q "verifier_check_read_escape\|read of non-Copy" tests/verifier_read_escape_tests.tg'
 
 # ———————————————————————————————————————————————————————————————
 # G7  Allocator
