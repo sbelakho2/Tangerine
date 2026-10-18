@@ -474,7 +474,7 @@ fi
 check_pin "the final gate installs the RSS ceiling unconditionally" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB=12288'
 check_pin "the authorization gate accepts no RSS override" scripts/check_ocaml_bootstrap_complete.sh   'accepts NO resource-budget override'
 check_pin "authorization pins the VM step budget" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_STEPS=150000000000'
-check_pin "authorization pins the VM host-call budget" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS=1000000000'
+check_pin "authorization pins the VM host-call budget" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS=8000000000'
 check_pin "authorization pins the VM alloc budget" scripts/check_ocaml_bootstrap_complete.sh   'TANGERINE_BOOTSTRAP_VM_MAX_ALLOC=8589934592'
 check_pin "authorization pins the outer gate timeout" scripts/check_ocaml_bootstrap_complete.sh   'GATE_TIMEOUT_S=6000'
 check_pin "authorization pins the GC policy" scripts/check_ocaml_bootstrap_complete.sh   'OCAMLRUNPARAM=o=40'

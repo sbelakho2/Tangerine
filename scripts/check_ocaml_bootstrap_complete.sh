@@ -106,14 +106,22 @@ GATE_TIMEOUT_S=6000
 # selfcheck directly with explicit env, never through this script, so no
 # measurement configuration can emit an authorization PASS.  Re-pin the
 # step/host-call/alloc limits only from a completed cold+warm calibration.
-# MEASURED REPIN (aggregate run, o=40): the provisional 30e9 cap trapped
-# inside resolve-import binding before the self-host preflight could reach
-# its tail; with 150e9 the preflight completes (VM B 2486s) and the whole
-# aggregate gate stays under the 4140s outer cap.  This is a completed-run
-# measurement, not a blind increase; a lower cap requires a completed
-# cold run that proves it.
+# MEASURED REPIN (aggregate run, o=40, HEAD 02b6344, aarch64-apple-darwin):
+# the provisional 30e9 cap trapped inside resolve-import binding before the
+# self-host preflight reached its tail.  With 150e9 the FULL preflight
+# completes (VM B 4120.4s, all 11 phases).  The earlier 2486s figure in the
+# first repin note was a TYPECHECK-FAILED run (it stopped on a non-exhaustive
+# match) and is NOT a completion measurement.  This is a completed-run
+# measurement, not a blind increase; a lower cap requires a completed cold
+# run that proves it.
 export TANGERINE_BOOTSTRAP_VM_MAX_STEPS=150000000000
-export TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS=1000000000
+# Repinned from the same completed aggregate run: the provisional 1e9
+# host-call cap trapped inside lower_stmt_impl/typed_binding_type_by_name;
+# the full preflight's realized host-call count is far below 8e9 (the
+# 46e9-step beacon in the instrumented run reported 442M, and the gate
+# completes under 8e9).  Allocation stays at 8GiB (RSS beacon <= ~9.0GB
+# under the 12GiB ceiling).
+export TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS=8000000000
 export TANGERINE_BOOTSTRAP_VM_MAX_ALLOC=8589934592
 # The final authorization ALWAYS installs the measured RSS ceiling and
 # accepts NO resource-budget override: an ambient environment cannot

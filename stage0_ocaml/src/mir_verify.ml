@@ -973,17 +973,12 @@ let place_type (ctx : ctx) (fn : function_) (p : place) : Type_repr.t option =
 let check_read_escapes (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : place)
     (rv : rvalue) : unit =
   let escape (src : place) : unit =
-    (* the PROJECTED extraction class: a chain crossing a container /
-       pointee boundary (dynamic Index, ConstantIndex, or Deref) — the
-       `let x = owning_vec[0]` shape.  A whole-place Read (the join /
-       call-ABI form) keeps the existing shared-read convention. *)
-    let crosses_boundary =
-      List.exists
-        (function
-          | Seed_mir.Index _ | Seed_mir.ConstantIndex _ | Seed_mir.Deref -> true
-          | _ -> false)
-        src.projections
-    in
+    (* ANY projected extraction can install a second owner: a field /
+       tuple / enum-payload read is exactly as dangerous as a container
+       index or a pointee deref when the leaf is a non-shareable handle.
+       Only a WHOLE-place Read (the join / call-ABI form) keeps the
+       shared-read convention. *)
+    let crosses_boundary = src.projections <> [] in
     let same_place =
       root_key src.root = root_key dest.root
       && List.length src.projections = List.length dest.projections
@@ -993,14 +988,39 @@ let check_read_escapes (ctx : ctx) (fn : function_) (bb_ctx : string) (dest : pl
              | ConstantIndex i, ConstantIndex j -> i = j
              | Field i, Field j -> Ids.Field_id.compare i j = 0
              | Deref, Deref -> true
-             | Downcast _, Downcast _ -> true
-             | Index _, Index _ -> true
+             | Downcast i, Downcast j -> Ids.Variant_id.compare i j = 0
+             | Index i, Index j -> i = j
              | _ -> false)
            src.projections dest.projections
     in
     if crosses_boundary && not same_place then
       match place_type ctx fn src with
       | Some ty when not (is_copy ctx ty) && not (shareable_read_type ctx ty) ->
+          if Sys.getenv_opt "TANGERINE_DEBUG_READ_ESCAPE" <> None then begin
+            Printf.eprintf "LI vec=%s map=%s set=%s option=%s result=%s box=%s rc=%s arc=%s unique=%s string=%s\n%!"
+              (match ctx.lang_items.Lang_items.vec with Some t -> Ids.Type_id.to_int t |> string_of_int | None -> "-")
+              (match ctx.lang_items.Lang_items.map with Some t -> Ids.Type_id.to_int t |> string_of_int | None -> "-")
+              (match ctx.lang_items.Lang_items.set with Some t -> Ids.Type_id.to_int t |> string_of_int | None -> "-")
+              (match ctx.lang_items.Lang_items.option with Some t -> Ids.Type_id.to_int t |> string_of_int | None -> "-")
+              (match ctx.lang_items.Lang_items.result with Some t -> Ids.Type_id.to_int t |> string_of_int | None -> "-")
+              (match ctx.lang_items.Lang_items.box_ with Some t -> Ids.Type_id.to_int t |> string_of_int | None -> "-")
+              (match ctx.lang_items.Lang_items.rc with Some t -> Ids.Type_id.to_int t |> string_of_int | None -> "-")
+              (match ctx.lang_items.Lang_items.arc with Some t -> Ids.Type_id.to_int t |> string_of_int | None -> "-")
+              (match ctx.lang_items.Lang_items.unique_ptr with Some t -> Ids.Type_id.to_int t |> string_of_int | None -> "-")
+              (match ctx.lang_items.Lang_items.string with Some t -> Ids.Type_id.to_int t |> string_of_int | None -> "-");
+            Printf.eprintf "%s\n%!" (Seed_mir.print_function fn);
+            Printf.eprintf "READ_ESCAPE fn=%s dest=%d type=%s projs=%s\n%!"
+              fn.name (root_key dest.root) (Seed_mir.print_type ty)
+              (String.concat ","
+                 (List.map
+                    (function
+                      | Seed_mir.Deref -> "D"
+                      | Seed_mir.Field f -> "F" ^ string_of_int (Ids.Field_id.to_int f)
+                      | Seed_mir.Index i -> "I" ^ string_of_int i
+                      | Seed_mir.ConstantIndex i -> "C" ^ string_of_int i
+                      | Seed_mir.Downcast v -> "V" ^ string_of_int (Ids.Variant_id.to_int v))
+                    src.projections))
+          end;
           add_err ctx
             (Printf.sprintf
                "%s: read of non-Copy non-shareable value of type %s escapes from the container/pointee into an independent owning local _%d (a Read is a shared borrow; ownership duplication must be a Clone call and a transfer must be a Move)"
