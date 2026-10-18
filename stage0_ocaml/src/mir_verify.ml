@@ -475,6 +475,7 @@ let rec shareable_go (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) 
       if List.mem tid seen then false
       else (
         let li = ctx.lang_items in
+        let seen = tid :: seen in
         if
           Lang_items.tid_eq li.Lang_items.vec tid
           || Lang_items.tid_eq li.Lang_items.map tid
