@@ -412,6 +412,49 @@ let () =
    end
    else check "m11: SAME dynamic-index local is same-place (not a Read escape)" true);
 
+
+  (* m12-m14: the recursion identity is the FULL nominal instance, not the
+     bare TypeId.  Nested same-constructor COW types are finite, shareable
+     chains; only the Box leaf makes one unsafe. *)
+  let nested_read = Seed_mir.Read { root = Local 1; projections = [ ConstantIndex 0 ] } in
+  let nested_accept name (param_ty : Type_repr.t) (dest_ty : Type_repr.t) =
+    let prog =
+      { Seed_mir.functions = [| mk_read_dest_fn name param_ty dest_ty nested_read [||] [||] |];
+        statics = [||]; types = [||] }
+    in
+    let errs =
+      match Mir_verify.require_valid_concrete ~lang_items:read_gate_li prog with
+      | Ok () -> []
+      | Error e -> e
+    in
+    if has_escape errs then begin
+      Printf.printf "    errors:\n%s\n" (String.concat "\n    " errs);
+      check name false
+    end
+    else check name true
+  in
+  nested_accept "m12: Vec[Vec[String]] shareable (nested instance identity)"
+    (vec_of (vec_of Type_repr.String)) (vec_of Type_repr.String);
+  nested_accept "m13: Vec[Vec[Vec[String]]] shareable (deep nested identity)"
+    (vec_of (vec_of (vec_of Type_repr.String))) (vec_of (vec_of Type_repr.String));
+  let m14_prog =
+    { Seed_mir.functions =
+        [| mk_read_dest_fn "nested_vec_box" (vec_of (vec_of box_int)) (vec_of box_int)
+             nested_read [||] [||] |];
+      statics = [||]; types = [||] }
+  in
+  let m14_errs =
+    match Mir_verify.require_valid_concrete ~lang_items:read_gate_li m14_prog with
+    | Ok () -> []
+    | Error e -> e
+  in
+  (if has_escape m14_errs
+   then check "m14: Vec[Vec[Box]] rejects the nested owning handle" true
+   else begin
+     Printf.printf "    errors:\n%s\n" (String.concat "\n    " m14_errs);
+     check "m14: Vec[Vec[Box]] rejects the nested owning handle" false
+   end);
+
   if !failures = 0 then begin
     Printf.printf "tg_verify: ALL PASS\n";
     Selfcheck_sentinel.emit_and_exit "tg_verify"

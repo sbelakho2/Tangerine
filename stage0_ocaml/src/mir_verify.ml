@@ -452,7 +452,7 @@ let is_copy (ctx : ctx) (ty : Type_repr.t) : bool =
    pass re-checks the substituted instance where a handle may appear;
    a def-less nominal answers shareable only when its arguments are
    shareable (conservative for a native handle). *)
-let rec shareable_go (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) : bool =
+let rec shareable_go (ctx : ctx) (seen : Type_repr.t list) (ty : Type_repr.t) : bool =
   match ty with
   | Type_repr.String -> true
   | Type_repr.Unit | Type_repr.Bool | Type_repr.Char | Type_repr.Int _
@@ -472,10 +472,13 @@ let rec shareable_go (ctx : ctx) (seen : Ids.Type_id.t list) (ty : Type_repr.t) 
   | Type_repr.Tuple elems -> Array.for_all (shareable_go ctx seen) elems
   | Type_repr.Fixed_array (elem, _) -> shareable_go ctx seen elem
   | Type_repr.Named (tid, args) ->
-      if List.mem tid seen then false
+      (* The active-recursion identity is the FULL nominal instance
+         (TypeId + arguments), never the bare TypeId: Vec[Vec[Int]] is a
+         finite nested type, not a cycle, and must answer shareable. *)
+      if List.mem ty seen then false
       else (
         let li = ctx.lang_items in
-        let seen = tid :: seen in
+        let seen = ty :: seen in
         if
           Lang_items.tid_eq li.Lang_items.vec tid
           || Lang_items.tid_eq li.Lang_items.map tid
