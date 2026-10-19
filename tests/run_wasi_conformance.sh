@@ -24,8 +24,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+RELEASE_GATE="${TG_RELEASE_GATE:-0}"
+if [ "${1:-}" = "--gate" ]; then
+  RELEASE_GATE=1
+  shift
+fi
 if [ "$#" -lt 2 ]; then
-  echo "usage: $0 <compiler> <outdir>" >&2
+  echo "usage: $0 [--gate] <compiler> <outdir>" >&2
   exit 1
 fi
 
@@ -49,6 +54,10 @@ if ! "$COMPILER" compile tests/wasi/wasi_guest_canary.tg --target wasm32-wasi -o
   # cannot serve the wasm family at all and the lane reports SKIP (the
   # lane runs after the next compiler build from this tree).
   if ! "$COMPILER" compile tests/wasm/wasm_canary.tg --target wasm32-unknown-unknown -o "$OUTDIR/wasm_probe.wasm" > "$OUTDIR/probe.log" 2>&1 || [ ! -s "$OUTDIR/wasm_probe.wasm" ]; then
+    if [ "$RELEASE_GATE" = "1" ]; then
+      echo "wasi conformance: FAIL — the release-required wasm32 routes are absent (the probe canary did not compile)" >&2
+      exit 1
+    fi
     echo "wasi conformance: SKIP — the compiler does not serve the wasm32 routes (the probe canary did not compile)"
     echo "wasi conformance: the lane runs after the next compiler build from this tree"
     exit 0

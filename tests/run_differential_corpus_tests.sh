@@ -89,6 +89,17 @@ cd "$ROOT"
 # shellcheck source=scripts/bootstrap_helpers.sh
 source "$ROOT/scripts/bootstrap_helpers.sh"
 
+# RELEASE-STRICT MODE: in TG_RELEASE_GATE=1 (or `--gate`), a required
+# compiler route or a required structural-parity surface being ABSENT is a
+# FAILURE, not SKIP-as-success.  A valid cross-host SKIP-EXEC (both objects
+# emitted and structural facts compared) remains legitimate.  Dev/local
+# runs keep the documented SKIP semantics.
+RELEASE_GATE="${TG_RELEASE_GATE:-0}"
+if [ "${1:-}" = "--gate" ]; then
+  RELEASE_GATE=1
+  shift
+fi
+
 COMPILER="${1:-$ROOT/build/tg_stage2}"
 SCRATCH="${2:-$ROOT/build/.differential_corpus}"
 
@@ -98,6 +109,11 @@ if [ ! -x "$COMPILER" ]; then
 fi
 
 mkdir -p "$SCRATCH"
+
+if [ "$RELEASE_GATE" = "1" ] && [ "${TG_DIFF_FORCE_STRUCTURAL:-0}" = "1" ]; then
+  bh_err "differential corpus: FAIL — TG_DIFF_FORCE_STRUCTURAL=1 is forbidden in TG_RELEASE_GATE=1 (a forced structural run may not substitute for executed parity)"
+  exit 1
+fi
 
 # ── the driver invocation helpers ───────────────────────────────────────
 # compile_route <route> <file> <out> <log> [extra args...]
@@ -176,10 +192,18 @@ end
 EOF
 
 if ! compile_route lir "$PROBE" "$SCRATCH/route_probe.lir" "$SCRATCH/route_probe.lir.log"; then
+  if [ "$RELEASE_GATE" = "1" ]; then
+    bh_err "differential corpus: FAIL — a release-required compiler route is absent: --codegen=lir (see $SCRATCH/route_probe.lir.log)"
+    exit 1
+  fi
   echo "differential corpus: SKIP — the compiler cannot serve the LIR route probe (a pre-ladder or pre-flip compiler; see $SCRATCH/route_probe.lir.log)"
   exit 0
 fi
 if ! compile_route direct "$PROBE" "$SCRATCH/route_probe.direct" "$SCRATCH/route_probe.direct.log"; then
+  if [ "$RELEASE_GATE" = "1" ]; then
+    bh_err "differential corpus: FAIL — a release-required compiler route is absent: --codegen=direct (see $SCRATCH/route_probe.direct.log)"
+    exit 1
+  fi
   echo "differential corpus: SKIP — the compiler cannot serve the explicit --codegen=direct probe (see $SCRATCH/route_probe.direct.log)"
   exit 0
 fi
@@ -440,6 +464,10 @@ GENERATED_CASES=(
 # ── the per-case runner ─────────────────────────────────────────────────
 MATCH_N=0
 SKIP_N=0
+# STRUCT-GAP: a SKIP-EXEC case whose STRUCTURAL parity surface is absent
+# (no object, no nm, no abi-plan dump).  In release mode this is a failure:
+# degradation to structural proof is allowed, degradation to NO proof is not.
+STRUCT_GAP_N=0
 GAP_N=0
 DIVERGE_N=0
 CFAIL_N=0
@@ -534,12 +562,22 @@ run_case() {
   local direct_obj_log="$SCRATCH/$name.direct.obj.log"
   # shellcheck disable=SC2086
   if ! compile_route_obj lir "$file" "$lir_obj" "$lir_obj_log" $extra; then
+    if [ "$RELEASE_GATE" = "1" ]; then
+      bh_err "differential corpus: FAIL — $name needs structural parity but the LIR --emit-obj artifact is unavailable"
+      STRUCT_GAP_N=$((STRUCT_GAP_N + 1))
+      return
+    fi
     bh_log "differential corpus: SKIP-EXEC $name — execution unavailable and the LIR --emit-obj artifact is unavailable; no parity claim"
     SKIP_N=$((SKIP_N + 1))
     return
   fi
   # shellcheck disable=SC2086
   if ! compile_route_obj direct "$file" "$direct_obj" "$direct_obj_log" $extra; then
+    if [ "$RELEASE_GATE" = "1" ]; then
+      bh_err "differential corpus: FAIL — $name needs structural parity but the direct --emit-obj artifact is unavailable"
+      STRUCT_GAP_N=$((STRUCT_GAP_N + 1))
+      return
+    fi
     bh_log "differential corpus: SKIP-EXEC $name — execution unavailable and the direct --emit-obj artifact is unavailable; no parity claim"
     SKIP_N=$((SKIP_N + 1))
     return
@@ -573,6 +611,10 @@ run_case() {
       fi
     fi
   else
+    if [ "$RELEASE_GATE" = "1" ]; then
+      bh_err "differential corpus: FAIL — $name structural symbol parity unavailable (nm missing)"
+      STRUCT_GAP_N=$((STRUCT_GAP_N + 1))
+    fi
     notes="$notes symbols:SKIP(no-nm)"
   fi
 
@@ -586,9 +628,17 @@ run_case() {
         facts_fail=1
       fi
     else
+      if [ "$RELEASE_GATE" = "1" ]; then
+        bh_err "differential corpus: FAIL — $name structural AbiCallPlan parity unavailable (direct dump unavailable)"
+        STRUCT_GAP_N=$((STRUCT_GAP_N + 1))
+      fi
       notes="$notes abi-plans:SKIP(direct-dump-unavailable)"
     fi
   else
+    if [ "$RELEASE_GATE" = "1" ]; then
+      bh_err "differential corpus: FAIL — $name structural AbiCallPlan parity unavailable (dump surface unavailable)"
+      STRUCT_GAP_N=$((STRUCT_GAP_N + 1))
+    fi
     notes="$notes abi-plans:SKIP(dump-surface-unavailable)"
   fi
 
@@ -666,6 +716,10 @@ if "$COMPILER" compile "$NONE_PROBE" --target "$NONE_TRIPLE" --codegen=lir --emi
           CFAIL_N=$((CFAIL_N + 1))
         fi
       else
+        if [ "$RELEASE_GATE" = "1" ]; then
+          bh_err "differential corpus: FAIL — aarch64-none symbol parity unavailable (nm missing)"
+          STRUCT_GAP_N=$((STRUCT_GAP_N + 1))
+        fi
         NONE_FACTS="$NONE_FACTS + (nm unavailable: symbol sub-check SKIPPED)"
       fi
       if [ -f "$NONE_OBJ.d/$NONE_TRIPLE.json" ] && [ -f "$NONE_OBJ.d/$NONE_TRIPLE.ld" ] && [ -f "$NONE_OBJ.d/startup.tg" ]; then
@@ -679,8 +733,13 @@ if "$COMPILER" compile "$NONE_PROBE" --target "$NONE_TRIPLE" --codegen=lir --emi
   fi
 else
   if grep -Eq "Unknown option: --codegen|Unknown codegen route" "$NONE_OBJ_LOG"; then
-    bh_log "differential corpus: SKIP aarch64-none LIR object row — the compiler predates the aarch64 LIR arm (see $NONE_OBJ_LOG)"
-    SKIP_N=$((SKIP_N + 1))
+    if [ "$RELEASE_GATE" = "1" ]; then
+      bh_err "differential corpus: FAIL — the release-required aarch64-none LIR route is absent (see $NONE_OBJ_LOG)"
+      STRUCT_GAP_N=$((STRUCT_GAP_N + 1))
+    else
+      bh_log "differential corpus: SKIP aarch64-none LIR object row — the compiler predates the aarch64 LIR arm (see $NONE_OBJ_LOG)"
+      SKIP_N=$((SKIP_N + 1))
+    fi
   else
     bh_err "differential corpus: aarch64-none LIR object row FAILED — the compile failed"
     bh_err "  $(head -n2 "$NONE_OBJ_LOG" | tr '\n' ' ')"
@@ -735,9 +794,13 @@ else
 fi
 
 # ── summary ─────────────────────────────────────────────────────────────
-echo "differential corpus: $MATCH_N MATCH, $SKIP_N SKIP-EXEC (structural facts only), $GAP_N LIR-GAP, $DIVERGE_N DIVERGE, $CFAIL_N COMPILE-FAIL"
+echo "differential corpus: $MATCH_N MATCH, $SKIP_N SKIP-EXEC (structural facts only), $STRUCT_GAP_N STRUCT-GAP, $GAP_N LIR-GAP, $DIVERGE_N DIVERGE, $CFAIL_N COMPILE-FAIL"
 if [ "$SKIP_N" -gt 0 ]; then
   echo "differential corpus: NOTE — $SKIP_N case(s) skipped execution and carry NO behavioral-parity claim"
+fi
+if [ "$STRUCT_GAP_N" -ne 0 ]; then
+  bh_err "differential corpus: FAILED — a required structural-parity surface is unavailable ($STRUCT_GAP_N case(s))"
+  exit 1
 fi
 if [ "$GAP_N" -ne 0 ] || [ "$DIVERGE_N" -ne 0 ] || [ "$CFAIL_N" -ne 0 ]; then
   bh_err "differential corpus: FAILED — route parity is not established"

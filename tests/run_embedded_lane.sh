@@ -38,6 +38,13 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# RELEASE-STRICT MODE: the required compiler route being absent is a
+# FAILURE in TG_RELEASE_GATE=1 (or `--gate`), never SKIP-as-success.
+RELEASE_GATE="${TG_RELEASE_GATE:-0}"
+if [ "${1:-}" = "--gate" ]; then
+  RELEASE_GATE=1
+  shift
+fi
 COMPILER="${1:-build/tg_stage2}"
 OUTDIR="${2:-build/.embedded_lane}"
 
@@ -71,6 +78,10 @@ end
 EOF
 
 if ! "$COMPILER" compile "$PROBE" --target "$REAL_TRIPLE" -o "$OUTDIR/embedded_probe" > "$OUTDIR/probe.log" 2>&1; then
+  if [ "$RELEASE_GATE" = "1" ]; then
+    echo "embedded lane: FAIL — the release-required embedded route is absent ($(grep -m1 -o 'Unknown option: [^ ]*' "$OUTDIR/probe.log" || echo 'the probe compile failed'))" >&2
+    exit 1
+  fi
   echo "embedded lane: SKIP — the compiler does not support the embedded route yet ($(grep -m1 -o 'Unknown option: [^ ]*' "$OUTDIR/probe.log" || echo 'the probe compile failed'))"
   echo "embedded lane: the lane runs after the next compiler build from this tree"
   exit 0

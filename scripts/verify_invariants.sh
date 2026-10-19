@@ -551,6 +551,11 @@ t G13.13 "remove-atomic-ordering detector: the x86 SeqCst store branch and the a
 t G13.14 'permissive-equality detector: the EXACT-equality invariants (the E0225-class) — the depth-1 projection check is the exact `== 1`, the convention-equality site is the exact `!(cpt.convention == ipt.convention)` form with the E0225 code, and the convention-mismatch negative canaries pin the expected text; the permissive `>= 1` never appears at the projection site' \
   'grep -qF "if keys.len() == 1 then" tg_compiler/types.tg && ! grep -qF "if keys.len() >= 1 then" tg_compiler/types.tg && grep -qF "if !(cpt.convention == ipt.convention) then" tg_compiler/types.tg && grep -q "\"E0225\"" tg_compiler/types.tg && grep -q "canary_neg_conv_convention_inout_let.tg.*access convention mismatch" tests/canary_neg/MANIFEST && grep -q "canary_neg_conv_convention_let_inout.tg.*access convention mismatch" tests/canary_neg/MANIFEST'
 
+# G14 Release-gate semantics: a required capability probe must fail
+# closed in TG_RELEASE_GATE=1 (dev SKIP stays allowed).
+t G14.1 'release gate fail-closed: required LIR/direct, tg test, embedded and no_std routes absent -> FAIL (never SKIP-as-success), dev mode still SKIPs, forced structural degradation is rejected, and the required CI steps set TG_RELEASE_GATE=1' \
+  'bash scripts/test_release_gate_skip_semantics.sh >/dev/null'
+
 # ———————————————————————————————————————————————————————————————
 # G12 Summary report
 # ———————————————————————————————————————————————————————————————

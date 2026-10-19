@@ -20,6 +20,17 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# RELEASE-STRICT MODE: a required `tg test` route being unavailable is a
+# FAILURE in TG_RELEASE_GATE=1 (or `--gate`), never SKIP-as-success.
+RELEASE_GATE="${TG_RELEASE_GATE:-0}"
+if [ "${1:-}" = "--gate" ]; then
+  RELEASE_GATE=1
+  shift
+fi
+if [ "$RELEASE_GATE" = "1" ]; then
+  export TG_RELEASE_GATE=1
+fi
+
 COMPILER="${1:-build/tg_stage2}"
 OUTDIR="${2:-build/.behavior_suites}"
 
@@ -46,6 +57,10 @@ end
 EOF
 
 if ! "$COMPILER" test "$PROBE" > "$OUTDIR/probe.log" 2>&1; then
+  if [ "$RELEASE_GATE" = "1" ]; then
+    echo "behavior suites: FAIL — the release-required `tg test` route is absent (the probe failed; see $OUTDIR/probe.log)" >&2
+    exit 1
+  fi
   echo "behavior suites: SKIP — the compiler cannot run `tg test` suites (the probe failed; see $OUTDIR/probe.log)"
   echo "behavior suites: the suites run after the next compiler build from this tree"
   exit 0

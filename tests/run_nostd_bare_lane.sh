@@ -22,6 +22,13 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# RELEASE-STRICT MODE: the required compiler route being absent is a
+# FAILURE in TG_RELEASE_GATE=1 (or `--gate`), never SKIP-as-success.
+RELEASE_GATE="${TG_RELEASE_GATE:-0}"
+if [ "${1:-}" = "--gate" ]; then
+  RELEASE_GATE=1
+  shift
+fi
 COMPILER="${1:-build/tg_stage2}"
 OUTDIR="${2:-build/.nostd_lane}"
 
@@ -43,6 +50,10 @@ end
 EOF
 
 if ! "$COMPILER" compile "$PROBE" --no-std -o "$OUTDIR/nostd_probe_bin" > "$OUTDIR/probe.log" 2>&1; then
+  if [ "$RELEASE_GATE" = "1" ]; then
+    echo "nostd lane: FAIL — the release-required --no-std route is absent ($(grep -m1 -o 'Unknown option: [^ ]*' "$OUTDIR/probe.log" || echo 'the probe compile failed'))" >&2
+    exit 1
+  fi
   echo "nostd lane: SKIP — the compiler does not support the --no-std route yet ($(grep -m1 -o 'Unknown option: [^ ]*' "$OUTDIR/probe.log" || echo 'the probe compile failed'))"
   echo "nostd lane: the lane runs after the next compiler build from this tree"
   exit 0
