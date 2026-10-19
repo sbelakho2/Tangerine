@@ -87,7 +87,9 @@ bh_run_with_timeout() {
   shift
   local tcmd
   tcmd="$(bh_timeout_cmd)" || return 1
-  "$tcmd" "$seconds" "$@"
+  # SIGKILL fallback: an OCaml guest that ignores SIGTERM must not turn a
+  # measured timeout into an unbounded authorization run.
+  "$tcmd" -k 10 "$seconds" "$@"
 }
 
 # Portably hash a string to its hex sha256.
