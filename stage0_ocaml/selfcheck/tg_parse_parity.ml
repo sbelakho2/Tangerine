@@ -239,4 +239,10 @@ let () =
           fail
             "kernel grammar parse-parity FAILED: %d closure file(s) produced error diagnostics or a corpus specimen disagreed under the kernel parser (VM exit %d)"
             (List.length closure) code
-      | None -> fail "the kernel VM run did not complete — an upstream closure stage failed")
+      | None ->
+          (match stages.Driver.bs_ctx.ctx_type_errors with
+           | [] -> ()
+           | errs ->
+               Printf.printf "tg_parse_parity: upstream typecheck diagnostics:\n";
+               List.iter (fun e -> Printf.printf "  %s\n" e) errs);
+          fail "the kernel VM run did not complete — an upstream closure stage failed")
