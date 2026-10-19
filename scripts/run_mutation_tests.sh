@@ -216,7 +216,7 @@ CATALOG=(
   "mut-branch-target|tg_compiler/mir.tg|NE|verifier: the verify_function_v2 extern early-return flipped (non-extern functions return unverified)"
   "mut-remove-wake|std/async.tg|NE|async contract: the waker's wake_task dispatch removed"
   "mut-remove-atomic-ordering|tg_compiler/codegen.tg|NE|atomics: the x86 SeqCst store branch made unreachable (weak MOV always)"
-  "mut-equality-to-permissive|tg_compiler/types.tg|NE|checker: the exact depth-1 projection check == 1 becomes >= 1"
+  "mut-equality-to-permissive|tg_compiler/types.tg|NE|checker: the E0225 exact convention-equality guard becomes if false (mismatched conventions are accepted)"
 )
 
 # behavioral_suites_for <mutation-id> — the PER-MUTATION BEHAVIORAL SUITE
@@ -320,7 +320,7 @@ elif mutation_id == "mut-duplicate-drop":
            "      end\n")
 elif mutation_id == "mut-skip-verifier":
     insert_after("tg_compiler/mir.tg",
-                 "def verify_mir(mir: MirProgram) -> Vec[String]\n  var errors = Vec::new()\n",
+                 "pub def verify_mir(mir: MirProgram) -> Vec[String]\n  var errors = Vec::new()\n",
                  "  return Vec::new()\n")
 elif mutation_id == "mut-field-offset":
     apply("tg_compiler/layout_engine.tg",
@@ -349,8 +349,8 @@ elif mutation_id == "mut-remove-atomic-ordering":
           "    emit8(&mut ctx.text, 0x06)   # cmp edx, 6 (MUTATION: never matches — the SeqCst store ordering removed)")
 elif mutation_id == "mut-equality-to-permissive":
     apply("tg_compiler/types.tg",
-          "if keys.len() == 1 then",
-          "if keys.len() >= 1 then")
+          "if !is_receiver_position && !(cpt.convention == ipt.convention) then",
+          "if false then")
 else:
     print("ERROR: unknown mutation id: " + mutation_id)
     sys.exit(2)

@@ -79,7 +79,7 @@ detect_mutation() {
     mut-skip-verifier)
       local firewall=1
       grep -q "verify_function_v2(&type_index" "$root/tg_compiler/mir.tg" || firewall=0
-      if [ "$(awk '/^def verify_mir\(/{f=1; next} f && /^def /{f=0} f && /return Vec::new\(\)/{n++} END{print n+0}' "$root/tg_compiler/mir.tg")" -ne 0 ]; then
+      if [ "$(awk '/^(pub )?def verify_mir\(/{f=1; next} f && /^(pub )?def /{f=0} f && /return Vec::new\(\)/{n++} END{print n+0}' "$root/tg_compiler/mir.tg")" -ne 0 ]; then
         firewall=0
       fi
       [ "$firewall" -eq 1 ] \
@@ -118,12 +118,8 @@ detect_mutation() {
         || { echo "the a64 ordering arms (ldaddal/casal) are missing from the atomic emitter"; return 1; }
       ;;
     mut-equality-to-permissive)
-      grep -qF "if keys.len() == 1 then" "$root/tg_compiler/types.tg" \
-        || { echo "the depth-1 projection check is no longer the exact equality '== 1' (the permissive '>= 1' widened the accepted set)"; return 1; }
-      grep -qF "if keys.len() >= 1 then" "$root/tg_compiler/types.tg" \
-        && { echo "the permissive '>= 1' form appears at the depth-1 projection site"; return 1; }
-      grep -qF "if !(cpt.convention == ipt.convention) then" "$root/tg_compiler/types.tg" \
-        || { echo "the E0225-class exact convention-equality site is gone (a permissive convention comparison would pass mismatched conventions)"; return 1; }
+      grep -qF "if !is_receiver_position && !(cpt.convention == ipt.convention) then" "$root/tg_compiler/types.tg" \
+        || { echo "the E0225-class exact convention-equality guard is gone (the mutation removed the exact comparison)"; return 1; }
       grep -q "canary_neg_conv_convention_inout_let.tg.*access convention mismatch" "$root/tests/canary_neg/MANIFEST" \
         || { echo "the E0225-class negative canary's expected text 'access convention mismatch' is missing from the manifest"; return 1; }
       grep -q "canary_neg_conv_convention_let_inout.tg.*access convention mismatch" "$root/tests/canary_neg/MANIFEST" \

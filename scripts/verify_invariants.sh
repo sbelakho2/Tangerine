@@ -495,7 +495,7 @@ t G13.6 "duplicate-drop detector: the deinit-count invariants — the MirDeinit 
   'grep -qF "if !deinit_instances.contains(&inst_key) && !drop_glue_fns.contains_key(&inst_key) then" tg_compiler/mir.tg && test "$(grep -c "collect_deinit_plan_instances(&dp, &mut deinit_instances)" tg_compiler/mir.tg)" -eq 1'
 
 t G13.7 "skip-verifier detector: verify_mir calls verify_function_v2 for every function and never early-returns an empty error list" \
-  'test "$(awk "/^(pub )?def verify_mir\(/{f=1; next} f && /^def /{f=0} f && /verify_function_v2\(&type_index/{n++} END{print n+0}" tg_compiler/mir.tg)" -eq 1 && test "$(awk "/^(pub )?def verify_mir\(/{f=1; next} f && /^def /{f=0} f && /return Vec::new\(\)/{n++} END{print n+0}" tg_compiler/mir.tg)" -eq 0'
+  'test "$(awk "/^(pub )?def verify_mir\(/{f=1; next} f && /^(pub )?def /{f=0} f && /verify_function_v2\(&type_index/{n++} END{print n+0}" tg_compiler/mir.tg)" -eq 1 && test "$(awk "/^(pub )?def verify_mir\(/{f=1; next} f && /^(pub )?def /{f=0} f && /return Vec::new\(\)/{n++} END{print n+0}" tg_compiler/mir.tg)" -eq 0'
 
 t G13.8 "field-offset detector: the Map header key_stride offset is the canonical 24 (the MAP_HEADER_FIELDS table)" \
   'grep -qE "field_name == \"key_stride\".*then Option::Some\(24\)" tg_compiler/layout_engine.tg'
