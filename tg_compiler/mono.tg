@@ -3274,7 +3274,8 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
   # re-walked immediately, discovering callee instances transitively
   # (deferred instances become concrete under the caller's substitution
   # and enter the queue here).
-  mono_drain_worklist(mir, cache, &mut pending, &mut seen, &mut errors, &mut specialized_count)
+  let templates = mono_template_index(mir)
+  mono_drain_worklist(mir, templates, cache, &mut pending, &mut seen, &mut errors, &mut specialized_count)
 
  # Phase 2b: inject the map/set Hash/Eq dispatch calls. After the
   # first wave every call site's key type is CONCRETE (including formerly
@@ -3285,7 +3286,7 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
   for func in mir.functions do
     scan_call_sites_in_function(func, mir, cache, &mut pending, &mut seen, &mut errors)
   end
-  mono_drain_worklist(mir, cache, &mut pending, &mut seen, &mut errors, &mut specialized_count)
+  mono_drain_worklist(mir, templates, cache, &mut pending, &mut seen, &mut errors, &mut specialized_count)
 
   # Phase 2c: devirtualize the trait-contract calls (the seed's bodyless
   # re-dispatch). A call on a generic-bound receiver keeps the contract's
@@ -3312,7 +3313,7 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
       for func in mir.functions do
         scan_call_sites_in_function(func, mir, cache, &mut pending, &mut seen, &mut errors)
       end
-      mono_drain_worklist(mir, cache, &mut pending, &mut seen, &mut errors, &mut specialized_count)
+      mono_drain_worklist(mir, templates, cache, &mut pending, &mut seen, &mut errors, &mut specialized_count)
     end
   end
 
@@ -3346,8 +3347,40 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
 end
 
 # The Phase-2 work-queue drain loop (shared by the two waves).
+# (template index — audit P0): def/name -> position over the INITIAL
+# template program.  The drain's per-instance template lookup was a full
+# scan of mir.functions for every queued instance (and a second full scan
+# fallback).  Specialized bodies are appended, so initial positions remain
+# stable.
+struct MonoTemplateIndex
+  by_def: Map[Int, Int]
+  by_name: Map[String, Int]
+end
+
+def mono_template_index(mir: MirProgram) -> MonoTemplateIndex
+  var out = MonoTemplateIndex { by_def: Map::new(), by_name: Map::new() }
+  var i = 0
+  while i < mir.functions.len() do
+    let f = &mir.functions[i]
+    if !out.by_name.contains_key(&f.name) then
+      out.by_name.insert(f.name.clone(), i)
+    end
+    match f.callable
+    when Option::Some(c) then
+      let did = def_id_numeric(&c.def)
+      if !out.by_def.contains_key(&did) then
+        out.by_def.insert(did, i)
+      end
+    when Option::None then ()
+    end
+    i = i + 1
+  end
+  out
+end
+
 def mono_drain_worklist(
   inout mir: MirProgram,
+  templates: MonoTemplateIndex,
   inout cache: MonoCache,
   inout pending: VecDeque[(String, InstanceId)],
   inout seen: Set[StructuralInstanceId],
@@ -3373,36 +3406,26 @@ def mono_drain_worklist(
       # Cache hit (specialized by an earlier pop or by the external APIs):
       # nothing to do — the body is already in the program.
       if !cache.instances.contains_key(&key_struct) then
-        var found: Option[MirFunction] = Option::None
         # (P0-4): template identity is SEMANTIC — an instance whose def is
         # an impl method's DefId selects the template carrying that
-        # callable. Two same-named templates from different traits (their
-        # emission names collide: `Both__bump` from trait A and from trait
-        # B) therefore specialize their OWN bodies; first-by-name alone
-        # would specialize whichever was lowered first under the other's
-        # identity. Instances whose def is not a template callable (the
-        # bare-name fallback) keep the first-by-name lookup.
-        for f in mir.functions do
-          match f.callable
-          when Option::Some(c) then
-            if f.name == callee_name && def_id_numeric(&c.def) == def_id_numeric(&inst.def.def) then
-              found = Option::Some(f)
-              break
-            end
-          when Option::None then ()
+        # callable.  Two same-named templates from different traits select
+        # their OWN bodies; the first-by-name index is the bare-name
+        # fallback.  Both lookups are O(1) map gets.
+        var found: Option[MirFunction] = Option::None
+        match templates.by_def.get(def_id_numeric(&inst.def.def))
+        when Option::Some(pos) then
+          let candidate = &mir.functions[pos]
+          if candidate.name == callee_name then
+            found = Option::Some(candidate.clone())
           end
-        end
-        var drain_found = false
-        match found
-        when Option::Some(_) then drain_found = true
         when Option::None then ()
         end
-        if !drain_found then
-          for f in mir.functions do
-            if f.name == callee_name then
-              found = Option::Some(f)
-              break
-            end
+        match found
+        when Option::Some(_) then ()
+        when Option::None then
+          match templates.by_name.get(&callee_name)
+          when Option::Some(pos) then found = Option::Some(mir.functions[pos].clone())
+          when Option::None then ()
           end
         end
         match found

@@ -369,6 +369,12 @@ struct MirFunction
   generic_params: Vec[GenericParamId] = Vec::new()
   locals: Vec[MirLocal]
   blocks: Vec[MirBlock]
+  # (verifier indices — audit P0): ID -> position maps for this function.
+  # Populated on the verifier's private function copy; all other consumers
+  # see the empty defaults. O(1) lookups replace per-operand linear scans.
+  verifier_block_pos: Map[Int, Int] = Map::new()
+  verifier_param_pos: Map[Int, Int] = Map::new()
+  verifier_local_pos: Map[Int, Int] = Map::new()
   entry_block: MirBlockId
   is_async: Bool
   is_unsafe: Bool
@@ -1890,7 +1896,7 @@ struct MirBuilder
   # the entire edge vector, which the completed preflight exposed as the
   # dominant step site in `lookup_cleanup_edge` (150e9-step wall inside
   # lower_block).  First-wins, exactly like the checker's find_edge_index.
-  cleanup_edge_index: Map[String, Int] = Map::new()
+  cleanup_edge_index: CleanupEdgeIndex = cleanup_edge_index_new()
   # (P1-2) PRE-LOWERING PERSISTENT HIR IDENTITY: the view the finalize
   # pipeline stamps BEFORE lowering (declaration + HIR lineage identities
   # through the shared DeclLineageStore). mir_origin_hir_node consults it,
@@ -2442,18 +2448,76 @@ struct PendingEffectDispatcherArm
   cleanup_key: Int
 end
 
-def build_cleanup_edge_index(cfg: TypedCFG) -> Map[String, Int]
-  # EAGER, per-function index over the immutable analyzed CFG.  The lowering
-  # lookups then only READ this map: lazy insert-on-first-use turned every
-  # lookup into a persistent-map write (the VM's COW mark/copy path) and was
-  # the remaining mark_value_shared storm in the self-host profile.
-  var index: Map[String, Int] = Map::new()
+struct CleanupEdgeIndex
+  normal: Map[Int, Int]
+  edge_true: Map[Int, Int]
+  edge_false: Map[Int, Int]
+  break_edge: Map[Int, Int]
+  continue_edge: Map[Int, Int]
+  return_edge: Map[Int, Int]
+  backedge: Map[Int, Int]
+  guard_else: Map[Int, Int]
+  propagate: Map[Int, Int]
+end
+
+def cleanup_edge_index_new() -> CleanupEdgeIndex
+  CleanupEdgeIndex {
+    normal: Map::new(),
+    edge_true: Map::new(),
+    edge_false: Map::new(),
+    break_edge: Map::new(),
+    continue_edge: Map::new(),
+    return_edge: Map::new(),
+    backedge: Map::new(),
+    guard_else: Map::new(),
+    propagate: Map::new()
+  }
+end
+
+def cleanup_edge_index_get(idx: CleanupEdgeIndex, kind: CfgEdgeKind, source: Int) -> Option[Int]
+  match kind
+  when CfgEdgeKind::Normal then idx.normal.get(source)
+  when CfgEdgeKind::True then idx.edge_true.get(source)
+  when CfgEdgeKind::False then idx.edge_false.get(source)
+  when CfgEdgeKind::Break then idx.break_edge.get(source)
+  when CfgEdgeKind::Continue then idx.continue_edge.get(source)
+  when CfgEdgeKind::Return then idx.return_edge.get(source)
+  when CfgEdgeKind::Backedge then idx.backedge.get(source)
+  when CfgEdgeKind::GuardElse then idx.guard_else.get(source)
+  when CfgEdgeKind::Propagate then idx.propagate.get(source)
+  end  end
+end
+
+def cleanup_edge_index_put_first(inout idx: CleanupEdgeIndex, kind: CfgEdgeKind, source: Int, pos: Int) -> Unit
+  match kind
+  when CfgEdgeKind::Normal then
+    if !idx.normal.contains_key(&source) then idx.normal.insert(source, pos) end
+  when CfgEdgeKind::True then
+    if !idx.edge_true.contains_key(&source) then idx.edge_true.insert(source, pos) end
+  when CfgEdgeKind::False then
+    if !idx.edge_false.contains_key(&source) then idx.edge_false.insert(source, pos) end
+  when CfgEdgeKind::Break then
+    if !idx.break_edge.contains_key(&source) then idx.break_edge.insert(source, pos) end
+  when CfgEdgeKind::Continue then
+    if !idx.continue_edge.contains_key(&source) then idx.continue_edge.insert(source, pos) end
+  when CfgEdgeKind::Return then
+    if !idx.return_edge.contains_key(&source) then idx.return_edge.insert(source, pos) end
+  when CfgEdgeKind::Backedge then
+    if !idx.backedge.contains_key(&source) then idx.backedge.insert(source, pos) end
+  when CfgEdgeKind::GuardElse then
+    if !idx.guard_else.contains_key(&source) then idx.guard_else.insert(source, pos) end
+  when CfgEdgeKind::Propagate then
+    if !idx.propagate.contains_key(&source) then idx.propagate.insert(source, pos) end
+  end  end
+end
+
+def build_cleanup_edge_index(cfg: TypedCFG) -> CleanupEdgeIndex
+  # EAGER, per-function index over the immutable analyzed CFG.  Integer maps
+  # split by kind: no String rendering/hash allocation in the lowering loop.
+  var index = cleanup_edge_index_new()
   var i = 0
   while i < cfg.edges.len() do
-    let key = mir_cleanup_edge_key(cfg.edges[i].kind.clone(), cfg.edges[i].source)
-    if !index.contains_key(&key) then
-      index.insert(key, i)
-    end
+    cleanup_edge_index_put_first(&mut index, cfg.edges[i].kind.clone(), cfg.edges[i].source, i)
     i = i + 1
   end
   index
@@ -10216,8 +10280,7 @@ pub def mir_cleanup_edge_key(kind: CfgEdgeKind, source: Int) -> String
 end
 
 def lookup_cleanup_edge(b: MirBuilder, kind: CfgEdgeKind, source: Int) -> Option[Vec[CleanupAction]]
-  let key = mir_cleanup_edge_key(kind, source)
-  match b.cleanup_edge_index.get(&key)
+  match cleanup_edge_index_get(&b.cleanup_edge_index, kind, source)
   when Option::Some(idx) then
     if idx < b.cfg.cleanup.len() then
       return Option::Some(b.cfg.cleanup[idx].actions.clone())
@@ -39227,37 +39290,82 @@ pub def verify_mir(mir: MirProgram) -> Vec[String]
     end
     feg = feg + 1
   end
-  var edge_keys = mir_call_edges.entries_cloned()
-  var eff_changed = true
-  while eff_changed do
-    eff_changed = false
-    var eki = 0
-    while eki < edge_keys.len() do
-      let (ecaller, ecallees) = edge_keys[eki]
-      var caller_effs = match fn_effects_closure.get(&ecaller)
-      when Option::Some(v) then v.clone()
-      when Option::None then Vec::new()
+  # Reverse dependencies + worklist: propagate only when a callee's effect
+  # set actually changes, instead of rescanning every call edge to a fixed
+  # point.  callers_of updates MUST write the mutated Vector back into the
+  # persistent map (a get() result is a value; pushing to it alone loses
+  # the caller and under-propagates effects).
+  var callers_of: Map[String, Vec[String]] = Map::new()
+  var eki = 0
+  let edge_keys = mir_call_edges.entries_cloned()
+  while eki < edge_keys.len() do
+    let (caller, callees) = edge_keys[eki]
+    var ci = 0
+    while ci < callees.len() do
+      let callee = callees[ci]
+      match callers_of.get(&callee)
+      when Option::Some(v) then
+        var nv = v.clone()
+        nv.push(caller.clone())
+        callers_of.insert(callee.clone(), nv)
+      when Option::None then
+        callers_of.insert(callee.clone(), Vec::from([caller.clone()]))
       end
-      for eckey in ecallees do
-        match fn_effects_closure.get(&eckey)
-        when Option::Some(ce3) then
-          for e3 in ce3 do
-            var has3 = false
-            var di5 = 0
-            while di5 < caller_effs.len() do
-              if caller_effs[di5].id == e3.id then has3 = true end
-              di5 = di5 + 1
-            end
-            if !has3 then
-              caller_effs.push(e3.clone())
-              eff_changed = true
-            end
-          end
-        when Option::None then ()
+      ci = ci + 1
+    end
+    eki = eki + 1
+  end
+
+  var queue: Vec[String] = Vec::new()
+  var queued: Set[String] = Set::new()
+  for f in mir.functions do
+    queue.push(f.name.clone())
+    queued.insert(f.name.clone())
+  end
+  var qhead = 0
+  while qhead < queue.len() do
+    let callee = queue[qhead]
+    qhead = qhead + 1
+    queued.remove(&callee)
+    let callee_effs = match fn_effects_closure.get(&callee)
+    when Option::Some(v) then v.clone()
+    when Option::None then Vec::new()
+    end
+    match callers_of.get(&callee)
+    when Option::Some(callers) then
+      var ci2 = 0
+      while ci2 < callers.len() do
+        let caller = callers[ci2]
+        var caller_effs = match fn_effects_closure.get(&caller)
+        when Option::Some(v) then v.clone()
+        when Option::None then Vec::new()
         end
+        var changed = false
+        var ei = 0
+        while ei < callee_effs.len() do
+          let e3 = callee_effs[ei]
+          var has3 = false
+          var di5 = 0
+          while di5 < caller_effs.len() do
+            if caller_effs[di5].id == e3.id then has3 = true end
+            di5 = di5 + 1
+          end
+          if !has3 then
+            caller_effs.push(e3.clone())
+            changed = true
+          end
+          ei = ei + 1
+        end
+        if changed then
+          fn_effects_closure.insert(caller.clone(), caller_effs)
+          if !queued.contains(&caller) then
+            queued.insert(caller.clone())
+            queue.push(caller.clone())
+          end
+        end
+        ci2 = ci2 + 1
       end
-      fn_effects_closure.insert(ecaller.clone(), caller_effs)
-      eki = eki + 1
+    when Option::None then ()
     end
   end
  # every MirTypeDef must be concrete — no Type::Param / Type::Var in
@@ -39893,6 +40001,109 @@ def verifier_type_key(type_index: Map[Int, MirTypeDef], ty: Type) -> String
   end  end
 end
 
+# Structural equality for the verifier's hot compatibility path.  It avoids
+# rendering both types to Strings on every successful comparison; the
+# String-key renderer remains only as a fallback for the complex variants
+# (FnPtr/Closure/Dyn) and for diagnostics.  The cases mirror the canonical
+# mono type_eq shape, including generic-parameter numeric identity.
+def verifier_types_structurally_equal(a: Type, b: Type) -> Bool
+  match a
+  when Type::Unit then match b when Type::Unit then true when _ then false end
+  when Type::Bool then match b when Type::Bool then true when _ then false end
+  when Type::Int then match b when Type::Int then true when _ then false end
+  when Type::UInt then match b when Type::UInt then true when _ then false end
+  when Type::Float then match b when Type::Float then true when _ then false end
+  when Type::Char then match b when Type::Char then true when _ then false end
+  when Type::String then match b when Type::String then true when _ then false end
+  when Type::StaticStrPtr then match b when Type::StaticStrPtr then true when _ then false end
+  when Type::Never then match b when Type::Never then true when _ then false end
+  when Type::I8 then match b when Type::I8 then true when _ then false end
+  when Type::I16 then match b when Type::I16 then true when _ then false end
+  when Type::I32 then match b when Type::I32 then true when _ then false end
+  when Type::I64 then match b when Type::I64 then true when _ then false end
+  when Type::I128 then match b when Type::I128 then true when _ then false end
+  when Type::U8 then match b when Type::U8 then true when _ then false end
+  when Type::U16 then match b when Type::U16 then true when _ then false end
+  when Type::U32 then match b when Type::U32 then true when _ then false end
+  when Type::U64 then match b when Type::U64 then true when _ then false end
+  when Type::U128 then match b when Type::U128 then true when _ then false end
+  when Type::ISize then match b when Type::ISize then true when _ then false end
+  when Type::USize then match b when Type::USize then true when _ then false end
+  when Type::F32 then match b when Type::F32 then true when _ then false end
+  when Type::F64 then match b when Type::F64 then true when _ then false end
+  when Type::IntLiteral(n1) then match b when Type::IntLiteral(n2) then n1 == n2 when _ then false end
+  when Type::Const(_) then match b when Type::Const(_) then true when _ then false end
+  when Type::Error then match b when Type::Error then true when _ then false end
+  when Type::Var(_) then match b when Type::Var(_) then true when _ then false end
+  when Type::Param(p1) then
+    match b
+    when Type::Param(p2) then generic_param_id_numeric(&p1) == generic_param_id_numeric(&p2)
+    when _ then false
+    end
+  when Type::ConstParam(p1) then
+    match b
+    when Type::ConstParam(p2) then generic_param_id_numeric(&p1) == generic_param_id_numeric(&p2)
+    when _ then false
+    end
+  when Type::ConstSym(_) then match b when Type::ConstSym(_) then true when _ then false end
+  when Type::RefInternal(i1, m1) then
+    match b
+    when Type::RefInternal(i2, m2) then m1 == m2 && verifier_types_structurally_equal(i1.clone(), i2.clone())
+    when _ then false
+    end
+  when Type::Ptr(i1) then
+    match b when Type::Ptr(i2) then verifier_types_structurally_equal(i1.clone(), i2.clone()) when _ then false end
+  when Type::PtrMut(i1) then
+    match b when Type::PtrMut(i2) then verifier_types_structurally_equal(i1.clone(), i2.clone()) when _ then false end
+  when Type::Effect(_, i1) then
+    match b when Type::Effect(_, i2) then verifier_types_structurally_equal(i1.clone(), i2.clone()) when _ then false end
+  when Type::Adt(t1, a1) then
+    match b
+    when Type::Adt(t2, a2) then
+      if t1.id != t2.id || a1.len() != a2.len() then
+        false
+      else
+        var i = 0
+        var same = true
+        while i < a1.len() do
+          if !verifier_types_structurally_equal(a1[i].clone(), a2[i].clone()) then same = false end
+          i = i + 1
+        end
+        same
+      end
+    when _ then false
+    end
+  when Type::Tuple(f1) then
+    match b
+    when Type::Tuple(f2) then
+      if f1.len() != f2.len() then
+        false
+      else
+        var i = 0
+        var same = true
+        while i < f1.len() do
+          if !verifier_types_structurally_equal(f1[i].clone(), f2[i].clone()) then same = false end
+          i = i + 1
+        end
+        same
+      end
+    when _ then false
+    end
+  when Type::FixedArray(e1, n1) then
+    match b
+    when Type::FixedArray(e2, n2) then n1 == n2 && verifier_types_structurally_equal(e1.clone(), e2.clone())
+    when _ then false
+    end
+  when Type::FixedArraySym(e1, g1) then
+    match b
+    when Type::FixedArraySym(e2, g2) then
+      generic_param_id_numeric(&g1) == generic_param_id_numeric(&g2) && verifier_types_structurally_equal(e1.clone(), e2.clone())
+    when _ then false
+    end
+  when _ then false
+  end  end
+end
+
 def verifier_types_compatible(type_index: Map[Int, MirTypeDef], inout aliases: Map[Int, GenericParamId], expected: Type, actual: Type) -> Bool
   # (generic-template posture — the canonical binder identity): when the
   # verified function is a generic template, both sides re-point through
@@ -39905,10 +40116,11 @@ def verifier_types_compatible(type_index: Map[Int, MirTypeDef], inout aliases: M
   # rewrite observes it, so the former two per-call deep clones are gone.
   let expected2 = verifier_rewrite_param_aliases_in_type(aliases, expected)
   let actual2 = verifier_rewrite_param_aliases_in_type(aliases, actual)
+  if verifier_types_structurally_equal(expected2.clone(), actual2.clone()) then return true end
+  # Unit/Never are interchangeable at value level.
   let ek = verifier_type_key(type_index, &expected2)
   let ak = verifier_type_key(type_index, &actual2)
   if ek == ak then return true end
-  # Unit/Never are interchangeable at value level.
   if (ek == "unit" && ak == "never") || (ek == "never" && ak == "unit") then return true end
   # (the checker's pointer-width aliases — FINDING 11): ISize and Int
   # (USize and UInt) are ONE pointer-width integer KIND in this language's
@@ -39921,24 +40133,44 @@ def verifier_types_compatible(type_index: Map[Int, MirTypeDef], inout aliases: M
   false
 end
 
+# (verifier function index — audit P0): one ID->position index per
+# verification target, built once in verify_function_v2.  The helpers below
+# are called from every operand/place/terminator check; without the index
+# each call linearly scanned params+locals or all blocks (O(N) per operand).
+def verifier_index_function(inout func: MirFunction) -> Unit
+  func.verifier_block_pos = Map::new()
+  func.verifier_param_pos = Map::new()
+  func.verifier_local_pos = Map::new()
+  var i = 0
+  while i < func.params.len() do
+    func.verifier_param_pos.insert(func.params[i].id.id, i)
+    i = i + 1
+  end
+  i = 0
+  while i < func.locals.len() do
+    func.verifier_local_pos.insert(func.locals[i].id.id, i)
+    i = i + 1
+  end
+  i = 0
+  while i < func.blocks.len() do
+    func.verifier_block_pos.insert(func.blocks[i].id.id, i)
+    i = i + 1
+  end
+end
+
 def verifier_local_type(func: MirFunction, lid: Int) -> Option[Type]
-  for p in func.params do
-    if p.id.id == lid then return Option::Some(p.ty.clone()) end
+  match func.verifier_param_pos.get(lid)
+  when Option::Some(i) then return Option::Some(func.params[i].ty.clone())
+  when Option::None then ()
   end
-  for l in func.locals do
-    if l.id.id == lid then return Option::Some(l.ty.clone()) end
-  end
-  Option::None
+  match func.verifier_local_pos.get(lid)
+  when Option::Some(i) then Option::Some(func.locals[i].ty.clone())
+  when Option::None then Option::None
+  end  end
 end
 
 def verifier_local_exists(func: MirFunction, lid: Int) -> Bool
-  for p in func.params do
-    if p.id.id == lid then return true end
-  end
-  for l in func.locals do
-    if l.id.id == lid then return true end
-  end
-  false
+  func.verifier_param_pos.contains_key(&lid) || func.verifier_local_pos.contains_key(&lid)
 end
 
 # Whether a local id is a function PARAMETER (not a body local). The item-j
@@ -39946,17 +40178,11 @@ end
 # contract covers concrete parameter reassignment; the hand-built verifier
 # tests reassign owning params to exercise the copy-safety backstop).
 def verifier_local_is_param(func: MirFunction, lid: Int) -> Bool
-  for p in func.params do
-    if p.id.id == lid then return true end
-  end
-  false
+  func.verifier_param_pos.contains_key(&lid)
 end
 
 def verifier_block_exists(func: MirFunction, bid: Int) -> Bool
-  for b in func.blocks do
-    if b.id.id == bid then return true end
-  end
-  false
+  func.verifier_block_pos.contains_key(&bid)
 end
 
 def verifier_type_def(type_index: Map[Int, MirTypeDef], tid: Int) -> Option[MirTypeDef]
@@ -40020,12 +40246,12 @@ end
 # are unchanged — a genuinely non-nominal base or an out-of-range index
 # stays fail-closed.
 def verifier_field_type(type_index: Map[Int, MirTypeDef], inout aliases: Map[Int, GenericParamId], ty: Type, index: Int) -> Option[Type]
-  let ty2 = verifier_rewrite_param_aliases_in_type(aliases.clone(), ty)
+  let ty2 = verifier_rewrite_param_aliases_in_type(aliases, ty)
   match ty2
   when Type::RefInternal(inner, _) then verifier_field_type(type_index, aliases, inner, index)
   when Type::Tuple(fields) then
     if index >= 0 && index < fields.len() then
-      Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &fields[index]))
+      Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &fields[index]))
     else
       Option::None
     end
@@ -40042,7 +40268,7 @@ def verifier_field_type(type_index: Map[Int, MirTypeDef], inout aliases: Map[Int
         # binder spelling vs the canonical args) leaves the declared
         # spelling; the alias rewrite of the result canonicalizes it.
         if index >= 0 && index < fields.len() then
-          Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &subst_type_args(&fields[index].ty, &td.generic_params, args)))
+          Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &subst_type_args(&fields[index].ty, &td.generic_params, args)))
         else
           Option::None
         end
@@ -40055,7 +40281,7 @@ def verifier_field_type(type_index: Map[Int, MirTypeDef], inout aliases: Map[Int
 end
 
 def verifier_downcast_type(type_index: Map[Int, MirTypeDef], inout aliases: Map[Int, GenericParamId], ty: Type, disc: Int) -> Option[Type]
-  let ty2 = verifier_rewrite_param_aliases_in_type(aliases.clone(), ty)
+  let ty2 = verifier_rewrite_param_aliases_in_type(aliases, ty)
   match ty2
   when Type::RefInternal(inner, _) then verifier_downcast_type(type_index, aliases, inner, disc)
   when Type::Adt(tid, _) then
@@ -40066,7 +40292,7 @@ def verifier_downcast_type(type_index: Map[Int, MirTypeDef], inout aliases: Map[
         var vi = 0
         while vi < variants.len() do
           if variants[vi].discriminant == disc then
-            return Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &Type::Tuple(variants[vi].fields.clone())))
+            return Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &Type::Tuple(variants[vi].fields.clone())))
           end
           vi = vi + 1
         end
@@ -40080,11 +40306,11 @@ def verifier_downcast_type(type_index: Map[Int, MirTypeDef], inout aliases: Map[
 end
 
 def verifier_elem_type(type_index: Map[Int, MirTypeDef], inout aliases: Map[Int, GenericParamId], ty: Type) -> Option[Type]
-  let ty2 = verifier_rewrite_param_aliases_in_type(aliases.clone(), ty)
+  let ty2 = verifier_rewrite_param_aliases_in_type(aliases, ty)
   match ty2
   when Type::RefInternal(inner, _) then verifier_elem_type(type_index, aliases, inner)
-  when Type::FixedArray(elem, _) then Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &elem))
-  when Type::FixedArraySym(elem, _) then Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &elem))
+  when Type::FixedArray(elem, _) then Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &elem))
+  when Type::FixedArraySym(elem, _) then Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &elem))
   when Type::Adt(tid, args) then
  # (Type collapse): the canonical Array/Slice arms are gone — the
     # Adt form of Array/Slice is selected by the registered name (the
@@ -40094,7 +40320,7 @@ def verifier_elem_type(type_index: Map[Int, MirTypeDef], inout aliases: Map[Int,
     when Option::None then ""
     end
     if (nname == "Array" || nname == "UnsafeSlice" || nname == "Slice" || nname == "Vec") && !args.is_empty() then
-      Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &args[0]))
+      Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &args[0]))
     else
       Option::None
     end
@@ -40162,7 +40388,7 @@ def verifier_ptr_field_type_at(type_index: Map[Int, MirTypeDef], inout aliases: 
     match td.kind
     when MirTypeDefKind::Struct(fields) then
       if index >= 0 && index < fields.len() then
-        Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &subst_type_args(&fields[index].ty, &td.generic_params, [pointee])))
+        Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &subst_type_args(&fields[index].ty, &td.generic_params, [pointee])))
       else
         Option::None
       end
@@ -40187,7 +40413,7 @@ def verifier_owner_def_field_type(type_index: Map[Int, MirTypeDef], inout aliase
     match td.kind
     when MirTypeDefKind::Struct(fields) then
       if index >= 0 && index < fields.len() then
-        Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &fields[index].ty))
+        Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &fields[index].ty))
       else
         Option::None
       end
@@ -40203,7 +40429,7 @@ def verifier_owner_def_variant_payload(type_index: Map[Int, MirTypeDef], inout a
     match td.kind
     when MirTypeDefKind::Enum(variants) then
       if index >= 0 && index < variants.len() then
-        Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &Type::Tuple(variants[index].fields.clone())))
+        Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &Type::Tuple(variants[index].fields.clone())))
       else
         Option::None
       end
@@ -40312,12 +40538,12 @@ def verifier_field_type_at(type_index: Map[Int, MirTypeDef], inout aliases: Map[
   when Type::Param(gpid) then Option::Some(gpid)
   when _ then Option::None
   end
-  let ty2 = verifier_rewrite_param_aliases_in_type(aliases.clone(), ty)
+  let ty2 = verifier_rewrite_param_aliases_in_type(aliases, ty)
   match ty2
   when Type::RefInternal(inner, _) then verifier_field_type_at(type_index, aliases, inner, owner_id, index)
   when Type::Tuple(fields) then
     if index >= 0 && index < fields.len() then
-      Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &fields[index]))
+      Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &fields[index]))
     else
       Option::None
     end
@@ -40339,7 +40565,7 @@ def verifier_field_type_at(type_index: Map[Int, MirTypeDef], inout aliases: Map[
           # field that becomes String after substitution types as the
           # CONCRETE String here.
           if index >= 0 && index < fields.len() then
-            Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &subst_type_args(&fields[index].ty, &td.generic_params, args)))
+            Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &subst_type_args(&fields[index].ty, &td.generic_params, args)))
           else
             Option::None
           end
@@ -40363,7 +40589,7 @@ def verifier_downcast_type_at(type_index: Map[Int, MirTypeDef], inout aliases: M
   when Type::Param(gpid) then Option::Some(gpid)
   when _ then Option::None
   end
-  let ty2 = verifier_rewrite_param_aliases_in_type(aliases.clone(), ty)
+  let ty2 = verifier_rewrite_param_aliases_in_type(aliases, ty)
   match ty2
   when Type::RefInternal(inner, _) then verifier_downcast_type_at(type_index, aliases, inner, vid)
   # (the declared-binder base): resolve the payload through the VariantId's
@@ -40388,7 +40614,7 @@ def verifier_downcast_type_at(type_index: Map[Int, MirTypeDef], inout aliases: M
               payload.push(subst_type_args(&variants[vid.index as Int].fields[fvi], &td.generic_params, args))
               fvi = fvi + 1
             end
-            Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &Type::Tuple(payload)))
+            Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &Type::Tuple(payload)))
           else
             Option::None
           end
@@ -40407,7 +40633,7 @@ def verifier_project_type(type_index: Map[Int, MirTypeDef], inout aliases: Map[I
   match proj
   when Projection::ProjDeref then
     match verifier_strip_pointee(type_index, cur)
-    when Option::Some(inner) then Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &inner))
+    when Option::Some(inner) then Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &inner))
     when Option::None then Option::None
     end
  # EVERY projection is semantic — the typed forms resolve by their
@@ -40497,7 +40723,7 @@ def verifier_place_result_type_opt(type_index: Map[Int, MirTypeDef], inout alias
     if place.projections.len() > 0 then
       verifier_place_type(type_index, aliases, &base, &place.projections)
     else
-      Option::Some(verifier_rewrite_param_aliases_in_type(aliases.clone(), &base))
+      Option::Some(verifier_rewrite_param_aliases_in_type(aliases, &base))
     end
   when Option::None then Option::None
   end  end
@@ -40567,7 +40793,7 @@ def verifier_check_place_state(type_index: Map[Int, MirTypeDef], inout aliases: 
   # tuples and the chain walk validates the index positionally. The
   # name/discriminant forms (ProjField / ProjFieldIndex / ProjDowncast) are
   # is not part of the model — every projection in the IR is semantic by construction.
-  var cur_ty = verifier_rewrite_param_aliases_in_type(aliases.clone(), &base_ty)
+  var cur_ty = verifier_rewrite_param_aliases_in_type(aliases, &base_ty)
   var pidx_v = 0
   while pidx_v < place.projections.len() do
     match place.projections[pidx_v]
@@ -42976,10 +43202,10 @@ def verifier_place_key(type_index: Map[Int, MirTypeDef], place: Place) -> String
 end
 
 def block_map_lookup(func: MirFunction, bid: Int) -> Option[MirBlock]
-  for b in func.blocks do
-    if b.id.id == bid then return Option::Some(b.clone()) end
-  end
-  Option::None
+  match func.verifier_block_pos.get(bid)
+  when Option::Some(pos) then Option::Some(func.blocks[pos].clone())
+  when Option::None then Option::None
+  end  end
 end
 
 def verifier_reachable_blocks(func: MirFunction) -> Set[Int]
@@ -43016,9 +43242,12 @@ def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTy
   let fn_ctx = "fn " + func.name.clone()
   let entry_id = func.entry_block.id
 
-  var block_map: Map[Int, MirBlock] = Map::new()
-  for b in func.blocks do
-    block_map.insert(b.id.id, b.clone())
+  # ID -> position index, never a clone of the block aggregates.
+  var block_pos: Map[Int, Int] = Map::new()
+  var bpi = 0
+  while bpi < func.blocks.len() do
+    block_pos.insert(func.blocks[bpi].id.id, bpi)
+    bpi = bpi + 1
   end
 
   var all_local_ids = Vec::new()
@@ -43100,8 +43329,8 @@ def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTy
       end
     end
 
-    let block = match block_map.get(bid)
-    when Option::Some(b) then b.clone()
+    let block = match block_pos.get(bid)
+    when Option::Some(pos) then &func.blocks[pos]
     when Option::None then break
     end
 
@@ -43158,15 +43387,15 @@ def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTy
   let reachable = verifier_reachable_blocks(func)
   # Cross-block moved-state dataflow (may-moved per block IN set — the
   # projection-aware Map[Int, Set[String]] place-key lattice).
-  let moved_in_map = verifier_compute_moved_dataflow(&type_index, func, &block_map, &preds, entry_id)
+  let moved_in_map = verifier_compute_moved_dataflow(&type_index, func, &block_pos, &preds, entry_id)
   # Cross-block DESTROYED-state dataflow (items h/i/j — the MirDeinit
   # destroyed place keys, propagated forward; the assign-vs-destroyed and
   # deinit-vs-destroyed rules consume it).
-  let destroyed_in_map = verifier_compute_destroyed_dataflow(&type_index, func, &block_map, &preds, entry_id)
+  let destroyed_in_map = verifier_compute_destroyed_dataflow(&type_index, func, &block_pos, &preds, entry_id)
   # Cross-block STORAGE-liveness dataflow (the WRITE face): every local's
   # frame slot exists from entry; only StorageLive/StorageDead move the
   # state, and an assignment destination must be live there.
-  let live_in_map = verifier_compute_live_dataflow(func, &block_map, &preds, entry_id)
+  let live_in_map = verifier_compute_live_dataflow(func, &block_pos, &preds, entry_id)
 
   # Phi edge validation: each Phi must have exactly one incoming value per CFG
   # predecessor (no duplicate/foreign predecessor ids), and the incoming local
@@ -43371,7 +43600,7 @@ end
 # state only propagates through this dedicated dataflow — the moved lattice
 # never carries deinit effects (the array-glue element loop would alias the
 # loop-carried destroy with a same-path duplicate).
-def verifier_compute_destroyed_dataflow(type_index: Map[Int, MirTypeDef], func: MirFunction, block_map: Map[Int, MirBlock], preds: Map[Int, Vec[Int]], entry_id: Int) -> Map[Int, Map[Int, Set[String]]]
+def verifier_compute_destroyed_dataflow(type_index: Map[Int, MirTypeDef], func: MirFunction, block_pos: Map[Int, Int], preds: Map[Int, Vec[Int]], entry_id: Int) -> Map[Int, Map[Int, Set[String]]]
   var destroyed_in: Map[Int, Map[Int, Set[String]]] = Map::new()
   var destroyed_out: Map[Int, Map[Int, Set[String]]] = Map::new()
   # (no entry pre-insert): the first processing of the entry block must see
@@ -43418,8 +43647,8 @@ def verifier_compute_destroyed_dataflow(type_index: Map[Int, MirTypeDef], func: 
       end
     end
 
-    let block = match block_map.get(bid)
-    when Option::Some(b) then b.clone()
+    let block = match block_pos.get(bid)
+    when Option::Some(pos) then &func.blocks[pos]
     when Option::None then break
     end
 
@@ -43480,7 +43709,7 @@ end
 # cross-block use-after-move (move in pred; use in successor). The state is
 # the projection-aware Map[Int, Set[String]] lattice (root local -> moved
 # place keys — the overlap/prefix rules of the lattice section above).
-def verifier_compute_moved_dataflow(type_index: Map[Int, MirTypeDef], func: MirFunction, block_map: Map[Int, MirBlock], preds: Map[Int, Vec[Int]], entry_id: Int) -> Map[Int, Map[Int, Set[String]]]
+def verifier_compute_moved_dataflow(type_index: Map[Int, MirTypeDef], func: MirFunction, block_pos: Map[Int, Int], preds: Map[Int, Vec[Int]], entry_id: Int) -> Map[Int, Map[Int, Set[String]]]
   var moved_in: Map[Int, Map[Int, Set[String]]] = Map::new()
   var moved_out: Map[Int, Map[Int, Set[String]]] = Map::new()
   # (no entry pre-insert): the first processing of the entry block must see
@@ -43527,8 +43756,8 @@ def verifier_compute_moved_dataflow(type_index: Map[Int, MirTypeDef], func: MirF
       end
     end
 
-    let block = match block_map.get(bid)
-    when Option::Some(b) then b.clone()
+    let block = match block_pos.get(bid)
+    when Option::Some(pos) then &func.blocks[pos]
     when Option::None then break
     end
 
@@ -43603,7 +43832,7 @@ end
 # initialization dataflow (verifier_dataflow_init's in_set): storage
 # existing is not a valid value, and a fresh local's first assignment is a
 # WRITE (checked against this lattice), never a value read.
-def verifier_compute_live_dataflow(func: MirFunction, block_map: Map[Int, MirBlock], preds: Map[Int, Vec[Int]], entry_id: Int) -> Map[Int, Set[Int]]
+def verifier_compute_live_dataflow(func: MirFunction, block_pos: Map[Int, Int], preds: Map[Int, Vec[Int]], entry_id: Int) -> Map[Int, Set[Int]]
   var live_in: Map[Int, Set[Int]] = Map::new()
   var live_out: Map[Int, Set[Int]] = Map::new()
   var entry_set: Set[Int] = Set::new()
@@ -43659,8 +43888,8 @@ def verifier_compute_live_dataflow(func: MirFunction, block_map: Map[Int, MirBlo
         pi = pi + 1
       end
     end
-    let block = match block_map.get(bid)
-    when Option::Some(b) then b.clone()
+    let block = match block_pos.get(bid)
+    when Option::Some(pos) then &func.blocks[pos]
     when Option::None then break
     end
     var out: Set[Int] = Set::new()
@@ -44190,7 +44419,8 @@ def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, Dein
   # declared set, so a signature/locals Param in its (signature-derived)
   # template posture is exactly the undeclared-param leak.
   let func_scope = Option::Some(verifier_binder_scope_new(func_in.generic_params.clone(), func_aliases.clone()))
-  let func = func_in
+  var func = func_in
+  verifier_index_function(&mut func)
   let fn_ctx = "fn " + func.name.clone()
 
  # (ABI classifications): the extern-ABI tag is part of the function's
