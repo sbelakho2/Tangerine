@@ -25,6 +25,9 @@ DUNE = ROOT / "stage0_ocaml" / "selfcheck" / "dune"
 SELFCHECK_DIR = ROOT / "stage0_ocaml" / "selfcheck"
 
 COMPLETENESS_GATES = {"tg_bootstrap_gate", "tg_bootstrap_selfcheck"}
+# Deliberately NON-AUTHORIZING diagnostic tools live in selfcheck/ but must
+# never emit a PASS sentinel (a stale-cache probe result is not evidence).
+NON_AUTHORIZING_DIAGNOSTICS = {"tg_kernel_probe"}
 
 
 def strip_strings_and_comments(source: str) -> str:
@@ -38,7 +41,7 @@ def main() -> int:
     names = sorted(set(re.findall(r"tg_[a-z0-9_]+", DUNE.read_text())))
     violations = []
     for name in names:
-        if name in COMPLETENESS_GATES:
+        if name in COMPLETENESS_GATES or name in NON_AUTHORIZING_DIAGNOSTICS:
             continue
         path = SELFCHECK_DIR / f"{name}.ml"
         if not path.exists():
@@ -64,7 +67,7 @@ def main() -> int:
         for violation in violations:
             print(f"SELFCHECK-SOURCE: FAIL - {violation}", file=sys.stderr)
         return 1
-    print(f"SELFCHECK-SOURCE: PASS - {len(names) - len(COMPLETENESS_GATES)} component selfchecks emit their own sentinel with no bypass exit")
+    print(f"SELFCHECK-SOURCE: PASS - {len(names) - len(COMPLETENESS_GATES) - len(NON_AUTHORIZING_DIAGNOSTICS & set(names))} component selfchecks emit their own sentinel with no bypass exit")
     return 0
 
 

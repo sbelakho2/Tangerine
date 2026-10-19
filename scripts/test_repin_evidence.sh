@@ -312,6 +312,7 @@ run_apply_refuse_case "apply refuses aggregate missing VM_B observation" "$TMP/a
 # ── --apply happy path on a TEMP gate copy (never the real gate) ─────
 gate_copy="$TMP/gate_copy.sh"
 cp "$GATE" "$gate_copy"
+orig_timeout="$(sed -n 's/^GATE_TIMEOUT_S=//p' "$gate_copy" | head -1)"
 rc=0
 python3 "$REPIN" --apply --gate-script "$gate_copy" "$TMP/cold" "$TMP/warm" >"$TMP/apply_ok.txt" 2>&1 || rc=$?
 if [ "$rc" -ne 0 ]; then
@@ -319,8 +320,8 @@ if [ "$rc" -ne 0 ]; then
   sed -n '1,6p' "$TMP/apply_ok.txt" >&2
 elif ! grep -q '^export TANGERINE_BOOTSTRAP_VM_MAX_STEPS=2300000$' "$gate_copy"; then
   bad "apply complete proposal set: steps pin not rewritten"
-elif ! grep -q '^GATE_TIMEOUT_S=4140$' "$gate_copy"; then
-  bad "apply complete proposal set: standalone apply must NOT rewrite the outer gate timeout"
+elif ! grep -q "^GATE_TIMEOUT_S=${orig_timeout}$" "$gate_copy"; then
+  bad "apply complete proposal set: standalone apply must NOT rewrite the outer gate timeout (was ${orig_timeout}, now $(sed -n 's/^GATE_TIMEOUT_S=//p' "$gate_copy" | head -1))"
 else
   pass "apply complete proposal set: VM pins rewritten, outer timeout left provisional"
 fi

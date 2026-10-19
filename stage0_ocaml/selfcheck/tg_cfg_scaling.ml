@@ -109,8 +109,7 @@ let () =
   if !ok then begin
     Printf.printf "CFG_VM_SCALING_BATTERY fails=0 cases=%d steps_first=%d steps_last=%d\n%!"
       (List.length sizes) first last;
-    Printf.printf "TANGERINE_SELFCHECK_PASS name=tg_cfg_scaling version=1\n%!";
-    exit 0
+    Selfcheck_sentinel.emit_and_exit "tg_cfg_scaling"
   end
   else begin
     Printf.printf "CFG_VM_SCALING_BATTERY fails=1 cases=%d steps_first=%d steps_last=%d\n%!"
