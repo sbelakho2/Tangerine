@@ -41,7 +41,7 @@ def main() -> int:
     names = sorted(set(re.findall(r"tg_[a-z0-9_]+", DUNE.read_text())))
     violations = []
     for name in names:
-        if name in COMPLETENESS_GATES or name in NON_AUTHORIZING_DIAGNOSTICS:
+        if name in COMPLETENESS_GATES:
             continue
         path = SELFCHECK_DIR / f"{name}.ml"
         if not path.exists():
@@ -54,6 +54,14 @@ def main() -> int:
                 raw,
             )
         )
+        if name in NON_AUTHORIZING_DIAGNOSTICS:
+            # The exemption is for a tool that must REMAIN non-authorizing:
+            # a PASS sentinel (helper or literal) is a violation, not a pass.
+            if own > 0 or "TANGERINE_SELFCHECK_PASS" in raw:
+                violations.append(
+                    f"{name}: non-authorizing diagnostic tool must not emit a PASS sentinel"
+                )
+            continue
         code_exits = len(re.findall(r"\bexit 0\b", strip_strings_and_comments(raw)))
         if own < 1:
             violations.append(

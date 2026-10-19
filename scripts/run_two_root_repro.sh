@@ -108,12 +108,19 @@ mkdir -p "$ROOT_A" "$ROOT_B"
 # Step 1 — the fresh source copies (the identical relative layout at
 #          different absolute roots)
 # ———————————————————————————————————————————————————————————————
+# ONE source set for BOTH the fresh-root copy and the closure-identity hash.
+# .woodpecker/ is an INPUT to gen_feature_registry (every declared ci_job must
+# have a step), so omitting it made every fresh root fail generation.
+SOURCE_DIRS=(tg_compiler std bootstrap docs scripts tests .woodpecker)
+SOURCE_FILES=(features.toml invariants.toml)
+
 copy_tree() { # copy_tree <dest>
   local dest="$1"
-  for d in tg_compiler std bootstrap docs scripts tests; do
+  local d f
+  for d in "${SOURCE_DIRS[@]}"; do
     rsync -a "$ROOT/$d/" "$dest/$d/"
   done
-  for f in features.toml invariants.toml; do
+  for f in "${SOURCE_FILES[@]}"; do
     cp -p "$ROOT/$f" "$dest/$f"
   done
 }
@@ -169,7 +176,14 @@ run_generations() { # run_generations <root>  ; generates + refreshes
     run_step gen_feature_registry bash scripts/gen_feature_registry.sh docs/current/feature_registry.md /dev/null
     run_step gen_stdlib_completeness bash scripts/gen_stdlib_completeness.sh docs/current/stdlib_completeness.md
     run_step gen_status_refresh bash scripts/gen_status.sh --refresh-manifests
-    run_step verify_invariants bash scripts/verify_invariants.sh > build/invariants_out.txt 2>>"$log"
+    # NOT through run_step: run_step routes the producer's stdout into $log,
+    # which would leave invariants_out.txt empty (the artifact compared below).
+    echo "== verify_invariants ==" >>"$log"
+    if ! bash scripts/verify_invariants.sh > build/invariants_out.txt 2>>"$log"; then
+      echo "run_two_root_repro: verify_invariants FAILED in $r" >&2
+      tail -n 30 "$log" >&2
+      return 1
+    fi
     for rel in build/public_api_manifest.json docs/current/feature_registry.md                docs/current/stdlib_completeness.md tests/canary/MANIFEST                tests/canary_neg/MANIFEST tests/arm64/MANIFEST build/invariants_out.txt; do
       if [ ! -s "$rel" ]; then
         echo "run_two_root_repro: generation artifact missing/empty in $r: $rel" >&2
@@ -183,13 +197,13 @@ sha256_of() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; }
 
 # (3a) the source closure identity
 CLOSURE_DIFF=0
-if ! diff -q <(cd "$ROOT_A" && find tg_compiler std bootstrap docs scripts tests -type f | sort) \
-             <(cd "$ROOT_B" && find tg_compiler std bootstrap docs scripts tests -type f | sort) >/dev/null; then
+if ! diff -q <(cd "$ROOT_A" && find "${SOURCE_DIRS[@]}" "${SOURCE_FILES[@]}" -type f | sort) \
+             <(cd "$ROOT_B" && find "${SOURCE_DIRS[@]}" "${SOURCE_FILES[@]}" -type f | sort) >/dev/null; then
   CLOSURE_DIFF=1
 fi
 if [ "$CLOSURE_DIFF" -eq 0 ]; then
-  HA="$(cd "$ROOT_A" && find tg_compiler std bootstrap docs scripts tests -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)"
-  HB="$(cd "$ROOT_B" && find tg_compiler std bootstrap docs scripts tests -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)"
+  HA="$(cd "$ROOT_A" && find "${SOURCE_DIRS[@]}" "${SOURCE_FILES[@]}" -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)"
+  HB="$(cd "$ROOT_B" && find "${SOURCE_DIRS[@]}" "${SOURCE_FILES[@]}" -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)"
   if [ "$HA" = "$HB" ]; then
     echo "  [PASS] source closure identity: A and B carry the identical file set (combined sha-256 $HA)"
   else

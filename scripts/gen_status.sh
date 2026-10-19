@@ -119,10 +119,6 @@ ARTIFACT_DIRS="${ARTIFACT_DIRS}${TG_STATUS_ARTIFACTS:-}"
 # shellcheck source=scripts/release_evidence_schema.sh
 . "$ROOT/scripts/release_evidence_schema.sh"
 
-SHA="$(git -C "$ROOT" rev-parse HEAD)"
-DATE="$(date +%Y-%m-%d)"
-TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
 # Portable sha-256: macOS ships `shasum` (perl); Debian containers ship
 # `sha256sum`. Either may be the only one present on a given CI lane.
 sha256_hex() { # sha256_hex [file...] ; reads stdin when no file is given
@@ -218,6 +214,12 @@ if [ "$REFRESH_MANIFESTS" -eq 1 ]; then
   [ "$ok" -eq "${#MANIFESTS[@]}" ] || exit 1
   exit 0
 fi
+
+# A manifest refresh is a pure source-tree operation (the two-root fresh
+# copies are NOT git worktrees); only the full status snapshot needs Git.
+SHA="$(git -C "$ROOT" rev-parse HEAD)"
+DATE="$(date +%Y-%m-%d)"
+TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # ── structural verification facts ──────────────────────────────────────────
 # Each fact greps for the marker of the implemented behavior; a fact that
