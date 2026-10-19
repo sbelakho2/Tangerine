@@ -56,6 +56,11 @@ unset BH_TIMEOUT_CMD_RESOLVED
 # o=40 (RSS ~1.2x live) and the pinned RSS ceiling assumes the same policy;
 # inheriting a different OCAMLRUNPARAM would invalidate the calibration.
 export OCAMLRUNPARAM=o=40
+# A stale diagnostic phase-trace flag must never perturb an authorization
+# run (phase_trace performs guest filesystem writes). Profiling is explicit.
+if [ "${TANGERINE_BOOTSTRAP_PROFILE:-0}" != "1" ]; then
+  rm -f "$ROOT/build/phase_trace.flag" "$ROOT/build/kernel_phase.log"
+fi
 
 if [ -f scripts/check_ocaml_toolchain.sh ]; then
   scripts/check_ocaml_toolchain.sh

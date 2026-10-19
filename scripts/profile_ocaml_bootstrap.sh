@@ -147,6 +147,12 @@ echo "PROFILE_MAX_RSS_MIB=${RSS_MIB}"
 echo "PROFILE_MAX_HOST_CALLS=${HOST_CALLS}"
 echo "PROFILE_MAX_ALLOC=${ALLOC_BYTES}"
 
+# Profiling explicitly owns the phase-trace flag; authorization removes it.
+export TANGERINE_BOOTSTRAP_PROFILE=1
+mkdir -p "$ROOT/build"
+: > "$ROOT/build/phase_trace.flag"
+: > "$ROOT/build/kernel_phase.log"
+
 CHILD_LOG="$(mktemp "${TMPDIR:-/tmp}/tg_profile_selfcheck.XXXXXX")"
 trap 'rm -f "$CHILD_LOG"' EXIT
 
