@@ -22,7 +22,7 @@ use tg_compiler::ast::{
   MatchExpr, GuardElse, IfStmt
 }
 use tg_compiler::types::{
-  Type, TypeId, AccessEffect, ParamType, FnSignature, LangItems, TypedProgram, LocalBinding,
+  Type, TypeId, type_structural_eq, AccessEffect, ParamType, FnSignature, LangItems, TypedProgram, LocalBinding,
   TypedExpr, TypedExprKind, TypedCall, TypedCallee, TypedHandler,
   TypedEffectOp, TypedEffectDecl,
   DeinitPlan, PlaceMoveState, fn_owner_key_of_def,
@@ -7179,6 +7179,13 @@ def lower_program(program: Program, analyzed: AnalyzedProgram, hir_view: HirNode
       dispatch_methods.insert(dname.clone(), (did, render, pc))
     when Option::None then ()
     end
+  end
+  # (indexes): expose block/param/local positions to later passes (mono's
+  # devirt receiver lookup) without rescanning locals per call.
+  var fi_idx = 0
+  while fi_idx < functions.len() do
+    verifier_index_function(&mut functions[fi_idx])
+    fi_idx = fi_idx + 1
   end
   var result = MirProgram { functions: functions, statics: statics, types: types, lang_items: b.lang_items.clone(), deinit_plans: b.concrete_deinit_plans.clone(), dispatch_methods: dispatch_methods, generic_param_names: b.generic_param_names.clone(), drop_glue_instances: b.drop_glue_instances.clone(), drop_glue_fns: b.drop_glue_fns.clone(), method_names_by_def: b.method_names_by_def.clone(), engine_env: b.engine_env.clone() }
   lower_pending_closures(&mut b, &mut result)
@@ -28945,7 +28952,8 @@ def verifier_membership_lane_errors(func: MirFunction, param_names: Map[Int, Str
   var fn_effects: Map[String, Vec[EffectId]] = Map::new()
   var fn_effects_closure: Map[String, Vec[EffectId]] = Map::new()
   var engine_env = engine_env_empty()
-  verify_function_v2(&type_index, &plans, &fn_names, &deinit_instances, &drop_glue_fns, param_names, func, &fn_effects, &fn_effects_closure, &mut engine_env, &mut errors)
+  var caches = verifier_new_caches()
+  verify_function_v2(&type_index, &plans, &fn_names, &deinit_instances, &drop_glue_fns, param_names, func, &fn_effects, &fn_effects_closure, &mut engine_env, &mut errors, caches)
   errors
 end
 
@@ -39226,7 +39234,9 @@ pub def verify_mir(mir: MirProgram) -> Vec[String]
   # The snapshot is taken by value once here and threaded as &mut through
   # the per-function verification (its type_prop_cache warms across the
   # whole program).
-  var engine_env = mir.engine_env.clone()
+  # Value read (COW), not a deep TypeEnv clone; type_properties_of mutates
+  # only the private memo cache on this copy.
+  var engine_env = mir.engine_env
   # Function table for the callee-resolution invariant: every MirFnItem
   # callee must name a lowered function or a known intrinsic.
   var fn_names: Set[String] = Set::new()
@@ -39419,10 +39429,11 @@ pub def verify_mir(mir: MirProgram) -> Vec[String]
   for (_, dp) in plans do
     collect_deinit_plan_instances(&dp, &mut deinit_instances)
   end
+  var verifier_caches = verifier_new_caches()
   var func_idx = 0
   while func_idx < mir.functions.len() do
     let func = mir.functions[func_idx]
-    verify_function_v2(&type_index, &plans, &fn_names, &deinit_instances, &mir.drop_glue_fns, &pnames, func, &fn_effects, &fn_effects_closure, &mut engine_env, &mut errors)
+    verify_function_v2(&type_index, &plans, &fn_names, &deinit_instances, &mir.drop_glue_fns, &pnames, func, &fn_effects, &fn_effects_closure, &mut engine_env, &mut errors, verifier_caches)
     func_idx = func_idx + 1
   end
   # (fourth-audit P0-7) the persistent-origin invariant: enforced on a
@@ -40001,109 +40012,6 @@ def verifier_type_key(type_index: Map[Int, MirTypeDef], ty: Type) -> String
   end  end
 end
 
-# Structural equality for the verifier's hot compatibility path.  It avoids
-# rendering both types to Strings on every successful comparison; the
-# String-key renderer remains only as a fallback for the complex variants
-# (FnPtr/Closure/Dyn) and for diagnostics.  The cases mirror the canonical
-# mono type_eq shape, including generic-parameter numeric identity.
-def verifier_types_structurally_equal(a: Type, b: Type) -> Bool
-  match a
-  when Type::Unit then match b when Type::Unit then true when _ then false end
-  when Type::Bool then match b when Type::Bool then true when _ then false end
-  when Type::Int then match b when Type::Int then true when _ then false end
-  when Type::UInt then match b when Type::UInt then true when _ then false end
-  when Type::Float then match b when Type::Float then true when _ then false end
-  when Type::Char then match b when Type::Char then true when _ then false end
-  when Type::String then match b when Type::String then true when _ then false end
-  when Type::StaticStrPtr then match b when Type::StaticStrPtr then true when _ then false end
-  when Type::Never then match b when Type::Never then true when _ then false end
-  when Type::I8 then match b when Type::I8 then true when _ then false end
-  when Type::I16 then match b when Type::I16 then true when _ then false end
-  when Type::I32 then match b when Type::I32 then true when _ then false end
-  when Type::I64 then match b when Type::I64 then true when _ then false end
-  when Type::I128 then match b when Type::I128 then true when _ then false end
-  when Type::U8 then match b when Type::U8 then true when _ then false end
-  when Type::U16 then match b when Type::U16 then true when _ then false end
-  when Type::U32 then match b when Type::U32 then true when _ then false end
-  when Type::U64 then match b when Type::U64 then true when _ then false end
-  when Type::U128 then match b when Type::U128 then true when _ then false end
-  when Type::ISize then match b when Type::ISize then true when _ then false end
-  when Type::USize then match b when Type::USize then true when _ then false end
-  when Type::F32 then match b when Type::F32 then true when _ then false end
-  when Type::F64 then match b when Type::F64 then true when _ then false end
-  when Type::IntLiteral(n1) then match b when Type::IntLiteral(n2) then n1 == n2 when _ then false end
-  when Type::Const(_) then match b when Type::Const(_) then true when _ then false end
-  when Type::Error then match b when Type::Error then true when _ then false end
-  when Type::Var(_) then match b when Type::Var(_) then true when _ then false end
-  when Type::Param(p1) then
-    match b
-    when Type::Param(p2) then generic_param_id_numeric(&p1) == generic_param_id_numeric(&p2)
-    when _ then false
-    end
-  when Type::ConstParam(p1) then
-    match b
-    when Type::ConstParam(p2) then generic_param_id_numeric(&p1) == generic_param_id_numeric(&p2)
-    when _ then false
-    end
-  when Type::ConstSym(_) then match b when Type::ConstSym(_) then true when _ then false end
-  when Type::RefInternal(i1, m1) then
-    match b
-    when Type::RefInternal(i2, m2) then m1 == m2 && verifier_types_structurally_equal(i1.clone(), i2.clone())
-    when _ then false
-    end
-  when Type::Ptr(i1) then
-    match b when Type::Ptr(i2) then verifier_types_structurally_equal(i1.clone(), i2.clone()) when _ then false end
-  when Type::PtrMut(i1) then
-    match b when Type::PtrMut(i2) then verifier_types_structurally_equal(i1.clone(), i2.clone()) when _ then false end
-  when Type::Effect(_, i1) then
-    match b when Type::Effect(_, i2) then verifier_types_structurally_equal(i1.clone(), i2.clone()) when _ then false end
-  when Type::Adt(t1, a1) then
-    match b
-    when Type::Adt(t2, a2) then
-      if t1.id != t2.id || a1.len() != a2.len() then
-        false
-      else
-        var i = 0
-        var same = true
-        while i < a1.len() do
-          if !verifier_types_structurally_equal(a1[i].clone(), a2[i].clone()) then same = false end
-          i = i + 1
-        end
-        same
-      end
-    when _ then false
-    end
-  when Type::Tuple(f1) then
-    match b
-    when Type::Tuple(f2) then
-      if f1.len() != f2.len() then
-        false
-      else
-        var i = 0
-        var same = true
-        while i < f1.len() do
-          if !verifier_types_structurally_equal(f1[i].clone(), f2[i].clone()) then same = false end
-          i = i + 1
-        end
-        same
-      end
-    when _ then false
-    end
-  when Type::FixedArray(e1, n1) then
-    match b
-    when Type::FixedArray(e2, n2) then n1 == n2 && verifier_types_structurally_equal(e1.clone(), e2.clone())
-    when _ then false
-    end
-  when Type::FixedArraySym(e1, g1) then
-    match b
-    when Type::FixedArraySym(e2, g2) then
-      generic_param_id_numeric(&g1) == generic_param_id_numeric(&g2) && verifier_types_structurally_equal(e1.clone(), e2.clone())
-    when _ then false
-    end
-  when _ then false
-  end  end
-end
-
 def verifier_types_compatible(type_index: Map[Int, MirTypeDef], inout aliases: Map[Int, GenericParamId], expected: Type, actual: Type) -> Bool
   # (generic-template posture — the canonical binder identity): when the
   # verified function is a generic template, both sides re-point through
@@ -40116,7 +40024,7 @@ def verifier_types_compatible(type_index: Map[Int, MirTypeDef], inout aliases: M
   # rewrite observes it, so the former two per-call deep clones are gone.
   let expected2 = verifier_rewrite_param_aliases_in_type(aliases, expected)
   let actual2 = verifier_rewrite_param_aliases_in_type(aliases, actual)
-  if verifier_types_structurally_equal(expected2.clone(), actual2.clone()) then return true end
+  if type_structural_eq(expected2.clone(), actual2.clone()) then return true end
   # Unit/Never are interchangeable at value level.
   let ek = verifier_type_key(type_index, &expected2)
   let ak = verifier_type_key(type_index, &actual2)
@@ -41202,10 +41110,33 @@ def verifier_type_key_in_stack(seen: Vec[String], key: String) -> Bool
   false
 end
 
-def verifier_types_all_shareable_read(inout env: TypeEnv, type_index: Map[Int, MirTypeDef], types: Vec[Type], seen: Vec[String]) -> Bool
+struct VerifierCaches
+  # Completed shareability results by fully instantiated type key, and the
+  # ACTIVE instance-key stack (push/pop; no per-child Vector clone).
+  shareable_read: Map[String, Bool]
+  active_read_stack: Vec[String]
+end
+
+def verifier_new_caches() -> VerifierCaches
+  VerifierCaches {
+    shareable_read: Map::new(),
+    active_read_stack: Vec::new()
+  }
+end
+
+def verifier_key_in_stack_inout(active: Vec[String], key: String) -> Bool
+  var i = 0
+  while i < active.len() do
+    if active[i] == key then return true end
+    i = i + 1
+  end
+  false
+end
+
+def verifier_types_all_shareable_read(inout env: TypeEnv, type_index: Map[Int, MirTypeDef], types: Vec[Type], inout caches: VerifierCaches) -> Bool
   var i = 0
   while i < types.len() do
-    if !verifier_type_shareable_read_seen(env, type_index, types[i].clone(), seen.clone()) then
+    if !verifier_type_shareable_read_seen(env, type_index, types[i].clone(), caches) then
       return false
     end
     i = i + 1
@@ -41255,40 +41186,44 @@ def verifier_type_simple_shareable(ty: Type) -> Bool
   end  end
 end
 
-def verifier_type_shareable_read(inout env: TypeEnv, type_index: Map[Int, MirTypeDef], ty: Type) -> Bool
+def verifier_type_shareable_read(inout env: TypeEnv, type_index: Map[Int, MirTypeDef], ty: Type, inout caches: VerifierCaches) -> Bool
   # Fast path: every non-composite type is shareable; only the recursive
-  # shapes need the cycle guard (and allocate its Set).
+  # shapes need the key/cache/cycle machinery.
   match ty
   when Type::Adt(tid, args) then
     let li = env.lang_items
     if tid.id == li.box_ || tid.id == li.rc || tid.id == li.arc_strong ||
        tid.id == li.weak_rc || tid.id == li.weak_arc || tid.id == li.unique_ptr then
+      caches.shareable_read.insert(verifier_type_key(type_index, &ty), false)
       return false
     end
-    # The overwhelmingly common containers hold scalar/String/user args:
-    # answer true without allocating a Set for the cycle guard.
     var all_simple = true
     var ai = 0
     while ai < args.len() do
-      if !verifier_type_simple_shareable(args[ai].clone()) then
-        all_simple = false
-      end
+      if !verifier_type_simple_shareable(args[ai].clone()) then all_simple = false end
       ai = ai + 1
     end
-    if all_simple then true else verifier_type_shareable_read_seen(env, type_index, ty, Vec::new()) end
-  when Type::Tuple(_) then verifier_type_shareable_read_seen(env, type_index, ty, Vec::new())
-  when Type::FixedArray(_, _) then verifier_type_shareable_read_seen(env, type_index, ty, Vec::new())
-  when Type::FixedArraySym(_, _) then verifier_type_shareable_read_seen(env, type_index, ty, Vec::new())
-  when Type::Effect(_, _) then verifier_type_shareable_read_seen(env, type_index, ty, Vec::new())
-  when _ then true
-  end  end
+    if all_simple then
+      caches.shareable_read.insert(verifier_type_key(type_index, &ty), true)
+      return true
+    end
+  when Type::Tuple(_) then ()
+  when Type::FixedArray(_, _) then ()
+  when Type::FixedArraySym(_, _) then ()
+  when Type::Effect(_, _) then ()
+  when _ then return true
+  end
+  let key = verifier_type_key(type_index, &ty)
+  match caches.shareable_read.get(&key)
+  when Option::Some(v) then return v
+  when Option::None then ()
+  end
+  let answer = verifier_type_shareable_read_seen(env, type_index, ty, caches)
+  caches.shareable_read.insert(key, answer)
+  answer
 end
 
-# `seen` is the recursion guard for recursive/generic nominals: a cycle
-# answers false (fail-closed) instead of spinning the verifier.  (The
-# seed's shareable_go has the same intended guard; a missing insertion
-# here was an unbounded recursion on a self-referential type.)
-def verifier_type_shareable_read_seen(inout env: TypeEnv, type_index: Map[Int, MirTypeDef], ty: Type, seen: Vec[String]) -> Bool
+def verifier_type_shareable_read_seen(inout env: TypeEnv, type_index: Map[Int, MirTypeDef], ty: Type, inout caches: VerifierCaches) -> Bool
   match ty
   when Type::String then true
   when Type::Unit then true
@@ -41326,39 +41261,30 @@ def verifier_type_shareable_read_seen(inout env: TypeEnv, type_index: Map[Int, M
   when Type::Ptr(_) then true
   when Type::PtrMut(_) then true
   when Type::Dyn(_) then true
-  when Type::Effect(_, inner) then verifier_type_shareable_read_seen(env, type_index, inner, seen.clone())
-  when Type::Tuple(elems) then verifier_types_all_shareable_read(env, type_index, elems, seen.clone())
-  when Type::FixedArray(elem, _) then verifier_type_shareable_read_seen(env, type_index, elem, seen.clone())
-  when Type::FixedArraySym(elem, _) then verifier_type_shareable_read_seen(env, type_index, elem, seen.clone())
+  when Type::Effect(_, inner) then verifier_type_shareable_read_seen(env, type_index, inner, caches)
+  when Type::Tuple(elems) then verifier_types_all_shareable_read(env, type_index, elems, caches)
+  when Type::FixedArray(elem, _) then verifier_type_shareable_read_seen(env, type_index, elem, caches)
+  when Type::FixedArraySym(elem, _) then verifier_type_shareable_read_seen(env, type_index, elem, caches)
   when Type::Adt(tid, args) then
-    # The active-recursion identity is the FULL nominal instance
-    # (TypeId + arguments), never the bare TypeId: Vec[Vec[Int]] is a finite
-    # nested type and must not look like a cycle.  The guard is a small
-    # active STACK of full-instance keys (no persistent Set copies).
     let inst_key = verifier_type_key(type_index, &ty)
-    if verifier_type_key_in_stack(seen, inst_key.clone()) then
+    if verifier_key_in_stack_inout(caches.active_read_stack, inst_key.clone()) then
       false
     else
+      caches.active_read_stack.push(inst_key)
       let li = env.lang_items
-      var next_seen = seen.clone()
-      next_seen.push(inst_key)
-      # COW/immutable containers and Option/Result inherit shareability
-      # element-wise (the seed shareable_go's Named arm).
-      if tid.id == li.vec || tid.id == li.map || tid.id == li.set ||
+      let result = if tid.id == li.vec || tid.id == li.map || tid.id == li.set ||
          tid.id == li.option || tid.id == li.result then
-        verifier_types_all_shareable_read(env, type_index, args, next_seen)
+        verifier_types_all_shareable_read(env, type_index, args, caches)
       elsif tid.id == li.box_ || tid.id == li.rc || tid.id == li.arc_strong ||
             tid.id == li.weak_rc || tid.id == li.weak_arc || tid.id == li.unique_ptr then
-        # the unique/shared HANDLES: a bare Read never bumps the count and
-        # would install a second owner — never shareable.
         false
       else
-        # a USER nominal (incl. resource/value declarations): the checker's
-        # resource analysis owns the consumption discipline; the verifier's
-        # gate targets the handle protocol only (seed parity).
-        verifier_types_all_shareable_read(env, type_index, args, next_seen)
+        verifier_types_all_shareable_read(env, type_index, args, caches)
       end
+      let _ = caches.active_read_stack.pop()
+      result
     end
+  when _ then true
   end  end
 end
 
@@ -41394,7 +41320,7 @@ def verifier_read_same_place(a: Place, b: Place) -> Bool
   true
 end
 
-def verifier_check_read_escape(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], inout aliases: Map[Int, GenericParamId], func: MirFunction, dest: Place, dest_ty: Type, src: Place, trust_dest_type: Bool, ctx: String, inout errors: Vec[String]) -> Unit
+def verifier_check_read_escape(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], inout aliases: Map[Int, GenericParamId], func: MirFunction, dest: Place, dest_ty: Type, src: Place, trust_dest_type: Bool, ctx: String, inout errors: Vec[String], inout caches: VerifierCaches) -> Unit
   # Bound the diagnostic flood: a compiler that lowers a pervasive Read-escape
   # class must fail with a bounded report, not spend the preflight building
   # millions of type-keyed strings.  The verdict is unchanged (any finding is
@@ -41413,14 +41339,14 @@ def verifier_check_read_escape(inout engine_env: TypeEnv, type_index: Map[Int, M
   match verifier_place_result_type_opt(type_index, aliases, func, &src)
   when Option::Some(ty) then
     if !verifier_type_trivially_copyable(engine_env, ty.clone()) &&
-       !verifier_type_shareable_read(engine_env, type_index, ty.clone()) then
+       !verifier_type_shareable_read(engine_env, type_index, ty.clone(), caches) then
       errors.push(ctx.clone() + ": read of non-Copy non-shareable value of type " + verifier_type_key(type_index, &ty) + " escapes from the container/pointee into an independent owning local _" + dest.local.id.to_string() + " (a Read is a shared borrow; ownership duplication must be a Clone call and a transfer must be a Move)")
     end
   when Option::None then ()
   end  end
 end
 
-def verifier_check_rvalue_read_escapes(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], inout aliases: Map[Int, GenericParamId], func: MirFunction, dest: Place, dest_ty: Type, rvalue: MirRvalue, ctx: String, inout errors: Vec[String]) -> Unit
+def verifier_check_rvalue_read_escapes(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], inout aliases: Map[Int, GenericParamId], func: MirFunction, dest: Place, dest_ty: Type, rvalue: MirRvalue, ctx: String, inout errors: Vec[String], inout caches: VerifierCaches) -> Unit
   if errors.len() >= 200 then return end
   # A Copy value cannot duplicate an owner; a SHAREABLE value can be read
   # freely by design. Decide both from the DESTINATION type (valid MIR has
@@ -41430,12 +41356,12 @@ def verifier_check_rvalue_read_escapes(inout engine_env: TypeEnv, type_index: Ma
   # VM's COW deep-mark storm). Only a non-Copy, non-shareable destination
   # needs the projected-source check at all.
   if verifier_type_trivially_copyable(engine_env, dest_ty.clone()) then return end
-  if verifier_type_shareable_read(engine_env, type_index, dest_ty.clone()) then return end
+  if verifier_type_shareable_read(engine_env, type_index, dest_ty.clone(), caches) then return end
   match rvalue.kind
   when MirRvalueKind::MirMove(op) then
     match op.kind
     when MirOperandKind::MirRead(src) then
-      verifier_check_read_escape(engine_env, type_index, aliases, func, dest, dest_ty.clone(), src, true, ctx, errors)
+      verifier_check_read_escape(engine_env, type_index, aliases, func, dest, dest_ty.clone(), src, true, ctx, errors, caches)
     when _ then ()
     end
   when MirRvalueKind::MirAggregate(_, ops) then
@@ -41443,7 +41369,7 @@ def verifier_check_rvalue_read_escapes(inout engine_env: TypeEnv, type_index: Ma
     while i < ops.len() do
       match ops[i].kind
       when MirOperandKind::MirRead(src) then
-        verifier_check_read_escape(engine_env, type_index, aliases, func, dest.clone(), dest_ty.clone(), src, false, ctx, errors)
+        verifier_check_read_escape(engine_env, type_index, aliases, func, dest.clone(), dest_ty.clone(), src, false, ctx, errors, caches)
       when _ then ()
       end
       i = i + 1
@@ -43238,7 +43164,7 @@ end
 # on entry to every block, then a per-block linear pass that checks uses of
 # possibly-uninitialized locals, projection typing, rvalue typing, and call
 # invariants in program order.
-def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, inout aliases: Map[Int, GenericParamId], param_names: Map[Int, String], scope: Option[VerifierBinderScope], fn_effects: Map[String, Vec[EffectId]], fn_effects_closure: Map[String, Vec[EffectId]], inout errors: Vec[String]) -> Unit
+def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, inout aliases: Map[Int, GenericParamId], param_names: Map[Int, String], scope: Option[VerifierBinderScope], fn_effects: Map[String, Vec[EffectId]], fn_effects_closure: Map[String, Vec[EffectId]], inout errors: Vec[String], inout caches: VerifierCaches) -> Unit
   let fn_ctx = "fn " + func.name.clone()
   let entry_id = func.entry_block.id
 
@@ -43485,7 +43411,7 @@ def verifier_dataflow_init(inout engine_env: TypeEnv, type_index: Map[Int, MirTy
       for lid in all_local_ids do lt.insert(lid.clone()) end
       lt
     end
-    verifier_check_block_stmts(engine_env, type_index, func, aliases, param_names, scope, b, &bin, &blive, &bmoved, &bdestroyed, &fn_effects, &fn_effects_closure, &bb_ctx, errors)
+    verifier_check_block_stmts(engine_env, type_index, func, aliases, param_names, scope, b, &bin, &blive, &bmoved, &bdestroyed, &fn_effects, &fn_effects_closure, &bb_ctx, errors, caches)
     bi = bi + 1
   end
 end
@@ -43928,7 +43854,7 @@ def verifier_compute_live_dataflow(func: MirFunction, block_pos: Map[Int, Int], 
   live_in
 end
 
-def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, inout aliases: Map[Int, GenericParamId], param_names: Map[Int, String], scope: Option[VerifierBinderScope], block: MirBlock, block_in: Set[Int], live_in: Set[Int], moved_in: Map[Int, Set[String]], destroyed_in: Map[Int, Set[String]], fn_effects: Map[String, Vec[EffectId]], fn_effects_closure: Map[String, Vec[EffectId]], ctx: String, inout errors: Vec[String]) -> Unit
+def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, MirTypeDef], func: MirFunction, inout aliases: Map[Int, GenericParamId], param_names: Map[Int, String], scope: Option[VerifierBinderScope], block: MirBlock, block_in: Set[Int], live_in: Set[Int], moved_in: Map[Int, Set[String]], destroyed_in: Map[Int, Set[String]], fn_effects: Map[String, Vec[EffectId]], fn_effects_closure: Map[String, Vec[EffectId]], ctx: String, inout errors: Vec[String], inout caches: VerifierCaches) -> Unit
   # `running` = values definitely initialized in this block so far.
   # `live` = storage that exists (the frame-model liveness lattice). These
   # are deliberately separate: storage existing does NOT imply a valid value.
@@ -43990,7 +43916,7 @@ def verifier_check_block_stmts(inout engine_env: TypeEnv, type_index: Map[Int, M
         # install a second owner (the seed's check_read_escapes parity).
         # A Copy destination is immune by definition and is the overwhelming
         # majority of assignments — skip before any source-type walk.
-        verifier_check_rvalue_read_escapes(engine_env, type_index, aliases, func, place.clone(), dst_ty.clone(), rvalue.clone(), ctx, errors)
+        verifier_check_rvalue_read_escapes(engine_env, type_index, aliases, func, place.clone(), dst_ty.clone(), rvalue.clone(), ctx, errors, caches)
         let rv_ty = verifier_rvalue_type(engine_env, type_index, func, aliases, param_names, scope, &rvalue, &running, &mut moved, Option::Some(dst_ty.clone()), ctx, errors)
         match rv_ty
         when Option::Some(t) then
@@ -44393,7 +44319,7 @@ def verifier_call_receiver_is_param(type_index: Map[Int, MirTypeDef], inout alia
 end
 
 # Top-level per-function verification driver.
-def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, DeinitPlan], fn_names: Set[String], deinit_instances: Set[Int], drop_glue_fns: Map[Int, String], param_names: Map[Int, String], func_in: MirFunction, fn_effects: Map[String, Vec[EffectId]], fn_effects_closure: Map[String, Vec[EffectId]], inout engine_env: TypeEnv, inout errors: Vec[String]) -> Unit
+def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, DeinitPlan], fn_names: Set[String], deinit_instances: Set[Int], drop_glue_fns: Map[Int, String], param_names: Map[Int, String], func_in: MirFunction, fn_effects: Map[String, Vec[EffectId]], fn_effects_closure: Map[String, Vec[EffectId]], inout engine_env: TypeEnv, inout errors: Vec[String], inout caches: VerifierCaches) -> Unit
  # (generic-template posture — the canonical binder identity): a function
   # declaring generic binders is a template. Its declared binders are the
   # canonical ones; every observed spelling of the same declared name
@@ -44562,7 +44488,7 @@ def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, Dein
   # monomorphic functions keep the strict check.
   verifier_check_callees(type_index, &mut func_aliases, func, fn_names, deinit_instances, drop_glue_fns, !func.generic_params.is_empty(), &fn_ctx, errors)
 
-  verifier_dataflow_init(engine_env, type_index, func, &mut func_aliases, param_names, func_scope, &fn_effects, &fn_effects_closure, errors)
+  verifier_dataflow_init(engine_env, type_index, func, &mut func_aliases, param_names, func_scope, &fn_effects, &fn_effects_closure, errors, caches)
 end
 
 # (item 11 — the switch-discriminant contract):

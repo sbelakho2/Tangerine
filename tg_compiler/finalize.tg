@@ -53,6 +53,8 @@ use tg_compiler::compiler_core::{
   CompilerOptions, driver_lower_to_mir_with_hir_lineage, type_errors_to_diags, mir_verify_everything,
   mir_fold_type_queries
 }
+use tg_compiler::asm::{AsmTarget}
+use tg_compiler::codegen::{run_mir_completeness_oracle}
 use tg_compiler::mir::{
   MirProgram, MirBlockId, verify_mir,
   check_effect_class_annotations_mir, check_purity_annotations_mir,
@@ -86,6 +88,17 @@ use tg_compiler::target_desc::{TargetDesc}
 # carry the advisory host plan table their backends ignore).
 pub struct FinalizeTarget
   slp_desc: Option[TargetDesc] = Option::None
+  # The route's ACTUAL target for target-sensitive finalized-MIR work
+  # (type-query folding, tail ABI plans). None preserves the legacy host
+  # fallback for explicitly target-agnostic routes.
+  asm_target: Option[AsmTarget] = Option::None
+end
+
+def finalize_asm_target(target: FinalizeTarget) -> AsmTarget
+  match target.asm_target
+  when Option::Some(t) then t
+  when Option::None then detect_host_target()
+  end  end
 end
 
 # TEST-ONLY finalization probes (the route-level negative lane): Clean is
@@ -152,6 +165,13 @@ pub struct FinalizeEvidence
   # the UNCONDITIONAL post-mono verify_mir accepted the monomorphized
   # program — the stage the audited routes used to skip.
   mono_verify_ok: Bool = false
+  # the post-mono completeness oracle accepted every signature/local/static
+  # layout (the kernel compile_file_core checkpoint).
+  post_mono_completeness_ok: Bool = false
+  # the post-optimization completeness oracle accepted the optimized program.
+  post_opt_completeness_ok: Bool = false
+  # the pre-codegen completeness oracle accepted the exact IR the route uses.
+  pre_codegen_completeness_ok: Bool = false
   # the post-optimization verify_mir accepted the optimized program.
   post_opt_mir_verify_ok: Bool = false
   # the final pre-codegen verify_mir accepted the exact IR the route
@@ -196,7 +216,10 @@ pub def finalize_stage_names() -> Vec[String]
     "mir".to_string(),
     "effects".to_string(),
     "post-mono-mir".to_string(),
+    "post-mono-completeness".to_string(),
     "post-opt-mir".to_string(),
+    "post-opt-completeness".to_string(),
+    "pre-codegen-completeness".to_string(),
     "pre-codegen-mir".to_string()
   ])
 end
@@ -206,9 +229,12 @@ def finalize_evidence_stages(optimized: Bool) -> Vec[String]
   stages.push("mir".to_string())
   stages.push("effects".to_string())
   stages.push("post-mono-mir".to_string())
+  stages.push("post-mono-completeness".to_string())
   if optimized then
     stages.push("post-opt-mir".to_string())
+    stages.push("post-opt-completeness".to_string())
     stages.push("pre-codegen-mir".to_string())
+    stages.push("pre-codegen-completeness".to_string())
   end
   stages
 end
@@ -313,6 +339,7 @@ pub def finalize_verified_mir(
   inout lineage_store: DeclLineageStore
 ) -> Result[VerifiedFinalMir, FinalizeFailure]
   let opts = options.compiler.clone()
+  let effective_asm_target = finalize_asm_target(target)
 
   # 1. THE PRE-LOWERING PERSISTENT IDENTITY VIEWS (P1-2). The declaration
   # lineage view the persistent mono cache binds from AND the HIR-node view
@@ -404,12 +431,23 @@ pub def finalize_verified_mir(
   # kernel layout engine BEFORE the unconditional post-mono checkpoint —
   # the seed's Layout_fold.fold_program mirror (a still-generic/unsized
   # query argument is the fail-closed error here, never a dyld symbol).
-  match mir_fold_type_queries(&mut mir, detect_host_target())
+  match mir_fold_type_queries(&mut mir, effective_asm_target.clone())
   when Result::Ok(_) then ()
   when Result::Err(qerrs) then
     return Result::Err(FinalizeFailure {
       stage: "type-queries".to_string(),
       rows: qerrs
+    })
+  end
+
+  # 6c. THE POST-MONO COMPLETENESS ORACLE (kernel parity): every concrete
+  # signature/local/static layout the mono'd program exposes must be
+  # computable before the verifier/codegen boundary.
+  let post_mono_oracle = run_mir_completeness_oracle(&mir, effective_asm_target)
+  if !post_mono_oracle.is_empty() then
+    return Result::Err(FinalizeFailure {
+      stage: "post-mono-completeness".to_string(),
+      rows: post_mono_oracle
     })
   end
 
@@ -433,7 +471,7 @@ pub def finalize_verified_mir(
   # before the tail pass, then the SLP target-capability stamp keyed on
   # the route's effective target descriptor.
   if options.stamp_tail_abi_plans then
-    stamp_tail_abi_plans(&mut mir, detect_host_target().arch)
+    stamp_tail_abi_plans(&mut mir, effective_asm_target.arch)
   end
   match target.slp_desc.clone()
   when Option::Some(d) then stamp_slp_vector_facility_desc(&mut mir, d)
@@ -450,6 +488,9 @@ pub def finalize_verified_mir(
         budget_verify_ok: true,
         lineage_ok: true,
         mono_verify_ok: true,
+        post_mono_completeness_ok: true,
+        post_opt_completeness_ok: false,
+        pre_codegen_completeness_ok: false,
         post_opt_mir_verify_ok: false,
         pre_codegen_mir_verify_ok: false,
         stages: finalize_evidence_stages(false)
@@ -471,12 +512,30 @@ pub def finalize_verified_mir(
   end
   mir.opt_level = opts.opt_level
 
+  # 9b. THE POST-OPT COMPLETENESS ORACLE.
+  let post_opt_oracle = run_mir_completeness_oracle(&mir, effective_asm_target)
+  if !post_opt_oracle.is_empty() then
+    return Result::Err(FinalizeFailure {
+      stage: "post-opt-completeness".to_string(),
+      rows: post_opt_oracle
+    })
+  end
+
   # 10. The post-opt verification boundary.
   let post_opt_errs = verify_mir(&mir)
   if !post_opt_errs.is_empty() then
     return Result::Err(FinalizeFailure {
       stage: "post-opt-mir".to_string(),
       rows: post_opt_errs
+    })
+  end
+
+  # 10b. THE PRE-CODEGEN COMPLETENESS ORACLE.
+  let pre_codegen_oracle = run_mir_completeness_oracle(&mir, effective_asm_target)
+  if !pre_codegen_oracle.is_empty() then
+    return Result::Err(FinalizeFailure {
+      stage: "pre-codegen-completeness".to_string(),
+      rows: pre_codegen_oracle
     })
   end
 
@@ -499,6 +558,9 @@ pub def finalize_verified_mir(
       budget_verify_ok: true,
       lineage_ok: true,
       mono_verify_ok: true,
+      post_mono_completeness_ok: true,
+      post_opt_completeness_ok: true,
+      pre_codegen_completeness_ok: true,
       post_opt_mir_verify_ok: true,
       pre_codegen_mir_verify_ok: true,
       stages: finalize_stage_names()

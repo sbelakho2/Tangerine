@@ -116,6 +116,7 @@ if [ ! -f "$HELPERS" ]; then
 fi
 # shellcheck source=scripts/bootstrap_helpers.sh
 source "$HELPERS"
+bh_export_bootstrap_vm_limits
 
 # Cheap structural pre-gate BEFORE the expensive ladder: a malformed struct
 # declaration in the kernel (missing fields or missing `end`) silently

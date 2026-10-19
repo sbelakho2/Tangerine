@@ -124,6 +124,18 @@ bh_sha256_cmd() {
 # helper would let builds silently target different platforms. Prefers the
 # harness-resolved TARGET_TRIPLE (run_bootstrap.sh), then TG_BOOTSTRAP_TARGET,
 # and defaults to the canonical aarch64-apple-darwin.
+# ONE authority for the seed-VM resource envelope.  Authorization and
+# Stage1 production must run the same program under the same caps; exporting
+# only inside the gate subprocess silently made Stage1 use the driver
+# defaults (1B host calls, unbounded RSS).
+bh_export_bootstrap_vm_limits() {
+  export TANGERINE_BOOTSTRAP_VM_MAX_STEPS=150000000000
+  export TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS=8000000000
+  export TANGERINE_BOOTSTRAP_VM_MAX_ALLOC=8589934592
+  export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB=12288
+  export OCAMLRUNPARAM=o=40
+}
+
 bh_boot_target() {
   printf '%s' "${TARGET_TRIPLE:-${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}}"
 }

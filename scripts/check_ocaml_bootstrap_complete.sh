@@ -55,7 +55,7 @@ unset BH_TIMEOUT_CMD_RESOLVED
 # Authorization pins the measurement GC policy: profiling calibrated with
 # o=40 (RSS ~1.2x live) and the pinned RSS ceiling assumes the same policy;
 # inheriting a different OCAMLRUNPARAM would invalidate the calibration.
-export OCAMLRUNPARAM=o=40
+bh_export_bootstrap_vm_limits
 # A stale diagnostic phase-trace flag must never perturb an authorization
 # run (phase_trace performs guest filesystem writes). Profiling is explicit.
 if [ "${TANGERINE_BOOTSTRAP_PROFILE:-0}" != "1" ]; then
@@ -119,15 +119,12 @@ GATE_TIMEOUT_S=6000
 # match) and is NOT a completion measurement.  This is a completed-run
 # measurement, not a blind increase; a lower cap requires a completed cold
 # run that proves it.
-export TANGERINE_BOOTSTRAP_VM_MAX_STEPS=150000000000
 # Repinned from the same completed aggregate run: the provisional 1e9
 # host-call cap trapped inside lower_stmt_impl/typed_binding_type_by_name;
 # the full preflight's realized host-call count is far below 8e9 (the
 # 46e9-step beacon in the instrumented run reported 442M, and the gate
 # completes under 8e9).  Allocation stays at 8GiB (RSS beacon <= ~9.0GB
 # under the 12GiB ceiling).
-export TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS=8000000000
-export TANGERINE_BOOTSTRAP_VM_MAX_ALLOC=8589934592
 # The final authorization ALWAYS installs the measured RSS ceiling and
 # accepts NO resource-budget override: an ambient environment cannot
 # disable the guard (0 = disabled), raise it, or turn this script into a
@@ -146,7 +143,6 @@ if [ "$FINAL_RSS_SUPPORTED" != "1" ]; then
   echo "check_ocaml_bootstrap_complete: FAIL — final authorization requires an RSS ceiling, but this host has no RSS measurement (/proc on Linux, Mach task_info on macOS). Run the authorization gate on Linux or macOS; unbounded measurement is a separate, explicitly non-authorizing activity." >&2
   exit 1
 fi
-export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB=12288
 # The bootstrap target authority: the SAME triple the ladder compiles for
 # (TG_BOOTSTRAP_TARGET; default aarch64-apple-darwin).  The gate's closure
 # front end is target-parameterized through @cfg elimination, and its
