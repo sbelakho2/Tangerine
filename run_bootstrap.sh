@@ -263,6 +263,12 @@ RUN_DEGRADED=0
 if [ "$RUN_LADDER" != "1" ] || [ "$RUN_DETERMINISM" != "1" ] || [ "$RUN_NATIVE_TESTS" != "1" ]; then
   RUN_DEGRADED=1
 fi
+# A FULL RUN also requires real phase-fingerprint evidence: without trace
+# mode the phase-equality gate may tolerate UNAVAILABLE phases, so a
+# non-trace run is a development/degraded run by definition.
+if [ "${BOOTSTRAP_TRACE_ACTIVE:-0}" != "1" ]; then
+  RUN_DEGRADED=1
+fi
 
 # Forbidden environment escape valves: a full bootstrap never runs under
 # a variable that turns a mandatory semantic test into a skip.  Fails
@@ -562,7 +568,7 @@ if [ "$RUN_DEGRADED" = "1" ]; then
   printf '%s\n%s\n' "$RESULT_LINE" "$RESULT_NOTE" >"$BOOT_LOG_DIR/bootstrap_result.txt"
 else
   RESULT_LINE="BOOTSTRAP RESULT: FULL RUN"
-  RESULT_NOTE="release evidence: kernel fixed point (stage2 == stage3 at every fingerprinted phase), two-root determinism, native acceptance lanes"
+  RESULT_NOTE="release evidence: kernel fixed point (stage2 == stage3 at every fingerprinted phase; trace mode required, zero UNAVAILABLE), two-root determinism, native acceptance lanes"
   printf '%s\n%s\n' "$RESULT_LINE" "$RESULT_NOTE" >"$BOOT_LOG_DIR/bootstrap_result.txt"
 fi
 

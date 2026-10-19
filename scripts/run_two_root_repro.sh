@@ -148,12 +148,34 @@ fail_assert() { # fail_assert <assertion> <detail>
 # ———————————————————————————————————————————————————————————————
 run_generations() { # run_generations <root>  ; generates + refreshes
   local r="$1"
-  ( cd "$r" && mkdir -p build
-    bash scripts/gen_api_manifest.sh build/public_api_manifest.json >/dev/null 2>&1
-    bash scripts/gen_feature_registry.sh docs/current/feature_registry.md /dev/null >/dev/null 2>&1
-    bash scripts/gen_stdlib_completeness.sh docs/current/stdlib_completeness.md >/dev/null 2>&1
-    bash scripts/gen_status.sh --refresh-manifests >/dev/null 2>&1
-    bash scripts/verify_invariants.sh > build/invariants_out.txt 2>&1
+  local log="$r/build/.two_root_generation.log"
+  # FAIL-FAST: two identical generation FAILURES must never compare equal and
+  # be reported as reproducible.  Every producer's exit status is checked and
+  # every expected artifact must exist and be nonempty.
+  ( set -euo pipefail
+    cd "$r"
+    mkdir -p build
+    : > "$log"
+    run_step() {
+      local name="$1"; shift
+      echo "== $name ==" >>"$log"
+      if ! "$@" >>"$log" 2>&1; then
+        echo "run_two_root_repro: generation step FAILED in $r: $name" >&2
+        tail -n 20 "$log" >&2
+        return 1
+      fi
+    }
+    run_step gen_api_manifest bash scripts/gen_api_manifest.sh build/public_api_manifest.json
+    run_step gen_feature_registry bash scripts/gen_feature_registry.sh docs/current/feature_registry.md /dev/null
+    run_step gen_stdlib_completeness bash scripts/gen_stdlib_completeness.sh docs/current/stdlib_completeness.md
+    run_step gen_status_refresh bash scripts/gen_status.sh --refresh-manifests
+    run_step verify_invariants bash scripts/verify_invariants.sh > build/invariants_out.txt 2>>"$log"
+    for rel in build/public_api_manifest.json docs/current/feature_registry.md                docs/current/stdlib_completeness.md tests/canary/MANIFEST                tests/canary_neg/MANIFEST tests/arm64/MANIFEST build/invariants_out.txt; do
+      if [ ! -s "$rel" ]; then
+        echo "run_two_root_repro: generation artifact missing/empty in $r: $rel" >&2
+        return 1
+      fi
+    done
   )
 }
 
@@ -185,8 +207,12 @@ else
 fi
 
 # (3c) the generated artifacts (deterministic by construction)
-run_generations "$ROOT_A"
-run_generations "$ROOT_B"
+if ! run_generations "$ROOT_A"; then
+  fail_assert "generation root A" "a producer failed or an expected artifact is missing/empty"
+fi
+if ! run_generations "$ROOT_B"; then
+  fail_assert "generation root B" "a producer failed or an expected artifact is missing/empty"
+fi
 
 GEN_PAIRS=(
   "build/public_api_manifest.json|the public-API manifest"
@@ -202,7 +228,9 @@ for pair in "${GEN_PAIRS[@]}"; do
   label="${pair#*|}"
   HA="$(sha256_of "$ROOT_A/$rel")"
   HB="$(sha256_of "$ROOT_B/$rel")"
-  if [ -n "$HA" ] && [ "$HA" = "$HB" ]; then
+  if [ ! -s "$ROOT_A/$rel" ] || [ ! -s "$ROOT_B/$rel" ]; then
+    fail_assert "$label" "an expected generated artifact is missing/empty (A=$( [ -s "$ROOT_A/$rel" ] && echo present || echo missing ) B=$( [ -s "$ROOT_B/$rel" ] && echo present || echo missing ))"
+  elif [ -n "$HA" ] && [ "$HA" = "$HB" ]; then
     echo "  [PASS] $label: A == B byte-identical (sha-256 $HA)"
   else
     fail_assert "$label" "A=$HA B=$HB — the generation is NOT reproducible across the roots"

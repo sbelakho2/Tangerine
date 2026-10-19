@@ -147,7 +147,9 @@ export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB=12288
 # front end is target-parameterized through @cfg elimination, and its
 # artifact corpus compile runs the TARGET's codegen/link route — so the
 # gate must be asked about the target the ladder will actually build.
-TARGET_TRIPLE="${TG_BOOTSTRAP_TARGET:-aarch64-apple-darwin}"
+# ONE target authority: honour the pre-resolved/exported TARGET_TRIPLE from
+# run_bootstrap.sh, then the operator override, then bh_boot_target().
+TARGET_TRIPLE="${TARGET_TRIPLE:-${TG_BOOTSTRAP_TARGET:-$(bh_boot_target)}}"
 echo "check_ocaml_bootstrap_complete: target $TARGET_TRIPLE"
 
 set +e
