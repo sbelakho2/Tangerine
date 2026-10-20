@@ -59,7 +59,8 @@ bh_export_bootstrap_vm_limits
 # A stale diagnostic phase-trace flag must never perturb an authorization
 # run (phase_trace performs guest filesystem writes). Profiling is explicit.
 if [ "${TANGERINE_BOOTSTRAP_PROFILE:-0}" != "1" ]; then
-  rm -f "$ROOT/build/phase_trace.flag" "$ROOT/build/kernel_phase.log"
+  rm -f "$ROOT/build/phase_trace.flag" "$ROOT/build/kernel_phase.log" \
+        "$ROOT/stage0_ocaml/build/phase_trace.flag" "$ROOT/stage0_ocaml/build/kernel_phase.log"
 fi
 
 if [ -f scripts/check_ocaml_toolchain.sh ]; then

@@ -152,6 +152,9 @@ export TANGERINE_BOOTSTRAP_PROFILE=1
 mkdir -p "$ROOT/build"
 : > "$ROOT/build/phase_trace.flag"
 : > "$ROOT/build/kernel_phase.log"
+mkdir -p "$ROOT/stage0_ocaml/build"
+: > "$ROOT/stage0_ocaml/build/phase_trace.flag"
+: > "$ROOT/stage0_ocaml/build/kernel_phase.log"
 
 CHILD_LOG="$(mktemp "${TMPDIR:-/tmp}/tg_profile_selfcheck.XXXXXX")"
 trap 'rm -f "$CHILD_LOG"' EXIT
