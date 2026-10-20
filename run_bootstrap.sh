@@ -385,7 +385,15 @@ fi
 
 # ── stage1: the seed compiles the manifest closure (the stage1 production
 # step the OCaml harness intends; see bh_ocaml_seed_compile).
+# Gate 11 stops at MONO; Stage1 production continues through codegen/object/
+# link. It is NOT the authorization run, so it gets a separate production
+# envelope rather than the gate's stop-at-mono ceiling.
 bh_log "== Stage 1: kernel via the OCaml seed (manifest closure) =="
+export TANGERINE_BOOTSTRAP_VM_MAX_STEPS="${TG_STAGE1_VM_MAX_STEPS:-400000000000}"
+export TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS="${TG_STAGE1_VM_MAX_HOST_CALLS:-16000000000}"
+export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB="${TG_STAGE1_VM_MAX_RSS_MB:-16384}"
+export TANGERINE_BOOTSTRAP_VM_MAX_ALLOC="${TG_STAGE1_VM_MAX_ALLOC:-34359738368}"
+bh_log "stage1 production VM envelope: steps=$TANGERINE_BOOTSTRAP_VM_MAX_STEPS host_calls=$TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS rss_mb=$TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB alloc=$TANGERINE_BOOTSTRAP_VM_MAX_ALLOC"
 if ! run_logged stage1_compile \
      bh_ocaml_seed_compile "$STAGE0_BIN" "$ROOT_DIR" "$TARGET_TRIPLE" "$STAGE1"; then
   bh_err "stage1 failed to build from the OCaml seed"
@@ -423,38 +431,6 @@ if ! validate_stage tg_stage3 "$STAGE3"; then
   exit 1
 fi
 
-# ── materialize: stage3 compiles the FULL driver (tg_compiler/driver.tg) into
-# build/tg. The ladder stages carry only the KERNEL entry (bootstrap_main.tg:
-# the compile/check commands); the full driver is intentionally NOT a member
-# of the kernel manifest, so the full CLI the tg-consuming CI jobs invoke
-# (fmt/lint/test/bench/doc/agent/...) is produced here from the validated
-# stage3 with the same CLI shape the self-host stages use:
-#   build/tg_stage3 compile --strict-resolution tg_compiler/driver.tg \
-#     -o build/tg --target <host>
-# CLOSURE SCOPE: the manifest-closed gate is keyed on the kernel entry
-# (compiler_core.tg is_kernel_entry_path — bootstrap_main.tg), so the ladder
-# builds above stay strictly manifest-closed while this tooling root loads
-# its imports from the repo via the canonical loader. No flag is required:
-# driver.tg is the sanctioned out-of-manifest tooling root by design.
-# The materialized build/tg is validated like every stage and published with
-# the stage artifacts (the CI artifact set carries build/tg, and the
-# tg-consuming jobs keep it instead of re-copying the kernel stage3).
-bh_log "== Full compiler materialization: $DRIVER_FULL_SRC via stage3 =="
-if ! run_logged materialize_full \
-     "$STAGE3" compile --strict-resolution "$DRIVER_FULL_SRC" -o "$TG_FULL" --target "$TARGET_TRIPLE"; then
-  bh_err "full compiler materialization failed (stage3 could not compile $DRIVER_FULL_SRC)"
-  exit 1
-fi
-chmod +x "$TG_FULL"
-if [ ! -x "$TG_FULL" ]; then
-  bh_err "full compiler not produced: $TG_FULL"
-  exit 1
-fi
-if ! validate_stage tg "$TG_FULL" "$DRIVER_FULL_SRC"; then
-  bh_err "materialized full compiler failed validation"
-  exit 1
-fi
-bh_log "Full Toolchain Materialization Complete: $TG_FULL (full compiler ready; published with the stage artifacts)"
 
 # Critical canaries under stage1 ONLY (the implemented policy): prove stage1's
 # runtime can compile the compiler before spending a full self-host cycle.
@@ -537,6 +513,39 @@ fi
 # stage2 at every fingerprinted phase, so stage3's runtime evidence transfers
 # to stage2.
 bh_log "Kernel Stage3 Complete: $STAGE3 (validated; byte-identical to $STAGE2 at every fingerprinted phase)"
+
+# ── materialize: stage3 compiles the FULL driver (tg_compiler/driver.tg) into
+# build/tg. The ladder stages carry only the KERNEL entry (bootstrap_main.tg:
+# the compile/check commands); the full driver is intentionally NOT a member
+# of the kernel manifest, so the full CLI the tg-consuming CI jobs invoke
+# (fmt/lint/test/bench/doc/agent/...) is produced here from the validated
+# stage3 with the same CLI shape the self-host stages use:
+#   build/tg_stage3 compile --strict-resolution tg_compiler/driver.tg \
+#     -o build/tg --target <host>
+# CLOSURE SCOPE: the manifest-closed gate is keyed on the kernel entry
+# (compiler_core.tg is_kernel_entry_path — bootstrap_main.tg), so the ladder
+# builds above stay strictly manifest-closed while this tooling root loads
+# its imports from the repo via the canonical loader. No flag is required:
+# driver.tg is the sanctioned out-of-manifest tooling root by design.
+# The materialized build/tg is validated like every stage and published with
+# the stage artifacts (the CI artifact set carries build/tg, and the
+# tg-consuming jobs keep it instead of re-copying the kernel stage3).
+bh_log "== Full compiler materialization: $DRIVER_FULL_SRC via stage3 =="
+if ! run_logged materialize_full \
+     "$STAGE3" compile --strict-resolution "$DRIVER_FULL_SRC" -o "$TG_FULL" --target "$TARGET_TRIPLE"; then
+  bh_err "full compiler materialization failed (stage3 could not compile $DRIVER_FULL_SRC)"
+  exit 1
+fi
+chmod +x "$TG_FULL"
+if [ ! -x "$TG_FULL" ]; then
+  bh_err "full compiler not produced: $TG_FULL"
+  exit 1
+fi
+if ! validate_stage tg "$TG_FULL" "$DRIVER_FULL_SRC"; then
+  bh_err "materialized full compiler failed validation"
+  exit 1
+fi
+bh_log "Full Toolchain Materialization Complete: $TG_FULL (full compiler ready; published with the stage artifacts)"
 
 # ———————————————————————————————————————————————————————————————
 # Step 6 — two-root reproducibility check

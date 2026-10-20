@@ -1900,6 +1900,8 @@ struct MirBuilder
   # AUTHORITATIVE per-function local tables (LocalId -> record/type/position)
   # and the resource-ownership memo.  Reads must not match/copy current_fn or
   # scan f.locals; type refinement invalidates the memo entry.
+  current_params: Vec[MirLocal] = Vec::new()
+  current_locals: Vec[MirLocal] = Vec::new()
   local_records: Map[Int, MirLocal] = Map::new()
   local_types: Map[Int, Type] = Map::new()
   local_pos: Map[Int, Int] = Map::new()
@@ -2678,6 +2680,8 @@ def start_function(inout b: MirBuilder, name: String, ret_type: Type, span: Span
   b.var_map = Map::new()
   b.blocks = Vec::new()
   b.declared_locals = Set::new()
+  b.current_params = Vec::new()
+  b.current_locals = Vec::new()
   b.local_records = Map::new()
   b.local_types = Map::new()
   b.local_pos = Map::new()
@@ -2760,12 +2764,7 @@ def start_function(inout b: MirBuilder, name: String, ret_type: Type, span: Span
   # missing-scrutinee-identity / empty local table failure). The same
   # pattern is applied at every current_fn mutation site below and to the
   # map-held Vec/Set mutations in this file.
-  match b.current_fn
-  when Option::Some(f) then
-    f.locals.push(ret_local.clone())
-    b.current_fn = Option::Some(f)
-  when _ then ()
-  end
+  b.current_locals.push(ret_local.clone())
   b.local_records.insert(ret_local.id.id, ret_local.clone())
   b.local_types.insert(ret_local.id.id, ret_local.ty.clone())
   b.local_pos.insert(ret_local.id.id, 0)
@@ -5189,9 +5188,10 @@ def block_own_moved_locals(inout b: MirBuilder, block_id: Int) -> Set[Int]
   out
 end
 
-def block_own_consumed_locals(inout b: MirBuilder, block: MirBlock) -> Set[Int]
+def block_own_consumed_locals(inout b: MirBuilder, block_id: Int) -> Set[Int]
   var out: Set[Int] = Set::new()
-  match block.terminator.kind
+  if block_id < 0 || block_id >= b.blocks.len() then return out end
+  match b.blocks[block_id].terminator.kind
   when MirTerminatorKind::MirCall { dest, func, args, success, unwind, intrinsic, tail: _ } then
     var callee_name = ""
     match func.kind
@@ -5239,40 +5239,35 @@ def block_own_consumed_locals(inout b: MirBuilder, block: MirBlock) -> Set[Int]
 end
 
 def compute_definitely_consumed(inout b: MirBuilder, n: Int) -> Map[Int, Set[Int]]
-  var block_map: Map[Int, MirBlock] = Map::new()
+  # Dense CFG vectors: block ids are 0..n-1. No block_map aggregate copies,
+  # no predecessor-list clone on every edge, no Set clone per map update.
+  var preds: Vec[Vec[Int]] = Vec::new()
+  var in_set: Vec[Set[Int]] = Vec::new()
+  var out_set: Vec[Set[Int]] = Vec::new()
   var bi = 0
   while bi < n do
-    let blk = b.blocks[bi]
-    block_map.insert(blk.id.id, blk.clone())
-    bi = bi + 1
-  end
-  var preds: Map[Int, Vec[Int]] = Map::new()
-  bi = 0
-  while bi < n do
-    let blk = b.blocks[bi]
-    preds.insert(blk.id.id, Vec::new())
+    preds.push(Vec::new())
+    in_set.push(Set::new())
+    out_set.push(Set::new())
     bi = bi + 1
   end
   bi = 0
   while bi < n do
-    let blk = b.blocks[bi]
-    let succs = terminator_successor_ids(&blk.terminator)
+    let succs = terminator_successor_ids(&b.blocks[bi].terminator)
     var si = 0
     while si < succs.len() do
       let sid = succs[si]
-      let existing = match preds.get(sid)
-      when Option::Some(list) then list.clone()
-      when Option::None then Vec::new()
+      if sid >= 0 && sid < n then
+        var plist = preds[sid].clone()
+        plist.push(bi)
+        preds[sid] = plist
       end
-      existing.push(blk.id.id)
-      preds.insert(sid, existing)
       si = si + 1
     end
     bi = bi + 1
   end
-  var in_set: Map[Int, Set[Int]] = Map::new()
-  var out_set: Map[Int, Set[Int]] = Map::new()
-  var worklist = Vec::new()
+
+  var worklist: Vec[Int] = Vec::new()
   worklist.push(0)
   var in_worklist: Set[Int] = Set::new()
   in_worklist.insert(0)
@@ -5284,64 +5279,39 @@ def compute_definitely_consumed(inout b: MirBuilder, n: Int) -> Map[Int, Set[Int
     in_worklist.remove(&bid)
     var new_in: Set[Int] = Set::new()
     if bid != 0 then
-      let pred_list = match preds.get(bid)
-      when Option::Some(l) then l.clone()
-      when Option::None then Vec::new()
-      end
       var first = true
       var pi = 0
-      while pi < pred_list.len() do
-        match out_set.get(pred_list[pi])
-        when Option::Some(pset) then
+      while pi < preds[bid].len() do
+        let pid = preds[bid][pi]
+        if pid >= 0 && pid < n then
           if first then
-            new_in = Set::new()
-            for v in pset do
-              new_in.insert(v.clone())
-            end
+            new_in = out_set[pid]
             first = false
           else
             var keep: Set[Int] = Set::new()
             for v in new_in do
-              if pset.contains(v) then
-                keep.insert(v.clone())
-              end
+              if out_set[pid].contains(&v) then keep.insert(v.clone()) end
             end
             new_in = keep
           end
-        when Option::None then ()
         end
         pi = pi + 1
       end
     end
-    let block = match block_map.get(bid)
-    when Option::Some(blk) then blk.clone()
-    when Option::None then break
-    end
     var out: Set[Int] = Set::new()
-    for v in new_in do
-      out.insert(v.clone())
-    end
-    let own = block_own_consumed_locals(b, &block)
-    for v in own do
-      out.insert(v.clone())
-    end
-    let old = match in_set.get(bid)
-    when Option::Some(s) then s.clone()
-    when Option::None then Set::new()
-    end
-    let had_out = match out_set.get(bid)
-    when Option::Some(_) then true
-    when Option::None then false
-    end
-    let changed = !had_out || !verifier_set_equal(&old, &new_in)
-    in_set.insert(bid, new_in.clone())
-    out_set.insert(bid, out)
+    for v in new_in do out.insert(v.clone()) end
+    let own = block_own_consumed_locals(b, bid)
+    for v in own do out.insert(v.clone()) end
+    let old = in_set[bid]
+    let changed = !verifier_set_equal(&old, &new_in) || out_set[bid].len() == 0
+    in_set[bid] = new_in
+    out_set[bid] = out
     if changed then
-      let succs = terminator_successor_ids(&block.terminator)
+      let succs = terminator_successor_ids(&b.blocks[bid].terminator)
       var s2 = 0
       while s2 < succs.len() do
         let sid = succs[s2]
-        if !in_worklist.contains(&sid) then
+        if sid >= 0 && sid < n && !in_worklist.contains(&sid) then
           in_worklist.insert(sid)
           worklist.push(sid)
         end
@@ -5349,7 +5319,13 @@ def compute_definitely_consumed(inout b: MirBuilder, n: Int) -> Map[Int, Set[Int
       end
     end
   end
-  in_set
+  var result: Map[Int, Set[Int]] = Map::new()
+  bi = 0
+  while bi < n do
+    result.insert(bi, in_set[bi])
+    bi = bi + 1
+  end
+  result
 end
 
 def emit_cfg_deinit_returns(inout b: MirBuilder) -> Unit
@@ -5524,14 +5500,8 @@ def update_local_type(inout b: MirBuilder, local_id: MirLocalId, new_ty: Type) -
   end
   match b.local_pos.get(local_id.id)
   when Option::Some(pos) then
-    match b.current_fn
-    when Option::Some(f) then
-      var nf = f
-      if pos < nf.locals.len() then
-        nf.locals[pos].ty = new_ty.clone()
-      end
-      b.current_fn = Option::Some(nf)
-    when Option::None then ()
+    if pos < b.current_locals.len() then
+      b.current_locals[pos].ty = new_ty.clone()
     end
   when Option::None then ()
   end
@@ -5943,20 +5913,18 @@ end
 def finish_function(inout b: MirBuilder) -> Option[MirFunction]
   match b.current_fn
   when Option::Some(f) then
-    # Collect all blocks from the map into the function's block list
-    var collected_blocks = Vec::new()
-    var idx = 0
-    while idx < b.blocks.len() do
-      let block = b.blocks[idx]
-      collected_blocks.push(duplicate_block(block))
-      idx = idx + 1
-    end
-    f.blocks = collected_blocks
+    # The builder already owns exactly these blocks and locals; attach them
+    # directly (the former duplicate_block loop copied every block).
+    f.blocks = b.blocks
+    f.params = b.current_params
+    f.locals = b.current_locals
     let result = Option::Some(f)
     b.current_fn = Option::None
     b.current_fn_budget = Option::None
     b.current_block = Option::None
     b.blocks = Vec::new()
+    b.current_params = Vec::new()
+    b.current_locals = Vec::new()
     result
   when Option::None then
     # Defensive diagnostic: finish_function called without an active function.
@@ -7879,6 +7847,17 @@ def expr_kind_tag(k: ExprKind) -> String
   end  end
 end
 
+def static_init_zero_ctor_path(path: Vec[String]) -> Bool
+  if path.len() < 2 then return false end
+  let owner = path[path.len() - 2]
+  let method = path[path.len() - 1]
+  if method != "new" then return false end
+  owner == "Vec" || owner == "Map" || owner == "Set" ||
+    owner == "Mutex" || owner == "String" ||
+    owner == "HashMap" || owner == "HashSet" ||
+    owner == "BTreeMap" || owner == "BTreeSet"
+end
+
 def lower_static_init_operand(inout b: MirBuilder, value: Expr, resolved_ty: Type) -> Option[MirOperand]
   # Try to produce a direct constant operand for common static init patterns:
   #   - Enum variant paths like Option::None → discriminant integer
@@ -7943,13 +7922,18 @@ def lower_static_init_operand(inout b: MirBuilder, value: Expr, resolved_ty: Typ
     # fail closed with a diagnostic (never a silently invented value,
     # never a trap).
     if qualified_call then
-      Option::Some(MirOperand {
-        kind: MirOperandKind::MirConstant(MirConstant {
-          kind: MirConstantKind::MirInt(0),
-          ty: Type::Int,
-          instance: Option::None
+      if static_init_zero_ctor_path(path.segments.clone()) then
+        Option::Some(MirOperand {
+          kind: MirOperandKind::MirConstant(MirConstant {
+            kind: MirConstantKind::MirInt(0),
+            ty: Type::Int,
+            instance: Option::None
+          })
         })
-      })
+      else
+        b.errors.push("internal error: unsupported static initializer (qualified call is not a known empty constructor) for type " + format_mir_type(&b.typed_type_names, &b.generic_param_names, &resolved_ty) + "; a static initializer must be a supported constant or runtime init, never a silent zero")
+        Option::None
+      end
     elsif args.len() == 0 then
       if path.segments.len() >= 2 then
         match resolve_enum_variant_discriminant(b, &path)
@@ -8107,14 +8091,24 @@ def lower_static_init_operand(inout b: MirBuilder, value: Expr, resolved_ty: Typ
       Option::None
     end
   when ExprKind::ExprCall(callee, _) then
-    # Vec::new(), Map::new(), etc. → zero-init (null pointer)
-    Option::Some(MirOperand {
-      kind: MirOperandKind::MirConstant(MirConstant {
-        kind: MirConstantKind::MirInt(0),
-        ty: Type::Int,
-        instance: Option::None
+    # ONLY the known empty-container constructors are a zero-init constant.
+    # An arbitrary call-shaped initializer must never silently become zero.
+    let ctor_ok = match (*callee.get()).kind
+    when ExprKind::ExprPath(path) then static_init_zero_ctor_path(path.segments.clone())
+    when _ then false
+    end
+    if ctor_ok then
+      Option::Some(MirOperand {
+        kind: MirOperandKind::MirConstant(MirConstant {
+          kind: MirConstantKind::MirInt(0),
+          ty: Type::Int,
+          instance: Option::None
+        })
       })
-    })
+    else
+      b.errors.push("internal error: unsupported static initializer (call-shaped expression is not a known empty constructor) for type " + format_mir_type(&b.typed_type_names, &b.generic_param_names, &resolved_ty) + "; a static initializer must be a supported constant or runtime init, never a silent zero")
+      Option::None
+    end
   when _ then
     panic("internal error: unsupported static initializer (expression kind " + expr_kind_name(&value.kind) + ") for type " + format_mir_type(&b.typed_type_names, &b.generic_param_names, &resolved_ty) + "; a static initializer must be a supported constant or runtime init, never a silent zero")
   end
@@ -9173,8 +9167,8 @@ def mir_current_fn_is_template(b: MirBuilder) -> Bool
   when Option::Some(f) then
     if f.generic_params.len() > 0 then return true end
     var pi = 0
-    while pi < f.params.len() do
-      if verifier_type_has_param(&f.params[pi].ty) then return true end
+    while pi < b.current_params.len() do
+      if verifier_type_has_param(&b.current_params[pi].ty) then return true end
       pi = pi + 1
     end
     verifier_type_has_param(&f.ret_type)
@@ -9290,17 +9284,17 @@ def mir_local_lookup_context(b: MirBuilder) -> String
   when Option::Some(f) then
     var lo = -1
     var hi = -1
-    if f.locals.len() > 0 then
-      lo = f.locals[0].id.id
-      hi = f.locals[f.locals.len() - 1].id.id
+    if b.current_locals.len() > 0 then
+      lo = b.current_locals[0].id.id
+      hi = b.current_locals[b.current_locals.len() - 1].id.id
     end
     var names = ""
     var ni = 0
-    while ni < f.locals.len() && ni < 12 do
-      names = names + " " + f.locals[ni].name.clone()
+    while ni < b.current_locals.len() && ni < 12 do
+      names = names + " " + b.current_locals[ni].name.clone()
       ni = ni + 1
     end
-    "fn present, " + f.locals.len().to_string() + " locals (ids " + lo.to_string() + ".." + hi.to_string() + ") [" + names + "], local_counter " + b.local_counter.to_string() + ", fn-body " + f.span.file.clone() + ":" + f.span.start.to_string()
+    "fn present, " + b.current_locals.len().to_string() + " locals (ids " + lo.to_string() + ".." + hi.to_string() + ") [" + names + "], local_counter " + b.local_counter.to_string() + ", fn-body " + f.span.file.clone() + ":" + f.span.start.to_string()
   when Option::None then
     "NO current function (current_fn = None)"
   end  end
@@ -11035,11 +11029,7 @@ def emit_return_edge_cleanup(inout b: MirBuilder, stmt_node_id: Int, kind: CfgEd
         when Option::None then ()
         end
         let self_mir_id = if is_deinit_fn_here then
-          match b.current_fn
-          when Option::Some(cf) then
-            if cf.params.len() > 0 then cf.params[0].id.id else -1 end
-          when Option::None then -1
-          end
+          if b.current_params.len() > 0 then b.current_params[0].id.id else -1 end
         else
           -1
         end
@@ -17856,6 +17846,8 @@ def lower_pending_closures(inout b: MirBuilder, inout program: MirProgram) -> Un
     let saved_locals = b.local_counter
     let saved_blocks = b.block_counter
     let saved_vars = b.var_map.clone()
+    let saved_current_params = b.current_params.clone()
+    let saved_current_locals = b.current_locals.clone()
     let saved_local_records = b.local_records.clone()
     let saved_local_types = b.local_types.clone()
     let saved_local_pos = b.local_pos.clone()
@@ -17974,6 +17966,8 @@ def lower_pending_closures(inout b: MirBuilder, inout program: MirProgram) -> Un
     b.local_counter = saved_locals
     b.block_counter = saved_blocks
     b.var_map = saved_vars
+    b.current_params = saved_current_params
+    b.current_locals = saved_current_locals
     b.local_records = saved_local_records
     b.local_types = saved_local_types
     b.local_pos = saved_local_pos
@@ -18009,6 +18003,8 @@ def lower_pending_dispatchers(inout b: MirBuilder, inout program: MirProgram) ->
     let saved_locals = b.local_counter
     let saved_blocks = b.block_counter
     let saved_vars = b.var_map.clone()
+    let saved_current_params = b.current_params.clone()
+    let saved_current_locals = b.current_locals.clone()
     let saved_local_records = b.local_records.clone()
     let saved_local_types = b.local_types.clone()
     let saved_local_pos = b.local_pos.clone()
@@ -18213,6 +18209,8 @@ def lower_pending_dispatchers(inout b: MirBuilder, inout program: MirProgram) ->
     b.local_counter = saved_locals
     b.block_counter = saved_blocks
     b.var_map = saved_vars
+    b.current_params = saved_current_params
+    b.current_locals = saved_current_locals
     b.local_records = saved_local_records
     b.local_types = saved_local_types
     b.local_pos = saved_local_pos
