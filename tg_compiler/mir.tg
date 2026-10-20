@@ -1897,9 +1897,14 @@ struct MirBuilder
   # dominant step site in `lookup_cleanup_edge` (150e9-step wall inside
   # lower_block).  First-wins, exactly like the checker's find_edge_index.
   cleanup_edge_index: CleanupEdgeIndex = cleanup_edge_index_new()
-  # function-name + LocalId -> resource-ownership answer (deinit plan query
-  # is not cheap enough to re-run per assignment).
-  local_resource_cache: Map[String, Bool] = Map::new()
+  # AUTHORITATIVE per-function local tables (LocalId -> record/type/position)
+  # and the resource-ownership memo.  Reads must not match/copy current_fn or
+  # scan f.locals; type refinement invalidates the memo entry.
+  local_records: Map[Int, MirLocal] = Map::new()
+  local_types: Map[Int, Type] = Map::new()
+  local_pos: Map[Int, Int] = Map::new()
+  mir_to_semantic: Map[Int, Int] = Map::new()
+  local_resource_cache: Map[Int, Bool] = Map::new()
   # (P1-2) PRE-LOWERING PERSISTENT HIR IDENTITY: the view the finalize
   # pipeline stamps BEFORE lowering (declaration + HIR lineage identities
   # through the shared DeclLineageStore). mir_origin_hir_node consults it,
@@ -2673,6 +2678,11 @@ def start_function(inout b: MirBuilder, name: String, ret_type: Type, span: Span
   b.var_map = Map::new()
   b.blocks = Vec::new()
   b.declared_locals = Set::new()
+  b.local_records = Map::new()
+  b.local_types = Map::new()
+  b.local_pos = Map::new()
+  b.mir_to_semantic = Map::new()
+  b.local_resource_cache = Map::new()
   # (fourth-audit P0-7) the per-function origin context: the emission key
   # face every lowered node's StableMirNodeId.function_key carries, a reset
   # generated sequence, and no stale HIR context / overrides.
@@ -2752,10 +2762,13 @@ def start_function(inout b: MirBuilder, name: String, ret_type: Type, span: Span
   # map-held Vec/Set mutations in this file.
   match b.current_fn
   when Option::Some(f) then
-    f.locals.push(ret_local)
+    f.locals.push(ret_local.clone())
     b.current_fn = Option::Some(f)
   when _ then ()
   end
+  b.local_records.insert(ret_local.id.id, ret_local.clone())
+  b.local_types.insert(ret_local.id.id, ret_local.ty.clone())
+  b.local_pos.insert(ret_local.id.id, 0)
 end
 
 # Whether a deinit callable with the given (mangled) name is registered for
@@ -2946,81 +2959,51 @@ def add_param(inout b: MirBuilder, name: String, ty: Type, span: Span) -> MirLoc
   when Option::None then ()
   end
   
-  b.var_map.insert(name, id)
+  b.var_map.insert(name.clone(), id)
   b.declared_locals.insert(id.id)
+  b.local_records.insert(id.id, local.clone())
+  b.local_types.insert(id.id, ty.clone())
+  b.local_pos.insert(id.id, b.local_counter - 1)
   id
 end
 
 # Whether a local id exists in the current function.
 def lookup_local_id(b: MirBuilder, local_id: MirLocalId) -> Option[MirLocal]
-  match b.current_fn
-  when Option::Some(f) then
-    for l in f.locals do
-      if l.id.id == local_id.id then
-        return Option::Some(l.clone())
-      end
-    end
-    Option::None
+  match b.local_records.get(local_id.id)
+  when Option::Some(l) then Option::Some(l.clone())
   when Option::None then Option::None
   end  end
 end
 
 def lookup_local_type(b: MirBuilder, local_id: MirLocalId) -> Type
-  match b.current_fn
-  when Option::Some(f) then
-    for local in f.locals do
-      if local.id.id == local_id.id then
-        return local.ty.clone()
-      end
-    end
-    Type::Unit
+  match b.local_types.get(local_id.id)
+  when Option::Some(t) then t.clone()
   when Option::None then Type::Unit
   end  end
 end
 
-def typed_binding_type_by_name(b: MirBuilder, name: String) -> Option[Type]
-  var best: Option[Type] = Option::None
-  var best_id = -1
-  let entries = b.typed_local_bindings.entries_cloned()
-  mut i = 0
-  while i < entries.len() do
-    if entries[i].1.name == name then
-      if entries[i].0 > best_id then
-        best = Option::Some(entries[i].1.ty.clone())
-        best_id = entries[i].0
-      end
-    end
-    i = i + 1
-  end
-  best
-end
-
 def builder_local_typed_ty(b: MirBuilder, local_id: MirLocalId) -> Option[Type]
-  # The CURRENT function's local record already carries the checked type.
-  # The old name lookup cloned the entire typed_local_bindings map and
-  # scanned it by name for EVERY local/resource query — the dominant
-  # `clone`/`entries_cloned` frame in the self-host lowering step limit.
-  match b.current_fn
-  when Option::Some(f) then
-    for local in f.locals do
-      if local.id.id == local_id.id then
-        match local.ty
-        when Type::Error then return typed_binding_type_by_name(b, &local.name)
-        when _ then return Option::Some(local.ty.clone())
+  match b.local_types.get(local_id.id)
+  when Option::Some(t) then
+    match t
+    when Type::Error then
+      # EXACT semantic identity only; never a global name search.
+      match b.mir_to_semantic.get(local_id.id)
+      when Option::Some(sem) then
+        match b.typed_local_bindings.get(sem)
+        when Option::Some(binding) then Option::Some(binding.ty.clone())
+        when Option::None then Option::None
         end
+      when Option::None then Option::None
       end
+    when _ then Option::Some(t.clone())
     end
-    Option::None
   when Option::None then Option::None
   end  end
 end
 
 def builder_local_is_resource(inout b: MirBuilder, local_id: MirLocalId) -> Bool
-  let cache_key = match b.current_fn
-  when Option::Some(f) then f.name.clone() + ":" + local_id.id.to_string()
-  when Option::None then ":" + local_id.id.to_string()
-  end
-  match b.local_resource_cache.get(&cache_key)
+  match b.local_resource_cache.get(local_id.id)
   when Option::Some(v) then return v
   when Option::None then ()
   end
@@ -3040,11 +3023,13 @@ def builder_local_is_resource(inout b: MirBuilder, local_id: MirLocalId) -> Bool
     var vis = Set::new()
     let plan = deinit_plan_for_type(b, &ty, &mut vis)
     let ans = verifier_plan_contains_ownership(&plan)
-    b.local_resource_cache.insert(cache_key, ans)
+    b.local_resource_cache.insert(local_id.id, ans)
     ans
   when Option::None then
-    b.local_resource_cache.insert(cache_key, false)
-    false
+    # Unknown local type: fail closed (may own) rather than silently
+    # skipping ownership accounting.
+    b.local_resource_cache.insert(local_id.id, true)
+    true
   end
 end
 
@@ -5182,9 +5167,15 @@ end
 # return-edge cleanup consults this so a local already moved into the return
 # slot (e.g. `return Result::Ok(result)`) is not deinited again on that same
 # edge — the checker's recorded Drop action can lag the move.
-def block_own_moved_locals(inout b: MirBuilder, block: MirBlock) -> Set[Int]
+def block_own_moved_locals(inout b: MirBuilder, block_id: Int) -> Set[Int]
+  # Read the block's statements through the builder's block vector; do not
+  # clone the complete MirBlock (the return cleanup path runs per return and
+  # the block can be large).
   var out: Set[Int] = Set::new()
-  for st in block.statements do
+  if block_id < 0 || block_id >= b.blocks.len() then return out end
+  var si = 0
+  while si < b.blocks[block_id].statements.len() do
+    let st = b.blocks[block_id].statements[si]
     match st.kind
     when MirStatementKind::MirAssign(place, rvalue) then
       if place.projections.len() == 0 && builder_local_is_resource(b, &place.local) then
@@ -5193,6 +5184,7 @@ def block_own_moved_locals(inout b: MirBuilder, block: MirBlock) -> Set[Int]
       mir_rvalue_whole_moved_locals(b, rvalue, &mut out)
     when _ then ()
     end
+    si = si + 1
   end
   out
 end
@@ -5456,6 +5448,7 @@ def record_semantic_pattern_local(inout b: MirBuilder, pat: Pattern, mir_local: 
   match b.pattern_binding_resolutions.get(pat.node_id)
   when Option::Some(sem_id) then
     b.semantic_to_mir.insert(sem_id, mir_local.id)
+    b.mir_to_semantic.insert(mir_local.id, sem_id)
   when Option::None then
     b.errors.push("internal error: missing typed pattern binding for " + what + " (pattern node " + pat.node_id.to_string() + " at " + pat.span.file.clone() + ":" + pat.span.start.to_string() + " in " + b.current_fn_key.clone() + ")")
   end  end
@@ -5509,32 +5502,39 @@ def add_local(inout b: MirBuilder, name: String, ty: Type, is_mut: Bool, span: S
   when Option::None then ()
   end
   
-  b.var_map.insert(name, id)
+  b.var_map.insert(name.clone(), id)
   b.declared_locals.insert(id.id)
+  b.local_records.insert(id.id, local.clone())
+  b.local_types.insert(id.id, ty.clone())
+  b.local_pos.insert(id.id, b.local_counter - 1)
   id
 end
 
 def update_local_type(inout b: MirBuilder, local_id: MirLocalId, new_ty: Type) -> Unit
-  match b.current_fn
-  when Option::Some(f) then
-    var updated_locals = Vec::new()
-    for local in f.locals do
-      if local.id.id == local_id.id then
-        updated_locals.push(MirLocal {
-          id: MirLocalId { id: local.id.id },
-          name: local.name.clone(),
-          ty: new_ty.clone(),
-          is_mut: local.is_mut,
-          span: local.span
-        })
-      else
-        updated_locals.push(local.clone())
-      end
-    end
-    f.locals = updated_locals
-    b.current_fn = Option::Some(f)
+  # Invalidate the resource memo BEFORE the type table changes (refinement
+  # can turn a non-resource local into an owning one).
+  b.local_resource_cache.remove(&local_id.id)
+  b.local_types.insert(local_id.id, new_ty.clone())
+  match b.local_records.get(local_id.id)
+  when Option::Some(rec) then
+    var updated = rec.clone()
+    updated.ty = new_ty.clone()
+    b.local_records.insert(local_id.id, updated)
   when Option::None then ()
-  end  end
+  end
+  match b.local_pos.get(local_id.id)
+  when Option::Some(pos) then
+    match b.current_fn
+    when Option::Some(f) then
+      var nf = f
+      if pos < nf.locals.len() then
+        nf.locals[pos].ty = new_ty.clone()
+      end
+      b.current_fn = Option::Some(nf)
+    when Option::None then ()
+    end
+  when Option::None then ()
+  end
 end
 
 def refine_collection_local_type_from_push(inout b: MirBuilder, recv_place: Place, recv_ty: Type, elem_ty: Type) -> Unit
@@ -10919,16 +10919,12 @@ def emit_return_edge_cleanup(inout b: MirBuilder, stmt_node_id: Int, kind: CfgEd
     # (the verifier's "deinit of previously moved"). Only whole-place moves
     # count (block_own_moved_locals); a partial move keeps the local's
     # remainder owned, so its Drop action stays.
-    var edge_actions = actions.clone()
+    # `actions` is already the lookup-owned copy; do not clone it again.
+    var edge_actions = actions
     match b.current_block
     when Option::Some(ret_blk) then
       if ret_blk.id < b.blocks.len() then
-        # CLONE the block: `block_own_moved_locals` takes it by value (the
-        # old `&b.blocks[ret_blk.id]` argument copied it the same way), and a
-        # bare `let blk = b.blocks[ret_blk.id]` would be a projected move-out
-        # from the root the same call passes `inout`.
-        let ret_blk_copy = b.blocks[ret_blk.id].clone()
-        let moved_here = block_own_moved_locals(b, ret_blk_copy)
+        let moved_here = block_own_moved_locals(b, ret_blk.id)
         if moved_here.len() > 0 then
           var kept: Vec[CleanupAction] = Vec::new()
           for act in actions do
@@ -17800,6 +17796,11 @@ def lower_pending_closures(inout b: MirBuilder, inout program: MirProgram) -> Un
     let saved_locals = b.local_counter
     let saved_blocks = b.block_counter
     let saved_vars = b.var_map.clone()
+    let saved_local_records = b.local_records.clone()
+    let saved_local_types = b.local_types.clone()
+    let saved_local_pos = b.local_pos.clone()
+    let saved_mir_to_semantic = b.mir_to_semantic.clone()
+    let saved_local_resource_cache = b.local_resource_cache.clone()
     let saved_block_map = duplicate_blocks(&b.blocks)
 
     let closure_span = closure.body.span
@@ -17913,6 +17914,11 @@ def lower_pending_closures(inout b: MirBuilder, inout program: MirProgram) -> Un
     b.local_counter = saved_locals
     b.block_counter = saved_blocks
     b.var_map = saved_vars
+    b.local_records = saved_local_records
+    b.local_types = saved_local_types
+    b.local_pos = saved_local_pos
+    b.mir_to_semantic = saved_mir_to_semantic
+    b.local_resource_cache = saved_local_resource_cache
     b.blocks = saved_block_map
   end
   end  # while pending_closures
@@ -17943,6 +17949,11 @@ def lower_pending_dispatchers(inout b: MirBuilder, inout program: MirProgram) ->
     let saved_locals = b.local_counter
     let saved_blocks = b.block_counter
     let saved_vars = b.var_map.clone()
+    let saved_local_records = b.local_records.clone()
+    let saved_local_types = b.local_types.clone()
+    let saved_local_pos = b.local_pos.clone()
+    let saved_mir_to_semantic = b.mir_to_semantic.clone()
+    let saved_local_resource_cache = b.local_resource_cache.clone()
     let saved_block_map = duplicate_blocks(&b.blocks)
 
     start_function(b, disp.name.clone(), Type::Unit, disp.span)
@@ -18142,6 +18153,11 @@ def lower_pending_dispatchers(inout b: MirBuilder, inout program: MirProgram) ->
     b.local_counter = saved_locals
     b.block_counter = saved_blocks
     b.var_map = saved_vars
+    b.local_records = saved_local_records
+    b.local_types = saved_local_types
+    b.local_pos = saved_local_pos
+    b.mir_to_semantic = saved_mir_to_semantic
+    b.local_resource_cache = saved_local_resource_cache
     b.blocks = saved_block_map
   end
   end  # while pending_dispatchers
@@ -39462,7 +39478,7 @@ pub def verify_mir(mir: MirProgram) -> Vec[String]
   # lowered program (the recovery ran first; a None here is a pass that
   # dropped an origin).
   if mir.origins_enforced then
-    for origin_error in verify_mir_origins(mir.clone()) do
+    for origin_error in verify_mir_origins(mir) do
       errors.push(origin_error)
     end
     # (P0-7 provenance extension) the typed-provenance CONSISTENCY
@@ -39471,7 +39487,7 @@ pub def verify_mir(mir: MirProgram) -> Vec[String]
     # (mir_provenance_recover ran there); a rebuild between those
     # boundaries may legitimately have dropped the typed face, so this
     # boundary check does not require it.
-    for prov_error in verify_mir_provenance_consistent(mir.clone()) do
+    for prov_error in verify_mir_provenance_consistent(mir) do
       errors.push(prov_error)
     end
   end
