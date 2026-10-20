@@ -504,7 +504,7 @@ run_behavioral_suite() {
     canary-neg)     run_neg_canaries "$2" '.*' ;;
     resource-neg)   run_neg_canaries "$2" '^(canary_neg_access_|canary_neg_resource_|resource_|canary_neg_option_resource)' ;;
     conv-neg)       run_neg_canaries "$2" '^canary_neg_conv_' ;;
-    verifier)       "$2" test tests/verifier_projection_tests.tg tests/verifier_read_escape_tests.tg tests/mir_cleanup_edge_key_test.tg tests/type_structural_eq_tests.tg golden/compiler_module_tests.tg ;;
+    verifier)       "$2" test tests/verifier_projection_tests.tg tests/verifier_read_escape_tests.tg tests/mir_cleanup_edge_key_test.tg tests/type_structural_eq_tests.tg tests/mir_cfg_convergence_test.tg tests/map_values_source_test.tg golden/compiler_module_tests.tg ;;
     layout)         "$2" test tests/layout_tests.tg tests/layout/differential_layout_test.tg ;;
     enum)           "$2" test tests/struct_enum_test.tg ;;
     numeric-gate)   "$2" test tests/numeric_literal_gate_e_test.tg ;;
