@@ -2165,12 +2165,14 @@ end
 
 # The key place's local type by id.
 def mono_mir_local_type(f: MirFunction, local_id: Int) -> Type
-  for l in f.locals do
-    if l.id.id == local_id then
-      return l.ty.clone()
-    end
+  match f.verifier_local_pos.get(local_id)
+  when Option::Some(pos) then return f.locals[pos].ty.clone()
+  when Option::None then ()
   end
-  Type::Unit
+  for l in f.locals do
+    if l.id.id == local_id then return l.ty.clone() end
+  end
+  panic("internal error: mono_mir_local_type: local id " + local_id.to_string() + " not present in function " + f.name.clone())
 end
 
 # The concrete key TYPE and the KEY place to borrow for the injected
@@ -2672,7 +2674,8 @@ def devirt_receiver_type(inout func: MirFunction, args: Vec[MirCallArg]) -> Opti
   when Option::Some(p) then
     var peeled = match mono_devirt_local_type(func, p.local.id)
     when Option::Some(t) then t
-    when Option::None then Type::Unit
+    when Option::None then
+      panic("internal error: devirt_receiver_type: receiver local id " + p.local.id.to_string() + " not present in function " + func.name.clone())
     end
     var peel_depth = 0
     while peel_depth < 4 do
@@ -3270,8 +3273,10 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
   # instead of inferring — every generic call reaching the monomorphizer
   # carries its solved instance; inference is not performed on the
   # program's call graph.
+  var peak_pending = 0
   for func in mir.functions do
     scan_call_sites_in_function(func, mir, cache, &mut pending, &mut seen, &mut errors)
+    if pending.len() > peak_pending then peak_pending = pending.len() end
   end
 
   # Phase 2: drain the queue. Each pop specializes ONE instance (cache
@@ -3283,7 +3288,7 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
   # (deferred instances become concrete under the caller's substitution
   # and enter the queue here).
   let templates = mono_template_index(mir)
-  mono_drain_worklist(mir, templates, cache, &mut pending, &mut seen, &mut errors, &mut specialized_count)
+  mono_drain_worklist(mir, templates, cache, &mut pending, &mut peak_pending, &mut seen, &mut errors, &mut specialized_count)
 
  # Phase 2b: inject the map/set Hash/Eq dispatch calls. After the
   # first wave every call site's key type is CONCRETE (including formerly
@@ -3293,8 +3298,9 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
   inject_map_dispatch_calls(mir)
   for func in mir.functions do
     scan_call_sites_in_function(func, mir, cache, &mut pending, &mut seen, &mut errors)
+    if pending.len() > peak_pending then peak_pending = pending.len() end
   end
-  mono_drain_worklist(mir, templates, cache, &mut pending, &mut seen, &mut errors, &mut specialized_count)
+  mono_drain_worklist(mir, templates, cache, &mut pending, &mut peak_pending, &mut seen, &mut errors, &mut specialized_count)
 
   # Phase 2c: devirtualize the trait-contract calls (the seed's bodyless
   # re-dispatch). A call on a generic-bound receiver keeps the contract's
@@ -3320,8 +3326,9 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
     if devirt_changed then
       for func in mir.functions do
         scan_call_sites_in_function(func, mir, cache, &mut pending, &mut seen, &mut errors)
+        if pending.len() > peak_pending then peak_pending = pending.len() end
       end
-      mono_drain_worklist(mir, templates, cache, &mut pending, &mut seen, &mut errors, &mut specialized_count)
+      mono_drain_worklist(mir, templates, cache, &mut pending, &mut peak_pending, &mut seen, &mut errors, &mut specialized_count)
     end
   end
 
@@ -3353,21 +3360,28 @@ pub def monomorphize_program(inout mir: MirProgram, inout cache: MonoCache) -> R
   end
   # (mono growth observability): record cardinality, not just a ceiling.
   var per_def: Map[Int, Int] = Map::new()
+  var def_name: Map[Int, String] = Map::new()
   var mfi = 0
   var max_per_def = 0
+  var max_per_def_id = -1
   while mfi < mir.functions.len() do
     match mir.functions[mfi].callable
     when Option::Some(c) then
       let did = def_id_numeric(&c.def)
+      if !def_name.contains_key(&did) then def_name.insert(did, mir.functions[mfi].name.clone()) end
       let cur = match per_def.get(&did) when Option::Some(v) then v when Option::None then 0 end
       let nv = cur + 1
       per_def.insert(did, nv)
-      if nv > max_per_def then max_per_def = nv end
+      if nv > max_per_def then
+        max_per_def = nv
+        max_per_def_id = did
+      end
     when Option::None then ()
     end
     mfi = mfi + 1
   end
-  println("mono metrics: functions=" + mir.functions.len().to_string() + " specialized=" + specialized_count.to_string() + " unique_defs=" + per_def.len().to_string() + " max_per_def=" + max_per_def.to_string() + " seen_instances=" + seen.len().to_string() + " limit=" + MAX_MONO_INSTANCES.to_string())
+  let max_name = match def_name.get(&max_per_def_id) when Option::Some(n) then n.clone() when Option::None then "".to_string() end
+  println("mono metrics: functions=" + mir.functions.len().to_string() + " specialized=" + specialized_count.to_string() + " unique_defs=" + per_def.len().to_string() + " max_per_def=" + max_per_def.to_string() + " max_per_def_id=" + max_per_def_id.to_string() + " max_per_def_name=" + max_name + " peak_pending=" + peak_pending.to_string() + " seen_instances=" + seen.len().to_string() + " limit=" + MAX_MONO_INSTANCES.to_string())
 
   Result::Ok(())
 end
@@ -3409,6 +3423,7 @@ def mono_drain_worklist(
   templates: MonoTemplateIndex,
   inout cache: MonoCache,
   inout pending: VecDeque[(String, InstanceId)],
+  inout peak_pending: Int,
   inout seen: Set[StructuralInstanceId],
   inout errors: Vec[String],
   inout specialized_count: Int
@@ -3477,6 +3492,7 @@ def mono_drain_worklist(
               when Option::Some(body) then
                 mir.functions.push(body.clone())
                 scan_call_sites_in_function(body, mir, cache, pending, seen, errors)
+                if pending.len() > peak_pending then peak_pending = pending.len() end
               when Option::None then ()
               end
             when Result::Err(msg) then

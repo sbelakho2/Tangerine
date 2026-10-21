@@ -523,6 +523,10 @@ t G13.14 'permissive-equality detector: the EXACT convention equality (E0225) �
 t G14.1 'release gate fail-closed: required LIR/direct, tg test, embedded and no_std routes absent -> FAIL (never SKIP-as-success), dev mode still SKIPs, forced structural degradation is rejected, and the required CI steps set TG_RELEASE_GATE=1' \
   'bash scripts/test_release_gate_skip_semantics.sh >/dev/null'
 
+# G14.2 Native C-symbol mapping covers every declared libc_* extern.
+t G14.2 'every extern def libc_* reachable from the compiler has an explicit native C-symbol mapping' \
+  'missing=0; for sym in $(grep -rhoE "extern def libc_[A-Za-z0-9_]+" tg_compiler std | awk "{print \$3}" | sort -u); do grep -qF "sym == \"$sym\"" tg_compiler/linker.tg || { echo "unmapped: $sym"; missing=1; }; done; [ "$missing" -eq 0 ]'
+
 # ———————————————————————————————————————————————————————————————
 # G12 Summary report
 # ———————————————————————————————————————————————————————————————
