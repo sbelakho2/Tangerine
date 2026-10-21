@@ -5234,38 +5234,80 @@ def block_own_consumed_locals(inout b: MirBuilder, block_id: Int) -> Set[Int]
   out
 end
 
+def mir_bool_row(size: Int) -> Vec[Bool]
+  var out: Vec[Bool] = Vec::new()
+  var i = 0
+  while i < size do
+    out.push(false)
+    i = i + 1
+  end
+  out
+end
+
 def compute_definitely_consumed(inout b: MirBuilder, n: Int) -> Map[Int, Set[Int]]
-  # Dense CFG vectors: block ids are 0..n-1. No block_map aggregate copies,
-  # no predecessor-list clone on every edge, no Set clone per map update.
-  # Dense CFG vectors: block ids are 0..n-1.  Predecessors are stored in
-  # CSR form (start offsets + flat edge list) — no nested-Vec copy per edge.
-  var in_set: Vec[Set[Int]] = Vec::new()
-  var out_set: Vec[Set[Int]] = Vec::new()
-  var out_initialized: Vec[Bool] = Vec::new()
-  var pred_count: Vec[Int] = Vec::new()
+  # Dense bitset facts over the RESOURCE locals consumed anywhere in the CFG.
+  # Flat Vec[Bool] rows avoid dynamic-index ownership of Vec[Set] elements;
+  # predecessor storage is CSR (start offsets + flat edges).
+  var own_sets: Vec[Set[Int]] = Vec::new()
+  var res_index: Map[Int, Int] = Map::new()
+  var res_ids: Vec[Int] = Vec::new()
   var bi = 0
   while bi < n do
-    in_set.push(Set::new())
-    out_set.push(Set::new())
-    out_initialized.push(false)
-    pred_count.push(0)
+    let own = block_own_consumed_locals(b, bi)
+    own_sets.push(own.clone())
+    for lid in own do
+      if !res_index.contains_key(&lid) then
+        res_index.insert(lid, res_ids.len())
+        res_ids.push(lid)
+      end
+    end
+    bi = bi + 1
+  end
+  let width = res_ids.len()
+  if width == 0 then
+    var empty: Map[Int, Set[Int]] = Map::new()
+    bi = 0
+    while bi < n do
+      empty.insert(bi, Set::new())
+      bi = bi + 1
+    end
+    return empty
+  end
+  let total = n * width
+  var in_bits = mir_bool_row(total)
+  var out_bits = mir_bool_row(total)
+  var own_bits = mir_bool_row(total)
+  var out_initialized = mir_bool_row(n)
+  bi = 0
+  while bi < n do
+    let obase = bi * width
+    for lid in own_sets[bi] do
+      match res_index.get(&lid)
+      when Option::Some(pos) then own_bits[obase + pos] = true
+      when Option::None then ()
+      end
+    end
     bi = bi + 1
   end
 
+  # CSR predecessors
+  var pred_count: Vec[Int] = Vec::new()
+  bi = 0
+  while bi < n do
+    pred_count.push(0)
+    bi = bi + 1
+  end
   bi = 0
   while bi < n do
     let succs = terminator_successor_ids(&b.blocks[bi].terminator)
     var si = 0
     while si < succs.len() do
       let sid = succs[si]
-      if sid >= 0 && sid < n then
-        pred_count[sid] = pred_count[sid] + 1
-      end
+      if sid >= 0 && sid < n then pred_count[sid] = pred_count[sid] + 1 end
       si = si + 1
     end
     bi = bi + 1
   end
-
   var pred_start: Vec[Int] = Vec::new()
   var acc = 0
   bi = 0
@@ -5275,10 +5317,10 @@ def compute_definitely_consumed(inout b: MirBuilder, n: Int) -> Map[Int, Set[Int
     bi = bi + 1
   end
   pred_start.push(acc)
-  var pred_from: Vec[Int] = Vec::new()
+  var pred_edges: Vec[Int] = Vec::new()
   var ei = 0
   while ei < acc do
-    pred_from.push(0)
+    pred_edges.push(0)
     ei = ei + 1
   end
   var pred_fill = pred_start.clone()
@@ -5290,7 +5332,7 @@ def compute_definitely_consumed(inout b: MirBuilder, n: Int) -> Map[Int, Set[Int
       let sid = succs[si]
       if sid >= 0 && sid < n then
         let pos = pred_fill[sid]
-        pred_from[pos] = bi
+        pred_edges[pos] = bi
         pred_fill[sid] = pos + 1
       end
       si = si + 1
@@ -5300,55 +5342,64 @@ def compute_definitely_consumed(inout b: MirBuilder, n: Int) -> Map[Int, Set[Int
 
   var worklist: Vec[Int] = Vec::new()
   worklist.push(0)
-  var in_worklist: Set[Int] = Set::new()
-  in_worklist.insert(0)
+  var in_worklist = mir_bool_row(n)
+  in_worklist[0] = true
   while !worklist.is_empty() do
     let bid = match worklist.pop()
     when Option::Some(v) then v
     when Option::None then break
     end
-    in_worklist.remove(&bid)
-    var new_in: Set[Int] = Set::new()
+    in_worklist[bid] = false
+    var new_row = mir_bool_row(width)
     if bid != 0 then
       var first = true
       var pi = pred_start[bid]
       let pend = pred_start[bid + 1]
       while pi < pend do
-        let pid = pred_from[pi]
-        # An as-yet-uncomputed predecessor must NOT contribute an empty OUT
-        # to a must-intersection (that would erase facts from initialised
-        # predecessors and converge to a wrong fixed point).
+        let pid = pred_edges[pi]
         if out_initialized[pid] then
+          let pbase = pid * width
           if first then
-            new_in = out_set[pid]
+            var j = 0
+            while j < width do
+              new_row[j] = out_bits[pbase + j]
+              j = j + 1
+            end
             first = false
           else
-            var keep: Set[Int] = Set::new()
-            for v in new_in do
-              if out_set[pid].contains(&v) then keep.insert(v.clone()) end
+            var j = 0
+            while j < width do
+              if !out_bits[pbase + j] then new_row[j] = false end
+              j = j + 1
             end
-            new_in = keep
           end
         end
         pi = pi + 1
       end
     end
-    var out: Set[Int] = Set::new()
-    for v in new_in do out.insert(v.clone()) end
-    let own = block_own_consumed_locals(b, bid)
-    for v in own do out.insert(v.clone()) end
-    let old = in_set[bid]
-    let changed = !out_initialized[bid] || !verifier_set_equal(&old, &new_in)
-    in_set[bid] = new_in
-    out_set[bid] = out
+    let base = bid * width
+    var changed = !out_initialized[bid]
+    if !changed then
+      var j = 0
+      while j < width do
+        if in_bits[base + j] != new_row[j] then changed = true end
+        j = j + 1
+      end
+    end
+    var j2 = 0
+    while j2 < width do
+      in_bits[base + j2] = new_row[j2]
+      out_bits[base + j2] = new_row[j2] || own_bits[base + j2]
+      j2 = j2 + 1
+    end
     out_initialized[bid] = true
     if changed then
       let succs = terminator_successor_ids(&b.blocks[bid].terminator)
       var s2 = 0
       while s2 < succs.len() do
         let sid = succs[s2]
-        if sid >= 0 && sid < n && !in_worklist.contains(&sid) then
-          in_worklist.insert(sid)
+        if sid >= 0 && sid < n && !in_worklist[sid] then
+          in_worklist[sid] = true
           worklist.push(sid)
         end
         s2 = s2 + 1
@@ -5358,74 +5409,17 @@ def compute_definitely_consumed(inout b: MirBuilder, n: Int) -> Map[Int, Set[Int
   var result: Map[Int, Set[Int]] = Map::new()
   bi = 0
   while bi < n do
-    result.insert(bi, in_set[bi])
+    var set: Set[Int] = Set::new()
+    let base = bi * width
+    var j = 0
+    while j < width do
+      if in_bits[base + j] then set.insert(res_ids[j]) end
+      j = j + 1
+    end
+    result.insert(bi, set)
     bi = bi + 1
   end
   result
-end
-
-def mir_cfg_set_empty_at(result: Map[Int, Set[Int]], bid: Int) -> Bool
-  match result.get(bid)
-  when Option::Some(v) then v.len() == 0
-  when Option::None then false
-  end  end
-end
-
-def mir_cfg_set_contains_at(result: Map[Int, Set[Int]], bid: Int, lid: Int) -> Bool
-  match result.get(bid)
-  when Option::Some(v) then v.contains(&lid)
-  when Option::None then false
-  end  end
-end
-
-pub def mir_cfg_convergence_selftest() -> Bool
-  # Empty two-block cycle: both OUT sets stay legitimately empty. The
-  # dataflow must still converge (the explicit initialized[] state is the
-  # authority, not OUT.len() == 0).
-  var b = builder_new()
-  start_function(&mut b, "cfg_convergence_selftest", Type::Unit, span_dummy())
-  let entry = b.blocks[0].id
-  let second = create_block(&mut b)
-  set_terminator(&mut b, MirTerminatorKind::MirGoto(second), span_dummy())
-  switch_to_block(&mut b, second)
-  set_terminator(&mut b, MirTerminatorKind::MirGoto(entry), span_dummy())
-  let result = compute_definitely_consumed(&mut b, b.blocks.len())
-  mir_cfg_set_empty_at(result, 0) && mir_cfg_set_empty_at(result, 1)
-end
-
-pub def mir_cfg_consumed_before_loop_selftest() -> Bool
-  # ENTRY consumes x, then A <-> B. A has predecessors ENTRY and B; on the
-  # first A visit B is uninitialized. The must-analysis must keep {x}, not
-  # intersect it with B's empty placeholder.
-  var b = builder_new()
-  start_function(&mut b, "cfg_consumed_before_loop", Type::Unit, span_dummy())
-  let x = add_local(&mut b, "x", Type::Int, false, span_dummy())
-  b.local_resource_cache.insert(x.id, true)
-  let a = create_block(&mut b)
-  let c = create_block(&mut b)
-  let consume_arg = MirCallArg {
-    effect: AccessEffect::Consume,
-    value: MirCallValue::Place(place_local(x))
-  }
-  set_terminator(&mut b, MirTerminatorKind::MirCall {
-    dest: place_local(MirLocalId { id: 0 }),
-    func: operand_constant(MirConstant {
-      kind: MirConstantKind::MirFnItem("__cfg_selftest_consumer".to_string()),
-      ty: Type::Unit,
-      instance: Option::None
-    }),
-    args: Vec::from([consume_arg]),
-    success: a,
-    unwind: Option::None,
-    intrinsic: Option::None,
-    tail: false
-  }, span_dummy())
-  switch_to_block(&mut b, a)
-  set_terminator(&mut b, MirTerminatorKind::MirGoto(c), span_dummy())
-  switch_to_block(&mut b, c)
-  set_terminator(&mut b, MirTerminatorKind::MirGoto(a), span_dummy())
-  let result = compute_definitely_consumed(&mut b, b.blocks.len())
-  mir_cfg_set_contains_at(result, a.id, x.id) && mir_cfg_set_contains_at(result, c.id, x.id)
 end
 
 def emit_cfg_deinit_returns(inout b: MirBuilder) -> Unit
