@@ -7362,7 +7362,7 @@ def lower_program(program: Program, analyzed: AnalyzedProgram, hir_view: HirNode
     verifier_index_function(&mut functions[fi_idx])
     fi_idx = fi_idx + 1
   end
-  var result = MirProgram { functions: functions, statics: statics, types: types, lang_items: b.lang_items.clone(), deinit_plans: b.concrete_deinit_plans.clone(), dispatch_methods: dispatch_methods, generic_param_names: b.generic_param_names.clone(), drop_glue_instances: b.drop_glue_instances.clone(), drop_glue_fns: b.drop_glue_fns.clone(), method_names_by_def: b.method_names_by_def.clone(), engine_env: b.engine_env.clone() }
+  var result = MirProgram { functions: functions, statics: statics, types: types, lang_items: b.lang_items.clone(), deinit_plans: Map::new(), dispatch_methods: dispatch_methods, generic_param_names: b.generic_param_names.clone(), drop_glue_instances: b.drop_glue_instances.clone(), drop_glue_fns: b.drop_glue_fns.clone(), method_names_by_def: b.method_names_by_def.clone(), engine_env: b.engine_env.clone() }
   lower_pending_closures(&mut b, &mut result)
   lower_pending_dispatchers(&mut b, &mut result)
  # (plan-key fix): pre-populate the CONCRETE (TypeId, substs)-keyed
@@ -7372,7 +7372,6 @@ def lower_program(program: Program, analyzed: AnalyzedProgram, hir_view: HirNode
   # and Wrapper[File] are distinct entries; the TypeId-keyed semantic table
   # cloned above stays the builder's def-less fallback only).
   mir_populate_concrete_plans(&mut b, &result)
-  result.deinit_plans = b.concrete_deinit_plans.clone()
  # build every generated drop-glue function body (ordinary
   # MirFunctions — codegen emits them like any other function and the
   # whole-value destruction sites call them through the MirDeinit
@@ -29222,7 +29221,7 @@ end
 def verifier_membership_lane_errors(func: MirFunction, param_names: Map[Int, String]) -> Vec[String]
   var errors: Vec[String] = Vec::new()
   var type_index: Map[Int, MirTypeDef] = Map::new()
-  var plans: Map[String, DeinitPlan] = Map::new()
+  var plan_keys: Set[String] = Set::new()
   var fn_names: Set[String] = Set::new()
   var deinit_instances: Set[Int] = Set::new()
   var drop_glue_fns: Map[Int, String] = Map::new()
@@ -29230,7 +29229,7 @@ def verifier_membership_lane_errors(func: MirFunction, param_names: Map[Int, Str
   var fn_effects_closure: Map[String, Vec[EffectId]] = Map::new()
   var engine_env = engine_env_empty()
   var caches = verifier_new_caches()
-  verify_function_v2(&type_index, &plans, &fn_names, &deinit_instances, &drop_glue_fns, param_names, func, &fn_effects, &fn_effects_closure, &mut engine_env, &mut errors, caches)
+  verify_function_v2(&type_index, &plan_keys, &fn_names, &deinit_instances, &drop_glue_fns, param_names, func, &fn_effects, &fn_effects_closure, &mut engine_env, &mut errors, caches)
   errors
 end
 
@@ -39487,23 +39486,19 @@ pub def verify_mir(mir: MirProgram) -> Vec[String]
   # the plans: the verifier queries the engine snapshot below
   # (type_properties_of on MirProgram.engine_env — the is_trivially_copyable
   # axis, the COPY authority).
-  var plans = mir.deinit_plans.clone()
-  # (generic-owner plan aliases): projection owners are checked against the
-  # BARE Type::Adt(owner, []) plan key. A generic owner (Result/Option/Vec/
-  # Map/Set/a user generic enum) keys the plan table only with its argument
-  # list, so alias each named owner's bare key to Trivial: the owner is
-  # canonical (its concrete plans exist — the key prefix names it), the bare
-  # shape is simply not itself a plan carrier (and its MirTypeDef need not
-  # exist in MirProgram.types for a builtin).
-  for (pkey, _pplan) in mir.deinit_plans do
+  # Presence index over the concrete plan table: the verifier only asks
+  # whether a plan EXISTS for a type key.  Do not deep-clone every recursive
+  # DeinitPlan tree just to answer contains_key.
+  var plan_keys: Set[String] = Set::new()
+  var deinit_instances: Set[Int] = Set::new()
+  for (pkey, dp) in mir.deinit_plans do
+    plan_keys.insert(pkey.clone())
     match mir_plan_key_named_owner(pkey.clone())
     when Option::Some(otid) then
-      let bare = "Named#" + otid.to_string()
-      if !plans.contains_key(bare.clone()) then
-        plans.insert(bare, DeinitPlan::Trivial)
-      end
+      plan_keys.insert("Named#" + otid.to_string())
     when Option::None then ()
     end
+    collect_deinit_plan_instances(&dp, &mut deinit_instances)
   end
  # (the needs_drop split): the engine snapshot env carried on the
   # program — the Copy verifier's canonical TypeProperties queries
@@ -39670,13 +39665,13 @@ pub def verify_mir(mir: MirProgram) -> Vec[String]
     match td.kind
     when MirTypeDefKind::Struct(fields) then
       for f in fields do
-        verifier_check_type_concreteness(&plans, &type_index, &pnames, Option::None, &td_what, &f.ty, td_allow_param, &mut errors)
+        verifier_check_type_concreteness(&plan_keys, &type_index, &pnames, Option::None, &td_what, &f.ty, td_allow_param, &mut errors)
       end
     when MirTypeDefKind::Enum(variants) then
       for v in variants do
         var vfi = 0
         while vfi < v.fields.len() do
-          verifier_check_type_concreteness(&plans, &type_index, &pnames, Option::None, &td_what, &v.fields[vfi], td_allow_param, &mut errors)
+          verifier_check_type_concreteness(&plan_keys, &type_index, &pnames, Option::None, &td_what, &v.fields[vfi], td_allow_param, &mut errors)
           vfi = vfi + 1
         end
       end
@@ -39690,10 +39685,10 @@ pub def verify_mir(mir: MirProgram) -> Vec[String]
   # rule.
   for st in mir.statics do
     let st_what = "static " + st.name.clone()
-    verifier_check_type_concreteness(&plans, &type_index, &pnames, Option::None, &st_what, &st.ty, false, &mut errors)
+    verifier_check_type_concreteness(&plan_keys, &type_index, &pnames, Option::None, &st_what, &st.ty, false, &mut errors)
     match st.init
     when Option::Some(op) then
-      verifier_check_static_embedded_types(&plans, &type_index, &pnames, &st_what, &op, &mut errors)
+      verifier_check_static_embedded_types(&plan_keys, &type_index, &pnames, &st_what, &op, &mut errors)
     when Option::None then ()
     end
   end
@@ -39702,15 +39697,11 @@ pub def verify_mir(mir: MirProgram) -> Vec[String]
   # / DeinitPlan::UserFinalizer, recursively) plus every generated drop-glue
   # function's identity (drop_glue_fns). A MirDeinit terminator may only
   # carry one of these (see verifier_check_callees).
-  var deinit_instances: Set[Int] = Set::new()
-  for (_, dp) in plans do
-    collect_deinit_plan_instances(&dp, &mut deinit_instances)
-  end
   var verifier_caches = verifier_new_caches()
   var func_idx = 0
   while func_idx < mir.functions.len() do
     let func = mir.functions[func_idx]
-    verify_function_v2(&type_index, &plans, &fn_names, &deinit_instances, &mir.drop_glue_fns, &pnames, func, &fn_effects, &fn_effects_closure, &mut engine_env, &mut errors, verifier_caches)
+    verify_function_v2(&type_index, &plan_keys, &fn_names, &deinit_instances, &mir.drop_glue_fns, &pnames, func, &fn_effects, &fn_effects_closure, &mut engine_env, &mut errors, verifier_caches)
     func_idx = func_idx + 1
   end
   # (fourth-audit P0-7) the persistent-origin invariant: enforced on a
@@ -41711,7 +41702,7 @@ end
 # placeholder; any other id must key either the semantic deinit-plan table
 # or a MirTypeDef (cross-universe ids are the exact bug class FIX 1
 # removes).
-def verifier_check_type_concreteness(plans: Map[String, DeinitPlan], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], what: String, ty: Type, allow_param: Bool, inout errors: Vec[String]) -> Unit
+def verifier_check_type_concreteness(plan_keys: Set[String], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], what: String, ty: Type, allow_param: Bool, inout errors: Vec[String]) -> Unit
   match ty
   when Type::Var(_) then
     errors.push(what.clone() + ": Type::Var reaches concrete MIR")
@@ -41770,7 +41761,7 @@ def verifier_check_type_concreteness(plans: Map[String, DeinitPlan], type_index:
       verifier_check_binder_membership(scope, what, "Type::FixedArraySym size parameter", gpid, param_names, errors)
     end
     for child in type_payload_children(ty) do
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, what, &child, allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, what, &child, allow_param, errors)
     end
   when Type::Const(_) then
     # (§20 slice 1): a const generic ARGUMENT (an integer constant in an
@@ -41786,10 +41777,7 @@ def verifier_check_type_concreteness(plans: Map[String, DeinitPlan], type_index:
       # (TypeId, substs) identity (mir_type_identity_key) — the concrete
       # cache holds an entry for every concrete type in the MIR (the
       # pre-population walk) and a DEFERRED entry for Param-carrying shapes.
-      let has_plan = match plans.get(mir_type_identity_key(ty))
-      when Option::Some(_) then true
-      when Option::None then false
-      end
+      let has_plan = plan_keys.contains(&mir_type_identity_key(ty))
       let has_def = match type_index.get(tid.id)
       when Option::Some(_) then true
       when Option::None then false
@@ -41799,15 +41787,15 @@ def verifier_check_type_concreteness(plans: Map[String, DeinitPlan], type_index:
       end
     end
     for child in type_payload_children(ty) do
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, what, &child, allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, what, &child, allow_param, errors)
     end
   when Type::FnPtr(_, _, _) then
     for child in type_payload_children(ty) do
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, what, &child, allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, what, &child, allow_param, errors)
     end
   when Type::Closure(_, _, _, _, _) then
     for child in type_payload_children(ty) do
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, what, &child, allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, what, &child, allow_param, errors)
     end
   # (FINDING 13): the payload-bearing wrappers below recurse the shared
   # type_payload_children table (Adt and FixedArraySym above keep their
@@ -41818,24 +41806,24 @@ def verifier_check_type_concreteness(plans: Map[String, DeinitPlan], type_index:
   # visited set and the error accumulation order are unchanged.
   when Type::RefInternal(_, _) then
     for child in type_payload_children(ty) do
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, what, &child, allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, what, &child, allow_param, errors)
     end
   when Type::Ptr(_) then
     for child in type_payload_children(ty) do
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, what, &child, allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, what, &child, allow_param, errors)
     end
   when Type::PtrMut(_) then
     for child in type_payload_children(ty) do
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, what, &child, allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, what, &child, allow_param, errors)
     end
   when Type::Dyn(_) then ()
   when Type::Effect(_, _) then
     for child in type_payload_children(ty) do
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, what, &child, allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, what, &child, allow_param, errors)
     end
   when Type::Tuple(_) then
     for child in type_payload_children(ty) do
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, what, &child, allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, what, &child, allow_param, errors)
     end
   when _ then ()
   end  end
@@ -41865,7 +41853,7 @@ end
 # specialized instance is concrete and carries none (allow_param mirrors
 # the signature concreteness — a generic template's body may legitimately
 # carry its own Params, which monomorphization substitutes out).
-def verifier_check_embedded_types(plans: Map[String, DeinitPlan], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], func: MirFunction, allow_param: Bool, inout errors: Vec[String]) -> Unit
+def verifier_check_embedded_types(plan_keys: Set[String], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], func: MirFunction, allow_param: Bool, inout errors: Vec[String]) -> Unit
   let fn_ctx = "fn " + func.name.clone()
   var bi = 0
   while bi < func.blocks.len() do
@@ -41874,32 +41862,32 @@ def verifier_check_embedded_types(plans: Map[String, DeinitPlan], type_index: Ma
     for st in block.statements do
       match st.kind
       when MirStatementKind::MirAssign(place, rvalue) then
-        verifier_check_place_embedded_types(plans, type_index, param_names, scope, &bb_ctx, &place, allow_param, errors)
-        verifier_check_rvalue_embedded_types(plans, type_index, param_names, scope, func, &bb_ctx, rvalue, allow_param, errors)
+        verifier_check_place_embedded_types(plan_keys, type_index, param_names, scope, &bb_ctx, &place, allow_param, errors)
+        verifier_check_rvalue_embedded_types(plan_keys, type_index, param_names, scope, func, &bb_ctx, rvalue, allow_param, errors)
       when _ then ()
       end
     end
     match block.terminator.kind
     when MirTerminatorKind::MirCall { dest, func: callee, args, success, unwind, intrinsic, tail: _ } then
-      verifier_check_place_embedded_types(plans, type_index, param_names, scope, &bb_ctx, &dest, allow_param, errors)
-      verifier_check_operand_embedded_types(plans, type_index, param_names, scope, func, &bb_ctx, callee, allow_param, errors)
+      verifier_check_place_embedded_types(plan_keys, type_index, param_names, scope, &bb_ctx, &dest, allow_param, errors)
+      verifier_check_operand_embedded_types(plan_keys, type_index, param_names, scope, func, &bb_ctx, callee, allow_param, errors)
       for arg in args do
         match arg.value
-        when MirCallValue::Value(op) then verifier_check_operand_embedded_types(plans, type_index, param_names, scope, func, &bb_ctx, &op, allow_param, errors)
-        when MirCallValue::Place(pl) then verifier_check_place_embedded_types(plans, type_index, param_names, scope, &bb_ctx, &pl, allow_param, errors)
+        when MirCallValue::Value(op) then verifier_check_operand_embedded_types(plan_keys, type_index, param_names, scope, func, &bb_ctx, &op, allow_param, errors)
+        when MirCallValue::Place(pl) then verifier_check_place_embedded_types(plan_keys, type_index, param_names, scope, &bb_ctx, &pl, allow_param, errors)
         end
       end
     when MirTerminatorKind::MirSwitchInt(op, targets, default_target) then
-      verifier_check_operand_embedded_types(plans, type_index, param_names, scope, func, &bb_ctx, &op, allow_param, errors)
+      verifier_check_operand_embedded_types(plan_keys, type_index, param_names, scope, func, &bb_ctx, &op, allow_param, errors)
     when MirTerminatorKind::MirAssert { cond, expected, msg, target, unwind } then
-      verifier_check_operand_embedded_types(plans, type_index, param_names, scope, func, &bb_ctx, &cond, allow_param, errors)
+      verifier_check_operand_embedded_types(plan_keys, type_index, param_names, scope, func, &bb_ctx, &cond, allow_param, errors)
     when MirTerminatorKind::MirDeinit { place, deinit_fn, target, unwind } then
  # (deinit instances): the destroyed place's projection owners are
       # checked like every other place (the local's own type is covered by
       # the signature/locals walk); the deinit INSTANCE is a semantic
       # identity checked by verifier_check_callees (it must be a registered
       # finalizer identity or a generated drop-glue function).
-      verifier_check_place_embedded_types(plans, type_index, param_names, scope, &bb_ctx, &place, allow_param, errors)
+      verifier_check_place_embedded_types(plan_keys, type_index, param_names, scope, &bb_ctx, &place, allow_param, errors)
     when _ then ()
     end
     bi = bi + 1
@@ -41911,15 +41899,15 @@ end
 # Adt concreteness check applies to type occurrences (id 0 is the documented
 # generic-struct-field placeholder; any other id must key the semantic
 # deinit-plan table or a MirTypeDef).
-def verifier_check_place_embedded_types(plans: Map[String, DeinitPlan], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], ctx: String, place: Place, allow_param: Bool, inout errors: Vec[String]) -> Unit
+def verifier_check_place_embedded_types(plan_keys: Set[String], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], ctx: String, place: Place, allow_param: Bool, inout errors: Vec[String]) -> Unit
   for proj in place.projections do
     match proj
     when Projection::Field(fid) then
       let owner_what = ctx.clone() + " FieldId projection owner TypeId " + fid.owner.id.to_string()
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, &owner_what, &Type::Adt(fid.owner.clone(), Vec::new()), allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, &owner_what, &Type::Adt(fid.owner.clone(), Vec::new()), allow_param, errors)
     when Projection::Variant(vid) then
       let owner_what = ctx.clone() + " VariantId projection owner TypeId " + vid.owner.id.to_string()
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, &owner_what, &Type::Adt(vid.owner.clone(), Vec::new()), allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, &owner_what, &Type::Adt(vid.owner.clone(), Vec::new()), allow_param, errors)
     when _ then ()
     end
   end
@@ -42005,41 +41993,41 @@ def mir_function_is_generic(func: MirFunction) -> Bool
   !func.generic_params.is_empty()
 end
 
-def verifier_check_rvalue_embedded_types(plans: Map[String, DeinitPlan], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], func: MirFunction, ctx: String, rvalue: MirRvalue, allow_param: Bool, inout errors: Vec[String]) -> Unit
+def verifier_check_rvalue_embedded_types(plan_keys: Set[String], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], func: MirFunction, ctx: String, rvalue: MirRvalue, allow_param: Bool, inout errors: Vec[String]) -> Unit
   match rvalue.kind
   when MirRvalueKind::MirMove(operand) then
-    verifier_check_operand_embedded_types(plans, type_index, param_names, scope, func, ctx, &operand, allow_param, errors)
+    verifier_check_operand_embedded_types(plan_keys, type_index, param_names, scope, func, ctx, &operand, allow_param, errors)
   when MirRvalueKind::MirRef(place) then
-    verifier_check_place_embedded_types(plans, type_index, param_names, scope, ctx, &place, allow_param, errors)
+    verifier_check_place_embedded_types(plan_keys, type_index, param_names, scope, ctx, &place, allow_param, errors)
   when MirRvalueKind::MirDiscriminant(place) then
-    verifier_check_place_embedded_types(plans, type_index, param_names, scope, ctx, &place, allow_param, errors)
+    verifier_check_place_embedded_types(plan_keys, type_index, param_names, scope, ctx, &place, allow_param, errors)
   when MirRvalueKind::MirLen(place) then
-    verifier_check_place_embedded_types(plans, type_index, param_names, scope, ctx, &place, allow_param, errors)
+    verifier_check_place_embedded_types(plan_keys, type_index, param_names, scope, ctx, &place, allow_param, errors)
   when MirRvalueKind::MirBinOp(_, lhs, rhs) then
-    verifier_check_operand_embedded_types(plans, type_index, param_names, scope, func, ctx, &lhs, allow_param, errors)
-    verifier_check_operand_embedded_types(plans, type_index, param_names, scope, func, ctx, &rhs, allow_param, errors)
+    verifier_check_operand_embedded_types(plan_keys, type_index, param_names, scope, func, ctx, &lhs, allow_param, errors)
+    verifier_check_operand_embedded_types(plan_keys, type_index, param_names, scope, func, ctx, &rhs, allow_param, errors)
   when MirRvalueKind::MirUnOp(_, operand) then
-    verifier_check_operand_embedded_types(plans, type_index, param_names, scope, func, ctx, &operand, allow_param, errors)
+    verifier_check_operand_embedded_types(plan_keys, type_index, param_names, scope, func, ctx, &operand, allow_param, errors)
   when MirRvalueKind::MirCast(_, operand, ty) then
-    verifier_check_operand_embedded_types(plans, type_index, param_names, scope, func, ctx, &operand, allow_param, errors)
+    verifier_check_operand_embedded_types(plan_keys, type_index, param_names, scope, func, ctx, &operand, allow_param, errors)
     let cast_what = ctx.clone() + " cast target"
-    verifier_check_type_concreteness(plans, type_index, param_names, scope, &cast_what, &ty, allow_param, errors)
+    verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, &cast_what, &ty, allow_param, errors)
   when MirRvalueKind::MirRepeat(operand, count) then
-    verifier_check_operand_embedded_types(plans, type_index, param_names, scope, func, ctx, &operand, allow_param, errors)
+    verifier_check_operand_embedded_types(plan_keys, type_index, param_names, scope, func, ctx, &operand, allow_param, errors)
     # The count operand is a constant (a MirInt literal or the SYMBOLIC
     # MirConstParamValue placeholder in a generic body) — its embedded type
     # is the constant's scalar type, checked like any constant. Its
     # const-parameter VALUE channel is reported by verifier_check_repeat_count
     # (the count-specific gate), so the walk skips that channel here.
-    verifier_check_count_operand_embedded_types(plans, type_index, param_names, scope, func, ctx, &count, allow_param, errors)
+    verifier_check_count_operand_embedded_types(plan_keys, type_index, param_names, scope, func, ctx, &count, allow_param, errors)
   when MirRvalueKind::MirAggregate(kind, operands) then
     match kind
     when AggregateKind::MirArray(arr_ty) then
       let arr_what = ctx.clone() + " array aggregate element type"
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, &arr_what, &arr_ty, allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, &arr_what, &arr_ty, allow_param, errors)
     when AggregateKind::Struct(tid, _) then
       let st_what = ctx.clone() + " struct aggregate type"
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, &st_what, &Type::Adt(tid.clone(), Vec::new()), allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, &st_what, &Type::Adt(tid.clone(), Vec::new()), allow_param, errors)
     when AggregateKind::Closure(_) then
  # (ClosureId-keyed aggregate): the closure aggregate's type is
       # registered by its ClosureId — there is no Adt def to check; the
@@ -42047,11 +42035,11 @@ def verifier_check_rvalue_embedded_types(plans: Map[String, DeinitPlan], type_in
       ()
     when AggregateKind::Generator(gid) then
       let gen_what = ctx.clone() + " generator aggregate type"
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, &gen_what, &Type::Adt(gid.clone(), Vec::new()), allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, &gen_what, &Type::Adt(gid.clone(), Vec::new()), allow_param, errors)
     when AggregateKind::Tuple then ()
     end
     for op in operands do
-      verifier_check_operand_embedded_types(plans, type_index, param_names, scope, func, ctx, &op, allow_param, errors)
+      verifier_check_operand_embedded_types(plan_keys, type_index, param_names, scope, func, ctx, &op, allow_param, errors)
     end
   when _ then ()
   end  end
@@ -42059,25 +42047,25 @@ end
 
 # The operand embedded-types walk (the public entry: the const-parameter
 # VALUE channel is checked here — see the impl's MirConstParamValue arm).
-def verifier_check_operand_embedded_types(plans: Map[String, DeinitPlan], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], func: MirFunction, ctx: String, op: MirOperand, allow_param: Bool, inout errors: Vec[String]) -> Unit
-  verifier_check_operand_embedded_types_impl(plans, type_index, param_names, scope, func, ctx, op, allow_param, true, errors)
+def verifier_check_operand_embedded_types(plan_keys: Set[String], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], func: MirFunction, ctx: String, op: MirOperand, allow_param: Bool, inout errors: Vec[String]) -> Unit
+  verifier_check_operand_embedded_types_impl(plan_keys, type_index, param_names, scope, func, ctx, op, allow_param, true, errors)
 end
 
 # The repeat-count operand's walk: everything except the const-parameter
 # VALUE channel, whose declared-binder membership is owned by
 # verifier_check_repeat_count (its diagnostic names the count position) —
 # this keeps one report per violation.
-def verifier_check_count_operand_embedded_types(plans: Map[String, DeinitPlan], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], func: MirFunction, ctx: String, op: MirOperand, allow_param: Bool, inout errors: Vec[String]) -> Unit
-  verifier_check_operand_embedded_types_impl(plans, type_index, param_names, scope, func, ctx, op, allow_param, false, errors)
+def verifier_check_count_operand_embedded_types(plan_keys: Set[String], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], func: MirFunction, ctx: String, op: MirOperand, allow_param: Bool, inout errors: Vec[String]) -> Unit
+  verifier_check_operand_embedded_types_impl(plan_keys, type_index, param_names, scope, func, ctx, op, allow_param, false, errors)
 end
 
-def verifier_check_operand_embedded_types_impl(plans: Map[String, DeinitPlan], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], func: MirFunction, ctx: String, op: MirOperand, allow_param: Bool, value_channel: Bool, inout errors: Vec[String]) -> Unit
+def verifier_check_operand_embedded_types_impl(plan_keys: Set[String], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], scope: Option[VerifierBinderScope], func: MirFunction, ctx: String, op: MirOperand, allow_param: Bool, value_channel: Bool, inout errors: Vec[String]) -> Unit
   match op.kind
   when MirOperandKind::MirConstant(cst) then
     # Every MirConstant carries its type: the MirFnItem signature types
     # (Type::Closure/FnPtr), the value types of the primitive constants.
     let cst_what = ctx.clone() + " constant type"
-    verifier_check_type_concreteness(plans, type_index, param_names, scope, &cst_what, &cst.ty, allow_param, errors)
+    verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, &cst_what, &cst.ty, allow_param, errors)
     # (the type-query placeholder): the payload type argument must be
     # concrete under the SAME template posture — a still-generic body
     # legitimately carries the enclosing declaration's Param (substituted
@@ -42087,7 +42075,7 @@ def verifier_check_operand_embedded_types_impl(plans: Map[String, DeinitPlan], t
     match cst.kind
     when MirConstantKind::MirTypeQuery(qkind, qarg) then
       let q_what = ctx.clone() + " type query `" + type_query_kind_name(qkind) + "` type argument"
-      verifier_check_type_concreteness(plans, type_index, param_names, scope, &q_what, &qarg, allow_param, errors)
+      verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, &q_what, &qarg, allow_param, errors)
     when MirConstantKind::MirConstParamValue(cpv) then
       # (the const-parameter VALUE channel): a MirConstParamValue constant
       # is a value READ of a const generic parameter. In the template
@@ -42112,19 +42100,19 @@ def verifier_check_operand_embedded_types_impl(plans: Map[String, DeinitPlan], t
       var si = 0
       while si < inst.args.len() do
         let subst_what = ctx.clone() + " instance substitution " + si.to_string()
-        verifier_check_type_concreteness(plans, type_index, param_names, scope, &subst_what, &generic_arg_type_view(inst.args[si].clone()), allow_param, errors)
+        verifier_check_type_concreteness(plan_keys, type_index, param_names, scope, &subst_what, &generic_arg_type_view(inst.args[si].clone()), allow_param, errors)
         si = si + 1
       end
     when Option::None then ()
     end
   when MirOperandKind::MirCopy(place) then
-    verifier_check_place_embedded_types(plans, type_index, param_names, scope, ctx, &place, allow_param, errors)
+    verifier_check_place_embedded_types(plan_keys, type_index, param_names, scope, ctx, &place, allow_param, errors)
   when MirOperandKind::MirMovePlace(place) then
-    verifier_check_place_embedded_types(plans, type_index, param_names, scope, ctx, &place, allow_param, errors)
+    verifier_check_place_embedded_types(plan_keys, type_index, param_names, scope, ctx, &place, allow_param, errors)
   when MirOperandKind::MirRead(place) then
-    verifier_check_place_embedded_types(plans, type_index, param_names, scope, ctx, &place, allow_param, errors)
+    verifier_check_place_embedded_types(plan_keys, type_index, param_names, scope, ctx, &place, allow_param, errors)
   when MirOperandKind::MirConsume(place) then
-    verifier_check_place_embedded_types(plans, type_index, param_names, scope, ctx, &place, allow_param, errors)
+    verifier_check_place_embedded_types(plan_keys, type_index, param_names, scope, ctx, &place, allow_param, errors)
   end  end
 end
 
@@ -42132,17 +42120,17 @@ end
 # operand — constant types and InstanceId substitutions, under the same
 # documented concreteness rule (a static is never a generic template, so
 # allow_param is always false).
-def verifier_check_static_embedded_types(plans: Map[String, DeinitPlan], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], ctx: String, op: MirOperand, inout errors: Vec[String]) -> Unit
+def verifier_check_static_embedded_types(plan_keys: Set[String], type_index: Map[Int, MirTypeDef], param_names: Map[Int, String], ctx: String, op: MirOperand, inout errors: Vec[String]) -> Unit
   match op.kind
   when MirOperandKind::MirConstant(cst) then
     let cst_what = ctx.clone() + " static init constant type"
-    verifier_check_type_concreteness(plans, type_index, param_names, Option::None, &cst_what, &cst.ty, false, errors)
+    verifier_check_type_concreteness(plan_keys, type_index, param_names, Option::None, &cst_what, &cst.ty, false, errors)
     match cst.instance
     when Option::Some(inst) then
       var si = 0
       while si < inst.args.len() do
         let subst_what = ctx.clone() + " static init instance substitution " + si.to_string()
-        verifier_check_type_concreteness(plans, type_index, param_names, Option::None, &subst_what, &generic_arg_type_view(inst.args[si].clone()), false, errors)
+        verifier_check_type_concreteness(plan_keys, type_index, param_names, Option::None, &subst_what, &generic_arg_type_view(inst.args[si].clone()), false, errors)
         si = si + 1
       end
     when Option::None then ()
@@ -44596,7 +44584,7 @@ def verifier_call_receiver_is_param(type_index: Map[Int, MirTypeDef], inout alia
 end
 
 # Top-level per-function verification driver.
-def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, DeinitPlan], fn_names: Set[String], deinit_instances: Set[Int], drop_glue_fns: Map[Int, String], param_names: Map[Int, String], func_in: MirFunction, fn_effects: Map[String, Vec[EffectId]], fn_effects_closure: Map[String, Vec[EffectId]], inout engine_env: TypeEnv, inout errors: Vec[String], inout caches: VerifierCaches) -> Unit
+def verify_function_v2(type_index: Map[Int, MirTypeDef], plan_keys: Set[String], fn_names: Set[String], deinit_instances: Set[Int], drop_glue_fns: Map[Int, String], param_names: Map[Int, String], func_in: MirFunction, fn_effects: Map[String, Vec[EffectId]], fn_effects_closure: Map[String, Vec[EffectId]], inout engine_env: TypeEnv, inout errors: Vec[String], inout caches: VerifierCaches) -> Unit
  # (generic-template posture — the canonical binder identity): a function
   # declaring generic binders is a template. Its declared binders are the
   # canonical ones; every observed spelling of the same declared name
@@ -44734,19 +44722,19 @@ def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, Dein
     let p_ty = p.ty.clone()
     if verifier_type_has_param(&p_ty) then sig_has_param = true end
     let p_what = fn_ctx.clone() + " param _" + p.id.id.to_string()
-    verifier_check_type_concreteness(plans, type_index, param_names, func_scope, &p_what, &p_ty, true, errors)
+    verifier_check_type_concreteness(plan_keys, type_index, param_names, func_scope, &p_what, &p_ty, true, errors)
     cpi = cpi + 1
   end
   let ret_ty = func.ret_type.clone()
   if verifier_type_has_param(&ret_ty) then sig_has_param = true end
   let ret_what = fn_ctx.clone() + " return type"
-  verifier_check_type_concreteness(plans, type_index, param_names, func_scope, &ret_what, &ret_ty, true, errors)
+  verifier_check_type_concreteness(plan_keys, type_index, param_names, func_scope, &ret_what, &ret_ty, true, errors)
   let template_posture = sig_has_param || !func.generic_params.is_empty()
   var li = 0
   while li < func.locals.len() do
     let local = func.locals[li]
     let local_what = fn_ctx.clone() + " local _" + local.id.id.to_string()
-    verifier_check_type_concreteness(plans, type_index, param_names, func_scope, &local_what, &local.ty, template_posture, errors)
+    verifier_check_type_concreteness(plan_keys, type_index, param_names, func_scope, &local_what, &local.ty, template_posture, errors)
     li = li + 1
   end
 
@@ -44755,7 +44743,7 @@ def verify_function_v2(type_index: Map[Int, MirTypeDef], plans: Map[String, Dein
   # aggregate element types including closure/generator payloads, call
   # signatures, deinit/drop instance payloads, projection owners) must be
   # free of Param/Var/Error under the same signature concreteness rule.
-  verifier_check_embedded_types(plans, type_index, param_names, func_scope, func, template_posture, errors)
+  verifier_check_embedded_types(plan_keys, type_index, param_names, func_scope, func, template_posture, errors)
 
  # every callee must resolve to a lowered function or a known
   # intrinsic;: every MirDeinit instance must be a registered finalizer
