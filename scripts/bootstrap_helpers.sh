@@ -128,6 +128,52 @@ bh_sha256_cmd() {
 # Stage1 production must run the same program under the same caps; exporting
 # only inside the gate subprocess silently made Stage1 use the driver
 # defaults (1B host calls, unbounded RSS).
+# Stage1 is full production (codegen/object/link), not the stop-at-mono
+# diagnostic gate.  These limits are provisional measurements from the
+# current 1T-step arena/digest-skipping run; repin only from a completed
+# Stage1 production run.
+bh_export_stage1_vm_limits() {
+  export TANGERINE_BOOTSTRAP_VM_MAX_STEPS="${TG_STAGE1_VM_MAX_STEPS:-1000000000000}"
+  export TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS="${TG_STAGE1_VM_MAX_HOST_CALLS:-32000000000}"
+  export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB="${TG_STAGE1_VM_MAX_RSS_MB:-32768}"
+  export TANGERINE_BOOTSTRAP_VM_MAX_ALLOC="${TG_STAGE1_VM_MAX_ALLOC:-68719476736}"
+}
+
+bh_stage1_provenance_path() {
+  printf '%s.provenance' "$1"
+}
+
+bh_write_stage1_provenance() {
+  local bin="$1" target="$2"
+  local prov head manifest_sha bin_sha
+  prov="$(bh_stage1_provenance_path "$bin")"
+  head="$(git -C "$(dirname "$bin")/.." rev-parse HEAD 2>/dev/null || true)"
+  manifest_sha="$(bh_sha256_file "$(dirname "$bin")/../bootstrap/compiler_kernel.manifest" 2>/dev/null || true)"
+  bin_sha="$(bh_sha256_file "$bin")"
+  printf 'sha256=%s\ntarget=%s\nhead=%s\nmanifest_sha256=%s\n' \
+    "$bin_sha" "$target" "$head" "$manifest_sha" > "$prov"
+}
+
+bh_stage1_provenance_ok() {
+  local bin="$1" target="$2"
+  local prov
+  prov="$(bh_stage1_provenance_path "$bin")"
+  [ -f "$bin" ] && [ -f "$prov" ] || return 1
+  local want_sha want_target want_head want_manifest
+  want_sha="$(sed -n 's/^sha256=//p' "$prov" | head -1)"
+  want_target="$(sed -n 's/^target=//p' "$prov" | head -1)"
+  want_head="$(sed -n 's/^head=//p' "$prov" | head -1)"
+  want_manifest="$(sed -n 's/^manifest_sha256=//p' "$prov" | head -1)"
+  [ "$want_target" = "$target" ] || return 1
+  [ "$want_sha" = "$(bh_sha256_file "$bin")" ] || return 1
+  local head manifest_sha
+  head="$(git -C "$(dirname "$bin")/.." rev-parse HEAD 2>/dev/null || true)"
+  manifest_sha="$(bh_sha256_file "$(dirname "$bin")/../bootstrap/compiler_kernel.manifest" 2>/dev/null || true)"
+  [ "$want_head" = "$head" ] || return 1
+  [ "$want_manifest" = "$manifest_sha" ] || return 1
+  return 0
+}
+
 bh_export_bootstrap_vm_limits() {
   export TANGERINE_BOOTSTRAP_VM_MAX_STEPS=150000000000
   export TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS=8000000000

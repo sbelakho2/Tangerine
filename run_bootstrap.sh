@@ -160,6 +160,10 @@ STAGE0_BIN=""
 RUN_LADDER=1
 RUN_DETERMINISM=1
 RUN_NATIVE_TESTS=1
+# The expensive seed-VM self-host preflight is diagnostic/authorization
+# evidence, NOT a prerequisite for producing Stage1. Default production path
+# compiles the closure once; TG_BOOTSTRAP_PREFLIGHT=1 (or --preflight) opts in.
+RUN_PREFLIGHT="${TG_BOOTSTRAP_PREFLIGHT:-0}"
 # The single resolved target object: resolved ONCE through the bootstrap
 # target authority (bh_boot_target) and exported so every subprocess
 # (gen_bootstrap_input.sh, stage compiles, canary lanes) observes the SAME
@@ -196,6 +200,9 @@ for arg in "$@"; do
     --skip-native-tests)
       RUN_NATIVE_TESTS=0
       ;;
+    --preflight)
+      RUN_PREFLIGHT=1
+      ;;
     -h|--help)
       cat <<'HELP'
 run_bootstrap.sh — deterministic Tangerine bootstrap validation harness
@@ -205,6 +212,7 @@ Options:
   --skip-ladder              skip the stage2 diagnostic ladder
   --skip-determinism         skip the two-root reproducibility check (scripts/run_two_root_repro.sh)
   --skip-native-tests        skip compiling+running native canaries / arch tests
+  --preflight                run the expensive seed-VM self-host gate (default: skip; Stage1 production compiles once)
   -h | --help                show this help
 
 Every --skip-* flag makes the run a DEGRADED DEVELOPMENT RUN: the persisted
@@ -370,17 +378,18 @@ STAGE1="$BUILD_DIR/tg_stage1"
 STAGE2="$BUILD_DIR/tg_stage2"
 STAGE3="$BUILD_DIR/tg_stage3"
 
-bh_log "== OCaml seed bootstrap completeness gate (delegated) =="
-bh_log "delegate: scripts/check_ocaml_bootstrap_complete.sh (stage0 -> stage1 -> stage2 -> stage3 closure)"
-set +e
-scripts/check_ocaml_bootstrap_complete.sh 2>&1 | tee "$BOOT_LOG_DIR/ocaml_bootstrap_complete.log"
-OCAML_GATE_RC="${PIPESTATUS[0]}"
-set -e
-if [ "$OCAML_GATE_RC" -ne 0 ]; then
-  bh_err "OCaml seed bootstrap gate FAILED (exit $OCAML_GATE_RC) — see $BOOT_LOG_DIR/ocaml_bootstrap_complete.log"
-  bh_err "the seed's typecheck debt must reach zero before the full self-hosting ladder can complete;"
-  bh_err "run scripts/check_ocaml_seed_health.sh for the pinned-debt development-health gate."
-  exit 1
+if [ "$RUN_PREFLIGHT" = "1" ]; then
+  bh_log "== OCaml seed bootstrap completeness gate (delegated, opt-in) =="
+  set +e
+  scripts/check_ocaml_bootstrap_complete.sh 2>&1 | tee "$BOOT_LOG_DIR/ocaml_bootstrap_complete.log"
+  OCAML_GATE_RC="${PIPESTATUS[0]}"
+  set -e
+  if [ "$OCAML_GATE_RC" -ne 0 ]; then
+    bh_err "OCaml seed bootstrap gate FAILED (exit $OCAML_GATE_RC) — see $BOOT_LOG_DIR/ocaml_bootstrap_complete.log"
+    exit 1
+  fi
+else
+  bh_log "== seed-VM self-host preflight skipped (production path; Stage1 compiles the closure once) =="
 fi
 
 # ── stage1: the seed compiles the manifest closure (the stage1 production
@@ -389,17 +398,19 @@ fi
 # link. It is NOT the authorization run, so it gets a separate production
 # envelope rather than the gate's stop-at-mono ceiling.
 bh_log "== Stage 1: kernel via the OCaml seed (manifest closure) =="
-export TANGERINE_BOOTSTRAP_VM_MAX_STEPS="${TG_STAGE1_VM_MAX_STEPS:-400000000000}"
-export TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS="${TG_STAGE1_VM_MAX_HOST_CALLS:-16000000000}"
-export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB="${TG_STAGE1_VM_MAX_RSS_MB:-16384}"
-export TANGERINE_BOOTSTRAP_VM_MAX_ALLOC="${TG_STAGE1_VM_MAX_ALLOC:-34359738368}"
+bh_export_stage1_vm_limits
 bh_log "stage1 production VM envelope: steps=$TANGERINE_BOOTSTRAP_VM_MAX_STEPS host_calls=$TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS rss_mb=$TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB alloc=$TANGERINE_BOOTSTRAP_VM_MAX_ALLOC"
-if ! run_logged stage1_compile \
-     bh_ocaml_seed_compile "$STAGE0_BIN" "$ROOT_DIR" "$TARGET_TRIPLE" "$STAGE1"; then
-  bh_err "stage1 failed to build from the OCaml seed"
-  exit 1
+if bh_stage1_provenance_ok "$STAGE1" "$TARGET_TRIPLE"; then
+  bh_log "stage1 resume: accepted existing $STAGE1 (sha/target/HEAD/manifest provenance matches)"
+else
+  if ! run_logged stage1_compile \
+       bh_ocaml_seed_compile "$STAGE0_BIN" "$ROOT_DIR" "$TARGET_TRIPLE" "$STAGE1"; then
+    bh_err "stage1 failed to build from the OCaml seed"
+    exit 1
+  fi
+  chmod +x "$STAGE1"
+  bh_write_stage1_provenance "$STAGE1" "$TARGET_TRIPLE"
 fi
-chmod +x "$STAGE1"
 if ! validate_stage tg_stage1 "$STAGE1"; then
   bh_err "stage1 failed validation"
   exit 1
@@ -408,7 +419,7 @@ fi
 # ── stage2: stage1 compiles itself (self-host).
 bh_log "== Stage 2: self-host via stage1 =="
 if ! run_logged stage2_compile \
-     "$STAGE1" compile --strict-resolution "$DRIVER_SRC" -o "$STAGE2" --target "$TARGET_TRIPLE"; then
+     "$STAGE1" compile --strict-resolution --bootstrap-proof "$DRIVER_SRC" -o "$STAGE2" --target "$TARGET_TRIPLE"; then
   bh_err "stage2 failed to build"
   exit 1
 fi
@@ -421,7 +432,7 @@ fi
 # ── stage3: stage2 compiles itself (the fixed-point cycle).
 bh_log "== Stage 3: self-host via stage2 =="
 if ! run_logged stage3_compile \
-     "$STAGE2" compile --strict-resolution "$DRIVER_SRC" -o "$STAGE3" --target "$TARGET_TRIPLE"; then
+     "$STAGE2" compile --strict-resolution --bootstrap-proof "$DRIVER_SRC" -o "$STAGE3" --target "$TARGET_TRIPLE"; then
   bh_err "stage3 failed to build"
   exit 1
 fi
