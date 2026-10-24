@@ -207,7 +207,7 @@ bh_ocaml_seed_compile() {
     --repo-root "$root" \
     --manifest "$root/bootstrap/compiler_kernel.manifest" \
     --target "$target" \
-    -- compile --strict-resolution tg_compiler/bootstrap_main.tg \
+    -- compile --strict-resolution --bootstrap-proof tg_compiler/bootstrap_main.tg \
        -o "$out" --target "$target" || rc=$?
   if [ "$rc" -ne 0 ]; then
     bh_err "the OCaml seed failed to compile the bootstrap closure into $out (exit $rc)"
