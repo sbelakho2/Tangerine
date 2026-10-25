@@ -133,6 +133,9 @@ bh_sha256_cmd() {
 # current 1T-step arena/digest-skipping run; repin only from a completed
 # Stage1 production run.
 bh_export_stage1_vm_limits() {
+  # Same GC policy as the authorization/profile path: direct Stage1 runs
+  # without o=40 were observed sitting in a swap/GC storm at ~15-25% CPU.
+  export OCAMLRUNPARAM="${OCAMLRUNPARAM:-o=40}"
   export TANGERINE_BOOTSTRAP_VM_MAX_STEPS="${TG_STAGE1_VM_MAX_STEPS:-1000000000000}"
   export TANGERINE_BOOTSTRAP_VM_MAX_HOST_CALLS="${TG_STAGE1_VM_MAX_HOST_CALLS:-32000000000}"
   export TANGERINE_BOOTSTRAP_VM_MAX_RSS_MB="${TG_STAGE1_VM_MAX_RSS_MB:-32768}"
