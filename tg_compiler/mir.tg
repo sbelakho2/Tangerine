@@ -3876,6 +3876,36 @@ def ensure_deinit_plan_for_type(inout b: MirBuilder, ty: Type, inout visited: Se
   let _ = deinit_plan_for_type(b, ty, visited)
 end
 
+# A CHILD edge in a concrete deinit plan is symbolic, not a recursively
+# embedded copy of the child's whole plan. Each concrete non-trivial type
+# already owns exactly one generated drop-glue function, so a parent only
+# needs to call that function. This keeps the deinit graph a DAG:
+#
+#   parent direct shape -> Call(child glue) -> child direct shape
+#
+# rather than re-expanding the complete transitive child tree in every
+# ancestor glue. It is the existing recursion-by-symbol mechanism applied
+# to every concrete owning child edge.
+#
+# Template/deferred positions retain the structural answer because they
+# cannot own a concrete glue identity before substitution.
+def deinit_child_plan_for_type(inout b: MirBuilder, ty: Type, inout visited: Set[Int]) -> DeinitPlan
+  if mir_type_is_template_position(b, ty) then
+    return deinit_plan_for_type(b, ty, visited)
+  end
+  let props = type_properties_of(&mut b.engine_env, ty)
+  if props.is_deferred then
+    # Deferred shape: keep the structural marker; only concrete instances
+    # may own a glue identity.
+    return deinit_plan_for_type(b, ty, visited)
+  end
+  if !props.requires_drop_glue then
+    return DeinitPlan::Trivial
+  end
+  ensure_deinit_plan_for_type(b, ty, visited)
+  DeinitPlan::Call(mir_glue_instance_for_type(b, ty))
+end
+
 def deinit_plan_for_type_uncached(inout b: MirBuilder, ty: Type, inout visited: Set[Int]) -> DeinitPlan
  # (engine consumption — the needs_drop SPLIT): the drop-glue DECISION
   # comes from the types.tg engine on the CONCRETE type — type_properties_of
@@ -3905,7 +3935,7 @@ def deinit_plan_for_type_uncached(inout b: MirBuilder, ty: Type, inout visited: 
   when Type::FixedArray(elem, _) then
     # The fixed array stores its elements INLINE: the drop glue walks the n
     # elements (no heap backing to release).
-    DeinitPlan::Array(deinit_plan_for_type(b, &elem, visited))
+    DeinitPlan::Array(deinit_child_plan_for_type(b, &elem, visited))
   when Type::Adt(tid, args) then
  # Adt form of the builtin compound types (storage form).
     # Resolve the registered type name and mirror the canonical arms below;
@@ -3925,9 +3955,9 @@ def deinit_plan_for_type_uncached(inout b: MirBuilder, ty: Type, inout visited: 
     # nine builtins, which register in type_env_new).
     let li = b.engine_env.lang_items
     if li.option != -1 && tid.id == li.option && args.len() >= 1 then
-      DeinitPlan::Option(deinit_plan_for_type(b, &args[0], visited))
+      DeinitPlan::Option(deinit_child_plan_for_type(b, &args[0], visited))
     elsif li.result != -1 && tid.id == li.result && args.len() >= 2 then
-      DeinitPlan::Result(deinit_plan_for_type(b, &args[0], visited), deinit_plan_for_type(b, &args[1], visited))
+      DeinitPlan::Result(deinit_child_plan_for_type(b, &args[0], visited), deinit_child_plan_for_type(b, &args[1], visited))
     elsif li.slice != -1 && tid.id == li.slice then
       # UnsafeSlice[T] — the RAW view { ptr: Ptr[T], len: UInt } (the
       # LangItems slice id): owns=false, drop=none. A raw-view local needs
@@ -3947,11 +3977,11 @@ def deinit_plan_for_type_uncached(inout b: MirBuilder, ty: Type, inout visited: 
       # canonical collection plan; missing the vec id fell through to the
       # structural def walk, which saw Vec's {ptr,cap,len} fields and
       # emitted a destructor-free Aggregate plan (a silent element leak).
-      DeinitPlan::Array(deinit_plan_for_type(b, &args[0], visited))
+      DeinitPlan::Array(deinit_child_plan_for_type(b, &args[0], visited))
     elsif li.map != -1 && tid.id == li.map && args.len() >= 2 then
-      DeinitPlan::Map(deinit_plan_for_type(b, &args[0], visited), deinit_plan_for_type(b, &args[1], visited))
+      DeinitPlan::Map(deinit_child_plan_for_type(b, &args[0], visited), deinit_child_plan_for_type(b, &args[1], visited))
     elsif li.set != -1 && tid.id == li.set && args.len() >= 1 then
-      DeinitPlan::Set(deinit_plan_for_type(b, &args[0], visited))
+      DeinitPlan::Set(deinit_child_plan_for_type(b, &args[0], visited))
     elsif li.box_ != -1 && tid.id == li.box_ && args.len() >= 1 then
       # Canonical Box[T] delegates to the registered Drop impl (drop_in_place
       # on the pointee + dealloc) — the same release path as the std struct
@@ -3975,9 +4005,9 @@ def deinit_plan_for_type_uncached(inout b: MirBuilder, ty: Type, inout visited: 
       when Option::None then DeinitPlan::PlanLimit
       end
     elsif plan_named == "Option" && args.len() >= 1 then
-      DeinitPlan::Option(deinit_plan_for_type(b, &args[0], visited))
+      DeinitPlan::Option(deinit_child_plan_for_type(b, &args[0], visited))
     elsif plan_named == "Result" && args.len() >= 2 then
-      DeinitPlan::Result(deinit_plan_for_type(b, &args[0], visited), deinit_plan_for_type(b, &args[1], visited))
+      DeinitPlan::Result(deinit_child_plan_for_type(b, &args[0], visited), deinit_child_plan_for_type(b, &args[1], visited))
     elsif plan_named == "UnsafeSlice" then
       # UnsafeSlice[T] — the RAW view { ptr: Ptr[T], len: UInt }:
       # owns=false, drop=none (the id-selected arm above is the primary
@@ -3987,11 +4017,11 @@ def deinit_plan_for_type_uncached(inout b: MirBuilder, ty: Type, inout visited: 
       # owns the destruction.
       DeinitPlan::Trivial
     elsif (plan_named == "Array" || plan_named == "Vec") && args.len() >= 1 then
-      DeinitPlan::Array(deinit_plan_for_type(b, &args[0], visited))
+      DeinitPlan::Array(deinit_child_plan_for_type(b, &args[0], visited))
     elsif plan_named == "Map" && args.len() >= 2 then
-      DeinitPlan::Map(deinit_plan_for_type(b, &args[0], visited), deinit_plan_for_type(b, &args[1], visited))
+      DeinitPlan::Map(deinit_child_plan_for_type(b, &args[0], visited), deinit_child_plan_for_type(b, &args[1], visited))
     elsif plan_named == "Set" && args.len() >= 1 then
-      DeinitPlan::Set(deinit_plan_for_type(b, &args[0], visited))
+      DeinitPlan::Set(deinit_child_plan_for_type(b, &args[0], visited))
     elsif plan_named == "Box" && args.len() >= 1 then
       # The Adt Box form mirrors the canonical Box arm — the REGISTERED
       # Drop-impl CallableId of the Box type (never a name).
@@ -4122,7 +4152,7 @@ def deinit_plan_for_type_uncached(inout b: MirBuilder, ty: Type, inout visited: 
   when Type::Tuple(fields) then
     var plans = Vec::new()
     for f in fields do
-      plans.push(deinit_plan_for_type(b, &f, visited))
+      plans.push(deinit_child_plan_for_type(b, &f, visited))
     end
     DeinitPlan::Tuple(plans)
   when Type::Param(_) then
@@ -4166,7 +4196,7 @@ def mir_structural_plan(inout b: MirBuilder, td: MirTypeDef, args: Vec[Type], in
     var plans = Vec::new()
     for f in fields do
       let fty = subst_type_args(&f.ty, &td.generic_params, args)
-      plans.push(deinit_plan_for_type(b, &fty, visited))
+      plans.push(deinit_child_plan_for_type(b, &fty, visited))
     end
     DeinitPlan::Aggregate(plans)
   when MirTypeDefKind::Enum(variants) then
@@ -4183,7 +4213,7 @@ def mir_structural_plan(inout b: MirBuilder, td: MirTypeDef, args: Vec[Type], in
       var vi = 0
       while vi < v.fields.len() do
         let vty = subst_type_args(&v.fields[vi], &td.generic_params, args)
-        vplans.push(deinit_plan_for_type(b, &vty, visited))
+        vplans.push(deinit_child_plan_for_type(b, &vty, visited))
         vi = vi + 1
       end
       vmap.insert(v.discriminant, (VariantId { owner: td.id, index: variant_idx as UInt }, vplans))
@@ -4202,17 +4232,17 @@ end
 def mir_named_container_plan(inout b: MirBuilder, td: MirTypeDef, args: Vec[Type], inout visited: Set[Int]) -> DeinitPlan
   let li = b.engine_env.lang_items
   if ((li.option != -1 && td.id.id == li.option) || (li.option == -1 && td.name == "Option")) && args.len() >= 1 then
-    DeinitPlan::Option(deinit_plan_for_type(b, &args[0], visited))
+    DeinitPlan::Option(deinit_child_plan_for_type(b, &args[0], visited))
   elsif ((li.result != -1 && td.id.id == li.result) || (li.result == -1 && td.name == "Result")) && args.len() >= 2 then
-    DeinitPlan::Result(deinit_plan_for_type(b, &args[0], visited), deinit_plan_for_type(b, &args[1], visited))
+    DeinitPlan::Result(deinit_child_plan_for_type(b, &args[0], visited), deinit_child_plan_for_type(b, &args[1], visited))
   elsif ((li.vec != -1 && td.id.id == li.vec) || (li.array != -1 && td.id.id == li.array)) && args.len() >= 1 then
-    DeinitPlan::Array(deinit_plan_for_type(b, &args[0], visited))
+    DeinitPlan::Array(deinit_child_plan_for_type(b, &args[0], visited))
   elsif (li.vec == -1 && li.array == -1) && (td.name == "Array" || td.name == "Vec") && args.len() >= 1 then
-    DeinitPlan::Array(deinit_plan_for_type(b, &args[0], visited))
+    DeinitPlan::Array(deinit_child_plan_for_type(b, &args[0], visited))
   elsif ((li.map != -1 && td.id.id == li.map) || (li.map == -1 && td.name == "Map")) && args.len() >= 2 then
-    DeinitPlan::Map(deinit_plan_for_type(b, &args[0], visited), deinit_plan_for_type(b, &args[1], visited))
+    DeinitPlan::Map(deinit_child_plan_for_type(b, &args[0], visited), deinit_child_plan_for_type(b, &args[1], visited))
   elsif ((li.set != -1 && td.id.id == li.set) || (li.set == -1 && td.name == "Set")) && args.len() >= 1 then
-    DeinitPlan::Set(deinit_plan_for_type(b, &args[0], visited))
+    DeinitPlan::Set(deinit_child_plan_for_type(b, &args[0], visited))
   else
     DeinitPlan::Trivial
   end
@@ -4377,7 +4407,7 @@ end
 # partial-drop sites (MirCall terminators to the glue label with a constant
 # mask) pass the live-field mask, and the walk (emit_plan_deinit's
 # mask_local mode) drops exactly the initialized fields.
-def mir_build_drop_glue_for_type(inout b: MirBuilder, ty: Type) -> Unit
+def mir_build_drop_glue_for_type(inout b: MirBuilder, inout result: MirProgram, ty: Type) -> Unit
   let key = mir_type_identity_key(ty)
   match b.drop_glue_names.get(key)
   when Option::None then ()
@@ -4420,7 +4450,7 @@ def mir_build_drop_glue_for_type(inout b: MirBuilder, ty: Type) -> Unit
     switch_to_block(b, MirBlockId { id: 0 })
     set_terminator(b, MirTerminatorKind::MirGoto(chain_entry), span)
     match finish_function(b)
-    when Option::Some(f) then b.drop_glue_functions.push(f)
+    when Option::Some(f) then result.functions.push(f)
     when Option::None then ()
     end
   end
@@ -4436,16 +4466,16 @@ def mir_build_all_drop_glues(inout b: MirBuilder, inout result: MirProgram) -> U
   # `b.drop_glue_types[ti]` per iteration is a projected move-out of an
   # element from a root the loop still passes `inout` (the element copy the
   # old `&b.drop_glue_types[ti]` argument made is preserved by the snapshot).
-  let glue_types = b.drop_glue_types.clone()
   var ti = 0
-  while ti < glue_types.len() do
-    mir_build_drop_glue_for_type(b, &glue_types[ti])
+  while ti < b.drop_glue_types.len() do
+    # Clone ONE type, not the whole pending vector: building a symbolic
+    # child Call may append newly discovered concrete glue types.
+    let glue_ty = b.drop_glue_types[ti].clone()
+    mir_build_drop_glue_for_type(b, result, glue_ty)
     ti = ti + 1
-  end
-  var gi = 0
-  while gi < b.drop_glue_functions.len() do
-    result.functions.push(b.drop_glue_functions[gi].clone())
-    gi = gi + 1
+    if ti % 64 == 0 then
+      phase_trace("mir-drop-glue-progress built=" + ti.to_string() + " total=" + b.drop_glue_types.len().to_string())
+    end
   end
 end
 

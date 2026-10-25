@@ -1328,6 +1328,12 @@ let rec drop_glue (m : Vm_memory.t) (v : t) : unit =
   | Tuple elems | Struct elems -> agg_iter (drop_glue m) elems
   | Array elems -> arr_iter (drop_glue m) elems
   | Set store -> List.iter (drop_glue m) (set_elems store)
+  (* map_pure is maintained incrementally and is true only while no key or
+     value subtree contains Ref (Region _), the VM's only recursively-owned
+     heap value. A pure map therefore has nothing for VM drop to release.
+     This also avoids forcing map_seq/map_pairs merely to destroy a large
+     compiler-internal table. *)
+  | Map store when store.map_pure -> ()
   | Map store ->
       if Lazy.force slow_host_enabled && map_len store >= 50000 then begin
         let n = map_len store in
