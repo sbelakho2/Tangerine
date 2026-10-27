@@ -3362,7 +3362,7 @@ let binding_manifest : binding list =
          (fun _ args ->
            match args with
            | [| Vm_value.Set store; handle |] -> (
-               match set_visit_after (Vm_value.set_elems store) handle with
+               match Vm_value.set_visit_next store handle with
                | Some (x :: _) ->
                    Vm_value.arr_mark_shared_value x;
                    Ok (vm_option_some x)

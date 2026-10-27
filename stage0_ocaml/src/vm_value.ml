@@ -168,6 +168,11 @@ and set_store = {
   set_count : int;
   (* See map_store.map_marked. *)
   mutable set_marked : bool;
+  (* MEMOIZED visit order: the physical-keyed suffix table makes
+     set_visit_next O(1) per step instead of rebuilding the element list
+     and linearly scanning it every step (a `for x in set` over a large
+     set was quadratic in the seed VM). *)
+  mutable set_suffix_memo : t list Obj_tbl.t option;
 }
 
 (* Reference targets (the audit's real-references rule):
@@ -779,7 +784,7 @@ let map_empty : t =
            map_seq_memo = None; map_suffix_memo = None }
 
 let set_empty : t =
-  Set { set_front = []; set_back = []; set_index = Int_map.empty; set_count = 0; set_marked = true }
+  Set { set_front = []; set_back = []; set_index = Int_map.empty; set_count = 0; set_marked = true; set_suffix_memo = None }
 
 let bucket_mem_key (bucket : (t * t) list) (key : t) : (t * t) option =
   List.find_opt (fun (k, _) -> lookup_eq k key) bucket
@@ -1001,6 +1006,7 @@ let set_insert_entry (s : set_store) (item : t) : bool * t option * set_store =
           set_index = Int_map.add h (List.map replace bucket) s.set_index;
           set_count = s.set_count;
           set_marked = s.set_marked;
+          set_suffix_memo = None;
         } )
   | None ->
       ( false,
@@ -1011,6 +1017,7 @@ let set_insert_entry (s : set_store) (item : t) : bool * t option * set_store =
           set_index = Int_map.add h (item :: bucket) s.set_index;
           set_count = s.set_count + 1;
           set_marked = s.set_marked;
+          set_suffix_memo = None;
         } )
 
 let set_insert (s : set_store) (item : t) : set_store =
@@ -1043,11 +1050,53 @@ let set_remove (s : set_store) (item : t) : (t option * set_store) =
               set_index = index';
               set_count = s.set_count - 1;
               set_marked = s.set_marked;
+              set_suffix_memo = None;
             } ))
 
 let set_len (s : set_store) : int = s.set_count
 
 let set_elems (s : set_store) : t list = set_seq s
+
+(* The suffix a visit handle names, physically: the set element list from
+   the handle onward.  The suffix table is built once per store (keyed by
+   the stored element's physical identity), so an iteration over a large
+   set is O(1) per step instead of O(n).  A handle that is only
+   structurally equal to a stored element (never returned by this visit
+   interface) falls back to the structural scan. *)
+let set_visit_suffix_table (s : set_store) : t list Obj_tbl.t =
+  match s.set_suffix_memo with
+  | Some t -> t
+  | None ->
+      let t = Obj_tbl.create (max 16 s.set_count) in
+      let rec build = function
+        | [] -> ()
+        | x :: rest ->
+            Obj_tbl.replace t (Obj.repr x) rest;
+            build rest
+      in
+      build (set_seq s);
+      s.set_suffix_memo <- Some t;
+      t
+
+let rec set_visit_phys (handle : t) (elems : t list) : t list option =
+  match elems with
+  | [] -> None
+  | x :: rest -> if x == handle then Some rest else set_visit_phys handle rest
+
+let rec set_visit_eq (handle : t) (elems : t list) : t list option =
+  match elems with
+  | [] -> None
+  | x :: rest -> if lookup_eq x handle then Some rest else set_visit_eq handle rest
+
+let set_visit_next (s : set_store) (handle : t) : t list option =
+  if s.set_count < 64 then
+    match set_visit_phys handle (set_seq s) with
+    | Some r -> Some r
+    | None -> set_visit_eq handle (set_seq s)
+  else
+    match Obj_tbl.find_opt (set_visit_suffix_table s) (Obj.repr handle) with
+    | Some r -> Some r
+    | None -> set_visit_eq handle (set_seq s)
 
 let set_of_list (elems : t list) : t =
   List.fold_left
@@ -1076,7 +1125,8 @@ let set_drain_one (s : set_store) : (t option * set_store) =
       in
       (Some x,
        { set_front = rest; set_back = back; set_index = index';
-         set_count = s.set_count - 1; set_marked = s.set_marked })
+         set_count = s.set_count - 1; set_marked = s.set_marked;
+         set_suffix_memo = None })
 
 (* ── Deterministic byte serialization (audit: pointer deref) ─────────
 
